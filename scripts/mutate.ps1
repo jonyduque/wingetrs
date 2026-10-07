@@ -23,6 +23,7 @@ param(
 )
 
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if (-not (Test-Path $Path)) { "[!] arquivo não existe: $Path"; exit 2 }
@@ -41,7 +42,9 @@ try {
     [IO.File]::WriteAllBytes((Resolve-Path $Path), $orig)
 }
 
-$compileFail = $out | Select-String -Pattern 'could not compile|^error\[E\d+\]|^error: ' -Quiet
+# Not '^error: ': cargo prints "error: test failed, to rerun pass ..." when a test fails,
+# which would turn every caught mutant into "does not compile".
+$compileFail = $out | Select-String -Pattern 'could not compile|^error\[E\d+\]' -Quiet
 if ($code -ne 0 -and $compileFail) {
     "[?] INCONCLUSIVO: o mutante não compila (exit $code). Escolha uma mutação que compile."
     $out | Select-String -Pattern '^error' | Select-Object -First 5 | ForEach-Object { "  $($_.Line)" }

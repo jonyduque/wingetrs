@@ -9,6 +9,7 @@
 param([switch]$NoTests)
 
 Set-StrictMode -Version Latest
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
