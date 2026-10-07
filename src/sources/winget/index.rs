@@ -88,10 +88,11 @@ pub fn validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
             return Err(IndexError::Integrity { block: i });
         }
     }
+    // b4:FileHash is a child element of <File> carrying the base64 sha256 in `Hash`.
     let file_hash = file
-        .attributes()
-        .find(|a| a.name() == "FileHash")
-        .map(|a| a.value());
+        .children()
+        .find(|n| n.has_tag_name("FileHash"))
+        .and_then(|n| n.attribute("Hash"));
     if let Some(expected) = file_hash
         && STANDARD.encode(Sha256::digest(&db)) != expected
     {

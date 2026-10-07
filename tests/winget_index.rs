@@ -8,6 +8,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const MSIX: &[u8] = include_bytes!("fixtures/winget/source2-mini.msix");
 const CORRUPT: &[u8] = include_bytes!("fixtures/winget/source2-mini-corrupt.msix");
+const MISSING_BLOCK: &[u8] = include_bytes!("fixtures/winget/source2-mini-missing-block.msix");
+const BAD_FILEHASH: &[u8] = include_bytes!("fixtures/winget/source2-mini-bad-filehash.msix");
 const DB: &[u8] = include_bytes!("fixtures/winget/index-mini.db");
 
 #[test]
@@ -21,6 +23,22 @@ fn corrupt_block_is_rejected() {
         Err(IndexError::Integrity { block }) => assert_eq!(block, (DB.len() / 2) / 65536),
         other => panic!("expected Integrity, got {other:?}"),
     }
+}
+
+#[test]
+fn missing_block_is_rejected() {
+    assert!(matches!(
+        validate_msix(MISSING_BLOCK),
+        Err(IndexError::BlockMap(_))
+    ));
+}
+
+#[test]
+fn bad_file_hash_is_rejected() {
+    assert!(matches!(
+        validate_msix(BAD_FILEHASH),
+        Err(IndexError::FileHash)
+    ));
 }
 
 #[test]

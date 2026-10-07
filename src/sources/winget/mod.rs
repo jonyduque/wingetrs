@@ -53,8 +53,9 @@ pub async fn fetch_index(
     let tmp = data
         .tmp_dir()
         .join(format!("index-{}.db", std::process::id()));
-    std::fs::write(&tmp, &db).map_err(|e| index::IndexError::Io(e.to_string()))?;
-    let result = index::read_index(&tmp);
+    let result = std::fs::write(&tmp, &db)
+        .map_err(|e| index::IndexError::Io(e.to_string()))
+        .and_then(|()| index::read_index(&tmp));
     let _ = std::fs::remove_file(&tmp);
     Ok(WingetFetch::Modified {
         import: result?,
