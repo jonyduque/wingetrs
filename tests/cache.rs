@@ -116,3 +116,9 @@ fn acquire_timeout_waits_then_gives_up() {
         "{el:?}"
     );
 }
+
+#[test]
+fn from_local_app_data_prefers_non_empty_env_value() {
+    let dir = wingetrs::cache::DataDir::from_local_app_data(Some("C:/x".into())).unwrap();
+    assert_eq!(dir.root(), std::path::Path::new("C:/x").join("wingetrs"));
+}

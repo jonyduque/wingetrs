@@ -82,17 +82,6 @@ pub enum Command {
     },
 }
 
-/// Data dir: `%LOCALAPPDATA%\wingetrs`, honoring the env var (the OS known-folder
-/// API ignores it, which would make the offline CLI test touch the real catalog).
-fn data_dir() -> anyhow::Result<DataDir> {
-    match std::env::var_os("LOCALAPPDATA") {
-        Some(base) if !base.is_empty() => {
-            Ok(DataDir::new(std::path::Path::new(&base).join("wingetrs")))
-        }
-        _ => Ok(DataDir::default_location()?),
-    }
-}
-
 /// Whether the stderr log layer is wanted: never for the TUI (it owns the terminal).
 pub fn stderr_logging(cli: &Cli) -> bool {
     cli.command.is_some() && cli.verbose > 0
@@ -315,7 +304,7 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
-    let data = data_dir()?;
+    let data = DataDir::from_env()?;
     data.ensure()?;
     let _guard = init_logging(&data, if stderr_logging(&cli) { cli.verbose } else { 0 });
     let cfg = Config::load(&data.config_path())?;

@@ -31,20 +31,11 @@ struct Ctx {
     details_gen: AtomicU64,
 }
 
-fn data_dir() -> anyhow::Result<DataDir> {
-    match std::env::var_os("LOCALAPPDATA") {
-        Some(base) if !base.is_empty() => {
-            Ok(DataDir::new(std::path::Path::new(&base).join("wingetrs")))
-        }
-        _ => Ok(DataDir::default_location()?),
-    }
-}
-
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
 /// The first frame is drawn before the catalog is read; loading happens in the background.
 pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
     let start = Instant::now();
-    let data = data_dir()?;
+    let data = DataDir::from_env()?;
     data.ensure()?;
     let cfg = Config::load(&data.config_path())?;
     let theme = Theme::new(

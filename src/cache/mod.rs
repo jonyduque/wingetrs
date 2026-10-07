@@ -39,6 +39,20 @@ impl DataDir {
         DataDir { root: root.into() }
     }
 
+    /// `%LOCALAPPDATA%\wingetrs`, honoring the env var first (the known-folder API
+    /// ignores it, which would make offline tests touch the real catalog), then the known folder.
+    pub fn from_env() -> Result<DataDir, CacheError> {
+        Self::from_local_app_data(std::env::var_os("LOCALAPPDATA"))
+    }
+
+    /// Pure core of [`DataDir::from_env`]: a non-empty value wins over the known folder.
+    pub fn from_local_app_data(var: Option<std::ffi::OsString>) -> Result<DataDir, CacheError> {
+        match var {
+            Some(base) if !base.is_empty() => Ok(DataDir::new(Path::new(&base).join("wingetrs"))),
+            _ => Self::default_location(),
+        }
+    }
+
     pub fn default_location() -> Result<DataDir, CacheError> {
         let base = directories::BaseDirs::new().ok_or(CacheError::NoDataDir)?;
         Ok(DataDir::new(base.data_local_dir().join("wingetrs")))
