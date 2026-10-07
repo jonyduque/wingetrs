@@ -1,3 +1,5 @@
 /target
 .claude/settings.local.json
 .claude/tasks/task-*-brief.md
+__pycache__/
+*.snap.new
