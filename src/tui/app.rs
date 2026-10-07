@@ -220,7 +220,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Tick => {
-            if app.refreshing {
+            let loading_details = app
+                .selected_key()
+                .is_some_and(|(s, id)| !app.details.contains_key(&format!("{s}/{id}")));
+            if app.refreshing || loading_details {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
             Vec::new()

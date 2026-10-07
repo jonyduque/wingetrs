@@ -41,21 +41,12 @@ fn data_dir() -> anyhow::Result<DataDir> {
 }
 
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
+/// The first frame is drawn before the catalog is read; loading happens in the background.
 pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
     let start = Instant::now();
     let data = data_dir()?;
     data.ensure()?;
     let cfg = Config::load(&data.config_path())?;
-    let http = Http::new()?;
-    let rt = tokio::runtime::Runtime::new()?;
-    let entries = Catalog::open(&data.catalog_path())
-        .and_then(|c| c.load_entries())
-        .unwrap_or_default();
-    let had_catalog = !entries.is_empty();
-    let mut app = App::new(entries, glyphs);
-    if let Some(age) = index_age(&data) {
-        app.index_age_secs = Some(age);
-    }
     let theme = Theme::new(
         cfg.theme != "light",
         detect_depth(
@@ -63,30 +54,32 @@ pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
             std::env::var("NO_COLOR").ok().as_deref(),
         ),
     );
-    let (tx, rx) = unbounded_channel::<Msg>();
-    let ctx = Arc::new(Ctx {
-        data,
-        cfg,
-        http,
-        tx,
-        details_gen: AtomicU64::new(0),
-    });
+    let mut app = App::new(Vec::new(), glyphs);
+    app.status = Some("carregando catálogo…".into());
     let mut terminal = ratatui::init();
     app.size = terminal
         .size()
         .map(|s| (s.width, s.height))
         .unwrap_or(app.size);
-    let result = rt.block_on(event_loop(
-        &mut terminal,
-        app,
-        &theme,
-        ctx,
-        rx,
-        had_catalog,
-        start,
-    ));
+    let drawn = terminal.draw(|f| view(&app, &theme, f)).map(|_| ());
+    tracing::info!(
+        first_frame_ms = start.elapsed().as_millis() as u64,
+        "first frame"
+    );
+    let result = match (drawn, tokio::runtime::Runtime::new()) {
+        (Ok(()), Ok(rt)) => rt.block_on(event_loop(&mut terminal, app, &theme, data, cfg)),
+        (Err(e), _) => Err(e.into()),
+        (_, Err(e)) => Err(e.into()),
+    };
     ratatui::restore();
     result
+}
+
+/// What the background load found; decides the startup refresh.
+struct Boot {
+    empty: bool,
+    needs_refresh: bool,
+    age: Option<i64>,
 }
 
 fn index_age(data: &DataDir) -> Option<i64> {
@@ -99,28 +92,22 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     mut app: App,
     theme: &Theme,
-    ctx: Arc<Ctx>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>,
-    had_catalog: bool,
-    start: Instant,
+    data: DataDir,
+    cfg: Config,
 ) -> anyhow::Result<()> {
+    let (tx, mut rx) = unbounded_channel::<Msg>();
+    let ctx = Arc::new(Ctx {
+        data,
+        cfg,
+        http: Http::new()?,
+        tx,
+        details_gen: AtomicU64::new(0),
+    });
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
-
-    spawn_scan(&ctx);
-    if had_catalog {
-        if startup_needs_refresh(&ctx) {
-            spawn_refresh(&ctx, false);
-        }
-    } else {
-        spawn_refresh(&ctx, false);
-    }
-
-    terminal.draw(|f| view(&app, theme, f))?;
-    tracing::info!(
-        first_frame_ms = start.elapsed().as_millis() as u64,
-        "first frame"
-    );
+    let (boot_tx, mut boot_rx) = tokio::sync::oneshot::channel::<Boot>();
+    let mut booting = true;
+    spawn_boot(&ctx, boot_tx);
 
     loop {
         let msg = tokio::select! {
@@ -132,6 +119,16 @@ async fn event_loop(
                 None => return Ok(()),
             },
             Some(m) = rx.recv() => m,
+            Ok(boot) = &mut boot_rx, if booting => {
+                booting = false;
+                app.status = None;
+                app.index_age_secs = boot.age;
+                spawn_scan(&ctx);
+                if boot.empty || boot.needs_refresh {
+                    spawn_refresh(&ctx, false);
+                }
+                Msg::Resize(app.size.0, app.size.1)
+            }
             _ = ticker.tick(), if app.refreshing || details_loading(&app) => Msg::Tick,
         };
         let is_tick = matches!(msg, Msg::Tick);
@@ -167,6 +164,25 @@ async fn event_loop(
 fn details_loading(app: &App) -> bool {
     app.selected_key()
         .is_some_and(|(s, id)| !app.details.contains_key(&format!("{s}/{id}")))
+}
+
+/// Loads the catalog off the UI path, then reports what the startup refresh should do.
+fn spawn_boot(ctx: &Arc<Ctx>, boot_tx: tokio::sync::oneshot::Sender<Boot>) {
+    let ctx = Arc::clone(ctx);
+    tokio::task::spawn_blocking(move || {
+        let entries = Catalog::open(&ctx.data.catalog_path())
+            .and_then(|c| c.load_entries())
+            .unwrap_or_default();
+        let empty = entries.is_empty();
+        let _ = ctx.tx.send(Msg::CatalogLoaded(entries));
+        let age = index_age(&ctx.data);
+        let needs_refresh = startup_needs_refresh(&ctx);
+        let _ = boot_tx.send(Boot {
+            empty,
+            needs_refresh,
+            age,
+        });
+    });
 }
 
 fn startup_needs_refresh(ctx: &Ctx) -> bool {
