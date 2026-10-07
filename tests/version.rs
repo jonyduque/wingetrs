@@ -145,3 +145,10 @@ fn sort_is_consistent_with_eq() {
     assert_eq!(s[1], "1.0-rc");
     assert_eq!(&s[4..], &["2.0", "latest"]);
 }
+
+#[test]
+fn suffix_comparison_is_case_insensitive() {
+    eq("1.0-RC", "1.0-rc");
+    lt("1.0-a", "1.0-B");
+    lt("1.0-A", "1.0-b");
+}
