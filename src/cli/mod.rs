@@ -93,6 +93,11 @@ fn data_dir() -> anyhow::Result<DataDir> {
     }
 }
 
+/// Whether the stderr log layer is wanted: never for the TUI (it owns the terminal).
+pub fn stderr_logging(cli: &Cli) -> bool {
+    cli.command.is_some() && cli.verbose > 0
+}
+
 fn init_logging(data: &DataDir, verbose: u8) -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -312,7 +317,7 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let data = data_dir()?;
     data.ensure()?;
-    let _guard = init_logging(&data, cli.verbose);
+    let _guard = init_logging(&data, if stderr_logging(&cli) { cli.verbose } else { 0 });
     let cfg = Config::load(&data.config_path())?;
     if cli.command.is_none() {
         // The TUI builds its own runtime; glyphs: flag > config.toml > nerd.

@@ -82,3 +82,17 @@ fn source_kind_display_and_parse_round_trip() {
         assert_eq!(k.to_string().parse::<SourceKind>().unwrap(), k);
     }
 }
+
+#[test]
+fn stderr_logging_is_off_without_subcommand() {
+    let cli = Cli::try_parse_from(["wingetrs", "-v"]).unwrap();
+    assert!(!wingetrs::cli::stderr_logging(&cli));
+}
+
+#[test]
+fn stderr_logging_is_on_with_subcommand_and_v() {
+    let cli = Cli::try_parse_from(["wingetrs", "list", "-v"]).unwrap();
+    assert!(wingetrs::cli::stderr_logging(&cli));
+    let cli = Cli::try_parse_from(["wingetrs", "list"]).unwrap();
+    assert!(!wingetrs::cli::stderr_logging(&cli));
+}
