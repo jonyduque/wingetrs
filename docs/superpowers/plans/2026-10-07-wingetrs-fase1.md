@@ -343,7 +343,10 @@ fn glyphs_is_global() {
 fn update_background_flag_is_hidden_but_accepted() {
     let cli = Cli::try_parse_from(["wingetrs", "update", "--background"]).unwrap();
     assert_eq!(cli.command, Some(Command::Update { force: false, background: true }));
-    let help = Cli::command().render_long_help().to_string();
+    // The root help never lists subcommand flags; inspect the subcommand's own help.
+    let mut root = Cli::command();
+    let help = root.find_subcommand_mut("update").unwrap().render_long_help().to_string();
+    assert!(help.contains("--force"), "sanity: update help rendered:\n{help}");
     assert!(!help.contains("--background"));
 }
 
