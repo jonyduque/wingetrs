@@ -110,3 +110,10 @@ fn exact_id_beats_equal_scoring_name_match() {
     let hits = i.search("foo", None, 10);
     assert_eq!(i.entries()[hits[0].index].id, "foo");
 }
+
+#[test]
+fn non_ascii_name_indices_are_char_positions() {
+    let mut i = idx();
+    let hits = i.search("安全", None, 10);
+    assert_eq!(hits[0].name_indices, [3, 4]);
+}

@@ -198,3 +198,58 @@ fn tags_and_commands_round_trip() {
     assert_eq!(e.source_name, "scoop:main");
     assert_eq!(e.source, SourceKind::Scoop);
 }
+
+#[test]
+fn code_lookup_folds_case_in_both_directions() {
+    let mut c = Catalog::open_in_memory().unwrap();
+    let maps = WingetMaps {
+        productcodes: vec![(
+            "{23170F69-40C1-2701-1900-000001000000}".into(),
+            "7zip.7zip".into(),
+        )],
+        upgradecodes: vec![(
+            "{ABCDEF00-0000-0000-0000-000000000000}".into(),
+            "7zip.7zip".into(),
+        )],
+        pfns: vec![("lower_pfn".into(), "7zip.7zip".into())],
+        ..Default::default()
+    };
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v",
+        1,
+        &[pkg("7zip.7zip", "7-Zip", "26.04")],
+        &maps,
+    )
+    .unwrap();
+    assert_eq!(
+        c.lookup(
+            MapTable::ProductCode,
+            "{23170F69-40C1-2701-1900-000001000000}"
+        )
+        .unwrap(),
+        ["7zip.7zip"]
+    );
+    assert_eq!(
+        c.lookup(
+            MapTable::UpgradeCode,
+            "{abcdef00-0000-0000-0000-000000000000}"
+        )
+        .unwrap(),
+        ["7zip.7zip"]
+    );
+    assert_eq!(c.lookup(MapTable::Pfn, "LOWER_PFN").unwrap(), ["7zip.7zip"]);
+}
+
+#[test]
+fn open_file_uses_wal_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let _c = Catalog::open(&path).unwrap();
+    let other = rusqlite::Connection::open(&path).unwrap();
+    let mode: String = other
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
