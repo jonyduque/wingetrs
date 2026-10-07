@@ -10,3 +10,4 @@ Plano: `docs/superpowers/plans/2026-10-07-wingetrs-fase1.md`. Uma linha por tare
 | 4 | Manifesto merged do winget | e52ef17..61055c5 | DONE | sonnet/sonnet | revisor: herança de Scope e fallback de homepage sem teste, pinados em 61055c5; achado de CRLF recusado (fixture tem 180 CR, sha confere) |
 | 6 | Diretório de dados, cache e HTTP condicional | e52ef17..e15b29f | DONE | sonnet/sonnet | APPROVE; desvio wiremock (headers divididos por vírgula) aceito e plano corrigido |
 | 5 | Catálogo SQLite e busca fuzzy | 084c7a7..3139123 | DONE | sonnet/sonnet | implementador pinou prioridade de match exato (mutação sobrevivia no plano); revisor: lowercase de chaves, índices de char e WAL pinados em 3139123 |
+| 10 | Porte do NameNormalizer | 0d33f6a..f0d218e | DONE | opus/sonnet | golden 1137/1137 (conferido); follow-up conhecido: NFKC não aplicado e FoldCase≈to_lowercase (ß, sigma final, İ) |
