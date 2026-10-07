@@ -1,4 +1,5 @@
 //! Winget source.
+pub mod manifest;
 pub mod mszip;
 pub mod version_data;
 
