@@ -11,7 +11,7 @@ fn strip_bom(b: &[u8]) -> &[u8] {
 }
 
 fn stem(path: &str) -> String {
-    let file = path.rsplit(['/', char::from(92)]).next().unwrap_or(path);
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
     match file.rfind('.') {
         Some(i) if i > 0 => file[..i].to_lowercase(),
         _ => file.to_lowercase(),
@@ -125,7 +125,10 @@ pub fn details_from_raw(app: &str, raw: &str) -> Result<PackageDetails, ScoopErr
                 });
             }
         }
-    } else if let Some(url) = v.get("url").and_then(first_url) {
+    }
+    if installers.is_empty()
+        && let Some(url) = v.get("url").and_then(first_url)
+    {
         installers.push(InstallerSummary {
             architecture: "neutral".to_string(),
             installer_type: "scoop".to_string(),

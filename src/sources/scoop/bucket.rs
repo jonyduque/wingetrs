@@ -46,7 +46,7 @@ pub fn read_tarball(tar_gz: &[u8]) -> Result<BucketImport, ScoopError> {
             .path()
             .map_err(|e| ScoopError::Tar(e.to_string()))?
             .to_string_lossy()
-            .replace(char::from(92), "/");
+            .replace('\\', "/");
         let Some(file) = manifest_file(&path) else {
             continue;
         };

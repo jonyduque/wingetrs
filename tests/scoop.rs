@@ -124,3 +124,69 @@ async fn fetch_bucket_conditional() {
     let second = fetch_bucket(&http, &url, Some(&entry)).await.unwrap();
     assert!(matches!(second, ScoopFetch::NotModified));
 }
+
+fn make_tgz(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    for (p, data) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, p, *data).unwrap();
+    }
+    let tar_bytes = b.into_inner().unwrap();
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut e, &tar_bytes).unwrap();
+    e.finish().unwrap()
+}
+
+#[test]
+fn path_filter_only_bucket_one_level() {
+    let ok: &[u8] = br#"{"version":"1"}"#;
+    let tgz = make_tgz(&[
+        ("P/bucket/ok.json", ok),
+        ("P/bucket/sub/x.json", ok),
+        ("P/deprecated/y.json", ok),
+        ("P/bucket/.json", ok),
+        ("bucket/top.json", ok),
+        ("A/B/bucket/deep.json", ok),
+    ]);
+    let imp = read_tarball(&tgz).unwrap();
+    let ids: Vec<&str> = imp.packages.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["ok"]);
+    assert!(imp.skipped.is_empty());
+}
+
+#[test]
+fn bin_inside_architecture() {
+    let p = parse(
+        "t",
+        br#"{"version":"1","architecture":{"64bit":{"bin":"A.exe"},"32bit":{"bin":["a.exe",["x.exe","B"]]}}}"#,
+    )
+    .unwrap();
+    assert_eq!(p.commands, ["a", "b"]);
+}
+
+#[test]
+fn empty_architecture_falls_back_to_neutral() {
+    let d = details_from_raw(
+        "n",
+        r#"{"version":"1","url":"https://x/a.zip","architecture":{}}"#,
+    )
+    .unwrap();
+    assert_eq!(d.installers.len(), 1);
+    assert_eq!(d.installers[0].architecture, "neutral");
+}
+
+#[test]
+fn malformed_shapes_do_not_panic() {
+    for j in [
+        &br#"{"version":"1","bin":5}"#[..],
+        br#"{"version":"1","architecture":[]}"#,
+        br#"{"version":"1","bin":[5,[],["a",5]]}"#,
+        b"[1,2]",
+    ] {
+        let _ = parse("m", j);
+        let _ = details_from_raw("m", std::str::from_utf8(j).unwrap());
+    }
+}
