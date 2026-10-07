@@ -1,5 +1,14 @@
 //! Command line interface.
+pub mod output;
+
+use crate::cache::{DataDir, HttpState, now_unix};
+use crate::catalog::Catalog;
+use crate::catalog::search::SearchIndex;
+use crate::config::Config;
 use crate::core::SourceKind;
+use crate::http::Http;
+use crate::update::{Endpoints, Outcome, SourceReport, needs_refresh, run_update};
+use anyhow::Context;
 use std::str::FromStr;
 
 fn parse_source(s: &str) -> Result<SourceKind, String> {
@@ -71,20 +80,197 @@ pub enum Command {
     },
 }
 
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Update { .. } => "update",
-            Command::Search { .. } => "search",
-            Command::Show { .. } => "show",
-            Command::List { .. } => "list",
+/// Data dir: `%LOCALAPPDATA%\wingetrs`, honoring the env var (the OS known-folder
+/// API ignores it, which would make the offline CLI test touch the real catalog).
+fn data_dir() -> anyhow::Result<DataDir> {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(base) if !base.is_empty() => {
+            Ok(DataDir::new(std::path::Path::new(&base).join("wingetrs")))
         }
+        _ => Ok(DataDir::default_location()?),
+    }
+}
+
+fn init_logging(data: &DataDir, verbose: u8) -> tracing_appender::non_blocking::WorkerGuard {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let appender = tracing_appender::rolling::daily(data.log_dir(), "wingetrs.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let file = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false);
+    let stderr = (verbose > 0).then(|| {
+        let level = if verbose > 1 {
+            tracing::Level::DEBUG
+        } else {
+            tracing::Level::INFO
+        };
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(tracing_subscriber::filter::LevelFilter::from_level(level))
+    });
+    let _ = tracing_subscriber::registry()
+        .with(file)
+        .with(stderr)
+        .try_init();
+    guard
+}
+
+/// Detached `wingetrs update --background`; the spawn itself is not tested.
+fn spawn_background_update() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["update", "--background"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NO_WINDOW
+        cmd.creation_flags(0x0000_0008 | 0x0800_0000);
+    }
+    if let Err(e) = cmd.spawn() {
+        tracing::warn!("falha ao iniciar atualização em segundo plano: {e}");
+    }
+}
+
+fn all_urls(ep: &Endpoints) -> Vec<&str> {
+    std::iter::once(ep.winget_index.as_str())
+        .chain(ep.scoop.iter().map(|(_, u)| u.as_str()))
+        .collect()
+}
+
+/// Ensures a catalog exists (blocking update when empty) and triggers a
+/// detached refresh when it is stale.
+async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Result<Catalog> {
+    let ep = Endpoints::production(cfg)?;
+    let catalog = Catalog::open(&data.catalog_path())?;
+    if catalog.is_empty()? {
+        drop(catalog);
+        let reports = run_update(data, &ep, http, false).await?;
+        let catalog = Catalog::open(&data.catalog_path())?;
+        if catalog.is_empty()? {
+            for r in &reports {
+                if let Outcome::Failed(m) = &r.outcome {
+                    tracing::warn!("{}: {m}", r.source);
+                }
+            }
+            anyhow::bail!("sem catálogo local e sem rede");
+        }
+        return Ok(catalog);
+    }
+    let state = HttpState::load(&data.http_state_path());
+    if needs_refresh(&state, &all_urls(&ep), now_unix()) {
+        spawn_background_update();
+    }
+    Ok(catalog)
+}
+
+fn print_reports(reports: &[SourceReport]) {
+    for r in reports {
+        println!("{}", output::report_line(r));
+    }
+}
+
+async fn run_async(cli: Cli, data: DataDir, cfg: Config) -> anyhow::Result<()> {
+    let http = Http::new()?;
+    let Some(cmd) = cli.command else {
+        anyhow::bail!("TUI ainda não implementada");
+    };
+    match cmd {
+        Command::Update { force, background } => {
+            let ep = Endpoints::production(&cfg)?;
+            let reports = run_update(&data, &ep, &http, force).await?;
+            if !background {
+                print_reports(&reports);
+            }
+            Ok(())
+        }
+        Command::Search {
+            query,
+            source,
+            json,
+            limit,
+        } => {
+            let catalog = ensure_catalog(&data, &cfg, &http).await?;
+            let mut index = SearchIndex::new(catalog.load_entries()?);
+            let hits = index.search(&query, source, limit);
+            let rows: Vec<_> = hits
+                .iter()
+                .filter_map(|h| index.entries().get(h.index).cloned())
+                .collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                print!("{}", output::search_table(&rows));
+            }
+            Ok(())
+        }
+        Command::Show {
+            id,
+            source,
+            version,
+            json,
+        } => {
+            let catalog = ensure_catalog(&data, &cfg, &http).await?;
+            let mut found = catalog.find_by_id(&id)?;
+            if let Some(k) = source {
+                found.retain(|p| p.entry.source == k);
+            }
+            let pkg = match found.len() {
+                0 => anyhow::bail!("pacote não encontrado: {id}"),
+                1 => found.remove(0),
+                _ => {
+                    let names: Vec<_> =
+                        found.iter().map(|p| p.entry.source_name.as_str()).collect();
+                    anyhow::bail!(
+                        "pacote ambíguo: {id} existe em {}; use --source",
+                        names.join(", ")
+                    )
+                }
+            };
+            let details = match pkg.entry.source {
+                SourceKind::Winget => {
+                    let hash = pkg
+                        .winget_hash
+                        .as_deref()
+                        .context("pacote winget sem hash de manifesto")?;
+                    let blobs = crate::cache::BlobStore::new(data.blobs_dir());
+                    crate::sources::winget::details::details(
+                        &http,
+                        &blobs,
+                        crate::sources::winget::CDN_BASE,
+                        &pkg.entry.id,
+                        hash,
+                        version.as_deref(),
+                    )
+                    .await?
+                }
+                SourceKind::Scoop => {
+                    let raw = pkg.raw.as_deref().context("pacote scoop sem manifesto")?;
+                    crate::sources::scoop::manifest::details_from_raw(&pkg.entry.id, raw)?
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&details)?);
+            } else {
+                print!("{}", output::details_text(&details));
+            }
+            Ok(())
+        }
+        Command::List { .. } => anyhow::bail!("comando ainda não implementado: list"),
     }
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
-        None => anyhow::bail!("TUI ainda não implementada"),
-        Some(cmd) => anyhow::bail!("comando ainda não implementado: {}", cmd.name()),
-    }
+    let data = data_dir()?;
+    data.ensure()?;
+    let _guard = init_logging(&data, cli.verbose);
+    let cfg = Config::load(&data.config_path())?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(run_async(cli, data, cfg))
 }

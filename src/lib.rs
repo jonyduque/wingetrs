@@ -2,6 +2,7 @@
 pub mod cache;
 pub mod catalog;
 pub mod cli;
+pub mod config;
 pub mod core;
 pub mod http;
 pub mod installed;
