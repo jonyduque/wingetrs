@@ -152,7 +152,7 @@ async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Re
     let catalog = Catalog::open(&data.catalog_path())?;
     if catalog.is_empty()? {
         drop(catalog);
-        let reports = run_update(data, &ep, http, false).await?;
+        let reports = run_update(data, &ep, http, true).await?;
         let catalog = Catalog::open(&data.catalog_path())?;
         if catalog.is_empty()? {
             for r in &reports {
