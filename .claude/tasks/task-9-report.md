@@ -41,3 +41,9 @@ Decisions:
 - Lock acquisition runs in spawn_blocking.
 
 Concerns: none. Files touched beyond list: none. show/background spawn not exercised by tests (show not manually run).
+
+## Follow-up: force refresh when catalog empty (a3d1e74)
+- ensure_catalog now calls run_update with force = true when the catalog is empty.
+- New test cli_offline::deleted_catalog_with_fresh_http_state_is_rebuilt_by_search (binary + wiremock; update, delete catalog.db, search --json gives 28 entries).
+- Mutation: [OK] mutação PEGA: 'run_update(data, &ep, http, true)' -> 'run_update(data, &ep, http, false)' fez o teste falhar (exit 101).
+- Gate: [OK] test (113 passed, 2 ignored) / [OK] gate verde.
