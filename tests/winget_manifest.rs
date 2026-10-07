@@ -84,3 +84,33 @@ fn invalid_utf8_and_yaml_are_errors() {
     assert!(parse(&[0xFF, 0xFE, 0x00]).is_err());
     assert!(parse(b"Installers: [").is_err());
 }
+
+#[test]
+fn root_scope_is_inherited_unless_overridden() {
+    let y = "PackageIdentifier: A.B\nPackageVersion: 1\nInstallerType: msi\nScope: user\nInstallers:\n- Architecture: x64\n  InstallerUrl: https://x/a.msi\n  InstallerSha256: AA\n- Architecture: x86\n  Scope: machine\n  InstallerUrl: https://x/b.msi\n  InstallerSha256: BB\n";
+    let d = parse(y.as_bytes()).unwrap().into_details(vec![]);
+    let scopes: Vec<Option<&str>> = d.installers.iter().map(|i| i.scope.as_deref()).collect();
+    assert_eq!(scopes, [Some("user"), Some("machine")]);
+}
+
+#[test]
+fn homepage_falls_back_to_publisher_url() {
+    let only_pub = "PackageIdentifier: A.B\nPackageVersion: 1\nPublisherUrl: https://pub.example\n";
+    assert_eq!(
+        parse(only_pub.as_bytes())
+            .unwrap()
+            .into_details(vec![])
+            .homepage
+            .as_deref(),
+        Some("https://pub.example")
+    );
+    let both = "PackageIdentifier: A.B\nPackageVersion: 1\nPackageUrl: https://pkg.example\nPublisherUrl: https://pub.example\n";
+    assert_eq!(
+        parse(both.as_bytes())
+            .unwrap()
+            .into_details(vec![])
+            .homepage
+            .as_deref(),
+        Some("https://pkg.example")
+    );
+}
