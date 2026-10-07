@@ -34,7 +34,7 @@ Use o LSP (rust-analyzer) para diagnósticos e navegação em vez de ler arquivo
 ## Regras do projeto (cada uma com o motivo)
 
 - **Dado externo nunca causa pânico.** Sem `unwrap()`/`expect()` em caminhos que tocam rede, disco, registro ou manifestos; use `?` com erro tipado. Motivo: o catálogo muda sem aviso e um manifesto ruim não pode derrubar a TUI.
-- **Erros:** `thiserror` por módulo; `anyhow` só em `main.rs`. Motivo: módulos precisam de erros que o chamador distingue (offline vs. integridade).
+- **Erros:** `thiserror` por módulo; `anyhow` só nas bordas (`main.rs`, `cli/`, `tui::run`). Motivo: módulos precisam de erros que o chamador distingue (offline vs. integridade).
 - **Nada escreve em stdout fora de `main.rs`/`cli/`.** Logs vão por `tracing` (arquivo). Motivo: a TUI ocupa o terminal; um `println!` perdido corrompe a tela.
 - **Código específico de Windows** (`winreg`, `windows`) fica em arquivos próprios com `#[cfg(windows)]` no `mod`, nunca `if cfg!(windows)` no meio da lógica. Motivo: a lógica de correlação é testável em qualquer plataforma com dados sintéticos.
 - **Testes unitários não acessam rede nem o registro real.** Usam `tests/fixtures/` e `wiremock`. Testes que precisam da máquina/rede reais levam `#[ignore = "live: <motivo>"]`.
