@@ -9,3 +9,4 @@ Plano: `docs/superpowers/plans/2026-10-07-wingetrs-fase1.md`. Uma linha por tare
 | 3 | Decodificador MSZIP e versionData | ec75b34..e52ef17 | DONE | sonnet/sonnet | APPROVE sem Critical/Important; revisor confirmou janela de 32 KiB do total e mutação própria pega |
 | 4 | Manifesto merged do winget | e52ef17..61055c5 | DONE | sonnet/sonnet | revisor: herança de Scope e fallback de homepage sem teste, pinados em 61055c5; achado de CRLF recusado (fixture tem 180 CR, sha confere) |
 | 6 | Diretório de dados, cache e HTTP condicional | e52ef17..e15b29f | DONE | sonnet/sonnet | APPROVE; desvio wiremock (headers divididos por vírgula) aceito e plano corrigido |
+| 5 | Catálogo SQLite e busca fuzzy | 084c7a7..3139123 | DONE | sonnet/sonnet | implementador pinou prioridade de match exato (mutação sobrevivia no plano); revisor: lowercase de chaves, índices de char e WAL pinados em 3139123 |
