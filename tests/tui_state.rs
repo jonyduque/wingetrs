@@ -172,3 +172,74 @@ fn glyph_sets_are_distinct_and_ascii_is_ascii() {
     assert_eq!(Glyphs::for_set(GlyphSet::Nerd).winget, "\u{f17a}");
     assert_eq!(Glyphs::for_set(GlyphSet::Unicode).upgrade, "↑");
 }
+
+fn row(
+    name: &str,
+    state: wingetrs::installed::correlate::UpdateState,
+) -> wingetrs::installed::correlate::ListRow {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule};
+    ListRow {
+        name: name.into(),
+        installed_version: Some("1".into()),
+        correlation: Correlation::Matched {
+            source: "winget".into(),
+            package_id: format!("Pkg.{name}"),
+            rule: Rule::ProductCode,
+        },
+        latest: None,
+        state,
+    }
+}
+
+#[test]
+fn no_color_keeps_modifiers_and_truecolor_uses_rgb() {
+    use ratatui::style::{Color, Modifier};
+    use wingetrs::tui::theme::Theme;
+    let t = Theme::new(true, ColorDepth::NoColor);
+    assert!(t.name().add_modifier.contains(Modifier::BOLD));
+    assert_eq!(t.name().fg, None);
+    assert!(t.description().add_modifier.contains(Modifier::ITALIC));
+    assert!(t.matched().add_modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(t.matched().fg, None);
+    let c = Theme::new(true, ColorDepth::TrueColor);
+    assert!(matches!(c.accent().fg, Some(Color::Rgb(..))));
+}
+
+#[test]
+fn selection_is_clamped_when_installed_list_shrinks() {
+    use wingetrs::installed::correlate::UpdateState;
+    let mut a = app();
+    update(&mut a, key(KeyCode::Tab));
+    let rows: Vec<_> = (0..5)
+        .map(|i| row(&format!("p{i}"), UpdateState::UpToDate))
+        .collect();
+    update(&mut a, Msg::InstalledLoaded(rows));
+    update(&mut a, key(KeyCode::End));
+    assert_eq!(a.selected, 4);
+    let rows: Vec<_> = (0..2)
+        .map(|i| row(&format!("p{i}"), UpdateState::UpToDate))
+        .collect();
+    update(&mut a, Msg::InstalledLoaded(rows));
+    assert!(a.selected < a.visible_len());
+    assert!(a.selected_key().is_some());
+}
+
+#[test]
+fn updates_tab_counts_only_available() {
+    use wingetrs::installed::correlate::UpdateState;
+    let mut a = app();
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![
+            row("a", UpdateState::Available { latest: "2".into() }),
+            row("b", UpdateState::UpToDate),
+            row("c", UpdateState::Unknown),
+            row("d", UpdateState::Available { latest: "3".into() }),
+        ]),
+    );
+    update(&mut a, key(KeyCode::Tab));
+    assert_eq!(a.visible_len(), 4);
+    update(&mut a, key(KeyCode::Tab));
+    assert_eq!(a.tab, Tab::Updates);
+    assert_eq!(a.visible_len(), 2);
+}
