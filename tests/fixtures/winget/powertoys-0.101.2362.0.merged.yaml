@@ -1,0 +1,180 @@
+Author: Microsoft Corporation
+Copyright: Copyright (c) Microsoft Corporation. All rights reserved.
+CopyrightUrl: https://github.com/microsoft/PowerToys/blob/main/LICENSE
+Description: 'Microsoft PowerToys is a set of utilities for power users to tune and
+  streamline their Windows experience for greater productivity.
+
+  Inspired by the Windows 95 era PowerToys project, this reboot provides power users
+  with ways to squeeze more efficiency out of the Windows 10 shell and customize it
+  for individual workflows.'
+Documentations:
+- DocumentLabel: Wiki
+  DocumentUrl: https://github.com/microsoft/PowerToys/wiki
+Icons:
+- IconFileType: ico
+  IconResolution: custom
+  IconSha256: 637eecfa2f0baaf87677adfbd7164ff9954429cf920e1bd7abebe08f85984e1d
+  IconTheme: default
+  IconUrl: https://cdn.winget.microsoft.com/icons/637eecfa2f0baaf87677adfbd7164ff9954429cf920e1bd7abebe08f85984e1d.ico
+InstallerSwitches:
+  Silent: /quiet /norestart
+  SilentWithProgress: /quiet /norestart
+InstallerType: burn
+Installers:
+- Architecture: x64
+  InstallerSha256: D56FA7130FA68AFE553068C15A59A6B24C8DBCC9A0989A43EF0FC5A373230DE3
+  InstallerUrl: https://github.com/microsoft/PowerToys/releases/download/v0.101.2362.0/PowerToysUserSetup-0.101.2362.0-x64.exe
+  Scope: user
+- Architecture: x64
+  ElevationRequirement: elevatesSelf
+  InstallerSha256: F27E4B4B01BFF1A74BFA0116C99F9205F7138DB6F7DFCAA9223FB8B635FE6050
+  InstallerUrl: https://github.com/microsoft/PowerToys/releases/download/v0.101.2362.0/PowerToysSetup-0.101.2362.0-x64.exe
+  Scope: machine
+- AppsAndFeaturesEntries:
+  - DisplayName: PowerToys (Preview) ARM64
+  Architecture: arm64
+  InstallerSha256: 4C2AE5156B7E4F1F5BA744BA6E1CF6BFE3D9614978356E6B00AA47CAB86350DB
+  InstallerUrl: https://github.com/microsoft/PowerToys/releases/download/v0.101.2362.0/PowerToysUserSetup-0.101.2362.0-arm64.exe
+  Scope: user
+- AppsAndFeaturesEntries:
+  - DisplayName: PowerToys (Preview) ARM64
+  Architecture: arm64
+  ElevationRequirement: elevatesSelf
+  InstallerSha256: BEE299302C0CD59E282BDC92CC8AAF737713EABCCA77BB8BF09F43745D43CD93
+  InstallerUrl: https://github.com/microsoft/PowerToys/releases/download/v0.101.2362.0/PowerToysSetup-0.101.2362.0-arm64.exe
+  Scope: machine
+License: MIT
+LicenseUrl: https://github.com/microsoft/PowerToys/blob/HEAD/LICENSE
+ManifestType: merged
+ManifestVersion: 1.12.0
+MinimumOSVersion: 10.0.17134.0
+Moniker: powertoys
+PackageIdentifier: Microsoft.PowerToys
+PackageLocale: en-US
+PackageName: PowerToys
+PackageUrl: https://github.com/microsoft/PowerToys
+PackageVersion: 0.101.2362.0
+Platform:
+- Windows.Desktop
+PrivacyUrl: https://privacy.microsoft.com/en-us/privacystatement
+Publisher: Microsoft Corporation
+PublisherSupportUrl: https://github.com/microsoft/PowerToys/issues
+PublisherUrl: https://github.com/microsoft/PowerToys
+ReleaseDate: 2026-08-25
+ReleaseNotes: "Hero image of what's new in version 0.100\nHighlights\nPowerToys 0.101
+  introduces Window Hopper for quickly moving between windows from the same app, a
+  redesigned update experience with Stable and Insider channels, and compact mode
+  for Command Palette. This release also continues our WinUI 3 modernization, brings
+  on-device Phi Silica transformations to Advanced Paste, and adds a big set of improvements
+  across PowerDisplay and Shortcut Guide.\nWatch the PowerToys 0.101 overview on YouTube\n\U0001FA9F
+  Meet Window Hopper\nIf you regularly have several windows open from the same app,
+  switching between them is now much faster. Window Hopper works like Alt + Tab, but
+  stays within the app you're currently using. Once the utility is enabled, press
+  the configurable Alt + backtick shortcut to cycle through that app's windows without
+  stepping through everything else on your desktop. It is especially useful when you're
+  juggling multiple browser windows, terminals, File Explorer windows, or editor instances.\nWindow
+  Hopper\nPR: #48281 (with coauthor credit to @wzhudev)\n\U0001F504 A smoother update
+  experience and the new Insider channel\nPowerToys updates now have a clearer home
+  in Settings. Open Settings > General > Update channel to choose between Stable and
+  Insider. Stable remains the default, while Insider lets you opt in to PowerToys
+  Preview builds and try the latest work sooner. The selected channel remains visible
+  when the setting is collapsed, preview builds are clearly labeled, and managed devices
+  can still have preview updates controlled by organizational policy.\nWe also redesigned
+  the update experience with clearer badges and a compact status surface that tracks
+  each step, from checking and downloading to installation or errors. Bug reports
+  are easier too, with progress updates, quick access to the generated ZIP, and a
+  prefilled GitHub issue.\nPowerToys update settings\nPRs: #49414, #49722, and #49872\n\u26A1
+  Command Palette goes compact\nCommand Palette can now stay out of the way until
+  you need the results. Enable compact mode in Command Palette Settings and the palette
+  opens as a focused search box at a configurable vertical position. Start typing
+  and it expands just enough to show matching results; you can also use Down Arrow
+  or Tab to expand it from the keyboard. Pages that need more room, such as detailed
+  views and confirmation dialogs, still expand fully when required. Compact mode is
+  off by default, so the existing full experience remains unchanged unless you opt
+  in.\nCommand Palette compact mode\nCompact mode is only one part of this Command
+  Palette update:\n- Search and responsiveness: Better ranking, cached Window Walker
+  results, and progressive icon loading make results feel faster and more predictable.\n-
+  Reliability: Improved backdrop switching, icon loading, dock cleanup, and extension-resource
+  management make prolonged use more stable.\n- Dock improvements: Auto-hide reclaims
+  screen space, while the dock clock and an optional bell provide quick access to
+  Notification Center.\n- Richer notifications: Extensions can show toasts with configurable
+  positions, icons, and action buttons.\n- Performance Monitor: New disk activity
+  metrics and clearer network bands make it easier to keep an eye on system performance.\n-
+  Extension Gallery: Deep links can open the gallery or take you directly to a specific
+  extension's installation page.\n- Windows Update commands: Update and restart and
+  Update and shut down appear when Windows is waiting for a reboot.\nMassive thanks
+  to @jiripolasek for the sustained Command Palette work across this release!\nPRs:
+  #48801, #49177, and #49780\n\U0001F504 Quick Accent and Mouse Jump move to WinUI
+  3\nWe're continuing to modernize PowerToys utilities with WinUI 3, and this release
+  brings refreshed foundations to Quick Accent and Mouse Jump. Quick Accent keeps
+  its familiar character picker while gaining better theming, accessibility, and DPI-aware
+  placement. It also adds an optional Press and hold the letter activation mode: choose
+  it in Quick Accent Settings, configure the hold duration, then hold an accent-capable
+  letter to open the picker. Use the arrow keys or Space to select a character and
+  release the letter to insert it. A quick tap still types the original letter, and
+  normal Ctrl, Alt, AltGr, and Windows-key shortcuts remain unaffected.\nMouse Jump
+  now uses a WinUI 3 interface with improved multi-monitor and mixed-DPI behavior.
+  Invoke Mouse Jump with your configured shortcut, then click the destination in the
+  preview or use the number keys, Home and End, or the arrow keys to select a monitor
+  from the keyboard. Smaller improvements across the two utilities include more reliable
+  Quick Accent activation, better first-frame rendering, expanded language, currency,
+  punctuation, and IPA character sets, plus updated Mouse Jump layout and release
+  support for both x64 and ARM64.\nPRs: #48891, #48937, and #48393 (Thanks, @LegendaryBlair
+  and @mikeclayton!)\n\U0001F5A5\uFE0F PowerDisplay gets linked controls and faster
+  access\nPowerDisplay can now control the brightness of several monitors together.
+  Turn on linked brightness to get one All Displays slider for every included brightness-capable
+  monitor, while keeping selected displays independent when needed. Individual display
+  cards remain available in an expandable section, and applying a saved profile returns
+  to per-monitor control before restoring its values. You can also opt in to brightness
+  control from the tray icon: choose whether scrolling over it adjusts the primary
+  display or all linked displays, then set the amount each mouse-wheel notch should
+  change.\nPowerDisplay linked controls\nPowerDisplay can now wake supported monitors
+  by selecting On from the display's power-state control, and a new command-line interface
+  lets you inspect displays, change monitor settings, and apply saved profiles from
+  scripts. This release also improves built-in panel detection on hybrid-GPU systems,
+  makes Maximum compatibility mode more resilient with unreliable monitors, preserves
+  recent setting changes during exit, restores saved brightness, contrast, volume,
+  and color temperature more reliably, and cleans up monitor and tray resources more
+  consistently.\nPRs: #48207 (Thanks, @gilnatab!), #48628, and #49446\n\U0001F4CB
+  Advanced Paste brings local AI to custom actions\nAdvanced Paste now supports on-device
+  transformations with Phi Silica on supported Windows devices, so you can use local
+  AI without configuring a cloud endpoint or API key. In Advanced Paste Settings,
+  check Phi Silica availability and download the model when prompted. You can then
+  choose Phi Silica as the provider for an action, customize its prompt and coaching
+  behavior, and assign a shortcut for quick access. Provider selection, prompts, and
+  shortcuts can all be configured per action, making it easier to mix local and online
+  models for different clipboard workflows.\nAdvanced Paste Phi Silica settings\nYou
+  can also hide the AI paste section when you do not use AI features, keeping the
+  Advanced Paste window focused on the actions you need. Custom OpenAI and Azure OpenAI
+  actions now work more reliably with models that do not support the minimal reasoning-effort
+  setting by allowing those services to use their own defaults.\nPR: #46727\n\u2328\uFE0F
+  Shortcut Guide adds Windows-key activation and search\nShortcut Guide can now respond
+  when you hold the Windows key. In Settings, choose whether this shows taskbar indicators,
+  opens the full guide, or remains disabled. You can also configure the hold duration
+  and whether the full guide closes when you release the key, while keeping the regular
+  activation shortcut independent.\nShortcut Guide now includes page-local search
+  across shortcut names, descriptions, modifiers, and displayed keys. This makes it
+  much faster to find one command without scanning an entire app's shortcut list.\nShortcut
+  Guide search\nThe experience also moves to a single transparent overlay, enabling
+  smoother transitions, cleaner click-outside behavior, and taskbar indicators that
+  adapt to taskbars positioned along any screen edge. Shortcut Guide adds coverage
+  for Brave Browser, Zoom Workspace, the new Outlook for Windows, DaVinci Resolve,
+  Greenshot, 1Password, Godot, Obsidian, ON1 Photo RAW, and Postman, alongside fixes
+  for key rendering, navigation, and stability.\nBig thanks to @noraa-junker for the
+  Windows-key activation options and continued Shortcut Guide improvements!\nPRs:
+  #49661, #49639, and #48683\n\U0001F3A5 ZoomIt adds DemoMirror"
+ReleaseNotesUrl: https://github.com/microsoft/PowerToys/releases/tag/v0.101.2362.0
+ShortDescription: Microsoft PowerToys is a set of utilities for power users to tune
+  and streamline their Windows experience for greater productivity.
+Tags:
+- colorpicker
+- fancyzones
+- fileexplorer
+- imageresizer
+- keyboardmanager
+- power-toys
+- powerrename
+- powertoys
+- powertoys-run
+- windows-key-shortcut-guide
+UpgradeBehavior: install

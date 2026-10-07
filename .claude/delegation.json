@@ -1,0 +1,21 @@
+{
+  "plan": "docs/superpowers/plans/2026-10-07-wingetrs-fase1.md",
+  "brief": ".claude/tasks/task-{task}-brief.md",
+  "report": ".claude/tasks/task-{task}-report.md",
+  "ledger": ".claude/tasks/progress.md",
+  "diffBase": "$(cat .claude/tasks/task-{task}-base.txt)",
+  "greenCommands": [
+    "pwsh -File scripts/verify.ps1"
+  ],
+  "bannedCommands": [
+    "git checkout / git restore / git stash / git clean / git reset on files you did not create",
+    "git push (no remote; integration belongs to the orchestrator)",
+    "cargo update (versions pinned in Cargo.lock; the set was verified in a probe crate)",
+    "editing docs/superpowers/specs/*, docs/superpowers/plans/*, .claude/tasks/progress.md"
+  ],
+  "mutateCommand": "pwsh -File scripts/mutate.ps1 -Path <file> -Anchor '<exact text>' -Replacement '<text>' -TestCommand '<one test>'",
+  "auditCommand": "",
+  "projectRules": "- External data never panics: no unwrap/expect outside tests (clippy denies), typed errors with thiserror; the catalog changes without notice and one bad manifest must not kill the TUI.\n- Nothing prints to stdout outside src/main.rs and src/cli/; the TUI owns the terminal and a stray println corrupts the screen.\n- Windows-only code in *_win.rs behind #[cfg(windows)] mod; never cfg!(windows) inside shared logic, so correlation stays testable with synthetic data.\n- Unit/integration tests never touch the network or the real registry; live tests are #[ignore = \"live: ...\"].\n- No new dependency unless the brief lists it; the set was verified together in a probe crate.\n- User-facing text in Portuguese; code and comments in English.\n",
+  "designTasks": [10, 12, 15],
+  "docsTask": 15
+}

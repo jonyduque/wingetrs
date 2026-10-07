@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo run:*)",
+      "Bash(cargo tree:*)",
+      "Bash(rust-analyzer:*)",
+      "Bash(pwsh -File scripts/verify.ps1:*)",
+      "Bash(pwsh -File scripts/mutate.ps1:*)",
+      "Bash(pwsh -File scripts/brief.ps1:*)",
+      "Bash(pwsh -File scripts/check_briefs.ps1:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git cat-file:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(sqlite3:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(cargo update:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -File \"$CLAUDE_PROJECT_DIR/scripts/hooks/rustfmt-on-edit.ps1\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
