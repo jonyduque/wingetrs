@@ -1,0 +1,172 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use std::collections::HashMap;
+use wingetrs::installed::{
+    Hive, InstallSource, RawArpEntry, filter_arp, pack_guid, read_scoop, unpack_guid,
+};
+
+fn raw(name: &str) -> RawArpEntry {
+    RawArpEntry {
+        hive: Some(Hive::MachineX64),
+        key_name: "K".into(),
+        display_name: Some(name.into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn guid_packing_round_trip() {
+    assert_eq!(
+        pack_guid("{23170F69-40C1-2701-1900-000001000000}").unwrap(),
+        "96F071321C0410729100000010000000"
+    );
+    assert_eq!(
+        unpack_guid("96F071321C0410729100000010000000").unwrap(),
+        "{23170F69-40C1-2701-1900-000001000000}"
+    );
+    assert_eq!(
+        pack_guid("{23170f69-40c1-2701-1900-000001000000}").unwrap(),
+        "96F071321C0410729100000010000000"
+    );
+    assert!(pack_guid("not-a-guid").is_none());
+    assert!(unpack_guid("XYZ").is_none());
+}
+
+#[test]
+fn filters_system_children_updates_and_nameless() {
+    let none = HashMap::new();
+    assert!(
+        filter_arp(
+            RawArpEntry {
+                display_name: None,
+                ..raw("x")
+            },
+            &none
+        )
+        .is_none()
+    );
+    assert!(filter_arp(raw("   "), &none).is_none());
+    assert!(
+        filter_arp(
+            RawArpEntry {
+                system_component: Some(1),
+                ..raw("x")
+            },
+            &none
+        )
+        .is_none()
+    );
+    assert!(
+        filter_arp(
+            RawArpEntry {
+                parent_key_name: Some("P".into()),
+                ..raw("x")
+            },
+            &none
+        )
+        .is_none()
+    );
+    assert!(
+        filter_arp(
+            RawArpEntry {
+                release_type: Some("security update".into()),
+                ..raw("x")
+            },
+            &none
+        )
+        .is_none()
+    );
+    assert!(
+        filter_arp(
+            RawArpEntry {
+                system_component: Some(0),
+                ..raw("Keep")
+            },
+            &none
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn msi_entry_gets_product_and_upgrade_code() {
+    let mut up = HashMap::new();
+    up.insert(
+        "{23170F69-40C1-2701-1900-000001000000}".to_string(),
+        "{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}".to_string(),
+    );
+    let app = filter_arp(
+        RawArpEntry {
+            key_name: "{23170F69-40C1-2701-1900-000001000000}".into(),
+            windows_installer: Some(1),
+            display_version: Some("19.00.00.0".into()),
+            ..raw("7-Zip 19.00 (x64 edition)")
+        },
+        &up,
+    )
+    .unwrap();
+    assert_eq!(
+        app.product_code.as_deref(),
+        Some("{23170F69-40C1-2701-1900-000001000000}")
+    );
+    assert_eq!(
+        app.upgrade_code.as_deref(),
+        Some("{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}")
+    );
+    assert_eq!(app.source, InstallSource::Arp(Hive::MachineX64));
+    assert_eq!(app.version.as_deref(), Some("19.00.00.0"));
+}
+
+#[test]
+fn non_msi_key_name_is_still_a_product_code_candidate_and_blank_version_is_none() {
+    let app = filter_arp(
+        RawArpEntry {
+            key_name: "Notepad++".into(),
+            display_version: Some("  ".into()),
+            ..raw("Notepad++ (64-bit x64)")
+        },
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert_eq!(app.product_code.as_deref(), Some("Notepad++"));
+    assert_eq!(app.version, None);
+}
+
+#[test]
+fn scoop_apps_from_directory_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let cur = dir.path().join("apps/ripgrep/current");
+    std::fs::create_dir_all(&cur).unwrap();
+    std::fs::write(
+        cur.join("manifest.json"),
+        r#"{"version":"15.2.0","description":"rg"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cur.join("install.json"),
+        r#"{"bucket":"main","architecture":"64bit"}"#,
+    )
+    .unwrap();
+    let broken = dir.path().join("apps/broken/current");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("manifest.json"), "{oops").unwrap();
+    let apps = read_scoop(dir.path());
+    assert_eq!(apps.len(), 1);
+    assert_eq!(apps[0].key, "ripgrep");
+    assert_eq!(apps[0].scoop_bucket.as_deref(), Some("main"));
+    assert_eq!(apps[0].version.as_deref(), Some("15.2.0"));
+    assert_eq!(apps[0].source, InstallSource::Scoop);
+}
+
+#[test]
+#[ignore = "live: reads this machine's registry and MSIX packages"]
+fn live_scan_is_fast_and_nonempty() {
+    let scan = wingetrs::installed::scan_all();
+    eprintln!(
+        "apps={} errors={:?} elapsed_ms={}",
+        scan.apps.len(),
+        scan.errors,
+        scan.elapsed_ms
+    );
+    assert!(scan.apps.len() > 50);
+    assert!(scan.elapsed_ms < 500);
+}
