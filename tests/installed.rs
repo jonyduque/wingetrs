@@ -170,3 +170,64 @@ fn live_scan_is_fast_and_nonempty() {
     assert!(scan.apps.len() > 50);
     assert!(scan.elapsed_ms < 500);
 }
+
+fn utf16le(s: &str, nul: bool) -> Vec<u8> {
+    let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    if nul {
+        v.extend([0, 0]);
+    }
+    v
+}
+
+#[test]
+fn reg_string_reads_sz_and_expand_sz() {
+    use wingetrs::installed::arp::{REG_EXPAND_SZ, REG_SZ, reg_string};
+    assert_eq!(
+        reg_string(REG_SZ, &utf16le("Olá 7-Zip", true)).as_deref(),
+        Some("Olá 7-Zip")
+    );
+    assert_eq!(
+        reg_string(REG_EXPAND_SZ, &utf16le("%X%", true)).as_deref(),
+        Some("%X%")
+    );
+}
+
+#[test]
+fn reg_string_ignores_non_string_types() {
+    use wingetrs::installed::arp::{REG_DWORD, reg_string};
+    assert_eq!(reg_string(REG_DWORD, &[1, 0, 0, 0]), None);
+}
+
+#[test]
+fn reg_string_tolerates_odd_length_and_missing_terminator() {
+    use wingetrs::installed::arp::{REG_SZ, reg_string};
+    assert_eq!(
+        reg_string(REG_SZ, &utf16le("abc", false)).as_deref(),
+        Some("abc")
+    );
+    let mut odd = utf16le("abc", true);
+    odd.push(0x41);
+    assert_eq!(reg_string(REG_SZ, &odd).as_deref(), Some("abc"));
+    assert_eq!(reg_string(REG_SZ, &[0x41]).as_deref(), Some(""));
+    assert_eq!(reg_string(REG_SZ, &[]).as_deref(), Some(""));
+}
+
+#[test]
+fn reg_dword_needs_four_bytes() {
+    use wingetrs::installed::arp::{REG_DWORD, REG_SZ, reg_dword};
+    assert_eq!(reg_dword(REG_DWORD, &[1, 0, 0, 0]), Some(1));
+    assert_eq!(reg_dword(REG_DWORD, &[1, 0]), None);
+    assert_eq!(reg_dword(REG_SZ, &[1, 0, 0, 0]), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn reg_type_constants_match_winreg() {
+    use winreg::enums;
+    assert_eq!(wingetrs::installed::arp::REG_SZ, enums::REG_SZ as u32);
+    assert_eq!(
+        wingetrs::installed::arp::REG_EXPAND_SZ,
+        enums::REG_EXPAND_SZ as u32
+    );
+    assert_eq!(wingetrs::installed::arp::REG_DWORD, enums::REG_DWORD as u32);
+}

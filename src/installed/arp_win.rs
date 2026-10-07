@@ -1,45 +1,20 @@
 //! Windows registry reading for ARP entries and MSI upgrade codes.
+use super::arp::{reg_dword, reg_string};
 use super::{Hive, InstalledApp, RawArpEntry, filter_arp, unpack_guid};
 use std::collections::HashMap;
-use winreg::enums::{
-    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ,
-    REG_SZ,
-};
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::{RegKey, RegValue};
 
 const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
 const UNINSTALL_X86: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
 const UPGRADE_CODES: &str = r"SOFTWARE\Classes\Installer\UpgradeCodes";
 
-/// Only REG_SZ / REG_EXPAND_SZ count as strings; anything else is treated as absent.
 fn as_string(v: RegValue) -> Option<String> {
-    match v.vtype {
-        REG_SZ | REG_EXPAND_SZ => {
-            let units: Vec<u16> = v
-                .bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| u16::from_le_bytes(*c))
-                .collect();
-            Some(
-                String::from_utf16_lossy(&units)
-                    .trim_end_matches('\0')
-                    .to_string(),
-            )
-        }
-        _ => None,
-    }
+    reg_string(v.vtype as u32, &v.bytes)
 }
 
 fn as_dword(v: RegValue) -> Option<u32> {
-    if v.vtype == REG_DWORD && v.bytes.len() >= 4 {
-        Some(u32::from_le_bytes([
-            v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3],
-        ]))
-    } else {
-        None
-    }
+    reg_dword(v.vtype as u32, &v.bytes)
 }
 
 /// ProductCode -> UpgradeCode, both unpacked.
