@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState, correlate};
+use crate::tui::theme::GlyphSet;
 use crate::update::{Endpoints, Outcome, SourceReport, needs_refresh, run_update};
 use anyhow::Context;
 use std::str::FromStr;
@@ -313,6 +314,20 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     data.ensure()?;
     let _guard = init_logging(&data, cli.verbose);
     let cfg = Config::load(&data.config_path())?;
+    if cli.command.is_none() {
+        // The TUI builds its own runtime; glyphs: flag > config.toml > nerd.
+        let glyphs = match cli.glyphs {
+            Some(GlyphArg::Nerd) => GlyphSet::Nerd,
+            Some(GlyphArg::Unicode) => GlyphSet::Unicode,
+            Some(GlyphArg::Ascii) => GlyphSet::Ascii,
+            None => match cfg.glyphs.as_str() {
+                "unicode" => GlyphSet::Unicode,
+                "ascii" => GlyphSet::Ascii,
+                _ => GlyphSet::Nerd,
+            },
+        };
+        return crate::tui::run::run(glyphs);
+    }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(cli, data, cfg))
 }

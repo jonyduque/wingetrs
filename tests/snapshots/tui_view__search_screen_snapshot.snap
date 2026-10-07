@@ -1,0 +1,21 @@
+---
+source: tests/tui_view.rs
+assertion_line: 67
+expression: "render(&typed(\"powert\"), 100, 16)"
+---
+"╭  Pesquisar  Instalados  Atualizações ────────────────────────────────────────────────────────────╮"
+"│ / powert▏                                                                                        │"
+"╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
+"╭─────────────────────────────────────────────────────╮╭───────────────────────────────────────────╮"
+"│> W PowerToys                            0.101.2362.0││PowerToys                                  │"
+"│  S powertoys                                 0.101.2││# Microsoft.PowerToys                      │"
+"│  W EverythingPowerToys                        0.91.1││versão 0.101.2362.0                        │"
+"│                                                     ││Utilitários para power users               │"
+"│                                                     ││                                           │"
+"│                                                     ││| carregando…                              │"
+"│                                                     ││                                           │"
+"│                                                     ││                                           │"
+"│                                                     ││                                           │"
+"│                                                     ││                                           │"
+"╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯"
+" 3 de 3 · ↑↓ mover · Tab aba · Enter detalhes · Ctrl+R refresh · ? ajuda                            "

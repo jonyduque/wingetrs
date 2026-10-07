@@ -1,0 +1,286 @@
+//! TUI event loop: terminal setup, input stream, command execution.
+use crate::cache::{BlobStore, DataDir, HttpState, now_unix};
+use crate::catalog::Catalog;
+use crate::config::Config;
+use crate::core::SourceKind;
+use crate::http::Http;
+use crate::installed::correlate::correlate;
+use crate::installed::normalize::NameNormalizer;
+use crate::installed::scan_all;
+use crate::tui::app::{App, Cmd, Msg, update};
+use crate::tui::theme::{GlyphSet, Theme, detect_depth};
+use crate::tui::view::view;
+use crate::update::{Endpoints, needs_refresh, run_update};
+use anyhow::Context;
+use crossterm::event::{Event, EventStream};
+use futures_util::StreamExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+
+const TICK: Duration = Duration::from_millis(100);
+const DETAILS_DEBOUNCE: Duration = Duration::from_millis(150);
+
+struct Ctx {
+    data: DataDir,
+    cfg: Config,
+    http: Http,
+    tx: UnboundedSender<Msg>,
+    /// Generation of the newest detail request; older ones are dropped after the debounce.
+    details_gen: AtomicU64,
+}
+
+fn data_dir() -> anyhow::Result<DataDir> {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(base) if !base.is_empty() => {
+            Ok(DataDir::new(std::path::Path::new(&base).join("wingetrs")))
+        }
+        _ => Ok(DataDir::default_location()?),
+    }
+}
+
+/// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
+pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let data = data_dir()?;
+    data.ensure()?;
+    let cfg = Config::load(&data.config_path())?;
+    let http = Http::new()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let entries = Catalog::open(&data.catalog_path())
+        .and_then(|c| c.load_entries())
+        .unwrap_or_default();
+    let had_catalog = !entries.is_empty();
+    let mut app = App::new(entries, glyphs);
+    if let Some(age) = index_age(&data) {
+        app.index_age_secs = Some(age);
+    }
+    let theme = Theme::new(
+        cfg.theme != "light",
+        detect_depth(
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("NO_COLOR").ok().as_deref(),
+        ),
+    );
+    let (tx, rx) = unbounded_channel::<Msg>();
+    let ctx = Arc::new(Ctx {
+        data,
+        cfg,
+        http,
+        tx,
+        details_gen: AtomicU64::new(0),
+    });
+    let mut terminal = ratatui::init();
+    app.size = terminal
+        .size()
+        .map(|s| (s.width, s.height))
+        .unwrap_or(app.size);
+    let result = rt.block_on(event_loop(
+        &mut terminal,
+        app,
+        &theme,
+        ctx,
+        rx,
+        had_catalog,
+        start,
+    ));
+    ratatui::restore();
+    result
+}
+
+fn index_age(data: &DataDir) -> Option<i64> {
+    let catalog = Catalog::open(&data.catalog_path()).ok()?;
+    let newest = catalog.sources().ok()?.iter().map(|s| s.fetched_at).max()?;
+    Some((now_unix() - newest).max(0))
+}
+
+async fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    mut app: App,
+    theme: &Theme,
+    ctx: Arc<Ctx>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    had_catalog: bool,
+    start: Instant,
+) -> anyhow::Result<()> {
+    let mut events = EventStream::new();
+    let mut ticker = tokio::time::interval(TICK);
+
+    spawn_scan(&ctx);
+    if had_catalog {
+        if startup_needs_refresh(&ctx) {
+            spawn_refresh(&ctx, false);
+        }
+    } else {
+        spawn_refresh(&ctx, false);
+    }
+
+    terminal.draw(|f| view(&app, theme, f))?;
+    tracing::info!(
+        first_frame_ms = start.elapsed().as_millis() as u64,
+        "first frame"
+    );
+
+    loop {
+        let msg = tokio::select! {
+            ev = events.next() => match ev {
+                Some(Ok(Event::Key(k))) => Msg::Key(k),
+                Some(Ok(Event::Resize(w, h))) => Msg::Resize(w, h),
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(()),
+            },
+            Some(m) = rx.recv() => m,
+            _ = ticker.tick(), if app.refreshing || details_loading(&app) => Msg::Tick,
+        };
+        let is_tick = matches!(msg, Msg::Tick);
+        let refresh_msg = matches!(msg, Msg::RefreshFinished(_));
+        let cmds = update(&mut app, msg);
+        for cmd in cmds {
+            match cmd {
+                Cmd::Quit => return Ok(()),
+                Cmd::Refresh { force } => spawn_refresh(&ctx, force),
+                Cmd::ScanInstalled => spawn_scan(&ctx),
+                Cmd::LoadDetails { source, id } => {
+                    spawn_details(&ctx, source, id);
+                }
+            }
+        }
+        if refresh_msg {
+            // New data on disk: reload the catalog into the search index.
+            spawn_reload(&ctx);
+            if !app.offline
+                && let Some(age) = index_age(&ctx.data)
+            {
+                app.index_age_secs = Some(age);
+            }
+        }
+        // Ticks only matter while something animates.
+        if !is_tick || app.refreshing || details_loading(&app) {
+            terminal.draw(|f| view(&app, theme, f))?;
+        }
+    }
+}
+
+/// True while the selected package's details have been requested but have not arrived.
+fn details_loading(app: &App) -> bool {
+    app.selected_key()
+        .is_some_and(|(s, id)| !app.details.contains_key(&format!("{s}/{id}")))
+}
+
+fn startup_needs_refresh(ctx: &Ctx) -> bool {
+    let Ok(ep) = Endpoints::production(&ctx.cfg) else {
+        return false;
+    };
+    let urls: Vec<&str> = std::iter::once(ep.winget_index.as_str())
+        .chain(ep.scoop.iter().map(|(_, u)| u.as_str()))
+        .collect();
+    let state = HttpState::load(&ctx.data.http_state_path());
+    needs_refresh(&state, &urls, now_unix())
+}
+
+fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
+    let ctx = Arc::clone(ctx);
+    let _ = ctx.tx.send(Msg::RefreshStarted);
+    tokio::spawn(async move {
+        let reports = match Endpoints::production(&ctx.cfg) {
+            Ok(ep) => run_update(&ctx.data, &ep, &ctx.http, force)
+                .await
+                .unwrap_or_else(|e| {
+                    vec![crate::update::SourceReport {
+                        source: "update".into(),
+                        outcome: crate::update::Outcome::Failed(e.to_string()),
+                    }]
+                }),
+            Err(e) => vec![crate::update::SourceReport {
+                source: "update".into(),
+                outcome: crate::update::Outcome::Failed(e.to_string()),
+            }],
+        };
+        let _ = ctx.tx.send(Msg::RefreshFinished(reports));
+    });
+}
+
+fn spawn_reload(ctx: &Arc<Ctx>) {
+    let ctx = Arc::clone(ctx);
+    tokio::task::spawn_blocking(move || {
+        match Catalog::open(&ctx.data.catalog_path()).and_then(|c| c.load_entries()) {
+            Ok(entries) => {
+                let _ = ctx.tx.send(Msg::CatalogLoaded(entries));
+            }
+            Err(e) => tracing::warn!("falha ao recarregar catálogo: {e}"),
+        }
+    });
+}
+
+fn spawn_scan(ctx: &Arc<Ctx>) {
+    let ctx = Arc::clone(ctx);
+    tokio::task::spawn_blocking(move || {
+        let scan = scan_all();
+        for e in &scan.errors {
+            tracing::warn!("scan: {e}");
+        }
+        let rows = Catalog::open(&ctx.data.catalog_path())
+            .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new()));
+        match rows {
+            Ok(rows) => {
+                let _ = ctx.tx.send(Msg::InstalledLoaded(rows));
+            }
+            Err(e) => tracing::warn!("correlação falhou: {e}"),
+        }
+    });
+}
+
+/// Debounced detail load; dropped when a newer request supersedes it.
+fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
+    let ctx = Arc::clone(ctx);
+    let generation = ctx.details_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    tokio::spawn(async move {
+        tokio::time::sleep(DETAILS_DEBOUNCE).await;
+        if ctx.details_gen.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let key = format!("{source}/{id}");
+        let result = load_details(&ctx, &source, &id)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = ctx.tx.send(Msg::DetailsLoaded { key, result });
+    });
+}
+
+async fn load_details(
+    ctx: &Ctx,
+    source: &str,
+    id: &str,
+) -> anyhow::Result<crate::core::PackageDetails> {
+    let (data_path, source, id) = (ctx.data.catalog_path(), source.to_owned(), id.to_owned());
+    let pkg = tokio::task::spawn_blocking(move || Catalog::open(&data_path)?.get(&source, &id))
+        .await??
+        .context("pacote não encontrado no catálogo")?;
+    match pkg.entry.source {
+        SourceKind::Winget => {
+            let hash = pkg
+                .winget_hash
+                .as_deref()
+                .context("pacote winget sem hash de manifesto")?;
+            let blobs = BlobStore::new(ctx.data.blobs_dir());
+            Ok(crate::sources::winget::details::details(
+                &ctx.http,
+                &blobs,
+                crate::sources::winget::CDN_BASE,
+                &pkg.entry.id,
+                hash,
+                None,
+            )
+            .await?)
+        }
+        SourceKind::Scoop => {
+            let raw = pkg.raw.as_deref().context("pacote scoop sem manifesto")?;
+            Ok(crate::sources::scoop::manifest::details_from_raw(
+                &pkg.entry.id,
+                raw,
+            )?)
+        }
+    }
+}

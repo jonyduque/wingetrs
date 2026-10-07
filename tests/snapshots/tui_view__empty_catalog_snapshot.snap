@@ -1,0 +1,17 @@
+---
+source: tests/tui_view.rs
+assertion_line: 72
+expression: "render(&App::new(vec![], GlyphSet::Ascii), 80, 12)"
+---
+"╭  Pesquisar  Instalados  Atualizações ────────────────────────────────────────╮"
+"│ / digite para buscar…                                                        │"
+"╰──────────────────────────────────────────────────────────────────────────────╯"
+"╭──────────────────────────────────────────╮╭──────────────────────────────────╮"
+"│| baixando catálogo…                      ││nenhum pacote selecionado         │"
+"│                                          ││                                  │"
+"│                                          ││                                  │"
+"│                                          ││                                  │"
+"│                                          ││                                  │"
+"│                                          ││                                  │"
+"╰──────────────────────────────────────────╯╰──────────────────────────────────╯"
+" 0 de 0 · ↑↓ mover · Tab aba · Enter detalhes · Ctrl+R refresh · ? ajuda        "
