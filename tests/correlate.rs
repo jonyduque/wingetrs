@@ -213,7 +213,19 @@ fn ambiguous_is_never_resolved_silently() {
 }
 
 #[test]
-#[ignore = "live: correlates this machine's installs against the real catalog in %LOCALAPPDATA%"]
+fn msix_is_never_matched_by_name_and_publisher() {
+    let mut a = arp("x", "Mozilla Firefox (x64 en-US)", "Mozilla", "1.0.0.0");
+    a.source = InstallSource::Msix;
+    a.product_code = None;
+    a.family_name = Some("Mozilla.Firefox_none".into());
+    let rows = correlate(&[a], &catalog(), &NameNormalizer::new()).unwrap();
+    assert_eq!(rows[0].correlation, Correlation::Unmatched);
+    assert_eq!(rows[0].state, UpdateState::Unknown);
+}
+
+// Run with: cargo test --release --test correlate -- --ignored live_list
+#[test]
+#[ignore = "live: correlates this machine's installs against the real catalog in %LOCALAPPDATA%; budget holds only with --release"]
 fn live_list_runs_under_budget() {
     let t = std::time::Instant::now();
     let data = wingetrs::cache::DataDir::default_location().unwrap();

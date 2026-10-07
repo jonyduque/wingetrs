@@ -113,6 +113,10 @@ fn by_name_and_publisher(
     catalog: &Catalog,
     normalizer: &NameNormalizer,
 ) -> Result<Option<Hit>, CatalogError> {
+    // winget correlates MSIX only by family name; sparse packages share names with ARP installs.
+    if !matches!(app.source, InstallSource::Arp(_)) {
+        return Ok(None);
+    }
     let keys = normalizer.index_keys(&app.name, app.publisher.as_deref().unwrap_or(""));
     if keys.name.is_empty() || keys.publisher.is_empty() {
         return Ok(None);
