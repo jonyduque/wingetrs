@@ -7,6 +7,7 @@ use crate::catalog::search::SearchIndex;
 use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
+use crate::installed::correlate::{Correlation, ListRow, UpdateState, correlate};
 use crate::update::{Endpoints, Outcome, SourceReport, needs_refresh, run_update};
 use anyhow::Context;
 use std::str::FromStr;
@@ -262,7 +263,48 @@ async fn run_async(cli: Cli, data: DataDir, cfg: Config) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::List { .. } => anyhow::bail!("comando ainda não implementado: list"),
+        Command::List {
+            upgradable,
+            source,
+            json,
+        } => {
+            let catalog = ensure_catalog(&data, &cfg, &http).await?;
+            let scan = crate::installed::scan_all();
+            for e in &scan.errors {
+                tracing::warn!("coleta de instalados: {e}");
+            }
+            let t = std::time::Instant::now();
+            let normalizer = crate::installed::normalize::NameNormalizer::new();
+            let mut rows = correlate(&scan.apps, &catalog, &normalizer)?;
+            tracing::info!(
+                scan_ms = scan.elapsed_ms,
+                correlate_ms = t.elapsed().as_millis(),
+                "list"
+            );
+            if let Some(kind) = source {
+                rows.retain(|r| row_kind(r) == Some(kind));
+            }
+            if upgradable {
+                rows.retain(|r| matches!(r.state, UpdateState::Available { .. }));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else {
+                print!("{}", output::list_text(&rows, upgradable));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Source kind a row was correlated against; `None` when unmatched.
+fn row_kind(r: &ListRow) -> Option<SourceKind> {
+    match &r.correlation {
+        Correlation::Matched { source, .. } if source.starts_with("scoop:") => {
+            Some(SourceKind::Scoop)
+        }
+        Correlation::Matched { .. } | Correlation::Ambiguous { .. } => Some(SourceKind::Winget),
+        Correlation::Unmatched => None,
     }
 }
 

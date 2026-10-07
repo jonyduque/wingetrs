@@ -4,6 +4,7 @@ mod appx_win;
 pub mod arp;
 #[cfg(windows)]
 mod arp_win;
+pub mod correlate;
 pub mod guid;
 pub mod normalize;
 pub mod scoop;

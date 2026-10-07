@@ -1,5 +1,6 @@
 //! Plain-text rendering for CLI commands (no colors).
 use crate::core::{PackageDetails, PackageEntry};
+use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 
 fn pad(s: &str, width: usize) -> String {
@@ -87,4 +88,87 @@ pub fn report_line(r: &SourceReport) -> String {
         }
         Outcome::Failed(m) => format!("{}: falhou: {m}", r.source),
     }
+}
+
+fn aligned(header: [&str; 5], cells: &[[String; 5]]) -> String {
+    let mut widths = header.map(|h| h.chars().count());
+    for r in cells {
+        for (w, c) in widths.iter_mut().zip(r) {
+            *w = (*w).max(c.chars().count());
+        }
+    }
+    let line = |r: &[&str]| {
+        let parts: Vec<String> = r.iter().zip(widths).map(|(c, w)| pad(c, w)).collect();
+        parts.join("  ").trim_end().to_string()
+    };
+    let mut out = line(&header);
+    out.push('\n');
+    for r in cells {
+        let refs: Vec<&str> = r.iter().map(String::as_str).collect();
+        out.push_str(&line(&refs));
+        out.push('\n');
+    }
+    out
+}
+
+/// `Nome  Id  Instalada  Disponível  Fonte` for correlated rows, followed by the
+/// ambiguous and unmatched sections unless `upgradable_only`.
+pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
+    let mut cells = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut unmatched = Vec::new();
+    for r in rows {
+        let installed = r.installed_version.clone().unwrap_or_default();
+        match &r.correlation {
+            Correlation::Matched {
+                source, package_id, ..
+            } => {
+                let available = match &r.state {
+                    UpdateState::Available { latest } => latest.clone(),
+                    _ => String::new(),
+                };
+                if upgradable_only && available.is_empty() {
+                    continue;
+                }
+                cells.push([
+                    r.name.clone(),
+                    package_id.clone(),
+                    installed,
+                    available,
+                    source.clone(),
+                ]);
+            }
+            Correlation::Ambiguous { candidates, .. } => {
+                ambiguous.push(format!(
+                    "{} ({installed}): {}",
+                    r.name,
+                    candidates.join(", ")
+                ));
+            }
+            Correlation::Unmatched => unmatched.push(format!("{} ({installed})", r.name)),
+        }
+    }
+    let mut out = aligned(["Nome", "Id", "Instalada", "Disponível", "Fonte"], &cells);
+    if !upgradable_only {
+        for (title, items) in [
+            ("Ambíguos", &ambiguous),
+            ("Não correlacionados", &unmatched),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n{title} ({}):\n", items.len()));
+            for i in items {
+                out.push_str(&format!("  {i}\n"));
+            }
+        }
+        out.push_str(&format!(
+            "\n{} instalados: {} correlacionados, {} ambíguos, {} não correlacionados\n",
+            rows.len(),
+            cells.len(),
+            ambiguous.len(),
+            unmatched.len()
+        ));
+    }
+    out
 }
