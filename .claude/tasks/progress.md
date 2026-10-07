@@ -7,3 +7,4 @@ Plano: `docs/superpowers/plans/2026-10-07-wingetrs-fase1.md`. Uma linha por tare
 | 1 | Scaffold do crate, tipos centrais e CLI | f4166ab..9149cb8 | DONE | sonnet/sonnet | revisor achou teste de flag oculta que não falhava (defeito do plano), corrigido em 9149cb8; mutate.ps1 corrigido em e528230 |
 | 2 | Comparação de versões estilo winget | 068bd1d..9eb0c18 | DONE | sonnet/sonnet | revisor: comparação case-insensitive de sufixo sem teste, pinada em 9eb0c18; plano apontou teste errado p/ mutação do trim (parse_corners é o que pega) |
 | 3 | Decodificador MSZIP e versionData | ec75b34..e52ef17 | DONE | sonnet/sonnet | APPROVE sem Critical/Important; revisor confirmou janela de 32 KiB do total e mutação própria pega |
+| 4 | Manifesto merged do winget | e52ef17..61055c5 | DONE | sonnet/sonnet | revisor: herança de Scope e fallback de homepage sem teste, pinados em 61055c5; achado de CRLF recusado (fixture tem 180 CR, sha confere) |

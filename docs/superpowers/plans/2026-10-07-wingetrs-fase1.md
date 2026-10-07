@@ -1408,7 +1408,8 @@ async fn sends_validators_and_maps_304() {
     let s = MockServer::start().await;
     Mock::given(method("GET")).and(path("/x"))
         .and(header("If-None-Match", "\"0x1\""))
-        .and(header("If-Modified-Since", "Wed, 07 Oct 2026 03:02:43 GMT"))
+        // wiremock 0.6 splits header values on commas: match the two pieces exactly.
+        .and(headers("If-Modified-Since", vec!["Wed", "07 Oct 2026 03:02:43 GMT"]))
         .respond_with(ResponseTemplate::new(304))
         .expect(1)
         .mount(&s).await;
