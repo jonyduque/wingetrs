@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+tests/fixtures/** -text
+*.db binary
+*.msix binary
+*.mszyml binary
+*.tar.gz binary
