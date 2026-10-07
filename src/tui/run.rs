@@ -10,7 +10,7 @@ use crate::installed::scan_all;
 use crate::tui::app::{App, Cmd, Msg, update};
 use crate::tui::theme::{GlyphSet, Theme, detect_depth};
 use crate::tui::view::view;
-use crate::update::{Endpoints, needs_refresh, run_update};
+use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update};
 use anyhow::Context;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
@@ -191,19 +191,22 @@ fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
     let ctx = Arc::clone(ctx);
     let _ = ctx.tx.send(Msg::RefreshStarted);
     tokio::spawn(async move {
-        let reports = match Endpoints::production(&ctx.cfg) {
-            Ok(ep) => run_update(&ctx.data, &ep, &ctx.http, force)
-                .await
-                .unwrap_or_else(|e| {
-                    vec![crate::update::SourceReport {
-                        source: "update".into(),
-                        outcome: crate::update::Outcome::Failed(e.to_string()),
-                    }]
-                }),
-            Err(e) => vec![crate::update::SourceReport {
+        let failed = |m: String| {
+            vec![crate::update::SourceReport {
                 source: "update".into(),
-                outcome: crate::update::Outcome::Failed(e.to_string()),
-            }],
+                outcome: crate::update::Outcome::Failed(m),
+            }]
+        };
+        let reports = match Endpoints::production(&ctx.cfg) {
+            Ok(ep) => match run_update(&ctx.data, &ep, &ctx.http, force, LockWait::NoWait).await {
+                Ok(r) => r,
+                Err(UpdateError::Busy) => {
+                    let _ = ctx.tx.send(Msg::RefreshBusy);
+                    return;
+                }
+                Err(e) => failed(e.to_string()),
+            },
+            Err(e) => failed(e.to_string()),
         };
         let _ = ctx.tx.send(Msg::RefreshFinished(reports));
     });

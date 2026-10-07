@@ -9,7 +9,7 @@ use crate::core::SourceKind;
 use crate::http::Http;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState, correlate};
 use crate::tui::theme::GlyphSet;
-use crate::update::{Endpoints, Outcome, SourceReport, needs_refresh, run_update};
+use crate::update::{Endpoints, LockWait, Outcome, SourceReport, needs_refresh, run_update};
 use anyhow::Context;
 use std::str::FromStr;
 
@@ -147,7 +147,7 @@ async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Re
     let catalog = Catalog::open(&data.catalog_path())?;
     if catalog.is_empty()? {
         drop(catalog);
-        let reports = run_update(data, &ep, http, true).await?;
+        let reports = run_update(data, &ep, http, true, LockWait::from_env()).await?;
         let catalog = Catalog::open(&data.catalog_path())?;
         if catalog.is_empty()? {
             for r in &reports {
@@ -180,7 +180,7 @@ async fn run_async(cli: Cli, data: DataDir, cfg: Config) -> anyhow::Result<()> {
     match cmd {
         Command::Update { force, background } => {
             let ep = Endpoints::production(&cfg)?;
-            let reports = run_update(&data, &ep, &http, force).await?;
+            let reports = run_update(&data, &ep, &http, force, LockWait::from_env()).await?;
             if !background {
                 print_reports(&reports);
             }

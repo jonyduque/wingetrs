@@ -243,3 +243,14 @@ fn updates_tab_counts_only_available() {
     assert_eq!(a.tab, Tab::Updates);
     assert_eq!(a.visible_len(), 2);
 }
+
+#[test]
+fn refresh_busy_is_not_offline_and_says_in_progress() {
+    let mut a = app();
+    update(&mut a, Msg::RefreshStarted);
+    update(&mut a, Msg::RefreshBusy);
+    assert!(!a.refreshing);
+    assert!(!a.offline);
+    let status = a.status.unwrap();
+    assert!(status.contains("atualização em andamento"), "{status}");
+}

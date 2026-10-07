@@ -59,6 +59,8 @@ pub struct SourceReport {
 pub enum UpdateError {
     #[error("outra atualização em andamento")]
     Busy,
+    #[error("falha interna: {0}")]
+    Internal(String),
     #[error(transparent)]
     Cache(#[from] crate::cache::CacheError),
     #[error(transparent)]
@@ -113,13 +115,29 @@ async fn fetch_one(
     }
 }
 
-fn lock_timeout() -> Duration {
-    // Test-only knob: lets tests avoid waiting the full 30 s for a held lock.
-    let ms = std::env::var("WINGETRS_LOCK_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_LOCK_TIMEOUT_MS);
-    Duration::from_millis(ms)
+/// How long `run_update` waits for the update lock held by another process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWait {
+    Block(Duration),
+    NoWait,
+}
+
+impl LockWait {
+    /// 30 s, or `WINGETRS_LOCK_TIMEOUT_MS` (test-only knob to avoid the full wait).
+    pub fn from_env() -> LockWait {
+        let ms = std::env::var("WINGETRS_LOCK_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_LOCK_TIMEOUT_MS);
+        LockWait::Block(Duration::from_millis(ms))
+    }
+
+    fn timeout(self) -> Duration {
+        match self {
+            LockWait::Block(d) => d,
+            LockWait::NoWait => Duration::ZERO,
+        }
+    }
 }
 
 pub async fn run_update(
@@ -127,13 +145,14 @@ pub async fn run_update(
     endpoints: &Endpoints,
     http: &Http,
     force: bool,
+    wait: LockWait,
 ) -> Result<Vec<SourceReport>, UpdateError> {
     let lock_path = data.lock_path();
-    let timeout = lock_timeout();
+    let timeout = wait.timeout();
     let lock =
         tokio::task::spawn_blocking(move || UpdateLock::acquire_timeout(&lock_path, timeout))
             .await
-            .map_err(|_| UpdateError::Busy)??;
+            .map_err(|e| UpdateError::Internal(e.to_string()))??;
     let Some(_lock) = lock else {
         return Err(UpdateError::Busy);
     };

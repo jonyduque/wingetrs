@@ -2,7 +2,7 @@
 use wingetrs::cache::{DataDir, HttpEntry, HttpState};
 use wingetrs::catalog::Catalog;
 use wingetrs::http::Http;
-use wingetrs::update::{Endpoints, Outcome, needs_refresh, run_update};
+use wingetrs::update::{Endpoints, LockWait, Outcome, UpdateError, needs_refresh, run_update};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -51,9 +51,15 @@ async fn update_imports_sources_and_isolates_failure() {
     let dir = tempfile::tempdir().unwrap();
     let data = DataDir::new(dir.path());
     data.ensure().unwrap();
-    let rep = run_update(&data, &ep, &Http::new().unwrap(), true)
-        .await
-        .unwrap();
+    let rep = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
     let get = |s: &str| rep.iter().find(|r| r.source == s).unwrap().outcome.clone();
     assert_eq!(
         get("winget"),
@@ -93,13 +99,25 @@ async fn second_update_without_force_is_fresh_and_offline_safe() {
     let dir = tempfile::tempdir().unwrap();
     let data = DataDir::new(dir.path());
     data.ensure().unwrap();
-    run_update(&data, &ep, &Http::new().unwrap(), true)
-        .await
-        .unwrap();
+    run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
     drop(s); // server gone: any network call would fail
-    let rep = run_update(&data, &ep, &Http::new().unwrap(), false)
-        .await
-        .unwrap();
+    let rep = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        false,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         rep.iter().find(|r| r.source == "winget").unwrap().outcome,
         Outcome::Fresh
@@ -126,10 +144,37 @@ async fn concurrent_update_is_busy() {
     // run_update waits up to 30 s; the test must not take that long, so use the
     // test-only knob described in the brief: WINGETRS_LOCK_TIMEOUT_MS
     unsafe { std::env::set_var("WINGETRS_LOCK_TIMEOUT_MS", "200") };
-    let e = run_update(&data, &ep, &Http::new().unwrap(), true)
+    let e = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.to_string(), "outra atualização em andamento");
+}
+
+#[tokio::test]
+async fn no_wait_returns_busy_immediately() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let _held = wingetrs::cache::UpdateLock::try_acquire(&data.lock_path())
+        .unwrap()
+        .unwrap();
+    let t = std::time::Instant::now();
+    let e = run_update(&data, &ep, &Http::new().unwrap(), true, LockWait::NoWait)
         .await
         .unwrap_err();
-    assert_eq!(e.to_string(), "outra atualização em andamento");
+    assert!(matches!(e, UpdateError::Busy), "{e:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(100),
+        "{:?}",
+        t.elapsed()
+    );
 }
 
 #[test]

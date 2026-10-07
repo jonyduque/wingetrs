@@ -40,6 +40,8 @@ pub enum Msg {
     },
     RefreshStarted,
     RefreshFinished(Vec<SourceReport>),
+    /// Another process holds the update lock; not a failure and not offline.
+    RefreshBusy,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +247,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::RefreshStarted => {
             app.refreshing = true;
+            Vec::new()
+        }
+        Msg::RefreshBusy => {
+            app.refreshing = false;
+            app.status = Some("Aguardando: outra atualização em andamento".to_string());
             Vec::new()
         }
         Msg::RefreshFinished(reports) => {
