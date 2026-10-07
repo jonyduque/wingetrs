@@ -191,10 +191,13 @@ fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
     let ctx = Arc::clone(ctx);
     let _ = ctx.tx.send(Msg::RefreshStarted);
     tokio::spawn(async move {
-        let failed = |m: String| {
+        let failed = |message: String| {
             vec![crate::update::SourceReport {
                 source: "update".into(),
-                outcome: crate::update::Outcome::Failed(m),
+                outcome: crate::update::Outcome::Failed {
+                    message,
+                    offline: false,
+                },
             }]
         };
         let reports = match Endpoints::production(&ctx.cfg) {

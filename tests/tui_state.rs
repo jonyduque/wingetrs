@@ -254,3 +254,23 @@ fn refresh_busy_is_not_offline_and_says_in_progress() {
     let status = a.status.unwrap();
     assert!(status.contains("atualização em andamento"), "{status}");
 }
+
+fn failed_report(offline: bool) -> Vec<wingetrs::update::SourceReport> {
+    vec![wingetrs::update::SourceReport {
+        source: "winget".into(),
+        outcome: wingetrs::update::Outcome::Failed {
+            message: "x".into(),
+            offline,
+        },
+    }]
+}
+
+#[test]
+fn only_network_failures_mark_offline() {
+    let mut a = app();
+    update(&mut a, Msg::RefreshFinished(failed_report(false)));
+    assert!(!a.offline);
+    assert!(a.status.is_some());
+    update(&mut a, Msg::RefreshFinished(failed_report(true)));
+    assert!(a.offline);
+}

@@ -27,6 +27,13 @@ pub enum WingetError {
     ManifestIntegrity,
 }
 
+impl WingetError {
+    /// True when the failure is a network problem (not integrity/format).
+    pub fn is_offline(&self) -> bool {
+        matches!(self, WingetError::Http(e) if e.is_offline())
+    }
+}
+
 // Interface fixed by the brief; the value is short-lived, boxing buys nothing.
 #[allow(clippy::large_enum_variant)]
 pub enum WingetFetch {

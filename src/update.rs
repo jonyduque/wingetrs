@@ -45,8 +45,15 @@ impl Endpoints {
 pub enum Outcome {
     Fresh,
     Unchanged,
-    Updated { packages: usize, skipped: usize },
-    Failed(String),
+    Updated {
+        packages: usize,
+        skipped: usize,
+    },
+    /// `offline` is true only for network-level errors (not HTTP status, integrity, format).
+    Failed {
+        message: String,
+        offline: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,18 +103,18 @@ async fn fetch_one(
     http: &Http,
     data: &DataDir,
     prev: Option<&HttpEntry>,
-) -> Result<Fetched, String> {
+) -> Result<Fetched, (String, bool)> {
     match job.kind {
         SourceKind::Scoop => match fetch_bucket(http, job.url, prev)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| (e.to_string(), e.is_offline()))?
         {
             ScoopFetch::NotModified => Ok(Fetched::NotModified),
             ScoopFetch::Modified { import, entry } => Ok(Fetched::Scoop(import, entry)),
         },
         SourceKind::Winget => match fetch_index(http, data, job.url, prev)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| (e.to_string(), e.is_offline()))?
         {
             WingetFetch::NotModified => Ok(Fetched::NotModified),
             WingetFetch::Modified { import, entry } => Ok(Fetched::Winget(import, entry)),
@@ -189,7 +196,7 @@ pub async fn run_update(
     for (job, res) in jobs.iter().zip(results) {
         let outcome = match res {
             None => Outcome::Fresh,
-            Some(Err(msg)) => Outcome::Failed(msg),
+            Some(Err((message, offline))) => Outcome::Failed { message, offline },
             Some(Ok(Fetched::NotModified)) => {
                 let mut e = state.get(job.url).cloned().unwrap_or_default();
                 e.checked_at = now;
@@ -251,6 +258,9 @@ fn apply(
                 skipped,
             }
         }
-        Err(e) => Outcome::Failed(e.to_string()),
+        Err(e) => Outcome::Failed {
+            message: e.to_string(),
+            offline: false,
+        },
     }
 }

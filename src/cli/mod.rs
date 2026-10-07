@@ -151,7 +151,7 @@ async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Re
         let catalog = Catalog::open(&data.catalog_path())?;
         if catalog.is_empty()? {
             for r in &reports {
-                if let Outcome::Failed(m) = &r.outcome {
+                if let Outcome::Failed { message: m, .. } = &r.outcome {
                     tracing::warn!("{}: {m}", r.source);
                 }
             }

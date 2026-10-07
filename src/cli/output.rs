@@ -86,7 +86,7 @@ pub fn report_line(r: &SourceReport) -> String {
         Outcome::Updated { packages, skipped } => {
             format!("{}: {packages} pacotes ({skipped} ignorados)", r.source)
         }
-        Outcome::Failed(m) => format!("{}: falhou: {m}", r.source),
+        Outcome::Failed { message: m, .. } => format!("{}: falhou: {m}", r.source),
     }
 }
 

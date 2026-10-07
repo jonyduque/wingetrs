@@ -75,7 +75,10 @@ async fn update_imports_sources_and_isolates_failure() {
             skipped: 1
         }
     );
-    assert!(matches!(get("scoop:extras"), Outcome::Failed(_)));
+    assert!(matches!(
+        get("scoop:extras"),
+        Outcome::Failed { offline: false, .. }
+    ));
     let cat = Catalog::open(&data.catalog_path()).unwrap();
     assert_eq!(cat.load_entries().unwrap().len(), 28);
     let meta = cat.sources().unwrap();
@@ -197,4 +200,46 @@ fn needs_refresh_rule() {
         },
     );
     assert!(needs_refresh(&st, &["u"], 10_000));
+}
+
+async fn single_scoop_outcome(url: String) -> Outcome {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let ep = Endpoints {
+        // Winget index is fresh-skipped only when not forced; point it at the same bad url.
+        winget_index: url.clone(),
+        scoop: vec![("main".into(), url)],
+    };
+    let rep = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    rep.into_iter()
+        .find(|r| r.source == "scoop:main")
+        .unwrap()
+        .outcome
+}
+
+#[tokio::test]
+async fn corrupt_tarball_failure_is_not_offline() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/main.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"not a tarball".to_vec()))
+        .mount(&s)
+        .await;
+    let o = single_scoop_outcome(format!("{}/main.tgz", s.uri())).await;
+    assert!(matches!(o, Outcome::Failed { offline: false, .. }), "{o:?}");
+}
+
+#[tokio::test]
+async fn unreachable_endpoint_failure_is_offline() {
+    let o = single_scoop_outcome("http://127.0.0.1:9/main.tgz".into()).await;
+    assert!(matches!(o, Outcome::Failed { offline: true, .. }), "{o:?}");
 }

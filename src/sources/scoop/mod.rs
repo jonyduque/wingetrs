@@ -14,6 +14,13 @@ pub enum ScoopError {
     Http(#[from] crate::http::HttpError),
 }
 
+impl ScoopError {
+    /// True when the failure is a network problem (not integrity/format).
+    pub fn is_offline(&self) -> bool {
+        matches!(self, ScoopError::Http(e) if e.is_offline())
+    }
+}
+
 /// Catalog source name for a bucket: `scoop:<bucket>`.
 pub fn source_name(bucket: &str) -> String {
     format!("scoop:{bucket}")

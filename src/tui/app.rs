@@ -256,14 +256,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::RefreshFinished(reports) => {
             app.refreshing = false;
-            let failed: Vec<String> = reports
-                .iter()
-                .filter_map(|r| match &r.outcome {
-                    Outcome::Failed(e) => Some(format!("{}: {e}", r.source)),
-                    _ => None,
-                })
-                .collect();
-            app.offline = !failed.is_empty();
+            let mut failed: Vec<String> = Vec::new();
+            let mut any_offline = false;
+            for r in &reports {
+                if let Outcome::Failed { message, offline } = &r.outcome {
+                    failed.push(format!("{}: {message}", r.source));
+                    any_offline |= *offline;
+                }
+            }
+            app.offline = any_offline;
             if failed.is_empty() {
                 app.index_age_secs = Some(0);
                 app.status = None;
