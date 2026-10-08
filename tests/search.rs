@@ -117,3 +117,40 @@ fn non_ascii_name_indices_are_char_positions() {
     let hits = i.search("安全", None, 10);
     assert_eq!(hits[0].name_indices, [3, 4]);
 }
+
+#[test]
+fn parallel_search_equals_sequential() {
+    let names = [
+        "PowerToys",
+        "Power Shell",
+        "powertoys-cli",
+        "360安全卫士",
+        "Ünïcode Tööl",
+        "Notepad++",
+    ];
+    let entries: Vec<PackageEntry> = (0..6001)
+        .map(|i| {
+            let n = format!("{} {i}", names[i % names.len()]);
+            let mut p = e(
+                if i % 3 == 0 {
+                    SourceKind::Scoop
+                } else {
+                    SourceKind::Winget
+                },
+                &format!("Pub{}.{}", i % 17, n.replace(' ', "")),
+                &n,
+                (i % 5 == 0).then_some("powertoys"),
+            );
+            p.tags = vec!["tool".into(), format!("t{}", i % 7)];
+            p
+        })
+        .collect();
+    let mut index = SearchIndex::new(entries);
+    for q in ["powertoys", "pwr", "安全", "tööl", "", "tool"] {
+        for filter in [None, Some(SourceKind::Scoop)] {
+            let seq = index.search_with_threads(q, filter, 100_000, 1);
+            let par = index.search_with_threads(q, filter, 100_000, 4);
+            assert_eq!(seq, par, "query {q:?} filter {filter:?}");
+        }
+    }
+}

@@ -116,13 +116,24 @@ impl SearchIndex {
         filter: Option<SourceKind>,
         limit: usize,
     ) -> Vec<SearchHit> {
-        let query = query.trim();
-        let lower_query = query.to_lowercase();
-        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .clamp(1, 8);
-        let mut hits: Vec<SearchHit> = if self.entries.len() < PARALLEL_MIN || workers == 1 {
+        self.search_with_threads(query, filter, limit, workers)
+    }
+
+    /// Same as `search` with an explicit worker count (1 = sequential); exposed for equivalence tests.
+    pub fn search_with_threads(
+        &mut self,
+        query: &str,
+        filter: Option<SourceKind>,
+        limit: usize,
+        workers: usize,
+    ) -> Vec<SearchHit> {
+        let query = query.trim();
+        let lower_query = query.to_lowercase();
+        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+        let mut hits: Vec<SearchHit> = if self.entries.len() < PARALLEL_MIN || workers <= 1 {
             scan(
                 &self.entries,
                 0,
@@ -150,7 +161,7 @@ impl SearchIndex {
                     .collect();
                 handles
                     .into_iter()
-                    .flat_map(|h| h.join().unwrap_or_default())
+                    .flat_map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
                     .collect()
             })
         };

@@ -137,8 +137,6 @@ pub enum CatalogError {
     Sqlite(#[from] rusqlite::Error),
     #[error("mapeamento aponta para pacote inexistente: {0}")]
     DanglingMap(String),
-    #[error("falha interna ao ler o catálogo")]
-    LoaderPanicked,
 }
 
 pub struct Catalog {
@@ -150,15 +148,8 @@ pub struct Catalog {
 const PKG_COLS: &str = "source, kind, id, name, moniker, version, publisher, description, tags, commands, \
                         arp_min_version, arp_max_version, winget_hash, raw";
 
-fn split_words(s: &str) -> Vec<String> {
-    let mut out = Vec::with_capacity(s.split_whitespace().count());
-    out.extend(s.split_whitespace().map(str::to_owned));
-    out
-}
-
-/// Borrowed TEXT column (no temporary `String`); NULL or non-text reads as empty.
-fn text_ref<'a>(r: &'a rusqlite::Row<'_>, i: usize) -> rusqlite::Result<&'a str> {
-    Ok(r.get_ref(i)?.as_str_or_null()?.unwrap_or(""))
+fn split_words(s: String) -> Vec<String> {
+    s.split_whitespace().map(str::to_owned).collect()
 }
 
 fn kind_from_db(s: &str) -> SourceKind {
@@ -180,8 +171,8 @@ fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PackageEntry> {
         version: r.get(5)?,
         publisher: r.get(6)?,
         description: r.get(7)?,
-        tags: split_words(text_ref(r, 8)?),
-        commands: split_words(text_ref(r, 9)?),
+        tags: split_words(r.get(8)?),
+        commands: split_words(r.get(9)?),
     })
 }
 
@@ -315,6 +306,22 @@ impl Catalog {
     /// Loads every package as a search entry (no `raw`/`winget_hash`), in rowid order.
     /// On-disk catalogs are decoded by several read connections, one rowid range each.
     pub fn load_entries(&self) -> Result<Vec<PackageEntry>, CatalogError> {
+        // A writer committing mid-load would give workers different snapshots: retry once.
+        let version = self.data_version()?;
+        let out = self.load_entries_once()?;
+        if self.data_version()? == version {
+            return Ok(out);
+        }
+        self.load_entries_once()
+    }
+
+    fn data_version(&self) -> Result<i64, CatalogError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
+
+    fn load_entries_once(&self) -> Result<Vec<PackageEntry>, CatalogError> {
         let (lo, hi): (Option<i64>, Option<i64>) =
             self.conn
                 .query_row("SELECT min(rowid), max(rowid) FROM packages", [], |r| {
@@ -352,10 +359,7 @@ impl Catalog {
                 .collect();
             handles
                 .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(CatalogError::LoaderPanicked))
-                })
+                .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
                 .collect()
         });
         let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;

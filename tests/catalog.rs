@@ -282,3 +282,67 @@ fn load_entries_does_not_need_raw_column() {
         Some(1_000_000)
     );
 }
+
+#[test]
+fn parallel_load_matches_sequential_order_on_sparse_rowids() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let first: Vec<_> = (0..3000).map(|i| pkg(&format!("a{i}"), "A", "1")).collect();
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "e",
+        1,
+        &first,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    // Second replace deletes the first rows and inserts at higher, non-contiguous rowids.
+    let second: Vec<_> = (0..3000).map(|i| pkg(&format!("b{i}"), "B", "1")).collect();
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "e",
+        2,
+        &second,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    c.replace_source(
+        "scoop:extras",
+        SourceKind::Scoop,
+        "e",
+        2,
+        &first[..500],
+        &WingetMaps::default(),
+    )
+    .unwrap();
+
+    let loaded: Vec<String> = c
+        .load_entries()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    let other = rusqlite::Connection::open(&path).unwrap();
+    let mut st = other
+        .prepare("SELECT id FROM packages ORDER BY rowid")
+        .unwrap();
+    let expected: Vec<String> = st
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(expected.len(), 3500);
+    assert_eq!(loaded, expected);
+    let unique: std::collections::HashSet<_> = loaded.iter().collect();
+    assert_eq!(unique.len(), 3500);
+}
+
+#[test]
+fn load_entries_on_empty_disk_catalog_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = Catalog::open(&dir.path().join("catalog.db")).unwrap();
+    assert!(c.load_entries().unwrap().is_empty());
+}
