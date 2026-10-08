@@ -204,6 +204,9 @@ async fn run_async(cli: Cli, data: DataDir, cfg: Config) -> anyhow::Result<()> {
             } else {
                 print!("{}", output::search_table(&rows));
             }
+            // The process exits next: skip freeing ~20k entries and closing the db (about 20 ms).
+            std::mem::forget(index);
+            std::mem::forget(catalog);
             Ok(())
         }
         Command::Show {

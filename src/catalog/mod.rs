@@ -137,38 +137,57 @@ pub enum CatalogError {
     Sqlite(#[from] rusqlite::Error),
     #[error("mapeamento aponta para pacote inexistente: {0}")]
     DanglingMap(String),
+    #[error("falha interna ao ler o catálogo")]
+    LoaderPanicked,
 }
 
 pub struct Catalog {
     conn: Connection,
+    /// File path when opened from disk; lets `load_entries` read with several connections.
+    path: Option<std::path::PathBuf>,
 }
 
 const PKG_COLS: &str = "source, kind, id, name, moniker, version, publisher, description, tags, commands, \
                         arp_min_version, arp_max_version, winget_hash, raw";
 
-fn split_words(s: String) -> Vec<String> {
-    s.split_whitespace().map(str::to_owned).collect()
+fn split_words(s: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(s.split_whitespace().count());
+    out.extend(s.split_whitespace().map(str::to_owned));
+    out
+}
+
+/// Borrowed TEXT column (no temporary `String`); NULL or non-text reads as empty.
+fn text_ref<'a>(r: &'a rusqlite::Row<'_>, i: usize) -> rusqlite::Result<&'a str> {
+    Ok(r.get_ref(i)?.as_str_or_null()?.unwrap_or(""))
 }
 
 fn kind_from_db(s: &str) -> SourceKind {
     s.parse().unwrap_or(SourceKind::Winget)
 }
 
-fn stored_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPackage> {
+/// Columns of `PackageEntry` only (first ten of `PKG_COLS`): skips `raw` and `winget_hash`.
+const ENTRY_COLS: &str =
+    "source, kind, id, name, moniker, version, publisher, description, tags, commands";
+
+fn entry_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PackageEntry> {
     let kind: String = r.get(1)?;
+    Ok(PackageEntry {
+        source: kind_from_db(&kind),
+        source_name: r.get(0)?,
+        id: r.get(2)?,
+        name: r.get(3)?,
+        moniker: r.get(4)?,
+        version: r.get(5)?,
+        publisher: r.get(6)?,
+        description: r.get(7)?,
+        tags: split_words(text_ref(r, 8)?),
+        commands: split_words(text_ref(r, 9)?),
+    })
+}
+
+fn stored_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPackage> {
     Ok(StoredPackage {
-        entry: PackageEntry {
-            source: kind_from_db(&kind),
-            source_name: r.get(0)?,
-            id: r.get(2)?,
-            name: r.get(3)?,
-            moniker: r.get(4)?,
-            version: r.get(5)?,
-            publisher: r.get(6)?,
-            description: r.get(7)?,
-            tags: split_words(r.get(8)?),
-            commands: split_words(r.get(9)?),
-        },
+        entry: entry_from_row(r)?,
         arp_min_version: r.get(10)?,
         arp_max_version: r.get(11)?,
         winget_hash: r.get(12)?,
@@ -181,14 +200,19 @@ impl Catalog {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Reads through the OS mapping instead of pread copies (best effort).
+        let _ = conn.pragma_update(None, "mmap_size", 268_435_456i64);
         conn.execute_batch(SCHEMA)?;
-        Ok(Catalog { conn })
+        Ok(Catalog {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
     }
 
     pub fn open_in_memory() -> Result<Catalog, CatalogError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Catalog { conn })
+        Ok(Catalog { conn, path: None })
     }
 
     pub fn replace_source(
@@ -288,14 +312,72 @@ impl Catalog {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Loads every package as a search entry (no `raw`/`winget_hash`), in rowid order.
+    /// On-disk catalogs are decoded by several read connections, one rowid range each.
     pub fn load_entries(&self) -> Result<Vec<PackageEntry>, CatalogError> {
-        let mut st = self
-            .conn
-            .prepare(&format!("SELECT {PKG_COLS} FROM packages ORDER BY rowid"))?;
-        let rows = st.query_map([], stored_from_row)?;
+        let (lo, hi): (Option<i64>, Option<i64>) =
+            self.conn
+                .query_row("SELECT min(rowid), max(rowid) FROM packages", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return Ok(Vec::new());
+        };
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, 8) as i64;
+        let Some(path) = self
+            .path
+            .as_deref()
+            .filter(|_| workers > 1 && hi - lo > 1024)
+        else {
+            return Self::load_range(&self.conn, lo, hi);
+        };
+        let step = (hi - lo) / workers + 1;
+        let parts: Vec<Result<Vec<PackageEntry>, CatalogError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|i| {
+                    let (from, to) = (lo + i * step, (lo + (i + 1) * step - 1).min(hi));
+                    s.spawn(move || {
+                        let conn = Connection::open_with_flags(
+                            path,
+                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                        )?;
+                        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                        let _ = conn.pragma_update(None, "mmap_size", 268_435_456i64);
+                        Self::load_range(&conn, from, to)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(CatalogError::LoaderPanicked))
+                })
+                .collect()
+        });
+        let parts = parts.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for p in parts {
+            out.extend(p);
+        }
+        Ok(out)
+    }
+
+    fn load_range(
+        conn: &Connection,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<PackageEntry>, CatalogError> {
+        let mut st = conn.prepare(&format!(
+            "SELECT {ENTRY_COLS} FROM packages WHERE rowid BETWEEN ?1 AND ?2 ORDER BY rowid"
+        ))?;
+        let rows = st.query_map(params![from, to], entry_from_row)?;
         let mut out = Vec::new();
         for r in rows {
-            out.push(r?.entry);
+            out.push(r?);
         }
         Ok(out)
     }

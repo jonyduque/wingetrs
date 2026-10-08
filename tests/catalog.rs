@@ -253,3 +253,32 @@ fn open_file_uses_wal_journal() {
         .unwrap();
     assert_eq!(mode, "wal");
 }
+
+#[test]
+fn load_entries_does_not_need_raw_column() {
+    // A package with a huge raw payload must load with the same entry and without raw.
+    let mut c = Catalog::open_in_memory().unwrap();
+    let mut p = pkg("big", "Big", "1");
+    p.raw = Some("x".repeat(1_000_000));
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "e",
+        1,
+        &[p],
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    let e = c.load_entries().unwrap();
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].id, "big");
+    assert_eq!(
+        c.get("scoop:main", "big")
+            .unwrap()
+            .unwrap()
+            .raw
+            .as_deref()
+            .map(str::len),
+        Some(1_000_000)
+    );
+}
