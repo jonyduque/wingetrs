@@ -231,3 +231,46 @@ fn reg_type_constants_match_winreg() {
     );
     assert_eq!(wingetrs::installed::arp::REG_DWORD, enums::REG_DWORD as u32);
 }
+
+#[test]
+fn msix_frameworks_are_deduped_by_family_keeping_highest_version() {
+    use wingetrs::installed::{InstallSource, InstalledApp, dedupe_msix_by_family};
+    let m = |fam: &str, v: &str| InstalledApp {
+        source: InstallSource::Msix,
+        key: fam.into(),
+        name: fam.into(),
+        publisher: None,
+        version: Some(v.into()),
+        product_code: None,
+        upgrade_code: None,
+        family_name: Some(fam.into()),
+        scoop_bucket: None,
+    };
+    let out = dedupe_msix_by_family(vec![
+        m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.33519.0"),
+        m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.33728.0"),
+        m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.30704.0"),
+        m("Microsoft.UI.Xaml.2.8_8wekyb3d8bbwe", "8.2310.30001.0"),
+    ]);
+    assert_eq!(out.len(), 2);
+    let vc = out
+        .iter()
+        .find(|a| a.key.starts_with("Microsoft.VCLibs"))
+        .unwrap();
+    assert_eq!(vc.version.as_deref(), Some("14.0.33728.0"));
+}
+
+#[test]
+fn msix_display_name_falls_back_on_resource_strings() {
+    use wingetrs::installed::msix_display_name;
+    assert_eq!(
+        msix_display_name(Some("ms-resource:AppName"), "Microsoft.VCLibs.140.00"),
+        "Microsoft.VCLibs.140.00"
+    );
+    assert_eq!(msix_display_name(Some("  "), "X.Y"), "X.Y");
+    assert_eq!(msix_display_name(None, "X.Y"), "X.Y");
+    assert_eq!(
+        msix_display_name(Some("Windows Terminal"), "Microsoft.WindowsTerminal"),
+        "Windows Terminal"
+    );
+}

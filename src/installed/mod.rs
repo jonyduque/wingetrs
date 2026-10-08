@@ -54,6 +54,44 @@ pub struct RawArpEntry {
     pub release_type: Option<String>,
 }
 
+/// Keeps one MSIX app per family name: the highest version (winget-style ordering).
+pub fn dedupe_msix_by_family(apps: Vec<InstalledApp>) -> Vec<InstalledApp> {
+    use crate::core::version::Version;
+    let mut out: Vec<InstalledApp> = Vec::with_capacity(apps.len());
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for app in apps {
+        let fam = match (&app.source, &app.family_name) {
+            (InstallSource::Msix, Some(f)) => f.to_ascii_lowercase(),
+            _ => {
+                out.push(app);
+                continue;
+            }
+        };
+        match seen.get(&fam) {
+            Some(&i) => {
+                let new_v = Version::parse(app.version.as_deref().unwrap_or(""));
+                let old_v = Version::parse(out[i].version.as_deref().unwrap_or(""));
+                if new_v > old_v {
+                    out[i] = app;
+                }
+            }
+            None => {
+                seen.insert(fam, out.len());
+                out.push(app);
+            }
+        }
+    }
+    out
+}
+
+/// "ms-resource:..." or blank display names fall back to the package id name.
+pub fn msix_display_name(display: Option<&str>, id_name: &str) -> String {
+    match display.map(str::trim) {
+        Some(d) if !d.is_empty() && !d.starts_with("ms-resource:") => d.to_string(),
+        _ => id_name.to_string(),
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct InstalledScan {
     pub apps: Vec<InstalledApp>,
@@ -80,7 +118,9 @@ fn collect_arp() -> Collected {
 
 #[cfg(windows)]
 fn collect_msix() -> Collected {
-    appx_win::read_appx().map_err(|e| format!("msix: {e}"))
+    appx_win::read_appx()
+        .map(dedupe_msix_by_family)
+        .map_err(|e| format!("msix: {e}"))
 }
 #[cfg(not(windows))]
 fn collect_msix() -> Collected {

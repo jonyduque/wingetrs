@@ -7,7 +7,7 @@ use windows::core::HSTRING;
 const WORKERS: usize = 8;
 
 fn read_one(p: &Package) -> Option<InstalledApp> {
-    if p.IsFramework().unwrap_or(false) || p.IsResourcePackage().unwrap_or(false) {
+    if p.IsResourcePackage().unwrap_or(false) {
         return None;
     }
     if p.SignatureKind().ok() == Some(PackageSignatureKind::System) {
@@ -15,13 +15,13 @@ fn read_one(p: &Package) -> Option<InstalledApp> {
     }
     let id = p.Id().ok()?;
     let family = id.FamilyName().ok()?.to_string();
-    let name = p
-        .DisplayName()
+    let id_name = id
+        .Name()
         .ok()
         .map(|n| n.to_string())
-        .filter(|n| !n.is_empty())
-        .or_else(|| id.Name().ok().map(|n| n.to_string()))
         .unwrap_or_else(|| family.clone());
+    let display = p.DisplayName().ok().map(|n| n.to_string());
+    let name = super::msix_display_name(display.as_deref(), &id_name);
     let version = id
         .Version()
         .ok()
