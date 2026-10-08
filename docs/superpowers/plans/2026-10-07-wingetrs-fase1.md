@@ -2957,3 +2957,132 @@ Fecha a fase 1 medindo os critérios de sucesso da spec §9.2 nesta máquina, co
 Esta tarefa não entrega código de produto: **no mutation proof** (declare explicitamente no relatório). A verificação é o orquestrador reexecutar um dos benchmarks e obter mediana dentro de ±30% da colada.
 
 **Commit:** `docs(report): phase 1 live validation and benchmarks`
+
+---
+
+## Lote de correção pós-validação (decidido pelo usuário em 2026-10-08)
+
+Origem: `docs/superpowers/reports/2026-10-07-fase1-validacao.md` (F1, F2). Decisões do usuário: corrigir as duas metas que falharam; pacotes MSIX de framework **incluídos e mostrados** (paridade com o winget, sem ocultar).
+
+### Task 16: `search` abaixo de 100 ms
+
+#### Where this fits
+
+`wingetrs search` mede 192–206 ms de mediana (meta da spec §9.2: < 100 ms). Medido na Task 15: `Catalog::load_entries` lê as 19 478 linhas **incluindo a coluna `raw` (5,6 MB de JSON do scoop) e `winget_hash`**, em ~90–105 ms; `nucleo` ~17–22 ms; drop das estruturas ~10–13 ms; piso do processo ~44 ms.
+
+#### What binds this task
+
+- Meta: mediana < 100 ms com `pwsh -File scripts/bench.ps1 -Exe target/release/wingetrs.exe -Args 'search powertoys'` (10 execuções, 2 de aquecimento), catálogo real em `%LOCALAPPDATA%\wingetrs`, binário release.
+- `load_entries` é usado por `cli` (search) e `tui::run` (2 lugares); todos só precisam de `PackageEntry` (sem `raw`, `winget_hash`, faixas ARP).
+- Não mude a interface pública de `Catalog` além de acrescentar; `get`/`find_by_id` continuam devolvendo `StoredPackage` completo.
+- Medir antes de otimizar além do item 1: cada mudança extra precisa de número antes/depois colado.
+
+#### The decision this task must get right
+
+1. `load_entries` passa a selecionar só as colunas de `PackageEntry` (`source, kind, id, name, moniker, version, publisher, description, tags, commands`) com uma função de linha própria. Isso é obrigatório.
+2. Se ainda ≥ 100 ms, perfile com `tracing` (spans existentes ou novos, `-v`) as etapas do processo `search` (init de log, DataDir/Config, `needs_refresh`/spawn de refresh em segundo plano, abrir catálogo, load, SearchIndex, busca, saída, drop) e ataque a maior. Permitido: pular a desalocação no caminho CLI de `search` (`std::mem::forget` do índice depois de imprimir, com comentário de uma linha explicando o motivo). Proibido: cache em disco novo, mudança de schema, dependência nova.
+3. A busca não muda de semântica: os testes existentes de `tests/search.rs` e `tests/catalog.rs` continuam passando sem alteração.
+
+#### Traps already paid for that apply here
+
+- Medir pelo processo inteiro (bench.ps1), não por função — a Task 15 mostrou piso de ~44 ms fora da busca.
+- O refresh em segundo plano só dispara com catálogo velho (> 900 s); meça nos dois estados e diga qual foi medido.
+
+#### The body of the tests that are not obvious
+
+Em `tests/catalog.rs` (new test fn):
+
+```rust
+#[test]
+fn load_entries_does_not_need_raw_column() {
+    // A package with a huge raw payload must load with the same entry and without raw.
+    let mut c = Catalog::open_in_memory().unwrap();
+    let mut p = pkg("big", "Big", "1");
+    p.raw = Some("x".repeat(1_000_000));
+    c.replace_source("scoop:main", SourceKind::Scoop, "e", 1, &[p], &WingetMaps::default()).unwrap();
+    let e = c.load_entries().unwrap();
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].id, "big");
+    assert_eq!(c.get("scoop:main", "big").unwrap().unwrap().raw.as_deref().map(str::len), Some(1_000_000));
+}
+```
+
+#### Checks beyond the steps
+
+- Mutation proof: `pwsh -File scripts/mutate.ps1 -Path src/catalog/mod.rs -Anchor '<o SELECT novo de load_entries>' -Replacement '<o SELECT com PKG_COLS>' -TestCommand 'cargo test --quiet --test catalog'` — **esperado: sobrevive** (é otimização, não regra observável por teste); cole a saída e diga isso. A prova desta tarefa é o benchmark.
+- Benchmark antes e depois (3 rodadas de bench.ps1 cada, catálogo fresco e velho), colados. Se a meta não for atingida: teto medido, causa e follow-up — nunca afrouxe a meta.
+
+**Files:**
+- Modify: `src/catalog/mod.rs`, `src/cli/mod.rs` (só se o perfil apontar), `src/tui/run.rs` (só se necessário)
+- Test: `tests/catalog.rs`
+
+**Commit:** `perf(search): load only search columns from the catalog`
+
+### Task 17: Incluir pacotes MSIX de framework no `list`
+
+#### Where this fits
+
+O oráculo da Task 15 (95/116 = 81,9%, meta ≥ 90%) perdeu 15 IDs porque `src/installed/appx_win.rs` descarta `IsFramework()`: `Microsoft.VCLibs.14`, `Microsoft.VCLibs.Desktop.14`, `Microsoft.UI.Xaml.2.6/2.7/2.8`, `Microsoft.DotNet.Native.Runtime`, `Microsoft.WindowsAppRuntime.1.1 … 1.8` e `.2`. O winget os lista. Decisão do usuário: **incluir e mostrar** (sem ocultar, sem flag nova).
+
+#### What binds this task
+
+- Remova o descarte de `IsFramework()`; **continue** descartando `IsResourcePackage()` e `SignatureKind == System`.
+- Deduplicação: vários pacotes MSIX do mesmo `FamilyName` coexistem (arquiteturas x86/x64/arm64 e versões lado a lado do mesmo framework). Mantenha **uma** `InstalledApp` por `FamilyName`, a de **maior versão** (`core::version::Version`). A regra fica numa função pura em `src/installed/mod.rs`, não no `_win.rs`.
+- Nome de exibição: se `DisplayName()` falhar, vier vazio ou começar com `ms-resource:`, use `Id().Name()`.
+- Orçamento: `list` continua < 500 ms (medido 400 ms antes desta tarefa). A coleta MSIX já é paralela em 8 threads; meça `list` com bench.ps1 antes e depois e cole.
+- Meta da spec: oráculo ≥ 90%. Reexecute a comparação com `winget list --source winget --disable-interactivity` (somente leitura) pelo mesmo método da Task 15 (seção "Oráculo" do relatório de validação) e cole a nova taxa.
+
+#### The body of the tests that are not obvious
+
+Funções puras a criar (assinaturas decididas), exportadas em `wingetrs::installed`:
+
+```rust
+/// Keeps one MSIX app per family name: the highest version (winget-style ordering).
+pub fn dedupe_msix_by_family(apps: Vec<InstalledApp>) -> Vec<InstalledApp>;
+/// "ms-resource:..." or blank display names fall back to the package id name.
+pub fn msix_display_name(display: Option<&str>, id_name: &str) -> String;
+```
+
+Testes em `tests/installed.rs`:
+
+```rust
+#[test]
+fn msix_frameworks_are_deduped_by_family_keeping_highest_version() {
+    use wingetrs::installed::{dedupe_msix_by_family, InstallSource, InstalledApp};
+    let m = |fam: &str, v: &str| InstalledApp {
+        source: InstallSource::Msix, key: fam.into(), name: fam.into(), publisher: None,
+        version: Some(v.into()), product_code: None, upgrade_code: None,
+        family_name: Some(fam.into()), scoop_bucket: None,
+    };
+    let out = dedupe_msix_by_family(vec![
+        m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.33519.0"),
+        m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.33728.0"),
+        m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.30704.0"),
+        m("Microsoft.UI.Xaml.2.8_8wekyb3d8bbwe", "8.2310.30001.0"),
+    ]);
+    assert_eq!(out.len(), 2);
+    let vc = out.iter().find(|a| a.key.starts_with("Microsoft.VCLibs")).unwrap();
+    assert_eq!(vc.version.as_deref(), Some("14.0.33728.0"));
+}
+
+#[test]
+fn msix_display_name_falls_back_on_resource_strings() {
+    use wingetrs::installed::msix_display_name;
+    assert_eq!(msix_display_name(Some("ms-resource:AppName"), "Microsoft.VCLibs.140.00"), "Microsoft.VCLibs.140.00");
+    assert_eq!(msix_display_name(Some("  "), "X.Y"), "X.Y");
+    assert_eq!(msix_display_name(None, "X.Y"), "X.Y");
+    assert_eq!(msix_display_name(Some("Windows Terminal"), "Microsoft.WindowsTerminal"), "Windows Terminal");
+}
+```
+
+#### Checks beyond the steps
+
+- Mutation proofs (`-TestCommand 'cargo test --quiet --test installed'`): (1) dedupe mantendo a **primeira** em vez da maior versão ⇒ PEGA; (2) remover o fallback de `ms-resource:` ⇒ PEGA.
+- Live: `cargo test --quiet --release --test installed -- --ignored --nocapture live_scan` e `cargo test --quiet --release --test correlate -- --ignored --nocapture live_list`, colados.
+- Oráculo: taxa nova colada, com a lista das divergências restantes.
+
+**Files:**
+- Modify: `src/installed/appx_win.rs`, `src/installed/mod.rs`
+- Test: `tests/installed.rs`
+
+**Commit:** `feat(list): include MSIX framework packages, one per family`
