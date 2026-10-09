@@ -32,3 +32,11 @@ Decisions:
 
 Concerns:
 - Target < 100 ms not met on this machine (median ~110 ms); remaining time is process floor (~38 ms+) plus startup; not profiled further.
+
+## Review fix (CHANGES_REQUESTED: early thread not always joined)
+Commits: 9bd75d3 fix(cli): always join the early search thread;6e3f5d2 chore(tasks): record task 18;4404b7e perf(search): fused on-disk scan, early start and cheap read-only open;
+- EarlySearch guard (Drop joins); ensure_catalog_ran joins explicitly before run_update on the empty-catalog path; error paths join via Drop.
+- New test existing_but_empty_catalog_is_updated_by_search (tests/cli_offline.rs, wiremock): passes.
+- Gate: [OK] test (155 passed, 2 ignored) / [OK] gate verde.
+- Bench search powertoys, 3 rounds after fix (median): 118,5 / 113,5 / 120,8 ms (two earlier rounds right after the build were disturbed: 494 / 233, discarded). No regression beyond noise.
+- Optional minor (double-space/tab tags in equivalence test) not done: NewPackage tags are joined by the writer, so it cannot be injected through the API.
