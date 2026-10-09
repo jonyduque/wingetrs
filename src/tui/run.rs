@@ -47,6 +47,7 @@ pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
     );
     let mut app = App::new(Vec::new(), glyphs);
     app.status = Some("carregando catálogo…".into());
+    // `ratatui::init` also installs a panic hook that restores the terminal before the message.
     let mut terminal = ratatui::init();
     app.size = terminal
         .size()
@@ -229,24 +230,39 @@ fn spawn_reload(ctx: &Arc<Ctx>) {
 
 fn spawn_scan(ctx: &Arc<Ctx>) {
     let ctx = Arc::clone(ctx);
-    tokio::task::spawn_blocking(move || {
-        // Tracking loads while the collectors run; joined before any other step can return.
-        let tracking_job = std::thread::spawn(crate::installed::winget_tracking::load_default);
-        let scan = scan_all();
-        let tracking = tracking_job
-            .join()
-            .unwrap_or_else(|p| std::panic::resume_unwind(p));
-        for e in &scan.errors {
-            tracing::warn!("scan: {e}");
-        }
-        let rows = Catalog::open(&ctx.data.catalog_path())
-            .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new(), &tracking));
-        match rows {
-            Ok(rows) => {
-                let _ = ctx.tx.send(Msg::InstalledLoaded(rows));
+    let job = tokio::task::spawn_blocking({
+        let ctx = Arc::clone(&ctx);
+        move || {
+            // Tracking loads while the collectors run; joined on every path, even if the scan panics.
+            let tracking_job = std::thread::spawn(crate::installed::winget_tracking::load_default);
+            let scan = std::panic::catch_unwind(scan_all);
+            let tracking = tracking_job.join();
+            let scan = scan.unwrap_or_else(|p| std::panic::resume_unwind(p));
+            let tracking = tracking.unwrap_or_else(|p| std::panic::resume_unwind(p));
+            for e in &scan.errors {
+                tracing::warn!("scan: {e}");
             }
-            Err(e) => tracing::warn!("correlação falhou: {e}"),
+            Catalog::open(&ctx.data.catalog_path())
+                .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new(), &tracking))
         }
+    });
+    tokio::spawn(async move {
+        let msg = match job.await {
+            Ok(Ok(rows)) => Msg::InstalledLoaded(rows),
+            Ok(Err(e)) => {
+                tracing::warn!("correlação falhou: {e}");
+                Msg::InstalledFailed(e.to_string())
+            }
+            Err(e) => {
+                tracing::error!("coleta de instalados falhou: {e}");
+                Msg::InstalledFailed(if e.is_panic() {
+                    "pânico interno".into()
+                } else {
+                    e.to_string()
+                })
+            }
+        };
+        let _ = ctx.tx.send(msg);
     });
 }
 

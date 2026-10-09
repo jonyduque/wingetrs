@@ -275,3 +275,11 @@ fn only_network_failures_mark_offline() {
     update(&mut a, Msg::RefreshFinished(failed_report(true)));
     assert!(a.offline);
 }
+
+#[test]
+fn installed_failure_shows_status() {
+    let mut a = app();
+    update(&mut a, Msg::InstalledFailed("pânico interno".into()));
+    let status = a.status.unwrap();
+    assert!(status.contains("falha ao ler instalados"), "{status}");
+}

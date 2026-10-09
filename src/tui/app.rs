@@ -34,6 +34,8 @@ pub enum Msg {
     Tick,
     CatalogLoaded(Vec<PackageEntry>),
     InstalledLoaded(Vec<ListRow>),
+    /// Reading or correlating the installed apps failed (error or worker panic).
+    InstalledFailed(String),
     DetailsLoaded {
         key: String,
         result: Result<PackageDetails, String>,
@@ -239,6 +241,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::InstalledLoaded(rows) => {
             app.installed = rows;
             app.clamp();
+            Vec::new()
+        }
+        Msg::InstalledFailed(reason) => {
+            app.status = Some(format!("falha ao ler instalados: {reason}"));
             Vec::new()
         }
         Msg::DetailsLoaded { key, result } => {
