@@ -4,6 +4,27 @@
 //! The index stores `Normalize(FoldCase(name), FoldCase(publisher))`; see [`NameNormalizer::index_keys`].
 
 use fancy_regex::{Regex, RegexBuilder};
+use unicode_normalization::UnicodeNormalization;
+
+#[path = "casefold_table.rs"]
+mod casefold_table;
+
+/// Full Unicode case folding (statuses C + F), as ICU `U_FOLD_CASE_DEFAULT`; unmapped chars pass through.
+// port: AppInstallerStrings.cpp FoldCase (ucasemap_utf8FoldCase, default options)
+pub fn fold_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii() {
+            out.push(c.to_ascii_lowercase());
+            continue;
+        }
+        match casefold_table::CASE_FOLDING.binary_search_by_key(&c, |&(k, _)| k) {
+            Ok(i) => out.push_str(casefold_table::CASE_FOLDING[i].1),
+            Err(_) => out.push(c),
+        }
+    }
+    out
+}
 
 /// Detected processor architecture of a program name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,7 +511,7 @@ impl Default for NameNormalizer {
 
 fn fold_and_sort(input: &[&str]) -> Vec<String> {
     // port: NameNormalization.cpp FoldAndSort
-    let mut v: Vec<String> = input.iter().map(|s| s.to_lowercase()).collect();
+    let mut v: Vec<String> = input.iter().map(|s| fold_case(s)).collect();
     v.sort();
     v
 }
@@ -574,9 +595,9 @@ impl NameNormalizer {
     }
 
     /// Keys as stored in the index: normalize(fold(name), fold(publisher)).
-    // port: Interface_2_0.cpp UpdateNormalizedNameAndPublisher (FoldCase approximated by to_lowercase)
+    // port: Interface_2_0.cpp UpdateNormalizedNameAndPublisher
     pub fn index_keys(&self, display_name: &str, publisher: &str) -> IndexKeys {
-        let r = self.normalize(&display_name.to_lowercase(), &publisher.to_lowercase());
+        let r = self.normalize(&fold_case(display_name), &fold_case(publisher));
         let name_with_arch = (r.architecture != Architecture::Unknown).then(|| r.name_with_arch());
         IndexKeys {
             name: r.name,
@@ -585,9 +606,10 @@ impl NameNormalizer {
         }
     }
 
-    // port: NameNormalization.cpp PrepareForValidation (Utility::Normalize/NFKC not applied)
+    // port: NameNormalization.cpp PrepareForValidation (Utility::Normalize, NFKC)
     fn prepare_for_validation(value: &str) -> String {
-        let trimmed = trim_ws(value);
+        let normalized: String = value.nfkc().collect();
+        let trimmed = trim_ws(&normalized);
         // `find(L"@@", 3)`: search starts at UTF-16 offset 3.
         let mut utf16 = 0usize;
         for (i, c) in trimmed.char_indices() {
@@ -657,7 +679,7 @@ impl NameNormalizer {
         self.locale.for_each(value, |is_match, text| {
             let mut copy = !is_match;
             if is_match {
-                let mut folded = text.to_lowercase();
+                let mut folded = fold_case(text);
                 if self.locales.binary_search(&folded).is_err() {
                     copy = true;
                 } else if !locale_found {
@@ -692,7 +714,7 @@ impl NameNormalizer {
                 return true;
             }
             if !result.is_empty() {
-                let folded = text.to_lowercase();
+                let folded = fold_case(text);
                 if self.legal_entity_suffixes.binary_search(&folded).is_ok() {
                     return !stop_on_exclusion;
                 }

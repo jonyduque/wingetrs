@@ -124,3 +124,23 @@ fn index_keys_match_real_index_rows() {
 fn all_patterns_compile() {
     assert!(wingetrs::installed::normalize::pattern_errors().is_empty());
 }
+
+#[test]
+fn full_case_folding_and_compatibility_forms() {
+    use wingetrs::installed::normalize::{NameNormalizer, fold_case};
+    // AppInstallerStrings.cpp FoldCase: ucasemap_utf8FoldCase with U_FOLD_CASE_DEFAULT (C + F).
+    assert_eq!(fold_case("Straße"), "strasse");
+    assert_eq!(fold_case("ﬁle"), "file");
+    assert_eq!(fold_case("ΟΔΟΣ"), "οδοσ");
+    let n = NameNormalizer::new();
+    // NameNormalization.cpp line 35: PrepareForValidation applies Utility::Normalize (default NFKC),
+    // so fullwidth letters normalize to the same key as ASCII.
+    assert_eq!(
+        n.index_keys("ＶＬＣ media player", "VideoLAN").name,
+        n.index_keys("VLC media player", "VideoLAN").name
+    );
+    assert_eq!(
+        n.index_keys("Straße App", "X").name,
+        n.index_keys("Strasse App", "X").name
+    );
+}
