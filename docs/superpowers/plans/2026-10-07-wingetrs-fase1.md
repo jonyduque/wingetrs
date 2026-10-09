@@ -3494,3 +3494,179 @@ Confira a assinatura real de `run_update`/`LockWait` com `rust-analyzer symbols 
 - Test: `tests/update.rs`
 
 **Commit:** `perf(search): compact search.idx written by update and read by search`
+
+---
+
+## Fechamento das pendências da fase 1 (decidido pelo usuário em 2026-10-09)
+
+Ordem: Task 20 sozinha (mede tempo) → Tasks 22 e 23 em paralelo → Task 21 (o oráculo dela depende da normalização da 22). Benchmarks sempre com `pwsh -File scripts/bench.ps1 ... -Baseline target/release/examples/noop.exe` (build: `cargo build --release --example noop`), máquina ociosa.
+
+### Task 20: `list` — medir por coletor e otimizar o maior custo
+
+#### Where this fits
+
+`list` mede 455–464 ms de mediana com máximos ocasionais > 500 ms (meta da spec §9.2: < 500 ms). Quebra conhecida da Task 12 (release, antes dos frameworks MSIX): abrir catálogo 12 ms, `scan_all` 285 ms, `NameNormalizer::new` 60 ms, correlação 65 ms. A Task 17 tentou reduzir chamadas `DisplayName` do MSIX e **não teve ganho medido** (revertida em 9192e7b): o palpite estava errado.
+
+#### What binds this task
+
+- **Medir antes de mudar.** Adicione spans `tracing` (nível info) por etapa: `scan_arp` (por hive), `scan_upgrade_codes`, `scan_msix` (enumeração e leitura de propriedades separadas), `scan_scoop`, `open_catalog`, `normalizer_new`, `correlate`, `output`. Rode `target/release/wingetrs.exe list -v` 10× e cole a mediana por etapa (os spans saem no stderr com `-v`).
+- Só depois otimize **a maior etapa medida**. Candidatas permitidas (escolha pelo número, não pelo palpite): `NameNormalizer` construído em paralelo com a coleta (thread desde o início do `list`); abrir o catálogo e preparar statements em paralelo com a coleta; leitura de registro mais enxuta (ler só os valores necessários com uma chamada por valor, sem enumerar todos); reduzir a disputa das 8 threads do MSIX.
+- **Saída idêntica:** `target/release/wingetrs.exe list --json` antes/depois com o mesmo conjunto de linhas (ordene e compare; cole o resultado).
+- Meta: mediana de `list` com `-Baseline` **delta < 350 ms** (≈ 390 ms absolutos numa máquina ociosa). Antes/depois, 2 rodadas cada, colados. Meta não atingida: teto medido + causa + follow-up; nunca afrouxe.
+- Sem dependência nova.
+
+#### Traps already paid for that apply here
+
+- Palpites sobre MSIX já falharam uma vez: decida pelo span.
+- O live test `live_list_runs_under_budget` roda em `--release`; mantenha o limite.
+
+#### Checks beyond the steps
+
+- Esta tarefa é de desempenho: **no mutation proof** para a otimização (declare). Se você criar função pura nova (ex.: escolha de valores do registro), ela leva teste e mutação normais.
+- Tabela de spans antes/depois colada no relatório.
+
+**Files:**
+- Modify: `src/installed/*.rs`, `src/cli/mod.rs` (só o caminho `list`), `src/installed/correlate.rs` (só se o span apontar)
+- Test: `tests/installed.rs`, `tests/correlate.rs` (se criar função pura)
+
+**Commit:** `perf(list): measure per-collector spans and cut the largest cost`
+
+### Task 21: Desempate de correlações ambíguas
+
+#### Where this fits
+
+O oráculo (Task 17) tem 110/116; 5 das 6 divergências são `Ambiguous` (medido, relatório de validação, seção Divergências):
+
+| winget | wingetrs | Causa |
+|---|---|---|
+| Google.AndroidStudio | Ambiguous [AndroidStudio, .Beta, .Canary] (ProductCode) | ProductCode compartilhado entre canais |
+| Gyan.FFmpeg | Ambiguous [FFmpeg, .Essentials, .Shared] (NameAndPublisher) | nome/publisher iguais entre variantes |
+| RubyInstallerTeam.RubyWithDevKit.4.0 | Ambiguous [Ruby.3.4, RubyWithDevKit.3.4] (ProductCode) | instalado 3.4.9-1; o winget provavelmente usa o próprio registro de instalação |
+| Devolutions.UniGetUI | Ambiguous [UniGetUI, MartiCliment.UniGetUI.Pre-Release] (ProductCode) | ProductCode compartilhado com pré-release |
+| wez.wezterm | Ambiguous [wezterm, wezterm.nightly] (ProductCode) | ProductCode compartilhado com nightly |
+| MSYS2.MSYS2 | Unmatched | catálogo sem ProductCode; nome normalizado `msys2installer` vs ARP `MSYS2` |
+
+#### What binds this task
+
+- **Regra de ouro (spec §5.4): nunca escolher em silêncio um candidato que pode estar errado.** Um desempate só resolve quando o critério é objetivo; senão continua `Ambiguous`.
+- Pesquise primeiro como o winget resolve: (a) leia no winget-cli (via `gh api repos/microsoft/winget-cli/contents/...` ou `gh search code --repo microsoft/winget-cli`) o código de correlação de pacotes instalados com o catálogo (procure `CorrelateForInstalled`, `ARPCorrelation`, `GetMatchingPackages`, `IsCompatible`, "tracking catalog"); salve o trecho relevante em `docs/reference/winget-cli/` com o commit no nome; (b) verifique se o winget mantém um **catálogo de rastreamento** local (pacotes instalados via winget) legível em modo somente leitura (ex.: sob `%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\`), e qual o formato. **Somente leitura**: nunca escreva em arquivos do winget.
+- Regras candidatas, na ordem, cada uma aplicada só sobre os candidatos já empatados:
+  1. Registro de rastreamento do winget (se existir e for legível): o ID que o winget instalou vence.
+  2. Faixa ARP: manter só candidatos cuja faixa `[arp_min_version, arp_max_version]` contém a versão instalada (quando a faixa existe).
+  3. Canal: se exatamente um candidato tem ID que é prefixo dos demais seguido de `.` e um sufixo de canal conhecido (`Beta`, `Canary`, `Dev`, `Nightly`, `Preview`, `Pre-Release`, `Insiders`, `Essentials`, `Shared`), **e** o nome exibido instalado não contém esse sufixo, o ID base vence.
+  4. Senão: continua `Ambiguous`.
+- Cada regra é uma função pura testável (sem I/O); a leitura do rastreamento fica em `*_win.rs` se usar APIs do Windows, ou em módulo próprio se for só SQLite.
+- `ListRow` passa a registrar a regra de desempate usada (`tiebreak: Option<String>` ou enum) para depuração no `--json`.
+- Meta: oráculo ≥ 112/116 sem nenhum falso positivo novo (nenhum ID que o winget mostra como outro). Reexecute o oráculo como na Task 15/17 e cole.
+
+#### The body of the tests that are not obvious
+
+Escreva com dados sintéticos (catálogo em memória com `replace_source`), um teste por regra, e um teste de **não-resolução**: dois candidatos sem faixa ARP, sem sufixo de canal reconhecido e sem rastreamento ⇒ continua `Ambiguous` com os dois. Inclua o caso `Gyan.FFmpeg` × `.Essentials` × `.Shared` com nome exibido "FFmpeg" ⇒ `Gyan.FFmpeg`, e o caso inverso (nome exibido "FFmpeg Essentials") ⇒ não escolhe o base.
+
+#### Checks beyond the steps
+
+- Mutation proofs (`--test correlate`): uma por regra (ex.: inverter a condição de contém da faixa ARP; remover a exigência de o nome exibido não conter o sufixo).
+- Oráculo antes/depois colado com a lista de divergências restantes.
+
+**Files:**
+- Modify: `src/installed/correlate.rs`, `src/installed/mod.rs`
+- Create (new): `src/installed/tiebreak.rs` (regras puras) e, se houver rastreamento legível, `src/installed/winget_tracking.rs`
+- Test: `tests/correlate.rs`
+
+**Commit:** `feat(list): objective tie-breaks for ambiguous correlations`
+
+### Task 22: Normalização Unicode fiel ao winget (NFKC e case folding completo)
+
+#### Where this fits
+
+O porte do `NameNormalizer` (Task 10) passa 1137/1137 no corpus golden, mas o relatório registrou duas aproximações: `Utility::Normalize` (normalização Unicode, linha 35 de `docs/reference/winget-cli/AppInstallerCommonCore_NameNormalization.cpp`) não é aplicada, e `FoldCase` (linhas 135, 200, 366) é aproximado por `str::to_lowercase`. Diferenças reais: `ß`→`ss`, `ﬁ`→`fi`, sigma final, caracteres fullwidth (`ＡＢＣ`), `İ`.
+
+#### What binds this task
+
+- Confirme no código do winget qual forma de normalização `Utility::Normalize` usa e como `FoldCase` é implementado: busque `Normalize(` e `FoldCase(` em `src/AppInstallerSharedLib` via `gh api repos/microsoft/winget-cli/contents/...?ref=<commit em docs/reference/winget-cli/SOURCE_COMMIT.txt>`; salve os arquivos em `docs/reference/winget-cli/` como os demais. Implemente a forma que o código mostrar (a expectativa é NFKC + ICU `u_strFoldCase` com opção default — confirme, não assuma).
+- Dependência nova **autorizada**: `unicode-normalization` (verifique a versão atual no crates.io e que compila com o conjunto atual). Case folding completo sem crate: gere uma tabela Rust a partir de `https://www.unicode.org/Public/UCD/latest/ucd/CaseFolding.txt` (status `C` + `F`), com um script em `scripts/gen_casefold.py` e o arquivo gerado `src/installed/casefold_table.rs` commitado (cabeçalho com a versão Unicode e a URL). `fold_case(s)` usa a tabela; caracteres fora dela passam inalterados.
+- Onde o porte chama `to_lowercase` em lugar de `FoldCase`, troque por `fold_case`. Aplique a normalização Unicode onde o C++ aplica.
+- O golden **continua 1137/1137** (`MEASURED_GOLDEN_PASS` não pode cair).
+
+#### The body of the tests that are not obvious
+
+Em `tests/normalize.rs`:
+
+```rust
+#[test]
+fn full_case_folding_and_compatibility_forms() {
+    use wingetrs::installed::normalize::{fold_case, NameNormalizer};
+    assert_eq!(fold_case("Straße"), "strasse");
+    assert_eq!(fold_case("ﬁle"), "file");
+    assert_eq!(fold_case("ΟΔΟΣ"), "οδοσ");
+    let n = NameNormalizer::new();
+    // Fullwidth letters normalize to the same key as ASCII.
+    assert_eq!(n.index_keys("ＶＬＣ media player", "VideoLAN").name, n.index_keys("VLC media player", "VideoLAN").name);
+    assert_eq!(n.index_keys("Straße App", "X").name, n.index_keys("Strasse App", "X").name);
+}
+```
+
+Se o código do winget mostrar que alguma dessas expectativas não vale (ex.: NFKC não aplicado ao nome), o código do winget vence: ajuste a asserção correspondente, cite a linha do C++ no comentário do teste e registre no relatório.
+
+#### Checks beyond the steps
+
+- Mutation proofs (`--test normalize`): (1) trocar `fold_case` por `to_lowercase` em `index_keys` ⇒ PEGA; (2) remover a normalização Unicode ⇒ PEGA (pelo caso fullwidth).
+- Golden: linha `golden: 1137/1137` colada.
+- Tempo: `NameNormalizer::new` + `index_keys` não podem piorar o `list` mais que 10 ms (medir com o span da Task 20 se já existir, ou com `cargo test --release ... live_list`).
+
+**Files:**
+- Modify: `src/installed/normalize.rs`, `Cargo.toml`
+- Create (new): `src/installed/casefold_table.rs`, `scripts/gen_casefold.py`
+- Test: `tests/normalize.rs`
+
+**Commit:** `feat(normalize): NFKC and full Unicode case folding as in winget`
+
+### Task 23: Ajuda da CLI completa e em português
+
+#### Where this fits
+
+`wingetrs <cmd> --help` mostra opções sem descrição (`--force`, `--source`, `--json`, `--upgradable`, `--version`, `<QUERY>`, `<ID>`) e textos do clap em inglês ("Print help", "Print version", "Usage", "Commands", "Options", "possible values", "help: Print this message or the help of the given subcommand(s)").
+
+#### What binds this task
+
+- Toda opção e argumento ganha descrição curta em português (doc comment no `Cli`/`Command`).
+- Textos embutidos do clap em português: desabilite as flags padrão (`disable_help_flag`, `disable_version_flag`, `disable_help_subcommand`) e declare as suas (`-h/--help` "Mostra a ajuda", `-V/--version` "Mostra a versão"); use `help_template` com cabeçalhos "Uso:", "Comandos:", "Opções:", "Argumentos:".
+- `--glyphs` só aparece na ajuda raiz (deixe de ser `global = true`, ou esconda nos subcomandos), porque só afeta a TUI.
+- Exemplos no `after_help` de cada subcomando (ex.: `wingetrs search powertoys --source scoop -n 5`).
+- Os testes de `tests/cli_parse.rs` continuam passando; ajuste-os só se a mudança de `--glyphs` exigir, mantendo a intenção.
+
+#### The body of the tests that are not obvious
+
+Snapshot com `insta` da ajuda de cada comando (`Cli::command().render_long_help()` e de cada subcomando via `find_subcommand_mut`) e um teste que garante que nenhuma opção ficou sem descrição:
+
+```rust
+#[test]
+fn every_argument_has_a_portuguese_description() {
+    use clap::CommandFactory;
+    let mut root = wingetrs::cli::Cli::command();
+    root.build();
+    let mut cmds = vec![root.clone()];
+    cmds.extend(root.get_subcommands().cloned());
+    for c in cmds {
+        for a in c.get_arguments() {
+            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(!help.trim().is_empty(), "{} --{:?} sem descrição", c.get_name(), a.get_id());
+        }
+    }
+    let text = wingetrs::cli::Cli::command().render_long_help().to_string();
+    for en in ["Print help", "Usage:", "Options:", "Commands:"] {
+        assert!(!text.contains(en), "texto em inglês: {en}");
+    }
+}
+```
+
+#### Checks beyond the steps
+
+- Mutation proof (`--test cli_parse`): apagar a descrição de uma opção (ex.: o doc comment de `json` em `List`) ⇒ PEGA.
+- Cole no relatório a saída real de `wingetrs --help` e `wingetrs search --help`.
+
+**Files:**
+- Modify: `src/cli/mod.rs`
+- Test: `tests/cli_parse.rs`, `tests/snapshots/*`
+
+**Commit:** `feat(cli): complete Portuguese help with examples`
