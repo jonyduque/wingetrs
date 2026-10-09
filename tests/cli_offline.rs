@@ -129,3 +129,21 @@ async fn existing_but_empty_catalog_is_updated_by_search() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 28);
 }
+
+#[test]
+fn list_without_catalog_and_without_network_fails_cleanly_and_fast() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_wingetrs"))
+        .args(["list"])
+        .env("LOCALAPPDATA", dir.path())
+        .env("WINGETRS_WINGET_INDEX_URL", "http://127.0.0.1:9/x")
+        .env("WINGETRS_SCOOP_BASE_URL", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("sem catálogo local e sem rede"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+    assert!(t.elapsed() < std::time::Duration::from_secs(5));
+}

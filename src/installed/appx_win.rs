@@ -69,36 +69,8 @@ fn read_one(c: &Candidate) -> InstalledApp {
     }
 }
 
-/// Work-stealing map: workers pull the next index, so one slow package does not stall a chunk.
 fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Option<R> + Sync) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let mut slots: Vec<(usize, R)> = Vec::new();
-    std::thread::scope(|s| {
-        let (f, next) = (&f, &next);
-        let handles: Vec<_> = (0..WORKERS.min(items.len().max(1)))
-            .map(|_| {
-                s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(item) = items.get(i) else { break };
-                        if let Some(r) = f(item) {
-                            local.push((i, r));
-                        }
-                    }
-                    local
-                })
-            })
-            .collect();
-        for h in handles {
-            if let Ok(mut v) = h.join() {
-                slots.append(&mut v);
-            }
-        }
-    });
-    slots.sort_by_key(|(i, _)| *i);
-    slots.into_iter().map(|(_, r)| r).collect()
+    super::par::parallel(items, WORKERS, f)
 }
 
 pub fn read_appx() -> Result<Vec<InstalledApp>, String> {

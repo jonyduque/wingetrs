@@ -376,18 +376,18 @@ async fn run_async(
                 )
             });
             let t0 = std::time::Instant::now();
-            let catalog = ensure_catalog(&data, &cfg, &http).await?;
+            let catalog = ensure_catalog(&data, &cfg, &http).await;
+            // Join both early threads on every path before propagating a catalog error.
+            let scan_res = scan_job.join();
+            let norm_res = norm_job.join();
+            let catalog = catalog?;
             tracing::info!(
                 step = "open_catalog",
                 ms = t0.elapsed().as_secs_f64() * 1000.0,
                 "span"
             );
-            let scan = scan_job
-                .join()
-                .map_err(|_| anyhow::anyhow!("coleta de instalados falhou"))?;
-            let normalizer = norm_job
-                .join()
-                .map_err(|_| anyhow::anyhow!("normalizador falhou"))?;
+            let scan = scan_res.map_err(|_| anyhow::anyhow!("coleta de instalados falhou"))?;
+            let normalizer = norm_res.map_err(|_| anyhow::anyhow!("normalizador falhou"))?;
             for e in &scan.errors {
                 tracing::warn!("coleta de instalados: {e}");
             }

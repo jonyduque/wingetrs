@@ -274,3 +274,26 @@ fn msix_display_name_falls_back_on_resource_strings() {
         "Windows Terminal"
     );
 }
+
+#[test]
+fn parallel_preserves_order_and_items() {
+    use std::time::Duration;
+    let items: Vec<u32> = (0..1000).collect();
+    let out = wingetrs::installed::par::parallel(&items, 8, |&i| {
+        std::thread::sleep(Duration::from_micros(u64::from((i * 7919) % 50)));
+        Some(i)
+    });
+    assert_eq!(out, items);
+}
+
+#[test]
+fn parallel_propagates_worker_panic() {
+    let items: Vec<u32> = (0..50).collect();
+    let r = std::panic::catch_unwind(|| {
+        wingetrs::installed::par::parallel(&items, 4, |&i| {
+            assert!(i != 20, "boom");
+            Some(i)
+        })
+    });
+    assert!(r.is_err());
+}
