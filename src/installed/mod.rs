@@ -144,16 +144,17 @@ fn collect_msix() -> Collected {
 
 /// Runs the three collectors in parallel; a failing collector is reported, not fatal.
 pub fn scan_all() -> InstalledScan {
+    scan_with(&[collect_arp, collect_msix, collect_scoop])
+}
+
+/// Runs `fns` in parallel. A collector error is reported; a collector panic is propagated.
+fn scan_with(fns: &[fn() -> Collected]) -> InstalledScan {
     let start = std::time::Instant::now();
-    let fns: [fn() -> Collected; 3] = [collect_arp, collect_msix, collect_scoop];
     let results: Vec<Collected> = std::thread::scope(|s| {
         let handles: Vec<_> = fns.iter().map(|f| s.spawn(f)).collect();
         handles
             .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err("collector panicked".to_string()))
-            })
+            .map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
             .collect()
     });
     let mut scan = InstalledScan::default();
@@ -165,4 +166,21 @@ pub fn scan_all() -> InstalledScan {
     }
     scan.elapsed_ms = start.elapsed().as_millis();
     scan
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn collector_panic_is_propagated() {
+        fn ok() -> Collected {
+            Ok(Vec::new())
+        }
+        fn boom() -> Collected {
+            panic!("collector boom")
+        }
+        let r = std::panic::catch_unwind(|| scan_with(&[ok, boom]));
+        assert!(r.is_err(), "collector panic must not become a warning");
+    }
 }
