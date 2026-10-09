@@ -70,7 +70,13 @@ async fn deleted_catalog_with_fresh_http_state_is_rebuilt_by_search() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 28);
     // The index shortcut must not leave the catalog missing.
-    assert!(d.exists());
+    let conn =
+        rusqlite::Connection::open_with_flags(&d, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM packages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 28);
 }
 
 #[tokio::test(flavor = "multi_thread")]
