@@ -34,3 +34,12 @@ Decisions:
 Concerns:
 - Meta de bench não comprovada (ruído da máquina); o ganho in-process (~2x vs SQLite) é do índice, o restante é pontuação nucleo (~25 ms) em ~19,6k entradas.
 - Durante a medição um `update --background` disparado pelo próprio `search` reescreveu catálogo+idx; restaurar um idx antigo à mão gerou idx obsoleto (erro meu, corrigido removendo e rodando `update`). O idx obsoleto só ocorre por manipulação manual, pois update regrava o idx sob o lock.
+
+## Correções da revisão (commit fix(search): pin search.idx trailer and require catalog.db for the index shortcut)
+1. Teste de dano ganhou trailer com último byte trocado (tamanho correto). Mutação: [OK] mutação PEGA: '|| &bytes[bytes.len() - 8..] != MAGIC' -> '' fez o teste falhar (exit 101).
+2. Atalho do índice no `search` exige `catalog.db` existente; `deleted_catalog_with_fresh_http_state_is_rebuilt_by_search` (tests/cli_offline.rs) agora também afirma que o catalog.db foi recriado. Sem prova de mutação para esta regra.
+3. `run_update` grava o índice antes de propagar o erro de `state.save`.
+Gate: [OK]   test (160 passed, 2 ignored) 77s / [OK]   gate verde
+
+## Segunda correção
+Teste agora abre o catalog.db read-only e exige count(*) == 28. [OK] mutação PEGA: 'let (catalog, updated) = if data.catalog_path().exists()' -> 'let (catalog, updated) = if true' fez o teste falhar (exit 101).
