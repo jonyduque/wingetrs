@@ -37,6 +37,7 @@ Use o LSP (rust-analyzer) para diagnósticos e navegação em vez de ler arquivo
 - **Erros:** `thiserror` por módulo; `anyhow` só nas bordas (`main.rs`, `cli/`, `tui::run`). Motivo: módulos precisam de erros que o chamador distingue (offline vs. integridade).
 - **Nada escreve em stdout fora de `main.rs`/`cli/`.** Logs vão por `tracing` (arquivo). Motivo: a TUI ocupa o terminal; um `println!` perdido corrompe a tela.
 - **Código específico de Windows** (`winreg`, `windows`) fica em arquivos próprios com `#[cfg(windows)]` no `mod`, nunca `if cfg!(windows)` no meio da lógica. Motivo: a lógica de correlação é testável em qualquer plataforma com dados sintéticos.
+- **Threads antecipadas são juntadas em todos os caminhos** (guard com `Drop` ou `join` antes do `?`), e pânico de worker é propagado com `std::panic::resume_unwind`, nunca engolido com `.ok()`/`if let Ok`. Motivo: o mesmo defeito (thread órfã durante update/erro) apareceu nas Tasks 18 e 20, e um pânico engolido devolve resultado parcial em silêncio.
 - **Testes unitários não acessam rede nem o registro real.** Usam `tests/fixtures/` e `wiremock`. Testes que precisam da máquina/rede reais levam `#[ignore = "live: <motivo>"]`.
 - **Fixtures são binárias ou grandes: nunca `cat`/`Read` inteiras.** Os fatos que os testes precisam já estão nos briefs.
 - **Não portar mais do que o brief pede** do winget-cli (YAGNI). Cada função portada cita o arquivo de origem em comentário de uma linha.
