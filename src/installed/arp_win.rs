@@ -52,6 +52,20 @@ fn read_hive(
     let Ok(base) = root.open_subkey_with_flags(path, flags) else {
         return;
     };
+    let step = match hive {
+        Hive::MachineX64 => "scan_arp_x64",
+        Hive::MachineX86 => "scan_arp_x86",
+        Hive::User => "scan_arp_user",
+    };
+    super::timed(step, || read_keys(&base, hive, codes, out));
+}
+
+fn read_keys(
+    base: &RegKey,
+    hive: Hive,
+    codes: &HashMap<String, String>,
+    out: &mut Vec<InstalledApp>,
+) {
     for name in base.enum_keys().flatten() {
         let Ok(k) = base.open_subkey_with_flags(&name, KEY_READ) else {
             continue;
@@ -76,7 +90,7 @@ fn read_hive(
 }
 
 pub fn read_arp() -> Result<Vec<InstalledApp>, String> {
-    let codes = upgrade_code_map();
+    let codes = super::timed("scan_upgrade_codes", upgrade_code_map);
     let mut out = Vec::new();
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     read_hive(

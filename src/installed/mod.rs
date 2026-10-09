@@ -99,12 +99,24 @@ pub struct InstalledScan {
     pub elapsed_ms: u128,
 }
 
+/// Runs `f` inside an info span named `step` and logs its wall time (visible with `-v`).
+pub fn timed<T>(step: &'static str, f: impl FnOnce() -> T) -> T {
+    let span = tracing::info_span!("step", step);
+    let _g = span.enter();
+    let t = std::time::Instant::now();
+    let out = f();
+    tracing::info!(step, ms = t.elapsed().as_secs_f64() * 1000.0, "span");
+    out
+}
+
 type Collected = Result<Vec<InstalledApp>, String>;
 
 fn collect_scoop() -> Collected {
-    Ok(scoop::scoop_root()
-        .map(|r| read_scoop(&r))
-        .unwrap_or_default())
+    timed("scan_scoop", || {
+        Ok(scoop::scoop_root()
+            .map(|r| read_scoop(&r))
+            .unwrap_or_default())
+    })
 }
 
 #[cfg(windows)]

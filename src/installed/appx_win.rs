@@ -69,32 +69,49 @@ fn read_one(c: &Candidate) -> InstalledApp {
     }
 }
 
+/// Work-stealing map: workers pull the next index, so one slow package does not stall a chunk.
 fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> Option<R> + Sync) -> Vec<R> {
-    let chunk = items.len().div_ceil(WORKERS).max(1);
-    let mut out = Vec::new();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let mut slots: Vec<(usize, R)> = Vec::new();
     std::thread::scope(|s| {
-        let f = &f;
-        let handles: Vec<_> = items
-            .chunks(chunk)
-            .map(|c| s.spawn(move || c.iter().filter_map(f).collect::<Vec<_>>()))
+        let (f, next) = (&f, &next);
+        let handles: Vec<_> = (0..WORKERS.min(items.len().max(1)))
+            .map(|_| {
+                s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        if let Some(r) = f(item) {
+                            local.push((i, r));
+                        }
+                    }
+                    local
+                })
+            })
             .collect();
         for h in handles {
             if let Ok(mut v) = h.join() {
-                out.append(&mut v);
+                slots.append(&mut v);
             }
         }
     });
-    out
+    slots.sort_by_key(|(i, _)| *i);
+    slots.into_iter().map(|(_, r)| r).collect()
 }
 
 pub fn read_appx() -> Result<Vec<InstalledApp>, String> {
-    let pm = PackageManager::new().map_err(|e| e.to_string())?;
-    let pkgs: Vec<Package> = pm
-        .FindPackagesByUserSecurityId(&HSTRING::new())
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .collect();
-    let cands = parallel(&pkgs, identify);
+    let pkgs: Vec<Package> = super::timed("scan_msix_enumerate", || {
+        let pm = PackageManager::new().map_err(|e| e.to_string())?;
+        Ok::<_, String>(
+            pm.FindPackagesByUserSecurityId(&HSTRING::new())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .collect(),
+        )
+    })?;
+    let cands = super::timed("scan_msix_identify", || parallel(&pkgs, identify));
     // Highest version per family; first seen wins ties (same as dedupe_msix_by_family).
     let mut best: HashMap<String, usize> = HashMap::new();
     let mut order: Vec<usize> = Vec::new();
@@ -116,5 +133,7 @@ pub fn read_appx() -> Result<Vec<InstalledApp>, String> {
         }
     }
     let winners: Vec<&Candidate> = order.iter().map(|&i| &cands[i]).collect();
-    Ok(parallel(&winners, |c| Some(read_one(c))))
+    Ok(super::timed("scan_msix_props", || {
+        parallel(&winners, |c| Some(read_one(c)))
+    }))
 }

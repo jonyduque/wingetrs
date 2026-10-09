@@ -365,14 +365,36 @@ async fn run_async(
             source,
             json,
         } => {
+            // Scan and normalizer start now so they overlap with the catalog open.
+            let scan_job = std::thread::spawn(|| {
+                crate::installed::timed("scan_all", crate::installed::scan_all)
+            });
+            let norm_job = std::thread::spawn(|| {
+                crate::installed::timed(
+                    "normalizer_new",
+                    crate::installed::normalize::NameNormalizer::new,
+                )
+            });
+            let t0 = std::time::Instant::now();
             let catalog = ensure_catalog(&data, &cfg, &http).await?;
-            let scan = crate::installed::scan_all();
+            tracing::info!(
+                step = "open_catalog",
+                ms = t0.elapsed().as_secs_f64() * 1000.0,
+                "span"
+            );
+            let scan = scan_job
+                .join()
+                .map_err(|_| anyhow::anyhow!("coleta de instalados falhou"))?;
+            let normalizer = norm_job
+                .join()
+                .map_err(|_| anyhow::anyhow!("normalizador falhou"))?;
             for e in &scan.errors {
                 tracing::warn!("coleta de instalados: {e}");
             }
             let t = std::time::Instant::now();
-            let normalizer = crate::installed::normalize::NameNormalizer::new();
-            let mut rows = correlate(&scan.apps, &catalog, &normalizer)?;
+            let mut rows = crate::installed::timed("correlate", || {
+                correlate(&scan.apps, &catalog, &normalizer)
+            })?;
             tracing::info!(
                 scan_ms = scan.elapsed_ms,
                 correlate_ms = t.elapsed().as_millis(),
@@ -384,11 +406,14 @@ async fn run_async(
             if upgradable {
                 rows.retain(|r| matches!(r.state, UpdateState::Available { .. }));
             }
-            if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
-            } else {
-                print!("{}", output::list_text(&rows, upgradable));
-            }
+            crate::installed::timed("output", || {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    print!("{}", output::list_text(&rows, upgradable));
+                }
+                Ok::<_, anyhow::Error>(())
+            })?;
             Ok(())
         }
     }
