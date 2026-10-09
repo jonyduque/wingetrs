@@ -3,7 +3,8 @@ pub mod output;
 
 use crate::cache::{DataDir, HttpState, now_unix};
 use crate::catalog::Catalog;
-use crate::catalog::search::SearchIndex;
+use crate::catalog::CatalogError;
+use crate::catalog::search::{Found, search_on_disk};
 use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
@@ -143,9 +144,34 @@ fn all_urls(ep: &Endpoints) -> Vec<&str> {
 /// Ensures a catalog exists (blocking update when empty) and triggers a
 /// detached refresh when it is stale.
 async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Result<Catalog> {
+    Ok(ensure_catalog_ran(data, cfg, http).await?.0)
+}
+
+/// Like `ensure_catalog`; the flag is true when a blocking update had to run.
+async fn ensure_catalog_ran(
+    data: &DataDir,
+    cfg: &Config,
+    http: &Http,
+) -> anyhow::Result<(Catalog, bool)> {
     let ep = Endpoints::production(cfg)?;
-    let catalog = Catalog::open(&data.catalog_path())?;
-    if catalog.is_empty()? {
+    let path = data.catalog_path();
+    // Cheap path: an existing, populated catalog opens read-only (no DDL, no journal write).
+    let existing = if path.exists() {
+        Catalog::open_read_only(&path)
+            .and_then(|c| c.is_empty().map(|empty| (c, empty)))
+            .ok()
+    } else {
+        None
+    };
+    let (catalog, empty) = match existing {
+        Some(found) => found,
+        None => {
+            let c = Catalog::open(&path)?;
+            let empty = c.is_empty()?;
+            (c, empty)
+        }
+    };
+    if empty {
         drop(catalog);
         let reports = run_update(data, &ep, http, true, LockWait::from_env()).await?;
         let catalog = Catalog::open(&data.catalog_path())?;
@@ -157,13 +183,13 @@ async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Re
             }
             anyhow::bail!("sem catálogo local e sem rede");
         }
-        return Ok(catalog);
+        return Ok((catalog, true));
     }
     let state = HttpState::load(&data.http_state_path());
     if needs_refresh(&state, &all_urls(&ep), now_unix()) {
         spawn_background_update();
     }
-    Ok(catalog)
+    Ok((catalog, false))
 }
 
 fn print_reports(reports: &[SourceReport]) {
@@ -172,7 +198,14 @@ fn print_reports(reports: &[SourceReport]) {
     }
 }
 
-async fn run_async(cli: Cli, data: DataDir, cfg: Config) -> anyhow::Result<()> {
+type EarlySearch = std::thread::JoinHandle<Result<Vec<Found>, CatalogError>>;
+
+async fn run_async(
+    cli: Cli,
+    data: DataDir,
+    cfg: Config,
+    early: Option<EarlySearch>,
+) -> anyhow::Result<()> {
     let http = Http::new()?;
     let Some(cmd) = cli.command else {
         anyhow::bail!("TUI ainda não implementada");
@@ -192,20 +225,19 @@ async fn run_async(cli: Cli, data: DataDir, cfg: Config) -> anyhow::Result<()> {
             json,
             limit,
         } => {
-            let catalog = ensure_catalog(&data, &cfg, &http).await?;
-            let mut index = SearchIndex::new(catalog.load_entries()?);
-            let hits = index.search(&query, source, limit);
-            let rows: Vec<_> = hits
-                .iter()
-                .filter_map(|h| index.entries().get(h.index).cloned())
-                .collect();
+            let (catalog, updated) = ensure_catalog_ran(&data, &cfg, &http).await?;
+            let early = early.and_then(|h| h.join().ok()).and_then(Result::ok);
+            let found = match early {
+                Some(found) if !updated => found,
+                _ => search_on_disk(&data.catalog_path(), &query, source, limit)?,
+            };
+            let rows: Vec<_> = found.into_iter().map(|f| f.entry).collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
             } else {
                 print!("{}", output::search_table(&rows));
             }
-            // The process exits next: skip freeing ~20k entries and closing the db (about 20 ms).
-            std::mem::forget(index);
+            // The process exits next: skip closing the db.
             std::mem::forget(catalog);
             Ok(())
         }
@@ -308,6 +340,22 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let data = DataDir::from_env()?;
+    // Start the search before logging, config and runtime setup: it only needs the file.
+    let early: Option<EarlySearch> = match &cli.command {
+        Some(Command::Search {
+            query,
+            source,
+            limit,
+            ..
+        }) if data.catalog_path().exists() => {
+            let (path, query, source, limit) =
+                (data.catalog_path(), query.clone(), *source, *limit);
+            Some(std::thread::spawn(move || {
+                search_on_disk(&path, &query, source, limit)
+            }))
+        }
+        _ => None,
+    };
     data.ensure()?;
     let _guard = init_logging(&data, if stderr_logging(&cli) { cli.verbose } else { 0 });
     let cfg = Config::load(&data.config_path())?;
@@ -326,5 +374,5 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         return crate::tui::run::run(glyphs);
     }
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(run_async(cli, data, cfg))
+    rt.block_on(run_async(cli, data, cfg, early))
 }

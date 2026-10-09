@@ -154,3 +154,112 @@ fn parallel_search_equals_sequential() {
         }
     }
 }
+
+#[allow(clippy::manual_is_multiple_of)] // brief body kept verbatim
+fn disk_catalog_with_many(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let names = [
+        "PowerToys",
+        "Power Automate",
+        "powertoys",
+        "Zeal",
+        "360安全卫士",
+        "Visual Studio Code",
+        "Café Läuft",
+        "7-Zip",
+    ];
+    let mk = |i: usize| NewPackage {
+        id: format!("Pub{}.App{i}", i % 37),
+        name: format!("{} {i}", names[i % names.len()]),
+        moniker: (i % 5 == 0).then(|| format!("m{i}")),
+        version: "1".into(),
+        tags: vec![format!("tag{}", i % 11), "power".into()],
+        commands: vec![format!("cmd{}", i % 13)],
+        ..Default::default()
+    };
+    let winget: Vec<NewPackage> = (0..n).map(mk).collect();
+    c.replace_source(
+        "winget",
+        wingetrs::core::SourceKind::Winget,
+        "v",
+        1,
+        &winget,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    let scoop: Vec<NewPackage> = (n..n + n / 3).map(mk).collect();
+    c.replace_source(
+        "scoop:main",
+        wingetrs::core::SourceKind::Scoop,
+        "e",
+        1,
+        &scoop,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    drop(c);
+    (dir, path)
+}
+
+#[test]
+fn search_on_disk_matches_in_memory_search_exactly() {
+    use wingetrs::catalog::Catalog;
+    use wingetrs::catalog::search::{SearchIndex, search_on_disk};
+    let (_d, path) = disk_catalog_with_many(6000);
+    let mut idx = SearchIndex::new(Catalog::open(&path).unwrap().load_entries().unwrap());
+    for (q, f, limit) in [
+        ("powertoys", None, 20),
+        ("power", None, 50),
+        ("power", Some(SourceKind::Scoop), 50),
+        ("安全", None, 10),
+        ("cafe", None, 10),
+        ("m10", None, 5),   // exact moniker bonus
+        ("tag3", None, 30), // tags at half weight
+        ("", None, 25),     // empty query: alphabetical
+        ("zzzz-no-match", None, 10),
+    ] {
+        let mem: Vec<(String, u32, Vec<u32>)> = idx
+            .search(q, f, limit)
+            .into_iter()
+            .map(|h| (idx.entries()[h.index].id.clone(), h.score, h.name_indices))
+            .collect();
+        let disk: Vec<(String, u32, Vec<u32>)> = search_on_disk(&path, q, f, limit)
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.entry.id, x.score, x.name_indices))
+            .collect();
+        assert_eq!(disk, mem, "query {q:?} filter {f:?} limit {limit}");
+    }
+}
+
+#[test]
+fn search_on_disk_missing_or_empty_catalog_is_empty() {
+    use wingetrs::catalog::search::search_on_disk;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        search_on_disk(&dir.path().join("nope.db"), "x", None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let p = dir.path().join("empty.db");
+    drop(wingetrs::catalog::Catalog::open(&p).unwrap());
+    assert!(search_on_disk(&p, "x", None, 10).unwrap().is_empty());
+}
+
+#[test]
+fn tag_and_command_matches_score_half_of_the_same_text_in_the_name() {
+    let mut tagged = e(SourceKind::Winget, "A.One", "Zzz", None);
+    tagged.tags = vec!["firefox".into()];
+    let mut cmd = e(SourceKind::Winget, "A.Two", "Yyy", None);
+    cmd.commands = vec!["firefox".into()];
+    let named = e(SourceKind::Winget, "B.Three", "firefox", None);
+    let mut idx = SearchIndex::new(vec![tagged, cmd, named]);
+    let hits = idx.search("firefox", None, 10);
+    let score_of = |i: usize| hits.iter().find(|h| h.index == i).unwrap().score;
+    assert!(score_of(2) > 0);
+    assert_eq!(score_of(0), score_of(2) / 2);
+    assert_eq!(score_of(1), score_of(2) / 2);
+}

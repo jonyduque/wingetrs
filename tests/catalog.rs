@@ -346,3 +346,28 @@ fn load_entries_on_empty_disk_catalog_is_empty() {
     let c = Catalog::open(&dir.path().join("catalog.db")).unwrap();
     assert!(c.load_entries().unwrap().is_empty());
 }
+
+#[test]
+fn open_read_only_does_not_write_and_sees_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("c.db");
+    let mut w = Catalog::open(&p).unwrap();
+    w.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v",
+        1,
+        &[pkg("A.A", "Alpha", "1")],
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    drop(w);
+    let r = Catalog::open_read_only(&p).unwrap();
+    assert!(!r.is_empty().unwrap());
+    assert_eq!(r.load_entries().unwrap().len(), 1);
+    assert!(
+        Catalog::open_read_only(&dir.path().join("missing.db")).is_err(),
+        "must not create a file"
+    );
+    assert!(!dir.path().join("missing.db").exists());
+}

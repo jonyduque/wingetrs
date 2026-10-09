@@ -139,6 +139,31 @@ pub enum CatalogError {
     DanglingMap(String),
 }
 
+/// Read-only connection with the settings used by every reader.
+pub(crate) fn open_worker_connection(path: &Path) -> Result<Connection, CatalogError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let _ = conn.pragma_update(None, "mmap_size", 268_435_456i64);
+    Ok(conn)
+}
+
+/// Splits `lo..=hi` into up to 8 contiguous rowid ranges (one when the span is small).
+pub(crate) fn rowid_ranges(lo: i64, hi: i64) -> Vec<(i64, i64)> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 8) as i64;
+    if workers <= 1 || hi - lo <= 1024 {
+        return vec![(lo, hi)];
+    }
+    let step = (hi - lo) / workers + 1;
+    (0..workers)
+        .map(|i| (lo + i * step, (lo + (i + 1) * step - 1).min(hi)))
+        .collect()
+}
+
 pub struct Catalog {
     conn: Connection,
     /// File path when opened from disk; lets `load_entries` read with several connections.
@@ -198,6 +223,50 @@ impl Catalog {
             conn,
             path: Some(path.to_path_buf()),
         })
+    }
+
+    /// Read-only open for an existing catalog: no schema DDL, no journal_mode write.
+    /// Never creates the file; fails when it does not exist.
+    pub fn open_read_only(path: &Path) -> Result<Catalog, CatalogError> {
+        let conn = open_worker_connection(path)?;
+        Ok(Catalog {
+            conn,
+            path: Some(path.to_path_buf()),
+        })
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub(crate) fn rowid_bounds(&self) -> Result<Option<(i64, i64)>, CatalogError> {
+        let (lo, hi): (Option<i64>, Option<i64>) =
+            self.conn
+                .query_row("SELECT min(rowid), max(rowid) FROM packages", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+        Ok(lo.zip(hi))
+    }
+
+    /// Entries for the given rowids, keyed by rowid.
+    pub(crate) fn entries_by_rowid(
+        &self,
+        ids: &[i64],
+    ) -> Result<HashMap<i64, PackageEntry>, CatalogError> {
+        let mut out = HashMap::with_capacity(ids.len());
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {ENTRY_COLS}, rowid FROM packages WHERE rowid IN ({list})"
+        ))?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(10)?, entry_from_row(r)?)))?;
+        for r in rows {
+            let (id, e) = r?;
+            out.insert(id, e);
+        }
+        Ok(out)
     }
 
     pub fn open_in_memory() -> Result<Catalog, CatalogError> {
@@ -315,44 +384,26 @@ impl Catalog {
         self.load_entries_once()
     }
 
-    fn data_version(&self) -> Result<i64, CatalogError> {
+    pub(crate) fn data_version(&self) -> Result<i64, CatalogError> {
         Ok(self
             .conn
             .query_row("PRAGMA data_version", [], |r| r.get(0))?)
     }
 
     fn load_entries_once(&self) -> Result<Vec<PackageEntry>, CatalogError> {
-        let (lo, hi): (Option<i64>, Option<i64>) =
-            self.conn
-                .query_row("SELECT min(rowid), max(rowid) FROM packages", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?;
-        let (Some(lo), Some(hi)) = (lo, hi) else {
+        let Some((lo, hi)) = self.rowid_bounds()? else {
             return Ok(Vec::new());
         };
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |n| n.get())
-            .clamp(1, 8) as i64;
-        let Some(path) = self
-            .path
-            .as_deref()
-            .filter(|_| workers > 1 && hi - lo > 1024)
-        else {
+        let ranges = rowid_ranges(lo, hi);
+        let Some(path) = self.path.as_deref().filter(|_| ranges.len() > 1) else {
             return Self::load_range(&self.conn, lo, hi);
         };
-        let step = (hi - lo) / workers + 1;
         let parts: Vec<Result<Vec<PackageEntry>, CatalogError>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..workers)
-                .map(|i| {
-                    let (from, to) = (lo + i * step, (lo + (i + 1) * step - 1).min(hi));
+            let handles: Vec<_> = ranges
+                .iter()
+                .map(|&(from, to)| {
                     s.spawn(move || {
-                        let conn = Connection::open_with_flags(
-                            path,
-                            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                        )?;
-                        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-                        let _ = conn.pragma_update(None, "mmap_size", 268_435_456i64);
+                        let conn = open_worker_connection(path)?;
                         Self::load_range(&conn, from, to)
                     })
                 })
@@ -424,7 +475,7 @@ impl Catalog {
     pub fn is_empty(&self) -> Result<bool, CatalogError> {
         let n: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM packages", [], |r| r.get(0))?;
+            .query_row("SELECT EXISTS(SELECT 1 FROM packages)", [], |r| r.get(0))?;
         Ok(n == 0)
     }
 }
