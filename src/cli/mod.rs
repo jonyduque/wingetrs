@@ -289,12 +289,15 @@ fn search_best(
     source: Option<SourceKind>,
     limit: usize,
 ) -> Result<Vec<Found>, CatalogError> {
-    match index_file::search(&data.search_index_path(), query, source, limit) {
-        Ok(Some(found)) => return Ok(found),
-        Ok(None) => {}
-        Err(e) => tracing::warn!("índice de busca inutilizável, usando o catálogo: {e}"),
-    }
-    search_on_disk(&data.catalog_path(), query, source, limit)
+    let out = search_early(
+        &data.search_index_path(),
+        &data.catalog_path(),
+        query,
+        source,
+        limit,
+    );
+    out.log_warning();
+    out.result
 }
 
 fn print_reports(reports: &[SourceReport]) {
@@ -303,37 +306,71 @@ fn print_reports(reports: &[SourceReport]) {
     }
 }
 
+/// Result of the early search plus the index problem seen on the way: the thread runs before the
+/// log is initialised, so the caller records the warning after the join.
+struct EarlyOutcome {
+    result: Result<Vec<Found>, CatalogError>,
+    index_warning: Option<String>,
+}
+
+impl EarlyOutcome {
+    fn log_warning(&self) {
+        if let Some(w) = &self.index_warning {
+            tracing::warn!("índice de busca inutilizável, usando o catálogo: {w}");
+        }
+    }
+}
+
 /// The search thread started before setup. Joined on every path: explicitly before a blocking
 /// update, or by `Drop` (e.g. after an error), so it never outlives the work that follows.
-struct EarlySearch(Option<std::thread::JoinHandle<Result<Vec<Found>, CatalogError>>>);
+struct EarlySearch(Option<std::thread::JoinHandle<EarlyOutcome>>);
 
 impl EarlySearch {
-    /// Waits for the thread; `None` when already taken, failed or panicked.
-    fn join(&mut self) -> Option<Vec<Found>> {
-        self.0.take()?.join().ok()?.ok()
+    /// Waits for the thread; `None` when already taken. A worker panic is propagated.
+    fn join(&mut self) -> Option<EarlyOutcome> {
+        match self.0.take()?.join() {
+            Ok(out) => Some(out),
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 }
 
 impl Drop for EarlySearch {
     fn drop(&mut self) {
-        let _ = self.join();
+        // While already unwinding, a second panic would abort: just reap the thread.
+        if std::thread::panicking() {
+            if let Some(h) = self.0.take() {
+                let _ = h.join();
+            }
+        } else {
+            let _ = self.join();
+        }
     }
 }
 
-/// Early-thread body: `search.idx` first, the catalog file when the index is absent or invalid.
+/// Search body: `search.idx` first, the catalog file when the index is absent or invalid.
 fn search_early(
     idx: &std::path::Path,
     catalog: &std::path::Path,
     query: &str,
     source: Option<SourceKind>,
     limit: usize,
-) -> Result<Vec<Found>, CatalogError> {
+) -> EarlyOutcome {
+    let mut index_warning = None;
     match index_file::search(idx, query, source, limit) {
-        Ok(Some(found)) => return Ok(found),
+        Ok(Some(found)) => {
+            return EarlyOutcome {
+                result: Ok(found),
+                index_warning,
+            };
+        }
         Ok(None) => {}
-        Err(e) => tracing::warn!("índice de busca inutilizável, usando o catálogo: {e}"),
+        Err(e) => index_warning = Some(e.to_string()),
     }
-    search_on_disk(catalog, query, source, limit)
+    EarlyOutcome {
+        result: search_on_disk(catalog, query, source, limit),
+        index_warning,
+    }
 }
 
 async fn run_async(
@@ -373,8 +410,12 @@ async fn run_async(
                 (Some(c), updated)
             };
             let early = early.as_mut().and_then(EarlySearch::join);
-            let found = match early {
-                Some(found) if !updated => found,
+            if let Some(out) = &early {
+                out.log_warning();
+            }
+            // An early search error (not a panic) falls back to a fresh search.
+            let found = match early.map(|o| o.result) {
+                Some(Ok(found)) if !updated => found,
                 _ => search_best(&data, &query, source, limit)?,
             };
             let rows: Vec<_> = found.into_iter().map(|f| f.entry).collect();
@@ -556,4 +597,18 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(cli, data, cfg, early))
+}
+
+#[cfg(test)]
+mod early_tests {
+    use super::*;
+
+    #[test]
+    fn early_search_propagates_worker_panic() {
+        let mut early = EarlySearch(Some(std::thread::spawn(|| -> EarlyOutcome {
+            panic!("worker boom")
+        })));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| early.join()));
+        assert!(r.is_err(), "worker panic must be resumed, not swallowed");
+    }
 }
