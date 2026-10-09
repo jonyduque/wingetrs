@@ -5,6 +5,7 @@
 - Gate antes de cada commit: `pwsh -File scripts/verify.ps1` deve terminar com `[OK]   gate verde`. Se demorar, espere ativamente (um laço que confere o arquivo de saída até aparecer o exit) antes de encerrar o turno — não encerre esperando notificação.
 - Commits pequenos, mensagem em inglês no formato `feat(<módulo>): ...`/`test(...)`/`fix(...)`, terminando com a linha `Co-Authored-By: Claude <noreply@anthropic.com>`. Nunca `git push`.
 - Não adicione dependências fora das listadas no brief. Não edite arquivos fora da lista **Files** sem registrar o motivo no relatório.
+- Nunca varra o disco inteiro (`find /`, `Get-ChildItem C:\ -Recurse`); procure só no repositório e em caminhos conhecidos. Encerre todo processo que você iniciou em segundo plano antes de responder.
 - Se algo do brief não existir ou contradizer o código real: pare, registre `BLOCKED: <motivo com evidência>` no relatório. Não invente uma alternativa silenciosa.
 
 #### Report contract

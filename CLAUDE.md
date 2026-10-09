@@ -48,6 +48,8 @@ Use o LSP (rust-analyzer) para diagnósticos e navegação em vez de ler arquivo
 - `git checkout`/`restore`/`stash`/`clean`/`reset` em arquivos que você não criou.
 - `git push` (não há remoto; integração é do orquestrador).
 - `cargo update` (versões travadas no `Cargo.lock`).
+- `find /`, `Get-ChildItem C:\ -Recurse` ou qualquer varredura do disco inteiro: um `find / -name oracle.py` esquecido por um subagente ficou horas consumindo CPU e invalidou os benchmarks. Procure só dentro do repositório, do scratchpad ou de caminhos conhecidos.
+- Deixar processos em segundo plano vivos ao terminar (servidores, watchers, buscas): encerre tudo que você iniciou antes de responder.
 - Editar `docs/superpowers/specs/*`, `docs/superpowers/plans/*`, `.claude/tasks/progress.md` (são do orquestrador).
 
 ## Economia de contexto (subagentes)
