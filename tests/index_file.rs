@@ -128,6 +128,11 @@ fn missing_file_is_none_and_damaged_files_are_errors_never_panics() {
     ] {
         assert!(IndexView::parse(&good[..cut]).is_err(), "cut {cut}");
     }
+    // right size, damaged trailer
+    let mut b = good.clone();
+    let n = b.len();
+    b[n - 1] ^= 0xFF;
+    assert!(IndexView::parse(&b).is_err());
     // wrong version byte
     let mut bad = good.clone();
     bad[7] = 2;

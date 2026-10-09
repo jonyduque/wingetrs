@@ -283,8 +283,8 @@ async fn run_async(
             limit,
         } => {
             // A valid non-empty search.idx proves a catalog exists: skip opening SQLite.
-            let (catalog, updated) = if index_file::probe(&data.search_index_path())
-                .is_some_and(|n| n > 0)
+            let (catalog, updated) = if data.catalog_path().exists()
+                && index_file::probe(&data.search_index_path()).is_some_and(|n| n > 0)
             {
                 let ep = Endpoints::production(&cfg)?;
                 refresh_if_stale(&data, &ep);

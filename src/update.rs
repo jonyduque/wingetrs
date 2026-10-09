@@ -229,7 +229,7 @@ pub async fn run_update(
             outcome,
         });
     }
-    state.save(&data.http_state_path())?;
+    let saved = state.save(&data.http_state_path());
     let index_path = data.search_index_path();
     let updated = reports
         .iter()
@@ -237,6 +237,7 @@ pub async fn run_update(
     if updated || !index_path.exists() {
         write_search_index(&catalog, &index_path);
     }
+    saved?;
     Ok(reports)
 }
 
