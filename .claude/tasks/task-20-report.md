@@ -44,3 +44,11 @@ Concerns:
 - First run of `cargo test --release --ignored` (all targets) showed the correlate live test FAILED once (0.62 s, cause not captured, likely right after a rebuild); 3 later runs passed.
 - Edited src/installed/arp_win.rs, appx_win.rs, mod.rs, cli/mod.rs (list path only); all in the Files list.
 - Machine noise: first runs vary +-50 ms; delta values are interleaved with noop baseline.
+
+## Review fix (commit: see `git log -1`, fix(list): join early threads on every path and propagate worker panics)
+- cli/mod.rs: ensure_catalog result held, both early threads joined, only then `?`. Test tests/cli_offline.rs list_without_catalog_and_without_network_fails_cleanly_and_fast (no "panicked", < 5 s).
+- parallel moved to src/installed/par.rs (pure, no cfg), worker panic -> resume_unwind. Tests in tests/installed.rs (order of 1000 items, panic propagates).
+- Gate: [OK] test (164 passed, 2 ignored) / [OK]   gate verde
+- Mutation: [OK] mutação PEGA: 'items.get(i)' -> 'items.get(i + 1)' fez o teste falhar (exit 101).
+- Also mutated `Err(p) => resume_unwind` -> `Err(_) => {}`: test failed (caught).
+- Bench list (1 round, -Baseline): median 344.8 ms, delta median 309.0 ms (< 350, no regression; machine noisy).
