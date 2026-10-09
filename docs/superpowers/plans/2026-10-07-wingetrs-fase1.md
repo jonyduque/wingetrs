@@ -3266,3 +3266,231 @@ fn open_read_only_does_not_write_and_sees_data() {
 - Test: `tests/search.rs`, `tests/catalog.rs`
 
 **Commit:** `perf(search): fused on-disk scan, early start and cheap read-only open`
+
+### Task 19: Arquivo de busca compacto (`search.idx`)
+
+#### Where this fits
+
+Decidido pelo usuário em 2026-10-08. Perfil do orquestrador (release, mediana): após a Task 18 o `search` custa **66–70 ms acima de um processo vazio** (`bench.ps1 -Baseline target/release/examples/noop.exe`). O que sobra está no SQLite: abrir conexão + primeira consulta ao `catalog.db` custa 11–15 ms (medido também em Python), ler as linhas ~24 ms numa thread, e 8 conexões paralelas competem no `prepare` (4 → 16–20 ms). Solução: o `update` grava, ao lado do catálogo, um arquivo binário só com os campos da busca; o `search` da CLI lê esse arquivo inteiro (`std::fs::read`, ~2–3 MB) e pontua em paralelo, sem SQLite.
+
+#### What binds this task
+
+- Arquivo: `DataDir::search_index_path()` = `<root>/search.idx` (acrescente o método em `src/cache/mod.rs`).
+- Sem dependência nova (nada de memmap2/bincode): leitura com `std::fs::read`, formato próprio little-endian descrito abaixo.
+- **Ranking idêntico** ao caminho em memória e a `search_on_disk`: use `Query`, `EntryView` e `score_entry` existentes em `src/catalog/search.rs`; ordenação idêntica (estável; vazia ⇒ nome minúsculo; senão score desc, desempate por nome minúsculo; entradas na ordem do catálogo, `rowid`).
+- Arquivo **ausente, inválido, truncado ou de versão diferente ⇒ fallback silencioso** para `search_on_disk` (com `tracing::warn!` quando inválido). Dado externo nunca causa pânico: toda leitura com checagem de limites.
+- Saída do `search` (tabela, `--json`, `--source`) idêntica à atual.
+- A TUI **não** muda nesta tarefa.
+- Meta: `pwsh -File scripts/bench.ps1 -Exe target/release/wingetrs.exe -Args 'search powertoys' -Runs 15 -Baseline target/release/examples/noop.exe` com **delta median < 30 ms** (hoje 66–70). Antes/depois, 2 rodadas cada, colados. Build do baseline: `cargo build --release --example noop`.
+
+#### Formato `search.idx` v1 (decidido)
+
+```
+offset 0  : magic  b"WRSIDX\0\x01"          (8 bytes; último byte = versão do formato = 1)
+offset 8  : u32 entry_count
+offset 12 : u32 reserved = 0
+offset 16 : u64 body_len                    (bytes do corpo que segue)
+offset 24 : u32 offsets[entry_count]        (início de cada registro, relativo ao começo do corpo)
+...       : corpo: registros concatenados
+fim       : magic b"WRSIDX\0\x01" de novo (trailer: detecta truncamento)
+```
+
+Registro (na ordem `rowid` do catálogo): `u8 kind` (0 = winget, 1 = scoop) seguido de 9 campos de texto, cada um `u32 len` + bytes UTF-8, ou `len = 0xFFFF_FFFF` para `None`: `source_name, id, name, moniker, version, publisher, description, tags, commands` (tags/commands como no catálogo: palavras separadas por espaço).
+
+Validação na leitura: magic inicial e final, versão = 1, `24 + 4*entry_count + body_len + 8 == file_len`, cada offset `< body_len` e crescente, cada campo dentro do registro, `std::str::from_utf8` em cada campo usado (erro ⇒ arquivo inválido ⇒ fallback).
+
+#### Interfaces (decididas)
+
+```rust
+// src/catalog/index_file.rs  (pub mod index_file; em catalog/mod.rs)
+pub const MAGIC: &[u8; 8] = b"WRSIDX\0\x01";
+
+#[derive(Debug, thiserror::Error)]
+pub enum IndexFileError {
+    #[error("índice de busca inválido: {0}")]
+    Invalid(&'static str),
+    #[error("E/S no índice de busca: {0}")]
+    Io(String),
+    #[error(transparent)]
+    Catalog(#[from] super::CatalogError),
+}
+
+/// Serializes the catalog's search columns (load_entries order) and writes `path` atomically
+/// (write `path.tmp`, then rename; retry the rename up to 5 times, 20 ms apart, because a
+/// concurrent reader on Windows can make it fail transiently).
+pub fn write(catalog: &super::Catalog, path: &std::path::Path) -> Result<usize, IndexFileError>;
+
+/// Parsed, validated view over the bytes of a search.idx (borrows `bytes`).
+pub struct IndexView<'a> { /* bytes, offsets */ }
+impl<'a> IndexView<'a> {
+    pub fn parse(bytes: &'a [u8]) -> Result<IndexView<'a>, IndexFileError>;
+    pub fn len(&self) -> usize;
+    pub fn view(&self, i: usize) -> Result<(EntryView<'a>, RecordRest<'a>), IndexFileError>;
+    pub fn entry(&self, i: usize) -> Result<PackageEntry, IndexFileError>; // materializes one record
+}
+/// Remaining fields of a record not needed for scoring.
+pub struct RecordRest<'a> { pub source_name: &'a str, pub version: &'a str, pub publisher: Option<&'a str>, pub description: Option<&'a str> }
+
+/// Reads `path` and searches it in parallel (same chunking idea as SearchIndex: up to 8 workers
+/// over contiguous record ranges, each with its own nucleo Matcher). Ok(None) when the file is
+/// missing; Err when it is invalid (caller falls back).
+pub fn search(path: &std::path::Path, query: &str, filter: Option<SourceKind>, limit: usize)
+    -> Result<Option<Vec<super::search::Found>>, IndexFileError>;
+```
+
+(`EntryView` e `Found` são os tipos já existentes em `src/catalog/search.rs`.)
+
+#### Integração
+
+1. **Update** (`src/update.rs`, `run_update`): depois do último `replace_source`/salvar `http.json`, ainda sob o lock: se alguma fonte teve `Outcome::Updated` **ou** o `search.idx` não existe, chame `index_file::write` (abrindo o catálogo). Falha ao gravar o índice ⇒ `tracing::warn!` e segue (o `search` cai no fallback); não transforma o update em erro.
+2. **CLI `search`** (`src/cli/mod.rs`): a thread antecipada (guard `EarlySearch` da Task 18) passa a tentar `index_file::search` primeiro; `Ok(None)`/`Err` ⇒ `search_on_disk` como hoje.
+3. **`ensure_catalog` no caminho do `search`:** se `search.idx` existe e é válido, não é preciso abrir o SQLite para checar "catálogo vazio" — índice com `entry_count > 0` prova que há catálogo. Mantenha o disparo de refresh em segundo plano pelo `http.json` (barato). Se o índice não existe ⇒ caminho atual.
+4. **Concorrência:** `fs::read` lê e fecha o arquivo (o Rust no Windows abre com share read/write/delete), então o rename do writer não deve falhar por causa do leitor; mesmo assim, faça o retry do rename e teste-o.
+
+#### Traps already paid for that apply here
+
+- Gargalo medido é abrir/preparar SQLite e alocar `String` por linha — o caminho novo não pode reintroduzir `PackageEntry` por registro durante a varredura; materialize só os `limit` finais (`IndexView::entry`).
+- Ordem dos registros = ordem de `load_entries` (rowid); o desempate estável depende disso.
+- Medir com `-Baseline` (a carga da máquina variou o piso de 38 a 67 ms na mesma sessão).
+
+#### The body of the tests that are not obvious
+
+`tests/index_file.rs` (new):
+
+```rust
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use wingetrs::catalog::index_file::{self, IndexView, MAGIC};
+use wingetrs::catalog::search::{search_on_disk, SearchIndex};
+use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
+use wingetrs::core::SourceKind;
+
+fn catalog(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let names = ["PowerToys", "Power Automate", "powertoys", "Zeal", "360安全卫士", "Visual Studio Code", "Café Läuft", "7-Zip"];
+    let mk = |i: usize| NewPackage {
+        id: format!("Pub{}.App{i}", i % 37),
+        name: format!("{} {i}", names[i % names.len()]),
+        moniker: (i % 5 == 0).then(|| format!("m{i}")),
+        version: format!("1.{i}"),
+        publisher: (i % 3 == 0).then(|| "Pub".to_string()),
+        description: (i % 4 == 0).then(|| format!("desc {i} ✓")),
+        tags: vec![format!("tag{}", i % 11), "power".into()],
+        commands: vec![format!("cmd{}", i % 13)],
+        ..Default::default()
+    };
+    let w: Vec<NewPackage> = (0..n).map(mk).collect();
+    c.replace_source("winget", SourceKind::Winget, "v", 1, &w, &WingetMaps::default()).unwrap();
+    let s: Vec<NewPackage> = (n..n + n / 3).map(mk).collect();
+    c.replace_source("scoop:main", SourceKind::Scoop, "e", 1, &s, &WingetMaps::default()).unwrap();
+    drop(c);
+    (dir, path)
+}
+
+#[test]
+fn round_trip_every_entry() {
+    let (d, db) = catalog(500);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    assert_eq!(index_file::write(&cat, &idx).unwrap(), 666);
+    let bytes = std::fs::read(&idx).unwrap();
+    let v = IndexView::parse(&bytes).unwrap();
+    let mem = cat.load_entries().unwrap();
+    assert_eq!(v.len(), mem.len());
+    for (i, e) in mem.iter().enumerate() {
+        assert_eq!(&v.entry(i).unwrap(), e, "record {i}");
+    }
+    assert!(!idx.with_extension("idx.tmp").exists());
+}
+
+#[test]
+fn index_search_matches_in_memory_and_sqlite_exactly() {
+    let (d, db) = catalog(6000);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    index_file::write(&cat, &idx).unwrap();
+    let mut mem = SearchIndex::new(cat.load_entries().unwrap());
+    for (q, f, limit) in [
+        ("powertoys", None, 20), ("power", None, 50), ("power", Some(SourceKind::Scoop), 50),
+        ("安全", None, 10), ("cafe", None, 10), ("m10", None, 5), ("tag3", None, 30),
+        ("", None, 25), ("zzzz-no-match", None, 10),
+    ] {
+        let a: Vec<(String, u32, Vec<u32>)> = mem.search(q, f, limit).into_iter()
+            .map(|h| (mem.entries()[h.index].id.clone(), h.score, h.name_indices)).collect();
+        let b: Vec<(String, u32, Vec<u32>)> = index_file::search(&idx, q, f, limit).unwrap().unwrap().into_iter()
+            .map(|x| (x.entry.id, x.score, x.name_indices)).collect();
+        let c: Vec<(String, u32, Vec<u32>)> = search_on_disk(&db, q, f, limit).unwrap().into_iter()
+            .map(|x| (x.entry.id, x.score, x.name_indices)).collect();
+        assert_eq!(b, a, "index vs memory: {q:?} {f:?}");
+        assert_eq!(c, a, "sqlite vs memory: {q:?} {f:?}");
+    }
+}
+
+#[test]
+fn missing_file_is_none_and_damaged_files_are_errors_never_panics() {
+    let (d, db) = catalog(300);
+    let idx = d.path().join("search.idx");
+    assert!(index_file::search(&idx, "x", None, 10).unwrap().is_none());
+    index_file::write(&Catalog::open(&db).unwrap(), &idx).unwrap();
+    let good = std::fs::read(&idx).unwrap();
+    // truncations
+    for cut in [0, 7, 8, 23, 24, good.len() / 2, good.len() - 8, good.len() - 1] {
+        assert!(IndexView::parse(&good[..cut]).is_err(), "cut {cut}");
+    }
+    // wrong version byte
+    let mut bad = good.clone();
+    bad[7] = 2;
+    assert!(IndexView::parse(&bad).is_err());
+    // count claims more entries than exist
+    let mut bad = good.clone();
+    bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(IndexView::parse(&bad).is_err());
+    // deterministic byte flips anywhere: parse/search may fail, but must never panic
+    let mut x: u32 = 0x9E37_79B9;
+    for _ in 0..500 {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        let mut b = good.clone();
+        let pos = (x as usize) % b.len();
+        b[pos] ^= (x >> 24) as u8 | 1;
+        if let Ok(v) = IndexView::parse(&b) {
+            for i in 0..v.len() { let _ = v.view(i); let _ = v.entry(i); }
+        }
+    }
+    assert_eq!(&good[..8], MAGIC);
+}
+```
+
+Em `tests/update.rs` (new test fn), usando o `setup()` existente:
+
+```rust
+#[tokio::test]
+async fn update_writes_search_index_and_rebuilds_it_when_missing() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    run_update(&data, &ep, &Http::new().unwrap(), true, wingetrs::update::LockWait::from_env()).await.unwrap();
+    let bytes = std::fs::read(data.search_index_path()).unwrap();
+    assert_eq!(wingetrs::catalog::index_file::IndexView::parse(&bytes).unwrap().len(), 28);
+    std::fs::remove_file(data.search_index_path()).unwrap();
+    // Fresh (no network needed): the missing index alone must trigger a rebuild.
+    run_update(&data, &ep, &Http::new().unwrap(), false, wingetrs::update::LockWait::from_env()).await.unwrap();
+    assert!(data.search_index_path().exists());
+}
+```
+
+Confira a assinatura real de `run_update`/`LockWait` com `rust-analyzer symbols < src/update.rs` e ajuste só a chamada, nunca as asserções.
+
+#### Checks beyond the steps
+
+- Mutation proofs (`-TestCommand 'cargo test --quiet --test index_file'`): (1) remover a checagem do trailer ⇒ PEGA (truncamento `good.len() - 8`); (2) trocar o desempate por nome por desempate por índice no `search` do arquivo ⇒ PEGA; (3) no update, remover a condição "índice ausente" ⇒ `update_writes_search_index_and_rebuilds_it_when_missing` PEGA (`--test update`).
+- `cargo run --release -- update` (sem `--force`; a condição "índice ausente" deve gerar o `search.idx` real) e depois `search powertoys`, `search powertoys --json`, `search "" -n 5`, `search powertoys --source scoop`: saída idêntica à do binário anterior (diff colado). Tamanho do `search.idx` real colado.
+- Bench com `-Baseline` antes/depois (2 rodadas cada), colado.
+
+**Files:**
+- Create (new): `src/catalog/index_file.rs`, `tests/index_file.rs`
+- Modify: `src/catalog/mod.rs`, `src/cache/mod.rs`, `src/update.rs`, `src/cli/mod.rs`
+- Test: `tests/update.rs`
+
+**Commit:** `perf(search): compact search.idx written by update and read by search`
