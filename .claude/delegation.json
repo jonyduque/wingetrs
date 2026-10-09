@@ -15,7 +15,19 @@
   ],
   "mutateCommand": "pwsh -File scripts/mutate.ps1 -Path <file> -Anchor '<exact text>' -Replacement '<text>' -TestCommand '<one test>'",
   "auditCommand": "",
-  "projectRules": "- External data never panics: no unwrap/expect outside tests (clippy denies), typed errors with thiserror; the catalog changes without notice and one bad manifest must not kill the TUI.\n- Nothing prints to stdout outside src/main.rs and src/cli/; the TUI owns the terminal and a stray println corrupts the screen.\n- Windows-only code in *_win.rs behind #[cfg(windows)] mod; never cfg!(windows) inside shared logic, so correlation stays testable with synthetic data.\n- Unit/integration tests never touch the network or the real registry; live tests are #[ignore = \"live: ...\"].\n- No new dependency unless the brief lists it; the set was verified together in a probe crate.\n- User-facing text in Portuguese; code and comments in English.\n",
-  "designTasks": [10, 12, 15],
-  "docsTask": 15
+  "projectRules": "- External data never panics: no unwrap/expect outside tests (clippy denies), typed errors with thiserror; the catalog changes without notice and one bad manifest must not kill the TUI.\n- Nothing prints to stdout outside src/main.rs and src/cli/; the TUI owns the terminal and a stray println corrupts the screen.\n- Windows-only code in *_win.rs behind #[cfg(windows)] mod; never cfg!(windows) inside shared logic, so correlation stays testable with synthetic data.\n- Unit/integration tests never touch the network or the real registry; live tests are #[ignore = \"live: ...\"].\n- No new dependency unless the brief lists it; the set was verified together in a probe crate.\n- User-facing text in Portuguese; code and comments in English.\n- Early threads are joined on every path and worker panics are re-raised with resume_unwind (escaped in tasks 18, 20 and the final review).\n- More than one path to the same result needs an equivalence test (search in memory / SQLite / search.idx).\n- Third-party files (winget installed.db) are read-only and never opened in WAL mode.\n- Measure before optimizing; benchmarks only with -Baseline; revert optimizations without measured gain.\n",
+  "designTasks": [
+    10,
+    12,
+    15
+  ],
+  "docsTask": 15,
+  "_designTasks": [
+    "Fase 1: design (opus) = 10 normalizer, 12 correlação, 15 validação, 21 desempates. Nesses o revisor opus achou os defeitos mais caros (MSIX sparse, rastreamento do winget). Transcrição com testes literais rodou bem em sonnet."
+  ],
+  "_perf": [
+    "Tarefas que medem tempo rodam sozinhas; bench sempre com -Baseline target/release/examples/noop.exe; A/B contra a base para números decisivos."
+  ],
+  "leftoversCommand": "pwsh -File scripts/leftovers.ps1",
+  "rulesCommand": "pwsh -File scripts/check_rules.ps1"
 }

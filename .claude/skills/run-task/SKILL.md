@@ -5,40 +5,35 @@ description: Orquestra UMA tarefa do plano do wingetrs com subagentes de baixo c
 
 # run-task — laço por tarefa com contexto mínimo
 
-O orquestrador (sessão principal) **não implementa**. Ele despacha, audita e integra. O objetivo é que cada subagente receba só o que precisa e devolva só o que o orquestrador precisa.
+O orquestrador (sessão principal) **não implementa**. Ele despacha, audita e integra. Cada subagente recebe só o que precisa e devolve só o que o orquestrador precisa. Antes de escrever briefs ou otimizar, leia `docs/ARMADILHAS.md`.
 
-## Laço (uma tarefa N por vez; tarefas tocam os mesmos arquivos)
+## Laço (uma tarefa N)
 
-1. **Base:** `git rev-parse HEAD > .claude/tasks/task-N-base.txt` (deixe o arquivo sujo de propósito — o primeiro commit da tarefa o inclui).
-2. **Brief:** `pwsh -File scripts/brief.ps1 N` e `pwsh -File scripts/check_briefs.ps1 -Dir .claude/tasks N N`. Exit ≠ 0 → corrija o plano, não o brief.
-3. **Modelo:** consulte `.claude/delegation.json` → `designTasks`. Tarefa de design → `model: "opus"`; demais → `rs-implementer` (sonnet).
-4. **Despacho do implementador** (Agent tool, `subagent_type: "rs-implementer"`), prompt mínimo:
-   ```
-   Brief: .claude/tasks/task-N-brief.md
-   Base: <sha>
-   Implemente conforme o brief e o CLAUDE.md. Responda em ≤10 linhas.
-   ```
-   Não cole o brief no prompt (o agente lê o arquivo). Não cole contexto da conversa.
-5. **Gate independente:** rode você mesmo `pwsh -File scripts/verify.ps1`. Leia o relatório `.claude/tasks/task-N-report.md` (não o transcript do agente).
-6. **Auditoria barata do relatório:** cada SHA → `git cat-file -t <sha>` = `commit`; linhas de mutação com `[OK] mutação PEGA`; nada de "tests pass" sem saída.
-7. **Revisão** (`subagent_type: "rs-reviewer"`), prompt mínimo:
-   ```
-   Brief: .claude/tasks/task-N-brief.md
-   Diff: <base>..HEAD
-   Relatório: .claude/tasks/task-N-report.md
-   ```
-8. **Correção:** só Critical/Important. Reenvie ao mesmo implementador (SendMessage, mantém o contexto dele) a lista de achados, não o review inteiro. Achado que não se sustenta: recuse com a evidência.
-9. **Ledger:** acrescente uma linha em `.claude/tasks/progress.md`: `| N | título | base..head | DONE | modelo | notas |`. Commit do ledger + base: `chore(tasks): record task N`.
+1. **Base:** `git rev-parse HEAD > .claude/tasks/task-N-base.txt`.
+2. **Brief:** `pwsh -File scripts/brief.ps1 N [-Plan <plano>]` e `pwsh -File scripts/check_briefs.ps1 -Dir .claude/tasks N N`. Exit ≠ 0 → corrija o plano, não o brief.
+3. **Modelo:** `.claude/delegation.json` → `designTasks` vão para `model: "opus"`; demais para `rs-implementer` (sonnet). Revisor: sonnet; **opus** para tarefas de design e para revisões finais de lote.
+4. **Despacho do implementador** (`subagent_type: "rs-implementer"`), prompt mínimo: caminho do brief, SHA base, e só o que mudou desde o plano (ex.: "outro agente edita X em paralelo: só `git add` dos seus arquivos"). Não cole o brief.
+5. **Auditoria barata** (você mesmo, sem ler o transcript):
+   - `git cat-file -t <sha>` = `commit` para cada SHA do relatório;
+   - `pwsh -File scripts/verify.ps1` (gate independente);
+   - **toda regra do brief sem `[OK] mutação PEGA` colado ⇒ rode você a mutação** (duas vezes nesta fase isso achou regra descoberta);
+   - mudança de desempenho ⇒ reexecute um bench com `-Baseline` e compare;
+   - mudança de comportamento visível ⇒ rode o binário real (`target/release/wingetrs.exe …`) e olhe a saída;
+   - `pwsh -File scripts/leftovers.ps1` — processos de agente sobrando (só reporte; encerrar exige pedido do usuário).
+6. **Revisão** (`subagent_type: "rs-reviewer"`): brief + `git show <sha>` + relatório + um "foco extra" escrito por você com os riscos específicos da tarefa (concorrência, arquivos de terceiros, equivalência entre caminhos, dados reais).
+7. **Correção:** só Critical/Important, mais Minors baratos que protegem tarefa futura. Reenvie ao **mesmo** implementador (SendMessage) a lista exata, com o teste literal quando possível. Achado que não se sustenta: recuse com a evidência (ex.: CRLF "faltando" que estava lá).
+8. **Ledger:** uma linha em `.claude/tasks/progress.md` com o que a revisão achou (é o que alimenta `docs/ARMADILHAS.md`). Commit do ledger + base + relatório com `git commit -- <arquivos>`.
+9. **Lição nova?** Se um defeito escapou do implementador e só a revisão pegou, pergunte: qual instrumento deixaria isso impossível? (regra em `check_rules.ps1`, item em `ARMADILHAS.md`, regra no `CLAUDE.md`, seção no `_common.md`). Faça isso **antes** da próxima tarefa e prove o instrumento (plante a violação, veja o gate falhar, restaure).
 
-## Regras de economia
+## Paralelismo
 
-- Nunca leia o arquivo de saída/transcript do subagente; leia o relatório.
-- Saída de comandos sempre filtrada (`verify.ps1` já resume).
-- Uma tarefa por vez; não paralelize tarefas que compartilham `Cargo.toml`/`lib.rs`.
-- Revisão final do branch (após a última tarefa): um único revisor com `model: "opus"` sobre `git diff <base da task 1>..HEAD --stat` + os hunks que ele pedir.
+- Tarefas que tocam arquivos disjuntos podem rodar em paralelo; avise cada agente dos arquivos do outro e proíba `git add -A`.
+- **Tarefas que medem tempo rodam sozinhas** — e nenhuma revisão com `cargo test` em paralelo a um benchmark.
+- Revisor é read-only e pode rodar junto com a próxima implementação se os arquivos não se cruzam.
 
 ## Quando parar e perguntar ao usuário
 
-- Implementador devolve `BLOCKED` por contradição entre brief e realidade (API não existe, fixture diferente).
+- Implementador devolve `BLOCKED` por contradição entre brief e realidade.
 - Gate vermelho após duas rodadas de correção.
-- Qualquer mudança no escopo da spec.
+- Qualquer mudança de escopo da spec, dependência nova não prevista, ou meta que não fecha (apresente opções com vantagens, desvantagens e recomendação).
+- Encerrar processo que não foi iniciado pela tarefa corrente.

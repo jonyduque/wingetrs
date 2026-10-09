@@ -18,6 +18,7 @@ $log = Join-Path $root 'target/verify.log'
 "verify $(Get-Date -Format o)" | Set-Content $log
 
 $steps = @(
+    @{ Name = 'rules';  Cmd = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'check_rules.ps1') 2>&1 } },
     @{ Name = 'fmt';    Cmd = { cargo fmt --all -- --check 2>&1 } },
     @{ Name = 'clippy'; Cmd = { cargo clippy --quiet --all-targets --message-format short -- -D warnings 2>&1 } }
 )
@@ -47,7 +48,7 @@ foreach ($s in $steps) {
         $failed = $true
         "[FAIL] $($s.Name) exit $code"
         # Only the lines that matter: errors, failing tests, panics. Capped.
-        $out | Select-String -Pattern '^(error|warning)|^---- .* stdout ----|panicked at|assertion|FAILED|^Diff in|left:|right:' |
+        $out | Select-String -Pattern '^(error|warning)|^---- .* stdout ----|panicked at|assertion|FAILED|^Diff in|left:|right:|^\s+src[\\/]' |
             Select-Object -First 40 | ForEach-Object { "  $($_.Line)" }
         "  (log completo: target/verify.log)"
         break
