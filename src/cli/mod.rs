@@ -446,7 +446,12 @@ async fn run_async(
         } => {
             // Scan and normalizer start now so they overlap with the catalog open.
             let scan_job = std::thread::spawn(|| {
-                crate::installed::timed("scan_all", crate::installed::scan_all)
+                let scan = crate::installed::timed("scan_all", crate::installed::scan_all);
+                let tracking = crate::installed::timed(
+                    "winget_tracking",
+                    crate::installed::winget_tracking::load_default,
+                );
+                (scan, tracking)
             });
             let norm_job = std::thread::spawn(|| {
                 crate::installed::timed(
@@ -465,14 +470,15 @@ async fn run_async(
                 ms = t0.elapsed().as_secs_f64() * 1000.0,
                 "span"
             );
-            let scan = scan_res.map_err(|_| anyhow::anyhow!("coleta de instalados falhou"))?;
-            let normalizer = norm_res.map_err(|_| anyhow::anyhow!("normalizador falhou"))?;
+            // A worker panic is a bug: re-raise it instead of returning partial results.
+            let (scan, tracking) = scan_res.unwrap_or_else(|p| std::panic::resume_unwind(p));
+            let normalizer = norm_res.unwrap_or_else(|p| std::panic::resume_unwind(p));
             for e in &scan.errors {
                 tracing::warn!("coleta de instalados: {e}");
             }
             let t = std::time::Instant::now();
             let mut rows = crate::installed::timed("correlate", || {
-                correlate(&scan.apps, &catalog, &normalizer)
+                correlate(&scan.apps, &catalog, &normalizer, &tracking)
             })?;
             tracing::info!(
                 scan_ms = scan.elapsed_ms,

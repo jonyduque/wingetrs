@@ -2,6 +2,8 @@
 use crate::catalog::{Catalog, CatalogError, MapTable};
 use crate::core::version::Version;
 use crate::installed::normalize::NameNormalizer;
+use crate::installed::tiebreak::{Candidate, Tiebreak, break_tie};
+use crate::installed::winget_tracking::Tracking;
 use crate::installed::{InstallSource, InstalledApp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -41,6 +43,8 @@ pub struct ListRow {
     pub correlation: Correlation,
     pub latest: Option<String>,
     pub state: UpdateState,
+    /// Tie-break that turned an ambiguous correlation into `Matched` (debugging aid).
+    pub tiebreak: Option<Tiebreak>,
 }
 
 const WINGET_SOURCE: &str = "winget";
@@ -197,44 +201,95 @@ fn row(
         correlation,
         latest,
         state,
+        tiebreak: None,
     }
+}
+
+/// Tries the objective tie-breaks on tied winget candidates; `None` keeps them ambiguous.
+fn resolve_tie(
+    app: &InstalledApp,
+    source: &str,
+    candidates: &[String],
+    catalog: &Catalog,
+    normalizer: &NameNormalizer,
+    tracking: &Tracking,
+) -> Result<Option<(String, Tiebreak)>, CatalogError> {
+    let mut tied = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        let pkg = catalog.get(source, id)?;
+        tied.push(Candidate {
+            id: id.clone(),
+            arp_min_version: pkg.as_ref().and_then(|p| p.arp_min_version.clone()),
+            arp_max_version: pkg.and_then(|p| p.arp_max_version),
+        });
+    }
+    let tracked = if source == WINGET_SOURCE {
+        tracking.ids_for(app, normalizer)
+    } else {
+        Vec::new()
+    };
+    Ok(break_tie(
+        &app.name,
+        app.version.as_deref(),
+        &tied,
+        &tracked,
+    ))
+}
+
+fn matched_row(
+    app: &InstalledApp,
+    catalog: &Catalog,
+    source: String,
+    package_id: String,
+    rule: Rule,
+) -> Result<ListRow, CatalogError> {
+    let pkg = catalog.get(&source, &package_id)?;
+    let correlation = Correlation::Matched {
+        source,
+        package_id,
+        rule,
+    };
+    Ok(match pkg {
+        Some(p) => {
+            let state = update_state(
+                app.version.as_deref(),
+                &p.entry.version,
+                p.arp_min_version.as_deref(),
+                p.arp_max_version.as_deref(),
+            );
+            row(app, correlation, Some(p.entry.version), state)
+        }
+        None => row(app, correlation, None, UpdateState::Unknown),
+    })
 }
 
 pub fn correlate(
     apps: &[InstalledApp],
     catalog: &Catalog,
     normalizer: &NameNormalizer,
+    tracking: &Tracking,
 ) -> Result<Vec<ListRow>, CatalogError> {
     let mut rows = Vec::with_capacity(apps.len());
     for app in apps {
         let r = match find(app, catalog, normalizer)? {
             None => row(app, Correlation::Unmatched, None, UpdateState::Unknown),
-            Some((_, candidates, rule)) if candidates.len() > 1 => row(
-                app,
-                Correlation::Ambiguous { candidates, rule },
-                None,
-                UpdateState::Unknown,
-            ),
+            Some((source, candidates, rule)) if candidates.len() > 1 => {
+                match resolve_tie(app, &source, &candidates, catalog, normalizer, tracking)? {
+                    Some((package_id, tiebreak)) => ListRow {
+                        tiebreak: Some(tiebreak),
+                        ..matched_row(app, catalog, source, package_id, rule)?
+                    },
+                    None => row(
+                        app,
+                        Correlation::Ambiguous { candidates, rule },
+                        None,
+                        UpdateState::Unknown,
+                    ),
+                }
+            }
             Some((source, mut ids, rule)) => {
                 let package_id = ids.pop().unwrap_or_default();
-                let pkg = catalog.get(&source, &package_id)?;
-                let correlation = Correlation::Matched {
-                    source,
-                    package_id,
-                    rule,
-                };
-                match pkg {
-                    Some(p) => {
-                        let state = update_state(
-                            app.version.as_deref(),
-                            &p.entry.version,
-                            p.arp_min_version.as_deref(),
-                            p.arp_max_version.as_deref(),
-                        );
-                        row(app, correlation, Some(p.entry.version), state)
-                    }
-                    None => row(app, correlation, None, UpdateState::Unknown),
-                }
+                matched_row(app, catalog, source, package_id, rule)?
             }
         };
         rows.push(r);

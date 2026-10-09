@@ -3,6 +3,8 @@ use wingetrs::catalog::Catalog;
 use wingetrs::core::SourceKind;
 use wingetrs::installed::correlate::{Correlation, Rule, UpdateState, correlate, update_state};
 use wingetrs::installed::normalize::NameNormalizer;
+use wingetrs::installed::tiebreak::Tiebreak;
+use wingetrs::installed::winget_tracking::{TrackedPackage, Tracking, read_tracking};
 use wingetrs::installed::{Hive, InstallSource, InstalledApp};
 use wingetrs::sources::winget::index::read_index;
 
@@ -51,6 +53,7 @@ fn product_code_match_is_case_insensitive() {
         )],
         &catalog(),
         &NameNormalizer::new(),
+        &Tracking::default(),
     )
     .unwrap();
     assert_eq!(
@@ -80,7 +83,13 @@ fn package_family_name_match() {
     a.source = InstallSource::Msix;
     a.product_code = None;
     a.family_name = Some("Microsoft.WindowsTerminal_8wekyb3d8bbwe".into());
-    let rows = correlate(&[a], &catalog(), &NameNormalizer::new()).unwrap();
+    let rows = correlate(
+        &[a],
+        &catalog(),
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
     assert_eq!(
         rows[0].correlation,
         Correlation::Matched {
@@ -101,7 +110,13 @@ fn name_and_publisher_with_arch_fallback() {
         "150.0",
     );
     a.product_code = None;
-    let rows = correlate(&[a], &catalog(), &NameNormalizer::new()).unwrap();
+    let rows = correlate(
+        &[a],
+        &catalog(),
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
     assert_eq!(
         rows[0].correlation,
         Correlation::Matched {
@@ -118,6 +133,7 @@ fn unknown_app_is_unmatched_and_never_upgradable() {
         &[arp("Zzz", "Totally Unknown Thing", "Nobody", "")],
         &catalog(),
         &NameNormalizer::new(),
+        &Tracking::default(),
     )
     .unwrap();
     assert_eq!(rows[0].correlation, Correlation::Unmatched);
@@ -198,6 +214,7 @@ fn ambiguous_is_never_resolved_silently() {
         &[arp("dup", "Something", "X", "1")],
         &c,
         &NameNormalizer::new(),
+        &Tracking::default(),
     )
     .unwrap();
     match &rows[0].correlation {
@@ -218,7 +235,13 @@ fn msix_is_never_matched_by_name_and_publisher() {
     a.source = InstallSource::Msix;
     a.product_code = None;
     a.family_name = Some("Mozilla.Firefox_none".into());
-    let rows = correlate(&[a], &catalog(), &NameNormalizer::new()).unwrap();
+    let rows = correlate(
+        &[a],
+        &catalog(),
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
     assert_eq!(rows[0].correlation, Correlation::Unmatched);
     assert_eq!(rows[0].state, UpdateState::Unknown);
 }
@@ -231,7 +254,13 @@ fn live_list_runs_under_budget() {
     let data = wingetrs::cache::DataDir::default_location().unwrap();
     let cat = Catalog::open(&data.catalog_path()).unwrap();
     let scan = wingetrs::installed::scan_all();
-    let rows = correlate(&scan.apps, &cat, &NameNormalizer::new()).unwrap();
+    let rows = correlate(
+        &scan.apps,
+        &cat,
+        &NameNormalizer::new(),
+        &wingetrs::installed::winget_tracking::load_default(),
+    )
+    .unwrap();
     let matched = rows
         .iter()
         .filter(|r| matches!(r.correlation, Correlation::Matched { .. }))
@@ -243,4 +272,286 @@ fn live_list_runs_under_budget() {
         t.elapsed().as_millis()
     );
     assert!(t.elapsed().as_millis() < 500);
+}
+
+// ---- Task 21: objective tie-breaks for ambiguous correlations ----
+
+/// (id, arp_min, arp_max) packages that all share the product code `dup`.
+fn tied_catalog(pkgs: &[(&str, Option<&str>, Option<&str>)]) -> Catalog {
+    let mut c = Catalog::open_in_memory().unwrap();
+    let packages: Vec<_> = pkgs
+        .iter()
+        .map(|(id, min, max)| wingetrs::catalog::NewPackage {
+            id: (*id).into(),
+            name: (*id).into(),
+            version: "9".into(),
+            arp_min_version: min.map(Into::into),
+            arp_max_version: max.map(Into::into),
+            ..Default::default()
+        })
+        .collect();
+    let maps = wingetrs::catalog::WingetMaps {
+        productcodes: pkgs
+            .iter()
+            .map(|(id, _, _)| ("dup".into(), (*id).into()))
+            .collect(),
+        ..Default::default()
+    };
+    c.replace_source("winget", SourceKind::Winget, "v", 1, &packages, &maps)
+        .unwrap();
+    c
+}
+
+fn tracked(id: &str, product_code: &str) -> TrackedPackage {
+    TrackedPackage {
+        id: id.into(),
+        product_codes: vec![product_code.into()],
+        ..Default::default()
+    }
+}
+
+fn matched(id: &str, rule: Rule) -> Correlation {
+    Correlation::Matched {
+        source: "winget".into(),
+        package_id: id.into(),
+        rule,
+    }
+}
+
+#[test]
+fn tiebreak_tracking_picks_the_id_winget_installed() {
+    let cat = tied_catalog(&[("Acme.Tool", None, None), ("Other.Tool", None, None)]);
+    let tracking = Tracking::new(vec![tracked("Other.Tool", "DUP")]);
+    let rows = correlate(
+        &[arp("dup", "Tool", "Acme", "1.0")],
+        &cat,
+        &NameNormalizer::new(),
+        &tracking,
+    )
+    .unwrap();
+    assert_eq!(
+        rows[0].correlation,
+        matched("Other.Tool", Rule::ProductCode)
+    );
+    assert_eq!(rows[0].tiebreak, Some(Tiebreak::WingetTracking));
+    assert_eq!(rows[0].latest.as_deref(), Some("9"));
+}
+
+#[test]
+fn tiebreak_tracking_outside_the_candidates_does_not_resolve() {
+    // Ruby case: winget tracked a 4.0 id, the installed product code ties two 3.4 ids.
+    let cat = tied_catalog(&[("Ruby.3.4", None, None), ("RubyDevKit.3.4", None, None)]);
+    let tracking = Tracking::new(vec![tracked("RubyDevKit.4.0", "dup")]);
+    let rows = correlate(
+        &[arp(
+            "dup",
+            "Ruby 3.4.9-1-x64",
+            "RubyInstallerTeam",
+            "3.4.9-1",
+        )],
+        &cat,
+        &NameNormalizer::new(),
+        &tracking,
+    )
+    .unwrap();
+    assert_eq!(
+        rows[0].correlation,
+        Correlation::Ambiguous {
+            candidates: vec!["Ruby.3.4".into(), "RubyDevKit.3.4".into()],
+            rule: Rule::ProductCode
+        }
+    );
+    assert_eq!(rows[0].tiebreak, None);
+}
+
+#[test]
+fn tiebreak_arp_range_keeps_only_the_candidate_containing_the_version() {
+    let cat = tied_catalog(&[
+        ("Acme.Old", Some("1.0"), Some("1.9")),
+        ("Acme.New", Some("2.0"), Some("2.9")),
+    ]);
+    let rows = correlate(
+        &[arp("dup", "Tool", "Acme", "2.5")],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    assert_eq!(rows[0].correlation, matched("Acme.New", Rule::ProductCode));
+    assert_eq!(rows[0].tiebreak, Some(Tiebreak::ArpVersionRange));
+    assert_eq!(rows[0].state, UpdateState::Available { latest: "9".into() });
+}
+
+#[test]
+fn tiebreak_arp_range_never_drops_a_candidate_without_range() {
+    let cat = tied_catalog(&[
+        ("Acme.Old", Some("1.0"), Some("1.9")),
+        ("Acme.Any", None, None),
+    ]);
+    let rows = correlate(
+        &[
+            arp("dup", "Tool", "Acme", "1.5"),
+            // Outside Acme.Old's range (e.g. an older install): still no evidence for Acme.Any.
+            arp("dup", "Tool", "Acme", "0.5"),
+        ],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    for r in &rows {
+        assert!(matches!(r.correlation, Correlation::Ambiguous { .. }));
+        assert_eq!(r.tiebreak, None);
+    }
+}
+
+#[test]
+fn tiebreak_channel_ffmpeg_display_name_without_suffix_picks_base() {
+    let cat = tied_catalog(&[
+        ("Gyan.FFmpeg", None, None),
+        ("Gyan.FFmpeg.Essentials", None, None),
+        ("Gyan.FFmpeg.Shared", None, None),
+    ]);
+    let rows = correlate(
+        &[arp("dup", "FFmpeg", "Gyan", "8.0")],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        rows[0].correlation,
+        matched("Gyan.FFmpeg", Rule::ProductCode)
+    );
+    assert_eq!(rows[0].tiebreak, Some(Tiebreak::Channel));
+}
+
+#[test]
+fn tiebreak_channel_display_name_with_suffix_does_not_pick_base() {
+    let cat = tied_catalog(&[
+        ("Gyan.FFmpeg", None, None),
+        ("Gyan.FFmpeg.Essentials", None, None),
+        ("Gyan.FFmpeg.Shared", None, None),
+    ]);
+    let rows = correlate(
+        &[arp("dup", "FFmpeg Essentials", "Gyan", "8.0")],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    assert!(matches!(rows[0].correlation, Correlation::Ambiguous { .. }));
+    assert_eq!(rows[0].tiebreak, None);
+}
+
+#[test]
+fn tiebreak_channel_suffix_is_case_insensitive_and_needs_a_known_suffix() {
+    let cat = tied_catalog(&[
+        ("wez.wezterm", None, None),
+        ("wez.wezterm.nightly", None, None),
+    ]);
+    let rows = correlate(
+        &[arp(
+            "dup",
+            "WezTerm version 20240203",
+            "Wez Furlong",
+            "20240203",
+        )],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        rows[0].correlation,
+        matched("wez.wezterm", Rule::ProductCode)
+    );
+    assert_eq!(rows[0].tiebreak, Some(Tiebreak::Channel));
+
+    let cat = tied_catalog(&[("Acme.Tool", None, None), ("Acme.Tool.Lite", None, None)]);
+    let rows = correlate(
+        &[arp("dup", "Tool", "Acme", "1.0")],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    assert!(matches!(rows[0].correlation, Correlation::Ambiguous { .. }));
+}
+
+#[test]
+fn tiebreak_without_objective_criterion_stays_ambiguous() {
+    let cat = tied_catalog(&[("Acme.Tool", None, None), ("Other.Tool", None, None)]);
+    let rows = correlate(
+        &[arp("dup", "Tool", "Acme", "1.0")],
+        &cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        rows[0].correlation,
+        Correlation::Ambiguous {
+            candidates: vec!["Acme.Tool".into(), "Other.Tool".into()],
+            rule: Rule::ProductCode
+        }
+    );
+    assert_eq!(rows[0].tiebreak, None);
+    assert_eq!(rows[0].state, UpdateState::Unknown);
+}
+
+#[test]
+fn read_tracking_reads_winget_installed_db_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("installed.db");
+    {
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch(
+            "CREATE TABLE ids(rowid INTEGER PRIMARY KEY, id TEXT NOT NULL);
+             CREATE TABLE manifest(rowid INTEGER PRIMARY KEY, id INT64 NOT NULL);
+             CREATE TABLE productcodes(rowid INTEGER PRIMARY KEY, productcode TEXT NOT NULL);
+             CREATE TABLE productcodes_map(manifest INT64 NOT NULL, productcode INT64 NOT NULL);
+             CREATE TABLE upgradecodes(rowid INTEGER PRIMARY KEY, upgradecode TEXT NOT NULL);
+             CREATE TABLE upgradecodes_map(manifest INT64 NOT NULL, upgradecode INT64 NOT NULL);
+             CREATE TABLE pfns(rowid INTEGER PRIMARY KEY, pfn TEXT NOT NULL);
+             CREATE TABLE pfns_map(manifest INT64 NOT NULL, pfn INT64 NOT NULL);
+             CREATE TABLE norm_names(rowid INTEGER PRIMARY KEY, norm_name TEXT NOT NULL);
+             CREATE TABLE norm_names_map(manifest INT64 NOT NULL, norm_name INT64 NOT NULL);
+             CREATE TABLE norm_publishers(rowid INTEGER PRIMARY KEY, norm_publisher TEXT NOT NULL);
+             CREATE TABLE norm_publishers_map(manifest INT64 NOT NULL, norm_publisher INT64 NOT NULL);
+             INSERT INTO ids VALUES (1, 'Gyan.FFmpeg'), (2, 'Acme.Tool');
+             INSERT INTO manifest VALUES (10, 1), (11, 2);
+             INSERT INTO productcodes VALUES (1, 'gyan.ffmpeg_microsoft.winget.source_8wekyb3d8bbwe');
+             INSERT INTO productcodes_map VALUES (10, 1);
+             INSERT INTO norm_names VALUES (1, 'tool');
+             INSERT INTO norm_names_map VALUES (11, 1);
+             INSERT INTO norm_publishers VALUES (1, 'acme');
+             INSERT INTO norm_publishers_map VALUES (11, 1);",
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(&p).unwrap();
+    let tracking = read_tracking(&p).unwrap();
+    assert_eq!(std::fs::read(&p).unwrap(), before);
+
+    let n = NameNormalizer::new();
+    let mut ff = arp(
+        "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
+        "FFmpeg",
+        "Gyan",
+        "8.0",
+    );
+    assert_eq!(tracking.ids_for(&ff, &n), ["Gyan.FFmpeg"]);
+    ff.product_code = Some("other".into());
+    assert!(tracking.ids_for(&ff, &n).is_empty());
+    let tool = arp("x", "Tool", "Acme", "1.0");
+    assert_eq!(tracking.ids_for(&tool, &n), ["Acme.Tool"]);
+    let wrong_publisher = arp("x", "Tool", "Nobody", "1.0");
+    assert!(tracking.ids_for(&wrong_publisher, &n).is_empty());
+}
+
+#[test]
+fn read_tracking_missing_file_is_an_error_not_a_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(read_tracking(&dir.path().join("absent.db")).is_err());
 }

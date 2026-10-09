@@ -234,8 +234,9 @@ fn spawn_scan(ctx: &Arc<Ctx>) {
         for e in &scan.errors {
             tracing::warn!("scan: {e}");
         }
+        let tracking = crate::installed::winget_tracking::load_default();
         let rows = Catalog::open(&ctx.data.catalog_path())
-            .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new()));
+            .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new(), &tracking));
         match rows {
             Ok(rows) => {
                 let _ = ctx.tx.send(Msg::InstalledLoaded(rows));

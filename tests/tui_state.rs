@@ -188,6 +188,7 @@ fn row(
         },
         latest: None,
         state,
+        tiebreak: None,
     }
 }
 

@@ -9,6 +9,8 @@ pub mod guid;
 pub mod normalize;
 pub mod par;
 pub mod scoop;
+pub mod tiebreak;
+pub mod winget_tracking;
 
 pub use arp::filter_arp;
 pub use guid::{pack_guid, unpack_guid};
