@@ -3086,3 +3086,183 @@ fn msix_display_name_falls_back_on_resource_strings() {
 - Test: `tests/installed.rs`
 
 **Commit:** `feat(list): include MSIX framework packages, one per family`
+
+### Task 18: `search` da CLI com leitura e busca fundidas, antecipação e abertura barata
+
+#### Where this fits
+
+Decidido pelo usuário em 2026-10-08 após perfil por etapa (orquestrador, release, mediana de 15, catálogo real de 19 528 entradas):
+
+| Etapa | ms |
+|---|---|
+| `Catalog::open` + `is_empty` (`COUNT(*)` + `CREATE ... IF NOT EXISTS` a cada abertura) | 6,5 |
+| `load_entries` paralelo (hoje) | 42,7 |
+| ↳ 1 thread: percorrer linhas sem ler | 12,2 |
+| ↳ 1 thread: ler colunas como `&str`, sem alocar | 27,0 |
+| ↳ 1 thread: decodificar e alocar `PackageEntry` (como hoje) | 78,5 |
+| ↳ alocações por load | ~223 mil `String`s (106 mil são tags/comandos) |
+| busca nucleo 8 threads / 1 thread | 10,3 / 19,4 |
+| piso do processo (hello-world Rust no mesmo bench) | 38 |
+
+O gargalo é alocação (o heap padrão do Windows serializa as threads), não o SQLite. Meta da spec §9.2: `search` < 100 ms; hoje 107 ms.
+
+#### What binds this task
+
+- Só o caminho **CLI `search`** muda de estratégia. A TUI continua com `load_entries` + `SearchIndex` em memória (ela precisa do catálogo inteiro). `SearchIndex::search` não muda de comportamento.
+- **Mesmo ranking, bit a bit**: a nova busca em disco deve produzir exatamente a mesma lista (ids, ordem, `score`, `name_indices`) que `SearchIndex::new(catalog.load_entries()?).search(q, filter, limit)`. Para isso, a pontuação de uma entrada vira **uma função compartilhada** usada pelos dois caminhos.
+- Sem dependência nova, sem mudança de schema, sem cache novo em disco.
+- Meta: `pwsh -File scripts/bench.ps1 -Exe target/release/wingetrs.exe -Args 'search powertoys'` mediana < 100 ms (estimativa 50–60 ms). Bench antes/depois, 3 rodadas, colados.
+
+#### The decision this task must get right
+
+1. **Pontuação compartilhada** em `src/catalog/search.rs`:
+
+```rust
+/// Text fields of one catalog row, borrowed (no allocation needed to score it).
+pub struct EntryView<'a> {
+    pub source: SourceKind,
+    pub id: &'a str,
+    pub name: &'a str,
+    pub moniker: Option<&'a str>,
+    pub tags: &'a str,      // space-separated, as stored in the catalog
+    pub commands: &'a str,  // space-separated, as stored in the catalog
+}
+/// Score of one entry for a parsed query, or None when it does not match.
+/// Same rules as today: name (with indices), id, moniker, tags/commands at half weight, EXACT_BONUS.
+pub fn score_entry(view: &EntryView<'_>, q: &Query, matcher: &mut Matcher, buf: &mut Vec<char>) -> Option<(u32, Vec<u32>)>;
+/// Parsed query reused across entries (trimmed text, lowercase, nucleo Pattern).
+pub struct Query { /* text, lower, pattern */ }
+impl Query { pub fn new(text: &str) -> Query; pub fn is_empty(&self) -> bool; }
+```
+
+`scan` (caminho em memória) passa a montar `EntryView` a partir de `PackageEntry` e chamar `score_entry`. Tags/commands: iterar `split(' ')` sobre o texto — em memória, junte com `' '` não é aceitável (alocaria); para `PackageEntry` use um helper que itera `tags.iter()` — então `score_entry` recebe os campos via um trait/closure ou duas variantes que compartilham o núcleo. **Decisão:** o núcleo é `fn score_fields<'a>(source, id, name, moniker, extra: impl Iterator<Item = &'a str>, q, matcher, buf)`; `EntryView` (disco) passa `tags.split(' ').chain(commands.split(' ')).filter(|s| !s.is_empty())`, e `PackageEntry` (memória) passa `tags.iter().chain(commands.iter()).map(String::as_str)`.
+
+2. **Busca em disco fundida** em `src/catalog/search.rs`:
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found { pub entry: PackageEntry, pub score: u32, pub name_indices: Vec<u32> }
+
+/// Parallel scan of the catalog file: each worker reads its rowid range as borrowed text,
+/// scores rows in place and keeps only (rowid, score, name_indices, lowercase name);
+/// then the top `limit` rows are materialized with one query.
+pub fn search_on_disk(path: &Path, query: &str, filter: Option<SourceKind>, limit: usize)
+    -> Result<Vec<Found>, CatalogError>;
+```
+
+- Fase 1 (paralela, até 8 workers, mesmas faixas de rowid de `load_entries`): conexão RO + mmap por worker; `SELECT rowid, kind, id, name, moniker, tags, commands FROM packages WHERE rowid BETWEEN ?1 AND ?2 ORDER BY rowid`; ler com `row.get_ref(i)?.as_str()` (sem `String`). Aplicar filtro de fonte e `score_entry`. Guardar só os acertos: `(rowid, score, name_indices, name.to_lowercase())`.
+- Concatenar os resultados dos workers **na ordem das faixas** (= ordem de rowid) e ordenar **exatamente** como `SearchIndex`: query vazia ⇒ por nome minúsculo (sort estável); senão score desc, empate por nome minúsculo (sort estável). Truncar em `limit`.
+- Fase 2: `SELECT {ENTRY_COLS}, rowid FROM packages WHERE rowid IN (…)` para os rowids finais, montar `PackageEntry` com o decodificador existente e devolver `Found` na ordem da fase 1.
+- Consistência: `PRAGMA data_version` antes da fase 1 e depois da fase 2 (mesma conexão-mestre); se mudou, refazer uma vez (mesma regra de `load_entries`).
+- Catálogo inexistente ou sem linhas ⇒ `Ok(vec![])`.
+
+3. **Abertura barata** em `src/catalog/mod.rs`:
+
+```rust
+/// Read-only open for an existing catalog: no schema DDL, no journal_mode write.
+pub fn open_read_only(path: &Path) -> Result<Catalog, CatalogError>;
+```
+
+e `is_empty` passa a `SELECT EXISTS(SELECT 1 FROM packages)`. `ensure_catalog` (CLI) usa `open_read_only` quando o arquivo existe; arquivo ausente ⇒ segue o caminho atual (update bloqueante via `open`). Nunca chame `open_read_only` antes de o arquivo existir.
+
+4. **Antecipação** em `src/cli/mod.rs`: em `run`, logo após obter `DataDir` e **antes** de `init_logging`/`Config::load`/runtime/`ensure_catalog`, se o comando é `Search` e `catalog.db` existe, dispare `std::thread::spawn(move || search_on_disk(&path, &query, source, limit))`. Depois que `ensure_catalog` confirmar catálogo não vazio, faça `join` e use o resultado. Se `ensure_catalog` precisou rodar o update (catálogo vazio) ou a thread devolveu erro, rode `search_on_disk` de novo, em série. Saída (tabela/JSON) idêntica à de hoje. Remova o `mem::forget` do índice nesse caminho (não há mais índice); mantenha só se o perfil mostrar custo de drop relevante.
+
+#### Traps already paid for that apply here
+
+- O heap padrão do Windows serializa alocações entre threads (78,5 ms em 1 thread viraram só 42,7 com 8): o ganho vem de **não alocar** por linha, não de mais threads.
+- Rowids não são contíguos após `replace_source` (faixas desbalanceadas, sem perda) — os testes de borda da Task 16 continuam valendo; reutilize a partição.
+- Medir pelo processo inteiro (bench.ps1), não por função.
+
+#### The body of the tests that are not obvious
+
+Em `tests/search.rs` (new test fn) — equivalência contra o caminho em memória num catálogo em disco com dados reais e sintéticos:
+
+```rust
+fn disk_catalog_with_many(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let names = ["PowerToys", "Power Automate", "powertoys", "Zeal", "360安全卫士", "Visual Studio Code", "Café Läuft", "7-Zip"];
+    let mk = |i: usize| NewPackage {
+        id: format!("Pub{}.App{i}", i % 37),
+        name: format!("{} {i}", names[i % names.len()]),
+        moniker: (i % 5 == 0).then(|| format!("m{i}")),
+        version: "1".into(),
+        tags: vec![format!("tag{}", i % 11), "power".into()],
+        commands: vec![format!("cmd{}", i % 13)],
+        ..Default::default()
+    };
+    let winget: Vec<NewPackage> = (0..n).map(mk).collect();
+    c.replace_source("winget", wingetrs::core::SourceKind::Winget, "v", 1, &winget, &WingetMaps::default()).unwrap();
+    let scoop: Vec<NewPackage> = (n..n + n / 3).map(mk).collect();
+    c.replace_source("scoop:main", wingetrs::core::SourceKind::Scoop, "e", 1, &scoop, &WingetMaps::default()).unwrap();
+    drop(c);
+    (dir, path)
+}
+
+#[test]
+fn search_on_disk_matches_in_memory_search_exactly() {
+    use wingetrs::catalog::Catalog;
+    use wingetrs::catalog::search::{search_on_disk, SearchIndex};
+    let (_d, path) = disk_catalog_with_many(6000);
+    let mut idx = SearchIndex::new(Catalog::open(&path).unwrap().load_entries().unwrap());
+    for (q, f, limit) in [
+        ("powertoys", None, 20),
+        ("power", None, 50),
+        ("power", Some(SourceKind::Scoop), 50),
+        ("安全", None, 10),
+        ("cafe", None, 10),
+        ("m10", None, 5),         // exact moniker bonus
+        ("tag3", None, 30),       // tags at half weight
+        ("", None, 25),           // empty query: alphabetical
+        ("zzzz-no-match", None, 10),
+    ] {
+        let mem: Vec<(String, u32, Vec<u32>)> = idx.search(q, f, limit).into_iter()
+            .map(|h| (idx.entries()[h.index].id.clone(), h.score, h.name_indices)).collect();
+        let disk: Vec<(String, u32, Vec<u32>)> = search_on_disk(&path, q, f, limit).unwrap().into_iter()
+            .map(|x| (x.entry.id, x.score, x.name_indices)).collect();
+        assert_eq!(disk, mem, "query {q:?} filter {f:?} limit {limit}");
+    }
+}
+
+#[test]
+fn search_on_disk_missing_or_empty_catalog_is_empty() {
+    use wingetrs::catalog::search::search_on_disk;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(search_on_disk(&dir.path().join("nope.db"), "x", None, 10).unwrap().is_empty());
+    let p = dir.path().join("empty.db");
+    drop(wingetrs::catalog::Catalog::open(&p).unwrap());
+    assert!(search_on_disk(&p, "x", None, 10).unwrap().is_empty());
+}
+```
+
+Em `tests/catalog.rs` (new test fn):
+
+```rust
+#[test]
+fn open_read_only_does_not_write_and_sees_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("c.db");
+    let mut w = Catalog::open(&p).unwrap();
+    w.replace_source("winget", SourceKind::Winget, "v", 1, &[pkg("A.A", "Alpha", "1")], &WingetMaps::default()).unwrap();
+    drop(w);
+    let r = Catalog::open_read_only(&p).unwrap();
+    assert!(!r.is_empty().unwrap());
+    assert_eq!(r.load_entries().unwrap().len(), 1);
+    assert!(Catalog::open_read_only(&dir.path().join("missing.db")).is_err(), "must not create a file");
+    assert!(!dir.path().join("missing.db").exists());
+}
+```
+
+#### Checks beyond the steps
+
+- Mutation proofs (`-TestCommand 'cargo test --quiet --test search'`): (1) no ordenamento da busca em disco, trocar o desempate por nome por desempate por rowid ⇒ PEGA; (2) no `score_fields`, peso de tags `s / 2` → `s` ⇒ PEGA (os dois caminhos usam a mesma função, então o teste de tags do `tests/search.rs` existente ou o novo deve pegar); (3) `open_read_only` com flag de criação ⇒ `open_read_only_does_not_write_and_sees_data` PEGA (`-TestCommand 'cargo test --quiet --test catalog'`).
+- Bench `search powertoys` (3 rodadas, antes/depois) e `search ""` (lista alfabética, pior caso de alocação de nomes) colados.
+- `cargo run --release -- search powertoys` e `--json` com saída idêntica à anterior (diff colado).
+
+**Files:**
+- Modify: `src/catalog/search.rs`, `src/catalog/mod.rs`, `src/cli/mod.rs`
+- Test: `tests/search.rs`, `tests/catalog.rs`
+
+**Commit:** `perf(search): fused on-disk scan, early start and cheap read-only open`
