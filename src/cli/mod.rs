@@ -45,16 +45,16 @@ Uso: {usage}
 )]
 pub struct Cli {
     /// Conjunto de glifos da TUI (nerd, unicode ou ascii)
-    #[arg(long, value_enum, hide_possible_values = true)]
+    #[arg(long, value_enum, hide_possible_values = true, value_name = "GLIFOS")]
     pub glyphs: Option<GlyphArg>,
     /// Verbosidade (-v, -vv): também loga no stderr
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, display_order = 9000)]
     pub verbose: u8,
     /// Mostra a ajuda
-    #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true)]
+    #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true, display_order = 9001)]
     help: Option<bool>,
     /// Mostra a versão
-    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, display_order = 9002)]
     version: Option<bool>,
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -88,7 +88,7 @@ pub enum Command {
     },
     /// Busca pacotes
     #[command(
-        override_usage = "wingetrs search [OPÇÕES] <QUERY>",
+        override_usage = "wingetrs search [OPÇÕES] <TERMO>",
         help_template = HELP_TEMPLATE,
         next_help_heading = "Opções",
         after_help = "Exemplos:
@@ -98,16 +98,22 @@ pub enum Command {
     )]
     Search {
         /// Texto a buscar (nome, id ou palavra-chave)
-        #[arg(help_heading = "Argumentos")]
+        #[arg(help_heading = "Argumentos", value_name = "TERMO")]
         query: String,
         /// Restringe a uma fonte (winget ou scoop)
-        #[arg(long, value_parser = parse_source)]
+        #[arg(long, value_parser = parse_source, value_name = "FONTE")]
         source: Option<SourceKind>,
         /// Saída em JSON
         #[arg(long)]
         json: bool,
         /// Máximo de resultados (padrão: 20)
-        #[arg(short = 'n', long, default_value_t = 20, hide_default_value = true)]
+        #[arg(
+            short = 'n',
+            long,
+            default_value_t = 20,
+            hide_default_value = true,
+            value_name = "N"
+        )]
         limit: usize,
     },
     /// Mostra detalhes de um pacote
@@ -125,10 +131,10 @@ pub enum Command {
         #[arg(help_heading = "Argumentos")]
         id: String,
         /// Restringe a uma fonte (winget ou scoop)
-        #[arg(long, value_parser = parse_source)]
+        #[arg(long, value_parser = parse_source, value_name = "FONTE")]
         source: Option<SourceKind>,
         /// Versão específica a mostrar
-        #[arg(long)]
+        #[arg(long, value_name = "VERSÃO")]
         version: Option<String>,
         /// Saída em JSON
         #[arg(long)]
@@ -149,7 +155,7 @@ pub enum Command {
         #[arg(long)]
         upgradable: bool,
         /// Restringe a uma fonte (winget ou scoop)
-        #[arg(long, value_parser = parse_source)]
+        #[arg(long, value_parser = parse_source, value_name = "FONTE")]
         source: Option<SourceKind>,
         /// Saída em JSON
         #[arg(long)]

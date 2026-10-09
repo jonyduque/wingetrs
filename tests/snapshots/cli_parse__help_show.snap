@@ -11,20 +11,20 @@ Argumentos:
           Identificador do pacote (ex.: Microsoft.PowerToys)
 
 Opções:
-      --source <SOURCE>
+      --source <FONTE>
           Restringe a uma fonte (winget ou scoop)
+
+      --version <VERSÃO>
+          Versão específica a mostrar
+
+      --json
+          Saída em JSON
 
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 
-      --version <VERSION>
-          Versão específica a mostrar
-
   -h, --help
           Mostra a ajuda
-
-      --json
-          Saída em JSON
 
 Exemplos:
   wingetrs show Microsoft.PowerToys

@@ -4,27 +4,27 @@ expression: sub.render_long_help().to_string()
 ---
 Busca pacotes
 
-Uso: wingetrs search [OPÇÕES] <QUERY>
+Uso: wingetrs search [OPÇÕES] <TERMO>
 
 Argumentos:
-  <QUERY>
+  <TERMO>
           Texto a buscar (nome, id ou palavra-chave)
 
 Opções:
-      --source <SOURCE>
+      --source <FONTE>
           Restringe a uma fonte (winget ou scoop)
 
       --json
           Saída em JSON
+
+  -n, --limit <N>
+          Máximo de resultados (padrão: 20)
 
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 
   -h, --help
           Mostra a ajuda
-
-  -n, --limit <LIMIT>
-          Máximo de resultados (padrão: 20)
 
 Exemplos:
   wingetrs search powertoys

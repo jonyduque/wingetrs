@@ -127,6 +127,19 @@ fn every_argument_has_a_portuguese_description() {
     for en in ["Print help", "Usage:", "Options:", "Commands:"] {
         assert!(!text.contains(en), "texto em inglês: {en}");
     }
+    let mut all = text;
+    for n in ["search", "show", "list", "update"] {
+        let mut c = wingetrs::cli::Cli::command();
+        c.build();
+        all += &c
+            .find_subcommand_mut(n)
+            .unwrap()
+            .render_long_help()
+            .to_string();
+    }
+    for en in ["<QUERY>", "<SOURCE>", "<LIMIT>", "<GLYPHS>", "<VERSION>"] {
+        assert!(!all.contains(en), "nome de valor em inglês: {en}");
+    }
 }
 
 #[test]

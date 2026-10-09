@@ -13,7 +13,7 @@ Comandos:
   list    Lista pacotes instalados
 
 Opções:
-      --glyphs <GLYPHS>
+      --glyphs <GLIFOS>
           Conjunto de glifos da TUI (nerd, unicode ou ascii)
 
   -v, --verbose...
