@@ -47,8 +47,8 @@ fn unknown_source_is_rejected_with_portuguese_message() {
 }
 
 #[test]
-fn glyphs_is_global() {
-    let cli = Cli::try_parse_from(["wingetrs", "list", "--glyphs", "ascii"]).unwrap();
+fn glyphs_is_root_only() {
+    let cli = Cli::try_parse_from(["wingetrs", "--glyphs", "ascii", "list"]).unwrap();
     assert_eq!(cli.glyphs, Some(GlyphArg::Ascii));
 }
 
@@ -95,4 +95,49 @@ fn stderr_logging_is_on_with_subcommand_and_v() {
     assert!(wingetrs::cli::stderr_logging(&cli));
     let cli = Cli::try_parse_from(["wingetrs", "list"]).unwrap();
     assert!(!wingetrs::cli::stderr_logging(&cli));
+}
+
+#[test]
+fn glyphs_is_rejected_after_a_subcommand() {
+    assert!(Cli::try_parse_from(["wingetrs", "list", "--glyphs", "ascii"]).is_err());
+}
+
+#[test]
+fn every_argument_has_a_portuguese_description() {
+    use clap::CommandFactory;
+    let mut root = wingetrs::cli::Cli::command();
+    root.build();
+    let mut cmds = vec![root.clone()];
+    cmds.extend(root.get_subcommands().cloned());
+    for c in cmds {
+        for a in c.get_arguments() {
+            if a.is_hide_set() {
+                continue;
+            }
+            let help = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(
+                !help.trim().is_empty(),
+                "{} --{:?} sem descrição",
+                c.get_name(),
+                a.get_id()
+            );
+        }
+    }
+    let text = wingetrs::cli::Cli::command().render_long_help().to_string();
+    for en in ["Print help", "Usage:", "Options:", "Commands:"] {
+        assert!(!text.contains(en), "texto em inglês: {en}");
+    }
+}
+
+#[test]
+fn help_snapshots() {
+    let mut root = Cli::command();
+    root.build();
+    insta::assert_snapshot!("help_root", root.render_long_help().to_string());
+    for name in ["update", "search", "show", "list"] {
+        let mut c = Cli::command();
+        c.build();
+        let sub = c.find_subcommand_mut(name).unwrap();
+        insta::assert_snapshot!(format!("help_{name}"), sub.render_long_help().to_string());
+    }
 }

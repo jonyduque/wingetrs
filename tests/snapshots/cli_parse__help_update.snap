@@ -1,0 +1,21 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Atualiza o catálogo local
+
+Uso: wingetrs update [OPÇÕES]
+
+Opções:
+      --force
+          Baixa o catálogo mesmo que esteja recente
+
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+Exemplos:
+  wingetrs update
+  wingetrs update --force

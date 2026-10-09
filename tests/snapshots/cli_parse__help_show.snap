@@ -1,0 +1,32 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Mostra detalhes de um pacote
+
+Uso: wingetrs show [OPÇÕES] <ID>
+
+Argumentos:
+  <ID>
+          Identificador do pacote (ex.: Microsoft.PowerToys)
+
+Opções:
+      --source <SOURCE>
+          Restringe a uma fonte (winget ou scoop)
+
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+      --version <VERSION>
+          Versão específica a mostrar
+
+  -h, --help
+          Mostra a ajuda
+
+      --json
+          Saída em JSON
+
+Exemplos:
+  wingetrs show Microsoft.PowerToys
+  wingetrs show git --source scoop
+  wingetrs show Microsoft.PowerToys --version 0.80.0 --json

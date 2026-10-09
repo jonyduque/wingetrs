@@ -1,0 +1,28 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Lista pacotes instalados
+
+Uso: wingetrs list [OPÇÕES]
+
+Opções:
+      --upgradable
+          Mostra só pacotes com atualização disponível
+
+      --source <SOURCE>
+          Restringe a uma fonte (winget ou scoop)
+
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+      --json
+          Saída em JSON
+
+Exemplos:
+  wingetrs list
+  wingetrs list --upgradable
+  wingetrs list --source winget --json

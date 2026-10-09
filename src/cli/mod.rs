@@ -19,19 +19,43 @@ fn parse_source(s: &str) -> Result<SourceKind, String> {
     SourceKind::from_str(s)
 }
 
+const HELP_TEMPLATE: &str = "{about-with-newline}
+Uso: {usage}
+
+{all-args}{after-help}";
+
 #[derive(Debug, clap::Parser)]
 #[command(
     name = "wingetrs",
     version,
-    about = "Gerenciador de pacotes rápido sobre winget e scoop"
+    about = "Gerenciador de pacotes rápido sobre winget e scoop",
+    override_usage = "wingetrs [OPÇÕES] [COMANDO]",
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true,
+    subcommand_help_heading = "Comandos",
+    next_help_heading = "Opções",
+    help_template = HELP_TEMPLATE,
+    after_help = "Exemplos:
+  wingetrs                       abre a TUI
+  wingetrs update                atualiza o catálogo
+  wingetrs search powertoys      busca pacotes
+  wingetrs show Microsoft.PowerToys
+  wingetrs list --upgradable     lista pacotes com atualização"
 )]
 pub struct Cli {
-    /// Conjunto de glifos da TUI
-    #[arg(long, value_enum, global = true)]
+    /// Conjunto de glifos da TUI (nerd, unicode ou ascii)
+    #[arg(long, value_enum, hide_possible_values = true)]
     pub glyphs: Option<GlyphArg>,
     /// Verbosidade (-v, -vv): também loga no stderr
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+    /// Mostra a ajuda
+    #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true)]
+    help: Option<bool>,
+    /// Mostra a versão
+    #[arg(short = 'V', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -46,7 +70,16 @@ pub enum GlyphArg {
 #[derive(Debug, PartialEq, clap::Subcommand)]
 pub enum Command {
     /// Atualiza o catálogo local
+    #[command(
+        override_usage = "wingetrs update [OPÇÕES]",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs update
+  wingetrs update --force"
+    )]
     Update {
+        /// Baixa o catálogo mesmo que esteja recente
         #[arg(long)]
         force: bool,
         /// Usado pelo refresh em segundo plano: sem saída
@@ -54,31 +87,71 @@ pub enum Command {
         background: bool,
     },
     /// Busca pacotes
+    #[command(
+        override_usage = "wingetrs search [OPÇÕES] <QUERY>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs search powertoys
+  wingetrs search powertoys --source scoop -n 5
+  wingetrs search git --json"
+    )]
     Search {
+        /// Texto a buscar (nome, id ou palavra-chave)
+        #[arg(help_heading = "Argumentos")]
         query: String,
+        /// Restringe a uma fonte (winget ou scoop)
         #[arg(long, value_parser = parse_source)]
         source: Option<SourceKind>,
+        /// Saída em JSON
         #[arg(long)]
         json: bool,
-        #[arg(short = 'n', long, default_value_t = 20)]
+        /// Máximo de resultados (padrão: 20)
+        #[arg(short = 'n', long, default_value_t = 20, hide_default_value = true)]
         limit: usize,
     },
     /// Mostra detalhes de um pacote
+    #[command(
+        override_usage = "wingetrs show [OPÇÕES] <ID>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs show Microsoft.PowerToys
+  wingetrs show git --source scoop
+  wingetrs show Microsoft.PowerToys --version 0.80.0 --json"
+    )]
     Show {
+        /// Identificador do pacote (ex.: Microsoft.PowerToys)
+        #[arg(help_heading = "Argumentos")]
         id: String,
+        /// Restringe a uma fonte (winget ou scoop)
         #[arg(long, value_parser = parse_source)]
         source: Option<SourceKind>,
+        /// Versão específica a mostrar
         #[arg(long)]
         version: Option<String>,
+        /// Saída em JSON
         #[arg(long)]
         json: bool,
     },
     /// Lista pacotes instalados
+    #[command(
+        override_usage = "wingetrs list [OPÇÕES]",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs list
+  wingetrs list --upgradable
+  wingetrs list --source winget --json"
+    )]
     List {
+        /// Mostra só pacotes com atualização disponível
         #[arg(long)]
         upgradable: bool,
+        /// Restringe a uma fonte (winget ou scoop)
         #[arg(long, value_parser = parse_source)]
         source: Option<SourceKind>,
+        /// Saída em JSON
         #[arg(long)]
         json: bool,
     },
