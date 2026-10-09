@@ -144,7 +144,7 @@ fn all_urls(ep: &Endpoints) -> Vec<&str> {
 /// Ensures a catalog exists (blocking update when empty) and triggers a
 /// detached refresh when it is stale.
 async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Result<Catalog> {
-    Ok(ensure_catalog_ran(data, cfg, http).await?.0)
+    Ok(ensure_catalog_ran(data, cfg, http, None).await?.0)
 }
 
 /// Like `ensure_catalog`; the flag is true when a blocking update had to run.
@@ -152,6 +152,7 @@ async fn ensure_catalog_ran(
     data: &DataDir,
     cfg: &Config,
     http: &Http,
+    early: Option<&mut EarlySearch>,
 ) -> anyhow::Result<(Catalog, bool)> {
     let ep = Endpoints::production(cfg)?;
     let path = data.catalog_path();
@@ -173,6 +174,10 @@ async fn ensure_catalog_ran(
     };
     if empty {
         drop(catalog);
+        // Never let the early reader run while the update rewrites the catalog.
+        if let Some(e) = early {
+            let _ = e.join();
+        }
         let reports = run_update(data, &ep, http, true, LockWait::from_env()).await?;
         let catalog = Catalog::open(&data.catalog_path())?;
         if catalog.is_empty()? {
@@ -198,13 +203,28 @@ fn print_reports(reports: &[SourceReport]) {
     }
 }
 
-type EarlySearch = std::thread::JoinHandle<Result<Vec<Found>, CatalogError>>;
+/// The search thread started before setup. Joined on every path: explicitly before a blocking
+/// update, or by `Drop` (e.g. after an error), so it never outlives the work that follows.
+struct EarlySearch(Option<std::thread::JoinHandle<Result<Vec<Found>, CatalogError>>>);
+
+impl EarlySearch {
+    /// Waits for the thread; `None` when already taken, failed or panicked.
+    fn join(&mut self) -> Option<Vec<Found>> {
+        self.0.take()?.join().ok()?.ok()
+    }
+}
+
+impl Drop for EarlySearch {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
 
 async fn run_async(
     cli: Cli,
     data: DataDir,
     cfg: Config,
-    early: Option<EarlySearch>,
+    mut early: Option<EarlySearch>,
 ) -> anyhow::Result<()> {
     let http = Http::new()?;
     let Some(cmd) = cli.command else {
@@ -225,8 +245,8 @@ async fn run_async(
             json,
             limit,
         } => {
-            let (catalog, updated) = ensure_catalog_ran(&data, &cfg, &http).await?;
-            let early = early.and_then(|h| h.join().ok()).and_then(Result::ok);
+            let (catalog, updated) = ensure_catalog_ran(&data, &cfg, &http, early.as_mut()).await?;
+            let early = early.as_mut().and_then(EarlySearch::join);
             let found = match early {
                 Some(found) if !updated => found,
                 _ => search_on_disk(&data.catalog_path(), &query, source, limit)?,
@@ -350,9 +370,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }) if data.catalog_path().exists() => {
             let (path, query, source, limit) =
                 (data.catalog_path(), query.clone(), *source, *limit);
-            Some(std::thread::spawn(move || {
+            Some(EarlySearch(Some(std::thread::spawn(move || {
                 search_on_disk(&path, &query, source, limit)
-            }))
+            }))))
         }
         _ => None,
     };
