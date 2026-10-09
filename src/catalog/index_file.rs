@@ -2,7 +2,7 @@
 //! Layout (little-endian): magic(8) | entry_count u32 | reserved u32 | body_len u64 |
 //! offsets u32[entry_count] | body | magic(8). See the record layout on `IndexView::raw`.
 use super::Catalog;
-use super::search::{EntryView, Found, Query, score_entry};
+use super::search::{EntryView, Found, Query, score_entry, sort_ranked};
 use crate::core::{PackageEntry, SourceKind};
 use nucleo::{Config, Matcher};
 use std::io::Read;
@@ -73,7 +73,10 @@ pub fn write(catalog: &Catalog, path: &Path) -> Result<usize, IndexFileError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
-    std::fs::write(&tmp, &out).map_err(|e| IndexFileError::Io(e.to_string()))?;
+    if let Err(e) = std::fs::write(&tmp, &out) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(IndexFileError::Io(e.to_string()));
+    }
     let mut last = None;
     for attempt in 0..5 {
         match std::fs::rename(&tmp, path) {
@@ -375,15 +378,12 @@ pub fn search(
         all
     };
     // Entries are in catalog (rowid) order and the sorts are stable, like the in-memory path.
-    if q.is_empty() {
-        scored.sort_by(|a, b| a.lower_name.cmp(&b.lower_name));
-    } else {
-        scored.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.lower_name.cmp(&b.lower_name))
-        });
-    }
+    sort_ranked(
+        &mut scored,
+        q.is_empty(),
+        |s| s.score,
+        |s| std::borrow::Cow::Borrowed(s.lower_name.as_str()),
+    );
     scored.truncate(limit);
     let mut found = Vec::with_capacity(scored.len());
     for s in scored {

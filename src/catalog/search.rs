@@ -230,20 +230,33 @@ impl SearchIndex {
             })
         };
         let entries = &self.entries;
-        if q.is_empty() {
-            hits.sort_by_cached_key(|h| entries[h.index].name.to_lowercase());
-        } else {
-            hits.sort_by(|a, b| {
-                b.score.cmp(&a.score).then_with(|| {
-                    entries[a.index]
-                        .name
-                        .to_lowercase()
-                        .cmp(&entries[b.index].name.to_lowercase())
-                })
-            });
-        }
+        sort_ranked(
+            &mut hits,
+            q.is_empty(),
+            |h| h.score,
+            |h| std::borrow::Cow::Owned(entries[h.index].name.to_lowercase()),
+        );
         hits.truncate(limit);
         hits
+    }
+}
+
+/// Single ordering for every search path: score descending (ignored for an empty query), then
+/// lowercased name ascending. The sort is stable, so ties keep catalog order.
+pub(crate) fn sort_ranked<T>(
+    items: &mut [T],
+    query_empty: bool,
+    score: impl Fn(&T) -> u32,
+    lower_name: impl for<'a> Fn(&'a T) -> std::borrow::Cow<'a, str>,
+) {
+    if query_empty {
+        items.sort_by_cached_key(|t| lower_name(t).into_owned());
+    } else {
+        items.sort_by(|a, b| {
+            score(b)
+                .cmp(&score(a))
+                .then_with(|| lower_name(a).cmp(&lower_name(b)))
+        });
     }
 }
 
@@ -373,15 +386,12 @@ fn search_once(
     for p in parts {
         scored.extend(p?);
     }
-    if q.is_empty() {
-        scored.sort_by(|a, b| a.lower_name.cmp(&b.lower_name));
-    } else {
-        scored.sort_by(|a, b| {
-            b.score
-                .cmp(&a.score)
-                .then_with(|| a.lower_name.cmp(&b.lower_name))
-        });
-    }
+    sort_ranked(
+        &mut scored,
+        q.is_empty(),
+        |s| s.score,
+        |s| std::borrow::Cow::Borrowed(s.lower_name.as_str()),
+    );
     scored.truncate(limit);
     let ids: Vec<i64> = scored.iter().map(|s| s.rowid).collect();
     let mut entries = master.entries_by_rowid(&ids)?;
