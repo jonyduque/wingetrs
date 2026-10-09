@@ -444,14 +444,15 @@ async fn run_async(
             source,
             json,
         } => {
-            // Scan and normalizer start now so they overlap with the catalog open.
+            // Scan, tracking and normalizer start now so they overlap with the catalog open.
             let scan_job = std::thread::spawn(|| {
-                let scan = crate::installed::timed("scan_all", crate::installed::scan_all);
-                let tracking = crate::installed::timed(
+                crate::installed::timed("scan_all", crate::installed::scan_all)
+            });
+            let tracking_job = std::thread::spawn(|| {
+                crate::installed::timed(
                     "winget_tracking",
                     crate::installed::winget_tracking::load_default,
-                );
-                (scan, tracking)
+                )
             });
             let norm_job = std::thread::spawn(|| {
                 crate::installed::timed(
@@ -461,8 +462,9 @@ async fn run_async(
             });
             let t0 = std::time::Instant::now();
             let catalog = ensure_catalog(&data, &cfg, &http).await;
-            // Join both early threads on every path before propagating a catalog error.
+            // Join every early thread on every path before propagating a catalog error.
             let scan_res = scan_job.join();
+            let tracking_res = tracking_job.join();
             let norm_res = norm_job.join();
             let catalog = catalog?;
             tracing::info!(
@@ -471,7 +473,8 @@ async fn run_async(
                 "span"
             );
             // A worker panic is a bug: re-raise it instead of returning partial results.
-            let (scan, tracking) = scan_res.unwrap_or_else(|p| std::panic::resume_unwind(p));
+            let scan = scan_res.unwrap_or_else(|p| std::panic::resume_unwind(p));
+            let tracking = tracking_res.unwrap_or_else(|p| std::panic::resume_unwind(p));
             let normalizer = norm_res.unwrap_or_else(|p| std::panic::resume_unwind(p));
             for e in &scan.errors {
                 tracing::warn!("coleta de instalados: {e}");

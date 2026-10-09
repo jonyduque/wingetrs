@@ -103,14 +103,13 @@ pub fn by_channel<'a>(display_name: &str, candidates: &[&'a str]) -> Option<&'a 
             .copied()
             .find(|s| s.eq_ignore_ascii_case(rest))
     };
-    let mut winners = candidates.iter().copied().filter(|base| {
+    // At most one id can be the `<base>.` prefix of all others, so the first winner is the only one.
+    candidates.iter().copied().find(|base| {
         candidates
             .iter()
             .filter(|o| !o.eq_ignore_ascii_case(base))
             .all(|o| channel_of(base, o).is_some_and(|s| !name.contains(&squash(s))))
-    });
-    let first = winners.next()?;
-    winners.next().is_none().then_some(first)
+    })
 }
 
 /// A rule that would drop every candidate decides nothing.

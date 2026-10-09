@@ -13,6 +13,12 @@ use crate::installed::normalize::NameNormalizer;
 pub enum TrackingError {
     #[error("catálogo de rastreamento do winget ilegível: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("catálogo de rastreamento do winget ilegível: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(
+        "catálogo de rastreamento do winget em modo WAL; ignorado para não criar arquivos na pasta do winget"
+    )]
+    Wal,
 }
 
 /// One tracked manifest: an id and the system references winget recorded for it.
@@ -85,8 +91,23 @@ fn read_map(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// True when a SQLite file header (first 100 bytes) declares WAL mode (write version 2):
+/// even a read-only connection may then create `-shm`/`-wal` next to the file.
+pub fn header_is_wal(header: &[u8]) -> bool {
+    header.get(18) == Some(&2)
+}
+
 /// Reads a tracking catalog (winget V1 SQLite index schema) opened strictly read-only.
+/// WAL-mode files are refused so nothing is ever created in winget's folder.
 pub fn read_tracking(path: &Path) -> Result<Tracking, TrackingError> {
+    let mut header = Vec::with_capacity(100);
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(std::fs::File::open(path)?, 100),
+        &mut header,
+    )?;
+    if header_is_wal(&header) {
+        return Err(TrackingError::Wal);
+    }
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,

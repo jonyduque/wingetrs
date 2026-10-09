@@ -230,11 +230,15 @@ fn spawn_reload(ctx: &Arc<Ctx>) {
 fn spawn_scan(ctx: &Arc<Ctx>) {
     let ctx = Arc::clone(ctx);
     tokio::task::spawn_blocking(move || {
+        // Tracking loads while the collectors run; joined before any other step can return.
+        let tracking_job = std::thread::spawn(crate::installed::winget_tracking::load_default);
         let scan = scan_all();
+        let tracking = tracking_job
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
         for e in &scan.errors {
             tracing::warn!("scan: {e}");
         }
-        let tracking = crate::installed::winget_tracking::load_default();
         let rows = Catalog::open(&ctx.data.catalog_path())
             .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new(), &tracking));
         match rows {

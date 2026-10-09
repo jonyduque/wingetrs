@@ -555,3 +555,39 @@ fn read_tracking_missing_file_is_an_error_not_a_panic() {
     let dir = tempfile::tempdir().unwrap();
     assert!(read_tracking(&dir.path().join("absent.db")).is_err());
 }
+
+#[test]
+fn tracking_header_wal_detection() {
+    use wingetrs::installed::winget_tracking::header_is_wal;
+    let mut h = [0u8; 100];
+    h[..16].copy_from_slice(b"SQLite format 3\0");
+    h[18] = 1;
+    h[19] = 1;
+    assert!(!header_is_wal(&h));
+    h[18] = 2;
+    h[19] = 2;
+    assert!(header_is_wal(&h));
+    assert!(!header_is_wal(&h[..10]));
+    assert!(!header_is_wal(&[]));
+}
+
+#[test]
+fn read_tracking_refuses_wal_catalogs_without_creating_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("installed.db");
+    {
+        let c = rusqlite::Connection::open(&p).unwrap();
+        c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE ids(rowid INTEGER PRIMARY KEY, id TEXT NOT NULL);")
+            .unwrap();
+    }
+    let before: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(read_tracking(&p).is_err());
+    let after: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+}
