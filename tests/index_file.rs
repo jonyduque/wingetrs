@@ -1,0 +1,181 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use wingetrs::catalog::index_file::{self, IndexView, MAGIC};
+use wingetrs::catalog::search::{SearchIndex, search_on_disk};
+use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
+use wingetrs::core::SourceKind;
+
+fn catalog(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let names = [
+        "PowerToys",
+        "Power Automate",
+        "powertoys",
+        "Zeal",
+        "360安全卫士",
+        "Visual Studio Code",
+        "Café Läuft",
+        "7-Zip",
+    ];
+    let mk = |i: usize| NewPackage {
+        id: format!("Pub{}.App{i}", i % 37),
+        name: format!("{} {i}", names[i % names.len()]),
+        moniker: i.is_multiple_of(5).then(|| format!("m{i}")),
+        version: format!("1.{i}"),
+        publisher: i.is_multiple_of(3).then(|| "Pub".to_string()),
+        description: i.is_multiple_of(4).then(|| format!("desc {i} ✓")),
+        tags: vec![format!("tag{}", i % 11), "power".into()],
+        commands: vec![format!("cmd{}", i % 13)],
+        ..Default::default()
+    };
+    let w: Vec<NewPackage> = (0..n).map(mk).collect();
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v",
+        1,
+        &w,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    let s: Vec<NewPackage> = (n..n + n / 3).map(mk).collect();
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "e",
+        1,
+        &s,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    drop(c);
+    (dir, path)
+}
+
+#[test]
+fn round_trip_every_entry() {
+    let (d, db) = catalog(500);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    assert_eq!(index_file::write(&cat, &idx).unwrap(), 666);
+    let bytes = std::fs::read(&idx).unwrap();
+    let v = IndexView::parse(&bytes).unwrap();
+    let mem = cat.load_entries().unwrap();
+    assert_eq!(v.len(), mem.len());
+    for (i, e) in mem.iter().enumerate() {
+        assert_eq!(&v.entry(i).unwrap(), e, "record {i}");
+    }
+    assert!(!idx.with_extension("idx.tmp").exists());
+}
+
+#[test]
+fn index_search_matches_in_memory_and_sqlite_exactly() {
+    let (d, db) = catalog(6000);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    index_file::write(&cat, &idx).unwrap();
+    let mut mem = SearchIndex::new(cat.load_entries().unwrap());
+    for (q, f, limit) in [
+        ("powertoys", None, 20),
+        ("power", None, 50),
+        ("power", Some(SourceKind::Scoop), 50),
+        ("安全", None, 10),
+        ("cafe", None, 10),
+        ("m10", None, 5),
+        ("tag3", None, 30),
+        ("", None, 25),
+        ("zzzz-no-match", None, 10),
+    ] {
+        let a: Vec<(String, u32, Vec<u32>)> = mem
+            .search(q, f, limit)
+            .into_iter()
+            .map(|h| (mem.entries()[h.index].id.clone(), h.score, h.name_indices))
+            .collect();
+        let b: Vec<(String, u32, Vec<u32>)> = index_file::search(&idx, q, f, limit)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.entry.id, x.score, x.name_indices))
+            .collect();
+        let c: Vec<(String, u32, Vec<u32>)> = search_on_disk(&db, q, f, limit)
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.entry.id, x.score, x.name_indices))
+            .collect();
+        assert_eq!(b, a, "index vs memory: {q:?} {f:?}");
+        assert_eq!(c, a, "sqlite vs memory: {q:?} {f:?}");
+    }
+}
+
+#[test]
+fn missing_file_is_none_and_damaged_files_are_errors_never_panics() {
+    let (d, db) = catalog(300);
+    let idx = d.path().join("search.idx");
+    assert!(index_file::search(&idx, "x", None, 10).unwrap().is_none());
+    index_file::write(&Catalog::open(&db).unwrap(), &idx).unwrap();
+    let good = std::fs::read(&idx).unwrap();
+    // truncations
+    for cut in [
+        0,
+        7,
+        8,
+        23,
+        24,
+        good.len() / 2,
+        good.len() - 8,
+        good.len() - 1,
+    ] {
+        assert!(IndexView::parse(&good[..cut]).is_err(), "cut {cut}");
+    }
+    // wrong version byte
+    let mut bad = good.clone();
+    bad[7] = 2;
+    assert!(IndexView::parse(&bad).is_err());
+    // count claims more entries than exist
+    let mut bad = good.clone();
+    bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(IndexView::parse(&bad).is_err());
+    // deterministic byte flips anywhere: parse/search may fail, but must never panic
+    let mut x: u32 = 0x9E37_79B9;
+    for _ in 0..500 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        let mut b = good.clone();
+        let pos = (x as usize) % b.len();
+        b[pos] ^= (x >> 24) as u8 | 1;
+        if let Ok(v) = IndexView::parse(&b) {
+            for i in 0..v.len() {
+                let _ = v.view(i);
+                let _ = v.entry(i);
+            }
+        }
+    }
+    assert_eq!(&good[..8], MAGIC);
+}
+
+#[test]
+fn rewriting_while_a_reader_loops_never_fails_or_tears() {
+    let (d, db) = catalog(300);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    index_file::write(&cat, &idx).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let reader = s.spawn(|| {
+            let mut reads = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let r = index_file::search(&idx, "power", None, 5).unwrap().unwrap();
+                assert!(!r.is_empty());
+                reads += 1;
+            }
+            reads
+        });
+        for _ in 0..10 {
+            assert_eq!(index_file::write(&cat, &idx).unwrap(), 400);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0);
+    });
+}

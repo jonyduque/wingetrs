@@ -243,3 +243,39 @@ async fn unreachable_endpoint_failure_is_offline() {
     let o = single_scoop_outcome("http://127.0.0.1:9/main.tgz".into()).await;
     assert!(matches!(o, Outcome::Failed { offline: true, .. }), "{o:?}");
 }
+
+#[tokio::test]
+async fn update_writes_search_index_and_rebuilds_it_when_missing() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        wingetrs::update::LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    let bytes = std::fs::read(data.search_index_path()).unwrap();
+    assert_eq!(
+        wingetrs::catalog::index_file::IndexView::parse(&bytes)
+            .unwrap()
+            .len(),
+        28
+    );
+    std::fs::remove_file(data.search_index_path()).unwrap();
+    // Fresh (no network needed): the missing index alone must trigger a rebuild.
+    run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        false,
+        wingetrs::update::LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    assert!(data.search_index_path().exists());
+}

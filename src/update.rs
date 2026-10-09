@@ -1,6 +1,6 @@
 //! Catalog update orchestration.
 use crate::cache::{DataDir, HttpEntry, HttpState, UpdateLock, now_unix};
-use crate::catalog::{Catalog, NewPackage, WingetMaps};
+use crate::catalog::{Catalog, NewPackage, WingetMaps, index_file};
 use crate::core::SourceKind;
 use crate::http::Http;
 use crate::sources::scoop::bucket::{BucketImport, ScoopFetch, bucket_url, fetch_bucket};
@@ -230,7 +230,23 @@ pub async fn run_update(
         });
     }
     state.save(&data.http_state_path())?;
+    let index_path = data.search_index_path();
+    let updated = reports
+        .iter()
+        .any(|r| matches!(r.outcome, Outcome::Updated { .. }));
+    if updated || !index_path.exists() {
+        write_search_index(&catalog, &index_path);
+    }
     Ok(reports)
+}
+
+/// Rewrites `search.idx`; on failure removes a possibly stale file so `search` falls back to
+/// the catalog instead of returning outdated results.
+fn write_search_index(catalog: &Catalog, path: &std::path::Path) {
+    if let Err(e) = index_file::write(catalog, path) {
+        tracing::warn!("falha ao gravar o índice de busca: {e}");
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

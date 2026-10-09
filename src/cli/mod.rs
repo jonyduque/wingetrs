@@ -4,6 +4,7 @@ pub mod output;
 use crate::cache::{DataDir, HttpState, now_unix};
 use crate::catalog::Catalog;
 use crate::catalog::CatalogError;
+use crate::catalog::index_file;
 use crate::catalog::search::{Found, search_on_disk};
 use crate::config::Config;
 use crate::core::SourceKind;
@@ -141,6 +142,14 @@ fn all_urls(ep: &Endpoints) -> Vec<&str> {
         .collect()
 }
 
+/// Triggers a detached refresh when any source was not checked recently.
+fn refresh_if_stale(data: &DataDir, ep: &Endpoints) {
+    let state = HttpState::load(&data.http_state_path());
+    if needs_refresh(&state, &all_urls(ep), now_unix()) {
+        spawn_background_update();
+    }
+}
+
 /// Ensures a catalog exists (blocking update when empty) and triggers a
 /// detached refresh when it is stale.
 async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Result<Catalog> {
@@ -190,11 +199,23 @@ async fn ensure_catalog_ran(
         }
         return Ok((catalog, true));
     }
-    let state = HttpState::load(&data.http_state_path());
-    if needs_refresh(&state, &all_urls(&ep), now_unix()) {
-        spawn_background_update();
-    }
+    refresh_if_stale(data, &ep);
     Ok((catalog, false))
+}
+
+/// Search through `search.idx` when it is present and valid; otherwise through the catalog file.
+fn search_best(
+    data: &DataDir,
+    query: &str,
+    source: Option<SourceKind>,
+    limit: usize,
+) -> Result<Vec<Found>, CatalogError> {
+    match index_file::search(&data.search_index_path(), query, source, limit) {
+        Ok(Some(found)) => return Ok(found),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("índice de busca inutilizável, usando o catálogo: {e}"),
+    }
+    search_on_disk(&data.catalog_path(), query, source, limit)
 }
 
 fn print_reports(reports: &[SourceReport]) {
@@ -218,6 +239,22 @@ impl Drop for EarlySearch {
     fn drop(&mut self) {
         let _ = self.join();
     }
+}
+
+/// Early-thread body: `search.idx` first, the catalog file when the index is absent or invalid.
+fn search_early(
+    idx: &std::path::Path,
+    catalog: &std::path::Path,
+    query: &str,
+    source: Option<SourceKind>,
+    limit: usize,
+) -> Result<Vec<Found>, CatalogError> {
+    match index_file::search(idx, query, source, limit) {
+        Ok(Some(found)) => return Ok(found),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("índice de busca inutilizável, usando o catálogo: {e}"),
+    }
+    search_on_disk(catalog, query, source, limit)
 }
 
 async fn run_async(
@@ -245,11 +282,21 @@ async fn run_async(
             json,
             limit,
         } => {
-            let (catalog, updated) = ensure_catalog_ran(&data, &cfg, &http, early.as_mut()).await?;
+            // A valid non-empty search.idx proves a catalog exists: skip opening SQLite.
+            let (catalog, updated) = if index_file::probe(&data.search_index_path())
+                .is_some_and(|n| n > 0)
+            {
+                let ep = Endpoints::production(&cfg)?;
+                refresh_if_stale(&data, &ep);
+                (None, false)
+            } else {
+                let (c, updated) = ensure_catalog_ran(&data, &cfg, &http, early.as_mut()).await?;
+                (Some(c), updated)
+            };
             let early = early.as_mut().and_then(EarlySearch::join);
             let found = match early {
                 Some(found) if !updated => found,
-                _ => search_on_disk(&data.catalog_path(), &query, source, limit)?,
+                _ => search_best(&data, &query, source, limit)?,
             };
             let rows: Vec<_> = found.into_iter().map(|f| f.entry).collect();
             if json {
@@ -369,9 +416,10 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             ..
         }) if data.catalog_path().exists() => {
             let (path, query, source, limit) =
-                (data.catalog_path(), query.clone(), *source, *limit);
+                (data.search_index_path(), query.clone(), *source, *limit);
+            let catalog = data.catalog_path();
             Some(EarlySearch(Some(std::thread::spawn(move || {
-                search_on_disk(&path, &query, source, limit)
+                search_early(&path, &catalog, &query, source, limit)
             }))))
         }
         _ => None,

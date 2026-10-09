@@ -64,6 +64,9 @@ impl DataDir {
     pub fn catalog_path(&self) -> PathBuf {
         self.root.join("catalog.db")
     }
+    pub fn search_index_path(&self) -> PathBuf {
+        self.root.join("search.idx")
+    }
     pub fn http_state_path(&self) -> PathBuf {
         self.root.join("http.json")
     }

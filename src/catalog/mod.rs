@@ -1,4 +1,5 @@
 //! Unified package catalog backed by SQLite.
+pub mod index_file;
 pub mod search;
 
 use crate::core::{PackageEntry, SourceKind};
