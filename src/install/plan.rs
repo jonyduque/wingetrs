@@ -77,6 +77,33 @@ pub struct InstallPlan {
     pub steps: Vec<Step>,
 }
 
+/// What uninstalling an app removes, built from its `state.db` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallPlan {
+    pub app: String,
+    /// Also delete `persist\<app>`.
+    pub purge: bool,
+    pub artifacts: Vec<crate::install::state::Artifact>,
+    /// Remove each recorded PATH entry that no other app still records (checked at execution).
+    pub remove_path_entry: bool,
+}
+
+impl UninstallPlan {
+    /// `None` when `app` has no record.
+    pub fn from_state(
+        state: &crate::install::state::StateDb,
+        app: &str,
+        purge: bool,
+    ) -> Result<Option<UninstallPlan>, crate::install::state::StateError> {
+        Ok(state.get(app)?.map(|(_, artifacts)| UninstallPlan {
+            app: app.to_string(),
+            purge,
+            artifacts,
+            remove_path_entry: true,
+        }))
+    }
+}
+
 impl ShimKind {
     /// Files the shim step creates in `shims\`.
     fn files(self, name: &str) -> String {

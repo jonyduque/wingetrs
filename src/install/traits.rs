@@ -83,6 +83,10 @@ pub mod fake {
         pub fn dump(&self) -> (BTreeMap<String, EnvValue>, u32) {
             (lock(&self.vars).clone(), *lock(&self.broadcasts))
         }
+        /// Raw value of `name`, if set.
+        pub fn get_raw(&self, name: &str) -> Option<String> {
+            lock(&self.vars).get(name).map(|v| v.value.clone())
+        }
     }
     impl EnvStore for FakeEnv {
         fn get(&self, name: &str) -> Result<Option<EnvValue>, EffectError> {

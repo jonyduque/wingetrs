@@ -3,6 +3,7 @@ pub mod download;
 pub mod executor;
 pub mod extract;
 pub mod layout;
+pub mod link;
 pub mod manifest;
 pub mod path_edit;
 pub mod plan;
