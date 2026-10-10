@@ -4,10 +4,16 @@ use crate::catalog::Catalog;
 use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
+use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
+use crate::install::plan::InstallPlan;
+use crate::install::residue::{self, Residue};
+use crate::install::state::StateDb;
 use crate::installed::correlate::correlate;
 use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
-use crate::tui::app::{App, Cmd, Msg, update};
+use crate::tui::app::{Action, App, Cmd, Done, InstallFail, Msg, Planned, update};
+#[cfg(windows)]
+use crate::tui::ops_win::with_ctx;
 use crate::tui::theme::{GlyphSet, Theme, detect_depth};
 use crate::tui::view::view;
 use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update};
@@ -134,6 +140,13 @@ async fn event_loop(
                 Cmd::LoadDetails { source, id } => {
                     spawn_details(&ctx, source, id);
                 }
+                Cmd::PlanInstall { source_name, id } => {
+                    spawn_plan(&ctx, move |c| plan_install(c, &source_name, &id));
+                }
+                Cmd::PlanRemove { app } => spawn_plan(&ctx, move |c| plan_remove(c, &app)),
+                Cmd::PlanUpgradeAll => spawn_plan(&ctx, plan_upgrade_all),
+                Cmd::Execute(action) => spawn_execute(&ctx, action),
+                Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
             }
         }
         if refresh_msg {
@@ -317,4 +330,226 @@ async fn load_details(
             )?)
         }
     }
+}
+
+#[cfg(not(windows))]
+fn with_ctx<R>(
+    _data: &DataDir,
+    _http: &Http,
+    _catalog: &Catalog,
+    _wait: LockWait,
+    _progress: crate::install::download::Progress<'_>,
+    _f: impl FnOnce(&OpsCtx<'_>) -> R,
+) -> Result<R, String> {
+    Err("instalar e remover só funciona no Windows".to_string())
+}
+
+fn no_progress(_label: &str, _done: u64, _total: Option<u64>) {}
+
+/// Runs `f` with the production `OpsCtx`; the TUI never waits for `install.lock`.
+fn with_ops<R>(
+    ctx: &Ctx,
+    progress: crate::install::download::Progress<'_>,
+    f: impl FnOnce(&OpsCtx<'_>) -> R,
+) -> Result<R, String> {
+    let catalog = Catalog::open(&ctx.data.catalog_path()).map_err(|e| e.to_string())?;
+    with_ctx(
+        &ctx.data,
+        &ctx.http,
+        &catalog,
+        LockWait::NoWait,
+        progress,
+        f,
+    )
+}
+
+/// Runs `work` on a blocking thread (it may block on the async `apply`) and sends the
+/// message it returns. The handle is always awaited; a worker panic becomes `panicked(..)`.
+fn spawn_job(
+    ctx: &Arc<Ctx>,
+    work: impl FnOnce(&Ctx, &tokio::runtime::Handle) -> Msg + Send + 'static,
+    panicked: fn(String) -> Msg,
+) {
+    let ctx = Arc::clone(ctx);
+    let handle = tokio::runtime::Handle::current();
+    tokio::spawn(async move {
+        let job = tokio::task::spawn_blocking({
+            let ctx = Arc::clone(&ctx);
+            move || work(&ctx, &handle)
+        });
+        let msg = match job.await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("tarefa de instalação falhou: {e}");
+                panicked(if e.is_panic() {
+                    "pânico interno".to_string()
+                } else {
+                    e.to_string()
+                })
+            }
+        };
+        let _ = ctx.tx.send(msg);
+    });
+}
+
+fn spawn_plan(ctx: &Arc<Ctx>, plan: impl FnOnce(&Ctx) -> Result<Planned, String> + Send + 'static) {
+    spawn_job(
+        ctx,
+        move |c, _| Msg::Planned(plan(c)),
+        |m| Msg::Planned(Err(m)),
+    );
+}
+
+fn plans_text(groups: &[Vec<InstallPlan>]) -> String {
+    groups
+        .iter()
+        .flatten()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`.
+fn plan_install(ctx: &Ctx, source_name: &str, id: &str) -> Result<Planned, String> {
+    let bucket = source_name
+        .strip_prefix("scoop:")
+        .ok_or_else(|| format!("{id} não vem de um bucket do scoop"))?;
+    with_ops(ctx, &no_progress, |c| {
+        match ops::resolve_target(c, id, Some(bucket)) {
+            Ok(Resolution::One(cand)) => {
+                let plans = ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?;
+                Ok(Planned::Ready {
+                    text: plans_text(std::slice::from_ref(&plans)),
+                    action: Action::Apply(vec![plans]),
+                })
+            }
+            Ok(Resolution::Many(found)) => Ok(Planned::Choose(found)),
+            Ok(Resolution::NotFound { .. }) => Err(format!("{id} não encontrado no catálogo")),
+            Err(e) => Err(e.to_string()),
+        }
+    })?
+}
+
+fn plan_remove(ctx: &Ctx, app: &str) -> Result<Planned, String> {
+    with_ops(ctx, &no_progress, |c| {
+        let plan = ops::plan_uninstall(c, app, false).map_err(|e| e.to_string())?;
+        let mut text = format!("Remover {} {}\n", plan.app, plan.version);
+        for a in &plan.artifacts {
+            text.push_str(&format!("  - {:?} {}\n", a.kind, a.target));
+        }
+        text.push_str("Os dados persistentes do app são mantidos.\n");
+        Ok(Planned::Ready {
+            text,
+            action: Action::Remove(plan),
+        })
+    })?
+}
+
+fn plan_upgrade_all(ctx: &Ctx) -> Result<Planned, String> {
+    with_ops(ctx, &no_progress, |c| {
+        let list = ops::upgradable(c).map_err(|e| e.to_string())?;
+        if list.upgradable.is_empty() {
+            return Err("nenhum app para atualizar".to_string());
+        }
+        let layout = c.data.install_layout();
+        let buckets: Vec<(String, String)> = StateDb::open(&layout.state_db())
+            .and_then(|s| s.apps())
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|r| (r.app, r.bucket))
+            .collect();
+        let mut groups = Vec::new();
+        for (app, _, _) in &list.upgradable {
+            let bucket = buckets
+                .iter()
+                .find(|(a, _)| a == app)
+                .map(|(_, b)| b.as_str());
+            match ops::resolve_target(c, app, bucket).map_err(|e| e.to_string())? {
+                Resolution::One(cand) => {
+                    groups.push(ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?);
+                }
+                _ => return Err(format!("{app}: não foi possível resolver no catálogo")),
+            }
+        }
+        Ok(Planned::Ready {
+            text: plans_text(&groups),
+            action: Action::Apply(groups),
+        })
+    })?
+}
+
+fn fail(e: OpsError) -> InstallFail {
+    match e {
+        OpsError::Busy => InstallFail::Busy,
+        other => InstallFail::Other(other.to_string()),
+    }
+}
+
+fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
+    spawn_job(
+        ctx,
+        move |c, handle| {
+            let tx = c.tx.clone();
+            let progress = move |label: &str, done: u64, total: Option<u64>| {
+                let _ = tx.send(Msg::InstallProgress {
+                    label: label.to_string(),
+                    done,
+                    total,
+                });
+            };
+            let result = with_ops(c, &progress, |o| run_action(o, handle, action))
+                .map_err(InstallFail::Other)
+                .and_then(|r| r);
+            Msg::InstallFinished(result)
+        },
+        |m| Msg::InstallFinished(Err(InstallFail::Other(m))),
+    );
+}
+
+fn run_action(
+    o: &OpsCtx<'_>,
+    handle: &tokio::runtime::Handle,
+    action: Action,
+) -> Result<Done, InstallFail> {
+    match action {
+        Action::Apply(groups) => {
+            let mut names: Vec<String> = Vec::new();
+            for group in &groups {
+                handle.block_on(ops::apply(o, group)).map_err(fail)?;
+                names.extend(group.iter().map(|p| p.app.clone()));
+            }
+            Ok(Done {
+                summary: format!("Instalado: {}", names.join(", ")),
+                residues: None,
+            })
+        }
+        Action::Remove(plan) => {
+            let residues = ops::uninstall(o, &plan).map_err(fail)?;
+            Ok(Done {
+                summary: format!("{} removido", plan.app),
+                residues: Some((plan.app, residues)),
+            })
+        }
+    }
+}
+
+fn spawn_clean(ctx: &Arc<Ctx>, app: String, residues: Vec<Residue>) {
+    spawn_job(
+        ctx,
+        move |c, _| {
+            let outcome = with_ops(c, &no_progress, |o| {
+                residue::clean(
+                    &residues,
+                    &app,
+                    &o.effects,
+                    &o.data.install_layout().backups(),
+                )
+            });
+            Msg::ResiduesCleaned(match outcome {
+                Ok(results) => results.into_iter().filter_map(Result::err).collect(),
+                Err(e) => vec![e],
+            })
+        },
+        |m| Msg::ResiduesCleaned(vec![m]),
+    );
 }

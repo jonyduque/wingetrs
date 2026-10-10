@@ -1,7 +1,11 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
 use crate::catalog::search::{SearchHit, SearchIndex};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
+use crate::install::plan::{InstallPlan, UninstallPlan};
+use crate::install::residue::{Confidence, Residue, ResidueKind};
+use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
+use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -44,14 +48,121 @@ pub enum Msg {
     RefreshFinished(Vec<SourceReport>),
     /// Another process holds the update lock; not a failure and not offline.
     RefreshBusy,
+    /// Result of planning an install, upgrade or removal.
+    Planned(Result<Planned, String>),
+    /// Download/extract progress of the running operation.
+    InstallProgress {
+        label: String,
+        done: u64,
+        total: Option<u64>,
+    },
+    /// The operation ended (also on failure, so the installed list is rescanned).
+    InstallFinished(Result<Done, InstallFail>),
+    /// Residue cleanup ended; one message per item that failed.
+    ResiduesCleaned(Vec<String>),
+}
+
+/// What the user is asked to confirm, or to choose from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Planned {
+    Ready {
+        text: String,
+        action: Action,
+    },
+    /// The text matched more than one package.
+    Choose(Vec<Candidate>),
+}
+
+/// A confirmed operation, executed by the runtime under `install.lock`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// One plan list per app (dependencies first), applied in order.
+    Apply(Vec<Vec<InstallPlan>>),
+    Remove(UninstallPlan),
+}
+
+impl Action {
+    fn label(&self) -> String {
+        match self {
+            Action::Apply(groups) => {
+                let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
+                format!("Instalando {}", apps.join(", "))
+            }
+            Action::Remove(p) => format!("Removendo {}", p.app),
+        }
+    }
+}
+
+/// Successful end of an operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Done {
+    pub summary: String,
+    /// `(app, residues)` left behind by a removal.
+    pub residues: Option<(String, Vec<Residue>)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InstallFail {
+    /// Another wingetrs process holds `install.lock`.
+    Busy,
+    Other(String),
+}
+
+/// Download/extract progress shown while an operation runs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunProgress {
+    pub label: String,
+    pub done: u64,
+    pub total: Option<u64>,
+}
+
+/// The dialog on top of the screen; it takes every key until it closes.
+pub enum Modal {
+    Confirm {
+        plan_text: String,
+        action: Action,
+    },
+    Picking {
+        picker: Picker,
+        candidates: Vec<Candidate>,
+    },
+    Running {
+        label: String,
+        progress: Option<RunProgress>,
+    },
+    Residues {
+        picker: Picker,
+        app: String,
+        residues: Vec<Residue>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Quit,
-    Refresh { force: bool },
-    LoadDetails { source: String, id: String },
+    Refresh {
+        force: bool,
+    },
+    LoadDetails {
+        source: String,
+        id: String,
+    },
     ScanInstalled,
+    /// Plan installing (or upgrading) one catalog package.
+    PlanInstall {
+        source_name: String,
+        id: String,
+    },
+    PlanRemove {
+        app: String,
+    },
+    /// Plan upgrading every app with a newer catalog version.
+    PlanUpgradeAll,
+    Execute(Action),
+    CleanResidues {
+        app: String,
+        residues: Vec<Residue>,
+    },
 }
 
 pub struct App {
@@ -73,6 +184,7 @@ pub struct App {
     pub status: Option<String>,
     pub glyphs: GlyphSet,
     pub size: (u16, u16),
+    pub modal: Option<Modal>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -101,6 +213,7 @@ impl App {
             status: None,
             glyphs,
             size: (80, 24),
+            modal: None,
         };
         app.research();
         app
@@ -260,6 +373,23 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.status = Some("Aguardando: outra atualização em andamento".to_string());
             Vec::new()
         }
+        Msg::Planned(result) => on_planned(app, result),
+        Msg::InstallProgress { label, done, total } => {
+            if let Some(Modal::Running { progress, .. }) = &mut app.modal {
+                *progress = Some(RunProgress { label, done, total });
+            }
+            Vec::new()
+        }
+        Msg::InstallFinished(result) => on_finished(app, result),
+        Msg::ResiduesCleaned(errors) => {
+            app.modal = None;
+            app.status = Some(if errors.is_empty() {
+                "Resíduos removidos".to_string()
+            } else {
+                format!("Falha ao limpar resíduos: {}", errors.join("; "))
+            });
+            Vec::new()
+        }
         Msg::RefreshFinished(reports) => {
             app.refreshing = false;
             let mut failed: Vec<String> = Vec::new();
@@ -285,6 +415,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
 fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     if key.kind == KeyEventKind::Release {
         return Vec::new();
+    }
+    if app.modal.is_some() {
+        return on_modal_key(app, key);
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -357,6 +490,9 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 vec![Cmd::Quit]
             }
         }
+        KeyCode::Char('i') if empty && app.tab == Tab::Search => install_selected(app),
+        KeyCode::Char('u') if empty && app.tab == Tab::Installed => remove_selected(app),
+        KeyCode::Char('U') if empty && app.tab == Tab::Updates => upgrade_selected(app),
         KeyCode::Char('q') if empty => vec![Cmd::Quit],
         KeyCode::Char('?') if empty => {
             app.show_help = true;
@@ -374,5 +510,222 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             app.details_cmd()
         }
         _ => Vec::new(),
+    }
+}
+
+const NOT_OURS: &str = "só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui";
+
+/// `i`: plan installing the selected package (scoop only).
+fn install_selected(app: &mut App) -> Vec<Cmd> {
+    let Some(hit) = app.hits.get(app.selected) else {
+        return Vec::new();
+    };
+    let Some(e) = app.search.entries().get(hit.index) else {
+        return Vec::new();
+    };
+    if e.source != SourceKind::Scoop {
+        app.status = Some("instalação na fase 2d".to_string());
+        return Vec::new();
+    }
+    vec![Cmd::PlanInstall {
+        source_name: e.source_name.clone(),
+        id: e.id.clone(),
+    }]
+}
+
+/// `u`: plan removing the selected app, which must be one wingetrs installed.
+fn remove_selected(app: &mut App) -> Vec<Cmd> {
+    let name = match app.installed_view().get(app.selected) {
+        None => return Vec::new(),
+        Some(r) if r.origin == "wingetrs" => r.name.clone(),
+        Some(_) => {
+            app.status = Some(NOT_OURS.to_string());
+            return Vec::new();
+        }
+    };
+    vec![Cmd::PlanRemove { app: name }]
+}
+
+/// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.
+fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
+    let (ours, source) = match app.installed_view().get(app.selected) {
+        None => return vec![Cmd::PlanUpgradeAll],
+        Some(r) => (
+            r.origin == "wingetrs",
+            match &r.correlation {
+                Correlation::Matched {
+                    source, package_id, ..
+                } => Some((source.clone(), package_id.clone())),
+                _ => None,
+            },
+        ),
+    };
+    match source {
+        Some((source_name, id)) if ours => vec![Cmd::PlanInstall { source_name, id }],
+        _ => {
+            app.status = Some(NOT_OURS.to_string());
+            Vec::new()
+        }
+    }
+}
+
+fn candidate_item(c: &Candidate) -> PickerItem {
+    PickerItem {
+        label: c.entry.id.clone(),
+        detail: format!("{} {}", c.entry.source_name, c.entry.version),
+        selectable: c.selectable,
+        note: c.note.clone(),
+    }
+}
+
+fn residue_item(r: &Residue) -> PickerItem {
+    let (label, detail) = match &r.kind {
+        ResidueKind::RegValue { key, value_name } => (
+            format!("{key}\\{}", value_name.as_deref().unwrap_or("(padrão)")),
+            "valor do registro",
+        ),
+        ResidueKind::RegKey { key } => (key.clone(), "chave do registro"),
+        ResidueKind::Folder { path } => (path.display().to_string(), "pasta"),
+        ResidueKind::Shortcut { path } => (path.display().to_string(), "atalho"),
+    };
+    let confidence = match r.confidence {
+        Confidence::High => "alta confiança",
+        Confidence::Low => "baixa confiança",
+    };
+    PickerItem {
+        label,
+        detail: format!("{detail}, {confidence}"),
+        selectable: true,
+        note: r.note.clone(),
+    }
+}
+
+fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
+    match result {
+        Ok(Planned::Ready { text, action }) => {
+            app.modal = Some(Modal::Confirm {
+                plan_text: text,
+                action,
+            });
+        }
+        Ok(Planned::Choose(candidates)) => {
+            let items = candidates.iter().map(candidate_item).collect();
+            app.modal = Some(Modal::Picking {
+                picker: Picker::single(items),
+                candidates,
+            });
+        }
+        Err(message) => app.status = Some(message),
+    }
+    Vec::new()
+}
+
+fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
+    app.modal = None;
+    match result {
+        Ok(done) => {
+            app.status = Some(done.summary);
+            if let Some((name, residues)) = done.residues
+                && !residues.is_empty()
+            {
+                let items: Vec<PickerItem> = residues.iter().map(residue_item).collect();
+                let initial: Vec<bool> = residues.iter().map(|r| r.preselected).collect();
+                app.modal = Some(Modal::Residues {
+                    picker: Picker::multi(items, &initial),
+                    app: name,
+                    residues,
+                });
+            }
+        }
+        Err(InstallFail::Busy) => {
+            app.status = Some("outra instalação em andamento".to_string());
+        }
+        Err(InstallFail::Other(message)) => app.status = Some(message),
+    }
+    // Success or not, the disk may have changed.
+    vec![Cmd::ScanInstalled]
+}
+
+fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
+    let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+    let Some(modal) = app.modal.take() else {
+        return Vec::new();
+    };
+    match modal {
+        Modal::Confirm { plan_text, action } => match key.code {
+            KeyCode::Enter => {
+                app.modal = Some(Modal::Running {
+                    label: action.label(),
+                    progress: None,
+                });
+                vec![Cmd::Execute(action)]
+            }
+            KeyCode::Esc => Vec::new(),
+            _ => {
+                app.modal = Some(Modal::Confirm { plan_text, action });
+                Vec::new()
+            }
+        },
+        Modal::Picking {
+            mut picker,
+            candidates,
+        } => match picker.key(key) {
+            PickOutcome::Pending => {
+                app.modal = Some(Modal::Picking { picker, candidates });
+                Vec::new()
+            }
+            PickOutcome::Cancelled => Vec::new(),
+            PickOutcome::Picked(chosen) => match chosen.first().and_then(|&i| candidates.get(i)) {
+                Some(c) if c.selectable => vec![Cmd::PlanInstall {
+                    source_name: c.entry.source_name.clone(),
+                    id: c.entry.id.clone(),
+                }],
+                _ => Vec::new(),
+            },
+        },
+        Modal::Running { label, progress } => {
+            // The operation cannot be abandoned half-way: keys wait for it.
+            if ctrl_c {
+                app.status = Some("aguarde: operação em andamento".to_string());
+            }
+            app.modal = Some(Modal::Running { label, progress });
+            Vec::new()
+        }
+        Modal::Residues {
+            mut picker,
+            app: name,
+            residues,
+        } => match picker.key(key) {
+            PickOutcome::Pending => {
+                app.modal = Some(Modal::Residues {
+                    picker,
+                    app: name,
+                    residues,
+                });
+                Vec::new()
+            }
+            PickOutcome::Cancelled => {
+                app.status = Some("resíduos mantidos".to_string());
+                Vec::new()
+            }
+            PickOutcome::Picked(chosen) => {
+                let selected: Vec<Residue> = chosen
+                    .iter()
+                    .filter_map(|&i| residues.get(i).cloned())
+                    .collect();
+                if selected.is_empty() {
+                    app.status = Some("resíduos mantidos".to_string());
+                    return Vec::new();
+                }
+                app.modal = Some(Modal::Running {
+                    label: format!("Limpando resíduos de {name}"),
+                    progress: None,
+                });
+                vec![Cmd::CleanResidues {
+                    app: name,
+                    residues: selected,
+                }]
+            }
+        },
     }
 }

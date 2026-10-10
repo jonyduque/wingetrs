@@ -134,3 +134,144 @@ fn matched_letters_are_underlined() {
     assert_eq!(tail.symbol(), "s");
     assert!(!tail.modifier.contains(Modifier::UNDERLINED));
 }
+// ---- modals (Task 39) ----
+
+use std::path::PathBuf;
+use wingetrs::install::plan::InstallPlan;
+use wingetrs::install::residue::{Confidence, Residue, ResidueKind};
+use wingetrs::install::target::Candidate;
+use wingetrs::tui::app::{Action, Done, Planned};
+
+fn plan() -> InstallPlan {
+    InstallPlan {
+        app: "powertoys".into(),
+        bucket: "main".into(),
+        version: "0.101.2".into(),
+        arch: None,
+        upgrade_from: None,
+        root: PathBuf::from("C:/w"),
+        manifest_sha256: "x".into(),
+        steps: vec![],
+    }
+}
+
+fn press(a: &mut App, code: crossterm::event::KeyCode) {
+    update(
+        a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+}
+
+fn with_confirm() -> App {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Instalar powertoys 0.101.2 (bucket main)\n  1. Baixar powertoys.zip\n  2. Extrair em apps/powertoys/0.101.2".into(),
+            action: Action::Apply(vec![vec![plan()]]),
+        })),
+    );
+    a
+}
+
+fn with_picking() -> App {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    let cand = |bucket: &str| {
+        let mut entry = entries().remove(2);
+        entry.source_name = format!("scoop:{bucket}");
+        Candidate {
+            entry,
+            selectable: true,
+            note: None,
+        }
+    };
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Choose(vec![cand("extras"), cand("main")]))),
+    );
+    a
+}
+
+fn with_running() -> App {
+    let mut a = with_confirm();
+    press(&mut a, crossterm::event::KeyCode::Enter);
+    update(
+        &mut a,
+        Msg::InstallProgress {
+            label: "powertoys.zip".into(),
+            done: 50,
+            total: Some(100),
+        },
+    );
+    a
+}
+
+fn with_residues() -> App {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    let r = |p: &str, pre: bool| Residue {
+        kind: ResidueKind::Folder { path: p.into() },
+        confidence: if pre {
+            Confidence::High
+        } else {
+            Confidence::Low
+        },
+        preselected: pre,
+        note: (!pre).then(|| "pode ser de outra instalação".to_string()),
+    };
+    update(
+        &mut a,
+        Msg::InstallFinished(Ok(Done {
+            summary: "powertoys removido".into(),
+            residues: Some((
+                "powertoys".into(),
+                vec![
+                    r("C:/Users/x/AppData/Roaming/powertoys", true),
+                    r("C:/Users/x/AppData/Local/powertoys", false),
+                ],
+            )),
+        })),
+    );
+    a
+}
+
+#[test]
+fn confirm_modal_snapshot() {
+    insta::assert_snapshot!(render(&with_confirm(), 100, 16));
+}
+
+#[test]
+fn picking_modal_snapshot() {
+    insta::assert_snapshot!(render(&with_picking(), 100, 16));
+}
+
+#[test]
+fn running_modal_snapshot() {
+    insta::assert_snapshot!(render(&with_running(), 100, 16));
+}
+
+#[test]
+fn residues_modal_snapshot() {
+    insta::assert_snapshot!(render(&with_residues(), 100, 16));
+}
+
+#[test]
+fn modals_never_panic_on_tiny_terminals() {
+    for build in [with_confirm, with_picking, with_running, with_residues] {
+        let a = build();
+        assert!(a.modal.is_some());
+        for (w, h) in [(1, 1), (20, 5), (10, 3), (59, 7), (60, 8), (200, 60)] {
+            let _ = render(&a, w, h);
+        }
+    }
+}
+
+#[test]
+fn closed_modal_leaves_the_screen_alone() {
+    let mut a = with_confirm();
+    press(&mut a, crossterm::event::KeyCode::Esc);
+    assert!(a.modal.is_none());
+    assert!(!render(&a, 100, 16).contains("Confirmar"));
+}

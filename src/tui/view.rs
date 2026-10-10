@@ -1,7 +1,8 @@
 //! Pure rendering of `App` (spec §7.1). Colors come only from `Theme` tokens.
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, Focus, Tab};
+use crate::tui::app::{App, Focus, Modal, RunProgress, Tab};
+use crate::tui::picker::{Picker, window};
 use crate::tui::theme::{Glyphs, Theme};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -19,6 +20,13 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    draw_screen(app, theme, frame, area);
+    if let Some(modal) = &app.modal {
+        draw_modal(modal, theme, frame, area);
+    }
+}
+
+fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let g = Glyphs::for_set(app.glyphs);
     if area.height < MIN_HEIGHT_FOR_CHROME {
         draw_list(app, theme, g, frame, area, false);
@@ -546,7 +554,7 @@ fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
     let w = area.width.min(52);
-    let h = area.height.min(12);
+    let h = area.height.min(15);
     let rect = Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
@@ -567,6 +575,9 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("PgUp PgDn", "mover de 10 em 10"),
         key("Tab", "próxima aba"),
         key("Enter", "foco nos detalhes"),
+        key("i", "instalar (aba Busca, scoop)"),
+        key("u", "remover (aba Instalados)"),
+        key("U", "atualizar (aba Atualizações)"),
         key("Ctrl+S", "filtrar fonte"),
         key("Ctrl+R", "atualizar catálogo"),
         key("Esc", "voltar / limpar / sair"),
@@ -575,6 +586,155 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     let blk = block(theme, true).title(Span::styled(
         " Ajuda ",
+        theme.accent().add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(lines).block(blk), rect);
+}
+
+/// Centered rectangle of at most `w` x `h` inside `area`.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+fn modal_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
+    block(theme, true).title(Span::styled(
+        format!(" {title} "),
+        theme.accent().add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn draw_modal(modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
+    match modal {
+        Modal::Confirm { plan_text, .. } => {
+            let mut lines: Vec<Line> = plan_text
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), theme.fg())))
+                .collect();
+            lines.push(Line::from(Span::styled(
+                "Enter confirma · Esc cancela",
+                theme.accent(),
+            )));
+            let h = u16::try_from(lines.len())
+                .unwrap_or(u16::MAX)
+                .saturating_add(2);
+            let rect = centered(area, 90, h);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(modal_block(theme, "Confirmar"))
+                    .wrap(Wrap { trim: false }),
+                rect,
+            );
+        }
+        Modal::Picking { picker, .. } => {
+            draw_picker(
+                picker,
+                "Escolha o pacote",
+                "Enter escolhe · Esc cancela",
+                theme,
+                frame,
+                area,
+            );
+        }
+        Modal::Residues { picker, app, .. } => {
+            let title = format!("Resíduos de {app}");
+            draw_picker(
+                picker,
+                &title,
+                "Espaço marca · Enter remove os marcados · Esc mantém",
+                theme,
+                frame,
+                area,
+            );
+        }
+        Modal::Running { label, progress } => {
+            let mut lines = vec![Line::from(Span::styled(label.clone(), theme.fg()))];
+            if let Some(p) = progress {
+                lines.push(progress_line(p, theme));
+            }
+            let rect = centered(area, 70, if progress.is_some() { 4 } else { 3 });
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(modal_block(theme, "Em andamento"))
+                    .wrap(Wrap { trim: true }),
+                rect,
+            );
+        }
+    }
+}
+
+fn progress_line<'a>(p: &RunProgress, theme: &Theme) -> Line<'a> {
+    let text = match p.total.filter(|t| *t > 0) {
+        Some(total) => {
+            let pct = (p.done.saturating_mul(100) / total).min(100);
+            let filled = usize::try_from(pct / 5).unwrap_or(20);
+            format!(
+                "{} [{}{}] {pct}%",
+                p.label,
+                "#".repeat(filled),
+                "-".repeat(20 - filled.min(20))
+            )
+        }
+        None => format!("{} {} bytes", p.label, p.done),
+    };
+    Line::from(Span::styled(text, theme.muted()))
+}
+
+fn draw_picker(
+    picker: &Picker,
+    title: &str,
+    footer: &str,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let items = picker.items();
+    let rows = usize::from(area.height.saturating_sub(4)).clamp(1, 12);
+    let range = window(picker.selected(), items.len(), rows);
+    let mut lines: Vec<Line> = Vec::new();
+    for i in range {
+        let it = &items[i];
+        let cursor = if i == picker.selected() { ">" } else { " " };
+        let mark = if !picker.is_multi() {
+            ""
+        } else if picker.checked().get(i).copied().unwrap_or(false) {
+            "[x] "
+        } else {
+            "[ ] "
+        };
+        let note = it
+            .note
+            .as_deref()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        let style = if !it.selectable {
+            theme.muted()
+        } else if i == picker.selected() {
+            theme.bg_selected()
+        } else {
+            theme.fg()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{cursor} {mark}{}  {}{note}", it.label, it.detail),
+            style,
+        )));
+    }
+    lines.push(Line::from(Span::styled(footer.to_string(), theme.accent())));
+    let h = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let rect = centered(area, 100, h);
+    frame.render_widget(Clear, rect);
+    let blk = block(theme, true).title(Span::styled(
+        format!(" {title} "),
         theme.accent().add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(Paragraph::new(lines).block(blk), rect);
