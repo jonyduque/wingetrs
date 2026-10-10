@@ -38,3 +38,4 @@ Plano: `docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md`.
 | Task | Título | base..head | Status | Modelo (impl/review) | Notas |
 |---|---|---|---|---|---|
 | 27 | Layout, traits de efeito, fakes, snapshot e PATH puro | 28165e3..090c970 | DONE | sonnet/sonnet | revisor: junction no snapshot sem teste (mutação sobrevivia), pinado em 090c970; brief.ps1 passou a incluir Global Constraints (4a52b78); check_rules pulava arquivos de 1 linha em silêncio, corrigido (87d9067) |
+| 35 | Resolução do alvo e seletor por setas | 4a52b78..8515601 | DONE | sonnet/sonnet | revisor: Ctrl+C não cancelava o seletor (raw mode), corrigido e testado; query vazia sem sugestões; desenho inline não verificável sem TTY |
