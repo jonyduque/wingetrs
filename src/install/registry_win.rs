@@ -5,13 +5,27 @@ use std::process::Command;
 use winreg::RegKey;
 use winreg::enums::{
     HKEY_CURRENT_USER, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
-    REG_SZ,
+    REG_OPTION_OPEN_LINK, REG_SZ,
 };
 
+use super::env_win::EMPTY_TEST_KEY;
 use super::traits::{EffectError, RegHit, RegistryScan};
 
 const MAX_DEPTH: u32 = 8;
 const KEY_SCAN: u32 = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS;
+
+/// Opens a subkey for scanning without following registry symbolic links: a link key is
+/// opened as itself (a `REG_LINK` value, no string data, no subkeys), so a link planted
+/// inside a scanned tree cannot redirect the walk elsewhere.
+fn open_nolink<P: AsRef<std::ffi::OsStr>>(key: &RegKey, path: P) -> std::io::Result<RegKey> {
+    key.open_subkey_with_options_flags(path, REG_OPTION_OPEN_LINK, KEY_SCAN)
+}
+
+fn is_link(key: &RegKey) -> bool {
+    key.enum_values()
+        .flatten()
+        .any(|(n, _)| n == "SymbolicLinkValue")
+}
 
 /// HKCU scanner; with `WINGETRS_TEST_ENV_KEY` set every key is relative to it.
 pub struct RegScanner {
@@ -19,18 +33,36 @@ pub struct RegScanner {
 }
 
 impl RegScanner {
+    /// Reads `WINGETRS_TEST_ENV_KEY`; present (even empty) means a test base, never real HKCU.
     pub fn from_env() -> RegScanner {
+        let var = std::env::var_os("WINGETRS_TEST_ENV_KEY");
+        let var = var.as_ref().map(|v| v.to_string_lossy());
         RegScanner {
-            base: std::env::var("WINGETRS_TEST_ENV_KEY")
-                .ok()
-                .filter(|s| !s.is_empty()),
+            base: RegScanner::resolve_base(var.as_deref()),
         }
     }
 
-    /// Scanner rooted at an explicit HKCU-relative base (tests).
+    /// `None` = real HKCU; `Some("")` falls back to a fixed test key so an empty base can
+    /// never reach the real registry.
+    pub fn resolve_base(var: Option<&str>) -> Option<String> {
+        var.map(|v| {
+            if v.is_empty() {
+                EMPTY_TEST_KEY.to_string()
+            } else {
+                v.to_string()
+            }
+        })
+    }
+
+    /// Scanner over the real HKCU. The only way to get one besides an unset env variable.
+    pub fn real() -> RegScanner {
+        RegScanner { base: None }
+    }
+
+    /// Scanner rooted at an explicit HKCU-relative base (tests); empty base is never real HKCU.
     pub fn with_base(base: &str) -> RegScanner {
         RegScanner {
-            base: Some(base.to_string()).filter(|b| !b.is_empty()),
+            base: RegScanner::resolve_base(Some(base)),
         }
     }
 
@@ -72,7 +104,7 @@ impl RegScanner {
         let mut tasks: Vec<(String, String, Kind)> = Vec::new();
         for root in roots {
             // A missing root is not an error: nothing to find.
-            let Ok(k) = hkcu.open_subkey_with_flags(self.full(root), KEY_SCAN) else {
+            let Ok(k) = open_nolink(&hkcu, self.full(root)) else {
                 continue;
             };
             scan_values(&k, root, &needle, &mut raw);
@@ -94,7 +126,7 @@ impl RegScanner {
                         .any(|p| p.eq_ignore_ascii_case(&sub))
                     {
                         tasks.push((path.clone(), full.clone(), Kind::Values));
-                        if let Ok(sk) = k.open_subkey_with_flags(&sub, KEY_SCAN) {
+                        if let Ok(sk) = open_nolink(&k, &sub) {
                             for sub2 in sk.enum_keys().flatten() {
                                 tasks.push((
                                     format!("{path}\\{sub2}"),
@@ -108,7 +140,7 @@ impl RegScanner {
                     }
                     continue;
                 }
-                let Ok(sk) = k.open_subkey_with_flags(&sub, KEY_SCAN) else {
+                let Ok(sk) = open_nolink(&k, &sub) else {
                     continue;
                 };
                 tasks.push((path.clone(), full.clone(), Kind::Values));
@@ -131,7 +163,7 @@ impl RegScanner {
                     break;
                 };
                 let mut out = Vec::new();
-                if let Ok(k) = hkcu.open_subkey_with_flags(full, KEY_SCAN) {
+                if let Ok(k) = open_nolink(&hkcu, full) {
                     match kind {
                         Kind::Values => scan_values(&k, path, &needle, &mut out),
                         Kind::Walk(depth) => walk(&k, path, &needle, *depth, &mut out),
@@ -237,7 +269,7 @@ fn open_ci(key: &RegKey, name: &str) -> Option<(String, RegKey)> {
         .enum_keys()
         .flatten()
         .find(|k| k.eq_ignore_ascii_case(name))?;
-    let sub = key.open_subkey_with_flags(&actual, KEY_SCAN).ok()?;
+    let sub = open_nolink(key, &actual).ok()?;
     Some((actual, sub))
 }
 
@@ -269,7 +301,7 @@ fn targeted_shell_at(key: &RegKey, path: &str, needle: &str, nest: u32, out: &mu
     let spath = format!("{path}\\{sn}");
     scan_values(&shell, &spath, needle, out);
     for verb in shell.enum_keys().flatten() {
-        let Ok(vk) = shell.open_subkey_with_flags(&verb, KEY_SCAN) else {
+        let Ok(vk) = open_nolink(&shell, &verb) else {
             continue;
         };
         let vpath = format!("{spath}\\{verb}");
@@ -289,7 +321,7 @@ fn walk(key: &RegKey, path: &str, needle: &str, depth: u32, out: &mut Vec<RawHit
         return;
     }
     for sub in key.enum_keys().flatten() {
-        if let Ok(k) = key.open_subkey_with_flags(&sub, KEY_SCAN) {
+        if let Ok(k) = open_nolink(key, &sub) {
             walk(&k, &format!("{path}\\{sub}"), needle, depth + 1, out);
         }
     }
@@ -310,7 +342,7 @@ impl RegistryScan for RegScanner {
 
     fn subkeys_named(&self, parent: &str, names: &[&str]) -> Result<Vec<String>, EffectError> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let Ok(k) = hkcu.open_subkey_with_flags(self.full(parent), KEY_SCAN) else {
+        let Ok(k) = open_nolink(&hkcu, self.full(parent)) else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -323,7 +355,7 @@ impl RegistryScan for RegScanner {
     }
 
     fn export(&self, key: &str, file: &Path) -> Result<(), EffectError> {
-        let out = Command::new("reg")
+        let out = Command::new(reg_exe())
             .arg("export")
             .arg(format!("HKCU\\{}", self.full(key)))
             .arg(file)
@@ -343,7 +375,7 @@ impl RegistryScan for RegScanner {
     fn delete_value(&self, key: &str, value_name: &str) -> Result<(), EffectError> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let k = hkcu
-            .open_subkey_with_flags(self.full(key), KEY_SET_VALUE)
+            .open_subkey_with_options_flags(self.full(key), REG_OPTION_OPEN_LINK, KEY_SET_VALUE)
             .map_err(|e| eff("abrir chave", e))?;
         k.delete_value(value_name)
             .map_err(|e| eff("apagar valor", e))
@@ -354,7 +386,20 @@ impl RegistryScan for RegScanner {
             return Err(EffectError("registro: chave vazia recusada".into()));
         }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        hkcu.delete_subkey_all(self.full(key))
+        // Refuse to delete through a registry symbolic link.
+        let full = self.full(key);
+        if let Ok(k) = open_nolink(&hkcu, &full)
+            && is_link(&k)
+        {
+            return Err(EffectError("registro: link simbólico recusado".into()));
+        }
+        hkcu.delete_subkey_all(full)
             .map_err(|e| eff("apagar chave", e))
     }
+}
+
+/// `reg.exe` by absolute path (no PATH search).
+fn reg_exe() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    std::path::Path::new(&root).join("System32").join("reg.exe")
 }

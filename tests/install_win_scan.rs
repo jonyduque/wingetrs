@@ -86,7 +86,8 @@ fn live_registry_scan_export_delete() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let reg = dir.path().join("out.reg");
+    let reg = dir.path().join("with space").join("out file.reg");
+    std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
     scan.export("Classes\\x", &reg).unwrap();
     let bytes = std::fs::read(&reg).unwrap();
     let (pairs, _) = bytes[2..].as_chunks::<2>();
@@ -116,6 +117,9 @@ fn live_classes_scan_is_targeted() {
         "Classes\\Applications\\x.exe\\shell\\open\\command",
         "Classes\\Directory\\Background\\shell\\v\\command",
         "Classes\\Prog\\DefaultIcon",
+        "Classes\\Nest\\shell\\v\\shell\\w\\command",
+        // MAX_NESTED_SHELL + 1 levels deep: must not be found
+        "Classes\\Deep\\shell\\a\\shell\\b\\shell\\c\\shell\\d\\shell\\e\\command",
     ] {
         let (k, _) = hkcu.create_subkey(format!("{}\\{sub}", tk.0)).unwrap();
         k.set_value("", &data).unwrap();
@@ -134,6 +138,7 @@ fn live_classes_scan_is_targeted() {
             "Classes\\.foo\\shell\\open\\command",
             "Classes\\Applications\\x.exe\\shell\\open\\command",
             "Classes\\Directory\\Background\\shell\\v\\command",
+            "Classes\\Nest\\shell\\v\\shell\\w\\command",
             "Classes\\Prog\\DefaultIcon",
         ]
     );
@@ -141,7 +146,8 @@ fn live_classes_scan_is_targeted() {
     assert_eq!(
         scan.values_containing_full(&["Classes"], "apps\\app", 2)
             .len(),
-        6
+        // 8 fixtures; the exhaustive walk stops at MAX_DEPTH before the deepest one
+        7
     );
 }
 
@@ -165,7 +171,7 @@ fn live_registry_delete_value() {
 #[test]
 #[ignore = "live: varre HKCU real (somente leitura) e mede tempo"]
 fn live_scan_speed() {
-    let scan = RegScanner::with_base("");
+    let scan = RegScanner::real();
     let roots = [
         "Software\\Classes",
         "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
@@ -195,7 +201,7 @@ fn live_scan_speed() {
 #[test]
 #[ignore = "live: varre HKCU real (somente leitura); prova de cobertura da varredura direcionada"]
 fn live_targeted_coverage() {
-    let scan = RegScanner::with_base("");
+    let scan = RegScanner::real();
     let roots = ["Software\\Classes"];
     let pruned = [
         "Local Settings",
@@ -257,4 +263,17 @@ fn live_recycle_removes_file() {
     std::fs::write(&f, b"x").unwrap();
     ShellTrash.recycle(&f).unwrap();
     assert!(!f.exists());
+}
+
+#[test]
+fn base_resolution_never_yields_real_hkcu_when_variable_is_present() {
+    assert_eq!(RegScanner::resolve_base(None), None);
+    assert_eq!(
+        RegScanner::resolve_base(Some("")).as_deref(),
+        Some(r"Software\wingetrs-test\env-empty")
+    );
+    assert_eq!(
+        RegScanner::resolve_base(Some(r"Software\x")).as_deref(),
+        Some(r"Software\x")
+    );
 }

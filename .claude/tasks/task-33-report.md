@@ -43,3 +43,12 @@ Status: DONE. Gate: [OK] test (305 passed, 15 ignored) / [OK] gate verde. Live: 
 - live_classes_scan_is_targeted: Classes\.foo, Applications\x.exe, Directory\Background, Prog\DefaultIcon found; Local Settings\shell\open\command and CLSID\shell\open\command not found; the full scan sees all 6.
 - Mutation: -Anchor '"Local Settings",' -Replacement '"Local Settings Off",' -> [OK] mutação PEGA: '"Local Settings",' -> '"Local Settings Off",' fez o teste falhar (exit 101). (First attempt survived because the fixture did not contain a shell\command under Local Settings; fixture fixed.)
 - Reported key paths use the stored casing (open_ci enumerates to find it); full and targeted agree.
+
+## Addendum 2: review fixes (commit "fix(install): empty test key never reaches real HKCU; pin nested shell scan")
+Gate: [OK] test (307 passed, 15 ignored) / [OK] gate verde. Live 6/6 passed.
+1. Base: variable present (even empty/non-unicode) => test base; empty => EMPTY_TEST_KEY (Software\wingetrs-test\env-empty, shared with env_win). Real HKCU only via RegScanner::real() (speed/coverage tests use it) or unset variable. Pure test base_resolution_never_yields_real_hkcu_when_variable_is_present.
+   Mutation 'EMPTY_TEST_KEY.to_string()' -> 'String::new()': [OK] mutação PEGA: 'EMPTY_TEST_KEY.to_string()' -> 'String::new()' fez o teste falhar (exit 101).
+2. Fixture has Nest\shell\v\shell\w\command (expected) and a 5-level-deep one (expected absent); full scan finds 7 of 8 (stops at MAX_DEPTH).
+   Mutation 'nest < MAX_NESTED_SHELL' -> 'nest < 0': [OK] mutação PEGA: 'nest < MAX_NESTED_SHELL' -> 'nest < 0' fez o teste falhar (exit 101).
+3. All scan opens use REG_OPTION_OPEN_LINK (link key opened as itself, nothing followed); delete_value opens with it; delete_key refuses a target that holds SymbolicLinkValue. Documented in code. NOT proven by test: creating a registry symlink needs raw API outside the allowed crates; mutation of OPEN_LINK -> 0 survives (no link fixture). RegDeleteTree on links nested deeper than the target is not checked.
+4. reg.exe by %SystemRoot%\System32\reg.exe; export test now writes to "with space\out file.reg".
