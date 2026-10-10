@@ -27,6 +27,9 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 - **`COUNT(*)` percorre a tabela**; para "está vazio?" use `EXISTS`. `Catalog::open` roda DDL do schema; para leitura use `open_read_only`.
 - **Processos órfãos de agentes distorcem medições.** Rode `scripts/leftovers.ps1` antes de medir e depois de cada tarefa.
 
+- **Caminho do manifesto é dado externo.** `extract_to`/`extract_dir` (Task 26) e `persist`/`env_add_path`/`bin`/`shortcuts` (Task 28) aceitavam `..` e absolutos; o scoop recusa `env_add_path` fora do app ("outside of app directory") e ignora entradas vazias. Regra: tudo passa por `install::safepath`.
+- **Regra listada no brief sem teste nomeado vira regra sem teste.** Tasks 24, 28, 29 e 36: o implementador testou só as fixtures e as regras de "What binds" ficaram descobertas (mutações sobreviveram). Ao escrever plano: cada regra de "What binds"/"Decision" tem o seu teste (literal ou descrito com entrada e saída).
+
 ## Dados do mundo real
 
 - **Pacotes MSIX "sparse"** (VS Code, Zed, Edge: `SignatureKind=Developer`, versão sintética 1.0.0.0) casavam por nome+publisher e viravam falso "atualização disponível". O winget só correlaciona MSIX por PFN.
