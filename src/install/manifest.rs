@@ -255,6 +255,10 @@ fn build_sources(root: &Obj, variant: Option<&Obj>) -> Result<Vec<Source>, Manif
     let hashes = str_list(field(root, variant, "hash"), "hash")?;
     let dirs = str_list(field(root, variant, "extract_dir"), "extract_dir")?;
     let tos = str_list(field(root, variant, "extract_to"), "extract_to")?;
+    // More hashes than URLs is malformed (checked first); fewer means some URL has no hash (Unsupported).
+    if hashes.len() > urls.len() {
+        return invalid(format!("{} hashes para {} URLs", hashes.len(), urls.len()));
+    }
     let mut sources = Vec::new();
     for (i, raw_url) in urls.iter().enumerate() {
         let (url, file_name) = split_fragment(raw_url);

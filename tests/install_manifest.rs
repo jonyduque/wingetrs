@@ -144,3 +144,91 @@ fn every_fixture_manifest_is_classified_by_its_prefix() {
     }
     assert!(seen >= 19, "fixtures missing: {seen}");
 }
+
+fn unsup(json: &str) -> bool {
+    matches!(
+        resolve(json, Arch::X64),
+        Err(ManifestError::Unsupported { .. })
+    )
+}
+
+#[test]
+fn hash_count_mismatch() {
+    let more = r#"{"version":"1","url":"https://x/a.zip","hash":["aa","bb"]}"#;
+    assert!(
+        matches!(resolve(more, Arch::X64), Err(ManifestError::Invalid(m)) if m.contains("2 hashes para 1 URLs"))
+    );
+    let less = r#"{"version":"1","url":["https://x/a.zip","https://x/b.zip"],"hash":["aa"]}"#;
+    assert!(
+        matches!(resolve(less, Arch::X64), Err(ManifestError::Unsupported { reason }) if reason.contains("sem hash"))
+    );
+}
+
+#[test]
+fn support_keys_inside_architecture_variant() {
+    for k in [
+        "pre_install",
+        "post_install",
+        "pre_uninstall",
+        "post_uninstall",
+        "installer",
+        "uninstaller",
+        "psmodule",
+        "innosetup",
+    ] {
+        let j = format!(
+            r#"{{"version":"1","architecture":{{"64bit":{{"url":"https://x/a.zip","hash":"aa","{k}":"x"}}}}}}"#
+        );
+        assert!(unsup(&j), "{k}");
+        let ok =
+            r#"{"version":"1","architecture":{"64bit":{"url":"https://x/a.zip","hash":"aa"}}}"#;
+        assert!(resolve(ok, Arch::X64).is_ok());
+    }
+}
+
+#[test]
+fn extension_is_decided_by_the_renamed_file() {
+    let a = r#"{"version":"1","url":"https://x/x.7z#/a.zip","hash":"aa"}"#;
+    assert!(resolve(a, Arch::X64).is_ok());
+    let b = r#"{"version":"1","url":"https://x/x.zip#/a.7z","hash":"aa"}"#;
+    assert!(unsup(b));
+}
+
+#[test]
+fn variant_replaces_root_fields() {
+    let j = r#"{"version":"1","url":"https://x/root.zip","hash":"aa","extract_dir":"rd","bin":"rootbin.exe",
+      "shortcuts":[["r.exe","Root"]],"env_set":{"R":"1"},"env_add_path":["rootp"],
+      "architecture":{"64bit":{"url":"https://x/v.zip","hash":"bb","extract_dir":"vd","bin":"varbin.exe",
+      "shortcuts":[["v.exe","Var"]],"env_set":{"V":"2"},"env_add_path":["varp"]}}}"#;
+    let r = resolve(j, Arch::X64).unwrap();
+    assert_eq!(r.sources[0].file_name, "v.zip");
+    assert_eq!(r.sources[0].extract_dir.as_deref(), Some("vd"));
+    assert_eq!(r.bin[0].path, "varbin.exe");
+    assert_eq!(r.shortcuts[0].name, "Var");
+    assert_eq!(r.env_set, [("V".to_string(), "2".to_string())]);
+    assert_eq!(r.env_add_path, ["varp"]);
+    let two = r#"{"version":"1","url":["https://x/a.zip","https://x/b.zip"],"hash":["aa","bb"],"extract_dir":["da","db"]}"#;
+    let r = resolve(two, Arch::X64).unwrap();
+    assert_eq!(r.sources.len(), 2);
+    assert_eq!(r.sources[1].file_name, "b.zip");
+    assert_eq!(r.sources[1].hash.hex, "bb");
+    assert_eq!(r.sources[0].extract_dir.as_deref(), Some("da"));
+    assert_eq!(r.sources[1].extract_dir.as_deref(), Some("db"));
+}
+
+#[test]
+fn host_arch_preference_and_hash_parse() {
+    use wingetrs::install::manifest::HashSpec;
+    let only32 =
+        r#"{"version":"1","architecture":{"32bit":{"url":"https://x/a.zip","hash":"aa"}}}"#;
+    assert_eq!(resolve(only32, Arch::X64).unwrap().arch, Some(Arch::X86));
+    assert_eq!(resolve(only32, Arch::X86).unwrap().arch, Some(Arch::X86));
+    let only64 =
+        r#"{"version":"1","architecture":{"64bit":{"url":"https://x/a.zip","hash":"aa"}}}"#;
+    assert_eq!(resolve(only64, Arch::X86), Err(ManifestError::NoArch));
+    let h = HashSpec::parse("SHA1:ABCD").unwrap();
+    assert_eq!((h.algo, h.hex.as_str()), (HashAlgo::Sha1, "abcd"));
+    assert!(HashSpec::parse("zzz:ab").is_none());
+    let h = HashSpec::parse("ABC").unwrap();
+    assert_eq!((h.algo, h.hex.as_str()), (HashAlgo::Sha256, "abc"));
+}
