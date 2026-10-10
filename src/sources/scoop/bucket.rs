@@ -24,6 +24,12 @@ pub fn bucket_url(bucket: &str) -> Result<&'static str, ScoopError> {
     }
 }
 
+/// Tarball URL of a GitHub repo's default branch (`HEAD` answers 200 for any default branch;
+/// `refs/heads/HEAD` answers 404 - measured 2026-10-10).
+pub fn repo_tarball_url(repo: &str) -> String {
+    format!("https://codeload.github.com/{repo}/tar.gz/HEAD")
+}
+
 /// Returns the `<app>.json` file name when the path is `<any>/bucket/<app>.json`.
 fn manifest_file(path: &str) -> Option<&str> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();

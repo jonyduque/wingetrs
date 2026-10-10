@@ -3,7 +3,7 @@ use crate::cache::{DataDir, HttpEntry, HttpState, UpdateLock, now_unix};
 use crate::catalog::{Catalog, NewPackage, WingetMaps, index_file};
 use crate::core::SourceKind;
 use crate::http::Http;
-use crate::sources::scoop::bucket::{BucketImport, ScoopFetch, bucket_url, fetch_bucket};
+use crate::sources::scoop::bucket::{BucketImport, ScoopFetch, fetch_bucket, repo_tarball_url};
 use crate::sources::scoop::source_name;
 use crate::sources::winget::index::WingetImport;
 use crate::sources::winget::{SOURCE_NAME, SOURCE2_URL, WingetFetch, fetch_index};
@@ -27,12 +27,12 @@ impl Endpoints {
             std::env::var("WINGETRS_WINGET_INDEX_URL").unwrap_or_else(|_| SOURCE2_URL.to_string());
         let base = std::env::var("WINGETRS_SCOOP_BASE_URL").ok();
         let mut scoop = Vec::new();
-        for b in &cfg.scoop_buckets {
+        for (b, repo) in crate::buckets::resolved(cfg)? {
             let url = match &base {
                 Some(base) => format!("{}/{b}.tgz", base.trim_end_matches('/')),
-                None => bucket_url(b)?.to_string(),
+                None => repo_tarball_url(&repo),
             };
-            scoop.push((b.clone(), url));
+            scoop.push((b, url));
         }
         Ok(Endpoints {
             winget_index,

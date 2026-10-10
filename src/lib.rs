@@ -1,4 +1,5 @@
 //! wingetrs: fast package manager over the winget and scoop catalogs.
+pub mod buckets;
 pub mod cache;
 pub mod catalog;
 pub mod cli;
