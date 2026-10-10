@@ -1,0 +1,31 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Remove um app instalado pelo wingetrs
+
+Uso: wingetrs uninstall [OPÇÕES] <ALVO>
+
+Argumentos:
+  <ALVO>
+          App a remover
+
+Opções:
+      --purge
+          Apaga também os dados persistentes do app
+
+      --dry-run
+          Mostra o plano e sai, sem alterar nada
+
+      --yes
+          Não pergunta nada (limpa só resíduos de confiança alta)
+
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+Exemplos:
+  wingetrs uninstall ripgrep
+  wingetrs uninstall ripgrep --purge --yes

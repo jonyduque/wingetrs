@@ -1,0 +1,17 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Reconstrói o estado a partir do disco
+
+Uso: wingetrs repair
+
+Opções:
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+Exemplos:
+  wingetrs repair

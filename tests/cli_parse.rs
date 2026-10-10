@@ -147,10 +147,136 @@ fn help_snapshots() {
     let mut root = Cli::command();
     root.build();
     insta::assert_snapshot!("help_root", root.render_long_help().to_string());
-    for name in ["update", "search", "show", "list"] {
+    for name in [
+        "update",
+        "search",
+        "show",
+        "list",
+        "install",
+        "uninstall",
+        "upgrade",
+        "bucket",
+        "repair",
+    ] {
         let mut c = Cli::command();
         c.build();
         let sub = c.find_subcommand_mut(name).unwrap();
         insta::assert_snapshot!(format!("help_{name}"), sub.render_long_help().to_string());
     }
+}
+
+#[test]
+fn install_flags_parse() {
+    use wingetrs::cli::Command;
+    let cli =
+        Cli::try_parse_from(["wingetrs", "install", "extras/x", "--dry-run", "--yes"]).unwrap();
+    assert_eq!(
+        cli.command,
+        Some(Command::Install {
+            target: "extras/x".into(),
+            bucket: None,
+            dry_run: true,
+            yes: true
+        })
+    );
+    let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--bucket", "main"]).unwrap();
+    assert_eq!(
+        cli.command,
+        Some(Command::Install {
+            target: "x".into(),
+            bucket: Some("main".into()),
+            dry_run: false,
+            yes: false
+        })
+    );
+    assert!(Cli::try_parse_from(["wingetrs", "install"]).is_err());
+}
+
+#[test]
+fn uninstall_flags_parse() {
+    use wingetrs::cli::Command;
+    let cli = Cli::try_parse_from(["wingetrs", "uninstall", "x", "--purge", "--dry-run"]).unwrap();
+    assert_eq!(
+        cli.command,
+        Some(Command::Uninstall {
+            target: "x".into(),
+            purge: true,
+            dry_run: true,
+            yes: false
+        })
+    );
+}
+
+#[test]
+fn upgrade_flags_parse_and_all_excludes_a_target() {
+    use wingetrs::cli::Command;
+    let cli = Cli::try_parse_from(["wingetrs", "upgrade", "--all", "--keep", "--yes"]).unwrap();
+    assert_eq!(
+        cli.command,
+        Some(Command::Upgrade {
+            target: None,
+            all: true,
+            keep: true,
+            dry_run: false,
+            yes: true
+        })
+    );
+    let cli = Cli::try_parse_from(["wingetrs", "upgrade", "x"]).unwrap();
+    assert_eq!(
+        cli.command,
+        Some(Command::Upgrade {
+            target: Some("x".into()),
+            all: false,
+            keep: false,
+            dry_run: false,
+            yes: false
+        })
+    );
+    assert!(Cli::try_parse_from(["wingetrs", "upgrade", "x", "--all"]).is_err());
+}
+
+#[test]
+fn bucket_and_repair_parse() {
+    use wingetrs::cli::{BucketAction, Command};
+    let parse = |a: &[&str]| {
+        let mut v = vec!["wingetrs"];
+        v.extend_from_slice(a);
+        Cli::try_parse_from(v).unwrap().command
+    };
+    assert_eq!(
+        parse(&["bucket", "add", "extras"]),
+        Some(Command::Bucket {
+            action: BucketAction::Add {
+                name: "extras".into(),
+                url: None,
+                yes: false
+            }
+        })
+    );
+    assert_eq!(
+        parse(&["bucket", "add", "mine", "o/r", "--yes"]),
+        Some(Command::Bucket {
+            action: BucketAction::Add {
+                name: "mine".into(),
+                url: Some("o/r".into()),
+                yes: true
+            }
+        })
+    );
+    assert_eq!(
+        parse(&["bucket", "list"]),
+        Some(Command::Bucket {
+            action: BucketAction::List
+        })
+    );
+    assert_eq!(
+        parse(&["bucket", "rm", "mine"]),
+        Some(Command::Bucket {
+            action: BucketAction::Rm {
+                name: "mine".into()
+            }
+        })
+    );
+    assert_eq!(parse(&["repair"]), Some(Command::Repair));
+    assert!(Cli::try_parse_from(["wingetrs", "bucket"]).is_err());
 }

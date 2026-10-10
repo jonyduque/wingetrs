@@ -1,0 +1,35 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Atualiza apps instalados pelo wingetrs
+
+Uso: wingetrs upgrade [OPÇÕES] [ALVO]
+
+Argumentos:
+  [ALVO]
+          App a atualizar
+
+Opções:
+      --all
+          Atualiza todos os apps com versão nova
+
+      --keep
+          Mantém a versão antiga em disco
+
+      --dry-run
+          Mostra o plano e sai, sem alterar nada
+
+      --yes
+          Não pergunta nada
+
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+Exemplos:
+  wingetrs upgrade               lista o que pode ser atualizado
+  wingetrs upgrade ripgrep
+  wingetrs upgrade --all --yes

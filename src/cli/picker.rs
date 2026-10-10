@@ -99,13 +99,27 @@ pub fn pick_inline(
     theme: &Theme,
     glyphs: &Glyphs,
 ) -> io::Result<Option<usize>> {
+    let picked = run(Picker::single(items), theme, glyphs)?;
+    Ok(picked.and_then(|v| v.first().copied()))
+}
+
+/// Multiple-choice picker with `initial` rows pre-checked; `None` when cancelled.
+pub fn pick_inline_multi(
+    items: Vec<PickerItem>,
+    initial: &[bool],
+    theme: &Theme,
+    glyphs: &Glyphs,
+) -> io::Result<Option<Vec<usize>>> {
+    run(Picker::multi(items, initial), theme, glyphs)
+}
+
+fn run(mut p: Picker, theme: &Theme, glyphs: &Glyphs) -> io::Result<Option<Vec<usize>>> {
     if !is_interactive() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "seletor exige terminal interativo",
         ));
     }
-    let mut p = Picker::single(items);
     let mut guard = Guard::enter()?;
     let (_, rows) = terminal::size()?;
     let height = usize::from(rows.saturating_sub(2)).clamp(1, 15);
@@ -118,7 +132,7 @@ pub fn pick_inline(
         match p.key(k) {
             PickOutcome::Pending => {}
             PickOutcome::Cancelled => break None,
-            PickOutcome::Picked(v) => break v.first().copied(),
+            PickOutcome::Picked(v) => break Some(v),
         }
         // The window height is constant, but its start follows the selection.
         let range = window(p.selected(), p.items().len(), height);

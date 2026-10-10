@@ -1,0 +1,25 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Gerencia os buckets do Scoop
+
+Uso: wingetrs bucket <COMANDO>
+
+Comandos:
+  add   Adiciona um bucket (nome conhecido, ou nome e repositório do GitHub)
+  list  Lista os buckets configurados
+  rm    Remove um bucket (recusa se houver apps instalados dele)
+
+Opções:
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+Exemplos:
+  wingetrs bucket list
+  wingetrs bucket add extras
+  wingetrs bucket add meu-bucket usuario/repositorio --yes
+  wingetrs bucket rm meu-bucket

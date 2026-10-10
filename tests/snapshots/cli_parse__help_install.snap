@@ -1,0 +1,32 @@
+---
+source: tests/cli_parse.rs
+expression: sub.render_long_help().to_string()
+---
+Instala um app de um bucket do Scoop
+
+Uso: wingetrs install [OPÇÕES] <ALVO>
+
+Argumentos:
+  <ALVO>
+          App a instalar (id, ou bucket/id)
+
+Opções:
+      --bucket <BUCKET>
+          Restringe a um bucket
+
+      --dry-run
+          Mostra o plano e sai, sem alterar nada
+
+      --yes
+          Não pergunta nada (falha se o alvo for ambíguo)
+
+  -v, --verbose...
+          Verbosidade (-v, -vv): também loga no stderr
+
+  -h, --help
+          Mostra a ajuda
+
+Exemplos:
+  wingetrs install ripgrep
+  wingetrs install extras/vscode --dry-run
+  wingetrs install git --bucket main --yes

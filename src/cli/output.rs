@@ -183,3 +183,156 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
     }
     out
 }
+
+/// `main/x` for a catalog source name (`scoop:main`) and id.
+pub fn bucket_id(source_name: &str, id: &str) -> String {
+    let bucket = source_name.strip_prefix("scoop:").unwrap_or(source_name);
+    format!("{bucket}/{id}")
+}
+
+/// Error text for an ambiguous target: one `bucket/id` per line.
+pub fn ambiguous_text(target: &str, candidates: &[String]) -> String {
+    let mut s = format!("'{target}' existe em mais de um lugar; use bucket/id:");
+    for c in candidates {
+        s.push_str("\n  ");
+        s.push_str(c);
+    }
+    s
+}
+
+/// Error text for a target that is not in the catalog.
+pub fn not_found_text(query: &str, suggestions: &[String]) -> String {
+    if suggestions.is_empty() {
+        format!("nenhum pacote encontrado para '{query}'")
+    } else {
+        format!(
+            "nenhum pacote encontrado para '{query}'; você quis dizer: {}?",
+            suggestions.join(", ")
+        )
+    }
+}
+
+fn artifact_kind(k: crate::install::state::ArtifactKind) -> &'static str {
+    use crate::install::state::ArtifactKind as K;
+    match k {
+        K::Shim => "atalho de linha de comando",
+        K::Shortcut => "atalho do Menu Iniciar",
+        K::Persist => "dados persistentes",
+        K::Path => "entrada no PATH",
+        K::Env => "variável de ambiente",
+    }
+}
+
+/// What `uninstall` is about to do, one numbered line per action.
+pub fn uninstall_plan_text(
+    plan: &crate::install::plan::UninstallPlan,
+    layout: &crate::install::layout::Layout,
+) -> String {
+    let mut s = format!("Desinstalar {} {}\n", plan.app, plan.version);
+    let mut n = 1;
+    let mut line = |text: String| {
+        s.push_str(&format!("{n:>3}. {text}\n"));
+        n += 1;
+    };
+    line(format!("Apagar {}", layout.app_dir(&plan.app).display()));
+    for a in &plan.artifacts {
+        let text = match a.kind {
+            crate::install::state::ArtifactKind::Persist if plan.purge => {
+                format!("Apagar {} ({})", a.target, artifact_kind(a.kind))
+            }
+            crate::install::state::ArtifactKind::Persist => {
+                format!(
+                    "Manter {} ({}; use --purge)",
+                    a.target,
+                    artifact_kind(a.kind)
+                )
+            }
+            _ => format!("Desfazer {}: {}", artifact_kind(a.kind), a.target),
+        };
+        line(text);
+    }
+    s
+}
+
+/// One line per residue for the picker and the listings.
+pub fn residue_label(r: &crate::install::residue::Residue) -> String {
+    use crate::install::residue::ResidueKind as K;
+    match &r.kind {
+        K::RegValue { key, value_name } => {
+            format!(
+                "Registro: HKCU\\{key} [{}]",
+                value_name.as_deref().unwrap_or("")
+            )
+        }
+        K::RegKey { key } => format!("Registro: HKCU\\{key}"),
+        K::Folder { path } => format!("Pasta: {}", path.display()),
+        K::Shortcut { path } => format!("Atalho: {}", path.display()),
+    }
+}
+
+/// `app  de -> para` lines for the upgrade listing.
+pub fn upgrades_text(rows: &[(String, String, String)]) -> String {
+    let mut s = String::new();
+    for (app, from, to) in rows {
+        s.push_str(&format!("{app}  {from} -> {to}\n"));
+    }
+    s
+}
+
+pub fn repair_text(r: &crate::install::ops::RepairReport) -> String {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "nenhum".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    format!(
+        "Reconstruídos: {}\nMantidos: {}\nRegistros removidos (app sumiu do disco): {}\nPulados (sem install.json legível): {}\n",
+        list(&r.rebuilt),
+        list(&r.kept),
+        list(&r.removed),
+        list(&r.skipped)
+    )
+}
+
+fn mib(n: u64) -> String {
+    format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+}
+
+/// Single-line download progress, padded so a shorter line fully overwrites a longer one.
+pub fn progress_line(done: u64, total: Option<u64>) -> String {
+    let text = match total {
+        Some(t) if t > 0 => format!(
+            "Baixando: {} / {} ({}%)",
+            mib(done),
+            mib(t),
+            (done.min(t) * 100) / t
+        ),
+        _ => format!("Baixando: {}", mib(done)),
+    };
+    format!("{text:<60}")
+}
+
+#[cfg(test)]
+mod install_output_tests {
+    use super::*;
+
+    #[test]
+    fn progress_line_shows_percent_and_pads() {
+        let l = progress_line(512 * 1024, Some(1024 * 1024));
+        assert!(l.starts_with("Baixando: 0.5 MiB / 1.0 MiB (50%)"), "{l}");
+        assert_eq!(l.chars().count(), 60);
+        assert!(progress_line(10, None).starts_with("Baixando: 0.0 MiB"));
+    }
+
+    #[test]
+    fn ambiguous_text_lists_bucket_ids() {
+        let t = ambiguous_text("x", &["main/x".into(), "extras/x".into()]);
+        assert!(
+            t.contains("\n  main/x") && t.contains("\n  extras/x"),
+            "{t}"
+        );
+        assert_eq!(bucket_id("scoop:main", "x"), "main/x");
+    }
+}

@@ -1,6 +1,9 @@
 //! Command line interface.
+pub mod install_cmd;
 pub mod output;
 pub mod picker;
+#[cfg(windows)]
+mod prod_win;
 
 use crate::cache::{DataDir, HttpState, now_unix};
 use crate::catalog::Catalog;
@@ -42,7 +45,9 @@ Uso: {usage}
   wingetrs update                atualiza o catálogo
   wingetrs search powertoys      busca pacotes
   wingetrs show Microsoft.PowerToys
-  wingetrs list --upgradable     lista pacotes com atualização"
+  wingetrs list --upgradable     lista pacotes com atualização
+  wingetrs install ripgrep       instala um app do Scoop
+  wingetrs upgrade --all         atualiza tudo que o wingetrs instalou"
 )]
 pub struct Cli {
     /// Conjunto de glifos da TUI (nerd, unicode ou ascii)
@@ -161,6 +166,150 @@ pub enum Command {
         /// Saída em JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Instala um app de um bucket do Scoop
+    #[command(
+        override_usage = "wingetrs install [OPÇÕES] <ALVO>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs install ripgrep
+  wingetrs install extras/vscode --dry-run
+  wingetrs install git --bucket main --yes"
+    )]
+    Install {
+        /// App a instalar (id, ou bucket/id)
+        #[arg(help_heading = "Argumentos", value_name = "ALVO")]
+        target: String,
+        /// Restringe a um bucket
+        #[arg(long, value_name = "BUCKET")]
+        bucket: Option<String>,
+        /// Mostra o plano e sai, sem alterar nada
+        #[arg(long)]
+        dry_run: bool,
+        /// Não pergunta nada (falha se o alvo for ambíguo)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove um app instalado pelo wingetrs
+    #[command(
+        override_usage = "wingetrs uninstall [OPÇÕES] <ALVO>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs uninstall ripgrep
+  wingetrs uninstall ripgrep --purge --yes"
+    )]
+    Uninstall {
+        /// App a remover
+        #[arg(help_heading = "Argumentos", value_name = "ALVO")]
+        target: String,
+        /// Apaga também os dados persistentes do app
+        #[arg(long)]
+        purge: bool,
+        /// Mostra o plano e sai, sem alterar nada
+        #[arg(long)]
+        dry_run: bool,
+        /// Não pergunta nada (limpa só resíduos de confiança alta)
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Atualiza apps instalados pelo wingetrs
+    #[command(
+        override_usage = "wingetrs upgrade [OPÇÕES] [ALVO]",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs upgrade               lista o que pode ser atualizado
+  wingetrs upgrade ripgrep
+  wingetrs upgrade --all --yes"
+    )]
+    Upgrade {
+        /// App a atualizar
+        #[arg(
+            help_heading = "Argumentos",
+            value_name = "ALVO",
+            conflicts_with = "all"
+        )]
+        target: Option<String>,
+        /// Atualiza todos os apps com versão nova
+        #[arg(long)]
+        all: bool,
+        /// Mantém a versão antiga em disco
+        #[arg(long)]
+        keep: bool,
+        /// Mostra o plano e sai, sem alterar nada
+        #[arg(long)]
+        dry_run: bool,
+        /// Não pergunta nada
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Gerencia os buckets do Scoop
+    #[command(
+        override_usage = "wingetrs bucket <COMANDO>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        subcommand_help_heading = "Comandos",
+        subcommand_required = true,
+        arg_required_else_help = true,
+        after_help = "Exemplos:
+  wingetrs bucket list
+  wingetrs bucket add extras
+  wingetrs bucket add meu-bucket usuario/repositorio --yes
+  wingetrs bucket rm meu-bucket"
+    )]
+    Bucket {
+        #[command(subcommand)]
+        action: BucketAction,
+    },
+    /// Reconstrói o estado a partir do disco
+    #[command(
+        override_usage = "wingetrs repair",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs repair"
+    )]
+    Repair,
+}
+
+#[derive(Debug, PartialEq, clap::Subcommand)]
+pub enum BucketAction {
+    /// Adiciona um bucket (nome conhecido, ou nome e repositório do GitHub)
+    #[command(
+        override_usage = "wingetrs bucket add [OPÇÕES] <NOME> [REPO]",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções"
+    )]
+    Add {
+        /// Nome do bucket
+        #[arg(help_heading = "Argumentos", value_name = "NOME")]
+        name: String,
+        /// owner/repo ou URL do GitHub (dispensável para buckets conhecidos)
+        #[arg(help_heading = "Argumentos", value_name = "REPO")]
+        url: Option<String>,
+        /// Confirma um repositório desconhecido sem perguntar
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Lista os buckets configurados
+    #[command(
+        override_usage = "wingetrs bucket list",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções"
+    )]
+    List,
+    /// Remove um bucket (recusa se houver apps instalados dele)
+    #[command(
+        override_usage = "wingetrs bucket rm <NOME>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções"
+    )]
+    Rm {
+        /// Nome do bucket
+        #[arg(help_heading = "Argumentos", value_name = "NOME")]
+        name: String,
     },
 }
 
@@ -544,6 +693,66 @@ async fn run_async(
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
+            Ok(())
+        }
+        cmd @ (Command::Install { .. }
+        | Command::Uninstall { .. }
+        | Command::Upgrade { .. }
+        | Command::Repair) => {
+            #[cfg(windows)]
+            {
+                let catalog = ensure_catalog(&data, &cfg, &http).await?;
+                prod_win::run(cmd, &data, &cfg, &http, &catalog).await
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = cmd;
+                anyhow::bail!("instalar e remover apps só funciona no Windows")
+            }
+        }
+        Command::Bucket { action } => run_bucket(action, &data, cfg),
+    }
+}
+
+/// `bucket add|list|rm`: edits `config.toml` (and the catalog on `rm`).
+fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::Result<()> {
+    use crate::buckets::{self, BucketError};
+    match action {
+        BucketAction::List => {
+            for (name, repo) in buckets::resolved(&cfg)? {
+                println!("{name}  {repo}");
+            }
+            Ok(())
+        }
+        BucketAction::Add { name, url, yes } => {
+            let spec = match (url, buckets::known_repo(&name)) {
+                (Some(u), _) => u,
+                (None, Some(known)) => known.to_string(),
+                (None, None) => anyhow::bail!(
+                    "o bucket {name} não é conhecido; informe o repositório: wingetrs bucket add {name} <owner/repo>"
+                ),
+            };
+            match buckets::add(&mut cfg, &name, &spec, yes) {
+                Err(BucketError::NeedsConfirmation { name, repo }) if picker::is_interactive() => {
+                    let ui = install_cmd::TtyUi::new(&cfg);
+                    let q = format!("O bucket {name} ({repo}) não é conhecido. Adicionar?");
+                    if !install_cmd::Ui::confirm(&ui, &q)? {
+                        println!("Cancelado.");
+                        return Ok(());
+                    }
+                    buckets::add(&mut cfg, &name, &spec, true)?;
+                }
+                other => other?,
+            }
+            cfg.save(&data.config_path())?;
+            println!("Bucket {name} adicionado. Rode `wingetrs update` para baixar o catálogo.");
+            Ok(())
+        }
+        BucketAction::Rm { name } => {
+            let state_db = data.install_layout().state_db();
+            buckets::remove_and_cleanup(data, &mut cfg, &name, &state_db)?;
+            cfg.save(&data.config_path())?;
+            println!("Bucket {name} removido.");
             Ok(())
         }
     }
