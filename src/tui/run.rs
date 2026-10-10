@@ -11,8 +11,6 @@ use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
 use crate::tui::app::{Action, App, Cmd, InstallFail, Msg, Planned, update};
 use crate::tui::jobs;
-#[cfg(windows)]
-use crate::tui::ops_win::with_ctx;
 use crate::tui::theme::{GlyphSet, Theme, detect_depth};
 use crate::tui::view::view;
 use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update};
@@ -333,6 +331,21 @@ async fn load_details(
             )?)
         }
     }
+}
+
+#[cfg(windows)]
+fn with_ctx<R>(
+    data: &DataDir,
+    http: &Http,
+    catalog: &Catalog,
+    wait: LockWait,
+    progress: crate::install::download::Progress<'_>,
+    f: impl FnOnce(&OpsCtx<'_>) -> R,
+) -> Result<R, String> {
+    use crate::install::prod_win::{ProdEffects, build_ctx};
+    let prod = ProdEffects::new().map_err(|e| e.0)?;
+    let ctx = build_ctx(&prod, data, http, catalog, wait, progress);
+    Ok(f(&ctx))
 }
 
 #[cfg(not(windows))]
