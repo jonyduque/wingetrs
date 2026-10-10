@@ -616,20 +616,20 @@ async fn upgradable_lists_apps_with_a_newer_catalog_version() {
     w.add(app("other", &[])).await;
     w.install("leaf").await;
     w.install("other").await;
-    assert!(upgradable(&w.ctx()).unwrap().is_empty());
+    assert!(upgradable(&w.ctx()).unwrap().upgradable.is_empty());
     w.add(App {
         version: "1.10",
         ..app("leaf", &[])
     })
     .await;
     assert_eq!(
-        upgradable(&w.ctx()).unwrap(),
+        upgradable(&w.ctx()).unwrap().upgradable,
         [("leaf".to_string(), "1.9".to_string(), "1.10".to_string())]
     );
     let plans = w.plans("leaf").unwrap();
     assert_eq!(plans[0].upgrade_from.as_deref(), Some("1.9"));
     apply(&w.ctx(), &plans).await.unwrap();
-    assert!(upgradable(&w.ctx()).unwrap().is_empty());
+    assert!(upgradable(&w.ctx()).unwrap().upgradable.is_empty());
     assert!(!w.layout.version_dir("leaf", "1.9").exists());
 }
 
@@ -746,4 +746,165 @@ async fn list_shows_wingetrs_origin_and_broken_apps() {
     assert!(leaf_line.contains("scoop:main"), "{text}");
     assert!(leaf_line.trim_end().ends_with("wingetrs"), "{text}");
     assert!(text.contains("other (quebrado"), "{text}");
+}
+
+#[tokio::test]
+async fn upgradable_skips_broken_and_uncatalogued_apps_with_a_reason() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.add(app("gone", &[])).await;
+    w.add(app("broken", &[])).await;
+    for a in ["leaf", "gone", "broken"] {
+        w.install(a).await;
+    }
+    w.add(App {
+        version: "2.0",
+        ..app("broken", &[])
+    })
+    .await;
+    w.packages.retain(|p| p.id != "gone");
+    w.put_raw("leaf", "2.0", w.packages[0].raw.clone().unwrap());
+    wingetrs::install::link::remove(&w.layout.current("broken")).unwrap();
+    let list = upgradable(&w.ctx()).unwrap();
+    assert_eq!(
+        list.upgradable,
+        [("leaf".to_string(), "1.0".to_string(), "2.0".to_string())]
+    );
+    let skipped: Vec<&str> = list.skipped.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(skipped, ["broken", "gone"]);
+    assert!(list.skipped[0].1.contains("quebrada"), "{list:?}");
+    assert!(list.skipped[1].1.contains("catálogo"), "{list:?}");
+}
+
+#[tokio::test]
+async fn dependency_with_explicit_bucket_comes_from_that_bucket() {
+    let mut w = World::new().await;
+    w.add(app("x", &[])).await;
+    w.add(app("top", &["extras/x"])).await;
+    let raw = w.packages.iter().find(|p| p.id == "x").unwrap().raw.clone();
+    w.catalog
+        .replace_source(
+            "scoop:extras",
+            SourceKind::Scoop,
+            "v",
+            1,
+            &[NewPackage {
+                id: "x".into(),
+                name: "x".into(),
+                version: "1.0".into(),
+                raw,
+                ..Default::default()
+            }],
+            &WingetMaps::default(),
+        )
+        .unwrap();
+    let c = match resolve_target(&w.ctx(), "top", Some("main")).unwrap() {
+        Resolution::One(c) => c,
+        other => panic!("{other:?}"),
+    };
+    let plans = plan_for(&w.ctx(), &c, false).unwrap();
+    assert_eq!(names(&plans), ["x", "top"]);
+    assert_eq!(plans[0].bucket, "extras");
+    assert_eq!(plans[1].bucket, "main");
+}
+
+fn disk(w: &World) -> std::collections::BTreeMap<String, String> {
+    let mut s = wingetrs::install::snapshot::snapshot(w.layout.root()).unwrap();
+    s.retain(|p, _| !p.starts_with("blobs") && !p.starts_with("tmp") && !p.starts_with("state.db"));
+    s
+}
+
+#[tokio::test]
+async fn apply_refuses_a_plan_made_stale_by_an_outside_install() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    let stale = w.plans("leaf").unwrap();
+    w.install("leaf").await;
+    let before = (disk(&w), w.env.dump(), w.state().get("leaf").unwrap());
+    match apply(&w.ctx(), &stale).await {
+        Err(OpsError::StateChanged(a)) => assert_eq!(a, "leaf"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        (disk(&w), w.env.dump(), w.state().get("leaf").unwrap()),
+        before
+    );
+}
+
+#[tokio::test]
+async fn apply_skips_a_dependency_installed_meanwhile() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.add(app("top", &["leaf"])).await;
+    let plans = w.plans("top").unwrap();
+    assert_eq!(names(&plans), ["leaf", "top"]);
+    w.install("leaf").await;
+    apply(&w.ctx(), &plans).await.unwrap();
+    assert!(w.state().get("top").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn uninstall_refuses_a_plan_made_stale_by_an_outside_change() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.install("leaf").await;
+    let stale = plan_uninstall(&w.ctx(), "leaf", false).unwrap();
+    w.add(App {
+        version: "2.0",
+        ..app("leaf", &[])
+    })
+    .await;
+    w.install("leaf").await;
+    let before = (disk(&w), w.env.dump(), w.state().get("leaf").unwrap());
+    match uninstall(&w.ctx(), &stale) {
+        Err(OpsError::StateChanged(a)) => assert_eq!(a, "leaf"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        (disk(&w), w.env.dump(), w.state().get("leaf").unwrap()),
+        before
+    );
+    // Uninstalled by someone else meanwhile: the same answer.
+    let fresh = plan_uninstall(&w.ctx(), "leaf", false).unwrap();
+    uninstall(&w.ctx(), &fresh).unwrap();
+    assert!(matches!(
+        uninstall(&w.ctx(), &fresh),
+        Err(OpsError::StateChanged(_))
+    ));
+}
+
+#[tokio::test]
+async fn failure_after_a_dependency_names_what_was_installed() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    let raw = w.add(app("top", &["leaf"])).await;
+    let mut m: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    m["hash"] = serde_json::json!("0".repeat(64));
+    w.put_raw("top", "1.0", m.to_string());
+    let plans = w.plans("top").unwrap();
+    let err = apply(&w.ctx(), &plans).await.unwrap_err();
+    assert!(err.to_string().contains("já instalados: leaf"), "{err}");
+    match err {
+        OpsError::PartlyApplied { applied, .. } => assert_eq!(applied, ["leaf"]),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.state().get("leaf").unwrap().is_some());
+    assert!(w.state().get("top").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn repair_ignores_shims_that_escape_the_app_folder() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.install("leaf").await;
+    let escape = w.layout.app_dir("leaf").join(r"..\..\x\evil.exe");
+    std::fs::write(
+        w.layout.shims().join("evil.shim"),
+        format!("path = \"{}\"\r\n", escape.display()),
+    )
+    .unwrap();
+    remove_state_db(&w.layout);
+    repair(&w.ctx()).unwrap();
+    let shims = summary(&w.state())[0].3.clone();
+    assert_eq!(shims, ["leaf"]);
 }

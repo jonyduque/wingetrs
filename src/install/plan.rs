@@ -83,6 +83,8 @@ pub struct InstallPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UninstallPlan {
     pub app: String,
+    /// Version recorded when the plan was built (checked again before executing).
+    pub version: String,
     /// Also delete `persist\<app>`.
     pub purge: bool,
     pub artifacts: Vec<crate::install::state::Artifact>,
@@ -97,8 +99,9 @@ impl UninstallPlan {
         app: &str,
         purge: bool,
     ) -> Result<Option<UninstallPlan>, crate::install::state::StateError> {
-        Ok(state.get(app)?.map(|(_, artifacts)| UninstallPlan {
+        Ok(state.get(app)?.map(|(rec, artifacts)| UninstallPlan {
             app: app.to_string(),
+            version: rec.version,
             purge,
             artifacts,
             remove_path_entry: true,

@@ -168,6 +168,13 @@ pub enum OpsError {
     Busy,
     #[error("não foi possível obter o install.lock: {0}")]
     Lock(String),
+    #[error("o estado de {0} mudou desde o planejamento; tente de novo")]
+    StateChanged(String),
+    #[error("{error} (já instalados: {})", .applied.join(", "))]
+    PartlyApplied {
+        applied: Vec<String>,
+        error: Box<OpsError>,
+    },
     #[error(transparent)]
     Plan(#[from] PlanError),
     #[error(transparent)]
@@ -501,13 +508,37 @@ pub fn plan_for(
     Ok(plans)
 }
 
+/// Under the lock, before any change: each plan must still match `state.db` (its
+/// `upgrade_from` is the installed version). A dependency that got installed meanwhile is
+/// skipped; any other divergence is `StateChanged`. Returns the plans to run.
+fn revalidate<'p>(
+    state: &StateDb,
+    plans: &'p [InstallPlan],
+) -> Result<Vec<&'p InstallPlan>, OpsError> {
+    let last = plans.len().saturating_sub(1);
+    let mut run = Vec::with_capacity(plans.len());
+    for (i, plan) in plans.iter().enumerate() {
+        let now = state.get(&plan.app)?.map(|(r, _)| r.version);
+        if now == plan.upgrade_from {
+            run.push(plan);
+        } else if i < last && plan.upgrade_from.is_none() {
+            // A dependency someone else installed meanwhile: already satisfied.
+        } else {
+            return Err(OpsError::StateChanged(plan.app.clone()));
+        }
+    }
+    Ok(run)
+}
+
 /// Applies `plans` in order under `install.lock`, stopping at the first failure (that plan
-/// is rolled back; earlier ones, its dependencies, stay installed). The environment change
-/// is broadcast once at the end when any variable ended up different.
+/// is rolled back; earlier ones, its dependencies, stay installed and are named in
+/// `PartlyApplied`). The environment change is broadcast once at the end when any
+/// variable ended up different.
 pub async fn apply(ctx: &OpsCtx<'_>, plans: &[InstallPlan]) -> Result<(), OpsError> {
     let layout = layout(ctx);
     let _lock = lock_async(&layout, ctx.wait).await?;
     let mut state = open_state(&layout)?;
+    let plans = revalidate(&state, plans)?;
     let names = env_names(plans.iter().flat_map(|p| &p.steps).filter_map(|s| match s {
         Step::EnvSet { name, .. } => Some(name.clone()),
         _ => None,
@@ -515,12 +546,22 @@ pub async fn apply(ctx: &OpsCtx<'_>, plans: &[InstallPlan]) -> Result<(), OpsErr
     let env = ctx.effects.env;
     let before = env_snapshot(env, &names)?;
     let mut result = Ok(());
+    let mut applied: Vec<String> = Vec::new();
     for plan in plans {
         let mut exec = exec_ctx(ctx, &layout, &mut state);
         if let Err(e) = executor::execute_install(plan, &mut exec).await {
-            result = Err(e.into());
+            let error = OpsError::from(e);
+            result = Err(if applied.is_empty() {
+                error
+            } else {
+                OpsError::PartlyApplied {
+                    applied,
+                    error: Box::new(error),
+                }
+            });
             break;
         }
+        applied.push(plan.app.clone());
     }
     broadcast_if_changed(env, &names, &before);
     result
@@ -592,12 +633,12 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     let layout = layout(ctx);
     let _lock = lock_blocking(&layout, ctx.wait)?;
     let mut state = open_state(&layout)?;
+    let homepage = match state.get(&plan.app)? {
+        Some((rec, _)) if rec.version == plan.version => homepage_of(ctx.catalog, &rec)?,
+        _ => return Err(OpsError::StateChanged(plan.app.clone())),
+    };
     refuse_if_needed(ctx, &state, &plan.app)?;
     let app_dir = layout.app_dir(&plan.app);
-    let homepage = match state.get(&plan.app)? {
-        Some((rec, _)) => homepage_of(ctx.catalog, &rec)?,
-        None => None,
-    };
     let names = env_names(
         plan.artifacts
             .iter()
@@ -699,17 +740,34 @@ fn scan_residues(
     })
 }
 
-/// `(app, installed, latest)` for every `state.db` app whose catalog version is newer.
-pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<Vec<(String, String, String)>, OpsError> {
-    let state = open_state(&layout(ctx))?;
-    let mut out = Vec::new();
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpgradeList {
+    /// `(app, installed, latest)` whose catalog version is newer.
+    pub upgradable: Vec<(String, String, String)>,
+    /// `(app, reason)` left out: broken install or no longer in the catalog.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Every `state.db` app whose catalog version is newer (`upgrade --all`).
+pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
+    let layout = layout(ctx);
+    let state = open_state(&layout)?;
+    let mut out = UpgradeList::default();
     for rec in state.apps()? {
+        if read_json(&layout.current(&rec.app).join("install.json")).is_none() {
+            out.skipped
+                .push((rec.app, "instalação quebrada (rode repair)".into()));
+            continue;
+        }
         let source = crate::sources::scoop::source_name(&rec.bucket);
         let Some(pkg) = ctx.catalog.get(&source, &rec.app)? else {
+            out.skipped
+                .push((rec.app, format!("não está mais no catálogo ({source})")));
             continue;
         };
         if Version::parse(&pkg.entry.version) > Version::parse(&rec.version) {
-            out.push((rec.app, rec.version, pkg.entry.version));
+            out.upgradable
+                .push((rec.app, rec.version, pkg.entry.version));
         }
     }
     Ok(out)
@@ -728,9 +786,13 @@ fn norm_path(s: &str) -> String {
     s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-/// `true` when `path` is `dir` or inside it.
+/// `true` when `path` is `dir` or inside it. A path with a `.` or `..` component is never
+/// under anything (`apps\foo\..\..\x` would otherwise pass the prefix test).
 fn is_under(path: &str, dir: &str) -> bool {
     let (p, d) = (norm_path(path), norm_path(dir));
+    if p.split('\\').any(|c| c == "." || c == "..") {
+        return false;
+    }
     p == d || p.starts_with(&format!("{d}\\"))
 }
 
