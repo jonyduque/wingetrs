@@ -10,6 +10,8 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 - **Corpo literal de teste no plano também passa pelo clippy.** `nonminimal_bool`, `double_comparisons`, `manual_is_multiple_of`, `assertions_on_constants` dispararam em testes transcritos. Ao escrever o plano, compile os testes num rascunho ou já escreva na forma aceita.
 - **wiremock 0.6 divide valores de header por vírgula.** `header("If-Modified-Since", "Wed, 07 Oct …")` nunca casa; use `headers(name, vec!["Wed", "07 Oct …"])`.
 
+- **Instrumento que para de vigiar em silêncio.** `check_rules.ps1` com `StrictMode`: `Get-Content` de arquivo de **uma linha** devolve string, `.Count` falhava, o arquivo era pulado e o script saía 0. Achado pelo revisor da Task 27 (stubs `//!`). Correção: `@(Get-Content …)` + `$ErrorActionPreference = 'Stop'`; provado plantando violação num arquivo de uma linha. Todo instrumento novo: prove com violação plantada **no menor caso** (arquivo vazio, uma linha).
+
 ## Concorrência
 
 - **Thread antecipada órfã** (Tasks 18 e 20): `spawn` antes de um `?` sem `join` em todos os caminhos. Use guard com `Drop` ou junte antes do `?`.

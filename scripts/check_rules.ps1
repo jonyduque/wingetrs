@@ -7,6 +7,8 @@
 #>
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
+# Any internal error must fail the gate, never pass it silently (a .Count on a one-line file once skipped checks).
+$ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -28,7 +30,7 @@ $violations = @()
 $files = Get-ChildItem -Recurse -File -Path src -Filter *.rs
 foreach ($f in $files) {
     $rel = [IO.Path]::GetRelativePath($root, $f.FullName)
-    $lines = Get-Content $f.FullName
+    $lines = @(Get-Content $f.FullName)
     $inTests = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
