@@ -1,5 +1,6 @@
 //! Terminal user interface.
 pub mod app;
+pub mod jobs;
 #[cfg(windows)]
 pub mod ops_win;
 pub mod picker;

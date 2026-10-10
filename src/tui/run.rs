@@ -4,14 +4,13 @@ use crate::catalog::Catalog;
 use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
-use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
-use crate::install::plan::InstallPlan;
-use crate::install::residue::{self, Residue};
-use crate::install::state::StateDb;
+use crate::install::ops::OpsCtx;
+use crate::install::residue::Residue;
 use crate::installed::correlate::correlate;
 use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
-use crate::tui::app::{Action, App, Cmd, Done, InstallFail, Msg, Planned, update};
+use crate::tui::app::{Action, App, Cmd, InstallFail, Msg, Planned, update};
+use crate::tui::jobs;
 #[cfg(windows)]
 use crate::tui::ops_win::with_ctx;
 use crate::tui::theme::{GlyphSet, Theme, detect_depth};
@@ -64,13 +63,16 @@ pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
         first_frame_ms = start.elapsed().as_millis() as u64,
         "first frame"
     );
-    let result = match (drawn, tokio::runtime::Runtime::new()) {
-        (Ok(()), Ok(rt)) => rt.block_on(event_loop(&mut terminal, app, &theme, data, cfg)),
-        (Err(e), _) => Err(e.into()),
-        (_, Err(e)) => Err(e.into()),
-    };
+    // A worker panic is re-raised by the loop; restore the terminal on that path too.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match (drawn, tokio::runtime::Runtime::new()) {
+            (Ok(()), Ok(rt)) => rt.block_on(event_loop(&mut terminal, app, &theme, data, cfg)),
+            (Err(e), _) => Err(e.into()),
+            (_, Err(e)) => Err(e.into()),
+        }
+    }));
     ratatui::restore();
-    result
+    result.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// What the background load found; decides the startup refresh.
@@ -129,6 +131,7 @@ async fn event_loop(
             }
             _ = ticker.tick(), if app.refreshing || details_loading(&app) => Msg::Tick,
         };
+        let msg = jobs::propagate(msg);
         let is_tick = matches!(msg, Msg::Tick);
         let refresh_msg = matches!(msg, Msg::RefreshFinished(_));
         let cmds = update(&mut app, msg);
@@ -141,10 +144,10 @@ async fn event_loop(
                     spawn_details(&ctx, source, id);
                 }
                 Cmd::PlanInstall { source_name, id } => {
-                    spawn_plan(&ctx, move |c| plan_install(c, &source_name, &id));
+                    spawn_plan(&ctx, move |o| jobs::plan_install(o, &source_name, &id));
                 }
-                Cmd::PlanRemove { app } => spawn_plan(&ctx, move |c| plan_remove(c, &app)),
-                Cmd::PlanUpgradeAll => spawn_plan(&ctx, plan_upgrade_all),
+                Cmd::PlanRemove { app } => spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app)),
+                Cmd::PlanUpgradeAll => spawn_plan(&ctx, jobs::plan_upgrade_all),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
             }
@@ -364,11 +367,11 @@ fn with_ops<R>(
 }
 
 /// Runs `work` on a blocking thread (it may block on the async `apply`) and sends the
-/// message it returns. The handle is always awaited; a worker panic becomes `panicked(..)`.
+/// message it returns. The handle is always awaited; a worker panic travels to the main
+/// loop as `Msg::Panicked` and is re-raised there.
 fn spawn_job(
     ctx: &Arc<Ctx>,
     work: impl FnOnce(&Ctx, &tokio::runtime::Handle) -> Msg + Send + 'static,
-    panicked: fn(String) -> Msg,
 ) {
     let ctx = Arc::clone(ctx);
     let handle = tokio::runtime::Handle::current();
@@ -377,179 +380,46 @@ fn spawn_job(
             let ctx = Arc::clone(&ctx);
             move || work(&ctx, &handle)
         });
-        let msg = match job.await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!("tarefa de instalação falhou: {e}");
-                panicked(if e.is_panic() {
-                    "pânico interno".to_string()
-                } else {
-                    e.to_string()
-                })
-            }
-        };
-        let _ = ctx.tx.send(msg);
+        let _ = ctx.tx.send(jobs::join_job(job).await);
     });
 }
 
-fn spawn_plan(ctx: &Arc<Ctx>, plan: impl FnOnce(&Ctx) -> Result<Planned, String> + Send + 'static) {
-    spawn_job(
-        ctx,
-        move |c, _| Msg::Planned(plan(c)),
-        |m| Msg::Planned(Err(m)),
-    );
-}
-
-fn plans_text(groups: &[Vec<InstallPlan>]) -> String {
-    groups
-        .iter()
-        .flatten()
-        .map(|p| p.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`.
-fn plan_install(ctx: &Ctx, source_name: &str, id: &str) -> Result<Planned, String> {
-    let bucket = source_name
-        .strip_prefix("scoop:")
-        .ok_or_else(|| format!("{id} não vem de um bucket do scoop"))?;
-    with_ops(ctx, &no_progress, |c| {
-        match ops::resolve_target(c, id, Some(bucket)) {
-            Ok(Resolution::One(cand)) => {
-                let plans = ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?;
-                Ok(Planned::Ready {
-                    text: plans_text(std::slice::from_ref(&plans)),
-                    action: Action::Apply(vec![plans]),
-                })
-            }
-            Ok(Resolution::Many(found)) => Ok(Planned::Choose(found)),
-            Ok(Resolution::NotFound { .. }) => Err(format!("{id} não encontrado no catálogo")),
-            Err(e) => Err(e.to_string()),
-        }
-    })?
-}
-
-fn plan_remove(ctx: &Ctx, app: &str) -> Result<Planned, String> {
-    with_ops(ctx, &no_progress, |c| {
-        let plan = ops::plan_uninstall(c, app, false).map_err(|e| e.to_string())?;
-        let mut text = format!("Remover {} {}\n", plan.app, plan.version);
-        for a in &plan.artifacts {
-            text.push_str(&format!("  - {:?} {}\n", a.kind, a.target));
-        }
-        text.push_str("Os dados persistentes do app são mantidos.\n");
-        Ok(Planned::Ready {
-            text,
-            action: Action::Remove(plan),
-        })
-    })?
-}
-
-fn plan_upgrade_all(ctx: &Ctx) -> Result<Planned, String> {
-    with_ops(ctx, &no_progress, |c| {
-        let list = ops::upgradable(c).map_err(|e| e.to_string())?;
-        if list.upgradable.is_empty() {
-            return Err("nenhum app para atualizar".to_string());
-        }
-        let layout = c.data.install_layout();
-        let buckets: Vec<(String, String)> = StateDb::open(&layout.state_db())
-            .and_then(|s| s.apps())
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|r| (r.app, r.bucket))
-            .collect();
-        let mut groups = Vec::new();
-        for (app, _, _) in &list.upgradable {
-            let bucket = buckets
-                .iter()
-                .find(|(a, _)| a == app)
-                .map(|(_, b)| b.as_str());
-            match ops::resolve_target(c, app, bucket).map_err(|e| e.to_string())? {
-                Resolution::One(cand) => {
-                    groups.push(ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?);
-                }
-                _ => return Err(format!("{app}: não foi possível resolver no catálogo")),
-            }
-        }
-        Ok(Planned::Ready {
-            text: plans_text(&groups),
-            action: Action::Apply(groups),
-        })
-    })?
-}
-
-fn fail(e: OpsError) -> InstallFail {
-    match e {
-        OpsError::Busy => InstallFail::Busy,
-        other => InstallFail::Other(other.to_string()),
-    }
+fn spawn_plan(
+    ctx: &Arc<Ctx>,
+    plan: impl FnOnce(&OpsCtx<'_>) -> Result<Planned, String> + Send + 'static,
+) {
+    spawn_job(ctx, move |c, _| {
+        Msg::Planned(with_ops(c, &no_progress, plan).and_then(|r| r))
+    });
 }
 
 fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
-    spawn_job(
-        ctx,
-        move |c, handle| {
-            let tx = c.tx.clone();
-            let progress = move |label: &str, done: u64, total: Option<u64>| {
+    spawn_job(ctx, move |c, handle| {
+        let tx = c.tx.clone();
+        let throttle = jobs::ProgressThrottle::new(Instant::now());
+        let progress = move |label: &str, done: u64, total: Option<u64>| {
+            if throttle.admit(Instant::now(), done, total) {
                 let _ = tx.send(Msg::InstallProgress {
                     label: label.to_string(),
                     done,
                     total,
                 });
-            };
-            let result = with_ops(c, &progress, |o| run_action(o, handle, action))
-                .map_err(InstallFail::Other)
-                .and_then(|r| r);
-            Msg::InstallFinished(result)
-        },
-        |m| Msg::InstallFinished(Err(InstallFail::Other(m))),
-    );
-}
-
-fn run_action(
-    o: &OpsCtx<'_>,
-    handle: &tokio::runtime::Handle,
-    action: Action,
-) -> Result<Done, InstallFail> {
-    match action {
-        Action::Apply(groups) => {
-            let mut names: Vec<String> = Vec::new();
-            for group in &groups {
-                handle.block_on(ops::apply(o, group)).map_err(fail)?;
-                names.extend(group.iter().map(|p| p.app.clone()));
             }
-            Ok(Done {
-                summary: format!("Instalado: {}", names.join(", ")),
-                residues: None,
-            })
-        }
-        Action::Remove(plan) => {
-            let residues = ops::uninstall(o, &plan).map_err(fail)?;
-            Ok(Done {
-                summary: format!("{} removido", plan.app),
-                residues: Some((plan.app, residues)),
-            })
-        }
-    }
+        };
+        let result = with_ops(c, &progress, |o| {
+            handle.block_on(jobs::run_action(o, action))
+        })
+        .map_err(InstallFail::Other)
+        .and_then(|r| r);
+        Msg::InstallFinished(result)
+    });
 }
 
 fn spawn_clean(ctx: &Arc<Ctx>, app: String, residues: Vec<Residue>) {
-    spawn_job(
-        ctx,
-        move |c, _| {
-            let outcome = with_ops(c, &no_progress, |o| {
-                residue::clean(
-                    &residues,
-                    &app,
-                    &o.effects,
-                    &o.data.install_layout().backups(),
-                )
-            });
-            Msg::ResiduesCleaned(match outcome {
-                Ok(results) => results.into_iter().filter_map(Result::err).collect(),
-                Err(e) => vec![e],
-            })
-        },
-        |m| Msg::ResiduesCleaned(vec![m]),
-    );
+    spawn_job(ctx, move |c, _| {
+        Msg::ResiduesCleaned(
+            with_ops(c, &no_progress, |o| jobs::clean(o, &app, &residues))
+                .unwrap_or_else(|e| vec![e]),
+        )
+    });
 }

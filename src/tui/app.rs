@@ -60,6 +60,8 @@ pub enum Msg {
     InstallFinished(Result<Done, InstallFail>),
     /// Residue cleanup ended; one message per item that failed.
     ResiduesCleaned(Vec<String>),
+    /// A worker thread panicked; the event loop re-raises it before `update` sees it.
+    Panicked(Box<dyn std::any::Any + Send>),
 }
 
 /// What the user is asked to confirm, or to choose from.
@@ -185,6 +187,8 @@ pub struct App {
     pub glyphs: GlyphSet,
     pub size: (u16, u16),
     pub modal: Option<Modal>,
+    /// A plan is being computed; further plan keys are ignored until it arrives.
+    pub planning: bool,
 }
 
 const MAX_HITS: usize = 1000;
@@ -214,6 +218,7 @@ impl App {
             glyphs,
             size: (80, 24),
             modal: None,
+            planning: false,
         };
         app.research();
         app
@@ -374,6 +379,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Planned(result) => on_planned(app, result),
+        Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
             if let Some(Modal::Running { progress, .. }) = &mut app.modal {
                 *progress = Some(RunProgress { label, done, total });
@@ -515,6 +521,16 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
 
 const NOT_OURS: &str = "só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui";
 
+/// Marks a plan as in flight; `None` when one already is.
+fn start_planning(app: &mut App, cmd: Cmd) -> Vec<Cmd> {
+    if app.planning {
+        return Vec::new();
+    }
+    app.planning = true;
+    app.status = Some("planejando…".to_string());
+    vec![cmd]
+}
+
 /// `i`: plan installing the selected package (scoop only).
 fn install_selected(app: &mut App) -> Vec<Cmd> {
     let Some(hit) = app.hits.get(app.selected) else {
@@ -527,10 +543,11 @@ fn install_selected(app: &mut App) -> Vec<Cmd> {
         app.status = Some("instalação na fase 2d".to_string());
         return Vec::new();
     }
-    vec![Cmd::PlanInstall {
+    let cmd = Cmd::PlanInstall {
         source_name: e.source_name.clone(),
         id: e.id.clone(),
-    }]
+    };
+    start_planning(app, cmd)
 }
 
 /// `u`: plan removing the selected app, which must be one wingetrs installed.
@@ -543,13 +560,13 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
             return Vec::new();
         }
     };
-    vec![Cmd::PlanRemove { app: name }]
+    start_planning(app, Cmd::PlanRemove { app: name })
 }
 
 /// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.
 fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
     let (ours, source) = match app.installed_view().get(app.selected) {
-        None => return vec![Cmd::PlanUpgradeAll],
+        None => return start_planning(app, Cmd::PlanUpgradeAll),
         Some(r) => (
             r.origin == "wingetrs",
             match &r.correlation {
@@ -561,7 +578,9 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
         ),
     };
     match source {
-        Some((source_name, id)) if ours => vec![Cmd::PlanInstall { source_name, id }],
+        Some((source_name, id)) if ours => {
+            start_planning(app, Cmd::PlanInstall { source_name, id })
+        }
         _ => {
             app.status = Some(NOT_OURS.to_string());
             Vec::new()
@@ -601,6 +620,8 @@ fn residue_item(r: &Residue) -> PickerItem {
 }
 
 fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
+    app.planning = false;
+    app.status = None;
     match result {
         Ok(Planned::Ready { text, action }) => {
             app.modal = Some(Modal::Confirm {
@@ -676,10 +697,13 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             }
             PickOutcome::Cancelled => Vec::new(),
             PickOutcome::Picked(chosen) => match chosen.first().and_then(|&i| candidates.get(i)) {
-                Some(c) if c.selectable => vec![Cmd::PlanInstall {
-                    source_name: c.entry.source_name.clone(),
-                    id: c.entry.id.clone(),
-                }],
+                Some(c) if c.selectable => {
+                    let cmd = Cmd::PlanInstall {
+                        source_name: c.entry.source_name.clone(),
+                        id: c.entry.id.clone(),
+                    };
+                    start_planning(app, cmd)
+                }
                 _ => Vec::new(),
             },
         },

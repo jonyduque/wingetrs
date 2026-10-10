@@ -621,3 +621,43 @@ fn upper_u_upgrades_selected_or_all() {
     assert!(update(&mut foreign, key(KeyCode::Char('U'))).is_empty());
     assert!(foreign.status.is_some());
 }
+
+#[test]
+fn repeated_plan_keys_are_ignored_while_planning() {
+    let mut a = app();
+    select_source(&mut a, SourceKind::Scoop);
+    assert_eq!(update(&mut a, key(KeyCode::Char('i'))).len(), 1);
+    assert!(a.planning);
+    assert_eq!(a.status.as_deref(), Some("planejando…"));
+    assert!(update(&mut a, key(KeyCode::Char('i'))).is_empty());
+    update(&mut a, ready("ripgrep"));
+    assert!(!a.planning);
+    assert!(confirm_open(&a));
+    update(&mut a, key(KeyCode::Esc));
+    assert_eq!(update(&mut a, key(KeyCode::Char('i'))).len(), 1);
+}
+
+#[test]
+fn a_failed_plan_frees_the_keys_again() {
+    let mut a = on_tab(Tab::Updates, vec![]);
+    assert_eq!(
+        update(&mut a, key(KeyCode::Char('U'))),
+        vec![Cmd::PlanUpgradeAll]
+    );
+    assert!(update(&mut a, key(KeyCode::Char('U'))).is_empty());
+    update(
+        &mut a,
+        Msg::Planned(Err("nenhum app para atualizar".into())),
+    );
+    assert!(!a.planning);
+    assert_eq!(update(&mut a, key(KeyCode::Char('U'))).len(), 1);
+}
+
+#[test]
+fn update_reraises_a_worker_panic() {
+    let mut a = app();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        update(&mut a, Msg::Panicked(Box::new("boom")));
+    }));
+    assert!(r.is_err());
+}
