@@ -1,5 +1,6 @@
 //! Command line interface.
 pub mod output;
+pub mod picker;
 
 use crate::cache::{DataDir, HttpState, now_unix};
 use crate::catalog::Catalog;
