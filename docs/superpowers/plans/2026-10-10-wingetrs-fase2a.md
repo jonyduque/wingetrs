@@ -1208,6 +1208,7 @@ A API que CLI e TUI chamam: junta resolução (35), manifesto (24), planejador (
 - `list`: `scan_all` (fase 1) inclui `scan_wingetrs`; correlação de app `Wingetrs` usa a mesma regra do scoop (`scoop:<bucket>` + app); `ListRow` mostra a origem "wingetrs"; app quebrado ⇒ estado "quebrado".
 - Toda a orquestração recebe `Effects` por parâmetro: testes usam fakes; produção monta as reais.
 - **Broadcast de ambiente (da Task 31):** o executor nunca chama `EnvStore::broadcast()`. `apply` e `uninstall` chamam `ctx.effects.env.broadcast()` **uma vez** ao final, se algum plano mexeu em env/PATH (sucesso ou rollback que tocou env). Teste com `FakeEnv`: dois planos com env ⇒ contador de broadcast = 1; plano sem env ⇒ 0.
+- **Hash do manifesto (da Task 31):** o executor grava `AppRecord.manifest_sha256` vazio porque o `InstallPlan` não o carrega; `ops` calcula o SHA-256 do JSON do manifesto usado e o põe no plano (campo novo `InstallPlan.manifest_sha256: String`, preenchido pelo planejador a partir de um parâmetro) — teste: após `apply`, o registro tem o hash do JSON da fixture.
 - **Arquivo em uso (da Task 31):** `ExecCtx.in_use` é injetado; `OpsCtx` ganha `pub in_use: &'a (dyn Fn(&Path) -> Vec<PathBuf> + Send + Sync)` e a produção (CLI/TUI) passa `install::fs_win::files_in_use`.
 
 **Files:**
