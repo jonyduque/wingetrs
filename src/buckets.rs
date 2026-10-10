@@ -35,6 +35,10 @@ pub enum BucketError {
     InUse { bucket: String, apps: Vec<String> },
     #[error("falha ao remover do catálogo: {0}")]
     Catalog(String),
+    #[error("não foi possível ler o state.db: {0}")]
+    StateDb(String),
+    #[error("falha ao gravar o estado: {0}")]
+    State(String),
 }
 
 /// Repo (`owner/repo`) of a well-known bucket name.
@@ -48,6 +52,8 @@ fn is_known_repo(repo: &str) -> bool {
 
 fn valid_part(s: &str) -> bool {
     !s.is_empty()
+        && s != "."
+        && s != ".."
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
@@ -55,7 +61,10 @@ fn valid_part(s: &str) -> bool {
 /// Normalizes `owner/repo` or a GitHub URL (optional `.git`, trailing slash) to `owner/repo`.
 pub fn parse_repo(spec: &str) -> Result<String, BucketError> {
     let spec = spec.trim();
-    let path = if let Some((_, rest)) = spec.split_once("://") {
+    let path = if let Some((scheme, rest)) = spec.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("https") {
+            return Err(BucketError::InvalidRepo(spec.to_string()));
+        }
         let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
         if !host.eq_ignore_ascii_case("github.com") && !host.eq_ignore_ascii_case("www.github.com")
         {
@@ -127,33 +136,34 @@ pub fn add(cfg: &mut Config, name: &str, spec: &str, confirmed: bool) -> Result<
     Ok(())
 }
 
-/// Apps in `state.db` installed from `bucket`; empty when the file is missing or unreadable.
-pub fn installed_from_bucket(state_db: &Path, bucket: &str) -> Vec<String> {
+/// Apps in `state.db` installed from `bucket`. A missing file means none; an unreadable
+/// database is an error (fail closed, so `rm` is not allowed by mistake).
+pub fn installed_from_bucket(state_db: &Path, bucket: &str) -> Result<Vec<String>, BucketError> {
     if !state_db.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Ok(conn) =
+    let err = |e: rusqlite::Error| BucketError::StateDb(e.to_string());
+    let conn =
         rusqlite::Connection::open_with_flags(state_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
-        return Vec::new();
-    };
-    let Ok(mut stmt) = conn.prepare("SELECT app FROM apps WHERE bucket = ?1 ORDER BY app") else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map([bucket], |r| r.get::<_, String>(0)) else {
-        return Vec::new();
-    };
-    rows.filter_map(Result::ok).collect()
+            .map_err(err)?;
+    let mut stmt = conn
+        .prepare("SELECT app FROM apps WHERE bucket = ?1 ORDER BY app")
+        .map_err(err)?;
+    let rows = stmt
+        .query_map([bucket], |r| r.get::<_, String>(0))
+        .map_err(err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(err)
 }
 
-/// `rm`: refuses while apps from the bucket are installed. Config only; see `remove_from_catalog`.
+/// `rm`: refuses while apps from the bucket are installed. Config only; the full flow is
+/// `remove_and_cleanup`.
 pub fn remove(cfg: &mut Config, name: &str, state_db: &Path) -> Result<(), BucketError> {
     let configured =
         cfg.scoop_buckets.iter().any(|n| n == name) || cfg.buckets.iter().any(|e| e.name == name);
     if !configured {
         return Err(BucketError::NotConfigured(name.to_string()));
     }
-    let apps = installed_from_bucket(state_db, name);
+    let apps = installed_from_bucket(state_db, name)?;
     if !apps.is_empty() {
         return Err(BucketError::InUse {
             bucket: name.to_string(),
@@ -165,32 +175,42 @@ pub fn remove(cfg: &mut Config, name: &str, state_db: &Path) -> Result<(), Bucke
     Ok(())
 }
 
-/// Drops the `scoop:<name>` source (packages, map rows, meta) from the catalog database.
-pub fn remove_from_catalog(catalog_path: &Path, name: &str) -> Result<(), BucketError> {
-    if !catalog_path.exists() {
-        return Ok(());
-    }
-    let source = crate::sources::scoop::source_name(name);
-    let run = || -> Result<(), rusqlite::Error> {
-        let mut conn = rusqlite::Connection::open(catalog_path)?;
-        let tx = conn.transaction()?;
-        for t in [
-            "map_productcode",
-            "map_upgradecode",
-            "map_pfn",
-            "map_norm_name",
-            "map_norm_publisher",
-        ] {
-            tx.execute(
-                &format!(
-                    "DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"
-                ),
-                [&source],
-            )?;
+/// Full `bucket rm`: checks `state.db`, drops the `scoop:<name>` source from the catalog,
+/// forgets its URL in `http.json` (so a later `add` refetches) and rewrites `search.idx`
+/// (deleting it when that fails; search then falls back to SQLite). The caller saves `cfg`.
+/// Stale `refs/heads/master` URLs from phase 1 stay orphaned in `http.json` (no effect).
+pub fn remove_and_cleanup(
+    data: &crate::cache::DataDir,
+    cfg: &mut Config,
+    name: &str,
+    state_db: &Path,
+) -> Result<(), BucketError> {
+    let repo = resolved(cfg)
+        .ok()
+        .and_then(|v| v.into_iter().find(|(n, _)| n == name).map(|(_, r)| r));
+    remove(cfg, name, state_db)?;
+    let cat_err = |e: crate::catalog::CatalogError| BucketError::Catalog(e.to_string());
+    let catalog_path = data.catalog_path();
+    if catalog_path.exists() {
+        let mut catalog = crate::catalog::Catalog::open(&catalog_path).map_err(cat_err)?;
+        catalog
+            .remove_source(&crate::sources::scoop::source_name(name))
+            .map_err(cat_err)?;
+        let idx = data.search_index_path();
+        if let Err(e) = crate::catalog::index_file::write(&catalog, &idx) {
+            tracing::warn!("falha ao regravar o índice de busca: {e}");
+            let _ = std::fs::remove_file(&idx);
         }
-        tx.execute("DELETE FROM packages WHERE source = ?1", [&source])?;
-        tx.execute("DELETE FROM meta WHERE source = ?1", [&source])?;
-        tx.commit()
-    };
-    run().map_err(|e| BucketError::Catalog(e.to_string()))
+    }
+    if let Some(repo) = repo {
+        let path = data.http_state_path();
+        let mut state = crate::cache::HttpState::load(&path);
+        let url = crate::sources::scoop::bucket::repo_tarball_url(&repo);
+        if state.entries.remove(&url).is_some() {
+            state
+                .save(&path)
+                .map_err(|e| BucketError::State(e.to_string()))?;
+        }
+    }
+    Ok(())
 }

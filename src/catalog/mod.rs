@@ -165,6 +165,19 @@ pub(crate) fn rowid_ranges(lo: i64, hi: i64) -> Vec<(i64, i64)> {
         .collect()
 }
 
+/// Deletes map rows and packages of `source` (not its meta row).
+fn delete_source_rows(tx: &rusqlite::Transaction<'_>, source: &str) -> Result<usize, CatalogError> {
+    for t in MAP_TABLES {
+        tx.execute(
+            &format!(
+                "DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"
+            ),
+            params![source],
+        )?;
+    }
+    Ok(tx.execute("DELETE FROM packages WHERE source = ?1", params![source])?)
+}
+
 pub struct Catalog {
     conn: Connection,
     /// File path when opened from disk; lets `load_entries` read with several connections.
@@ -276,6 +289,15 @@ impl Catalog {
         Ok(Catalog { conn, path: None })
     }
 
+    /// Removes a source with its packages, map rows and meta; returns the packages removed.
+    pub fn remove_source(&mut self, source: &str) -> Result<usize, CatalogError> {
+        let tx = self.conn.transaction()?;
+        let n = delete_source_rows(&tx, source)?;
+        tx.execute("DELETE FROM meta WHERE source = ?1", params![source])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
     pub fn replace_source(
         &mut self,
         source: &str,
@@ -287,13 +309,7 @@ impl Catalog {
     ) -> Result<ImportStats, CatalogError> {
         // Dropping `tx` on an early return rolls the whole import back.
         let tx = self.conn.transaction()?;
-        for t in MAP_TABLES {
-            tx.execute(
-                &format!("DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"),
-                params![source],
-            )?;
-        }
-        tx.execute("DELETE FROM packages WHERE source = ?1", params![source])?;
+        delete_source_rows(&tx, source)?;
         let mut rowids: HashMap<&str, i64> = HashMap::with_capacity(packages.len());
         {
             let mut ins = tx.prepare(&format!(
