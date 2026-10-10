@@ -28,6 +28,7 @@ pub enum InstallSource {
     Arp(Hive),
     Msix,
     Scoop,
+    Wingetrs,
 }
 
 #[derive(Debug, Clone, PartialEq)]

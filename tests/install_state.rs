@@ -1,0 +1,116 @@
+use wingetrs::install::layout::Layout;
+use wingetrs::install::state::*;
+use wingetrs::installed::InstallSource;
+
+fn rec(app: &str, version: &str) -> AppRecord {
+    AppRecord {
+        app: app.into(),
+        bucket: "main".into(),
+        version: version.into(),
+        arch: Some("64bit".into()),
+        installed_at: 1700000000,
+        manifest_sha256: "ab".repeat(32),
+    }
+}
+fn art(kind: ArtifactKind, target: &str, previous: Option<&str>) -> Artifact {
+    Artifact {
+        kind,
+        target: target.into(),
+        previous: previous.map(str::to_string),
+    }
+}
+
+#[test]
+fn open_creates_schema_in_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("sub").join("state.db");
+    let db = StateDb::open(&p).unwrap();
+    assert!(p.exists());
+    assert!(db.apps().unwrap().is_empty());
+}
+
+#[test]
+fn record_get_remove_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    let arts = vec![
+        art(ArtifactKind::Shim, "shims\\a.exe", None),
+        art(ArtifactKind::Env, "FOO", Some("old")),
+    ];
+    db.record(&rec("a", "1.0"), &arts).unwrap();
+    let (r, got) = db.get("a").unwrap().unwrap();
+    assert_eq!(r, rec("a", "1.0"));
+    assert_eq!(got, arts);
+    assert_eq!(db.apps().unwrap().len(), 1);
+    db.remove("a").unwrap();
+    assert!(db.get("a").unwrap().is_none());
+    assert!(db.apps().unwrap().is_empty());
+}
+
+#[test]
+fn rerecord_replaces_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    db.record(&rec("a", "1.0"), &[art(ArtifactKind::Shim, "x", None)])
+        .unwrap();
+    db.record(&rec("a", "2.0"), &[art(ArtifactKind::Shim, "y", None)])
+        .unwrap();
+    let (r, got) = db.get("a").unwrap().unwrap();
+    assert_eq!(r.version, "2.0");
+    assert_eq!(got, vec![art(ArtifactKind::Shim, "y", None)]);
+}
+
+#[test]
+fn path_users_excludes_self_and_other_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    db.record(&rec("a", "1"), &[art(ArtifactKind::Path, "C:\\bin", None)])
+        .unwrap();
+    db.record(&rec("b", "1"), &[art(ArtifactKind::Path, "C:\\bin", None)])
+        .unwrap();
+    db.record(&rec("c", "1"), &[art(ArtifactKind::Env, "C:\\bin", None)])
+        .unwrap();
+    assert_eq!(
+        db.path_users("a", "C:\\bin").unwrap(),
+        vec!["b".to_string()]
+    );
+    assert!(db.path_users("a", "C:\\other").unwrap().is_empty());
+}
+
+#[test]
+fn install_json_has_scoop_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    write_install_json(dir.path(), "main", Some("64bit"), "1.2").unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("install.json")).unwrap()).unwrap();
+    assert_eq!(v["bucket"], "main");
+    assert_eq!(v["architecture"], "64bit");
+    assert_eq!(v["version"], "1.2");
+    assert_eq!(v["wingetrs"], 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn scan_lists_valid_and_broken_apps() {
+    let root = tempfile::tempdir().unwrap();
+    let layout = Layout::new(root.path());
+    let good = layout.version_dir("good", "1.0");
+    std::fs::create_dir_all(&good).unwrap();
+    write_install_json(&good, "extras", Some("64bit"), "1.0").unwrap();
+    junction::create(&good, layout.current("good")).unwrap();
+
+    let gone = layout.version_dir("gone", "1.0");
+    std::fs::create_dir_all(&gone).unwrap();
+    write_install_json(&gone, "main", None, "1.0").unwrap();
+    junction::create(&gone, layout.current("gone")).unwrap();
+    std::fs::remove_dir_all(&gone).unwrap();
+
+    let apps = scan_wingetrs(&layout);
+    assert_eq!(apps.len(), 2);
+    assert_eq!(apps[0].key, "gone");
+    assert_eq!(apps[0].version, None);
+    assert_eq!(apps[0].source, InstallSource::Wingetrs);
+    assert_eq!(apps[1].key, "good");
+    assert_eq!(apps[1].version.as_deref(), Some("1.0"));
+    assert_eq!(apps[1].scoop_bucket.as_deref(), Some("extras"));
+}
