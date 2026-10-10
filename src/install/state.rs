@@ -175,13 +175,23 @@ impl StateDb {
 
     /// Apps (other than `app`) whose recorded artifacts include a PATH entry equal to `entry`.
     pub fn path_users(&self, app: &str, entry: &str) -> Result<Vec<String>, StateError> {
+        use crate::install::path_edit::norm;
+        let want = norm(entry);
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT app FROM artifacts WHERE kind = 'path' AND target = ?1 AND app <> ?2 ORDER BY app",
+            "SELECT app, target FROM artifacts WHERE kind = 'path' AND app <> ?1 ORDER BY app",
         )?;
-        let v = stmt
-            .query_map(params![entry, app], |r| r.get::<_, String>(0))?
+        let rows = stmt
+            .query_map(params![app], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(v)
+        let mut out: Vec<String> = Vec::new();
+        for (a, t) in rows {
+            if norm(&t) == want && !out.contains(&a) {
+                out.push(a);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -208,7 +218,9 @@ pub fn write_install_json(
         obj.insert("architecture".into(), a.into());
     }
     let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;
-    std::fs::write(version_dir.join("install.json"), bytes)
+    let tmp = version_dir.join("install.json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, version_dir.join("install.json"))
 }
 
 fn read_install_json(app_dir: &Path) -> Option<serde_json::Value> {

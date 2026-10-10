@@ -1,6 +1,6 @@
 //! Pure editing of the user `Path` value.
 
-fn norm(s: &str) -> String {
+pub(crate) fn norm(s: &str) -> String {
     s.strip_suffix('\\').unwrap_or(s).to_lowercase()
 }
 

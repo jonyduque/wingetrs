@@ -78,6 +78,33 @@ fn path_users_excludes_self_and_other_kinds() {
 }
 
 #[test]
+fn path_users_uses_path_equivalence() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    db.record(&rec("A", "1"), &[art(ArtifactKind::Path, r"C:\Bin\", None)])
+        .unwrap();
+    assert_eq!(
+        db.path_users("B", r"c:\bin").unwrap(),
+        vec!["A".to_string()]
+    );
+}
+
+#[test]
+fn open_garbage_file_is_err_and_uses_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.db");
+    std::fs::write(&bad, vec![0x41u8; 4096]).unwrap();
+    assert!(StateDb::open(&bad).is_err());
+    let good = dir.path().join("good.db");
+    drop(StateDb::open(&good).unwrap());
+    let c = rusqlite::Connection::open(&good).unwrap();
+    let m: String = c
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(m, "wal");
+}
+
+#[test]
 fn install_json_has_scoop_fields() {
     let dir = tempfile::tempdir().unwrap();
     write_install_json(dir.path(), "main", Some("64bit"), "1.2").unwrap();
@@ -105,6 +132,7 @@ fn scan_lists_valid_and_broken_apps() {
     junction::create(&gone, layout.current("gone")).unwrap();
     std::fs::remove_dir_all(&gone).unwrap();
 
+    std::fs::write(layout.apps().join("stray.txt"), "x").unwrap();
     let apps = scan_wingetrs(&layout);
     assert_eq!(apps.len(), 2);
     assert_eq!(apps[0].key, "gone");
