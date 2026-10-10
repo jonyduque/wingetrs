@@ -42,34 +42,81 @@ impl RegScanner {
         needle: &str,
         threads: usize,
     ) -> Vec<RegHit> {
-        let _span =
-            tracing::info_span!("reg_values_containing", roots = roots.len(), threads).entered();
+        self.scan(roots, needle, threads, true)
+    }
+
+    /// Exhaustive recursive scan of every root, including `Classes` (coverage proof and
+    /// A/B reference for the targeted scan).
+    pub fn values_containing_full(
+        &self,
+        roots: &[&str],
+        needle: &str,
+        threads: usize,
+    ) -> Vec<RegHit> {
+        self.scan(roots, needle, threads, false)
+    }
+
+    fn scan(&self, roots: &[&str], needle: &str, threads: usize, targeted: bool) -> Vec<RegHit> {
+        let _span = tracing::info_span!(
+            "reg_values_containing",
+            roots = roots.len(),
+            threads,
+            targeted
+        )
+        .entered();
         let needle = needle.to_lowercase();
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let mut raw: Vec<RawHit> = Vec::new();
-        // Work items in sequential-walk order: (display path, full path, depth, values only).
-        // Subtrees are split two levels deep so a few huge subtrees (e.g. `Classes\*`) do not
-        // serialise the scan.
-        let mut tasks: Vec<(String, String, u32, bool)> = Vec::new();
+        // Work items in sequential-walk order. Subtrees are split two levels deep so a few
+        // huge subtrees do not serialise the scan.
+        let mut tasks: Vec<(String, String, Kind)> = Vec::new();
         for root in roots {
             // A missing root is not an error: nothing to find.
             let Ok(k) = hkcu.open_subkey_with_flags(self.full(root), KEY_SCAN) else {
                 continue;
             };
             scan_values(&k, root, &needle, &mut raw);
+            let classes = targeted && is_classes_root(root);
             for sub in k.enum_keys().flatten() {
                 let path = format!("{root}\\{sub}");
                 let full = format!("{}\\{sub}", self.full(root));
+                if classes {
+                    // spec §8: associations, shell verbs and ProgIDs only.
+                    if PRUNED_CLASSES.iter().any(|p| p.eq_ignore_ascii_case(&sub)) {
+                        continue;
+                    }
+                    if WALKED_CLASSES.iter().any(|p| p.eq_ignore_ascii_case(&sub)) {
+                        tasks.push((path, full, Kind::Walk(1)));
+                        continue;
+                    }
+                    if CLASSES_CONTAINERS
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&sub))
+                    {
+                        tasks.push((path.clone(), full.clone(), Kind::Values));
+                        if let Ok(sk) = k.open_subkey_with_flags(&sub, KEY_SCAN) {
+                            for sub2 in sk.enum_keys().flatten() {
+                                tasks.push((
+                                    format!("{path}\\{sub2}"),
+                                    format!("{full}\\{sub2}"),
+                                    Kind::Targeted,
+                                ));
+                            }
+                        }
+                    } else {
+                        tasks.push((path, full, Kind::Targeted));
+                    }
+                    continue;
+                }
                 let Ok(sk) = k.open_subkey_with_flags(&sub, KEY_SCAN) else {
                     continue;
                 };
-                tasks.push((path.clone(), full.clone(), 1, true));
+                tasks.push((path.clone(), full.clone(), Kind::Values));
                 for sub2 in sk.enum_keys().flatten() {
                     tasks.push((
                         format!("{path}\\{sub2}"),
                         format!("{full}\\{sub2}"),
-                        2,
-                        false,
+                        Kind::Walk(2),
                     ));
                 }
             }
@@ -80,15 +127,15 @@ impl RegScanner {
             let mut done: Vec<(usize, Vec<RawHit>)> = Vec::new();
             loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some((path, full, depth, values_only)) = tasks.get(i) else {
+                let Some((path, full, kind)) = tasks.get(i) else {
                     break;
                 };
                 let mut out = Vec::new();
                 if let Ok(k) = hkcu.open_subkey_with_flags(full, KEY_SCAN) {
-                    if *values_only {
-                        scan_values(&k, path, &needle, &mut out);
-                    } else {
-                        walk(&k, path, &needle, *depth, &mut out);
+                    match kind {
+                        Kind::Values => scan_values(&k, path, &needle, &mut out),
+                        Kind::Walk(depth) => walk(&k, path, &needle, *depth, &mut out),
+                        Kind::Targeted => targeted_class(&k, path, &needle, &mut out),
                     }
                 }
                 done.push((i, out));
@@ -149,6 +196,89 @@ fn scan_values(key: &RegKey, path: &str, needle: &str, out: &mut Vec<RawHit>) {
         };
         if data.to_lowercase().contains(needle) {
             out.push((path.to_string(), (!name.is_empty()).then_some(name), data));
+        }
+    }
+}
+
+enum Kind {
+    /// Values of the key only.
+    Values,
+    /// Full recursive walk starting at this depth.
+    Walk(u32),
+    /// Association/shell-verb subset of a `Classes` child.
+    Targeted,
+}
+
+/// `Classes` children never scanned: not associations (CLSID registrations, caches, ...).
+const PRUNED_CLASSES: &[&str] = &[
+    "Local Settings",
+    "CLSID",
+    "Interface",
+    "TypeLib",
+    "WOW6432Node",
+    "shellex",
+];
+/// `Classes` children whose own children are the ProgID-like keys.
+const MAX_NESTED_SHELL: u32 = 3;
+/// `Classes` children small enough to walk completely (toast icon registrations).
+const WALKED_CLASSES: &[&str] = &["AppUserModelId"];
+const CLASSES_CONTAINERS: &[&str] = &["Applications", "SystemFileAssociations"];
+
+fn is_classes_root(root: &str) -> bool {
+    root.rsplit('\\')
+        .next()
+        .is_some_and(|l| l.eq_ignore_ascii_case("Classes"))
+}
+
+/// Opens the child of `key` named `name` (case-insensitive) and returns it with the name as
+/// stored, so reported paths match what a full walk reports.
+fn open_ci(key: &RegKey, name: &str) -> Option<(String, RegKey)> {
+    let actual = key
+        .enum_keys()
+        .flatten()
+        .find(|k| k.eq_ignore_ascii_case(name))?;
+    let sub = key.open_subkey_with_flags(&actual, KEY_SCAN).ok()?;
+    Some((actual, sub))
+}
+
+/// A ProgID/extension/`*`/`Directory` key: own values, `DefaultIcon`, `shell\<verb>` (+ its
+/// `command`) and `Background\shell\<verb>` (+ `command`). Never `shellex`.
+fn targeted_class(key: &RegKey, path: &str, needle: &str, out: &mut Vec<RawHit>) {
+    scan_values(key, path, needle, out);
+    if let Some((n, k)) = open_ci(key, "DefaultIcon") {
+        scan_values(&k, &format!("{path}\\{n}"), needle, out);
+    }
+    if let Some((n, k)) = open_ci(key, "Application") {
+        scan_values(&k, &format!("{path}\\{n}"), needle, out);
+    }
+    targeted_shell(key, path, needle, out);
+    if let Some((n, bg)) = open_ci(key, "Background") {
+        targeted_shell(&bg, &format!("{path}\\{n}"), needle, out);
+    }
+}
+
+fn targeted_shell(key: &RegKey, path: &str, needle: &str, out: &mut Vec<RawHit>) {
+    targeted_shell_at(key, path, needle, 0, out);
+}
+
+/// Cascading verbs (`shell\\v\\shell\\w\\command`) nest up to `MAX_NESTED_SHELL` levels.
+fn targeted_shell_at(key: &RegKey, path: &str, needle: &str, nest: u32, out: &mut Vec<RawHit>) {
+    let Some((sn, shell)) = open_ci(key, "shell") else {
+        return;
+    };
+    let spath = format!("{path}\\{sn}");
+    scan_values(&shell, &spath, needle, out);
+    for verb in shell.enum_keys().flatten() {
+        let Ok(vk) = shell.open_subkey_with_flags(&verb, KEY_SCAN) else {
+            continue;
+        };
+        let vpath = format!("{spath}\\{verb}");
+        scan_values(&vk, &vpath, needle, out);
+        if let Some((cn, cmd)) = open_ci(&vk, "command") {
+            scan_values(&cmd, &format!("{vpath}\\{cn}"), needle, out);
+        }
+        if nest < MAX_NESTED_SHELL {
+            targeted_shell_at(&vk, &vpath, needle, nest + 1, out);
         }
     }
 }

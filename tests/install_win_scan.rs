@@ -105,6 +105,48 @@ fn live_registry_scan_export_delete() {
 
 #[test]
 #[ignore = "live: grava sob HKCU Software wingetrs-test"]
+fn live_classes_scan_is_targeted() {
+    let tk = TestKey::new("prune");
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let data = "C:\\W\\apps\\app\\x.exe";
+    for sub in [
+        "Classes\\Local Settings\\shell\\open\\command",
+        "Classes\\CLSID\\shell\\open\\command",
+        "Classes\\.foo\\shell\\open\\command",
+        "Classes\\Applications\\x.exe\\shell\\open\\command",
+        "Classes\\Directory\\Background\\shell\\v\\command",
+        "Classes\\Prog\\DefaultIcon",
+    ] {
+        let (k, _) = hkcu.create_subkey(format!("{}\\{sub}", tk.0)).unwrap();
+        k.set_value("", &data).unwrap();
+    }
+    let scan = RegScanner::with_base(&tk.0);
+    let mut keys: Vec<String> = scan
+        .values_containing(&["Classes"], "apps\\app")
+        .unwrap()
+        .into_iter()
+        .map(|h| h.key)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "Classes\\.foo\\shell\\open\\command",
+            "Classes\\Applications\\x.exe\\shell\\open\\command",
+            "Classes\\Directory\\Background\\shell\\v\\command",
+            "Classes\\Prog\\DefaultIcon",
+        ]
+    );
+    // the exhaustive scan sees the pruned subtrees
+    assert_eq!(
+        scan.values_containing_full(&["Classes"], "apps\\app", 2)
+            .len(),
+        6
+    );
+}
+
+#[test]
+#[ignore = "live: grava sob HKCU Software wingetrs-test"]
 fn live_registry_delete_value() {
     let tk = TestKey::new("val");
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -130,29 +172,81 @@ fn live_scan_speed() {
         "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths",
         "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
     ];
-    let needle = "microsoft";
-    let t = std::time::Instant::now();
-    let seq = scan.values_containing_with(&roots, needle, 1);
-    eprintln!(
-        "sequential: {} ms, {} hits",
-        t.elapsed().as_millis(),
-        seq.len()
-    );
-    let t = std::time::Instant::now();
-    let par = scan.values_containing(&roots, needle).unwrap();
-    let ms = t.elapsed().as_millis();
-    eprintln!("parallel: {ms} ms, {} hits", par.len());
-    // equivalence: same hits, same order
+    // equivalence: thread count does not change hits or order
+    let seq = scan.values_containing_with(&roots, "microsoft", 1);
+    let par = scan.values_containing(&roots, "microsoft").unwrap();
     assert_eq!(seq, par);
-    // The brief's 300 ms bound holds for the small roots; Software\Classes holds ~80k keys on
-    // this machine and is reported, not asserted (see report).
-    let small = &roots[1..];
-    let t = std::time::Instant::now();
-    scan.values_containing(small, "wingetrs-no-such-app")
-        .unwrap();
-    let ms_small = t.elapsed().as_millis();
-    eprintln!("small roots (no hits): {ms_small} ms");
-    assert!(ms_small < 300, "{ms_small} ms");
+
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        scan.values_containing(&roots, "wingetrs-no-such-app")
+            .unwrap();
+        times.push(t.elapsed().as_millis());
+    }
+    times.sort();
+    eprintln!(
+        "targeted scan, 5 runs sorted: {times:?} ms; median {} ms",
+        times[2]
+    );
+    assert!(times[2] < 300, "{times:?}");
+}
+
+#[test]
+#[ignore = "live: varre HKCU real (somente leitura); prova de cobertura da varredura direcionada"]
+fn live_targeted_coverage() {
+    let scan = RegScanner::with_base("");
+    let roots = ["Software\\Classes"];
+    let pruned = [
+        "Local Settings",
+        "CLSID",
+        "Interface",
+        "TypeLib",
+        "WOW6432Node",
+        "shellex",
+    ];
+    for needle in ["\\appdata\\", "c:\\"] {
+        let full = scan.values_containing_full(&roots, needle, 8);
+        let targeted = scan.values_containing_with(&roots, needle, 8);
+        let only_full: Vec<_> = full.iter().filter(|h| !targeted.contains(h)).collect();
+        let only_targeted = targeted.iter().filter(|h| !full.contains(h)).count();
+        let mut groups: std::collections::BTreeMap<String, usize> = Default::default();
+        for h in &only_full {
+            let g = h.key.split('\\').take(3).collect::<Vec<_>>().join("\\");
+            *groups.entry(g).or_default() += 1;
+        }
+        eprintln!(
+            "needle {needle:?}: full {} hits, targeted {} hits, only-full {}, only-targeted {only_targeted}",
+            full.len(),
+            targeted.len(),
+            only_full.len()
+        );
+        for (g, n) in &groups {
+            eprintln!("    {n:5}  {g}");
+        }
+        for h in targeted.iter().filter(|h| !full.contains(h)) {
+            eprintln!("    only-targeted: {} = {}", h.key, h.data);
+        }
+        assert_eq!(only_targeted, 0);
+        let outside: Vec<_> = only_full
+            .iter()
+            .filter(|h| {
+                let second = h.key.split('\\').nth(2).unwrap_or("");
+                !pruned.iter().any(|p| p.eq_ignore_ascii_case(second))
+            })
+            .map(|h| (&h.key, &h.data))
+            .collect();
+        // Everything missed must live in a pruned subtree, or be a non-shell part of a
+        // ProgID/extension key (reported above for review).
+        assert!(
+            outside.is_empty(),
+            "missed outside pruned subtrees: {outside:?}"
+        );
+        eprintln!("    outside pruned subtrees: 0");
+        for (k, d) in outside.iter().take(40) {
+            eprintln!("      {k} = {d}");
+        }
+    }
 }
 
 #[test]
