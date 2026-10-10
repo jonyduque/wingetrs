@@ -330,6 +330,29 @@ fn scan(
     Ok(out)
 }
 
+/// Windows ERROR_SHARING_VIOLATION (antivirus or another process holding the file).
+const SHARING_VIOLATION: i32 = 32;
+
+/// Reads `path`, retrying transient locks up to 5 times, 10 ms apart: on Windows a reader that
+/// opens the file while `write` renames over it gets "access denied", and a scanner holding the
+/// fresh file gives a sharing violation.
+fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+    let transient = |e: &std::io::Error| {
+        e.kind() == std::io::ErrorKind::PermissionDenied
+            || e.raw_os_error() == Some(SHARING_VIOLATION)
+    };
+    let mut attempt = 0;
+    loop {
+        match std::fs::read(path) {
+            Err(e) if transient(&e) && attempt < 5 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            r => return r,
+        }
+    }
+}
+
 /// Reads `path` and searches it in parallel (up to 8 workers over contiguous record ranges,
 /// each with its own nucleo Matcher). Ok(None) when the file is missing; Err when it is
 /// invalid (the caller falls back to the catalog).
@@ -339,7 +362,7 @@ pub fn search(
     filter: Option<SourceKind>,
     limit: usize,
 ) -> Result<Option<Vec<Found>>, IndexFileError> {
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_retrying(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(IndexFileError::Io(e.to_string())),
