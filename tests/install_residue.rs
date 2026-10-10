@@ -334,6 +334,8 @@ impl RegistryScan for OrderedRegistry {
         if self.fail_export.is_some_and(|f| key.contains(f)) {
             return Err(EffectError("acesso negado".into()));
         }
+        // Like `reg export /y`: writes (or overwrites) the file with the key's dump.
+        std::fs::write(file, key).map_err(|e| EffectError(e.to_string()))?;
         self.inner.export(key, file)
     }
     fn delete_value(&self, key: &str, value_name: &str) -> Result<(), EffectError> {
@@ -405,21 +407,14 @@ fn clean_exports_before_deleting_key_and_value() {
     let run = &state[r"Software\Run"];
     assert!(!run.contains_key(&Some("rg".to_string())));
     assert!(run.contains_key(&Some("keep".to_string())));
-    // backups\<YYYYMMDD-HHMMSS>\<app>.reg, with a distinct file per exported key.
+    // backups\<YYYYMMDD-HHMMSSZ>\<app>.reg (UTC), with a distinct file per exported key.
     assert_eq!(exports.len(), 2);
     let mut files = vec![];
     for (_, f) in &exports {
         let stamp = f.parent().unwrap();
         assert_eq!(stamp.parent().unwrap(), backups.path());
         let s = stamp.file_name().unwrap().to_str().unwrap();
-        assert_eq!(s.len(), 15, "{s}");
-        assert_eq!(&s[8..9], "-");
-        assert!(
-            s[..8]
-                .bytes()
-                .chain(s[9..].bytes())
-                .all(|b| b.is_ascii_digit())
-        );
+        assert!(is_stamp(s), "{s}");
         assert!(stamp.is_dir(), "backup dir must exist before export");
         files.push(f.file_name().unwrap().to_str().unwrap().to_string());
     }
@@ -545,4 +540,99 @@ fn clean_sends_folders_and_shortcuts_to_trash() {
     assert!(rg.log().is_empty());
     // No registry item ⇒ no backup directory created.
     assert_eq!(std::fs::read_dir(backups.path()).unwrap().count(), 0);
+}
+
+/// `YYYYMMDD-HHMMSSZ`.
+fn is_stamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 16
+        && b[8] == b'-'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
+}
+
+#[test]
+fn two_cleans_of_same_app_never_overwrite_a_backup() {
+    // Retry until both cleans fall in the same second, the case that could collide.
+    for _ in 0..5 {
+        let env = FakeEnv::new();
+        let sc = FakeShortcuts::new(r"C:\SM");
+        let tr = FakeTrash::new();
+        let rg = OrderedRegistry::new(None);
+        rg.inner.insert(r"Software\First", Some("x"), "1");
+        rg.inner.insert(r"Software\Second", Some("y"), "2");
+        let fx = Effects {
+            env: &env,
+            shortcuts: &sc,
+            trash: &tr,
+            registry: &rg,
+        };
+        // Missing backups root is created.
+        let tmp = tempfile::tempdir().unwrap();
+        let backups = tmp.path().join("backups");
+        let key = |k: &str| vec![sel(ResidueKind::RegKey { key: k.into() })];
+        assert_eq!(
+            clean(&key(r"Software\First"), "ripgrep", &fx, &backups),
+            vec![Ok(())]
+        );
+        assert_eq!(
+            clean(&key(r"Software\Second"), "ripgrep", &fx, &backups),
+            vec![Ok(())]
+        );
+        let (_, exports) = rg.inner.dump();
+        assert_eq!(exports.len(), 2);
+        let (f1, f2) = (&exports[0].1, &exports[1].1);
+        let d1 = f1.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        let d2 = f2.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        if d1[..16] != d2[..16] {
+            continue;
+        }
+        assert_ne!(f1, f2, "second clean reused the first backup path");
+        assert!(is_stamp(d1), "{d1}");
+        assert_eq!(d2, format!("{d1}-2"));
+        assert_eq!(std::fs::read_to_string(f1).unwrap(), r"Software\First");
+        assert_eq!(std::fs::read_to_string(f2).unwrap(), r"Software\Second");
+        return;
+    }
+    panic!("never got two cleans within the same second");
+}
+
+#[test]
+fn names_must_match_whole_not_by_prefix() {
+    let mut i = In::new();
+    i.app = "git";
+    i.folders = vec![PathBuf::from(r"C:\Users\u\AppData\Roaming\github")];
+    i.keys = vec![r"Software\GitHub".into()];
+    assert!(i.run().is_empty(), "{:?}", i.run());
+
+    let mut i = In::new();
+    i.folders = vec![PathBuf::from(r"C:\Users\u\AppData\Roaming\ripgrep-all")];
+    i.keys = vec![r"Software\ripgrep-all".into()];
+    assert!(i.run().is_empty(), "{:?}", i.run());
+}
+
+#[test]
+fn malformed_github_homepage_gives_no_owner_candidate() {
+    for hp in [
+        "https://github.com/../x",
+        "https://github.com/a?b/c",
+        "https://github.com/",
+        "https://github.com",
+        "https://github.com//x",
+    ] {
+        let mut i = In::new();
+        i.homepage = Some(hp);
+        i.folders = vec![
+            PathBuf::from(r"C:\A\.."),
+            PathBuf::from(r"C:\A\a?b"),
+            PathBuf::from(r"C:\A\a"),
+            PathBuf::from(r"C:\A\github.com"),
+        ];
+        i.keys = vec![
+            r"Software\..".into(),
+            r"Software\a?b".into(),
+            r"Software\a".into(),
+        ];
+        assert!(i.run().is_empty(), "{hp}: {:?}", i.run());
+    }
 }

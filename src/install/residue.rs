@@ -152,7 +152,7 @@ pub fn classify(input: &ResidueInput<'_>) -> Vec<Residue> {
     out
 }
 
-/// `YYYYMMDD-HHMMSS` (UTC) for the current time.
+/// `YYYYMMDD-HHMMSSZ` (UTC, hence the `Z`) for the current time.
 fn stamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -170,11 +170,29 @@ fn stamp() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!(
-        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}",
+        "{y:04}{m:02}{d:02}-{:02}{:02}{:02}Z",
         rem / 3600,
         (rem / 60) % 60,
         rem % 60
     )
+}
+
+/// Atomically reserves a fresh `backups\<stamp>` (or `<stamp>-2`, `-3`…), so a later
+/// clean never writes into, and overwrites, an earlier backup.
+fn reserve_backup_dir(backups: &Path, stamp: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(backups)?;
+    let mut n = 1u32;
+    loop {
+        let dir = match n {
+            1 => backups.join(stamp),
+            _ => backups.join(format!("{stamp}-{n}")),
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 10_000 => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Removes the selected residues recoverably: folders and shortcuts go to the Recycle Bin;
@@ -186,8 +204,8 @@ pub fn clean(
     effects: &Effects<'_>,
     backups: &Path,
 ) -> Vec<Result<(), String>> {
-    let dir = backups.join(stamp());
-    let mut dir_ready: Option<Result<(), String>> = None;
+    let stamp = stamp();
+    let mut dir_ready: Option<Result<PathBuf, String>> = None;
     // Each distinct key is exported once; the result is reused for later items of that key.
     let mut exported: BTreeMap<String, Result<(), String>> = BTreeMap::new();
     let mut export = |key: &str| -> Result<(), String> {
@@ -196,15 +214,15 @@ pub fn clean(
         }
         let ready = dir_ready
             .get_or_insert_with(|| {
-                std::fs::create_dir_all(&dir).map_err(|e| {
+                reserve_backup_dir(backups, &stamp).map_err(|e| {
                     format!(
-                        "não foi possível criar a pasta de backup {}: {e}",
-                        dir.display()
+                        "não foi possível criar a pasta de backup em {}: {e}",
+                        backups.display()
                     )
                 })
             })
             .clone();
-        let r = ready.and_then(|()| {
+        let r = ready.and_then(|dir| {
             let file = match exported.len() {
                 0 => dir.join(format!("{app}.reg")),
                 n => dir.join(format!("{app}-{}.reg", n + 1)),
