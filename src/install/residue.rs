@@ -1,0 +1,1 @@
+//! Residue scan after uninstall.

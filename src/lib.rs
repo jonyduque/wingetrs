@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod core;
 pub mod http;
+pub mod install;
 pub mod installed;
 pub mod sources;
 pub mod tui;

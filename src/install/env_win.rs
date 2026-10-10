@@ -1,0 +1,1 @@
+//! Windows user environment store.

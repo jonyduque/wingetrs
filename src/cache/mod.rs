@@ -58,6 +58,9 @@ impl DataDir {
         Ok(DataDir::new(base.data_local_dir().join("wingetrs")))
     }
 
+    pub fn install_layout(&self) -> crate::install::layout::Layout {
+        crate::install::layout::Layout::new(self.root())
+    }
     pub fn root(&self) -> &Path {
         &self.root
     }
