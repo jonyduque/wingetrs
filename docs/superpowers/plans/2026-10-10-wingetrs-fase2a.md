@@ -745,7 +745,7 @@ impl StateDb {
     pub fn remove(&mut self, app: &str) -> Result<(), StateError>;
     pub fn apps(&self) -> Result<Vec<AppRecord>, StateError>;
     /// Apps (other than `app`) whose recorded artifacts include a PATH entry equal to `entry`.
-    pub fn path_users(&self, entry: &str) -> Result<Vec<String>, StateError>;
+    pub fn path_users(&self, app: &str, entry: &str) -> Result<Vec<String>, StateError>; // apps other than `app` using `entry`
 }
 pub fn write_install_json(version_dir: &Path, bucket: &str, arch: Option<&str>, version: &str) -> std::io::Result<()>;
 pub fn scan_wingetrs(layout: &crate::install::layout::Layout) -> Vec<crate::installed::InstalledApp>;
