@@ -83,11 +83,14 @@ fn rel_path(rel: &str) -> Result<PathBuf, PlanError> {
 }
 
 /// Resolves one `env_add_path` entry (already substituted) under `current`.
-/// `Ok(None)` for empty or `.` entries, which scoop drops.
+/// `Ok(None)` for empty entries, which scoop drops; `.` is the app directory itself
+/// (scoop joins it to `$dir`, as in `"env_add_path": "."`).
 fn env_path_entry(raw: &str, current: &Path) -> Result<Option<PathBuf>, PlanError> {
     let unsafe_path = || PlanError::UnsafePath(raw.to_string());
-    if matches!(raw.trim(), "" | ".") {
-        return Ok(None);
+    match raw.trim() {
+        "" => return Ok(None),
+        "." => return Ok(Some(current.to_path_buf())),
+        _ => {}
     }
     let cur = current.to_string_lossy();
     let rel = match raw.strip_prefix(cur.as_ref()) {

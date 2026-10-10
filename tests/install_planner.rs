@@ -306,7 +306,13 @@ fn empty_and_dot_env_path_entries_are_dropped() {
             }
         })
         .collect();
-    assert_eq!(entries, [PathBuf::from(r"C:\W\apps\app\current\bin")]);
+    assert_eq!(
+        entries,
+        [
+            PathBuf::from(r"C:\W\apps\app\current"),
+            PathBuf::from(r"C:\W\apps\app\current\bin")
+        ]
+    );
 }
 
 #[test]
