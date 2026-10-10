@@ -131,12 +131,36 @@ pub async fn ensure_launcher_from(
     result
 }
 
+/// First 4 KiB of `path` (enough for the PE headers of any sane image); `None` on any error.
+fn read_header(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
+/// A shim name must be exactly one safe path component (it comes from a manifest alias).
+fn check_name(name: &str) -> Result<(), ShimError> {
+    let ok = !name.contains(['/', '\\'])
+        && crate::install::safepath::safe_components(name).is_some_and(|c| c.len() == 1);
+    if ok {
+        Ok(())
+    } else {
+        Err(ShimError::Io(format!("nome de shim inseguro: {name}")))
+    }
+}
+
 fn write_text(path: &Path, text: &str) -> Result<(), ShimError> {
     fs::write(path, text.as_bytes()).map_err(io)
 }
 
 /// Creates the shim files for `spec`; returns every file created.
 pub fn create_shim(layout: &Layout, spec: &ShimSpec) -> Result<Vec<PathBuf>, ShimError> {
+    check_name(&spec.name)?;
     let dir = layout.shims();
     fs::create_dir_all(&dir).map_err(io)?;
     let target = spec.target.display().to_string();
@@ -148,15 +172,20 @@ pub fn create_shim(layout: &Layout, spec: &ShimSpec) -> Result<Vec<PathBuf>, Shi
             let exe = dir.join(format!("{}.exe", spec.name));
             let shim = dir.join(format!("{}.shim", spec.name));
             let launcher = layout.launcher();
-            let _ = fs::remove_file(&exe);
-            let gui = fs::read(&spec.target)
-                .ok()
+            match fs::remove_file(&exe) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io(e)),
+            }
+            let gui = read_header(&spec.target)
                 .and_then(|b| pe_subsystem(&b))
                 .is_some_and(|s| s == 2);
             if gui {
                 let mut bytes = fs::read(&launcher)
                     .map_err(|e| ShimError::Launcher(format!("{}: {e}", launcher.display())))?;
-                set_pe_subsystem(&mut bytes, 2);
+                if !set_pe_subsystem(&mut bytes, 2) {
+                    return Err(ShimError::Launcher("lançador inválido".into()));
+                }
                 fs::write(&exe, bytes).map_err(io)?;
             } else if fs::hard_link(&launcher, &exe).is_err() {
                 fs::copy(&launcher, &exe)
@@ -210,6 +239,7 @@ pub fn create_shim(layout: &Layout, spec: &ShimSpec) -> Result<Vec<PathBuf>, Shi
 
 /// Deletes every `shims\<name>.{exe,shim,cmd,ps1}` that exists.
 pub fn remove_shim(layout: &Layout, name: &str) -> Result<(), ShimError> {
+    check_name(name)?;
     let dir = layout.shims();
     for ext in ["exe", "shim", "cmd", "ps1"] {
         match fs::remove_file(dir.join(format!("{name}.{ext}"))) {
