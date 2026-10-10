@@ -1,5 +1,5 @@
 {
-  "plan": "docs/superpowers/plans/2026-10-07-wingetrs-fase1.md",
+  "plan": "docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md",
   "brief": ".claude/tasks/task-{task}-brief.md",
   "report": ".claude/tasks/task-{task}-report.md",
   "ledger": ".claude/tasks/progress.md",
@@ -17,11 +17,14 @@
   "auditCommand": "",
   "projectRules": "- External data never panics: no unwrap/expect outside tests (clippy denies), typed errors with thiserror; the catalog changes without notice and one bad manifest must not kill the TUI.\n- Nothing prints to stdout outside src/main.rs and src/cli/; the TUI owns the terminal and a stray println corrupts the screen.\n- Windows-only code in *_win.rs behind #[cfg(windows)] mod; never cfg!(windows) inside shared logic, so correlation stays testable with synthetic data.\n- Unit/integration tests never touch the network or the real registry; live tests are #[ignore = \"live: ...\"].\n- No new dependency unless the brief lists it; the set was verified together in a probe crate.\n- User-facing text in Portuguese; code and comments in English.\n- Early threads are joined on every path and worker panics are re-raised with resume_unwind (escaped in tasks 18, 20 and the final review).\n- More than one path to the same result needs an equivalence test (search in memory / SQLite / search.idx).\n- Third-party files (winget installed.db) are read-only and never opened in WAL mode.\n- Measure before optimizing; benchmarks only with -Baseline; revert optimizations without measured gain.\n",
   "designTasks": [
-    10,
-    12,
-    15
+    28,
+    31,
+    32,
+    34,
+    37,
+    40
   ],
-  "docsTask": 15,
+  "docsTask": 40,
   "_designTasks": [
     "Fase 1: design (opus) = 10 normalizer, 12 correlação, 15 validação, 21 desempates. Nesses o revisor opus achou os defeitos mais caros (MSIX sparse, rastreamento do winget). Transcrição com testes literais rodou bem em sonnet."
   ],

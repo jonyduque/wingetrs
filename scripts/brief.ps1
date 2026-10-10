@@ -11,7 +11,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory, Position = 0)] [int]$Task,
-    [string]$Plan = 'docs/superpowers/plans/2026-10-07-wingetrs-fase1.md'
+    [string]$Plan = 'docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md'
 )
 
 Set-StrictMode -Version Latest

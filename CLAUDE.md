@@ -3,7 +3,7 @@
 Gerenciador de pacotes para Windows em Rust (TUI ratatui + CLI) sobre o catálogo do winget (CDN `source2.msix`) e buckets do Scoop.
 
 - **Fase 1 (concluída, somente leitura):** `update`, `search`, `show`, `list`. Spec `docs/superpowers/specs/2026-10-07-wingetrs-fase1-design.md`, plano `docs/superpowers/plans/2026-10-07-wingetrs-fase1.md`, validação `docs/superpowers/reports/2026-10-07-fase1-validacao.md`.
-- **Fase 2 (em desenho):** instalação. Spec e plano próprios em `docs/superpowers/`.
+- **Fase 2a (em implementação):** instalar/remover/atualizar apps do Scoop. Spec `docs/superpowers/specs/2026-10-10-wingetrs-fase2a-scoop-design.md`, plano `docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md` (Tasks 24–40).
 - Ledger de tarefas: `.claude/tasks/progress.md`
 - **Armadilhas medidas (leia antes de escrever brief ou otimizar): `docs/ARMADILHAS.md`**
 - Referência portada do winget-cli (MIT, commit em `SOURCE_COMMIT.txt`): `docs/reference/winget-cli/`
@@ -62,7 +62,7 @@ As marcadas com ⚙ são verificadas mecanicamente por `scripts/check_rules.ps1`
 - `cargo update` (versões travadas no `Cargo.lock`).
 - `find /`, `Get-ChildItem C:\ -Recurse` ou qualquer varredura do disco inteiro: um `find / -name oracle.py` esquecido por um subagente ficou horas consumindo CPU e invalidou os benchmarks. Procure só dentro do repositório, do scratchpad ou de caminhos conhecidos.
 - Deixar processos em segundo plano vivos ao terminar (servidores, watchers, buscas, laços `until … sleep`): encerre tudo que você iniciou antes de responder.
-- Escrever em arquivos do winget, do scoop ou do sistema fora de `%LOCALAPPDATA%\wingetrs` (até a fase 2 definir o contrário na spec).
+- Escrever fora de `%LOCALAPPDATA%\wingetrs`, exceto o que a spec da fase 2a autoriza (`HKCU\Environment`, `Start Menu\Programs\wingetrs Apps`, Lixeira, chaves `HKCU` de resíduo confirmadas) — e **testes nunca** tocam esses lugares reais: usam `WINGETRS_TEST_ENV_KEY` e `WINGETRS_TEST_SHORTCUT_DIR`. Nunca escreva em arquivos do winget ou do `~/scoop`.
 - Editar `docs/superpowers/specs/*`, `docs/superpowers/plans/*`, `.claude/tasks/progress.md` (são do orquestrador).
 
 ## Economia de contexto (subagentes)
