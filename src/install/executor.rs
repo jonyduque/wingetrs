@@ -582,7 +582,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 version: version.to_string(),
                 arch: plan.arch.map(|a| a.key().to_string()),
                 installed_at: now_secs(),
-                manifest_sha256: String::new(),
+                manifest_sha256: plan.manifest_sha256.clone(),
             };
             let arts = run.artifacts.clone();
             ctx.state.record(&rec, &arts).map_err(|e| e.to_string())

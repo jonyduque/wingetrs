@@ -25,6 +25,8 @@ pub struct PlanInput<'a> {
     pub installed: Option<InstalledInfo>,
     pub launcher_present: bool,
     pub keep_old: bool,
+    /// SHA-256 (hex) of the manifest JSON, carried into the plan.
+    pub manifest_sha256: &'a str,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -275,6 +277,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         arch: m.arch,
         upgrade_from,
         root: layout.root().to_path_buf(),
+        manifest_sha256: input.manifest_sha256.to_string(),
         steps,
     })
 }

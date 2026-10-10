@@ -142,6 +142,7 @@ impl World {
             installed,
             launcher_present: true,
             keep_old,
+            manifest_sha256: "",
         })
         .unwrap()
     }
@@ -234,6 +235,7 @@ async fn setup() -> World {
             arch: None,
             upgrade_from: None,
             root: PathBuf::new(),
+            manifest_sha256: String::new(),
             steps: Vec::new(),
         },
     };

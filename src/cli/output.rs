@@ -90,7 +90,7 @@ pub fn report_line(r: &SourceReport) -> String {
     }
 }
 
-fn aligned(header: [&str; 5], cells: &[[String; 5]]) -> String {
+fn aligned<const N: usize>(header: [&str; N], cells: &[[String; N]]) -> String {
     let mut widths = header.map(|h| h.chars().count());
     for r in cells {
         for (w, c) in widths.iter_mut().zip(r) {
@@ -111,14 +111,18 @@ fn aligned(header: [&str; 5], cells: &[[String; 5]]) -> String {
     out
 }
 
-/// `Nome  Id  Instalada  Disponível  Fonte` for correlated rows, followed by the
-/// ambiguous and unmatched sections unless `upgradable_only`.
+/// `Nome  Id  Instalada  Disponível  Fonte  Origem` for correlated rows, followed by the
+/// ambiguous and unmatched sections unless `upgradable_only`. A broken wingetrs install
+/// shows "quebrado" instead of its version.
 pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
     let mut cells = Vec::new();
     let mut ambiguous = Vec::new();
     let mut unmatched = Vec::new();
     for r in rows {
-        let installed = r.installed_version.clone().unwrap_or_default();
+        let installed = match r.state {
+            UpdateState::Broken => "quebrado".to_string(),
+            _ => r.installed_version.clone().unwrap_or_default(),
+        };
         match &r.correlation {
             Correlation::Matched {
                 source, package_id, ..
@@ -136,19 +140,26 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
                     installed,
                     available,
                     source.clone(),
+                    r.origin.clone(),
                 ]);
             }
             Correlation::Ambiguous { candidates, .. } => {
                 ambiguous.push(format!(
-                    "{} ({installed}): {}",
+                    "{} ({installed}, {}): {}",
                     r.name,
+                    r.origin,
                     candidates.join(", ")
                 ));
             }
-            Correlation::Unmatched => unmatched.push(format!("{} ({installed})", r.name)),
+            Correlation::Unmatched => {
+                unmatched.push(format!("{} ({installed}, {})", r.name, r.origin));
+            }
         }
     }
-    let mut out = aligned(["Nome", "Id", "Instalada", "Disponível", "Fonte"], &cells);
+    let mut out = aligned(
+        ["Nome", "Id", "Instalada", "Disponível", "Fonte", "Origem"],
+        &cells,
+    );
     if !upgradable_only {
         for (title, items) in [
             ("Ambíguos", &ambiguous),

@@ -29,6 +29,7 @@ fn plan(
         installed: installed.map(|v| InstalledInfo { version: v.into() }),
         launcher_present: launcher,
         keep_old: false,
+        manifest_sha256: "",
     })
 }
 
@@ -178,6 +179,7 @@ fn shortcut_names_are_sanitized_and_contained() {
         installed: None,
         launcher_present: true,
         keep_old: false,
+        manifest_sha256: "",
     })
     .unwrap();
     let links: Vec<PathBuf> = p
@@ -242,6 +244,7 @@ fn display_snapshots_for_every_supported_fixture() {
             installed: None,
             launcher_present: false,
             keep_old: false,
+            manifest_sha256: "",
         })
         .unwrap();
         insta::assert_snapshot!(name.trim_end_matches(".json"), p.to_string());
@@ -265,6 +268,7 @@ fn plan_raw(
         installed: installed.map(|v| InstalledInfo { version: v.into() }),
         launcher_present: true,
         keep_old,
+        manifest_sha256: "",
     })
 }
 

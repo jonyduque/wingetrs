@@ -32,13 +32,19 @@ pub enum Correlation {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum UpdateState {
     UpToDate,
-    Available { latest: String },
+    Available {
+        latest: String,
+    },
     Unknown,
+    /// Installed by wingetrs, but `current` or its `install.json` is missing (run `repair`).
+    Broken,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ListRow {
     pub name: String,
+    /// Who installed it: `arp`, `msix`, `scoop` or `wingetrs`.
+    pub origin: String,
     pub installed_version: Option<String>,
     pub correlation: Correlation,
     pub latest: Option<String>,
@@ -145,8 +151,11 @@ fn by_name_and_publisher(
     Ok((!ids.is_empty()).then(|| (WINGET_SOURCE.to_owned(), ids, Rule::NameAndPublisher)))
 }
 
+/// Scoop and wingetrs installs record their bucket; both correlate by `scoop:<bucket>` + app.
 fn by_scoop(app: &InstalledApp, catalog: &Catalog) -> Result<Option<Hit>, CatalogError> {
-    let (InstallSource::Scoop, Some(bucket)) = (&app.source, app.scoop_bucket.as_deref()) else {
+    let (InstallSource::Scoop | InstallSource::Wingetrs, Some(bucket)) =
+        (&app.source, app.scoop_bucket.as_deref())
+    else {
         return Ok(None);
     };
     let source = crate::sources::scoop::source_name(bucket);
@@ -189,14 +198,29 @@ fn find(
     by_scoop(app, catalog)
 }
 
+fn origin(source: &InstallSource) -> &'static str {
+    match source {
+        InstallSource::Arp(_) => "arp",
+        InstallSource::Msix => "msix",
+        InstallSource::Scoop => "scoop",
+        InstallSource::Wingetrs => "wingetrs",
+    }
+}
+
 fn row(
     app: &InstalledApp,
     correlation: Correlation,
     latest: Option<String>,
     state: UpdateState,
 ) -> ListRow {
+    // `scan_wingetrs` lists an app without version when its install is broken.
+    let state = match (&app.source, &app.version) {
+        (InstallSource::Wingetrs, None) => UpdateState::Broken,
+        _ => state,
+    };
     ListRow {
         name: app.name.clone(),
+        origin: origin(&app.source).to_string(),
         installed_version: app.version.clone(),
         correlation,
         latest,

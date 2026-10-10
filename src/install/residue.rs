@@ -83,7 +83,7 @@ fn mentions_dir(text: &str, dir: &str) -> bool {
 }
 
 /// Owner of a `https://github.com/<owner>/<repo>…` homepage.
-fn github_owner(homepage: &str) -> Option<&str> {
+pub fn github_owner(homepage: &str) -> Option<&str> {
     let lower = homepage.to_ascii_lowercase();
     let rest_at = ["https://github.com/", "http://github.com/"]
         .iter()

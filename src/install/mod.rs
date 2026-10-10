@@ -5,6 +5,7 @@ pub mod extract;
 pub mod layout;
 pub mod link;
 pub mod manifest;
+pub mod ops;
 pub mod path_edit;
 pub mod plan;
 pub mod planner;

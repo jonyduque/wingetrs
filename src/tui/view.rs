@@ -358,6 +358,10 @@ fn install_status(theme: &Theme, g: &Glyphs, r: &ListRow) -> Line<'static> {
             Span::styled(format!("{} ", g.ok), theme.ok()),
             Span::styled(format!("instalado {installed} (atualizado)"), theme.ok()),
         ]),
+        UpdateState::Broken => Line::from(vec![
+            Span::styled(format!("{} ", g.unknown), theme.alert()),
+            Span::styled("instalação quebrada (rode repair)", theme.alert()),
+        ]),
         UpdateState::Unknown => {
             let text = match &r.correlation {
                 Correlation::Ambiguous { .. } => "correspondência ambígua no catálogo",

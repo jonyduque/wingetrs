@@ -74,6 +74,8 @@ pub struct InstallPlan {
     pub upgrade_from: Option<String>,
     /// wingetrs root the plan was built against (used to print full paths).
     pub root: PathBuf,
+    /// SHA-256 (hex) of the manifest JSON the plan was built from; recorded in `state.db`.
+    pub manifest_sha256: String,
     pub steps: Vec<Step>,
 }
 

@@ -143,9 +143,17 @@ fn collect_msix() -> Collected {
     Ok(Vec::new())
 }
 
-/// Runs the three collectors in parallel; a failing collector is reported, not fatal.
+/// Apps installed by wingetrs under `%LOCALAPPDATA%\wingetrs\apps`.
+fn collect_wingetrs() -> Collected {
+    timed("scan_wingetrs", || {
+        let data = crate::cache::DataDir::from_env().map_err(|e| format!("wingetrs: {e}"))?;
+        Ok(crate::install::state::scan_wingetrs(&data.install_layout()))
+    })
+}
+
+/// Runs the collectors in parallel; a failing collector is reported, not fatal.
 pub fn scan_all() -> InstalledScan {
-    scan_with(&[collect_arp, collect_msix, collect_scoop])
+    scan_with(&[collect_arp, collect_msix, collect_scoop, collect_wingetrs])
 }
 
 /// Runs `fns` in parallel. A collector error is reported; a collector panic is propagated.

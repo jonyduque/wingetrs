@@ -180,6 +180,7 @@ fn row(
     use wingetrs::installed::correlate::{Correlation, ListRow, Rule};
     ListRow {
         name: name.into(),
+        origin: "arp".into(),
         installed_version: Some("1".into()),
         correlation: Correlation::Matched {
             source: "winget".into(),
