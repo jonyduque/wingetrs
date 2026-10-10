@@ -22,6 +22,8 @@ pub mod env_win;
 #[cfg(windows)]
 pub mod fs_win;
 #[cfg(windows)]
+pub mod prod_win;
+#[cfg(windows)]
 pub mod registry_win;
 #[cfg(windows)]
 pub mod shortcut_win;

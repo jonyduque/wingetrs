@@ -95,6 +95,23 @@ impl StateDb {
         Ok(StateDb { conn })
     }
 
+    /// Opens an existing `state.db` without creating it, its folder or its schema.
+    /// `None` when the file is absent (nothing installed yet).
+    pub fn open_existing(path: &Path) -> Result<Option<StateDb>, StateError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        Ok(Some(StateDb { conn }))
+    }
+
+    /// Empty database in memory (stands in for an absent `state.db` when only reading).
+    pub fn empty_in_memory() -> Result<StateDb, StateError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(StateDb { conn })
+    }
+
     /// Replaces the app's record and artifacts in one transaction.
     pub fn record(&mut self, app: &AppRecord, artifacts: &[Artifact]) -> Result<(), StateError> {
         let tx = self.conn.transaction()?;

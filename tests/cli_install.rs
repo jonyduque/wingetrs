@@ -126,7 +126,6 @@ impl Lab {
         let layout = Layout::new(&root);
         std::fs::create_dir_all(layout.launcher().parent().unwrap()).unwrap();
         std::fs::write(layout.launcher(), fake_pe(3)).unwrap();
-        drop(StateDb::open(&layout.state_db()).unwrap());
         let key = OwnKey(format!(
             r"Software\wingetrs-test\env-cli-{}-{tag}",
             std::process::id()
@@ -207,6 +206,10 @@ async fn dry_run_prints_the_plan_and_leaves_the_root_untouched() {
     assert!(so.contains("Instalar solo 1.0"), "{so}");
     assert!(so.contains("Simulação"), "{so}");
     assert_eq!(lab.snapshot(), before, "dry-run changed the root");
+    assert!(
+        !lab.root.join("state.db").exists(),
+        "dry-run created state.db"
+    );
     // Same for the other two mutating commands.
     let out = tokio::task::block_in_place(|| lab.run(&["upgrade", "--all", "--dry-run", "--yes"]));
     assert!(out.status.success(), "{}", text(&out.stderr));
@@ -349,4 +352,41 @@ async fn bucket_add_list_rm_round_trip() {
     assert!(ok(&["bucket", "list"]).contains("mine  someone/scoop-mine"));
     ok(&["bucket", "rm", "mine"]);
     assert!(!ok(&["bucket", "list"]).contains("mine"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_dry_run_leaves_the_root_untouched_and_takes_no_lock() {
+    use wingetrs::install::state::AppRecord;
+    let server = MockServer::start().await;
+    let lab = Lab::new(&server, "udry").await;
+    {
+        let mut db = StateDb::open(&lab.root.join("state.db")).unwrap();
+        db.record(
+            &AppRecord {
+                app: "solo".into(),
+                bucket: "main".into(),
+                version: "1.0".into(),
+                arch: None,
+                installed_at: 1,
+                manifest_sha256: "00".into(),
+            },
+            &[],
+        )
+        .unwrap();
+    }
+    assert!(
+        tokio::task::block_in_place(|| lab.run(&["bucket", "list"]))
+            .status
+            .success()
+    );
+    let before = lab.snapshot();
+    let out = tokio::task::block_in_place(|| lab.run(&["uninstall", "solo", "--dry-run", "--yes"]));
+    let so = text(&out.stdout);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        so.contains("Desinstalar solo 1.0") && so.contains("Simulação"),
+        "{so}"
+    );
+    assert_eq!(lab.snapshot(), before);
+    assert!(!lab.root.join("install.lock").exists());
 }

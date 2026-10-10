@@ -3,7 +3,6 @@
 use super::{Command, output};
 use crate::install::ops::{self, OpsCtx, Resolution};
 use crate::install::residue::{self, Confidence, Residue};
-use crate::install::state::StateDb;
 use crate::install::target::Candidate;
 use crate::tui::picker::PickerItem;
 use anyhow::bail;
@@ -362,7 +361,7 @@ async fn upgrade(
     f: Flags,
 ) -> anyhow::Result<()> {
     let list = ops::upgradable(ctx)?;
-    let state = StateDb::open(&ctx.data.install_layout().state_db())?;
+    let state = ops::read_state(&ctx.data.install_layout())?;
     let chosen: Vec<(String, String, String)> = match target {
         Some(t) => {
             let t = t.rsplit('/').next().unwrap_or(t);
@@ -439,6 +438,79 @@ async fn upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoUi;
+    impl Ui for NoUi {
+        fn interactive(&self) -> bool {
+            false
+        }
+        fn confirm(&self, _: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn pick(&self, _: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
+            Ok(None)
+        }
+        fn pick_many(&self, _: Vec<PickerItem>, _: &[bool]) -> anyhow::Result<Option<Vec<usize>>> {
+            Ok(None)
+        }
+    }
+
+    fn no_progress(_: &str, _: u64, _: Option<u64>) {}
+    fn nothing_in_use(_: &std::path::Path) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
+    #[test]
+    fn yes_cleans_only_high_confidence_preselected_residues() {
+        use crate::install::ops::ResidueScan;
+        use crate::install::residue::ResidueKind;
+        use crate::install::traits::Effects;
+        use crate::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
+        use std::path::PathBuf;
+        let t = tempfile::tempdir().unwrap();
+        let data = crate::cache::DataDir::new(t.path());
+        let http = crate::http::Http::new().unwrap();
+        let catalog = crate::catalog::Catalog::open_in_memory().unwrap();
+        let (env, sc, trash, reg) = (
+            FakeEnv::new(),
+            FakeShortcuts::new(t.path().join("sm")),
+            FakeTrash::new(),
+            FakeRegistry::new(),
+        );
+        let ctx = OpsCtx {
+            data: &data,
+            http: &http,
+            catalog: &catalog,
+            effects: Effects {
+                env: &env,
+                shortcuts: &sc,
+                trash: &trash,
+                registry: &reg,
+            },
+            wait: crate::update::LockWait::NoWait,
+            progress: &no_progress,
+            in_use: &nothing_in_use,
+            residue: ResidueScan::none(),
+        };
+        let res = |name: &str, confidence, preselected| Residue {
+            kind: ResidueKind::Folder {
+                path: PathBuf::from(name),
+            },
+            confidence,
+            preselected,
+            note: None,
+        };
+        let residues = [
+            res("high-pre", Confidence::High, true),
+            res("low-pre", Confidence::Low, true),
+            res("high-not", Confidence::High, false),
+        ];
+        clean_residues(&ctx, &NoUi, "app", &residues, true).unwrap();
+        assert_eq!(trash.dump(), vec![PathBuf::from("high-pre")]);
+        // Without --yes and without a terminal nothing is removed.
+        clean_residues(&ctx, &NoUi, "app", &residues, false).unwrap();
+        assert_eq!(trash.dump().len(), 1);
+    }
 
     #[test]
     fn only_explicit_yes_answers_confirm() {

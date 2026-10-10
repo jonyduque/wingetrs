@@ -3,7 +3,7 @@ pub mod install_cmd;
 pub mod output;
 pub mod picker;
 #[cfg(windows)]
-mod prod_win;
+mod run_win;
 
 use crate::cache::{DataDir, HttpState, now_unix};
 use crate::catalog::Catalog;
@@ -702,7 +702,7 @@ async fn run_async(
             #[cfg(windows)]
             {
                 let catalog = ensure_catalog(&data, &cfg, &http).await?;
-                prod_win::run(cmd, &data, &cfg, &http, &catalog).await
+                run_win::run(cmd, &data, &cfg, &http, &catalog).await
             }
             #[cfg(not(windows))]
             {

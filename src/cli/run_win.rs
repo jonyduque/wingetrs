@@ -1,0 +1,26 @@
+//! Runs the operation commands against the production context.
+use super::Command;
+use super::install_cmd::{self, LineProgress, TtyUi};
+use crate::cache::DataDir;
+use crate::catalog::Catalog;
+use crate::config::Config;
+use crate::http::Http;
+use crate::install::prod_win::{ProdEffects, build_ctx};
+use crate::update::LockWait;
+use std::io::IsTerminal;
+
+pub async fn run(
+    cmd: Command,
+    data: &DataDir,
+    cfg: &Config,
+    http: &Http,
+    catalog: &Catalog,
+) -> anyhow::Result<()> {
+    let prod = ProdEffects::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let line = LineProgress::new(std::io::stderr().is_terminal());
+    let progress = |url: &str, done: u64, total: Option<u64>| line.update(url, done, total);
+    let ctx = build_ctx(&prod, data, http, catalog, LockWait::from_env(), &progress);
+    let result = install_cmd::execute(&ctx, &TtyUi::new(cfg), cmd).await;
+    line.finish();
+    result
+}

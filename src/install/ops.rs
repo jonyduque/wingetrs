@@ -215,6 +215,15 @@ fn open_state(layout: &Layout) -> Result<StateDb, OpsError> {
     Ok(StateDb::open(&layout.state_db())?)
 }
 
+/// Read-only view for planning and queries: never creates `state.db`; an absent file reads
+/// as "nothing installed".
+pub fn read_state(layout: &Layout) -> Result<StateDb, OpsError> {
+    match StateDb::open_existing(&layout.state_db())? {
+        Some(s) => Ok(s),
+        None => Ok(StateDb::empty_in_memory()?),
+    }
+}
+
 fn effects<'a>(ctx: &'a OpsCtx<'_>) -> Effects<'a> {
     Effects {
         env: ctx.effects.env,
@@ -467,7 +476,7 @@ pub fn plan_for(
     })?;
     let target = manifest::resolve(&raw, Arch::host())?;
     let layout = layout(ctx);
-    let state = open_state(&layout)?;
+    let state = read_state(&layout)?;
     let mut walk = DepWalk {
         catalog: ctx.catalog,
         state: &state,
@@ -619,7 +628,7 @@ fn refuse_if_needed(ctx: &OpsCtx<'_>, state: &StateDb, app: &str) -> Result<(), 
 
 /// What uninstalling `app` removes; refuses while another wingetrs app depends on it.
 pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<UninstallPlan, OpsError> {
-    let state = open_state(&layout(ctx))?;
+    let state = read_state(&layout(ctx))?;
     let plan = UninstallPlan::from_state(&state, app, purge)?
         .ok_or_else(|| OpsError::NotInstalled(app.to_string()))?;
     refuse_if_needed(ctx, &state, &plan.app)?;
@@ -751,7 +760,7 @@ pub struct UpgradeList {
 /// Every `state.db` app whose catalog version is newer (`upgrade --all`).
 pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
     let layout = layout(ctx);
-    let state = open_state(&layout)?;
+    let state = read_state(&layout)?;
     let mut out = UpgradeList::default();
     for rec in state.apps()? {
         if read_json(&layout.current(&rec.app).join("install.json")).is_none() {
