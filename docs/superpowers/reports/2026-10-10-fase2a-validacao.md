@@ -5,9 +5,45 @@ Binários: `cargo build --release` e `cargo build --release --examples` antes de
 
 ## 1. Prova ao vivo (LOCALAPPDATA real)
 
-**Pendente de autorização do usuário — não executada nesta tarefa.** O orquestrador executa
-depois (`install ripgrep --yes`, `rg --version` em terminal novo, `uninstall ripgrep --yes`,
-conferência de `apps\ripgrep`, `shims\rg.*`, `Path` do usuário e `.lnk`).
+Executada pelo orquestrador em 2026-10-10 com autorização do usuário, binário release de `ab2dbff`,
+`LOCALAPPDATA` e `HKCU\Environment` reais. Três pacotes escolhidos para cobrir recursos diferentes:
+
+| Pacote | Bucket | O que exercita |
+|---|---|---|
+| `ripgrep` 15.2.0 | main | `extract_dir`, lançador de shims (1ª instalação), PATH |
+| `delta` 0.20.1 | main | `extract_dir`, shim sem lançador novo |
+| `cpu-z` 3.01 | extras | `persist` de arquivo (hardlink), atalho no Menu Iniciar, `bin` com alvo renomeado |
+
+Antes: `reg query HKCU\Environment` e `reg export` salvos; 50 `.lnk` sob `Start Menu\Programs`;
+pasta `wingetrs Apps` inexistente. O `Path` do usuário é `REG_EXPAND_SZ` e contém `%USERPROFILE%\go\bin`.
+
+Instalação (`install <p> --yes`, tempo de parede incluindo download): ripgrep 2034 ms, delta 1260 ms,
+cpu-z 4501 ms; todos exit 0.
+
+Conferências com tudo instalado:
+- `Path` do usuário bruto (`reg query`) = valor anterior + `;C:\Users\jonyd\AppData\Local\wingetrs\shims`;
+  tipo continua `ExpandString`, `%USERPROFILE%` preservado sem expandir.
+- Com o PATH lido do registro (máquina + usuário, como num terminal novo), `where.exe` acha
+  `wingetrs\shims\delta.exe` e `cpuz.exe`; `rg` resolve primeiro para o do Chocolatey (PATH da máquina
+  vem antes) e o de `wingetrs\shims` aparece em 3º.
+- `shims\rg.exe --version` → `ripgrep 15.2.0 (rev e89fff89ac)`; `delta --version` (pelo PATH) → `delta 0.20.1`.
+  `cpuz` é GUI e não foi aberto.
+- `CPU-Z.lnk` em `wingetrs Apps` aponta para `apps\cpu-z\current\cpuz_x64.exe`, que existe.
+- `persist\cpu-z\cpuz.ini` tem 2 links (hardlink com a versão instalada).
+- `wingetrs list` mostra os três com fonte `scoop:main`/`scoop:extras` e origem `wingetrs`.
+
+Desinstalação (`uninstall <p> --yes`): ripgrep 1757 ms, delta 869 ms, cpu-z 1360 ms; todos exit 0.
+O cpu-z informou "Manter cpuz.ini (dados persistentes; use --purge)".
+
+Depois:
+- `reg query HKCU\Environment` idêntico ao de antes (todas as linhas); `Path` continua `ExpandString`.
+- Lista de `.lnk` idêntica (50); pasta `wingetrs Apps` removida.
+- `apps\` vazio; `shims\` só com `.launcher\shim.exe`; `persist\cpu-z\cpuz.ini` mantido (esperado sem `--purge`).
+
+Contagem de referência da entrada `shims` no PATH (o plano de cada `uninstall` lista "Desfazer entrada
+no PATH" mesmo quando outro app ainda a usa): instalados ripgrep e delta, removido ripgrep → `shims`
+continua no PATH; removido delta → sai. `HKCU\Environment` final idêntico ao inicial. O efeito está
+certo; o texto do plano engana (pendência abaixo).
 
 ## 2. Ciclo completo em raiz temporária (substituto isolado, não é a prova ao vivo)
 
@@ -172,8 +208,10 @@ Leitura:
 
 ## 5. Pendências
 
-- Prova ao vivo com `LOCALAPPDATA` real: pendente de autorização.
 - Chave `HKCU\Software\wingetrs-test\bench-10543` ficou vazia após o `uninstall` (o valor `Path`
-  saiu, a chave não). Não apagada à mão.
+  saiu, a chave não). Apagada pelo orquestrador com autorização do usuário (`reg delete`, conferida vazia antes).
+- O plano do `uninstall` mostra "Desfazer entrada no PATH: …\shims" mesmo quando outro app ainda usa a
+  entrada (que corretamente fica). Deveria dizer que a entrada é mantida.
+- `--purge` não foi exercitado ao vivo (`persist\cpu-z\cpuz.ini` ficou no disco do usuário).
 - Sem spans por etapa no `install`/`uninstall`; a divisão do tempo de execução não foi medida.
 - `bin` com mais de 3 elementos é recusado (zigup).
