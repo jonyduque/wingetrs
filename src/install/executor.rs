@@ -91,11 +91,6 @@ enum Undo {
         entry: String,
         var_existed: bool,
     },
-    /// The app's record before `RecordState` (`None` = it had none).
-    RestoreState {
-        app: String,
-        previous: Option<(AppRecord, Vec<Artifact>)>,
-    },
 }
 
 fn io_msg(p: &Path, e: io::Error) -> String {
@@ -243,11 +238,21 @@ fn apply_undo(u: Undo, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
             }
         }
         Undo::RestoreShim { name, saved } => {
-            shim::remove_shim(ctx.layout, &name).map_err(|e| e.to_string())?;
-            for (p, bytes) in saved {
-                fs::write(&p, bytes).map_err(|e| io_msg(&p, e))?;
+            // Keep going after an error: the saved files still have to come back.
+            let mut errors = Vec::new();
+            if let Err(e) = shim::remove_shim(ctx.layout, &name) {
+                errors.push(format!("{e}"));
             }
-            Ok(())
+            for (p, bytes) in saved {
+                if let Err(e) = fs::write(&p, bytes) {
+                    errors.push(io_msg(&p, e));
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
         }
         Undo::RemoveShortcut(p) => ctx.effects.shortcuts.remove(&p).map_err(|e| e.to_string()),
         Undo::RecreateShortcut(s) => ctx
@@ -261,11 +266,6 @@ fn apply_undo(u: Undo, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
         Undo::PathRemove { entry, var_existed } => {
             path_remove_entry(env, &entry, var_existed).map_err(|e| e.to_string())
         }
-        Undo::RestoreState { app, previous } => match previous {
-            Some((r, arts)) => ctx.state.record(&r, &arts),
-            None => ctx.state.remove(&app),
-        }
-        .map_err(|e| e.to_string()),
     }
 }
 
@@ -287,6 +287,28 @@ fn rollback(journal: Vec<(String, Undo)>, ctx: &mut ExecCtx<'_>) -> Vec<String> 
     undone
 }
 
+/// The record is the last step that can be rolled back: only `RemoveOldVersion` may follow it.
+fn check_order(steps: &[Step]) -> Result<(), String> {
+    let is_old = |s: &Step| matches!(s, Step::RemoveOldVersion { .. });
+    let records: Vec<usize> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Step::RecordState))
+        .map(|(i, _)| i)
+        .collect();
+    match records.as_slice() {
+        [r] if steps[r + 1..].iter().all(is_old) && !steps[..*r].iter().any(is_old) => Ok(()),
+        _ => Err(
+            "plano inválido: o registro deve ser o último passo (só a remoção da versão antiga vem depois)"
+                .into(),
+        ),
+    }
+}
+
+/// Applies `plan`; on failure everything done so far is undone in reverse order.
+///
+/// Never broadcasts the environment change: the caller calls `effects.env.broadcast()` once
+/// after a successful install (and after a failed one whose rollback touched the environment).
 pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Result<(), ExecError> {
     let fail_early = |message: String| ExecError::Failed {
         index: 0,
@@ -296,6 +318,7 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
     };
     check_component("app", &plan.app).map_err(fail_early)?;
     check_component("versão", &plan.version).map_err(fail_early)?;
+    check_order(&plan.steps).map_err(fail_early)?;
     for s in &plan.steps {
         if let Step::RemoveOldVersion { version } = s {
             check_component("versão", version).map_err(fail_early)?;
@@ -336,6 +359,8 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
             });
         }
     }
+    // Same policy as removing the old version: the install stands, failures are warnings.
+    remove_upgrade_leftovers(&run, ctx);
     for (i, step) in cleanup {
         let Step::RemoveOldVersion { version } = step else {
             continue;
@@ -354,6 +379,29 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
         }
     }
     Ok(())
+}
+
+/// Artifacts of the previous install that this version no longer declares, removed as
+/// uninstall would.
+fn remove_upgrade_leftovers(run: &Run<'_>, ctx: &mut ExecCtx<'_>) {
+    let Some((_, old)) = &run.previous else {
+        return;
+    };
+    for a in old {
+        let kept = run
+            .artifacts
+            .iter()
+            .any(|n| n.kind == a.kind && n.target.eq_ignore_ascii_case(&a.target));
+        if kept {
+            continue;
+        }
+        if let Some((label, Err(e))) = remove_artifact(ctx, &run.plan.app, a, true) {
+            tracing::warn!(
+                "{}: sobra da versão anterior ({label}) ficou: {e}",
+                run.plan.app
+            );
+        }
+    }
 }
 
 fn remove_old_version(layout: &Layout, app: &str, new: &str, old: &str) -> Result<(), String> {
@@ -467,6 +515,9 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
         Step::Shim(spec) => make_shim(run, spec, ctx),
         Step::Shortcut(spec) => {
             let target = spec.link.display().to_string();
+            if let Some(owner) = owner_of(ctx.state, app, ArtifactKind::Shortcut, &target)? {
+                return Err(format!("o atalho {target} já pertence a {owner}"));
+            }
             if run
                 .previous_artifact(ArtifactKind::Shortcut, &target)
                 .is_some()
@@ -523,10 +574,8 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             add_path(run, ctx.effects.env, &layout.shims().display().to_string())
         }
         Step::RecordState => {
-            run.push(Undo::RestoreState {
-                app: app.to_string(),
-                previous: run.previous.clone(),
-            });
+            // Last step that can fail (validated up front); `record` is one transaction, so a
+            // failure leaves the previous record untouched and there is nothing to undo.
             let rec = AppRecord {
                 app: app.to_string(),
                 bucket: plan.bucket.clone(),
@@ -574,24 +623,34 @@ fn add_path(run: &mut Run<'_>, env: &dyn EnvStore, entry: &str) -> Result<(), St
     Ok(())
 }
 
-fn make_shim(run: &mut Run<'_>, spec: &ShimSpec, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
-    let app = run.plan.app.as_str();
-    for rec in ctx.state.apps().map_err(|e| e.to_string())? {
+/// Another app whose record lists an artifact of `kind` at `target` (case-insensitive).
+fn owner_of(
+    state: &StateDb,
+    app: &str,
+    kind: ArtifactKind,
+    target: &str,
+) -> Result<Option<String>, String> {
+    for rec in state.apps().map_err(|e| e.to_string())? {
         if rec.app == app {
             continue;
         }
-        let owns = ctx
-            .state
+        let owns = state
             .get(&rec.app)
             .map_err(|e| e.to_string())?
             .is_some_and(|(_, arts)| {
-                arts.iter().any(|a| {
-                    a.kind == ArtifactKind::Shim && a.target.eq_ignore_ascii_case(&spec.name)
-                })
+                arts.iter()
+                    .any(|a| a.kind == kind && a.target.eq_ignore_ascii_case(target))
             });
         if owns {
-            return Err(format!("o comando {} já pertence a {}", spec.name, rec.app));
+            return Ok(Some(rec.app));
         }
+    }
+    Ok(None)
+}
+
+fn make_shim(run: &mut Run<'_>, spec: &ShimSpec, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
+    if let Some(owner) = owner_of(ctx.state, &run.plan.app, ArtifactKind::Shim, &spec.name)? {
+        return Err(format!("o comando {} já pertence a {owner}", spec.name));
     }
     let dir = ctx.layout.shims();
     run.ensure_dirs(&dir)?;
@@ -673,7 +732,63 @@ fn persist(run: &mut Run<'_>, spec: &PersistSpec, layout: &Layout) -> Result<(),
     Ok(())
 }
 
+/// Removes one recorded artifact of `app` (step label and result); `None` for persist,
+/// which uninstall handles as a whole. A PATH entry goes only when no other app records it,
+/// and the variable itself goes if nothing is left in it.
+fn remove_artifact(
+    ctx: &mut ExecCtx<'_>,
+    app: &str,
+    a: &Artifact,
+    remove_path: bool,
+) -> Option<(String, Result<(), String>)> {
+    let env = ctx.effects.env;
+    Some(match a.kind {
+        ArtifactKind::Shim => (
+            format!("comando {}", a.target),
+            shim::remove_shim(ctx.layout, &a.target).map_err(|e| e.to_string()),
+        ),
+        ArtifactKind::Shortcut => (
+            format!("atalho {}", a.target),
+            ctx.effects
+                .shortcuts
+                .remove(Path::new(&a.target))
+                .map_err(|e| e.to_string()),
+        ),
+        ArtifactKind::Env => {
+            let previous = a.previous.as_ref().map(|v| EnvValue {
+                value: v.clone(),
+                expand: v.contains('%'),
+            });
+            (
+                format!("variável {}", a.target),
+                restore_env(env, &a.target, previous.as_ref()).map_err(|e| e.to_string()),
+            )
+        }
+        ArtifactKind::Path => {
+            let r = if remove_path {
+                ctx.state
+                    .path_users(app, &a.target)
+                    .map_err(|e| e.to_string())
+                    .and_then(|users| {
+                        if users.is_empty() {
+                            path_remove_entry(env, &a.target, false).map_err(|e| e.to_string())
+                        } else {
+                            Ok(())
+                        }
+                    })
+            } else {
+                Ok(())
+            };
+            (format!("PATH {}", a.target), r)
+        }
+        ArtifactKind::Persist => return None,
+    })
+}
+
 /// Removes what the app's record lists. Nothing changes when a file under `apps\<app>` is in use.
+///
+/// Never broadcasts the environment change: the caller calls `effects.env.broadcast()` once
+/// after a successful uninstall.
 pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<(), ExecError> {
     let fail = |index: usize, step: String, message: String| ExecError::Failed {
         index,
@@ -687,51 +802,10 @@ pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<
     if let Some(p) = (ctx.in_use)(&app_dir).first() {
         return Err(ExecError::InUse(p.display().to_string()));
     }
-    let env = ctx.effects.env;
     for (i, a) in plan.artifacts.iter().enumerate() {
-        let (label, r) = match a.kind {
-            ArtifactKind::Shim => (
-                format!("comando {}", a.target),
-                shim::remove_shim(layout, &a.target).map_err(|e| e.to_string()),
-            ),
-            ArtifactKind::Shortcut => (
-                format!("atalho {}", a.target),
-                ctx.effects
-                    .shortcuts
-                    .remove(Path::new(&a.target))
-                    .map_err(|e| e.to_string()),
-            ),
-            ArtifactKind::Env => {
-                let previous = a.previous.as_ref().map(|v| EnvValue {
-                    value: v.clone(),
-                    expand: v.contains('%'),
-                });
-                (
-                    format!("variável {}", a.target),
-                    restore_env(env, &a.target, previous.as_ref()).map_err(|e| e.to_string()),
-                )
-            }
-            ArtifactKind::Path => {
-                let r = if plan.remove_path_entry {
-                    ctx.state
-                        .path_users(&plan.app, &a.target)
-                        .map_err(|e| e.to_string())
-                        .and_then(|users| {
-                            if users.is_empty() {
-                                path_remove_entry(env, &a.target, true).map_err(|e| e.to_string())
-                            } else {
-                                Ok(())
-                            }
-                        })
-                } else {
-                    Ok(())
-                };
-                (format!("PATH {}", a.target), r)
-            }
-            // persist\<app> as a whole is handled below.
-            ArtifactKind::Persist => continue,
-        };
-        r.map_err(|m| fail(i, label, m))?;
+        if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry) {
+            r.map_err(|m| fail(i, label, m))?;
+        }
     }
     let n = plan.artifacts.len();
     remove_any(&app_dir).map_err(|e| fail(n, "remover app".into(), io_msg(&app_dir, e)))?;

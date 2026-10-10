@@ -753,3 +753,223 @@ async fn unsafe_version_in_plan_is_refused_before_any_change() {
     assert!(err.to_string().contains("inseguro"), "{err}");
     assert_eq!(s.snapshot(), snap);
 }
+
+#[tokio::test]
+async fn shortcut_of_another_app_is_refused_and_rolled_back() {
+    let s = setup().await;
+    install(&s, &s.plan).await;
+    let (url, sha) = s.serve("other.zip", fixture_zip()).await;
+    // different command name, same Start Menu entry "Tool"
+    let o = ManifestOpts {
+        bin: serde_json::json!([["tool.exe", "tool2"]]),
+        ..default_opts()
+    };
+    let plan = s.plan_from("other", &manifest_custom(&url, &sha, &o), false);
+    let snap = s.snapshot();
+    let env = s.env.dump();
+    let sc = s.shortcuts.dump();
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let err = wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("o atalho"), "{err}");
+    assert!(err.to_string().contains("já pertence a app"), "{err}");
+    assert_eq!(s.shortcuts.dump(), sc);
+    assert_eq!(s.snapshot(), snap);
+    assert_eq!(s.env.dump(), env);
+    assert!(s.state.get("other").unwrap().is_none());
+}
+
+/// v1 declares bins a.exe and b.exe; v2 only a.exe.
+async fn two_bin_world() -> (World, InstallPlan) {
+    let s = setup().await;
+    let zip = |marker: &[u8]| {
+        let mut tool = fake_pe(3);
+        tool.extend_from_slice(marker);
+        zip_of(&[
+            ("pkg/tool.exe", &tool),
+            ("pkg/a.exe", &fake_pe(3)),
+            ("pkg/b.exe", &fake_pe(3)),
+            ("pkg/conf/default.ini", b"[default]\r\n"),
+        ])
+    };
+    let (url1, sha1) = s.serve("ab-1.0.zip", zip(b"")).await;
+    let o1 = ManifestOpts {
+        bin: serde_json::json!(["a.exe", "b.exe"]),
+        ..default_opts()
+    };
+    let p1 = s.plan_from("app", &manifest_custom(&url1, &sha1, &o1), false);
+    install(&s, &p1).await;
+    assert!(s.layout.shims().join("b.shim").exists());
+    let (url2, sha2) = s.serve("ab-2.0.zip", zip(b"v2")).await;
+    let o2 = ManifestOpts {
+        version: "2.0",
+        bin: serde_json::json!(["a.exe"]),
+        ..default_opts()
+    };
+    let p2 = s.plan_from("app", &manifest_custom(&url2, &sha2, &o2), false);
+    (s, p2)
+}
+
+fn shim_names(s: &World) -> Vec<String> {
+    s.state
+        .get("app")
+        .unwrap()
+        .unwrap()
+        .1
+        .into_iter()
+        .filter(|a| a.kind == wingetrs::install::state::ArtifactKind::Shim)
+        .map(|a| a.target)
+        .collect()
+}
+
+#[tokio::test]
+async fn upgrade_removes_artifacts_the_new_version_no_longer_declares() {
+    let (s, p2) = two_bin_world().await;
+    install(&s, &p2).await;
+    for ext in ["exe", "shim"] {
+        assert!(
+            !s.layout.shims().join(format!("b.{ext}")).exists(),
+            "b.{ext} left behind"
+        );
+    }
+    assert!(s.layout.shims().join("a.shim").exists());
+    assert_eq!(shim_names(&s), ["a"]);
+}
+
+#[tokio::test]
+async fn failed_upgrade_keeps_artifacts_the_new_version_drops() {
+    let (s, p2) = two_bin_world().await;
+    let k = p2
+        .steps
+        .iter()
+        .position(|st| matches!(st, Step::RecordState))
+        .unwrap();
+    let mut ctx = s.ctx_with_hook(&FailAt(k));
+    wingetrs::install::executor::execute_install(&p2, &mut ctx)
+        .await
+        .unwrap_err();
+    assert!(s.layout.shims().join("b.shim").exists());
+    assert!(s.layout.shims().join("b.exe").exists());
+    assert_eq!(shim_names(&s), ["a", "b"]);
+}
+
+#[tokio::test]
+async fn record_state_must_be_the_last_main_step() {
+    let s = setup().await;
+    let mut plan = s.plan.clone();
+    let r = plan
+        .steps
+        .iter()
+        .position(|st| matches!(st, Step::RecordState))
+        .unwrap();
+    // an otherwise valid plan: only the record moved before the PATH step
+    plan.steps.swap(r - 1, r);
+    let snap = s.snapshot();
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let err = wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("o registro deve ser o último passo"),
+        "{err}"
+    );
+    assert_eq!(s.snapshot(), snap);
+    assert!(s.state.get("app").unwrap().is_none());
+}
+
+/// Fails at step `k` after turning `blocked` into a directory, so deleting it fails during rollback.
+#[derive(Clone)]
+struct BlockAndFailAt {
+    k: usize,
+    blocked: PathBuf,
+}
+impl StepHook for BlockAndFailAt {
+    fn before(&self, i: usize, _s: &Step) -> Result<(), ExecError> {
+        if i != self.k {
+            return Ok(());
+        }
+        std::fs::remove_file(&self.blocked).unwrap();
+        std::fs::create_dir(&self.blocked).unwrap();
+        Err(ExecError::Hook(format!("injected at {i}")))
+    }
+}
+
+#[tokio::test]
+async fn shim_undo_failure_is_reported_and_the_rest_is_undone() {
+    let s = setup().await;
+    install(&s, &s.plan).await;
+    let shim_file = s.layout.shims().join("tool.shim");
+    let v1_shim = std::fs::read(&shim_file).unwrap();
+    let mut tool = fake_pe(3);
+    tool.extend_from_slice(b"v2");
+    let (url, sha) = s
+        .serve(
+            "pkg-2.0.zip",
+            zip_of(&[
+                ("pkg/tool.exe", &tool),
+                ("pkg/conf/default.ini", b"[default]\r\n"),
+            ]),
+        )
+        .await;
+    // v2 shim text differs (args), so restoring v1's bytes is observable
+    let o = ManifestOpts {
+        version: "2.0",
+        bin: serde_json::json!([["tool.exe", "tool", "--v2"]]),
+        ..default_opts()
+    };
+    let p2 = s.plan_from("app", &manifest_custom(&url, &sha, &o), false);
+    let k = p2
+        .steps
+        .iter()
+        .position(|st| matches!(st, Step::RecordState))
+        .unwrap();
+    let env = s.env.dump();
+    let sc = s.shortcuts.dump();
+    let state = s.state.get("app").unwrap();
+    let hook = BlockAndFailAt {
+        k,
+        blocked: s.layout.shims().join("tool.exe"),
+    };
+    let mut ctx = s.ctx_with_hook(&hook);
+    let err = wingetrs::install::executor::execute_install(&p2, &mut ctx)
+        .await
+        .unwrap_err();
+    let ExecError::Failed { undone, .. } = &err else {
+        panic!("{err}")
+    };
+    assert!(
+        undone
+            .iter()
+            .any(|u| u.starts_with("comando tool (falhou:")),
+        "{undone:?}"
+    );
+    assert_eq!(
+        std::fs::read(&shim_file).unwrap(),
+        v1_shim,
+        "saved shim bytes restored anyway"
+    );
+    assert!(current_target(&s).ends_with("1.0"));
+    assert!(!s.layout.version_dir("app", "2.0").exists());
+    assert_eq!(s.env.dump(), env);
+    assert_eq!(s.shortcuts.dump(), sc);
+    assert_eq!(s.state.get("app").unwrap(), state);
+}
+
+#[tokio::test]
+async fn uninstall_removes_path_variable_the_install_created() {
+    let s = setup().await;
+    s.env.remove("Path").unwrap();
+    let before = s.env.dump();
+    install(&s, &s.plan).await;
+    assert!(s.env.get("Path").unwrap().is_some());
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    wingetrs::install::executor::execute_uninstall(&s.uninstall_plan(false), &mut ctx).unwrap();
+    assert_eq!(
+        s.env.get("Path").unwrap(),
+        None,
+        "no empty Path left behind"
+    );
+    assert_eq!(s.env.dump(), before);
+}
