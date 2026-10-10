@@ -1,5 +1,5 @@
 //! Pure state of the arrow-key picker, shared by the CLI (inline) and the TUI.
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +83,9 @@ impl Picker {
             return PickOutcome::Pending;
         }
         match ev.code {
+            KeyCode::Char('c') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                return PickOutcome::Cancelled;
+            }
             KeyCode::Down => self.step(true),
             KeyCode::Up => self.step(false),
             KeyCode::Home => {

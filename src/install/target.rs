@@ -50,6 +50,12 @@ pub fn resolve(
     bucket: Option<&str>,
 ) -> Result<Vec<Candidate>, TargetError> {
     let (prefix, text) = split_bucket(query.trim());
+    if text.trim().is_empty() {
+        return Err(TargetError::NotFound {
+            query: query.to_owned(),
+            suggestions: Vec::new(),
+        });
+    }
     let bucket = prefix.or(bucket);
     let wanted = bucket.map(|b| format!("scoop:{}", b.to_lowercase()));
     let entries: Vec<PackageEntry> = catalog

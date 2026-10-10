@@ -17,12 +17,14 @@ pub fn is_interactive() -> bool {
 }
 
 /// Restores raw mode and the cursor on every exit path, including errors.
-struct Guard;
+struct Guard {
+    drawn: u16,
+}
 
 impl Guard {
     fn enter() -> io::Result<Guard> {
         terminal::enable_raw_mode()?;
-        let g = Guard;
+        let g = Guard { drawn: 0 };
         execute!(io::stdout(), Hide)?;
         Ok(g)
     }
@@ -30,6 +32,15 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        if self.drawn > 0 {
+            // Best effort: erase the lines left behind (also on I/O errors).
+            let _ = execute!(
+                io::stdout(),
+                MoveUp(self.drawn),
+                MoveToColumn(0),
+                Clear(ClearType::FromCursorDown)
+            );
+        }
         let _ = execute!(io::stdout(), Show, SetAttribute(Attribute::Reset));
         let _ = terminal::disable_raw_mode();
     }
@@ -47,7 +58,7 @@ fn draw(
     glyphs: &Glyphs,
     redraw: bool,
 ) -> io::Result<()> {
-    if redraw {
+    if redraw && !range.is_empty() {
         queue!(out, MoveUp(range.len() as u16))?;
     }
     for i in range.clone() {
@@ -95,12 +106,13 @@ pub fn pick_inline(
         ));
     }
     let mut p = Picker::single(items);
-    let _guard = Guard::enter()?;
+    let mut guard = Guard::enter()?;
     let (_, rows) = terminal::size()?;
     let height = usize::from(rows.saturating_sub(2)).clamp(1, 15);
     let mut out = io::stdout();
     let range = window(p.selected(), p.items().len(), height);
     draw(&mut out, &p, &range, theme, glyphs, false)?;
+    guard.drawn = range.len() as u16;
     let result = loop {
         let Event::Key(k) = read()? else { continue };
         match p.key(k) {
@@ -112,12 +124,6 @@ pub fn pick_inline(
         let range = window(p.selected(), p.items().len(), height);
         draw(&mut out, &p, &range, theme, glyphs, true)?;
     };
-    let shown = height.min(p.items().len());
-    execute!(
-        out,
-        MoveUp(shown as u16),
-        MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    )?;
+    drop(guard);
     Ok(result)
 }

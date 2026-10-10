@@ -185,3 +185,20 @@ fn unknown_term_gives_suggestions_never_a_candidate() {
         other => panic!("unexpected: {other:?}"),
     }
 }
+
+#[test]
+fn ctrl_c_cancels_but_plain_c_does_not() {
+    let mut p = Picker::single(vec![item("a", true)]);
+    assert_eq!(p.key(k(KeyCode::Char('c'))), PickOutcome::Pending);
+    let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert_eq!(p.key(ev), PickOutcome::Cancelled);
+}
+
+#[test]
+fn blank_query_is_not_found_without_suggestions() {
+    let c = catalog();
+    match resolve(&c, "   ", None).unwrap_err() {
+        TargetError::NotFound { suggestions, .. } => assert!(suggestions.is_empty()),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
