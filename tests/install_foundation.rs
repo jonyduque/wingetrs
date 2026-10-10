@@ -132,3 +132,31 @@ fn fakes_dump_changes_and_reverts() {
     rg.delete_key(r"Software\Foo\Bar").unwrap();
     assert_eq!(rg.dump(), d0);
 }
+
+#[cfg(windows)]
+#[test]
+fn snapshot_treats_junction_as_a_link_not_a_directory() {
+    let ext = tempfile::tempdir().unwrap();
+    std::fs::write(ext.path().join("f.txt"), b"1").unwrap();
+    let ext2 = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let j = root.path().join("j");
+    junction::create(ext.path(), &j).unwrap();
+    let s1 = snapshot(root.path()).unwrap();
+    assert!(s1.get("j").unwrap().starts_with("link:"), "{s1:?}");
+    assert!(s1.keys().all(|k| !k.starts_with("j/")), "{s1:?}");
+    std::fs::write(ext.path().join("f.txt"), b"changed").unwrap();
+    assert_eq!(
+        s1,
+        snapshot(root.path()).unwrap(),
+        "target content is not followed"
+    );
+    junction::delete(&j).unwrap();
+    std::fs::remove_dir(&j).unwrap();
+    junction::create(ext2.path(), &j).unwrap();
+    assert_ne!(
+        s1,
+        snapshot(root.path()).unwrap(),
+        "retargeting changes the snapshot"
+    );
+}

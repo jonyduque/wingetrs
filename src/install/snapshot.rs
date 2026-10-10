@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
 
+/// Junctions and symlinks count as links (std reports both via `is_symlink`) and are never followed.
 /// Deterministic picture of a directory tree: relative path -> (kind, sha256 of content or link target).
 pub fn snapshot(root: &Path) -> io::Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
@@ -21,10 +22,8 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) -> io::Resu
             .to_string_lossy()
             .replace('\\', "/");
         let ft = entry.file_type()?;
-        if ft.is_symlink() || is_reparse(&path) {
-            let target = std::fs::read_link(&path)
-                .map(|t| t.to_string_lossy().into_owned())
-                .unwrap_or_default();
+        if ft.is_symlink() {
+            let target = std::fs::read_link(&path)?.to_string_lossy().into_owned();
             out.insert(
                 rel,
                 format!("link:{}", hex::encode(Sha256::digest(target.as_bytes()))),
@@ -38,17 +37,4 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) -> io::Resu
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn is_reparse(path: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_attributes() & 0x400 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(windows))]
-fn is_reparse(_path: &Path) -> bool {
-    false
 }
