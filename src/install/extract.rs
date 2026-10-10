@@ -40,10 +40,29 @@ fn safe_components(raw: &str) -> Result<Vec<String>, ExtractError> {
             "" | "." => {}
             ".." => return Err(unsafe_path()),
             c if c.contains(':') || c.contains('\0') => return Err(unsafe_path()),
+            c if is_windows_unfriendly(c) => return Err(unsafe_path()),
             c => out.push(c.to_string()),
         }
     }
     Ok(out)
+}
+
+/// Windows reserved device names (with or without extension) and names ending in `.` or space.
+fn is_windows_unfriendly(c: &str) -> bool {
+    if c.ends_with('.') || c.ends_with(' ') {
+        return true;
+    }
+    let stem = c
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ["COM", "LPT"].iter().any(|p| {
+            stem.strip_prefix(p)
+                .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
+        })
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -84,6 +103,14 @@ impl Mapper {
     }
 }
 
+/// One downloaded file to extract.
+pub struct ExtractSource<'a> {
+    pub file: &'a Path,
+    pub file_name: &'a str,
+    pub extract_dir: Option<&'a str>,
+    pub extract_to: Option<&'a str>,
+}
+
 /// Extracts (or copies) `file` into `dest` honoring extract_dir/extract_to. `dest` may already have content.
 pub fn extract(
     file: &Path,
@@ -92,17 +119,35 @@ pub fn extract(
     extract_to: Option<&str>,
     dest: &Path,
 ) -> Result<(), ExtractError> {
-    let mut mapper = Mapper {
-        dir: extract_dir
-            .map(safe_components)
-            .transpose()?
-            .unwrap_or_default(),
-        to: extract_to
-            .map(safe_components)
-            .transpose()?
-            .unwrap_or_default(),
-        dir_seen: false,
-    };
+    extract_all(
+        &[ExtractSource {
+            file,
+            file_name,
+            extract_dir,
+            extract_to,
+        }],
+        dest,
+    )
+}
+
+/// Extracts every source, in order, into one temp folder and moves it into `dest` once at the end.
+pub fn extract_all(sources: &[ExtractSource<'_>], dest: &Path) -> Result<(), ExtractError> {
+    let mut mappers = Vec::new();
+    for s in sources {
+        mappers.push(Mapper {
+            dir: s
+                .extract_dir
+                .map(safe_components)
+                .transpose()?
+                .unwrap_or_default(),
+            to: s
+                .extract_to
+                .map(safe_components)
+                .transpose()?
+                .unwrap_or_default(),
+            dir_seen: false,
+        });
+    }
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -115,35 +160,41 @@ pub fn extract(
         path: tmp.clone(),
         armed: true,
     };
+    for (s, mapper) in sources.iter().zip(mappers.iter_mut()) {
+        extract_one(s, &tmp, mapper)?;
+    }
+    merge_into(&tmp, dest)?;
+    guard.armed = false;
+    let _ = fs::remove_dir_all(&tmp);
+    Ok(())
+}
 
-    let lower = file_name.to_ascii_lowercase();
+fn extract_one(s: &ExtractSource<'_>, tmp: &Path, mapper: &mut Mapper) -> Result<(), ExtractError> {
+    let lower = s.file_name.to_ascii_lowercase();
     if lower.ends_with(".zip") {
-        extract_zip(file, &tmp, &mut mapper)?;
+        extract_zip(s.file, tmp, mapper)?;
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        extract_tar_gz(file, &tmp, &mut mapper)?;
+        extract_tar_gz(s.file, tmp, mapper)?;
     } else {
-        let comps = safe_components(file_name)?;
+        let comps = safe_components(s.file_name)?;
         if comps.is_empty() {
-            return Err(ExtractError::UnsafePath(file_name.to_string()));
+            return Err(ExtractError::UnsafePath(s.file_name.to_string()));
         }
-        let mut target = tmp.clone();
+        let mut target = tmp.to_path_buf();
         for c in mapper.to.iter().chain(comps.iter()) {
             target.push(c);
         }
         if let Some(p) = target.parent() {
             fs::create_dir_all(p)?;
         }
-        fs::copy(file, &target)?;
+        fs::copy(s.file, &target)?;
         mapper.dir_seen = true;
     }
     if !mapper.dir.is_empty() && !mapper.dir_seen {
         return Err(ExtractError::MissingExtractDir(
-            extract_dir.unwrap_or_default().to_string(),
+            s.extract_dir.unwrap_or_default().to_string(),
         ));
     }
-    merge_into(&tmp, dest)?;
-    guard.armed = false;
-    let _ = fs::remove_dir_all(&tmp);
     Ok(())
 }
 

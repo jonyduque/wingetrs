@@ -150,3 +150,115 @@ fn second_source_merges_into_existing_dest() {
     extract(&g, "two.txt", None, None, &dest).unwrap();
     assert!(dest.join("one.txt").exists() && dest.join("two.txt").exists());
 }
+
+fn entries_in(d: &std::path::Path) -> usize {
+    std::fs::read_dir(d).unwrap().count()
+}
+
+#[test]
+fn manifest_extract_to_with_traversal_is_refused() {
+    for bad in ["../x", "..\\..\\x", "C:\\x"] {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let f = root.join("a.zip");
+        std::fs::write(&f, zip_with(&[("ok.txt", b"1")])).unwrap();
+        let dest = root.join("out");
+        let r = extract(&f, "a.zip", None, Some(bad), &dest);
+        assert!(
+            matches!(r, Err(ExtractError::UnsafePath(_))),
+            "{bad}: {r:?}"
+        );
+        assert_eq!(entries_in(&root), 1, "{bad}: only a.zip may exist in root");
+        assert_eq!(entries_in(d.path()), 1, "{bad}");
+    }
+}
+
+#[test]
+fn manifest_extract_dir_with_traversal_is_unsafe_not_missing() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.zip");
+    std::fs::write(&f, zip_with(&[("x/rg.exe", b"x")])).unwrap();
+    let r = extract(&f, "a.zip", Some("../x"), None, &d.path().join("o"));
+    assert!(matches!(r, Err(ExtractError::UnsafePath(_))), "{r:?}");
+}
+
+#[test]
+fn windows_reserved_and_trailing_dot_space_names_are_refused() {
+    for bad in ["aux.txt", "x/CON", "foo.", "bar ", "dir/Lpt1.log", "nul"] {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.zip");
+        std::fs::write(&f, zip_with(&[(bad, b"2")])).unwrap();
+        let dest = d.path().join("out");
+        let r = extract(&f, "a.zip", None, None, &dest);
+        assert!(
+            matches!(r, Err(ExtractError::UnsafePath(_))),
+            "{bad}: {r:?}"
+        );
+        assert!(!dest.exists());
+    }
+}
+
+#[test]
+fn zip_symlink_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.zip");
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let o = zip::write::SimpleFileOptions::default();
+        z.start_file("ok.txt", o).unwrap();
+        z.write_all(b"1").unwrap();
+        z.add_symlink("link", "../../etc", o).unwrap();
+        z.finish().unwrap();
+    }
+    std::fs::write(&f, buf.into_inner()).unwrap();
+    let dest = d.path().join("out");
+    let r = extract(&f, "a.zip", None, None, &dest);
+    assert!(matches!(r, Err(ExtractError::UnsafePath(_))), "{r:?}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn tar_gz_hardlink_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.tar.gz");
+    let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut b = tar::Builder::new(enc);
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Link);
+    h.set_size(0);
+    h.set_mode(0o644);
+    h.set_cksum();
+    b.append_link(&mut h, "hl", "ok.txt").unwrap();
+    std::fs::write(&f, b.into_inner().unwrap().finish().unwrap()).unwrap();
+    let dest = d.path().join("out");
+    let r = extract(&f, "a.tar.gz", None, None, &dest);
+    assert!(matches!(r, Err(ExtractError::UnsafePath(_))), "{r:?}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn many_sources_land_in_dest_with_a_single_move_and_failure_leaves_nothing() {
+    use wingetrs::install::extract::{ExtractSource, extract_all};
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.zip");
+    std::fs::write(&f, zip_with(&[("one.txt", b"1")])).unwrap();
+    let g = d.path().join("blob");
+    std::fs::write(&g, b"2").unwrap();
+    let src = |file, file_name| ExtractSource {
+        file,
+        file_name,
+        extract_dir: None,
+        extract_to: None,
+    };
+    let dest = d.path().join("out");
+    extract_all(&[src(&f, "a.zip"), src(&g, "two.txt")], &dest).unwrap();
+    assert!(dest.join("one.txt").exists() && dest.join("two.txt").exists());
+    let bad = d.path().join("bad.zip");
+    std::fs::write(&bad, zip_with(&[("../e", b"x")])).unwrap();
+    let dest2 = d.path().join("out2");
+    let r = extract_all(&[src(&f, "a.zip"), src(&bad, "bad.zip")], &dest2);
+    assert!(matches!(r, Err(ExtractError::UnsafePath(_))));
+    assert!(!dest2.exists());
+}
