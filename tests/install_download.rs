@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-// TEMP: trocar por wingetrs::install::manifest quando a Task 24 unificar os tipos.
-use wingetrs::install::download::{DownloadError, HashSpec, Source, fetch_all, verify};
+use wingetrs::install::download::{DownloadError, fetch_all, verify};
+use wingetrs::install::manifest::{HashSpec, Source};
 
 use wingetrs::cache::DataDir;
 use wingetrs::http::Http;
@@ -142,4 +142,138 @@ async fn index_pointing_at_wrong_blob_is_not_trusted() {
         .unwrap();
     assert_eq!(std::fs::read(&paths[0]).unwrap(), b"abc");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+// ---- minimal raw TCP servers (wiremock cannot stream slowly) ----
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+async fn read_request(sock: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = sock.read(&mut tmp).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn slow_but_steady_download_outlives_total_timeout() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        read_request(&mut s).await;
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            s.write_all(b"x").await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let http = Http::with_timeouts(Duration::from_secs(2), Duration::from_secs(1))
+        .unwrap()
+        .with_chunk_timeout(Duration::from_secs(1));
+    let td = tempfile::tempdir().unwrap();
+    let f = td.path().join("out");
+    http.get_to_file(&format!("http://{addr}/"), &f, |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"xxxxxx");
+}
+
+#[tokio::test]
+async fn stalled_download_times_out() {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        read_request(&mut s).await;
+        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nx")
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    let http = Http::new()
+        .unwrap()
+        .with_chunk_timeout(Duration::from_millis(400));
+    let td = tempfile::tempdir().unwrap();
+    let err = http
+        .get_to_file(
+            &format!("http://{addr}/"),
+            &td.path().join("out"),
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, wingetrs::http::HttpError::Timeout), "{err:?}");
+}
+
+#[tokio::test]
+async fn at_most_four_downloads_run_at_once() {
+    use sha2::{Digest, Sha256};
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max = Arc::new(AtomicUsize::new(0));
+    let (a2, m2) = (active.clone(), max.clone());
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (a, m) = (a2.clone(), m2.clone());
+            tokio::spawn(async move {
+                let req = read_request(&mut s).await;
+                let body = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .trim_start_matches('/')
+                    .to_owned();
+                let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                m.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                a.fetch_sub(1, Ordering::SeqCst);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                s.write_all(head.as_bytes()).await.unwrap();
+            });
+        }
+    });
+    let sources: Vec<Source> = (0..8)
+        .map(|i| {
+            let body = format!("file-{i}");
+            let hex: String = Sha256::digest(body.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            Source {
+                url: format!("http://{addr}/{body}"),
+                file_name: body,
+                hash: HashSpec::parse(&hex).unwrap(),
+                extract_dir: None,
+                extract_to: None,
+            }
+        })
+        .collect();
+    let td = tempfile::tempdir().unwrap();
+    let data = DataDir::new(td.path());
+    let http = Http::new().unwrap();
+    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    assert_eq!(paths.len(), 8);
+    let m = max.load(Ordering::SeqCst);
+    assert!((2..=4).contains(&m), "max concurrent = {m}");
 }

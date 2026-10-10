@@ -10,56 +10,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::cache::{BlobStore, DataDir};
 use crate::http::Http;
-
-// TEMP: mover para manifest.rs (Task 24)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HashAlgo {
-    Sha256,
-    Sha1,
-    Sha512,
-    Md5,
-}
-// TEMP: mover para manifest.rs (Task 24)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HashSpec {
-    pub algo: HashAlgo,
-    pub hex: String,
-}
-// TEMP: mover para manifest.rs (Task 24)
-impl HashSpec {
-    /// Parses `sha256` (bare), `sha1:`, `sha512:`, `md5:`; hex is lowercased.
-    pub fn parse(s: &str) -> Option<HashSpec> {
-        let (algo, hex) = match s.split_once(':') {
-            None => (HashAlgo::Sha256, s),
-            Some((p, h)) => {
-                let algo = match p.to_ascii_lowercase().as_str() {
-                    "sha256" => HashAlgo::Sha256,
-                    "sha1" => HashAlgo::Sha1,
-                    "sha512" => HashAlgo::Sha512,
-                    "md5" => HashAlgo::Md5,
-                    _ => return None,
-                };
-                (algo, h)
-            }
-        };
-        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        Some(HashSpec {
-            algo,
-            hex: hex.to_ascii_lowercase(),
-        })
-    }
-}
-// TEMP: mover para manifest.rs (Task 24)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Source {
-    pub url: String,
-    pub file_name: String,
-    pub hash: HashSpec,
-    pub extract_dir: Option<String>,
-    pub extract_to: Option<String>,
-}
+use crate::install::manifest::{HashAlgo, HashSpec, Source};
 
 fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -123,9 +74,16 @@ fn read_index(data: &DataDir) -> BTreeMap<String, String> {
 fn write_index(data: &DataDir, idx: &BTreeMap<String, String>) -> Result<(), DownloadError> {
     let p = index_path(data);
     let json = serde_json::to_vec(idx).map_err(|e| DownloadError::Io(e.to_string()))?;
-    let tmp = p.with_extension("json.tmp");
+    let tmp = p.with_extension(format!(
+        "json.{}-{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, json).map_err(|e| io_err(&tmp, e))?;
-    std::fs::rename(&tmp, &p).map_err(|e| io_err(&p, e))
+    std::fs::rename(&tmp, &p).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        io_err(&p, e)
+    })
 }
 
 /// Path of a cached, content-verified blob for `spec`, if any.
@@ -231,7 +189,10 @@ pub async fn fetch_all(
         }
     }
     if dirty {
-        write_index(data, &new_idx)?;
+        // Blobs are already verified; a lost index only costs a re-download.
+        if let Err(e) = write_index(data, &new_idx) {
+            tracing::warn!("não foi possível gravar blobs/index.json: {e}");
+        }
     }
     match first_err {
         Some(e) => Err(e),

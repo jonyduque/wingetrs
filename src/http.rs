@@ -37,6 +37,9 @@ fn map_err(e: reqwest::Error) -> HttpError {
 #[derive(Clone)]
 pub struct Http {
     client: reqwest::Client,
+    /// No total timeout (big downloads); stalls are caught by `chunk_timeout`.
+    dl_client: reqwest::Client,
+    chunk_timeout: Duration,
 }
 
 impl Http {
@@ -51,7 +54,22 @@ impl Http {
             .timeout(total)
             .build()
             .map_err(|e| HttpError::Network(e.to_string()))?;
-        Ok(Http { client })
+        let dl_client = reqwest::Client::builder()
+            .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(connect)
+            .build()
+            .map_err(|e| HttpError::Network(e.to_string()))?;
+        Ok(Http {
+            client,
+            dl_client,
+            chunk_timeout: Duration::from_secs(30),
+        })
+    }
+
+    /// Max idle time waiting for headers or the next body chunk in `get_to_file`.
+    pub fn with_chunk_timeout(mut self, d: Duration) -> Http {
+        self.chunk_timeout = d;
+        self
     }
 
     /// Sends If-None-Match / If-Modified-Since from `prev`; on 200 returns the new entry with checked_at = now.
@@ -112,7 +130,11 @@ impl Http {
     ) -> Result<(), HttpError> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
-        let resp = self.client.get(url).send().await.map_err(map_err)?;
+        let idle = self.chunk_timeout;
+        let resp = tokio::time::timeout(idle, self.dl_client.get(url).send())
+            .await
+            .map_err(|_| HttpError::Timeout)?
+            .map_err(map_err)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(HttpError::Status(status.as_u16()));
@@ -122,7 +144,10 @@ impl Http {
         let mut file = tokio::fs::File::create(path).await.map_err(io)?;
         let mut done = 0u64;
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) = tokio::time::timeout(idle, stream.next())
+            .await
+            .map_err(|_| HttpError::Timeout)?
+        {
             let chunk = chunk.map_err(map_err)?;
             file.write_all(&chunk).await.map_err(io)?;
             done += chunk.len() as u64;
