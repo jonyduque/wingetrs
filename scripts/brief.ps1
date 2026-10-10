@@ -30,11 +30,24 @@ for ($j = $start + 1; $j -lt $lines.Count; $j++) {
     if ($lines[$j] -match '^### Task \d+' -or $lines[$j] -match '^## ') { $end = $j; break }
 }
 $section = $lines[$start..($end - 1)]
+# The plan's "## Global Constraints" section binds every task but lives in the preamble,
+# which the task slice above never reaches (Task 27 of phase 2a hit exactly this).
+$global = @()
+$g = -1
+for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^## Global Constraints') { $g = $i; break } }
+if ($g -ge 0) {
+    $ge = $lines.Count
+    for ($j = $g + 1; $j -lt $lines.Count; $j++) { if ($lines[$j] -match '^## ' -or $lines[$j] -match '^### Task \d+') { $ge = $j; break } }
+    $global = @('', '#### Global Constraints (do plano, valem para esta tarefa)', '') + $lines[($g + 1)..($ge - 1)]
+    # Tech Stack line carries dependency versions and features: copy it too.
+    $ts = $lines | Where-Object { $_ -match '^\*\*Tech Stack:\*\*' } | Select-Object -First 1
+    if ($ts) { $global += @('', $ts) }
+}
 $common = (Get-Content '.claude/tasks/_common.md' -Raw).Replace('{N}', "$Task")
 $out = ".claude/tasks/task-$Task-brief.md"
 $header = @(
     "<!-- gerado por scripts/brief.ps1 a partir de $Plan; não editar à mão -->",
     ''
 )
-Set-Content -Path $out -Value ($header + $section + @('', $common)) -Encoding utf8NoBOM
+Set-Content -Path $out -Value ($header + $section + $global + @('', $common)) -Encoding utf8NoBOM
 "[OK] $out ($((Get-Content $out).Count) linhas)"
