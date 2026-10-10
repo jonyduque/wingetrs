@@ -1,0 +1,14 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 0.2025.10.02 (bucket main, sem arquitetura)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/lukesampson/concfg/archive/e3b1d7aeb08c0db9e24109d1063b8d2e4f2f9729.zip (e3b1d7aeb08c0db9e24109d1063b8d2e4f2f9729.zip, sha256 ee31f10f65a4d89a3dcb8b4e81f3331531ff3fa8d8bf59c1e444828c87219f28)
+  3. Extrair [1] e3b1d7aeb08c0db9e24109d1063b8d2e4f2f9729.zip para C:\W\apps\app\.staging-0.2025.10.02 (só a subpasta concfg-e3b1d7aeb08c0db9e24109d1063b8d2e4f2f9729)
+  4. Mover C:\W\apps\app\.staging-0.2025.10.02 para C:\W\apps\app\0.2025.10.02
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\0.2025.10.02 (junção)
+  6. Criar comando concfg em C:\W\shims (concfg.cmd + concfg.ps1) -> C:\W\apps\app\current\bin\concfg.ps1
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 0.2025.10.02 (main) em C:\W\state.db

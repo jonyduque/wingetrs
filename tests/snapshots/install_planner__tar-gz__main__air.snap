@@ -1,0 +1,14 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 1.67.4 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/air-verse/air/releases/download/v1.67.4/air_1.67.4_windows_amd64.tar.gz (air_1.67.4_windows_amd64.tar.gz, sha256 c35dbd568cff98055cc382d003bfda06bcdae82389568fb5e60ce5da278fa79d)
+  3. Extrair [1] air_1.67.4_windows_amd64.tar.gz para C:\W\apps\app\.staging-1.67.4
+  4. Mover C:\W\apps\app\.staging-1.67.4 para C:\W\apps\app\1.67.4
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.67.4 (junção)
+  6. Criar comando air em C:\W\shims (air.exe + air.shim) -> C:\W\apps\app\current\air.exe
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 1.67.4 (main) em C:\W\state.db

@@ -1,0 +1,14 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 3.6.19 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://downloads.sourceforge.net/project/astyle/astyle/astyle%203.6/astyle-3.6.19-x64.zip (astyle-3.6.19-x64.zip, sha1 2d4a95993755458a86867abb39c90fb6a6445061)
+  3. Extrair [1] astyle-3.6.19-x64.zip para C:\W\apps\app\.staging-3.6.19 (só a subpasta astyle-3.6.19-x64)
+  4. Mover C:\W\apps\app\.staging-3.6.19 para C:\W\apps\app\3.6.19
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\3.6.19 (junção)
+  6. Criar comando astyle em C:\W\shims (astyle.exe + astyle.shim) -> C:\W\apps\app\current\astyle.exe
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 3.6.19 (main) em C:\W\state.db

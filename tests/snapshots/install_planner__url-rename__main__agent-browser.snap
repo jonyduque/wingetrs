@@ -1,0 +1,14 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 0.39.0 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/vercel-labs/agent-browser/releases/download/v0.39.0/agent-browser-win32-x64.exe (agent-browser.exe, sha256 772d3f2b47fceffde8289308d11979836f4ca3066199c3accfdbd694d5f7610a)
+  3. Copiar [1] agent-browser.exe para C:\W\apps\app\.staging-0.39.0
+  4. Mover C:\W\apps\app\.staging-0.39.0 para C:\W\apps\app\0.39.0
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\0.39.0 (junção)
+  6. Criar comando agent-browser em C:\W\shims (agent-browser.exe + agent-browser.shim) -> C:\W\apps\app\current\agent-browser.exe
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 0.39.0 (main) em C:\W\state.db

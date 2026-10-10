@@ -1,0 +1,17 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 0.12.0 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/Wieku/danser-go/releases/download/0.12.0/danser-0.12.0-win.zip (danser-0.12.0-win.zip, sha256 4f7a832a24517dc0355c925755488b84c6199d248c4bc13ca000f86bb2153f75)
+  3. Extrair [1] danser-0.12.0-win.zip para C:\W\apps\app\.staging-0.12.0
+  4. Mover C:\W\apps\app\.staging-0.12.0 para C:\W\apps\app\0.12.0
+  5. Persistir pasta C:\W\apps\app\0.12.0\settings -> C:\W\persist\app\settings (junção)
+  6. Apontar C:\W\apps\app\current -> C:\W\apps\app\0.12.0 (junção)
+  7. Criar comando danser em C:\W\shims (danser.exe + danser.shim) -> C:\W\apps\app\current\danser.exe
+  8. Criar comando danser-cli em C:\W\shims (danser-cli.exe + danser-cli.shim) -> C:\W\apps\app\current\danser-cli.exe
+  9. Criar atalho C:\SM\wingetrs Apps\danser-go.lnk -> C:\W\apps\app\current\danser.exe
+ 10. Garantir C:\W\shims no PATH do usuário
+ 11. Registrar app 0.12.0 (main) em C:\W\state.db

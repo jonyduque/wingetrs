@@ -1,0 +1,14 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 15.2.0 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip (ripgrep-15.2.0-x86_64-pc-windows-msvc.zip, sha256 71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5)
+  3. Extrair [1] ripgrep-15.2.0-x86_64-pc-windows-msvc.zip para C:\W\apps\app\.staging-15.2.0 (só a subpasta ripgrep-15.2.0-x86_64-pc-windows-msvc)
+  4. Mover C:\W\apps\app\.staging-15.2.0 para C:\W\apps\app\15.2.0
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\15.2.0 (junção)
+  6. Criar comando rg em C:\W\shims (rg.exe + rg.shim) -> C:\W\apps\app\current\rg.exe
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 15.2.0 (main) em C:\W\state.db

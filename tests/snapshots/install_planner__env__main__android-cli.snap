@@ -1,0 +1,21 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 1.0.16500706 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://dl.google.com/android/cli/1.0.16500706/windows_x86_64/android-cli.exe (android-cli.exe, sha256 bdda9fed0d3dceaf8e53647f937c0c8bf6c3cade91fb0c9a927669e14a068c6b)
+  3. Copiar [1] android-cli.exe para C:\W\apps\app\.staging-1.0.16500706
+  4. Mover C:\W\apps\app\.staging-1.0.16500706 para C:\W\apps\app\1.0.16500706
+  5. Persistir pasta C:\W\apps\app\1.0.16500706\userhome -> C:\W\persist\app\userhome (junção)
+  6. Persistir pasta C:\W\apps\app\1.0.16500706\Sdk -> C:\W\persist\app\Sdk (junção)
+  7. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.0.16500706 (junção)
+  8. Criar comando android-cli em C:\W\shims (android-cli.exe + android-cli.shim) -> C:\W\apps\app\current\android-cli.exe
+  9. Criar comando android em C:\W\shims (android.exe + android.shim) -> C:\W\apps\app\current\android-cli.exe
+ 10. Definir variável de usuário ANDROID_HOME = C:\W\apps\app\current\Sdk
+ 11. Definir variável de usuário ANDROID_USER_HOME = C:\W\apps\app\current\userhome
+ 12. Adicionar ao PATH do usuário: C:\W\apps\app\current\Sdk\cmdline-tools\latest\bin
+ 13. Adicionar ao PATH do usuário: C:\W\apps\app\current\Sdk\platform-tools
+ 14. Garantir C:\W\shims no PATH do usuário
+ 15. Registrar app 1.0.16500706 (main) em C:\W\state.db

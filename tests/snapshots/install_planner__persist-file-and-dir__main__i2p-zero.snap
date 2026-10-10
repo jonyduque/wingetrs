@@ -1,0 +1,16 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 1.20 (bucket main, sem arquitetura)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/i2p-zero/i2p-zero/releases/download/v1.20/i2p-zero-win.v1.20.zip (i2p-zero-win.v1.20.zip, sha256 37c38e66a1f4935a21c2514eb4692827834ec8bd9c2dfc11d6871f7a07dbdd16)
+  3. Extrair [1] i2p-zero-win.v1.20.zip para C:\W\apps\app\.staging-1.20 (só a subpasta i2p-zero-win.v1.20\router)
+  4. Mover C:\W\apps\app\.staging-1.20 para C:\W\apps\app\1.20
+  5. Persistir pasta C:\W\apps\app\1.20\conf -> C:\W\persist\app\conf (junção)
+  6. Persistir arquivo C:\W\apps\app\1.20\i2p.base -> C:\W\persist\app\i2p.base (hardlink)
+  7. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.20 (junção)
+  8. Criar comando i2p-zero em C:\W\shims (i2p-zero.cmd) -> C:\W\apps\app\current\bin\launch.bat
+  9. Garantir C:\W\shims no PATH do usuário
+ 10. Registrar app 1.20 (main) em C:\W\state.db

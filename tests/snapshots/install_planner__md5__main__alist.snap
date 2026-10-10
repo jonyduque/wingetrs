@@ -1,0 +1,16 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 3.64.0 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/AlistGo/alist/releases/download/v3.64.0/alist-windows-amd64.zip (alist-windows-amd64.zip, md5 48dc4f222e7d1822bad7e9583f616080)
+  3. Extrair [1] alist-windows-amd64.zip para C:\W\apps\app\.staging-3.64.0
+  4. Mover C:\W\apps\app\.staging-3.64.0 para C:\W\apps\app\3.64.0
+  5. Persistir pasta C:\W\apps\app\3.64.0\data -> C:\W\persist\app\data (junção)
+  6. Persistir pasta C:\W\apps\app\3.64.0\log -> C:\W\persist\app\log (junção)
+  7. Apontar C:\W\apps\app\current -> C:\W\apps\app\3.64.0 (junção)
+  8. Criar comando alist em C:\W\shims (alist.exe + alist.shim) -> C:\W\apps\app\current\alist.exe --force-bin-dir
+  9. Garantir C:\W\shims no PATH do usuário
+ 10. Registrar app 3.64.0 (main) em C:\W\state.db

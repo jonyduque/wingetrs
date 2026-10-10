@@ -1,0 +1,14 @@
+---
+source: tests/install_planner.rs
+assertion_line: 247
+expression: p.to_string()
+---
+Instalar app 2.0.0 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://github.com/kaegi/alass/releases/download/v2.0.0/alass-windows64.zip (alass-windows64.zip, sha256 e81a72f97f592910e909a2352d6b8c0de0801c51ac1383bad4ebf3f2ecdd2fd8)
+  3. Extrair [1] alass-windows64.zip para C:\W\apps\app\.staging-2.0.0 (só a subpasta alass-windows64)
+  4. Mover C:\W\apps\app\.staging-2.0.0 para C:\W\apps\app\2.0.0
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\2.0.0 (junção)
+  6. Criar comando alass em C:\W\shims (alass.cmd) -> C:\W\apps\app\current\alass.bat
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 2.0.0 (main) em C:\W\state.db
