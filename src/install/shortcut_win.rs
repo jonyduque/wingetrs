@@ -3,6 +3,7 @@
 //! `.lnk` files via `IShellLinkW` + `IPersistFile`, under
 //! `Start Menu\Programs\wingetrs Apps` (or `WINGETRS_TEST_SHORTCUT_DIR`).
 use crate::install::traits::{EffectError, Shortcuts};
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Com::{
@@ -24,10 +25,20 @@ pub struct ComShortcuts {
 impl ComShortcuts {
     /// Root from `WINGETRS_TEST_SHORTCUT_DIR`, else `<FOLDERID_Programs>\wingetrs Apps`.
     pub fn new() -> Result<ComShortcuts, EffectError> {
-        if let Some(dir) = std::env::var_os(TEST_DIR_VAR).filter(|s| !s.is_empty()) {
+        if let Some(dir) = ComShortcuts::test_root(std::env::var_os(TEST_DIR_VAR))? {
             return Ok(ComShortcuts::with_root(dir));
         }
         Ok(ComShortcuts::with_root(programs_dir()?.join(ROOT_NAME)))
+    }
+
+    /// Raw `WINGETRS_TEST_SHORTCUT_DIR` to a test root. Present but empty is an error:
+    /// a test must never fall through to the real Start Menu.
+    pub fn test_root(var: Option<OsString>) -> Result<Option<PathBuf>, EffectError> {
+        match var {
+            None => Ok(None),
+            Some(v) if v.is_empty() => Err(EffectError(format!("{TEST_DIR_VAR} está vazia"))),
+            Some(v) => Ok(Some(PathBuf::from(v))),
+        }
     }
 
     pub fn with_root(root: impl Into<PathBuf>) -> ComShortcuts {

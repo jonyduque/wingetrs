@@ -3,11 +3,14 @@
 //! Values are read and written as raw UTF-16 so `%VAR%` references survive verbatim
 //! (no `ExpandEnvironmentStrings`, no implicit expansion on read).
 use crate::install::traits::{EffectError, EnvStore, EnvValue};
+use std::ffi::OsString;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, RegType};
 use winreg::{RegKey, RegValue};
 
 const TEST_KEY_VAR: &str = "WINGETRS_TEST_ENV_KEY";
 const USER_ENV_KEY: &str = "Environment";
+/// Used when `WINGETRS_TEST_ENV_KEY` is present but empty: still a test, never the real key.
+pub const EMPTY_TEST_KEY: &str = r"Software\wingetrs-test\env-empty";
 
 pub struct RegEnvStore {
     key: String,
@@ -21,12 +24,13 @@ impl Default for RegEnvStore {
 }
 
 impl RegEnvStore {
-    /// `HKCU\Environment`, or `HKCU\<WINGETRS_TEST_ENV_KEY>` when that variable is set.
+    /// `HKCU\Environment`, or `HKCU\<WINGETRS_TEST_ENV_KEY>` when that variable is present
+    /// (even empty).
     pub fn new() -> RegEnvStore {
-        let test = std::env::var(TEST_KEY_VAR).ok().filter(|s| !s.is_empty());
+        let test = std::env::var_os(TEST_KEY_VAR);
         RegEnvStore {
-            key: RegEnvStore::key_path(test.as_deref()),
-            broadcast: RegEnvStore::should_broadcast(test.as_deref()),
+            key: RegEnvStore::key_path(test.clone()),
+            broadcast: RegEnvStore::should_broadcast(test),
         }
     }
 
@@ -38,13 +42,19 @@ impl RegEnvStore {
         }
     }
 
-    /// HKCU-relative key used for the given test override.
-    pub fn key_path(test_key: Option<&str>) -> String {
-        test_key.unwrap_or(USER_ENV_KEY).to_string()
+    /// HKCU-relative key for the raw `WINGETRS_TEST_ENV_KEY` value. Present ⇒ never
+    /// `Environment`; present but empty ⇒ [`EMPTY_TEST_KEY`].
+    pub fn key_path(test_key: Option<OsString>) -> String {
+        match test_key {
+            None => USER_ENV_KEY.to_string(),
+            Some(k) if k.is_empty() => EMPTY_TEST_KEY.to_string(),
+            Some(k) => k.to_string_lossy().into_owned(),
+        }
     }
 
-    /// Only the real `HKCU\Environment` notifies other processes.
-    pub fn should_broadcast(test_key: Option<&str>) -> bool {
+    /// Only the real `HKCU\Environment` notifies other processes: any presence of the
+    /// test variable (even empty) turns broadcasting off.
+    pub fn should_broadcast(test_key: Option<OsString>) -> bool {
         test_key.is_none()
     }
 
@@ -116,10 +126,24 @@ impl EnvStore for RegEnvStore {
             .map_err(|e| err("abrir", &self.key, e))?;
         // The existing value's type wins, so a REG_EXPAND_SZ Path never degrades.
         let vtype = match key.get_raw_value(name) {
-            Ok(old) if old.vtype == RegType::REG_EXPAND_SZ => RegType::REG_EXPAND_SZ,
-            Ok(old) if old.vtype == RegType::REG_SZ => RegType::REG_SZ,
-            _ if value.expand || name.eq_ignore_ascii_case("Path") => RegType::REG_EXPAND_SZ,
-            _ => RegType::REG_SZ,
+            Ok(old) => match old.vtype {
+                RegType::REG_EXPAND_SZ => RegType::REG_EXPAND_SZ,
+                RegType::REG_SZ => RegType::REG_SZ,
+                other => {
+                    return Err(EffectError(format!(
+                        "HKCU\\{}\\{name} tem tipo {other:?}, esperado texto",
+                        self.key
+                    )));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if value.expand || name.eq_ignore_ascii_case("Path") {
+                    RegType::REG_EXPAND_SZ
+                } else {
+                    RegType::REG_SZ
+                }
+            }
+            Err(e) => return Err(err("ler", &self.key, e)),
         };
         let raw = RegValue {
             bytes: encode(&value.value).into(),
