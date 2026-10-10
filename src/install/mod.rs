@@ -8,6 +8,7 @@ pub mod path_edit;
 pub mod plan;
 pub mod planner;
 pub mod residue;
+pub mod safepath;
 pub mod shim;
 pub mod snapshot;
 pub mod state;

@@ -8,6 +8,7 @@ use crate::install::manifest::{Arch, Resolved};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimKind, ShimSpec, ShortcutSpec, Step,
 };
+use crate::install::safepath;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledInfo {
@@ -32,6 +33,8 @@ pub enum PlanError {
     AlreadyInstalled { app: String, version: String },
     #[error("dois executáveis com o mesmo nome de atalho de comando: {0}")]
     ShimConflict(String),
+    #[error("caminho inseguro no manifesto: {0}")]
+    UnsafePath(String),
 }
 
 /// Replaces scoop manifest variables (`$dir`, `$persist_dir`, `$version`, `$app`,
@@ -58,27 +61,45 @@ fn components(p: &str) -> impl Iterator<Item = &str> {
     p.split(['\\', '/']).filter(|c| !c.is_empty())
 }
 
-fn is_absolute(p: &str) -> bool {
-    let b = p.as_bytes();
-    Path::new(p).is_absolute()
-        || p.starts_with("\\\\")
-        || (b.len() >= 3
-            && b[0].is_ascii_alphabetic()
-            && b[1] == b':'
-            && matches!(b[2], b'\\' | b'/'))
-}
-
-/// `base` joined with every component of the manifest path `rel`.
-fn join_rel(base: &Path, rel: &str) -> PathBuf {
-    let mut out = base.to_path_buf();
-    for c in components(rel) {
-        out.push(c);
+/// Components of a manifest-supplied relative path that must name something inside
+/// its base directory: `..`, absolute, drive, UNC, ADS, reserved names and empty
+/// paths are refused.
+fn safe_rel(raw: &str) -> Result<Vec<String>, PlanError> {
+    match safepath::safe_components(raw) {
+        Some(c) if !c.is_empty() => Ok(c),
+        _ => Err(PlanError::UnsafePath(raw.to_string())),
     }
-    out
 }
 
-fn rel_path(rel: &str) -> PathBuf {
+/// `base` joined with the validated manifest path `rel`.
+fn join_rel(base: &Path, rel: &str) -> Result<PathBuf, PlanError> {
+    let mut out = base.to_path_buf();
+    out.extend(safe_rel(rel)?);
+    Ok(out)
+}
+
+fn rel_path(rel: &str) -> Result<PathBuf, PlanError> {
     join_rel(Path::new(""), rel)
+}
+
+/// Resolves one `env_add_path` entry (already substituted) under `current`.
+/// `Ok(None)` for empty or `.` entries, which scoop drops.
+fn env_path_entry(raw: &str, current: &Path) -> Result<Option<PathBuf>, PlanError> {
+    let unsafe_path = || PlanError::UnsafePath(raw.to_string());
+    if matches!(raw.trim(), "" | ".") {
+        return Ok(None);
+    }
+    let cur = current.to_string_lossy();
+    let rel = match raw.strip_prefix(cur.as_ref()) {
+        Some("") => return Ok(Some(current.to_path_buf())),
+        Some(rest) if rest.starts_with(['\\', '/']) => rest,
+        Some(_) => return Err(unsafe_path()),
+        None => raw,
+    };
+    let comps = safepath::safe_components(rel).ok_or_else(unsafe_path)?;
+    let mut out = current.to_path_buf();
+    out.extend(comps);
+    Ok(Some(out))
 }
 
 fn shim_kind(path: &str) -> ShimKind {
@@ -106,12 +127,14 @@ fn stem(path: &str) -> String {
 }
 
 /// One shortcut name component made safe for the file system: reserved and control
-/// characters become `_`, and `.`/`..` cannot climb out of the shortcut root.
+/// characters become `_`, `.`/`..` cannot climb out of the shortcut root, a trailing
+/// `.`/space becomes `_` and a reserved device name gets a `_` prefix.
 fn sanitize_component(c: &str) -> String {
     if c == "." || c == ".." {
         return "_".to_string();
     }
-    c.chars()
+    let mut out: String = c
+        .chars()
         .map(|ch| {
             if matches!(ch, '<' | '>' | ':' | '"' | '/' | '|' | '?' | '*') || ch.is_control() {
                 '_'
@@ -119,7 +142,17 @@ fn sanitize_component(c: &str) -> String {
                 ch
             }
         })
-        .collect()
+        .collect();
+    let kept = out.trim_end_matches(['.', ' ']).len();
+    if kept < out.len() {
+        let tail = "_".repeat(out.len() - kept);
+        out.truncate(kept);
+        out.push_str(&tail);
+    }
+    if safepath::is_windows_unfriendly(&out) {
+        out.insert(0, '_');
+    }
+    out
 }
 
 fn shortcut_link(root: &Path, name: &str) -> PathBuf {
@@ -179,8 +212,8 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     steps.push(Step::Promote);
     for p in &m.persist {
         steps.push(Step::Persist(PersistSpec {
-            in_version: rel_path(&p.source),
-            in_persist: rel_path(&p.target),
+            in_version: rel_path(&p.source)?,
+            in_persist: rel_path(&p.target)?,
             kind: persist_kind(&p.source),
         }));
     }
@@ -194,7 +227,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         }
         steps.push(Step::Shim(ShimSpec {
             name,
-            target: join_rel(&current, &b.path),
+            target: join_rel(&current, &b.path)?,
             args: b.args.as_deref().map(sub),
             kind: shim_kind(&b.path),
         }));
@@ -202,9 +235,13 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     for s in &m.shortcuts {
         steps.push(Step::Shortcut(ShortcutSpec {
             link: shortcut_link(input.shortcut_root, &s.name),
-            target: join_rel(&current, &s.target),
+            target: join_rel(&current, &s.target)?,
             args: s.args.as_deref().map(sub),
-            icon: s.icon.as_deref().map(|i| join_rel(&current, i)),
+            icon: s
+                .icon
+                .as_deref()
+                .map(|i| join_rel(&current, i))
+                .transpose()?,
         }));
     }
     for (name, value) in &m.env_set {
@@ -214,13 +251,9 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         });
     }
     for entry in &m.env_add_path {
-        let entry = sub(entry);
-        let entry = if is_absolute(&entry) {
-            PathBuf::from(entry)
-        } else {
-            join_rel(&current, &entry)
-        };
-        steps.push(Step::EnvAddPath { entry });
+        if let Some(entry) = env_path_entry(&sub(entry), &current)? {
+            steps.push(Step::EnvAddPath { entry });
+        }
     }
     steps.push(Step::EnsureShimsOnPath);
     steps.push(Step::RecordState);

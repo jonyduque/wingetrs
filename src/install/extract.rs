@@ -8,6 +8,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::install::safepath;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
     #[error("caminho inseguro no arquivo: {0}")]
@@ -29,40 +31,7 @@ impl From<io::Error> for ExtractError {
 /// Splits an archive path on `/` and `\` into safe components; refuses `..`,
 /// absolute paths, drive prefixes, UNC and `\\?\` forms.
 fn safe_components(raw: &str) -> Result<Vec<String>, ExtractError> {
-    let unsafe_path = || ExtractError::UnsafePath(raw.to_string());
-    let norm = raw.replace('\\', "/");
-    if norm.starts_with('/') {
-        return Err(unsafe_path());
-    }
-    let mut out = Vec::new();
-    for c in norm.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => return Err(unsafe_path()),
-            c if c.contains(':') || c.contains('\0') => return Err(unsafe_path()),
-            c if is_windows_unfriendly(c) => return Err(unsafe_path()),
-            c => out.push(c.to_string()),
-        }
-    }
-    Ok(out)
-}
-
-/// Windows reserved device names (with or without extension) and names ending in `.` or space.
-fn is_windows_unfriendly(c: &str) -> bool {
-    if c.ends_with('.') || c.ends_with(' ') {
-        return true;
-    }
-    let stem = c
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim_end()
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ["COM", "LPT"].iter().any(|p| {
-            stem.strip_prefix(p)
-                .is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']))
-        })
+    safepath::safe_components(raw).ok_or_else(|| ExtractError::UnsafePath(raw.to_string()))
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
