@@ -101,4 +101,34 @@ impl Http {
         }
         Ok(resp.bytes().await.map_err(map_err)?.to_vec())
     }
+
+    /// Streams the body of `url` into `path` (created/truncated), reporting `(done, total)`.
+    /// The caller owns cleanup of `path` on error.
+    pub async fn get_to_file(
+        &self,
+        url: &str,
+        path: &std::path::Path,
+        progress: impl Fn(u64, Option<u64>),
+    ) -> Result<(), HttpError> {
+        use futures_util::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let resp = self.client.get(url).send().await.map_err(map_err)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(HttpError::Status(status.as_u16()));
+        }
+        let total = resp.content_length();
+        let io = |e: std::io::Error| HttpError::Network(format!("E/S: {e}"));
+        let mut file = tokio::fs::File::create(path).await.map_err(io)?;
+        let mut done = 0u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(map_err)?;
+            file.write_all(&chunk).await.map_err(io)?;
+            done += chunk.len() as u64;
+            progress(done, total);
+        }
+        file.flush().await.map_err(io)?;
+        Ok(())
+    }
 }
