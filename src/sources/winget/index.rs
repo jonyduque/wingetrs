@@ -128,7 +128,8 @@ pub fn validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
     std::thread::scope(|s| {
         let (block_tx, block_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(32);
         let (file_tx, file_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(32);
-        let blocks = s.spawn(move || {
+        let spawn_err = |e: std::io::Error| IndexError::Io(e.to_string());
+        let blocks = std::thread::Builder::new().spawn_scoped(s, move || {
             let mut first_bad = None;
             for (i, block) in block_rx.into_iter().enumerate() {
                 if first_bad.is_none()
@@ -141,13 +142,26 @@ pub fn validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
             }
             first_bad
         });
-        let whole = s.spawn(move || {
+        // block_rx moved into the failed closure is dropped with it; nothing to join.
+        let blocks = blocks.map_err(spawn_err)?;
+        let whole = std::thread::Builder::new().spawn_scoped(s, move || {
             let mut h = Sha256::new();
             for block in file_rx {
                 h.update(&block[..]);
             }
             file_hash.is_none_or(|expected| STANDARD.encode(h.finalize()) == expected)
         });
+        let whole = match whole {
+            Ok(w) => w,
+            Err(e) => {
+                // Close the block channel so the first worker ends, and join it before returning.
+                drop(block_tx);
+                blocks
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p));
+                return Err(spawn_err(e));
+            }
+        };
         let mut db = Vec::with_capacity(cap);
         let produced = (|| -> Result<(), IndexError> {
             loop {
