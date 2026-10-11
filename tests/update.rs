@@ -320,6 +320,10 @@ fn background_refresh_backs_off_after_an_attempt() {
     let stale = HttpState::default();
     let now = 10_000;
     assert!(background_due(&stale, &["u"], None, now), "nunca tentou");
+    assert!(
+        !background_due(&stale, &["u"], Some(now), now),
+        "tentativa agora: espera"
+    );
     assert!(!background_due(
         &stale,
         &["u"],
@@ -354,6 +358,10 @@ fn claim_records_the_attempt_and_refuses_a_second_claim_inside_the_window() {
     assert!(claim_background_refresh(&data, &urls, 10_000));
     let read = || std::fs::read_to_string(data.refresh_attempt_path()).unwrap();
     assert_eq!(read().trim(), "10000");
+    assert!(
+        !claim_background_refresh(&data, &urls, 10_000),
+        "mesmo instante"
+    );
     assert!(!claim_background_refresh(&data, &urls, 10_060));
     assert_eq!(read().trim(), "10000", "recusa não regrava");
     assert!(claim_background_refresh(&data, &urls, 10_000 + RETRY_SECS));

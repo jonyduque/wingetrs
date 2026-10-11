@@ -21,3 +21,5 @@ Mutation proofs (all "[OK] mutação PEGA"):
 Decisions: claim_background_refresh calls needs_refresh before reading the attempt file (reviewer focus b); removed now-unused imports (HttpState, needs_refresh) in cli/mod.rs.
 
 Concerns: none. leftovers.ps1 listed only pre-existing unrelated processes (bash/python from 10/10).
+
+Follow-up (review Minor): pinned boundary at attempt instant. Mutation: [OK] mutação PEGA: 't > now || now - t' -> 't >= now || now - t' fez o teste falhar (exit 101).
