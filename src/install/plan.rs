@@ -88,6 +88,8 @@ pub struct UninstallPlan {
     /// Also delete `persist\<app>`.
     pub purge: bool,
     pub artifacts: Vec<crate::install::state::Artifact>,
+    /// PATH entries of this app that other apps still record: `(entry, other apps)`.
+    pub path_users: Vec<(String, Vec<String>)>,
     /// Remove each recorded PATH entry that no other app still records (checked at execution).
     pub remove_path_entry: bool,
 }
@@ -99,13 +101,59 @@ impl UninstallPlan {
         app: &str,
         purge: bool,
     ) -> Result<Option<UninstallPlan>, crate::install::state::StateError> {
-        Ok(state.get(app)?.map(|(rec, artifacts)| UninstallPlan {
+        use crate::install::state::ArtifactKind;
+        let Some((rec, artifacts)) = state.get(app)? else {
+            return Ok(None);
+        };
+        let mut path_users = Vec::new();
+        for a in artifacts.iter().filter(|a| a.kind == ArtifactKind::Path) {
+            let users = state.path_users(app, &a.target)?;
+            if !users.is_empty() {
+                path_users.push((a.target.clone(), users));
+            }
+        }
+        Ok(Some(UninstallPlan {
             app: app.to_string(),
             version: rec.version,
             purge,
             artifacts,
+            path_users,
             remove_path_entry: true,
         }))
+    }
+
+    /// One user-facing line per artifact, in `artifacts` order.
+    pub fn artifact_lines(&self) -> Vec<String> {
+        use crate::install::state::ArtifactKind as K;
+        self.artifacts
+            .iter()
+            .map(|a| match a.kind {
+                K::Path => match self.path_users.iter().find(|(t, _)| *t == a.target) {
+                    Some((_, users)) => format!(
+                        "Manter entrada no PATH: {} (ainda usada por: {})",
+                        a.target,
+                        users.join(", ")
+                    ),
+                    None => format!("Desfazer entrada no PATH: {}", a.target),
+                },
+                K::Persist if self.purge => {
+                    format!("Apagar {} (dados persistentes)", a.target)
+                }
+                K::Persist => format!("Manter {} (dados persistentes; use --purge)", a.target),
+                other => format!("Desfazer {}: {}", artifact_kind(other), a.target),
+            })
+            .collect()
+    }
+}
+
+fn artifact_kind(k: crate::install::state::ArtifactKind) -> &'static str {
+    use crate::install::state::ArtifactKind as K;
+    match k {
+        K::Shim => "atalho de linha de comando",
+        K::Shortcut => "atalho do Menu Iniciar",
+        K::Persist => "dados persistentes",
+        K::Path => "entrada no PATH",
+        K::Env => "variável de ambiente",
     }
 }
 

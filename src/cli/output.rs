@@ -212,17 +212,6 @@ pub fn not_found_text(query: &str, suggestions: &[String]) -> String {
     }
 }
 
-fn artifact_kind(k: crate::install::state::ArtifactKind) -> &'static str {
-    use crate::install::state::ArtifactKind as K;
-    match k {
-        K::Shim => "atalho de linha de comando",
-        K::Shortcut => "atalho do Menu Iniciar",
-        K::Persist => "dados persistentes",
-        K::Path => "entrada no PATH",
-        K::Env => "variável de ambiente",
-    }
-}
-
 /// What `uninstall` is about to do, one numbered line per action.
 pub fn uninstall_plan_text(
     plan: &crate::install::plan::UninstallPlan,
@@ -235,20 +224,7 @@ pub fn uninstall_plan_text(
         n += 1;
     };
     line(format!("Apagar {}", layout.app_dir(&plan.app).display()));
-    for a in &plan.artifacts {
-        let text = match a.kind {
-            crate::install::state::ArtifactKind::Persist if plan.purge => {
-                format!("Apagar {} ({})", a.target, artifact_kind(a.kind))
-            }
-            crate::install::state::ArtifactKind::Persist => {
-                format!(
-                    "Manter {} ({}; use --purge)",
-                    a.target,
-                    artifact_kind(a.kind)
-                )
-            }
-            _ => format!("Desfazer {}: {}", artifact_kind(a.kind), a.target),
-        };
+    for text in plan.artifact_lines() {
         line(text);
     }
     s

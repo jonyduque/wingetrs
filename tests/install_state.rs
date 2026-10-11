@@ -142,3 +142,118 @@ fn scan_lists_valid_and_broken_apps() {
     assert_eq!(apps[1].version.as_deref(), Some("1.0"));
     assert_eq!(apps[1].scoop_bucket.as_deref(), Some("extras"));
 }
+
+#[allow(clippy::unwrap_used)]
+fn shared_path_db(dir: &std::path::Path) -> StateDb {
+    let mut db = StateDb::open(&dir.join("state.db")).unwrap();
+    db.record(
+        &rec("a", "1"),
+        &[
+            art(ArtifactKind::Path, r"C:\R\shims", None),
+            art(ArtifactKind::Path, r"C:\R\apps\a\current\bin", None),
+            art(ArtifactKind::Shim, "rg", None),
+        ],
+    )
+    .unwrap();
+    db.record(
+        &rec("b", "1"),
+        &[art(ArtifactKind::Path, r"c:\r\shims\", None)],
+    )
+    .unwrap();
+    db.record(
+        &rec("c", "1"),
+        &[art(ArtifactKind::Env, r"C:\R\shims", None)],
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn uninstall_plan_keeps_a_shared_path_entry_and_undoes_its_own() {
+    use wingetrs::install::plan::UninstallPlan;
+    let dir = tempfile::tempdir().unwrap();
+    let db = shared_path_db(dir.path());
+    let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
+    assert_eq!(
+        plan.path_users,
+        vec![(r"C:\R\shims".to_string(), vec!["b".to_string()])]
+    );
+    assert_eq!(
+        plan.artifact_lines(),
+        vec![
+            r"Manter entrada no PATH: C:\R\shims (ainda usada por: b)".to_string(),
+            r"Desfazer entrada no PATH: C:\R\apps\a\current\bin".to_string(),
+            "Desfazer atalho de linha de comando: rg".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn uninstall_plan_lists_every_other_user_of_the_entry() {
+    use wingetrs::install::plan::UninstallPlan;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    for app in ["a", "b", "c"] {
+        db.record(
+            &rec(app, "1"),
+            &[art(ArtifactKind::Path, r"C:\R\shims", None)],
+        )
+        .unwrap();
+    }
+    let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
+    assert!(
+        plan.artifact_lines()[0].ends_with("(ainda usada por: b, c)"),
+        "{:?}",
+        plan.artifact_lines()
+    );
+}
+
+#[test]
+fn uninstall_plan_text_is_unchanged_without_shared_entries() {
+    use wingetrs::install::plan::UninstallPlan;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    db.record(
+        &rec("a", "1"),
+        &[
+            art(ArtifactKind::Path, r"C:\R\shims", None),
+            art(ArtifactKind::Persist, "conf", None),
+        ],
+    )
+    .unwrap();
+    let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
+    assert_eq!(
+        wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R")),
+        "Desinstalar a 1\n  1. Apagar C:\\R\\apps\\a\n  2. Desfazer entrada no PATH: C:\\R\\shims\n  3. Manter conf (dados persistentes; use --purge)\n"
+    );
+}
+
+#[test]
+fn uninstall_plan_text_says_kept_when_shared() {
+    use wingetrs::install::plan::UninstallPlan;
+    let dir = tempfile::tempdir().unwrap();
+    let db = shared_path_db(dir.path());
+    let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
+    let text = wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R"));
+    assert!(text.contains(r"Manter entrada no PATH: C:\R\shims (ainda usada por: b)"));
+    assert!(!text.contains(r"Desfazer entrada no PATH: C:\R\shims"));
+}
+
+#[test]
+fn uninstall_plan_only_path_artifacts_consult_other_users() {
+    use wingetrs::install::plan::UninstallPlan;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    db.record(
+        &rec("a", "1"),
+        &[art(ArtifactKind::Shim, r"C:\R\shims", None)],
+    )
+    .unwrap();
+    db.record(
+        &rec("b", "1"),
+        &[art(ArtifactKind::Path, r"C:\R\shims", None)],
+    )
+    .unwrap();
+    let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
+    assert!(plan.path_users.is_empty(), "{:?}", plan.path_users);
+}

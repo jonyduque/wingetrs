@@ -578,6 +578,7 @@ fn u_removes_only_wingetrs_apps_on_installed_tab() {
         version: "1".into(),
         purge: false,
         artifacts: vec![],
+        path_users: vec![],
         remove_path_entry: true,
     };
     update(

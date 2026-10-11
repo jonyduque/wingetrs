@@ -310,3 +310,19 @@ fn read_catalog_of_a_good_catalog_lists_its_entries() {
     drop(c);
     assert_eq!(jobs::read_catalog(&path).unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn plan_remove_text_uses_the_plan_lines() {
+    let mut w = World::new().await;
+    w.add("leaf").await;
+    let ctx = w.ctx(LockWait::NoWait, &quiet);
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf") else {
+        panic!("expected Ready");
+    };
+    jobs::run_action(&ctx, action).await.unwrap();
+    let Ok(Planned::Ready { text, .. }) = jobs::plan_remove(&ctx, "leaf") else {
+        panic!("expected Ready");
+    };
+    assert!(text.contains("Desfazer entrada no PATH: "), "{text}");
+    assert!(!text.contains("Path ") && !text.contains("Shim "), "{text}");
+}

@@ -99,8 +99,8 @@ pub fn plan_install(c: &OpsCtx<'_>, source_name: &str, id: &str) -> Result<Plann
 pub fn plan_remove(c: &OpsCtx<'_>, app: &str) -> Result<Planned, String> {
     let plan = ops::plan_uninstall(c, app, false).map_err(|e| e.to_string())?;
     let mut text = format!("Remover {} {}\n", plan.app, plan.version);
-    for a in &plan.artifacts {
-        text.push_str(&format!("  - {:?} {}\n", a.kind, a.target));
+    for l in plan.artifact_lines() {
+        text.push_str(&format!("  - {l}\n"));
     }
     text.push_str("Os dados persistentes do app são mantidos.\n");
     Ok(Planned::Ready {
