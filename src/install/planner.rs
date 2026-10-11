@@ -235,6 +235,10 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         if !crate::install::shim::is_safe_shim_name(&name) {
             return Err(PlanError::UnsafePath(name));
         }
+        // The target is written into `.shim`/`.cmd` text: no line breaks or quotes.
+        if b.path.chars().any(|c| c.is_control() || c == '"') {
+            return Err(PlanError::UnsafePath(format!("{:?}", b.path)));
+        }
         let args = b.args.as_deref().map(sub);
         if let Some(a) = args.as_deref().filter(|a| a.chars().any(char::is_control)) {
             return Err(PlanError::UnsafeArgs(format!("{a:?}")));

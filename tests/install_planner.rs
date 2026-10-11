@@ -441,11 +441,29 @@ fn empty_alias_falls_back_to_the_file_stem() {
 
 #[test]
 fn unsafe_shim_alias_is_refused_by_the_planner() {
-    for alias in ["..\\\\evil", "a/b", "CON", "x."] {
+    for alias in [
+        "..\\\\evil",
+        "a/b",
+        "CON",
+        "x.",
+        "a/",
+        ".\\\\a",
+        "a\\u0001b",
+        "a|b",
+        "a*b",
+    ] {
         let r = plan_bin(&format!(r#"[["a.exe","{alias}"]]"#));
         assert!(matches!(r, Err(PlanError::UnsafePath(_))), "{alias}: {r:?}");
     }
     assert!(plan_bin(r#"[["a.exe","ok"]]"#).is_ok());
+}
+
+#[test]
+fn control_characters_and_quotes_in_bin_paths_are_refused() {
+    for p in [r#""a\r\nargs = evil.exe""#, r#""a\".exe""#] {
+        let r = plan_bin(&format!(r#"[[{p},"ok"]]"#));
+        assert!(matches!(r, Err(PlanError::UnsafePath(_))), "{p}: {r:?}");
+    }
 }
 
 #[test]
