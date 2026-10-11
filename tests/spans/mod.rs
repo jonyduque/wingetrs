@@ -7,9 +7,19 @@ use tracing_subscriber::registry::LookupSpan;
 pub type Row = (String, String, String, tracing::Level);
 
 #[derive(Clone, Default)]
-pub struct Closed(pub Arc<Mutex<Vec<Row>>>);
+/// Rows of spans that were entered at least once, plus `(child name, parent name)` pairs.
+pub struct Closed(
+    pub Arc<Mutex<Vec<Row>>>,
+    pub Arc<Mutex<Vec<(String, String)>>>,
+);
 
 struct Kind(String);
+
+/// Parent span name (empty = root) and whether the span was ever entered.
+struct Info {
+    parent: String,
+    entered: bool,
+}
 
 struct KindVisitor(Option<String>);
 
@@ -45,8 +55,28 @@ where
     ) {
         let mut v = KindVisitor(None);
         attrs.record(&mut v);
-        if let (Some(span), Some(k)) = (ctx.span(id), v.0) {
-            span.extensions_mut().insert(Kind(k));
+        let parent = ctx
+            .span(id)
+            .and_then(|s| s.parent())
+            .map(|p| p.name().to_string())
+            .unwrap_or_default();
+        if let Some(span) = ctx.span(id) {
+            let mut ext = span.extensions_mut();
+            if let Some(k) = v.0 {
+                ext.insert(Kind(k));
+            }
+            ext.insert(Info {
+                parent,
+                entered: false,
+            });
+        }
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(id)
+            && let Some(i) = span.extensions_mut().get_mut::<Info>()
+        {
+            i.entered = true;
         }
     }
 
@@ -58,8 +88,21 @@ where
                 .map(|k| k.0.clone())
                 .unwrap_or_default();
             let m = span.metadata();
+            let (parent, entered) = span
+                .extensions()
+                .get::<Info>()
+                .map(|i| (i.parent.clone(), i.entered))
+                .unwrap_or_default();
+            if !entered {
+                return;
+            }
             CURRENT.with(|c| {
                 if let Some(closed) = c.borrow().as_ref() {
+                    closed
+                        .1
+                        .lock()
+                        .unwrap()
+                        .push((m.name().to_string(), parent));
                     closed.0.lock().unwrap().push((
                         m.name().to_string(),
                         kind,
@@ -86,6 +129,17 @@ impl Closed {
                     format!("{n}:{k}")
                 }
             })
+            .collect()
+    }
+
+    /// Parent names seen for spans called `name` (empty string = no parent).
+    pub fn parents(&self, name: &str) -> Vec<String> {
+        self.1
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, p)| p.clone())
             .collect()
     }
 

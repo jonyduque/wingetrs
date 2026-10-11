@@ -302,6 +302,11 @@ async fn update_emits_a_fetch_span_per_source_and_parse_only_for_downloaded_ones
     assert_eq!(closed.count("update.lock"), 1, "{:?}", closed.names());
     assert_eq!(closed.count("update.fetch"), 3, "{:?}", closed.names());
     assert_eq!(closed.count("update.parse"), 2, "extras falha antes de ler");
+    assert_eq!(
+        closed.parents("update.parse"),
+        ["update.fetch", "update.fetch"],
+        "parse must run inside its fetch span"
+    );
     assert_eq!(closed.count("update.catalog_write"), 2);
     assert_eq!(closed.count("update.state_save"), 1);
     assert_eq!(closed.count("update.search_idx"), 1);
