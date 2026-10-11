@@ -16,9 +16,10 @@ use crate::tui::view::view;
 use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update};
 use anyhow::Context;
 use crossterm::event::{Event, EventStream};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
@@ -189,7 +190,7 @@ async fn event_loop(
             });
             let jobs = futures_util::stream::poll_fn(|cx| rx.poll_recv(cx));
             let mut queued = futures_util::stream::select(keys, jobs);
-            drain_ready(first, &mut queued, BATCH_CAP)
+            drain_ready(first, &mut queued, BATCH_CAP).await
         };
         if let Some(e) = input_err {
             return Err(e.into());
@@ -255,17 +256,19 @@ pub fn spinner_ticker() -> tokio::time::Interval {
 }
 
 /// `first` followed by whatever `more` already has ready, without waiting; at most `cap` items.
-pub fn drain_ready<S: futures_util::Stream<Item = Msg> + Unpin>(
+/// `more` is polled with the calling task's waker: crossterm's `EventStream` keeps the first
+/// waker it sees while pending, so a throwaway waker here would leave the loop asleep.
+pub async fn drain_ready<S: futures_util::Stream<Item = Msg> + Unpin>(
     first: Msg,
     more: &mut S,
     cap: usize,
 ) -> Vec<Msg> {
     let mut batch = vec![first];
     while batch.len() < cap {
-        match more.next().now_or_never() {
-            Some(Some(m)) => batch.push(m),
+        match std::future::poll_fn(|cx| Poll::Ready(more.poll_next_unpin(cx))).await {
+            Poll::Ready(Some(m)) => batch.push(m),
             // Nothing ready, or the stream ended.
-            Some(None) | None => break,
+            Poll::Ready(None) | Poll::Pending => break,
         }
     }
     batch
@@ -327,8 +330,9 @@ fn startup_needs_refresh(ctx: &Ctx) -> bool {
 
 fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
     let ctx = Arc::clone(ctx);
+    let tx = ctx.tx.clone();
     let _ = ctx.tx.send(Msg::RefreshStarted);
-    tokio::spawn(async move {
+    let work = tokio::spawn(async move {
         let failed = |message: String| {
             vec![crate::update::SourceReport {
                 source: "update".into(),
@@ -341,16 +345,32 @@ fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
         let reports = match Endpoints::production(&ctx.cfg) {
             Ok(ep) => match run_update(&ctx.data, &ep, &ctx.http, force, LockWait::NoWait).await {
                 Ok(r) => r,
-                Err(UpdateError::Busy) => {
-                    let _ = ctx.tx.send(Msg::RefreshBusy);
-                    return;
-                }
+                Err(UpdateError::Busy) => return Msg::RefreshBusy,
                 Err(e) => failed(e.to_string()),
             },
             Err(e) => failed(e.to_string()),
         };
-        let _ = ctx.tx.send(Msg::RefreshFinished(reports));
+        Msg::RefreshFinished(reports)
     });
+    tokio::spawn(async move {
+        let _ = tx.send(join_refresh(work).await);
+    });
+}
+
+/// Awaits the refresh task: a panic travels to the loop as `Msg::Panicked`, a cancellation
+/// finishes the refresh as failed, so `refreshing` never stays on.
+pub async fn join_refresh(h: tokio::task::JoinHandle<Msg>) -> Msg {
+    match h.await {
+        Ok(msg) => msg,
+        Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
+        Err(e) => Msg::RefreshFinished(vec![crate::update::SourceReport {
+            source: "update".into(),
+            outcome: crate::update::Outcome::Failed {
+                message: format!("tarefa cancelada: {e}"),
+                offline: false,
+            },
+        }]),
+    }
 }
 
 fn spawn_reload(ctx: &Arc<Ctx>) {
