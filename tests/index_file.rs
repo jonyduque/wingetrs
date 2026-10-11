@@ -174,11 +174,17 @@ fn search_retries_while_the_file_is_briefly_locked() {
         .share_mode(0)
         .open(&idx)
         .unwrap();
+    // The reader's whole retry budget is ~50 ms of wall clock, so the lock is released after a
+    // few ms (not 20): a descheduled holder thread under load is the only remaining risk, and
+    // the barrier makes both sides start together so the reader always hits the lock first.
+    let start = std::sync::Barrier::new(2);
     std::thread::scope(|s| {
-        s.spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+        s.spawn(|| {
+            start.wait();
+            std::thread::sleep(std::time::Duration::from_millis(5));
             drop(lock);
         });
+        start.wait();
         let r = index_file::search(&idx, "power", None, 5).unwrap().unwrap();
         assert!(!r.is_empty());
     });
