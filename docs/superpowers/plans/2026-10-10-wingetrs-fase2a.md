@@ -1421,3 +1421,815 @@ Testes:
 3. O orquestrador roda `wingetrs update` real e confere que o log do dia não ganha linhas `h2`/`hyper` de nível < WARN.
 
 **Commit:** `fix(log): filter the file log to wingetrs and keep 14 days`
+
+## Robustez e medição (Tasks 44–47)
+
+Origem: revisão pós-Task 43. `spawn_boot`/`spawn_reload` da TUI descartam o handle de `spawn_blocking` (pânico engolido) e `spawn_boot` troca erro de catálogo por lista vazia; não há spans por etapa em install/update (relatório da fase 2a §3: "não medido (sem spans)"); `upgrade` carrega o catálogo inteiro por app; `update --background` é redisparado a cada comando depois de uma falha.
+
+### Task 44: Tarefas de fundo da TUI aguardadas e erro de catálogo visível
+
+#### Where this fits
+
+Independente das outras desta leva (só TUI e scripts do gate). Hoje, em `src/tui/run.rs`:
+
+- `spawn_boot` (~:176–192) chama `tokio::task::spawn_blocking(..)` e descarta o handle: se o trabalho entra em pânico, o tokio guarda o pânico num handle que ninguém lê. Pior: `Catalog::open(..).and_then(load_entries).unwrap_or_default()` (:179–181) transforma um catálogo ilegível (corrompido, travado) numa lista **vazia sem aviso**.
+- `spawn_reload` (~:233–243) também descarta o handle (o erro só vai para o log).
+- `spawn_scan` (~:245–281) aguarda o handle, mas **engole** o pânico: `Err(e)` com `e.is_panic()` vira `Msg::InstalledFailed("pânico interno")` (:270–276).
+
+A TUI já tem o mecanismo certo para trabalho bloqueante: `spawn_job` (`src/tui/run.rs` ~385–398) aguarda o handle via `jobs::join_job` (`src/tui/jobs.rs` ~45), que transforma pânico em `Msg::Panicked`; o laço chama `jobs::propagate` (:132), que faz `resume_unwind`; `run` (:65–73) restaura o terminal e re-lança. Esta tarefa põe boot, reload e scan nesse caminho e cria a regra mecânica que impede a volta do handle descartado.
+
+**Por que re-lançar e não mostrar "pânico interno":** a regra do CLAUDE.md manda propagar com `resume_unwind`; pânico é bug, e mostrar status com resultado parcial é exatamente "pânico engolido". O laço já restaura o terminal antes de re-lançar, então o usuário vê a mensagem do pânico num terminal sadio.
+
+#### What binds this task
+
+1. **Boot pelo canal de mensagens.** Remova o `oneshot`/`struct Boot`/variável `booting` do `event_loop`. Nova variante em `src/tui/app.rs`:
+   ```rust
+   /// Startup load finished: the catalog (or why it could not be read), its age and
+   /// whether the startup refresh is due.
+   Booted {
+       catalog: Result<Vec<PackageEntry>, String>,
+       age: Option<i64>,
+       needs_refresh: bool,
+   },
+   ```
+   `spawn_boot(ctx)` vira `spawn_job(ctx, |c, _| boot_msg(c))`, com `boot_msg` em `run.rs` montando `Msg::Booted { catalog: jobs::read_catalog(&c.data.catalog_path()), age: index_age(&c.data), needs_refresh: startup_needs_refresh(c) }`.
+2. **`update` trata `Booted`** (função pura, testável): `app.status = None`; `app.index_age_secs = age`; `Ok(entries)` ⇒ mesmo efeito de `CatalogLoaded` (`SearchIndex::new`, `research`, `clamp`); `Err(e)` ⇒ **mantém** o índice atual e põe `app.status = Some(format!("falha ao ler o catálogo: {e}"))`. Devolve `vec![Cmd::ScanInstalled]` e acrescenta `Cmd::Refresh { force: false }` quando `catalog` é `Err`, ou `Ok` vazio, ou `needs_refresh` — nessa ordem (é a ordem atual: `spawn_scan` depois `spawn_refresh`, run.rs :124–127).
+3. **Nova variante `Msg::CatalogFailed(String)`**: `update` mantém o índice atual e põe `app.status = Some(format!("falha ao ler o catálogo: {e}"))`. `spawn_reload` vira `spawn_job(ctx, |c, _| match jobs::read_catalog(&c.data.catalog_path()) { Ok(e) => Msg::CatalogLoaded(e), Err(e) => Msg::CatalogFailed(e) })`.
+4. **Nova `pub fn read_catalog(path: &Path) -> Result<Vec<PackageEntry>, String>` em `src/tui/jobs.rs`**: `Catalog::open(path).and_then(|c| c.load_entries()).map_err(|e| e.to_string())`. Nunca devolve vazio no lugar de erro.
+5. **`spawn_scan` via `spawn_job`**: o corpo atual (thread de tracking juntada em todos os caminhos, `catch_unwind` + `resume_unwind`) fica igual dentro da closure, que devolve `Msg::InstalledLoaded(rows)` ou, em erro de correlação, `Msg::InstalledFailed(e.to_string())`. O ramo `is_panic() ⇒ "pânico interno"` desaparece (o `join_job` leva o pânico ao laço).
+6. **Regra mecânica em `scripts/check_rules.ps1`**: uma linha de código de produção (fora de `#[cfg(test)]` e de comentário, como as regras atuais) que contém `spawn_blocking(` só passa se o handle estiver **ligado**: `let <nome> =` na mesma linha (nome que **não** começa com `_`; `let _ =` e `let _h =` também descartam/soltam o handle), ou a linha de código anterior terminar em `let <nome> =` (forma do rustfmt em `src/update.rs` :159–160), ou `.await` na mesma linha, ou a linha seguinte começar com `.await`. Senão: violação `[spawn_blocking sem handle]`. **Atenção ao índice −1:** em PowerShell `$lines[-1]` é a **última** linha; a checagem da linha anterior exige `$i -gt 0`.
+7. **O instrumento é provado no menor caso** (ARMADILHAS "Instrumento que para de vigiar em silêncio"): `check_rules.ps1` ganha `param([string]$Path = 'src')` (o gate continua chamando sem argumento) e um novo `scripts/check_rules_selftest.ps1` planta cada caso num diretório temporário próprio, roda `check_rules.ps1 -Path <dir>` e compara o exit. O `verify.ps1` roda o selftest logo depois de `rules`.
+
+Fora de escopo (registrar no relatório, não implementar): `spawn_refresh` (:205–231) e `spawn_details` (:284–298) descartam o handle de `tokio::spawn`; um pânico em `run_update` deixaria `app.refreshing` preso. A regra mecânica desta tarefa é só para `spawn_blocking`.
+
+**Files:**
+- Modify: `src/tui/run.rs`, `src/tui/app.rs`, `src/tui/jobs.rs`, `scripts/check_rules.ps1`, `scripts/verify.ps1`
+- Create (new): `scripts/check_rules_selftest.ps1`
+- Test: `tests/tui_state.rs`, `tests/tui_jobs.rs`
+
+Código do bloco novo em `scripts/check_rules.ps1` (dentro do `for`, depois do `foreach ($r in $rules)`, portanto já depois dos `continue` de teste e de comentário):
+
+```powershell
+        # Task 44: a dropped spawn_blocking handle lets tokio swallow the worker panic.
+        # Bound = `let <name> =` (name not starting with `_`) on this line or ending the previous
+        # line, or `.await` on this line or starting the next one.
+        if ($line -match '\bspawn_blocking\s*\(') {
+            $bound = ($line -match '\blet\s+(mut\s+)?[A-Za-z]\w*\s*(:[^=]+)?=.*spawn_blocking') -or
+                     ($line -match 'spawn_blocking.*\.await')
+            # $i -gt 0: $lines[-1] is the LAST line in PowerShell, not "no line".
+            if (-not $bound -and $i -gt 0) {
+                $bound = $lines[$i - 1] -match '\blet\s+(mut\s+)?[A-Za-z]\w*\s*(:[^=]+)?=\s*$'
+            }
+            if (-not $bound -and $i + 1 -lt $lines.Count) {
+                $bound = $lines[$i + 1] -match '^\s*\.await'
+            }
+            if (-not $bound) {
+                $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'spawn_blocking sem handle', $line.Trim()
+            }
+        }
+```
+
+E no topo, logo depois do bloco `<# ... #>`: `[CmdletBinding()] param([string]$Path = 'src')`; troque `Get-ChildItem -Recurse -File -Path src` por `-Path $Path`.
+
+`scripts/check_rules_selftest.ps1` (literal):
+
+```powershell
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Proves check_rules.ps1 still sees violations: plants each case in its own temp dir, runs the
+    checker on it and compares the exit code. Exit 0 = every case behaved, 1 = the instrument went blind.
+#>
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$checker = Join-Path $PSScriptRoot 'check_rules.ps1'
+$bound = @(
+    'async fn a() -> u8 {',
+    '    let h = tokio::task::spawn_blocking(|| 1);',
+    '    let lock =',
+    '        tokio::task::spawn_blocking(|| 2)',
+    '            .await;',
+    '    let r = spawn_blocking(|| 3).await;',
+    '    let job: JoinHandle<u8> = tokio::task::spawn_blocking(|| 4);',
+    '    // tokio::task::spawn_blocking(|| 5);',
+    '    tokio::task::spawn_blocking(|| 6)',
+    '        .await',
+    '}'
+) -join "`n"
+$cases = @(
+    @{ Name = 'arquivo vazio'; Text = ''; Want = 0 },
+    @{ Name = 'uma linha, caminho completo'; Text = 'fn f() { tokio::task::spawn_blocking(|| 1); }'; Want = 1 },
+    @{ Name = 'uma linha, nome curto'; Text = 'fn f() { spawn_blocking(|| 1); }'; Want = 1 },
+    @{ Name = 'let _ ='; Text = 'let _ = tokio::task::spawn_blocking(|| 1);'; Want = 1 },
+    @{ Name = 'let _h ='; Text = 'let _h = tokio::task::spawn_blocking(|| 1);'; Want = 1 },
+    @{ Name = '1a linha nao olha a ultima'; Text = "tokio::task::spawn_blocking(|| 1);`nlet x ="; Want = 1 },
+    @{ Name = 'forma do spawn_boot'; Text = "fn f(c: u8) {`n    let c = c;`n    tokio::task::spawn_blocking(move || {`n        let _ = c;`n    });`n}"; Want = 1 },
+    @{ Name = 'formas ligadas'; Text = $bound; Want = 0 },
+    @{ Name = 'regra antiga viva'; Text = 'fn f() { println!("x"); }'; Want = 1 }
+)
+$base = Join-Path ([IO.Path]::GetTempPath()) ("check_rules_selftest-" + [guid]::NewGuid())
+$bad = @()
+try {
+    $n = 0
+    foreach ($c in $cases) {
+        $n++
+        $dir = Join-Path $base "case$n"
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dir 'x.rs'), $c.Text)
+        pwsh -NoProfile -File $checker -Path $dir *> $null
+        if ($LASTEXITCODE -ne $c.Want) { $bad += "  [$($c.Name)] exit $LASTEXITCODE, esperado $($c.Want)" }
+    }
+} finally {
+    Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
+}
+if ($bad.Count -gt 0) { $bad; exit 1 }
+"[OK] check_rules: $($cases.Count) casos plantados"
+exit 0
+```
+
+Em `scripts/verify.ps1`, logo depois do passo `rules`:
+`@{ Name = 'rules-selftest'; Cmd = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'check_rules_selftest.ps1') 2>&1 } },`
+
+Ordem TDD: (a) acrescente a regra e o selftest **antes** de mexer em `run.rs`; `pwsh -File scripts/check_rules.ps1` deve sair 1 apontando `src/tui/run.rs` nas linhas de `spawn_boot` e `spawn_reload` — cole essa saída no relatório; (b) depois corrija a TUI e veja sair 0.
+
+Testes (corpos literais):
+
+1. `boot_with_an_unreadable_catalog_keeps_entries_shows_the_error_and_refreshes` (`tests/tui_state.rs`):
+   ```rust
+   #[test]
+   fn boot_with_an_unreadable_catalog_keeps_entries_shows_the_error_and_refreshes() {
+       let mut a = app();
+       let before = a.search.entries().len();
+       assert!(before > 0);
+       let cmds = update(
+           &mut a,
+           Msg::Booted {
+               catalog: Err("file is not a database".into()),
+               age: None,
+               needs_refresh: false,
+           },
+       );
+       let status = a.status.clone().unwrap_or_default();
+       assert!(status.contains("falha ao ler o catálogo"), "{status}");
+       assert!(status.contains("file is not a database"), "{status}");
+       assert_eq!(a.search.entries().len(), before);
+       assert_eq!(cmds, vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]);
+   }
+   ```
+2. `boot_with_a_populated_fresh_catalog_loads_it_and_does_not_refresh` (`tests/tui_state.rs`):
+   ```rust
+   #[test]
+   fn boot_with_a_populated_fresh_catalog_loads_it_and_does_not_refresh() {
+       let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+       a.status = Some("carregando catálogo…".into());
+       let cmds = update(
+           &mut a,
+           Msg::Booted {
+               catalog: Ok(vec![
+                   entry(SourceKind::Scoop, "ripgrep", "ripgrep"),
+                   entry(SourceKind::Winget, "Zeal.Zeal", "Zeal"),
+               ]),
+               age: Some(42),
+               needs_refresh: false,
+           },
+       );
+       assert_eq!(a.search.entries().len(), 2);
+       assert_eq!(a.status, None);
+       assert_eq!(a.index_age_secs, Some(42));
+       assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+   }
+   ```
+3. `boot_refreshes_when_the_catalog_is_empty_or_stale` (`tests/tui_state.rs`):
+   ```rust
+   #[test]
+   fn boot_refreshes_when_the_catalog_is_empty_or_stale() {
+       let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+       let cmds = update(
+           &mut a,
+           Msg::Booted { catalog: Ok(vec![]), age: None, needs_refresh: false },
+       );
+       assert_eq!(cmds, vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]);
+       let mut b = App::new(Vec::new(), GlyphSet::Nerd);
+       let cmds = update(
+           &mut b,
+           Msg::Booted {
+               catalog: Ok(vec![entry(SourceKind::Scoop, "ripgrep", "ripgrep")]),
+               age: Some(5000),
+               needs_refresh: true,
+           },
+       );
+       assert_eq!(cmds, vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]);
+   }
+   ```
+4. `a_failed_reload_keeps_the_entries_and_shows_the_error` (`tests/tui_state.rs`):
+   ```rust
+   #[test]
+   fn a_failed_reload_keeps_the_entries_and_shows_the_error() {
+       let mut a = app();
+       let before = a.search.entries().len();
+       assert!(before > 0);
+       update(&mut a, Msg::CatalogFailed("database is locked".into()));
+       assert_eq!(a.search.entries().len(), before);
+       let status = a.status.clone().unwrap_or_default();
+       assert!(status.contains("falha ao ler o catálogo"), "{status}");
+       assert!(status.contains("database is locked"), "{status}");
+   }
+   ```
+5. `read_catalog_reports_an_unreadable_file_instead_of_an_empty_list` e `read_catalog_of_a_good_catalog_lists_its_entries` (`tests/tui_jobs.rs`):
+   ```rust
+   #[test]
+   fn read_catalog_reports_an_unreadable_file_instead_of_an_empty_list() {
+       let dir = tempfile::tempdir().unwrap();
+       let path = dir.path().join("catalog.db");
+       std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+       let err = jobs::read_catalog(&path).unwrap_err();
+       assert!(!err.is_empty());
+   }
+
+   #[test]
+   fn read_catalog_of_a_good_catalog_lists_its_entries() {
+       let dir = tempfile::tempdir().unwrap();
+       let path = dir.path().join("catalog.db");
+       let mut c = Catalog::open(&path).unwrap();
+       c.replace_source(
+           "scoop:main",
+           SourceKind::Scoop,
+           "v",
+           1,
+           &[NewPackage {
+               id: "ripgrep".into(),
+               name: "ripgrep".into(),
+               version: "1".into(),
+               ..Default::default()
+           }],
+           &WingetMaps::default(),
+       )
+       .unwrap();
+       drop(c);
+       assert_eq!(jobs::read_catalog(&path).unwrap().len(), 1);
+   }
+   ```
+   (Acrescente os `use` que faltarem: `wingetrs::catalog::{Catalog, NewPackage, WingetMaps}`, `wingetrs::core::SourceKind`.)
+6. Os testes existentes de pânico continuam valendo para o novo caminho: `a_worker_panic_reaches_the_main_loop_and_is_reraised` (`tests/tui_jobs.rs`) e `update_reraises_a_worker_panic` (`tests/tui_state.rs`).
+7. `pwsh -File scripts/check_rules_selftest.ps1` ⇒ `[OK] check_rules: 9 casos plantados`, exit 0 (colar no relatório).
+
+#### Checks beyond the steps
+
+Rode cada uma com `pwsh -File scripts/mutate.ps1 -Path <arquivo> -Anchor '<texto exato>' -Replacement '<texto>' -TestCommand '<comando>'`; todas devem ser PEGAS.
+
+1. Erro de catálogo vira vazio: no ramo `Err` do `Booted` em `src/tui/app.rs`, troque o tratamento por o de `Ok(Vec::new())` (índice vazio, status `None`) ⇒ PEGA (teste 1). `-TestCommand 'cargo test --quiet --test tui_state boot_'`.
+2. Refresh no boot: troque a condição do `Cmd::Refresh` por só `needs_refresh` ⇒ PEGA (testes 1 e 3).
+3. Reload que falha apaga a lista: faça `CatalogFailed` também zerar `app.search` ⇒ PEGA (teste 4).
+4. `read_catalog` engolindo: troque o `map_err(..)` por `.or_else(|_| Ok(Vec::new()))` ⇒ PEGA (teste 5).
+5. Instrumento, índice −1: em `scripts/check_rules.ps1` troque `-not $bound -and $i -gt 0` por `-not $bound` ⇒ PEGA (`-TestCommand 'pwsh -NoProfile -File scripts/check_rules_selftest.ps1'`, caso "1a linha nao olha a ultima").
+6. Instrumento, `let _h`: troque `[A-Za-z]\w*\s*(:[^=]+)?=.*spawn_blocking` por `\w+\s*(:[^=]+)?=.*spawn_blocking` ⇒ PEGA (casos `let _ =`/`let _h =`).
+7. Instrumento, falso positivo: apague o bloco que olha `.await` na linha seguinte ⇒ PEGA (caso "formas ligadas" passa a sair 1).
+8. A regra vigia o código real: em `src/tui/run.rs`, reintroduza um `tokio::task::spawn_blocking(move || { .. });` sem `let` (por exemplo, volte `spawn_reload` ao corpo antigo) ⇒ `-TestCommand 'pwsh -NoProfile -File scripts/check_rules.ps1'` sai 1 ⇒ PEGA.
+9. Pânico do scan: sem prova de mutação automática (cola em `run.rs`, sem harness). Verificação por grep: `grep -rn "pânico interno" src` não acha nada, e `spawn_scan` usa `spawn_job`.
+
+**Commit:** `fix(tui): await background catalog jobs and show catalog errors`
+
+**Foco extra do revisor:** (a) a TUI agora **termina** com pânico se a coleta de instalados entrar em pânico (antes mostrava status) — é a regra do CLAUDE.md, mas confira que `run` restaura o terminal nesse caminho (`run.rs` :65–73); (b) o primeiro desenho do catálogo passa a esperar `index_age` + `startup_needs_refresh` (abre o catálogo de novo, ~11–15 ms segundo ARMADILHAS) — aceitável, não medido; (c) rode o selftest no checkout de base para ver que o caso "forma do spawn_boot" é o mesmo formato de `run.rs` :177–191.
+
+---
+
+### Task 45: Spans por etapa com duração no log em arquivo
+
+#### Where this fits
+
+Independente da Task 44 (arquivos disjuntos). Precede as Tasks 46 e 47 (mesmos arquivos e é o instrumento que a 46 usa para medir). **Tarefa de medição: nenhuma otimização.** Hoje só existem spans em `src/install/registry_win.rs` (~92) e `installed::timed` (`src/installed/mod.rs` :107, que já cobre o `list`); o relatório da fase 2a §3 registra "Divisão interna … **não medido** (sem spans)".
+
+O log em arquivo é montado em `init_logging` (`src/cli/mod.rs` ~376–397), filtrado por `file_log_filter()` (~322: `wingetrs` em DEBUG, resto em WARN). A camada `fmt` só registra span se pedirmos eventos de span: `tracing_subscriber::fmt::format::FmtSpan::CLOSE` faz cada span, ao fechar, gravar uma linha `close time.busy=… time.idle=…` (sem crate nova; `tracing-subscriber` 0.3 já está no `Cargo.toml`).
+
+#### What binds this task
+
+1. **Nível e alvo:** todo span de etapa é `tracing::debug_span!` criado em código do crate (alvo `wingetrs::…`), portanto aceito por `file_log_filter()`. Nada em TRACE.
+2. **Camada do arquivo:** extraia `fn file_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>` (com `S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>`, `W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static`) = `fmt::layer().with_writer(writer).with_ansi(false).with_span_events(FmtSpan::CLOSE).with_filter(file_log_filter())`; `init_logging` usa `file_layer(writer)`.
+3. **Stderr:** `fn stderr_span_events(verbose: u8) -> FmtSpan` = `FmtSpan::CLOSE` se `verbose > 1`, senão `FmtSpan::NONE`; a camada de stderr usa `.with_span_events(stderr_span_events(verbose))`. Resultado: `-vv` mostra as durações no terminal, `-v` não (os spans são DEBUG e o `-v` é INFO, mas os spans INFO de `installed::timed` poluiriam o `-v`).
+4. **Spans de etapa (nomes exatos, um por etapa, nunca por item de catálogo):**
+   - `src/install/ops.rs` `apply_with_targets`: `install.lock` (no `lock_async(..)`, via `.instrument(span)`), `install.revalidate` (`span.in_scope(..)`), `install.prefetch` (`.instrument`, campo `plans = plans.len()`), `install.execute` **um por plano** (`.instrument` no `executor::execute_install(..)`, campo `app = %plan.app`), `install.broadcast` (`in_scope` no `broadcast_if_changed`).
+   - `src/install/ops.rs` `uninstall`: `uninstall.lock`, `uninstall.execute`, `uninstall.broadcast`, `uninstall.residue_scan` (no `scan_residues`).
+   - `src/install/ops.rs`: `upgrade.list` (corpo de `upgradable`), `target.resolve` (corpo de `resolve_target`), `plan.build` (corpo de `plan_for`).
+   - `src/install/executor.rs`: em `execute_install`, cada passo de `main` roda dentro de `debug_span!("install.step", kind = step_kind(step), index = i)` (`.instrument` no `run_step(..)`); os passos de limpeza (`RemoveOldVersion`) usam o mesmo span com `in_scope`. Nova `fn step_kind(step: &Step) -> &'static str`: `EnsureLauncher`→`"launcher"`, `Download`→`"download"`, `Extract`→`"extract"`, `Promote`→`"promote"`, `Persist`→`"persist"`, `LinkCurrent`→`"link"`, `Shim`→`"shim"`, `Shortcut`→`"shortcut"`, `EnvSet`→`"env"`, `EnvAddPath`→`"path"`, `EnsureShimsOnPath`→`"shims_path"`, `RecordState`→`"state"`, `RemoveOldVersion`→`"remove_old"`.
+   - `src/update.rs` `run_update`: `update.lock`, `update.fetch` **um por fonte** (cada future do `join_all` com `.instrument(debug_span!("update.fetch", source = %job.source))`, inclusive as puladas), `update.catalog_write` (corpo de `apply`, campo `source`), `update.state_save` (`state.save`), `update.search_idx` (`write_search_index`).
+   - `update.parse`: em `src/sources/winget/mod.rs` `fetch_index` em volta de `validate_msix` + gravação + `read_index`; em `src/sources/scoop/bucket.rs` `fetch_bucket` em volta de `read_tarball`. Só existe quando houve corpo para ler (304/erro não abre span).
+   - Spans assíncronos usam `tracing::Instrument` (nunca `span.enter()` atravessando `.await`).
+5. **Busca:** o corpo da busca roda antes do log existir (`run`, ~824–844), então span ali se perde. `EarlyOutcome` ganha `via: &'static str` (`"idx"` quando `index_file::search` respondeu, `"catalog"` quando caiu para `search_on_disk`) e `elapsed_ms: f64`; `log_warning` passa a registrar também `tracing::debug!(stage = "search", via = out.via, ms = out.elapsed_ms, "stage")`.
+6. `list`: nada novo (já medido por `installed::timed`). Não remova nem mude `timed`.
+
+**Files:**
+- Modify: `src/cli/mod.rs`, `src/install/ops.rs`, `src/install/executor.rs`, `src/update.rs`, `src/sources/winget/mod.rs`, `src/sources/scoop/bucket.rs`
+- Create (new): `tests/spans/mod.rs` (camada de captura compartilhada; `mod spans;` nos dois arquivos de teste)
+- Test: `tests/install_ops.rs`, `tests/update.rs`, módulos `#[cfg(test)]` de `src/cli/mod.rs`
+
+`tests/spans/mod.rs` (literal):
+
+```rust
+#![allow(dead_code)]
+//! Test layer that records every span that closed: (name, `kind` field, target, level).
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
+
+#[derive(Clone, Default)]
+pub struct Closed(pub Arc<Mutex<Vec<(String, String, String, tracing::Level)>>>);
+
+struct Kind(String);
+
+struct KindVisitor(Option<String>);
+
+impl tracing::field::Visit for KindVisitor {
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        if f.name() == "kind" {
+            self.0 = Some(v.to_string());
+        }
+    }
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        if f.name() == "kind" {
+            self.0 = Some(format!("{v:?}").trim_matches('"').to_string());
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for Closed
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        let mut v = KindVisitor(None);
+        attrs.record(&mut v);
+        if let (Some(span), Some(k)) = (ctx.span(id), v.0) {
+            span.extensions_mut().insert(Kind(k));
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+        if let Some(span) = ctx.span(&id) {
+            let kind = span
+                .extensions()
+                .get::<Kind>()
+                .map(|k| k.0.clone())
+                .unwrap_or_default();
+            let m = span.metadata();
+            self.0.lock().unwrap().push((
+                m.name().to_string(),
+                kind,
+                m.target().to_string(),
+                *m.level(),
+            ));
+        }
+    }
+}
+
+impl Closed {
+    /// `name` or `name:kind`, in closing order.
+    pub fn names(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, k, _, _)| if k.is_empty() { n.clone() } else { format!("{n}:{k}") })
+            .collect()
+    }
+
+    pub fn count(&self, name: &str) -> usize {
+        self.names().iter().filter(|n| n.as_str() == name).count()
+    }
+
+    /// Installs this layer as the thread's default subscriber (tests are `current_thread`).
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    }
+}
+```
+
+(Os testes `#[tokio::test]` destes arquivos são `current_thread`: as futures rodam na thread do teste, então o `set_default` vê os spans. Nenhum span de etapa pode ser criado dentro de `spawn_blocking`.)
+
+Testes:
+
+1. `install_emits_one_span_per_stage_and_per_app` (`tests/install_ops.rs`) — dois planos (dependência + alvo), só a dependência com `env`, para que um span por plano não coincida com um span por lote:
+   ```rust
+   #[tokio::test]
+   async fn install_emits_one_span_per_stage_and_per_app() {
+       let mut w = World::new().await;
+       w.add(App { env: true, ..app("leaf", &[]) }).await;
+       w.add(app("top", &["leaf"])).await;
+       let plans = w.plans("top").unwrap();
+       assert_eq!(plans.len(), 2);
+       let closed = spans::Closed::default();
+       let _g = closed.install();
+       apply(&w.ctx(), &plans).await.unwrap();
+       for once in ["install.lock", "install.revalidate", "install.prefetch", "install.broadcast"] {
+           assert_eq!(closed.count(once), 1, "{once}: {:?}", closed.names());
+       }
+       assert_eq!(closed.count("install.execute"), 2, "{:?}", closed.names());
+       for per_app in ["install.step:download", "install.step:extract", "install.step:shim", "install.step:state"] {
+           assert_eq!(closed.count(per_app), 2, "{per_app}: {:?}", closed.names());
+       }
+       assert_eq!(closed.count("install.step:env"), 1, "só leaf tem env_set");
+       let filter = wingetrs::cli::file_log_filter();
+       for (name, _, target, level) in closed.0.lock().unwrap().iter() {
+           if name.starts_with("install.") {
+               assert!(filter.would_enable(target, level), "{name} ({target}, {level}) não chega ao log");
+           }
+       }
+   }
+   ```
+2. `uninstall_emits_its_stage_spans` (`tests/install_ops.rs`): `w.add(app("leaf", &[]))`, `w.install("leaf")`, `plan_uninstall`; depois `let _g = closed.install();` e `uninstall(&w.ctx(), &p).unwrap()` ⇒ `uninstall.lock`, `uninstall.execute`, `uninstall.broadcast`, `uninstall.residue_scan` com `count == 1` cada.
+3. `planning_spans_wrap_resolve_and_plan` (`tests/install_ops.rs`): com `_g` ativo, `w.plans("top")` (que chama `resolve_target` e `plan_for`) e `upgradable(&w.ctx())` ⇒ `target.resolve`, `plan.build` e `upgrade.list` com `count == 1`.
+4. `update_emits_a_fetch_span_per_source_and_parse_only_for_downloaded_ones` (`tests/update.rs`, com `mod spans;` no topo), usando o `setup()` existente (winget 200, main 200, extras 500 — três fontes, só duas com corpo):
+   ```rust
+   #[tokio::test]
+   async fn update_emits_a_fetch_span_per_source_and_parse_only_for_downloaded_ones() {
+       let (_s, ep) = setup().await;
+       let dir = tempfile::tempdir().unwrap();
+       let data = DataDir::new(dir.path());
+       data.ensure().unwrap();
+       let closed = spans::Closed::default();
+       let _g = closed.install();
+       run_update(&data, &ep, &Http::new().unwrap(), true, LockWait::from_env())
+           .await
+           .unwrap();
+       assert_eq!(closed.count("update.lock"), 1, "{:?}", closed.names());
+       assert_eq!(closed.count("update.fetch"), 3, "{:?}", closed.names());
+       assert_eq!(closed.count("update.parse"), 2, "extras falha antes de ler");
+       assert_eq!(closed.count("update.catalog_write"), 2);
+       assert_eq!(closed.count("update.state_save"), 1);
+       assert_eq!(closed.count("update.search_idx"), 1);
+   }
+   ```
+5. `file_layer_logs_the_duration_of_a_closed_wingetrs_span` (módulo `log_tests` de `src/cli/mod.rs`):
+   ```rust
+   #[derive(Clone, Default)]
+   struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+   impl std::io::Write for Buf {
+       fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+           self.0.lock().unwrap().extend_from_slice(b);
+           Ok(b.len())
+       }
+       fn flush(&mut self) -> std::io::Result<()> {
+           Ok(())
+       }
+   }
+
+   #[test]
+   fn file_layer_logs_the_duration_of_a_closed_wingetrs_span() {
+       use tracing_subscriber::layer::SubscriberExt;
+       let buf = Buf::default();
+       let w = buf.clone();
+       let sub = tracing_subscriber::registry().with(file_layer(move || w.clone()));
+       tracing::subscriber::with_default(sub, || {
+           let _a = tracing::debug_span!(target: "wingetrs::install::ops", "install.prefetch").entered();
+           let _b = tracing::debug_span!(target: "h2::proto", "noise").entered();
+       });
+       let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+       let line = out
+           .lines()
+           .find(|l| l.contains("install.prefetch") && l.contains("close"))
+           .unwrap_or_else(|| panic!("sem linha de fechamento: {out}"));
+       assert!(line.contains("time.busy"), "{line}");
+       assert!(!out.contains("noise"), "{out}");
+   }
+
+   #[test]
+   fn stderr_shows_span_durations_only_with_vv() {
+       use tracing_subscriber::fmt::format::FmtSpan;
+       assert_eq!(stderr_span_events(1), FmtSpan::NONE);
+       assert_eq!(stderr_span_events(2), FmtSpan::CLOSE);
+   }
+   ```
+6. `early_search_reports_which_path_answered` (módulo `early_tests` de `src/cli/mod.rs`) — os dois caminhos, para que um `via` fixo falhe:
+   ```rust
+   #[test]
+   fn early_search_reports_which_path_answered() {
+       use crate::catalog::{NewPackage, WingetMaps};
+       let dir = tempfile::tempdir().unwrap();
+       let (idx, cat) = (dir.path().join("search.idx"), dir.path().join("catalog.db"));
+       let mut c = Catalog::open(&cat).unwrap();
+       c.replace_source(
+           "scoop:main",
+           SourceKind::Scoop,
+           "v",
+           1,
+           &[NewPackage {
+               id: "ripgrep".into(),
+               name: "ripgrep".into(),
+               version: "1".into(),
+               ..Default::default()
+           }],
+           &WingetMaps::default(),
+       )
+       .unwrap();
+       let out = search_early(&idx, &cat, "ripgrep", None, 10);
+       assert_eq!(out.via, "catalog");
+       index_file::write(&c, &idx).unwrap();
+       let out = search_early(&idx, &cat, "ripgrep", None, 10);
+       assert_eq!(out.via, "idx");
+       assert_eq!(out.result.unwrap().len(), 1);
+   }
+   ```
+7. Cole no relatório uma linha real de fechamento do log de um teste manual (`wingetrs -vv search ripgrep` numa raiz temporária ou o resultado do teste 5 com `--nocapture`), mostrando o formato `… install.prefetch…: close time.busy=… time.idle=…`.
+
+Como o orquestrador lê as durações (depois do merge; raiz isolada como no relatório da fase 2a §2):
+
+```
+$S = '<scratchpad>'
+$env:LOCALAPPDATA = "$S\la"; $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\t45'; $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+pwsh -File scripts/leftovers.ps1
+target\release\wingetrs.exe install ripgrep --yes
+$log = Get-ChildItem "$S\la\wingetrs\log\wingetrs.log.*" | Sort-Object Name | Select-Object -Last 1
+Select-String -Path $log.FullName -Pattern '(install|uninstall|update|target|plan|upgrade)\.[a-z_]+.*close time\.busy' | Select-Object -Last 40
+Select-String -Path $log.FullName -Pattern 'stage="search"|stage=search' | Select-Object -Last 3
+```
+
+(Alternativa sem arquivo: `target\release\wingetrs.exe -vv install ripgrep --yes 2>&1 | Select-String 'close time.busy'`; o stderr pode ter códigos ANSI. O nome do arquivo diário usa a data UTC do `tracing-appender`, daí o `Select-Object -Last 1`.) Para spans assíncronos (`install.lock`, `install.prefetch`, `install.execute`, `install.step`, `update.fetch`), a duração de parede é `time.busy + time.idle`; para os síncronos, `time.busy`.
+
+#### Checks beyond the steps
+
+1. Fechamento no arquivo: em `file_layer`, remova `.with_span_events(FmtSpan::CLOSE)` ⇒ PEGA (teste 5). `pwsh -File scripts/mutate.ps1 -Path src/cli/mod.rs -Anchor '<linha do with_span_events em file_layer>' -Replacement '' -TestCommand 'cargo test --quiet --lib file_layer_logs'`.
+2. Um span por plano: mova o `install.execute` para envolver o laço inteiro (um span por lote) ⇒ PEGA (teste 1, `count == 2`).
+3. Nível: troque `debug_span!("install.step"` por `trace_span!("install.step"` ⇒ PEGA (teste 1, asserção do filtro).
+4. Parse só com corpo: tire o span `update.parse` de `fetch_bucket` ⇒ PEGA (teste 4, `count == 2`); ponha o `update.parse` envolvendo o `fetch_one` inteiro ⇒ PEGA (`count` vira 3).
+5. Resíduos: tire o span `uninstall.residue_scan` ⇒ PEGA (teste 2).
+6. `-vv`: faça `stderr_span_events` devolver `CLOSE` para `verbose > 0` ⇒ PEGA (teste 5b).
+7. Caminho da busca: fixe `via: "idx"` ⇒ PEGA (teste 6).
+8. Nenhuma otimização: o diff não muda ordem de chamadas nem o que é lido/escrito (revisor confere; não há mutação para isso).
+
+**Commit:** `feat(log): spans per stage with durations in the file log`
+
+**Foco extra do revisor:** (a) nenhum `span.enter()`/`entered()` vivo atravessando `.await` (use `Instrument`); (b) nenhum span por pacote em laço quente (`replace_source`, `load_entries`, parse de manifesto) — o log do `update --background` não pode crescer por pacote (Task 43 acabou de reduzir); (c) o teste 1 depende de `current_thread` — se alguém trocar o flavor, o teste falha (não passa em silêncio), confira; (d) `time.busy` nos spans assíncronos subestima o tempo de parede — está documentado acima, não "conserte" com `Instant` manual.
+
+---
+
+### Task 46: `upgrade` busca a linha do app instalado em vez de carregar o catálogo
+
+#### Where this fits
+
+Depois da Task 45 (mesmos `src/install/ops.rs`/`tests/install_ops.rs`; usa os spans `target.resolve`/`upgrade.list` para medir) e da Task 44 (`src/tui/jobs.rs`). Hoje, para cada app escolhido, `upgrade` (`src/cli/install_cmd.rs` ~407–417) e `plan_upgrade_all` da TUI (`src/tui/jobs.rs` ~102–128) chamam `ops::resolve_target(ctx, app, Some(bucket))` (`src/install/ops.rs` ~329), que chama `target::resolve` (`src/install/target.rs` ~47), que faz `catalog.load_entries()` (:61–62) — **o catálogo inteiro** (dezenas de milhares de linhas, várias conexões) — para achar uma linha cujo `(bucket, id)` já sabemos pelo `state.db`.
+
+Pré-condição que torna a troca segura: os apps só chegam aqui depois de `ops::upgradable` (~832–853), que já exige `ctx.catalog.get(&source_name(&rec.bucket), &rec.app)` = `Some` (busca **exata**, indexada por `UNIQUE (source, id)` — `src/catalog/mod.rs` :33 e :457). Logo a mesma busca exata acha o candidato.
+
+`upgradable` em si fica como está: lê o `raw` só dos apps instalados, uma busca indexada por app (não "de tudo").
+
+#### What binds this task
+
+1. Nova função em `src/install/ops.rs`:
+   ```rust
+   /// Upgrade target of an installed app: its exact catalog row `(scoop:<bucket>, app)`, one
+   /// indexed lookup instead of `resolve_target`'s full catalog load. Never matches by name.
+   pub fn resolve_installed(ctx: &OpsCtx<'_>, app: &str, bucket: &str) -> Result<Resolution, OpsError>
+   ```
+   Corpo: `ctx.catalog.get(&crate::sources::scoop::source_name(bucket), app)?` ⇒ `Some(p)` ⇒ `Resolution::One(target::candidate(&p.entry))`; `None` ⇒ `Resolution::NotFound { suggestions: Vec::new() }`. Torne `candidate` em `src/install/target.rs` `pub(crate)` (mesma construção de `Candidate`: `selectable`/`note` idênticos). Span `debug_span!("target.resolve_installed")` em volta (convenção da Task 45).
+2. CLI `upgrade` (`src/cli/install_cmd.rs`): no laço que monta `groups`, `ops::resolve_installed(ctx, app, &rec.bucket)?` no lugar de `ops::resolve_target(ctx, app, Some(&rec.bucket))?`; mensagens e saída iguais.
+3. TUI `plan_upgrade_all` (`src/tui/jobs.rs`): idem; o bucket vem do `state.db` (já lido ali). App sem linha no `state.db` ⇒ `Err(format!("{app}: não está no registro do wingetrs"))` em vez de passar `None`.
+4. `resolve_target` não muda (continua servindo `install <texto do usuário>` e `plan_install` da TUI, que precisam de nome/moniker/sugestões).
+5. **Dois caminhos para o mesmo resultado ⇒ teste de equivalência** (CLAUDE.md): no domínio da pré-condição, `resolve_installed(app, bucket)` devolve o **mesmo `Candidate`** que `resolve_target(app, Some(bucket))`.
+6. Divergência intencional e documentada: fora da pré-condição, `resolve_target` cai para casamento por **nome** (`target.rs` :79–91) e poderia "atualizar" outro pacote; `resolve_installed` nunca faz isso.
+
+**Files:**
+- Modify: `src/install/ops.rs`, `src/install/target.rs`, `src/cli/install_cmd.rs`, `src/tui/jobs.rs`
+- Test: `tests/install_ops.rs`
+
+Testes:
+
+1. `resolve_installed_matches_resolve_target_for_every_installed_shape` (`tests/install_ops.rs`) — mesmo id em dois buckets (um caminho que ignore o bucket dá o outro), id com maiúscula (um caminho que baixe a caixa erra), e um pacote cujo **nome** é o id de outro:
+   ```rust
+   #[tokio::test]
+   async fn resolve_installed_matches_resolve_target_for_every_installed_shape() {
+       let mut w = World::new().await;
+       w.add(app("ripgrep", &[])).await;
+       w.add(app("Git", &[])).await;
+       w.add(app("vscode", &[])).await;
+       w.catalog
+           .replace_source(
+               "scoop:extras",
+               SourceKind::Scoop,
+               "v",
+               1,
+               &[
+                   NewPackage {
+                       id: "vscode".into(),
+                       name: "vscode".into(),
+                       version: "2".into(),
+                       ..Default::default()
+                   },
+                   NewPackage {
+                       id: "zed".into(),
+                       name: "ripgrep".into(),
+                       version: "1".into(),
+                       ..Default::default()
+                   },
+               ],
+               &WingetMaps::default(),
+           )
+           .unwrap();
+       let ctx = w.ctx();
+       for (bucket, id) in [
+           ("main", "ripgrep"),
+           ("main", "Git"),
+           ("main", "vscode"),
+           ("extras", "vscode"),
+           ("extras", "zed"),
+       ] {
+           match (
+               resolve_target(&ctx, id, Some(bucket)).unwrap(),
+               resolve_installed(&ctx, id, bucket).unwrap(),
+           ) {
+               (Resolution::One(old), Resolution::One(new)) => assert_eq!(old, new, "{bucket}/{id}"),
+               (old, new) => panic!("{bucket}/{id}: antigo {old:?}, novo {new:?}"),
+           }
+       }
+       for (bucket, id) in [("main", "zed"), ("main", "nada")] {
+           assert!(
+               matches!(resolve_target(&ctx, id, Some(bucket)).unwrap(), Resolution::NotFound { .. }),
+               "{bucket}/{id}"
+           );
+           assert!(
+               matches!(resolve_installed(&ctx, id, bucket).unwrap(), Resolution::NotFound { .. }),
+               "{bucket}/{id}"
+           );
+       }
+   }
+   ```
+2. `resolve_installed_never_matches_by_name` (`tests/install_ops.rs`), mesmo catálogo do teste 1 (extraia um helper se quiser): `resolve_target(&ctx, "ripgrep", Some("extras"))` ⇒ `One(c)` com `c.entry.id == "zed"` (casamento por nome — o motivo de não usá-lo no upgrade); `resolve_installed(&ctx, "ripgrep", "extras")` ⇒ `NotFound`.
+3. Os testes de upgrade existentes continuam verdes (`upgradable_lists_apps_with_a_newer_catalog_version` em `tests/install_ops.rs`, os de `tests/tui_jobs.rs` e `tests/cli_install.rs`).
+
+Medição (orquestrador; A/B contra a base num worktree temporário, como manda a regra de desempenho). `upgrade --dry-run` é repetível (não muda nada) desde que exista um app desatualizado numa raiz isolada:
+
+```
+$S = '<scratchpad>'
+# raiz isolada com o catálogo real copiado só-leitura (relatório da fase 2a §2)
+New-Item -ItemType Directory -Force "$S\la\wingetrs" | Out-Null
+sqlite3 "file:$env:LOCALAPPDATA/wingetrs/catalog.db?mode=ro" ".backup '$S/la/wingetrs/catalog.db'"
+$env:LOCALAPPDATA = "$S\la"; $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\t46'; $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+target\release\wingetrs.exe install ripgrep --yes
+sqlite3 "$S\la\wingetrs\state.db" "UPDATE apps SET version='0.0.1' WHERE app='ripgrep'"
+target\release\wingetrs.exe update      # http.json novo: nenhum update em segundo plano durante o bench
+pwsh -File scripts/leftovers.ps1
+pwsh -File scripts/bench.ps1 -Exe "$S\base\target\release\wingetrs.exe" -Args 'upgrade ripgrep --dry-run' -Runs 15 -Baseline target/release/examples/noop.exe
+pwsh -File scripts/bench.ps1 -Exe target/release/wingetrs.exe -Args 'upgrade ripgrep --dry-run' -Runs 15 -Baseline target/release/examples/noop.exe
+```
+
+(`$S\base` = `git worktree add` no SHA anterior à tarefa + `cargo build --release` lá; remova o worktree e a raiz no fim. Os dois binários precisam da Task 45 para a leitura por span abaixo, então a base é o commit da 45.) Leitura por etapa, nas duas versões: `target\release\wingetrs.exe -vv upgrade ripgrep --dry-run 2>&1 | Select-String 'target\.resolve|upgrade\.list|plan\.build'` — o `target.resolve` da base contra o `target.resolve_installed` da nova é o ganho isolado do ruído de processo. Ganho esperado ≈ tempo de `load_entries` do catálogo real: **não medido**. Se o delta do bench não for maior que o ruído entre execuções da base, vale o número do span; se nenhum dos dois mostrar ganho, a tarefa é revertida (regra do CLAUDE.md).
+
+#### Checks beyond the steps
+
+1. Bucket respeitado: em `resolve_installed`, troque a busca por `ctx.catalog.find_by_id(app)?.into_iter().next()` (ignora o bucket) ⇒ PEGA (teste 1, `extras/vscode` vira o de `main`).
+2. Caixa exata: passe `&app.to_lowercase()` ao `get` ⇒ PEGA (teste 1, `main/Git`).
+3. Candidato idêntico: em `target::candidate`, troque `selectable: scoop` por `selectable: true` **só numa cópia** usada por `resolve_installed` (se o implementador duplicou a construção em vez de reusar) ⇒ deve PEGAR; se reusou `candidate`, registre "mutação não aplicável: construção única".
+4. Uso pelos chamadores: a troca `resolve_target` ⇄ `resolve_installed` em `upgrade`/`plan_upgrade_all` é **mutação equivalente** (mesmo resultado por construção — é o que o teste 1 prova); sem prova de mutação. Verificação: `grep -n "resolve_target" src/cli/install_cmd.rs src/tui/jobs.rs` mostra só os usos de `install`/`plan_install`, e o ganho aparece no bench/span acima.
+
+**Commit:** `perf(upgrade): look up the installed app's catalog row instead of loading the catalog`
+
+**Foco extra do revisor:** (a) a pré-condição (`upgradable` usa `get` exato) é o que garante a equivalência — se alguém mudar `upgradable` para busca sem caixa, o upgrade de um app com id de caixa diferente passaria a dar `NotFound`; confira que o teste 1 cobre `Git`; (b) `plan_upgrade_all` deixou de aceitar bucket `None` — mensagem em português; (c) número sem bench A/B ou sem span = "não medido", não "mais rápido".
+
+---
+
+### Task 47: `update --background` com intervalo depois de cada tentativa e sem esperar o lock
+
+#### Where this fits
+
+Depois da Task 45 (mesmos `src/update.rs`, `src/cli/mod.rs`, `tests/update.rs`); independente da 46. Hoje:
+
+- `refresh_if_stale` (`src/cli/mod.rs` ~427–432) dispara `spawn_background_update` sempre que `needs_refresh` (`src/update.rs` ~80) é verdadeiro.
+- `checked_at` só é gravado quando a fonte respondeu (304 em ~197–201; 200 + gravação no catálogo em `apply` ~272–276). Fonte que falha — offline, HTTP 500, catálogo travado (`apply` ~278) — fica sem `checked_at` e `needs_refresh` continua verdadeiro: **cada** `search`/`list`/`show`/`install` dispara um processo novo. Mesmo online, comandos em sequência rápida disparam um processo cada até o primeiro gravar `http.json`.
+- O `update --background` usa `LockWait::from_env()` (~591) = espera até **30 s** pelo `update.lock`; o 2º processo fica vivo esperando e depois refaz a fonte que falhou.
+
+**Desenho escolhido (o mais simples que mata a tempestade):** registrar a **tentativa** no momento do disparo, num arquivo próprio, e não disparar de novo por `RETRY_SECS = 300` s; e o `--background` nunca espera o lock (`NoWait`, sai em silêncio se outro update está rodando). Por que não registrar a falha no `http.json`: (1) o `http.json` é gravado pelo `run_update` sob o lock — o processo do comando gravando ali correria contra o update em andamento (escrita perdida); (2) registrar no disparo cobre também o caso "online, vários comandos antes do 1º terminar" e o processo que morre sem gravar nada. Por que intervalo fixo e não exponencial: o exponencial precisa de contador de falhas persistido e não muda a ordem de grandeza (offline com uso contínuo: no máximo 12 processos/hora, cada um sai em < 1 s com conexão recusada); `MAX_AGE_SECS` (900) continua mandando quando tudo dá certo.
+
+#### What binds this task
+
+1. `src/cache/mod.rs`: `pub fn refresh_attempt_path(&self) -> PathBuf` = `self.root.join("refresh.attempt")` (conteúdo: segundos Unix em texto).
+2. `src/update.rs`: `pub const RETRY_SECS: i64 = 300;` e a regra pura
+   ```rust
+   /// A detached refresh is due when a source is stale and the last attempt is at least
+   /// RETRY_SECS old (or in the future: the clock went back, never block forever).
+   pub fn background_due(state: &HttpState, urls: &[&str], last_attempt: Option<i64>, now: i64) -> bool {
+       needs_refresh(state, urls, now)
+           && last_attempt.is_none_or(|t| t > now || now - t >= RETRY_SECS)
+   }
+   ```
+3. `src/update.rs`: `pub fn claim_background_refresh(data: &DataDir, urls: &[&str], now: i64) -> bool` — carrega `HttpState`, lê `refresh_attempt_path()` (ausente ou ilegível ⇒ `None`), e se `background_due` grava `now` no arquivo e devolve `true`. Falha ao gravar ⇒ `tracing::warn!` e ainda devolve `true` (problema de disco não pode impedir a atualização). Nunca entra em pânico.
+4. `src/cli/mod.rs` `refresh_if_stale`: `if claim_background_refresh(data, &all_urls(ep), now_unix()) { spawn_background_update(); }`.
+5. `src/cli/mod.rs` `Command::Update { force, background }`: com `background`, `LockWait::NoWait`, e `Err(UpdateError::Busy)` ⇒ `Ok(())` (só `tracing::debug!`). Sem `background`, nada muda (espera `LockWait::from_env()` e `Busy` continua erro).
+6. A TUI não muda (o refresh dela é no próprio processo, com `NoWait`, `src/tui/run.rs` ~219).
+
+**Files:**
+- Modify: `src/cache/mod.rs`, `src/update.rs`, `src/cli/mod.rs`
+- Test: `tests/update.rs`, `tests/cli_offline.rs`
+
+Testes (sem `sleep`; tempo injetado; rede só por wiremock ou porta 9 recusada):
+
+1. `background_refresh_backs_off_after_an_attempt` (`tests/update.rs`) — valores de fronteira dos dois lados:
+   ```rust
+   #[test]
+   fn background_refresh_backs_off_after_an_attempt() {
+       let stale = HttpState::default();
+       let now = 10_000;
+       assert!(background_due(&stale, &["u"], None, now), "nunca tentou");
+       assert!(!background_due(&stale, &["u"], Some(now - (RETRY_SECS - 1)), now));
+       assert!(background_due(&stale, &["u"], Some(now - RETRY_SECS), now));
+       assert!(background_due(&stale, &["u"], Some(now + 60), now), "relógio voltou: não trava");
+       let mut fresh = HttpState::default();
+       fresh.set("u", HttpEntry { checked_at: now - 10, ..Default::default() });
+       assert!(!background_due(&fresh, &["u"], None, now), "catálogo novo: nada a fazer");
+   }
+   ```
+2. `claim_records_the_attempt_and_refuses_a_second_claim_inside_the_window` (`tests/update.rs`):
+   ```rust
+   #[test]
+   fn claim_records_the_attempt_and_refuses_a_second_claim_inside_the_window() {
+       let dir = tempfile::tempdir().unwrap();
+       let data = DataDir::new(dir.path());
+       data.ensure().unwrap();
+       let urls = ["http://127.0.0.1:9/x"];
+       assert!(claim_background_refresh(&data, &urls, 10_000));
+       let read = || std::fs::read_to_string(data.refresh_attempt_path()).unwrap();
+       assert_eq!(read().trim(), "10000");
+       assert!(!claim_background_refresh(&data, &urls, 10_060));
+       assert_eq!(read().trim(), "10000", "recusa não regrava");
+       assert!(claim_background_refresh(&data, &urls, 10_000 + RETRY_SECS));
+       assert_eq!(read().trim(), (10_000 + RETRY_SECS).to_string());
+   }
+   ```
+3. `unreadable_attempt_file_does_not_block_the_refresh` (`tests/update.rs`): grave `"lixo"` em `refresh_attempt_path()` ⇒ `claim_background_refresh(&data, &urls, 10_000)` é `true` e o arquivo passa a conter `10000`.
+4. `a_failed_source_does_not_respawn_on_every_command` (`tests/update.rs`) — o cenário do bug, com o `setup()` existente (extras responde 500):
+   ```rust
+   #[tokio::test]
+   async fn a_failed_source_does_not_respawn_on_every_command() {
+       let (_s, ep) = setup().await;
+       let dir = tempfile::tempdir().unwrap();
+       let data = DataDir::new(dir.path());
+       data.ensure().unwrap();
+       run_update(&data, &ep, &Http::new().unwrap(), true, LockWait::from_env())
+           .await
+           .unwrap();
+       let urls: Vec<&str> = std::iter::once(ep.winget_index.as_str())
+           .chain(ep.scoop.iter().map(|(_, u)| u.as_str()))
+           .collect();
+       let now = wingetrs::cache::now_unix();
+       assert!(
+           needs_refresh(&HttpState::load(&data.http_state_path()), &urls, now),
+           "extras falhou: continua velho"
+       );
+       assert!(claim_background_refresh(&data, &urls, now));
+       for later in [1, 30, RETRY_SECS - 1] {
+           assert!(!claim_background_refresh(&data, &urls, now + later), "+{later}s");
+       }
+   }
+   ```
+5. `background_update_gives_up_at_once_when_another_update_holds_the_lock` e `foreground_update_still_waits_for_the_lock` (`tests/cli_offline.rs`) — timeout de 10 s contra limite de 3 s, para que "espera e depois sai 0" não passe:
+   ```rust
+   fn update_with_lock_held(args: &[&str], timeout_ms: &str) -> (std::process::Output, std::time::Duration) {
+       let dir = tempfile::tempdir().unwrap();
+       let root = dir.path().join("wingetrs");
+       std::fs::create_dir_all(&root).unwrap();
+       let _held = wingetrs::cache::UpdateLock::try_acquire(&root.join("update.lock"))
+           .unwrap()
+           .unwrap();
+       let t = std::time::Instant::now();
+       let out = Command::new(env!("CARGO_BIN_EXE_wingetrs"))
+           .args(args)
+           .env("LOCALAPPDATA", dir.path())
+           .env("WINGETRS_LOCK_TIMEOUT_MS", timeout_ms)
+           .env("WINGETRS_WINGET_INDEX_URL", "http://127.0.0.1:9/x")
+           .env("WINGETRS_SCOOP_BASE_URL", "http://127.0.0.1:9")
+           .output()
+           .unwrap();
+       (out, t.elapsed())
+   }
+
+   #[test]
+   fn background_update_gives_up_at_once_when_another_update_holds_the_lock() {
+       let (out, took) = update_with_lock_held(&["update", "--background"], "10000");
+       assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+       assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+   }
+
+   #[test]
+   fn foreground_update_still_waits_for_the_lock() {
+       let (out, took) = update_with_lock_held(&["update"], "1500");
+       assert!(!out.status.success());
+       assert!(took >= std::time::Duration::from_millis(1400), "{took:?}");
+   }
+   ```
+
+#### Checks beyond the steps
+
+1. Fronteira: em `background_due`, troque `now - t >= RETRY_SECS` por `now - t > RETRY_SECS` ⇒ PEGA (teste 1). `pwsh -File scripts/mutate.ps1 -Path src/update.rs -Anchor 'now - t >= RETRY_SECS' -Replacement 'now - t > RETRY_SECS' -TestCommand 'cargo test --quiet --test update background_refresh_backs_off'`.
+2. Relógio que volta: apague `t > now ||` ⇒ PEGA (teste 1).
+3. Registro da tentativa: em `claim_background_refresh`, não grave o arquivo ⇒ PEGA (testes 2 e 4).
+4. Regra de idade ainda vale: troque o corpo de `background_due` por só a parte do `last_attempt` ⇒ PEGA (teste 1, caso `fresh`).
+5. `--background` sem espera: volte para `LockWait::from_env()` ⇒ PEGA (teste 5a, demora ~10 s).
+6. Só o `--background`: use `NoWait` para todo `update` ⇒ PEGA (teste 5b).
+7. Arquivo ilegível: faça a leitura de `refresh.attempt` falhar como "tentativa agora" (`Some(now)`) ⇒ PEGA (teste 3).
+
+**Commit:** `fix(update): back off background refresh after an attempt and never wait for the lock`
+
+**Foco extra do revisor:** (a) dois comandos simultâneos podem ainda ler o arquivo antes de qualquer um gravar e disparar dois processos — aceito: o 2º sai na hora pelo `NoWait`; confira que não foi "resolvido" com lock de arquivo extra no caminho quente do `search`; (b) o caminho quente do `search` ganhou uma leitura de arquivo pequeno só quando `needs_refresh` já é verdadeiro — confira a ordem (`needs_refresh` primeiro, arquivo depois) para não ler disco à toa no caso comum; (c) os testes de `tests/cli_offline.rs` que já existem disparam `update --background` reais contra a porta 9 / wiremock — depois desta tarefa, no máximo um por raiz temporária; rode `scripts/leftovers.ps1` depois do gate.
