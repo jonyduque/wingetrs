@@ -6,6 +6,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use tracing::Instrument;
+
 use crate::cache::DataDir;
 use crate::http::Http;
 use crate::install::download::{self, Progress};
@@ -159,6 +161,25 @@ fn check_component(what: &str, v: &str) -> Result<(), String> {
     match safepath::safe_components(v) {
         Some(c) if c.len() == 1 && c[0] == v => Ok(()),
         _ => Err(format!("nome inseguro de {what}: {v}")),
+    }
+}
+
+/// Stable short name of a step, for the `install.step` span.
+fn step_kind(step: &Step) -> &'static str {
+    match step {
+        Step::EnsureLauncher => "launcher",
+        Step::Download { .. } => "download",
+        Step::Extract { .. } => "extract",
+        Step::Promote => "promote",
+        Step::Persist(_) => "persist",
+        Step::LinkCurrent => "link",
+        Step::Shim(_) => "shim",
+        Step::Shortcut(_) => "shortcut",
+        Step::EnvSet { .. } => "env",
+        Step::EnvAddPath { .. } => "path",
+        Step::EnsureShimsOnPath => "shims_path",
+        Step::RecordState => "state",
+        Step::RemoveOldVersion { .. } => "remove_old",
     }
 }
 
@@ -345,7 +366,15 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
     for (i, step) in main {
         run.label = step_label(step);
         let result = match ctx.hook.before(i, step) {
-            Ok(()) => run_step(&mut run, step, ctx).await,
+            Ok(()) => {
+                run_step(&mut run, step, ctx)
+                    .instrument(tracing::debug_span!(
+                        "install.step",
+                        kind = step_kind(step),
+                        index = i
+                    ))
+                    .await
+            }
             Err(e) => Err(e.to_string()),
         };
         if let Err(message) = result {
@@ -369,7 +398,10 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
             .hook
             .before(i, step)
             .map_err(|e| e.to_string())
-            .and_then(|()| remove_old_version(ctx.layout, &plan.app, &plan.version, version));
+            .and_then(|()| {
+                tracing::debug_span!("install.step", kind = step_kind(step), index = i)
+                    .in_scope(|| remove_old_version(ctx.layout, &plan.app, &plan.version, version))
+            });
         if let Err(e) = result {
             tracing::warn!(
                 "{} {} instalado, mas a versão antiga {version} ficou: {e}",

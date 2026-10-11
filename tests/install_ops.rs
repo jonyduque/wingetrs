@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Operations layer: dependencies, lock, apply, uninstall, upgrade listing, repair and list.
+mod spans;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -1140,4 +1142,80 @@ async fn prefetch_skips_dependencies_installed_meanwhile() {
     apply(&w.ctx(), &plans).await.unwrap();
     assert!(w.state().get("a").unwrap().is_some());
     w.server.verify().await;
+}
+
+#[tokio::test]
+async fn install_emits_one_span_per_stage_and_per_app() {
+    let mut w = World::new().await;
+    w.add(App {
+        env: true,
+        ..app("leaf", &[])
+    })
+    .await;
+    w.add(app("top", &["leaf"])).await;
+    let plans = w.plans("top").unwrap();
+    assert_eq!(plans.len(), 2);
+    let closed = spans::Closed::default();
+    let _g = closed.install();
+    apply(&w.ctx(), &plans).await.unwrap();
+    for once in [
+        "install.lock",
+        "install.revalidate",
+        "install.prefetch",
+        "install.broadcast",
+    ] {
+        assert_eq!(closed.count(once), 1, "{once}: {:?}", closed.names());
+    }
+    assert_eq!(closed.count("install.execute"), 2, "{:?}", closed.names());
+    for per_app in [
+        "install.step:download",
+        "install.step:extract",
+        "install.step:shim",
+        "install.step:state",
+    ] {
+        assert_eq!(closed.count(per_app), 2, "{per_app}: {:?}", closed.names());
+    }
+    assert_eq!(closed.count("install.step:env"), 1, "só leaf tem env_set");
+    let filter = wingetrs::cli::file_log_filter();
+    for (name, _, target, level) in closed.0.lock().unwrap().iter() {
+        if name.starts_with("install.") {
+            assert!(
+                filter.would_enable(target, level),
+                "{name} ({target}, {level}) não chega ao log"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn uninstall_emits_its_stage_spans() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.install("leaf").await;
+    let p = plan_uninstall(&w.ctx(), "leaf", false).unwrap();
+    let closed = spans::Closed::default();
+    let _g = closed.install();
+    uninstall(&w.ctx(), &p).unwrap();
+    for once in [
+        "uninstall.lock",
+        "uninstall.execute",
+        "uninstall.broadcast",
+        "uninstall.residue_scan",
+    ] {
+        assert_eq!(closed.count(once), 1, "{once}: {:?}", closed.names());
+    }
+}
+
+#[tokio::test]
+async fn planning_spans_wrap_resolve_and_plan() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.add(app("top", &["leaf"])).await;
+    let closed = spans::Closed::default();
+    let _g = closed.install();
+    w.plans("top").unwrap();
+    upgradable(&w.ctx()).unwrap();
+    for once in ["target.resolve", "plan.build", "upgrade.list"] {
+        assert_eq!(closed.count(once), 1, "{once}: {:?}", closed.names());
+    }
 }

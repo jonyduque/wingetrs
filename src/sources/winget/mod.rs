@@ -56,6 +56,7 @@ pub async fn fetch_index(
         crate::http::Fetch::NotModified => return Ok(WingetFetch::NotModified),
         crate::http::Fetch::Modified { body, entry } => (body, entry),
     };
+    let _parse = tracing::debug_span!("update.parse").entered();
     let db = index::validate_msix(&body)?;
     let tmp = data
         .tmp_dir()

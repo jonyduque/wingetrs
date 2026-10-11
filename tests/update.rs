@@ -1,4 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+mod spans;
+
 use wingetrs::cache::{DataDir, HttpEntry, HttpState};
 use wingetrs::catalog::Catalog;
 use wingetrs::http::Http;
@@ -278,4 +280,29 @@ async fn update_writes_search_index_and_rebuilds_it_when_missing() {
     .await
     .unwrap();
     assert!(data.search_index_path().exists());
+}
+
+#[tokio::test]
+async fn update_emits_a_fetch_span_per_source_and_parse_only_for_downloaded_ones() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let closed = spans::Closed::default();
+    let _g = closed.install();
+    run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed.count("update.lock"), 1, "{:?}", closed.names());
+    assert_eq!(closed.count("update.fetch"), 3, "{:?}", closed.names());
+    assert_eq!(closed.count("update.parse"), 2, "extras falha antes de ler");
+    assert_eq!(closed.count("update.catalog_write"), 2);
+    assert_eq!(closed.count("update.state_save"), 1);
+    assert_eq!(closed.count("update.search_idx"), 1);
 }

@@ -8,6 +8,7 @@ use crate::sources::scoop::source_name;
 use crate::sources::winget::index::WingetImport;
 use crate::sources::winget::{SOURCE_NAME, SOURCE2_URL, WingetFetch, fetch_index};
 use std::time::Duration;
+use tracing::Instrument;
 
 pub const MAX_AGE_SECS: i64 = 900;
 const DEFAULT_LOCK_TIMEOUT_MS: u64 = 30_000;
@@ -158,6 +159,7 @@ pub async fn run_update(
     let timeout = wait.timeout();
     let lock =
         tokio::task::spawn_blocking(move || UpdateLock::acquire_timeout(&lock_path, timeout))
+            .instrument(tracing::debug_span!("update.lock"))
             .await
             .map_err(|e| UpdateError::Internal(e.to_string()))??;
     let Some(_lock) = lock else {
@@ -182,12 +184,14 @@ pub async fn run_update(
     let fetches = jobs.iter().map(|job| {
         let prev = state.get(job.url).cloned();
         let skip = !force && !needs_refresh(&state, &[job.url], now);
+        let span = tracing::debug_span!("update.fetch", source = %job.source);
         async move {
             if skip {
                 return None;
             }
             Some(fetch_one(job, http, data, prev.as_ref()).await)
         }
+        .instrument(span)
     });
     let results = futures_util::future::join_all(fetches).await;
 
@@ -229,13 +233,15 @@ pub async fn run_update(
             outcome,
         });
     }
-    let saved = state.save(&data.http_state_path());
+    let saved =
+        tracing::debug_span!("update.state_save").in_scope(|| state.save(&data.http_state_path()));
     let index_path = data.search_index_path();
     let updated = reports
         .iter()
         .any(|r| matches!(r.outcome, Outcome::Updated { .. }));
     if updated || !index_path.exists() {
-        write_search_index(&catalog, &index_path);
+        tracing::debug_span!("update.search_idx")
+            .in_scope(|| write_search_index(&catalog, &index_path));
     }
     saved?;
     Ok(reports)
@@ -261,6 +267,7 @@ fn apply(
     maps: &WingetMaps,
     skipped: usize,
 ) -> Outcome {
+    let _span = tracing::debug_span!("update.catalog_write", source = %job.source).entered();
     let version = entry
         .source_version
         .clone()

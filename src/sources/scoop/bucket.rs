@@ -85,9 +85,9 @@ pub async fn fetch_bucket(
 ) -> Result<ScoopFetch, ScoopError> {
     match http.get_conditional(url, prev).await? {
         Fetch::NotModified => Ok(ScoopFetch::NotModified),
-        Fetch::Modified { body, entry } => Ok(ScoopFetch::Modified {
-            import: read_tarball(&body)?,
-            entry,
-        }),
+        Fetch::Modified { body, entry } => {
+            let import = tracing::debug_span!("update.parse").in_scope(|| read_tarball(&body))?;
+            Ok(ScoopFetch::Modified { import, entry })
+        }
     }
 }

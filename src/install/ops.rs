@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tracing::Instrument;
+
 use crate::cache::{DataDir, UpdateLock};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::SourceKind;
@@ -331,6 +333,7 @@ pub fn resolve_target(
     input: &str,
     bucket: Option<&str>,
 ) -> Result<Resolution, OpsError> {
+    let _span = tracing::debug_span!("target.resolve").entered();
     match target::resolve(ctx.catalog, input, bucket) {
         Ok(mut found) if found.len() == 1 => match found.pop() {
             Some(c) => Ok(Resolution::One(c)),
@@ -465,6 +468,7 @@ pub fn plan_for(
     c: &Candidate,
     keep_old: bool,
 ) -> Result<Vec<InstallPlan>, OpsError> {
+    let _span = tracing::debug_span!("plan.build").entered();
     let bucket = match (c.selectable, bucket_of(&c.entry.source_name)) {
         (true, Some(b)) if c.entry.source == SourceKind::Scoop => b.to_string(),
         _ => {
@@ -615,10 +619,18 @@ async fn apply_with_targets(
     targets: &std::collections::HashSet<String>,
 ) -> Result<(), OpsError> {
     let layout = layout(ctx);
-    let _lock = lock_async(&layout, ctx.wait).await?;
+    let _lock = lock_async(&layout, ctx.wait)
+        .instrument(tracing::debug_span!("install.lock"))
+        .await?;
     let mut state = open_state(&layout)?;
-    let plans = revalidate(&state, plans, targets)?;
-    prefetch(ctx, &plans).await?;
+    let plans = tracing::debug_span!("install.revalidate")
+        .in_scope(|| revalidate(&state, plans, targets))?;
+    prefetch(ctx, &plans)
+        .instrument(tracing::debug_span!(
+            "install.prefetch",
+            plans = plans.len()
+        ))
+        .await?;
     let names = env_names(plans.iter().flat_map(|p| &p.steps).filter_map(|s| match s {
         Step::EnvSet { name, .. } => Some(name.clone()),
         _ => None,
@@ -629,7 +641,11 @@ async fn apply_with_targets(
     let mut applied: Vec<String> = Vec::new();
     for plan in plans {
         let mut exec = exec_ctx(ctx, &layout, &mut state);
-        if let Err(e) = executor::execute_install(plan, &mut exec).await {
+        let step_span = tracing::debug_span!("install.execute", app = %plan.app);
+        if let Err(e) = executor::execute_install(plan, &mut exec)
+            .instrument(step_span)
+            .await
+        {
             let error = OpsError::from(e);
             result = Err(if applied.is_empty() {
                 error
@@ -643,7 +659,8 @@ async fn apply_with_targets(
         }
         applied.push(plan.app.clone());
     }
-    broadcast_if_changed(env, &names, &before);
+    tracing::debug_span!("install.broadcast")
+        .in_scope(|| broadcast_if_changed(env, &names, &before));
     result
 }
 
@@ -711,7 +728,8 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
 /// classified residues; the caller confirms and calls `residue::clean`.
 pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>, OpsError> {
     let layout = layout(ctx);
-    let _lock = lock_blocking(&layout, ctx.wait)?;
+    let _lock =
+        tracing::debug_span!("uninstall.lock").in_scope(|| lock_blocking(&layout, ctx.wait))?;
     let mut state = open_state(&layout)?;
     let homepage = match state.get(&plan.app)? {
         Some((rec, _)) if rec.version == plan.version => homepage_of(ctx.catalog, &rec)?,
@@ -729,11 +747,14 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     let before = env_snapshot(env, &names)?;
     let result = {
         let mut exec = exec_ctx(ctx, &layout, &mut state);
-        executor::execute_uninstall(plan, &mut exec)
+        tracing::debug_span!("uninstall.execute")
+            .in_scope(|| executor::execute_uninstall(plan, &mut exec))
     };
-    broadcast_if_changed(env, &names, &before);
+    tracing::debug_span!("uninstall.broadcast")
+        .in_scope(|| broadcast_if_changed(env, &names, &before));
     result?;
-    Ok(scan_residues(ctx, &app_dir, &plan.app, homepage.as_deref()))
+    Ok(tracing::debug_span!("uninstall.residue_scan")
+        .in_scope(|| scan_residues(ctx, &app_dir, &plan.app, homepage.as_deref())))
 }
 
 fn homepage_of(catalog: &Catalog, rec: &AppRecord) -> Result<Option<String>, OpsError> {
@@ -830,6 +851,7 @@ pub struct UpgradeList {
 
 /// Every `state.db` app whose catalog version is newer (`upgrade --all`).
 pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
+    let _span = tracing::debug_span!("upgrade.list").entered();
     let layout = layout(ctx);
     let state = read_state(&layout)?;
     let mut out = UpgradeList::default();

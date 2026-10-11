@@ -326,6 +326,31 @@ pub fn file_log_filter() -> tracing_subscriber::filter::Targets {
         .with_target("wingetrs", Level::DEBUG)
 }
 
+/// File log layer: wingetrs at DEBUG, with the duration of every closed span.
+fn file_layer<S, W>(writer: W) -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::fmt::format::FmtSpan;
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_filter(file_log_filter())
+}
+
+/// Span durations on stderr only with `-vv` (`-v` stays quiet).
+fn stderr_span_events(verbose: u8) -> tracing_subscriber::fmt::format::FmtSpan {
+    use tracing_subscriber::fmt::format::FmtSpan;
+    if verbose > 1 {
+        FmtSpan::CLOSE
+    } else {
+        FmtSpan::NONE
+    }
+}
+
 /// Stderr log filter for `-v`/`-vv`: same principle, dependencies stay at WARN.
 fn stderr_log_filter(verbose: u8) -> tracing_subscriber::filter::Targets {
     use tracing::Level;
@@ -380,13 +405,11 @@ fn init_logging(data: &DataDir, verbose: u8) -> tracing_appender::non_blocking::
     prune_logs(&data.log_dir(), LOG_KEEP);
     let appender = tracing_appender::rolling::daily(data.log_dir(), "wingetrs.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
-    let file = tracing_subscriber::fmt::layer()
-        .with_writer(writer)
-        .with_ansi(false)
-        .with_filter(file_log_filter());
+    let file = file_layer(writer);
     let stderr = (verbose > 0).then(|| {
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
+            .with_span_events(stderr_span_events(verbose))
             .with_filter(stderr_log_filter(verbose))
     });
     let _ = tracing_subscriber::registry()
@@ -513,6 +536,9 @@ fn print_reports(reports: &[SourceReport]) {
 struct EarlyOutcome {
     result: Result<Vec<Found>, CatalogError>,
     index_warning: Option<String>,
+    /// Which path answered: `"idx"` (search.idx) or `"catalog"` (catalog file).
+    via: &'static str,
+    elapsed_ms: f64,
 }
 
 impl EarlyOutcome {
@@ -520,6 +546,12 @@ impl EarlyOutcome {
         if let Some(w) = &self.index_warning {
             tracing::warn!("índice de busca inutilizável, usando o catálogo: {w}");
         }
+        tracing::debug!(
+            stage = "search",
+            via = self.via,
+            ms = self.elapsed_ms,
+            "stage"
+        );
     }
 }
 
@@ -558,20 +590,26 @@ fn search_early(
     source: Option<SourceKind>,
     limit: usize,
 ) -> EarlyOutcome {
+    let started = std::time::Instant::now();
     let mut index_warning = None;
     match index_file::search(idx, query, source, limit) {
         Ok(Some(found)) => {
             return EarlyOutcome {
                 result: Ok(found),
                 index_warning,
+                via: "idx",
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             };
         }
         Ok(None) => {}
         Err(e) => index_warning = Some(e.to_string()),
     }
+    let result = search_on_disk(catalog, query, source, limit);
     EarlyOutcome {
-        result: search_on_disk(catalog, query, source, limit),
+        result,
         index_warning,
+        via: "catalog",
+        elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
     }
 }
 
@@ -873,6 +911,34 @@ mod early_tests {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| early.join()));
         assert!(r.is_err(), "worker panic must be resumed, not swallowed");
     }
+
+    #[test]
+    fn early_search_reports_which_path_answered() {
+        use crate::catalog::{NewPackage, WingetMaps};
+        let dir = tempfile::tempdir().unwrap();
+        let (idx, cat) = (dir.path().join("search.idx"), dir.path().join("catalog.db"));
+        let mut c = Catalog::open(&cat).unwrap();
+        c.replace_source(
+            "scoop:main",
+            SourceKind::Scoop,
+            "v",
+            1,
+            &[NewPackage {
+                id: "ripgrep".into(),
+                name: "ripgrep".into(),
+                version: "1".into(),
+                ..Default::default()
+            }],
+            &WingetMaps::default(),
+        )
+        .unwrap();
+        let out = search_early(&idx, &cat, "ripgrep", None, 10);
+        assert_eq!(out.via, "catalog");
+        index_file::write(&c, &idx).unwrap();
+        let out = search_early(&idx, &cat, "ripgrep", None, 10);
+        assert_eq!(out.via, "idx");
+        assert_eq!(out.result.unwrap().len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -888,6 +954,45 @@ mod log_tests {
         assert!(!f.would_enable("h2::proto::streams", &Level::TRACE));
         assert!(!f.would_enable("hyper_util::client", &Level::DEBUG));
         assert!(f.would_enable("rustls", &Level::WARN));
+    }
+
+    #[derive(Clone, Default)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn file_layer_logs_the_duration_of_a_closed_wingetrs_span() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let buf = Buf::default();
+        let w = buf.clone();
+        let sub = tracing_subscriber::registry().with(file_layer(move || w.clone()));
+        tracing::subscriber::with_default(sub, || {
+            let _a = tracing::debug_span!(target: "wingetrs::install::ops", "install.prefetch")
+                .entered();
+            let _b = tracing::debug_span!(target: "h2::proto", "noise").entered();
+        });
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|l| l.contains("install.prefetch") && l.contains("close"))
+            .unwrap_or_else(|| panic!("sem linha de fechamento: {out}"));
+        assert!(line.contains("time.busy"), "{line}");
+        assert!(!out.contains("noise"), "{out}");
+    }
+
+    #[test]
+    fn stderr_shows_span_durations_only_with_vv() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        assert_eq!(stderr_span_events(1), FmtSpan::NONE);
+        assert_eq!(stderr_span_events(2), FmtSpan::CLOSE);
     }
 
     #[test]
