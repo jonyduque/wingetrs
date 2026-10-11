@@ -144,6 +144,64 @@ async fn index_pointing_at_wrong_blob_is_not_trusted() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+#[tokio::test]
+async fn uppercase_sha256_in_manifest_lands_in_a_lowercase_blob() {
+    let server = MockServer::start().await;
+    serve(&server, "/a", b"abc").await;
+    let td = tempfile::tempdir().unwrap();
+    let data = DataDir::new(td.path());
+    let http = Http::new().unwrap();
+    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    // `HashSpec::parse` lowercases, so build the spec by hand to keep the uppercase.
+    let mut s = src(&server, "/a", SHA_A);
+    s.hash.hex = SHA_A.to_ascii_uppercase();
+    let sources = [s];
+    let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    assert_eq!(paths[0].file_name().unwrap().to_str().unwrap(), SHA_A);
+    let names: Vec<String> = std::fs::read_dir(data.blobs_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n != "index.json")
+        .collect();
+    assert_eq!(names, vec![SHA_A.to_owned()]);
+    let again = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    assert_eq!(again[0].file_name().unwrap().to_str().unwrap(), SHA_A);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sha512_cached_blob_with_wrong_content_is_redownloaded() {
+    use sha2::{Digest, Sha256};
+    let sha512_abc = "sha512:ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+    let server = MockServer::start().await;
+    serve(&server, "/c", b"abc").await;
+    let td = tempfile::tempdir().unwrap();
+    let data = DataDir::new(td.path());
+    let http = Http::new().unwrap();
+    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let sources = [src(&server, "/c", sha512_abc)];
+    let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    // Replace the blob by other bytes, renamed to their own sha256 (intact by name,
+    // wrong for the manifest), and point the index at it.
+    let evil = b"evil";
+    let evil_name: String = Sha256::digest(evil)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::remove_file(&paths[0]).unwrap();
+    std::fs::write(data.blobs_dir().join(&evil_name), evil).unwrap();
+    std::fs::write(
+        data.blobs_dir().join("index.json"),
+        format!(r#"{{"{sha512_abc}":"{evil_name}"}}"#),
+    )
+    .unwrap();
+    let again = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    assert_eq!(std::fs::read(&again[0]).unwrap(), b"abc");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
 // ---- minimal raw TCP servers (wiremock cannot stream slowly) ----
 
 use std::sync::Arc;

@@ -96,7 +96,8 @@ fn cached(data: &DataDir, idx: &BTreeMap<String, String>, spec: &HashSpec) -> Op
     };
     let blobs = BlobStore::new(data.blobs_dir());
     let bytes = blobs.get(&name)?; // checks sha256(content) == name
-    verify(spec, &bytes).then(|| data.blobs_dir().join(name))
+    // For sha256 the blob name is the manifest hash, so `get` already proved it.
+    (spec.algo == HashAlgo::Sha256 || verify(spec, &bytes)).then(|| data.blobs_dir().join(name))
 }
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -134,7 +135,12 @@ async fn download_one(
             url: src.url.clone(),
         }); // guard deletes the temp file
     }
-    let name = hex_of(&Sha256::digest(&bytes));
+    // For sha256 the verified manifest hash is the blob name; no second digest.
+    let name = if src.hash.algo == HashAlgo::Sha256 {
+        src.hash.hex.to_ascii_lowercase()
+    } else {
+        hex_of(&Sha256::digest(&bytes))
+    };
     drop(bytes);
     let blobs = data.blobs_dir();
     std::fs::create_dir_all(&blobs).map_err(|e| io_err(&blobs, e))?;
