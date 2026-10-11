@@ -1311,3 +1311,110 @@ Tarefa de relatório: **no mutation proof** (declare no relatório). A verifica�
 - Create (new): `docs/superpowers/reports/2026-10-10-fase2a-validacao.md`
 
 **Commit:** `docs(report): phase 2a validation`
+
+
+---
+
+## Desempenho pós-validação (Tasks 41–43)
+
+Origem: prova ao vivo da Task 40 (relatório §1). Medido: `install` com cache e efeitos reais ~1000 ms, dos quais o broadcast `WM_SETTINGCHANGE` custa 438–568 ms (2,5 s com janela lenta); `upgrade --all` (CLI `src/cli/install_cmd.rs` fn `upgrade`, ~linhas 407–434) e a TUI (`src/tui/jobs.rs` `run_action`, `Action::Apply`) chamam `ops::apply` **uma vez por app**, então pegam o lock e podem fazer broadcast uma vez por app; o executor baixa cada `Step::Download` em sequência (`src/install/executor.rs` ~433), então o paralelismo de `download::fetch_all` (`MAX_PARALLEL = 4`) nunca é usado. O log em arquivo (`src/cli/mod.rs` `init_logging`) não tem filtro: o `update --background` grava TRACE do `h2` (9,5 MB num dia) e os arquivos diários nunca são apagados.
+
+### Task 41: Lote numa só aplicação (um lock, um broadcast)
+
+#### Where this fits
+
+`upgrade --all` e a atualização em lote da TUI passam a aplicar todos os planos numa única chamada de `ops::apply`: um `install.lock`, um broadcast no fim, falha no meio relatada como `PartlyApplied` com os apps já aplicados.
+
+#### What binds this task
+
+- Nova função pura `pub fn merge_groups(groups: Vec<Vec<InstallPlan>>) -> Vec<InstallPlan>` em `src/install/ops.rs`: concatena na ordem dos grupos e, dentro de cada grupo, na ordem original; um plano cujo `app` (comparação sem caixa) já apareceu antes é descartado (dependência comum a dois grupos aparece uma vez, na primeira posição).
+- Nova `pub async fn apply_groups(ctx: &OpsCtx<'_>, groups: Vec<Vec<InstallPlan>>) -> Result<Vec<InstallPlan>, OpsError>` = `merge_groups` + **uma** chamada a `apply`; devolve os planos aplicados (para a CLI imprimir "Atualizado: app versão" de cada um). Não reimplemente nada de `apply`.
+- CLI `upgrade` (`src/cli/install_cmd.rs`): substitui o laço `for g in &groups { ops::apply(..) }` por `apply_groups`; imprime "Atualizado: {app} {versão}" para cada plano devolvido. Texto do plano e do `--dry-run` não mudam.
+- TUI `run_action` (`src/tui/jobs.rs`, `Action::Apply(groups)`): usa `apply_groups`; o resumo continua "Instalado: a, b".
+- Falha no 2º app de um lote depois do 1º aplicado ⇒ `OpsError::PartlyApplied { applied: ["<1º>"], .. }` (hoje a CLI perde essa informação porque cada grupo é uma chamada).
+- Nada muda em `install` de um alvo só (já é um grupo).
+
+**Files:**
+- Modify: `src/install/ops.rs`, `src/cli/install_cmd.rs`, `src/tui/jobs.rs`
+- Test: `tests/install_ops.rs`, `tests/tui_jobs.rs`
+
+Testes (literais em prosa; use o `World` existente de cada arquivo):
+1. `merge_groups_keeps_order_and_drops_repeated_apps` (`tests/install_ops.rs`): grupos `[[leaf, a], [LEAF, b], [c]]` (planos reais via `w.plans`, ou construídos) ⇒ apps `["leaf", "a", "b", "c"]`.
+2. `apply_groups_broadcasts_once_for_two_env_apps` (`tests/install_ops.rs`): dois apps independentes com `env: true` (campo `App.env` do teste), `apply_groups(ctx, vec![plans_a, plans_b])` ⇒ `w.broadcasts() == 1` e ambos no `state.db`.
+3. `apply_groups_reports_what_was_applied_when_a_later_app_fails` (`tests/install_ops.rs`): app `a` normal; app `b` cujo zip servido é lixo com o SHA-256 **certo** (o hash confere, a extração falha) ⇒ `Err(PartlyApplied { applied == ["a"] })`, `a` no `state.db`, `b` não, `apps\b` não existe.
+4. `run_action_applies_all_groups_with_one_broadcast` (`tests/tui_jobs.rs`): `Action::Apply(vec![g1, g2])` com dois apps que mexem em env ⇒ um broadcast (amplie o `World` do arquivo com env se preciso).
+
+#### Checks beyond the steps
+
+1. Dedupe de `merge_groups`: mutate removendo o filtro de repetidos ⇒ PEGA (teste 1).
+2. Um broadcast: mutate fazendo `apply_groups` chamar `apply` por grupo ⇒ PEGA (teste 2).
+3. TUI usa o lote: mutate voltando `run_action` ao laço por grupo ⇒ PEGA (teste 4).
+
+**Commit:** `perf(ops): apply a batch of upgrades under one lock and one broadcast`
+
+---
+
+### Task 42: Downloads do lote em paralelo antes de aplicar
+
+#### Where this fits
+
+Depende da Task 41 (lote numa só `apply`). Com o lote inteiro em mãos, `apply` baixa todas as fontes de todos os planos de uma vez (até 4 simultâneas) antes de mexer em qualquer coisa; o executor depois encontra tudo no cache de blobs. Ganho esperado: tempo de download do lote cai da soma para perto do maior (na prova ao vivo: ~4,6 s → ~3,4 s para ripgrep+delta+cpu-z); bônus: download que falha aborta o lote **antes** de qualquer mudança.
+
+#### What binds this task
+
+- `src/install/download.rs`: nova `pub async fn fetch_each(http: &Http, data: &DataDir, sources: &[Source], progress: Progress<'_>) -> Vec<Result<PathBuf, DownloadError>>` — mesma ordem de `sources`, mesmo semáforo `MAX_PARALLEL` para **todas** as fontes (não um por plano), cache consultado antes, índice `index.json` gravado **uma vez** no fim com as entradas novas que deram certo. `fetch_all` passa a ser um invólucro de `fetch_each` (primeiro erro), comportamento inalterado.
+- `src/install/ops.rs` `apply`: depois do lock e de `revalidate`, coleta `(app, source)` de todo `Step::Download` de todos os planos restantes e chama `fetch_each` **uma vez**; qualquer erro ⇒ retorna `OpsError::Download { app, error }` (variante nova, mensagem `"falha ao baixar {app}: {error}"`) **antes de executar qualquer plano** — sem `PartlyApplied`, sem broadcast, raiz intacta. Os downloads ficam **dentro** do lock (o `index.json` dos blobs não é seguro entre processos).
+- O executor não muda: o `Step::Download` dele acha o blob no cache. O `EnsureLauncher` continua como está.
+- Progresso: o callback já é chamado por URL; `LineProgress` (CLI) agrega por URL e `ProgressThrottle` (TUI) já é atômico — confirme que nada assume um download por vez; se assumir, corrija e teste.
+- Concorrência: `join_all` sobre futures que pegam permissão do semáforo — nenhuma `spawn` (sem thread/tarefa órfã). Se usar `spawn`, aplique a regra de join/`resume_unwind` do CLAUDE.md.
+
+**Files:**
+- Modify: `src/install/download.rs`, `src/install/ops.rs`
+- Test: `tests/install_download.rs`, `tests/install_ops.rs`
+
+Testes:
+1. `fetch_each_keeps_order_and_reports_each_failure` (`tests/install_download.rs`): fontes `[ok1, 404, ok2]` (wiremock) ⇒ `[Ok, Err, Ok]` com os caminhos de `ok1`/`ok2` em `blobs`.
+2. `apply_downloads_the_batch_in_parallel` (`tests/install_ops.rs`): três apps independentes, cada zip servido com `ResponseTemplate::set_delay(Duration::from_millis(400))`; `apply` dos três planos concatenados ⇒ tempo total < 1000 ms (sequencial seria ≥ 1200 ms) e os três instalados.
+3. `apply_fails_before_any_change_when_a_download_fails` (`tests/install_ops.rs`): app `a` ok, app `b` com 404 ⇒ `Err(OpsError::Download { app == "b", .. })`, `state.db` sem apps, `apps\a` não existe, `w.broadcasts() == 0`. (Antes desta tarefa o mesmo cenário instalaria `a` e daria `PartlyApplied`.)
+4. Os testes da Task 41 continuam verdes (o teste 3 dela falha na extração, não no download — de propósito).
+
+#### Checks beyond the steps
+
+1. Paralelismo: mutate trocando a chamada única de `fetch_each` por um laço sequencial por plano ⇒ PEGA (teste 2).
+2. Falha antes de mudar: mutate ignorando os erros de `fetch_each` em `apply` ⇒ PEGA (teste 3).
+3. Ordem: mutate devolvendo os resultados de `fetch_each` em ordem de conclusão ⇒ PEGA (teste 1).
+4. Bench do orquestrador: `upgrade --all` não é medível sem apps desatualizados; o orquestrador mede com raiz temporária e mock lento se precisar — implementador só reporta os tempos do teste 2.
+
+**Commit:** `perf(ops): download every source of a batch in parallel before applying`
+
+---
+
+### Task 43: Log em arquivo filtrado e com retenção
+
+#### Where this fits
+
+Independente das Tasks 41–42 (só `src/cli/mod.rs` e, se preciso, um módulo novo pequeno). Reduz disco e CPU do `update --background`.
+
+#### What binds this task
+
+- Filtro do arquivo de log: `tracing_subscriber::filter::Targets` (sem crate nova; `Targets` está no `tracing-subscriber` já presente): alvo `wingetrs` em `DEBUG`, todo o resto em `WARN`. Função pura `pub fn file_log_filter() -> Targets` testável.
+- Camada de stderr (`-v`/`-vv`): mesmo princípio — `wingetrs` em INFO/DEBUG conforme `verbose`, resto em `WARN` (hoje `-vv` despeja DEBUG do `h2`/`hyper`).
+- Retenção: na inicialização do log, `pub fn prune_logs(dir: &Path, keep: usize)` apaga os arquivos mais antigos com nome `wingetrs.log.AAAA-MM-DD` além dos `keep` mais novos (ordem pelo nome, que é a data); ignora qualquer outro arquivo; erro de E/S só vira `tracing::warn!`, nunca falha o comando. `keep = 14`.
+- Nada mais muda no formato das linhas.
+
+**Files:**
+- Modify: `src/cli/mod.rs` (funções novas ao lado de `init_logging`)
+- Test: no próprio módulo (`#[cfg(test)] mod tests` em `src/cli/mod.rs`)
+
+Testes:
+1. `file_filter_keeps_wingetrs_debug_and_drops_dependency_noise`: `file_log_filter().would_enable(target, &level)` ⇒ `("wingetrs::install::ops", DEBUG)` true; `("wingetrs", TRACE)` false; `("h2::proto::streams", TRACE)` false; `("hyper_util::client", DEBUG)` false; `("rustls", WARN)` true.
+2. `prune_logs_keeps_the_newest_and_ignores_other_files`: tempdir com 16 arquivos `wingetrs.log.2026-09-01` … `wingetrs.log.2026-09-16` e um `outro.txt` ⇒ após `prune_logs(dir, 14)` restam `…09-03` … `…09-16` e `outro.txt`.
+3. `prune_logs_on_a_missing_dir_is_a_no_op`.
+
+#### Checks beyond the steps
+
+1. Filtro: mutate trocando o default `WARN` por `TRACE` ⇒ PEGA (teste 1).
+2. Retenção: mutate trocando `keep` por `keep + 1` dentro de `prune_logs` ⇒ PEGA (teste 2).
+3. O orquestrador roda `wingetrs update` real e confere que o log do dia não ganha linhas `h2`/`hyper` de nível < WARN.
+
+**Commit:** `fix(log): filter the file log to wingetrs and keep 14 days`
