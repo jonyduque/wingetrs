@@ -24,3 +24,5 @@ Decisions:
 
 Concerns:
 - Benchmark/span measurement not done (orchestrator's job): ganho não medido.
+
+Extra (coordinator): apply_downloads_the_batch_in_parallel now records request arrival instants (Recording responder) and asserts last-first arrival < 400 ms delay (overlap, no wall-clock threshold). Mutation: [OK] mutação PEGA: 'const MAX_PARALLEL: usize = 4;' -> 'const MAX_PARALLEL: usize = 1;' fez o teste falhar (exit 101). Gate verde.

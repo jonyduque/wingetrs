@@ -98,6 +98,24 @@ struct World {
     http: Http,
     catalog: Catalog,
     packages: Vec<NewPackage>,
+    /// Arrival instant of every download request, in arrival order.
+    arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+}
+
+/// Responder that records when each request arrives, then answers with `template`.
+struct Recording {
+    arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    template: ResponseTemplate,
+}
+
+impl wiremock::Respond for Recording {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::Instant::now());
+        self.template.clone()
+    }
 }
 
 impl World {
@@ -130,6 +148,7 @@ impl World {
             http: Http::new().unwrap(),
             catalog: Catalog::open_in_memory().unwrap(),
             packages: Vec::new(),
+            arrivals: Default::default(),
         }
     }
 
@@ -162,11 +181,12 @@ impl World {
         let name = format!("{}-{}.zip", a.id, a.version);
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
-            .respond_with(
-                ResponseTemplate::new(200)
+            .respond_with(Recording {
+                arrivals: self.arrivals.clone(),
+                template: ResponseTemplate::new(200)
                     .set_body_bytes(zip)
                     .set_delay(std::time::Duration::from_millis(a.delay_ms)),
-            )
+            })
             .mount(&self.server)
             .await;
         let url = format!("{}/{name}", self.server.uri());
@@ -1048,11 +1068,20 @@ async fn apply_downloads_the_batch_in_parallel() {
     let mut plans = w.plans("a").unwrap();
     plans.extend(w.plans("b").unwrap());
     plans.extend(w.plans("c").unwrap());
-    let t0 = std::time::Instant::now();
     apply(&w.ctx(), &plans).await.unwrap();
-    let ms = t0.elapsed().as_millis();
-    eprintln!("apply_downloads_the_batch_in_parallel: {ms} ms");
-    assert!(ms < 1000, "{ms} ms");
+    // Each response is delayed 400 ms: if the last request arrived before the first response
+    // could have finished, the downloads overlapped. No absolute wall-clock threshold.
+    let arrivals = w.arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 3);
+    let (first, last) = (
+        arrivals.iter().min().unwrap(),
+        arrivals.iter().max().unwrap(),
+    );
+    assert!(
+        last.duration_since(*first) < std::time::Duration::from_millis(400),
+        "downloads did not overlap: {:?}",
+        last.duration_since(*first)
+    );
     for id in ["a", "b", "c"] {
         assert!(w.state().get(id).unwrap().is_some(), "{id}");
     }
