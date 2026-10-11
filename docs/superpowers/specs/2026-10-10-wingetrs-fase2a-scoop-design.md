@@ -143,6 +143,7 @@ Conhecidos por nome: main, extras, versions, nerd-fonts, java, games, nirsoft, s
 - **Conflito**: se o mesmo app aparece no `list` instalado por scoop/winget, o item é marcado "pode ser de outra instalação" e nunca pré-selecionado.
 - **Recuperável**: pastas → Lixeira (`IFileOperation` com `FOFX_RECYCLEONDELETE`); chaves → `reg export` para `backups\…\<app>.reg` e só então apagadas.
 - Seleção na mesma lista com setas (espaço marca/desmarca). Com `--yes`: remove só os de alta confiança.
+- **Emenda (2026-10-11):** na TUI, o ajuste "Resíduos após remover" pode trocar a confirmação por "só alta confiança" (mesmo efeito do `--yes`) ou "manter" (não remove nada; avisa quantos ficaram). O padrão continua sendo confirmar.
 
 ## 9. Erros
 
@@ -154,6 +155,11 @@ Conhecidos por nome: main, extras, versions, nerd-fonts, java, games, nirsoft, s
 - Tela de confirmação mostra o `InstallPlan` (mesmo texto do `--dry-run`).
 - Progresso de download/extração na barra de status; erro com estilo `err` e o que foi desfeito.
 - Seleção de candidatos e de resíduos com o mesmo componente da CLI.
+
+> **Emenda (2026-10-11, aprovada pelo usuário).**
+> - Progresso continua na barra de status; **resultados e erros viram toasts** (fase 1 §7.1, emenda).
+> - Aba **Ajustes**, gravada na seção `[behavior]` do `config.toml` (gravação lê-modifica-grava, para não apagar `bucket add` feito pela CLI com a TUI aberta): confirmar antes de aplicar (`sempre` padrão / `só remoções` / `nunca`), purge ao remover (`não` padrão), manter versão antiga ao atualizar (`não` padrão), resíduos (`perguntar` padrão / `só alta confiança` / `manter`), glifos e tema. Escolha de candidato ambíguo nunca é pulada.
+> - Os ajustes valem **só na TUI**; a CLI continua com as flags de §6.
 
 ## 11. Testes e critérios de sucesso
 

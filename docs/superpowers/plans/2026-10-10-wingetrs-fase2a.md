@@ -3377,3 +3377,547 @@ Equivalência no real: `search.idx` com o mesmo hash nas duas raizes (comando do
 **Critério (mediana E pior caso):** fica se (1) delta pareado mediano ≤ −80 ms (metade dos −162/−170 ms do harness), (2) `max(new) ≤ max(base)` — se só (2) falhar, repita uma rodada de 10; falhou de novo ⇒ revert —, (3) `search.idx` e digests iguais. Senão `git revert --no-edit <sha da tarefa>` e ledger com os números colados. Se o pipeline mostrar o mesmo tipo de travamento bimodal da Task 54 (execuções `new` muito acima da base sem padrão), registre em `docs/ARMADILHAS.md` mesmo revertendo.
 
 **Commit:** `perf(winget): validate the index msix as an inflate and hash pipeline`
+
+
+## TUI — redesenho no estilo Bubble Tea (Tasks 57–69)
+
+Decisões do usuário (2026-10-11, recomendações aceitas): D1 = só a TUI (sem U13), D2 = três modos de confirmação com padrão "sempre", D3 = ajuste de resíduos com padrão "perguntar", D4 = paleta Charm com ajuda clareada para `#6C6C6C`, D5 = itens em duas linhas, D6 = barra de ajuda só com altura ≥ 20, D7 = busca fora da UI só se a medição pedir, D8 = emendas aprovadas (fase 1 §7.1/§7.2/§7.3, fase 2a §8/§10, já no texto das specs), D9 = toast de erro fixo até `Esc`, D10 = sem linha entre itens, D11 = toast de sucesso da atualização do catálogo só com Ctrl+R. Pedido extra do usuário: `←`/`→` trocam de aba (Task 57); por isso, na aba Ajustes (Task 68), o valor muda com `Enter`/Espaço/`l` (e `h` volta), não com as setas laterais.
+
+Ordem e paralelismo: 57, 58, 61 e 67 tocam arquivos disjuntos e rodam em paralelo; 59 (mede frame) roda sozinha; 60 (condicional, mede busca) sozinha; 62 → 63 → 64 → 65 → 66 em série (todas em `src/tui/view.rs`); 68 depois de 66 e 67; 69 depois de 68. Números de linha citados nos textos copiados do rascunho podem ter deslocado com as Tasks 53–56: localize pelo símbolo citado junto.
+
+### Task 57: `←` e `→` trocam de aba
+
+#### Where this fits
+
+Pedido do usuário (2026-10-11), emenda da spec da fase 1 §7.2. Hoje só `Tab`/`Shift+Tab` trocam de aba (`src/tui/app.rs`, `on_key`, ramos `KeyCode::Tab` e `KeyCode::BackTab`, cada um com seu `match` de abas); `KeyCode::Left`/`Right` não fazem nada. A Task 68 vai acrescentar a aba Ajustes ao ciclo: esta tarefa deixa o ciclo num lugar só para isso.
+
+#### What binds this task
+
+- `src/tui/app.rs`: duas funções públicas, `pub fn next_tab(tab: Tab) -> Tab` e `pub fn prev_tab(tab: Tab) -> Tab`, circulares, mesma ordem de hoje (Pesquisar → Instalados → Atualizações → Pesquisar). Os ramos `Tab` e `Right` chamam `app.set_tab(next_tab(app.tab))`; `BackTab` e `Left` chamam `app.set_tab(prev_tab(app.tab))`. Os dois `match` inline atuais deixam de existir.
+- Vale com foco na lista **ou** nos detalhes, com a busca vazia ou não (o campo de busca não tem cursor; seta lateral nunca altera `query`).
+- Diálogo aberto (`app.modal.is_some()`): as setas continuam indo para `on_modal_key` (a checagem do modal vem antes; não mude a ordem). Ajuda aberta (`show_help`): ignoradas, como as outras teclas hoje.
+- Textos (português): rodapé `"Tab aba"` passa a `"←→ aba"`; no diálogo de ajuda, a linha `key("Tab", "próxima aba")` passa a `key("←→ / Tab", "trocar aba")`. Atualize os `.snap` afetados com `INSTA_UPDATE=always cargo test --quiet --test tui_view` e confira no diff que só o rodapé/ajuda mudaram.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/view.rs`
+- Test: `tests/tui_state.rs`, `.snap` de `tests/snapshots/tui_view__*.snap`
+
+Testes (`tests/tui_state.rs`, helpers de tecla e de app que o arquivo já tem):
+1. `right_and_left_arrows_cycle_tabs`: a partir de Pesquisar, `Right` ⇒ Instalados, `Right` ⇒ Atualizações, `Right` ⇒ Pesquisar; `Left` ⇒ Atualizações, `Left` ⇒ Instalados.
+2. `arrows_match_tab_and_backtab`: para cada aba de partida (as três), o estado de aba depois de `Right` é igual ao depois de `Tab`, e depois de `Left` igual ao depois de `BackTab` (dois `App` iguais, um por tecla).
+3. `arrows_switch_tabs_with_text_and_from_details`: digitar `po` ⇒ `Right` ⇒ aba Instalados e `query` sem caractere novo; noutro app, `Enter` (foco nos detalhes) ⇒ `Right` ⇒ aba Instalados.
+4. `arrows_belong_to_an_open_dialog`: com um diálogo de confirmação aberto (mesmo jeito que os testes existentes abrem `Modal::Confirm`, p.ex. `Msg::Planned(Ok(Planned::Ready { .. }))`), `Right` e `Left` ⇒ aba inalterada e `modal` continua `Confirm`.
+
+#### Checks beyond the steps
+
+1. Direção: mutate fazendo o ramo `Right` chamar `prev_tab` ⇒ PEGA (teste 1).
+2. Ciclo único: mutate trocando em `next_tab` o destino de Atualizações para Instalados ⇒ PEGA (testes 1 e 2).
+3. Diálogo primeiro: mutate tratando `Left`/`Right` antes da checagem de `app.modal` ⇒ PEGA (teste 4).
+
+**Commit:** `feat(tui): left and right arrows switch tabs`
+
+---
+
+### Task 58: Progresso da TUI somado entre downloads paralelos
+
+#### Where this fits
+
+Pendência cosmética registrada na Task 42 (`.claude/tasks/progress.md`, linha da Task 42: "ProgressThrottle da TUI único para todas as URLs (rótulo alterna)"). Com `fetch_each` baixando até `MAX_PARALLEL = 4` (`src/install/download.rs:46`), o callback é chamado por URL (`download.rs:129`); a TUI encaminha cada chamada admitida como `Msg::InstallProgress { label: url, done, total }` (`src/tui/run.rs:410-420`), e o modal guarda só a última (`src/tui/app.rs:383-386`): o rótulo e a barra pulam entre arquivos. Além disso o `ProgressThrottle` (`src/tui/jobs.rs:15-41`) deixa passar "o final" por URL (`total == Some(done)`), mas uma URL pode dominar os 20/s. A CLI já soma por URL (`LineProgress`, `src/cli/install_cmd.rs:93-126`). **Tarefa pequena**: só `src/tui/jobs.rs` e 3 linhas de `src/tui/run.rs`.
+
+#### What binds this task
+
+- `ProgressThrottle` passa a somar por rótulo: guarda `Mutex<BTreeMap<String, (u64, Option<u64>)>>` (lock com `unwrap_or_else(|p| p.into_inner())`, como `LineProgress`) e troca `admit` por
+  `pub fn admit(&self, now: Instant, label: &str, done: u64, total: Option<u64>) -> Option<(String, u64, Option<u64>)>`
+  que atualiza o mapa e, se admitido, devolve o agregado:
+  - rótulo: o próprio `label` quando o mapa tem 1 entrada; senão `format!("{n} arquivos")`;
+  - `done` = soma dos `done`; `total` = soma dos `total` só se **todos** forem `Some`, senão `None`;
+  - admitido se é o primeiro, se passaram `PROGRESS_GAP` desde o último admitido, **ou** se o agregado está completo (`total == Some(done)`). O final de **uma** URL com outras em curso não fura o intervalo.
+- `src/tui/run.rs` `spawn_execute`: a closure chama `throttle.admit(Instant::now(), label, done, total)` e envia o agregado. Nada mais em `run.rs`.
+- `Msg::InstallProgress` e o modal não mudam.
+
+**Files:**
+- Modify: `src/tui/jobs.rs`, `src/tui/run.rs`
+- Test: `tests/tui_jobs.rs`
+
+Testes:
+1. `progress_is_coalesced_to_about_twenty_per_second` (existente, l. 270): adapte para a nova assinatura com um rótulo só (`"u1"`); mesmas expectativas e rótulo devolvido `"u1"`.
+2. `parallel_downloads_are_summed_not_alternated`: `t.admit(at(0), "u1", 10, Some(100))` ⇒ `Some(("u1", 10, Some(100)))`; `at(60), "u2", 5, Some(50)` ⇒ `Some(("2 arquivos", 15, Some(150)))`; `at(120), "u1", 40, Some(100)` ⇒ `Some(("2 arquivos", 45, Some(150)))` (o `done` de `u2` foi mantido).
+3. `unknown_total_makes_the_sum_unknown`: `"u1", 10, Some(100)` em 0 ms e `"u2", 5, None` em 60 ms ⇒ segundo devolve `("2 arquivos", 15, None)`.
+4. `one_finished_file_does_not_bypass_the_gap_while_others_run`: `"u1", 10, Some(100)` em 0 ms (admitido); `"u2", 50, Some(50)` em 10 ms ⇒ `None` (u2 terminou, o lote não); `"u1", 100, Some(100)` em 20 ms ⇒ `Some(("2 arquivos", 150, Some(150)))` (lote completo passa).
+
+#### Checks beyond the steps
+
+1. Soma: mutate devolvendo `(label, done, total)` da chamada em vez do agregado ⇒ PEGA (teste 2).
+2. Total desconhecido: mutate somando só os `Some` ⇒ PEGA (teste 3).
+3. Final do lote, não do arquivo: mutate usando `total == Some(done)` da chamada individual ⇒ PEGA (teste 4).
+4. A TUI usa o agregado: sem teste automático do `run.rs` (exige TTY, como registrado na Task 39); o revisor confere o diff de 3 linhas — **no mutation proof** para essa ligação.
+
+**Commit:** `fix(tui): sum download progress across parallel files`
+
+---
+
+### Task 59: Frame barato, medido
+
+#### Where this fits
+
+Depende de Task 53. Cada frame monta até 1000 linhas para mostrar ~30 (`src/tui/view.rs:238-296`, recorte só em `view.rs:341`); nas abas Instalados/Atualizações, `basics` procura a entrada do catálogo com busca linear nas ~19,5 mil entradas **a cada frame** (`view.rs:407-410`); `installed_view()` (`src/tui/app.rs:237-254`) refaz o filtro com `to_lowercase` por linha a cada chamada (várias por evento). Regra do projeto: medir antes, medir delta; otimização sem ganho medido é revertida.
+
+#### What binds this task
+
+- **Primeiro commit: o benchmark**, `examples/tui_frame.rs` (novo): abre o catálogo real (`DataDir::from_env()`, `Catalog::open(&data.catalog_path())?.load_entries()?`), monta `App::new(entries, GlyphSet::Nerd)` e 400 `ListRow` sintéticos casados (`Correlation::Matched`) com as 400 primeiras entradas do catálogo, um a cada quatro com `UpdateState::Available`. Para cada cenário — Pesquisar sem busca, Pesquisar com busca `code`, Instalados, Atualizações — renderiza 200 frames em `TestBackend::new(120, 40)` com `Theme::new(true, ColorDepth::TrueColor)`, descendo a seleção um item por frame, e imprime mediana e p95 em µs por cenário (o exemplo pode usar `println!`; a regra só vale para `src/`). Rode `cargo run --release --example tui_frame` 3 vezes e cole os números como **antes**.
+- **Janela visível**: função pública nova em `src/tui/view.rs`, `pub fn list_window(selected: usize, scroll: usize, len: usize, height: usize) -> std::ops::Range<usize>`, com exatamente a lógica de `view.rs:331-340` (início = `selected` se `selected < scroll`; `selected + 1 - height` se `selected >= scroll + height`; senão `scroll`; limitado a `len - 1`) e fim `min(início + height, len)`; `len == 0` ⇒ `0..0`. `list_lines` monta **só** essas linhas; o destaque da seleção usa o índice relativo.
+- **Índice do catálogo**: `App` ganha `catalog_pos: HashMap<(String, String), usize>` (`(source_name, id)` ⇒ posição em `search.entries()`), refeito em `App::new` e em `Msg::CatalogLoaded`; `basics` usa o índice em vez de `iter().find`.
+- **Filtro dos instalados em cache**: `App` ganha `view_rows: Vec<usize>` (índices em `installed`), refeito em todo lugar que muda `installed`, `query`, `filter` ou `tab` (`refresh_view`, `set_tab`, `Msg::InstalledLoaded`, Ctrl+S, digitação, Backspace, Esc). `pub fn installed_view(&self) -> Vec<&ListRow>` mantém a assinatura (testes usam) e passa a mapear `view_rows`.
+- Cada uma das três mudanças em commit próprio, com o benchmark rodado depois de cada uma; mudança sem ganho na sua aba é revertida (registre no relatório).
+- Aparência inalterada: nenhum `.snap` muda.
+
+**Files:**
+- Create (novo): `examples/tui_frame.rs`
+- Modify: `src/tui/view.rs`, `src/tui/app.rs`
+- Test: `tests/tui_view.rs`, `tests/tui_state.rs`
+
+Testes:
+1. `list_window_keeps_selection_visible` (`tests/tui_view.rs`): `(0, 0, 1500, 10)` ⇒ `0..10`; `(700, 0, 1500, 10)` ⇒ `691..701`; `(1499, 1490, 1500, 10)` ⇒ `1490..1500`; `(5, 3, 1500, 10)` ⇒ `3..13`; `(0, 0, 3, 10)` ⇒ `0..3`; `(0, 0, 0, 10)` ⇒ `0..0`.
+2. `long_list_end_is_rendered` (`tests/tui_view.rs`): 1500 entradas winget `pkg0000`…`pkg1499` (nome e id iguais), `App::new(.., GlyphSet::Ascii)`, tecla `End`, `render(&a, 100, 20)` ⇒ a linha que começa com `"│> "` contém `pkg1499`; o buffer não contém `pkg0000`.
+3. `installed_details_show_the_catalog_publisher` (`tests/tui_view.rs`): `App::new(vec![], GlyphSet::Ascii)` e depois `Msg::CatalogLoaded` com uma entrada winget `Acme.Tool` de `publisher: Some("Acme Corp".into())`; `installed` com uma linha `Matched { source: "winget", package_id: "Acme.Tool", .. }`; aba Instalados; o render contém `"Acme Corp"`.
+4. `cached_installed_view_matches_a_fresh_filter` (`tests/tui_state.rs`): 6 linhas variadas (winget/scoop, com e sem atualização, nomes `Alpha`, `beta`, `Gamma`, `alfa`, `Zed`, `zebra`); para cada combinação de aba (Instalados, Atualizações) × filtro (3 toques de Ctrl+S) × busca (`""`, `"a"`, `"ze"`), chegando ao estado **só por teclas**, os nomes de `a.installed_view()` são iguais ao filtro de referência escrito no teste (mesmo predicado de `app.rs:237-254`).
+
+#### Checks beyond the steps
+
+1. Janela: mutate trocando `selected + 1 - height` por `selected - height` ⇒ PEGA (teste 1).
+2. Só linhas visíveis sem perder a seleção: mutate desenhando a janela a partir de `scroll` sem o ajuste da seleção ⇒ PEGA (teste 2).
+3. Índice refeito na carga: mutate removendo a reconstrução de `catalog_pos` em `CatalogLoaded` ⇒ PEGA (teste 3).
+4. Cache invalidado: mutate removendo a reconstrução de `view_rows` no ramo Ctrl+S ⇒ PEGA (teste 4).
+5. Ganho medido: relatório com a tabela antes/depois do `tui_frame` por cenário (mediana e p95). Sem número colado, a otimização não conta.
+
+**Commit:** `perf(tui): build only visible rows and index catalog lookups`
+
+---
+
+### Task 60: Busca fora da thread de UI (condicional à medição)
+
+#### Where this fits
+
+Depende de Task 59. Hoje cada tecla de texto roda `SearchIndex::search` inteira na thread de UI (`src/tui/app.rs:284-300`, `research`/`refresh_view`). **Esta tarefa só é implementada se a medição justificar.**
+
+#### What binds this task
+
+- **Passo 0, medir**: estenda `examples/tui_frame.rs` (criado na Task 59) com o cenário "busca": `app.search.search(q, None, 1000)` para `q` em `c`, `co`, `cod`, `code`, `vscode`, 50 repetições cada, mediana e p95 em µs. Cole os números. **Se o p95 de todas as consultas for ≤ 8 000 µs, pare**: relatório `DONE` com "não necessário" e os números; nenhum código além do cenário do benchmark.
+- Se passar de 8 ms:
+  - `App.search` vira `std::sync::Arc<SearchIndex>`; `Cmd::Search { generation: u64, query: String, kind: Option<SourceKind> }` emitido por `refresh_view` na aba Pesquisar no lugar da busca síncrona; `Msg::SearchDone { generation, hits }`. `App` guarda `search_generation`; resultado de geração diferente da atual é descartado. Até chegar, a lista mostra os hits anteriores; ao chegar, `selected = 0`, `scroll = 0` e `details_cmd()`.
+  - `src/tui/run.rs` executa a busca em `spawn_blocking` com o handle aguardado (regra do CLAUDE.md; pânico ⇒ `Msg::Panicked`), pela função pública única `pub fn run_search(index: &SearchIndex, query: &str, kind: Option<SourceKind>) -> Vec<SearchHit>` (= `index.search(query, kind, MAX_HITS)`), que também é a usada em `App::new`/`CatalogLoaded`.
+  - Regra do projeto: dois caminhos para o mesmo resultado ⇒ teste de equivalência.
+
+**Files:**
+- Modify: `examples/tui_frame.rs`, `src/tui/app.rs`, `src/tui/run.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_loop.rs`
+
+Testes (só se implementar):
+1. `async_search_equals_sync_search` (`tests/tui_state.rs`): com as entradas de `app()`, para cada consulta em `["", "p", "po", "zeal", "xyz"]` e filtro `None`/`Some(Winget)`: digitar até a consulta, executar o `Cmd::Search` emitido com `run_search` e entregar `Msg::SearchDone` ⇒ `a.hits` igual a `a.search.search(q, kind, 1000)` (índice e `name_indices`).
+2. `stale_search_results_are_dropped` (`tests/tui_state.rs`): digitar `p` (geração 1) e `o` (geração 2); entregar `SearchDone` da 2 e depois da 1 ⇒ `a.hits` é o da 2.
+3. `typing_does_not_search_on_the_ui_thread` (`tests/tui_state.rs`): digitar `p` ⇒ comandos contêm `Cmd::Search { query: "p", .. }` e `a.hits` ainda é o da consulta anterior.
+
+#### Checks beyond the steps
+
+1. Equivalência: mutate fazendo `run_search` usar limite 999 ⇒ PEGA (teste 1).
+2. Geração: mutate aplicando qualquer `SearchDone` ⇒ PEGA (teste 2).
+3. Fora da UI: mutate voltando a chamar `research()` síncrono em `refresh_view` ⇒ PEGA (teste 3).
+4. Se parar no passo 0: "no mutation proof (tarefa encerrada pela medição)", com os números colados.
+
+**Commit:** `perf(tui): search off the UI thread with generations`
+
+---
+
+### Task 61: Paleta Bubble Tea nos tokens
+
+#### Where this fits
+
+Independente (paralelo a Task 59/Task 67). Troca os valores dos tokens de `src/tui/theme.rs` pela paleta do Charm (Lip Gloss/Bubbles) e acrescenta os tokens que Task 63–Task 68 vão usar. Regra do projeto: cores só via tokens de `src/tui/theme.rs` (o gate barra `Color::` fora dele).
+
+#### What binds this task
+
+- Valores (truecolor; índice 256 entre parênteses), escuro / claro:
+  - `accent`: `#7D56F4` (99) / `#874BFD` (99). `border_focus` = `accent`.
+  - `sel_bar` e `sel_desc` (novos): `#AD58B4` (133) / `#F793FF` (219).
+  - `sel_title` (novo): `#EE6FF8` (213) nos dois.
+  - `fg`: `#DDDDDD` (253) / `#1A1A1A` (234). `fg_dim`: `#777777` (243) / `#A49FA5` (247).
+  - `border`: `#383838` (237) / `#D9DCCF` (253).
+  - `ok`: `#73F59F` (85) / `#43BF6D` (71).
+  - `help_key`, `help_desc`, `help_sep` (novos): `#626262` (241), `#6C6C6C` (242) (D4: clareado do `#4A4A4A` original), `#3C3C3C` (237) / `#909090` (246), `#B2B2B2` (249), `#DADADA` (253).
+  - `badge` (novo, `Style` com fg e bg): fg índice 230 / `#FFFFD7`, bg índice 62 / `#5F5FD7`, `BOLD`, nos dois temas.
+  - `pill_msg` (novo): fg `#FFFDF5` (230), bg `#FF5F87` (204). `pill_a`: fg `#FFFDF5` (230), bg `#A550DF` (134). `pill_b`: fg `#FFFDF5` (230), bg `#6124DF` (56). Iguais nos dois temas.
+  - `spinner` (novo): `#747373` (243) / `#8E8E8E` (245).
+  - `warn`, `muted`, `alert`, `err`, `src_winget`, `src_scoop`, `bg_selected`: valores atuais.
+- `NoColor`: nenhum token tem cor; modificadores mantidos; `badge`, `pill_msg`, `pill_a`, `pill_b` ganham `Modifier::REVERSED` (para continuarem visíveis sem cor).
+- Spinner dos glifos `Nerd` e `Unicode` passa ao `Dot` do Bubbles: `["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]`; `Ascii` inalterado.
+- Glifos novos de aba em `Glyphs` (usados na Task 63/Task 68): `tab_search`, `tab_installed`, `tab_updates`, `tab_settings` = Nerd `"\u{f002}"`, `"\u{f0a0}"`, `"\u{f06b0}"`, `"\u{f013}"`; Unicode `"⌕"`, `"▤"`, `"↑"`, `"⚙"`; Ascii `""` (sem glifo). E `bar`: Nerd/Unicode `"┃"`, Ascii `"|"`.
+- Nenhuma view muda nesta tarefa além do que a troca de valores implica; os `.snap` (NoColor + Ascii) não mudam.
+
+**Files:**
+- Modify: `src/tui/theme.rs`
+- Test: `tests/tui_theme.rs` (novo arquivo de teste)
+
+Testes:
+1. `dark_truecolor_uses_the_charm_palette`: `Theme::new(true, ColorDepth::TrueColor)` ⇒ `accent().fg == Some(Color::Rgb(0x7D, 0x56, 0xF4))`, `sel_title().fg == Some(Color::Rgb(0xEE, 0x6F, 0xF8))`, `help_key().fg == Some(Color::Rgb(0x62, 0x62, 0x62))`, `badge().bg == Some(Color::Rgb(0x5F, 0x5F, 0xD7))`.
+2. `light_truecolor_accent_is_darker_purple`: `Theme::new(false, TrueColor).accent().fg == Some(Color::Rgb(0x87, 0x4B, 0xFD))`.
+3. `ansi256_uses_the_listed_indexes`: `Theme::new(true, ColorDepth::Ansi256)` ⇒ `accent` 99, `sel_title` 213, `pill_msg().bg` 204, `ok` 85.
+4. `no_color_keeps_pills_visible`: `Theme::new(true, ColorDepth::NoColor)` ⇒ `pill_msg().bg == None` e `pill_msg().add_modifier` contém `REVERSED`; `badge()` contém `REVERSED` e `BOLD`.
+5. `nerd_and_unicode_spin_with_dot_frames`: `Glyphs::for_set(GlyphSet::Nerd).spinner.len() == 8` e primeiro quadro `"⣾"`; Ascii continua `["|", "/", "-", "\\"]`.
+
+#### Checks beyond the steps
+
+1. Paleta: mutate trocando o valor escuro de `accent` por `(122, 162, 247)` ⇒ PEGA (teste 1).
+2. Claro ≠ escuro: mutate usando o par escuro de `accent` no tema claro ⇒ PEGA (teste 2).
+3. Sem cor visível: mutate removendo o `REVERSED` do `pill_msg` em `NoColor` ⇒ PEGA (teste 4).
+4. `scripts/check_rules.ps1` continua verde (nenhum `Color::` fora de `src/tui/theme.rs`).
+
+**Commit:** `feat(tui): Charm palette tokens and Dot spinner`
+
+---
+
+### Task 62: Escala de espaçamento num lugar só
+
+#### Where this fits
+
+Depende de Task 59 (as duas mexem em `src/tui/view.rs`) e de Task 61. O usuário pediu padding entre os widgets. Hoje o texto encosta na borda (snapshot `tests/snapshots/tui_view__search_screen_snapshot.snap`: `"│> W PowerToys"`) e os espaços são números soltos espalhados por `src/tui/view.rs` (`" "` e `"  "` em `list_lines`, `centered(area, 90, h)` etc.). Esta tarefa cria a escala (`tui-design.md` §2.8) e a aplica **às caixas que existem hoje**; Task 63–Task 66 a usam no layout novo.
+
+#### What binds this task
+
+- Módulo novo `src/tui/layout.rs` (registrar em `src/tui/mod.rs`), só com constantes `u16` documentadas e duas funções puras:
+  - `PAD_X = 1` (entre borda e texto em toda caixa com borda), `FILTER_GAP = 1` (linhas entre a linha da busca e a lista), `GUTTER = 1` (colunas de cada lado do divisor lista/detalhes), `ITEM_GAP = 0` (linhas entre itens; D10), `DIALOG_PAD_X = 2`, `DIALOG_PAD_Y = 1`, `TOAST_PAD_X = 1`, `TOAST_MARGIN_X = 2`, `TOAST_MARGIN_Y = 1`, `TAB_PAD_X = 1`, `BAR_PAD_X = 1`.
+  - `pub fn inset(area: Rect, x: u16, y: u16) -> Rect`: tira `x` colunas de cada lado e `y` linhas em cima e embaixo, com subtração saturada (área menor que o recuo ⇒ largura/altura 0, nunca pânico).
+  - `pub fn split_with_gutter(area: Rect, left_percent: u16) -> (Rect, u16, Rect)`: divide na horizontal em `(esquerda, coluna_do_divisor, direita)` deixando `GUTTER` colunas em branco de cada lado do divisor; a esquerda tem `area.width * left_percent / 100` colunas (antes dos vãos); áreas estreitas demais saturam em 0.
+- Aplicação nesta tarefa (layout atual, três caixas): conteúdo da caixa de busca, da lista e dos detalhes desenhado em `inset(blk.inner(area), PAD_X, 0)`; diálogos (Confirmar, seletor, resíduos, Em andamento, ajuda) em `inset(blk.inner(rect), DIALOG_PAD_X, DIALOG_PAD_Y)`, com a altura/largura do diálogo crescendo `2*DIALOG_PAD_Y` / `2*DIALOG_PAD_X` para caber o mesmo texto; barra de status começando em `BAR_PAD_X` (hoje é um `" "` literal no `format!`; troque pela constante).
+- **Nenhum número de espaçamento solto** fora de `src/tui/layout.rs` nas funções de desenho alteradas (os `" "` entre glifo e nome dentro de um item continuam; são parte do item, não do layout).
+- Os testes de Task 53 (`selected_row_moves_on_screen_while_details_load`) e Task 59 (`long_list_end_is_rendered`) procuram a linha que começa com `"│> "`; com o padding ela passa a começar com `"│ > "`. Ajuste o prefixo procurado, sem enfraquecer a asserção (continua: a linha do item selecionado contém o nome esperado).
+- `CHROME_ROWS` não muda nesta tarefa (o padding é horizontal; nos diálogos não afeta a lista).
+- Atualize os `.snap` com `INSTA_UPDATE=always cargo test --quiet --test tui_view` e cole o novo `search_screen_snapshot` no relatório.
+
+**Files:**
+- Create (novo): `src/tui/layout.rs`
+- Modify: `src/tui/mod.rs`, `src/tui/view.rs`
+- Test: `tests/tui_view.rs` e os `.snap` de `tests/snapshots/tui_view__*.snap`
+
+Testes (`render` do arquivo, `GlyphSet::Ascii`, `ColorDepth::NoColor`; "coluna x da linha y" = símbolo da célula):
+1. `inset_saturates_on_tiny_rects`: `inset(Rect::new(0, 0, 1, 1), 1, 1)` tem largura e altura 0; `inset(Rect::new(2, 3, 10, 5), 1, 1) == Rect::new(3, 4, 8, 3)`.
+2. `split_with_gutter_leaves_blank_columns`: `split_with_gutter(Rect::new(0, 0, 100, 10), 55)` ⇒ esquerda `Rect::new(0, 0, 55, 10)`, divisor na coluna 56, direita começa na coluna 58 e termina na 99 (largura 42).
+3. `list_and_details_text_start_one_column_after_the_border`: `typed("powert")`, 100×16 ⇒ nas linhas 4 a 6, a coluna 1 (logo depois da borda da lista) é `" "` e a coluna 2 é `">"` ou `" "` seguida do glifo da fonte na coluna 4; no painel de detalhes (borda esquerda na coluna 55), a coluna 56 da linha 4 é `" "` e a 57 é o `P` de `PowerToys`.
+4. `confirm_dialog_has_inner_padding`: `with_confirm()` (helper existente), 100×24 ⇒ dentro do diálogo, a primeira linha interna é toda espaço e as duas primeiras colunas internas das linhas de texto são espaço.
+5. `layout_constants_are_the_documented_scale`: as constantes têm os valores listados acima (trava contra mudança acidental; a escala é decisão do usuário).
+
+#### Checks beyond the steps
+
+1. Padding da lista: mutate trocando `PAD_X` por `0` em `src/tui/layout.rs` ⇒ PEGA (teste 3, e o 5).
+2. Padding do diálogo: mutate desenhando o diálogo em `blk.inner(rect)` sem `inset` ⇒ PEGA (teste 4).
+3. Vão do divisor: mutate removendo o `GUTTER` da direita em `split_with_gutter` ⇒ PEGA (teste 2).
+4. Saturação: mutate trocando `saturating_sub` por `-` em `inset` ⇒ PEGA (teste 1, com pânico de overflow em debug).
+
+**Commit:** `feat(tui): one spacing scale for every box and dialog`
+
+---
+
+### Task 63: Abas encaixadas no topo
+
+#### Where this fits
+
+Depende de Task 62 (escala de espaçamento; Task 62 já depende de Task 59 e Task 61). Substitui as abas-texto do título da caixa de busca (`src/tui/view.rs:81-107`, `148-166`) pelas abas do exemplo `tabs` do Bubble Tea: caixas arredondadas, a ativa aberta para a janela de conteúdo. Layout de referência: `tui-design.md` §2.1–2.3.
+
+#### What binds this task
+
+- Módulo novo `src/tui/tabs.rs` (registrar em `src/tui/mod.rs`): `pub fn draw_tabs(frame: &mut Frame, area: Rect, labels: &[String], active: usize, theme: &Theme)`, desenhando 3 linhas:
+  - Cada aba tem interior `" " + rótulo + " "` (largura pelo `Span::width`, que conta unicode).
+  - Linha 0: por aba `╭` + `─`×interior + `╮`; o resto, espaços.
+  - Linha 1: por aba `│` + interior + `│`; o resto, espaços, com o badge ` wingetrs ` (token `badge`) alinhado à direita e um espaço de margem, só se couber.
+  - Linha 2: aba ativa `┘` + espaços×interior + `└`; inativa `┴` + `─`×interior + `┴`; **exceção da primeira aba**: canto esquerdo `│` se ativa, `├` se inativa; depois da última aba, `─` até a penúltima coluna e `╮` na última.
+  - Bordas no token `accent`; rótulo ativo `accent` + `BOLD`; inativos `fg_dim`; aba Atualizações com contagem > 0 e inativa usa `warn` (como hoje).
+  - **Estreito**: se a soma das larguras das abas + 1 > `area.width`, modo compacto: linha 0 vazia; linha 1 rótulos separados por `" · "` (ativo `accent` + `BOLD`); linha 2 `╭` + `─`×(largura−2) + `╮`. Largura < 2: não desenha nada (sem pânico).
+- Rótulos: `format!("{glyph} {nome}")`, ou só o nome quando o glifo é `""` (Ascii): `Pesquisar`, `Instalados`, `Atualizações` / `Atualizações N`.
+- Tela (`draw_screen`): linhas = abas (3) + janela (resto) + status (1). A janela é um `Block` com `Borders::LEFT | RIGHT | BOTTOM`, arredondado, borda `accent`; dentro, tudo em `inset(janela_interna, PAD_X, 0)` (`src/tui/layout.rs`): linha da busca (prompt + consulta + à direita o `corner_line` atual), `FILTER_GAP` linha(s) em branco, e lista | divisor `│` (token `border`) | detalhes via `split_with_gutter(.., 55)` (`GUTTER` em branco de cada lado do divisor). Rótulo de aba com `TAB_PAD_X` de cada lado (é o `" " + rótulo + " "` abaixo). A caixa de busca separada e as duas caixas da lista/detalhes deixam de existir. Abaixo de 60 colunas os detalhes somem (como hoje); abaixo de 8 linhas só a lista (como hoje).
+- `CHROME_ROWS` (`src/tui/app.rs:206`) passa a `3 + 1 + FILTER_GAP + 1 + 1` = 7 (abas + busca + vão + borda de baixo + status), escrito com as constantes.
+- Atualize os `.snap` de `tests/snapshots/` com `INSTA_UPDATE=always cargo test --quiet --test tui_view` e cole o novo `tui_view__search_screen_snapshot.snap` no relatório. Ajuste o teste `selected_row_moves_on_screen_while_details_load` (Task 53) e `long_list_end_is_rendered` (Task 59) se o prefixo da linha selecionada mudar (a janela agora começa em `│` + espaço?); a asserção continua sendo "a linha do item selecionado contém o nome".
+
+**Files:**
+- Create (novo): `src/tui/tabs.rs`
+- Modify: `src/tui/mod.rs`, `src/tui/view.rs`, `src/tui/app.rs` (usa `src/tui/layout.rs` da Task 62)
+- Test: `tests/tui_view.rs` e os `.snap` de `tests/snapshots/tui_view__*.snap`
+
+Testes (rótulos `["Pesquisar", "Instalados", "Atualizações 2"]`, `TestBackend::new(60, 3)`, `Theme::new(true, ColorDepth::NoColor)` salvo o teste 4; "linha" = conteúdo da linha do buffer):
+1. `active_first_tab_opens_into_the_window`: ativa 0 ⇒ linha 0 `format!("╭{}╮╭{}╮╭{}╮{}", "─".repeat(11), "─".repeat(12), "─".repeat(16), " ".repeat(15))`; linha 1 `format!("│ Pesquisar ││ Instalados ││ Atualizações 2 │{} wingetrs  ", " ".repeat(4))`; linha 2 `format!("│{}└┴{}┴┴{}┴{}╮", " ".repeat(11), "─".repeat(12), "─".repeat(16), "─".repeat(14))`.
+2. `active_middle_tab_tees_the_first_corner`: ativa 1 ⇒ linha 2 `format!("├{}┴┘{}└┴{}┴{}╮", "─".repeat(11), " ".repeat(12), "─".repeat(16), "─".repeat(14))`.
+3. `tabs_fall_back_to_one_line_when_narrow`: largura 30 ⇒ linha 0 só espaços; linha 1 contém `Pesquisar · Instalados`; linha 2 `format!("╭{}╮", "─".repeat(28))`.
+4. `active_label_is_bold_accent_and_others_dim`: `Theme::new(true, ColorDepth::TrueColor)`, ativa 0 ⇒ célula `(2, 1)` (`P`) com `fg == theme.accent().fg` e `BOLD`; célula `(15, 1)` (`I`) com `fg == theme.fg_dim().fg`.
+5. `tabs_never_panic_on_tiny_widths`: larguras 0..=12, alturas 0..=3.
+6. `search_screen_snapshot` (existente) atualizado: as três primeiras linhas do snapshot são as abas e a busca fica dentro da janela.
+7. `window_spacing_matches_the_scale` (tela inteira, `typed("powert")`, Ascii, NoColor, 100×16): coluna 1 em branco nas linhas 3 a 13 (`PAD_X`; a 14 é a borda de baixo); a linha 4 (entre a busca e a lista) é só borda + espaços + borda (`FILTER_GAP`); com o divisor na coluna `d` (procure o `│` interno da linha 5), as colunas `d-1` e `d+1` são espaço em todas as linhas da lista (`GUTTER`).
+
+#### Checks beyond the steps
+
+1. Fundo aberto da ativa: mutate trocando `┘`/`└` por `┴`/`┴` na ativa ⇒ PEGA (teste 1).
+2. Canto da primeira aba: mutate usando sempre `│` na primeira aba ⇒ PEGA (teste 2).
+3. Modo compacto: mutate trocando o `+ 1` do limiar por `+ 100` ⇒ PEGA (teste 3).
+4. Estilo: mutate usando `fg_dim` no rótulo ativo ⇒ PEGA (teste 4).
+5. Vão entre busca e lista: mutate desenhando a lista logo abaixo da busca (sem `FILTER_GAP`) ⇒ PEGA (teste 7).
+6. Gutter: mutate trocando `split_with_gutter` por um `Layout` 55/45 sem vãos ⇒ PEGA (teste 7).
+
+**Commit:** `feat(tui): lipgloss-style tabs joined to the content window`
+
+---
+
+### Task 64: Itens de lista em duas linhas com barra de seleção
+
+#### Where this fits
+
+Depende de Task 63. Itens no estilo do `list.DefaultDelegate` do Bubbles: título + linha de descrição; selecionado com barra vertical à esquerda e cor rosa (D5 = duas linhas).
+
+#### What binds this task
+
+- Constante pública `pub const ITEM_ROWS: usize = 2;` em `src/tui/app.rs`. `clamp` calcula a página em **itens**: `(altura - CHROME_ROWS) / (ITEM_ROWS + ITEM_GAP)` (`ITEM_GAP` de `src/tui/layout.rs`, 0 por D10), mínimo 1; entre dois itens desenhe `ITEM_GAP` linhas em branco; `PageUp/PageDown` continuam 10 itens. `list_window` (Task 59) recebe a altura em itens.
+- Linha 1 do item: barra (selecionado: `glyphs.bar` + espaço no token `sel_bar`; senão dois espaços) + glifo da fonte + espaço + nome (letras casadas sublinhadas, `matched`) + à direita a versão como hoje (Pesquisar: versão `fg_dim`; Instalados: versão + glifo de estado; Atualizações: `antiga → nova`, antiga `dim`, nova `ok` + `BOLD`). Nome: selecionado `sel_title` + `BOLD`; senão `name()`.
+- Linha 2: barra igual + `"  "` + texto: Pesquisar `"{id} · {descrição}"` (descrição cortada para caber; sem descrição, `"{id} · {source_name}"`); Instalados/Atualizações `"{package_id} · {fonte}"` quando casado, `"sem correspondência no catálogo"` ou `"correspondência ambígua"` senão. Estilo: selecionado `sel_desc`; senão `fg_dim`.
+- Sem fundo na linha selecionada (o `bg_selected` fica só para o seletor modal).
+- O glifo `selected` antigo deixa de ser usado na lista.
+- Atualize os `.snap` (como na Task 63) e as asserções de "linha selecionada" dos testes de Task 53/Task 59 para procurar a barra (`|` no Ascii).
+
+**Files:**
+- Modify: `src/tui/view.rs`, `src/tui/app.rs`
+- Test: `tests/tui_view.rs`, `tests/tui_state.rs` e os `.snap` de `tests/snapshots/tui_view__*.snap`
+
+Testes:
+1. `selected_item_has_bar_and_pink_title` (`tests/tui_view.rs`): `Theme::new(true, ColorDepth::TrueColor)`, Nerd, 100×20, primeiro item selecionado ⇒ a célula da barra tem símbolo `"┃"` e `fg == theme.sel_bar().fg`; a primeira célula do nome tem `fg == theme.sel_title().fg` e `BOLD`; a primeira célula do nome do 2º item tem `fg == theme.fg().fg`.
+2. `second_line_shows_id_and_description` (`tests/tui_view.rs`): com `entries()` do arquivo, a linha logo abaixo de `PowerToys` contém `Microsoft.PowerToys · Utilitários para power users`.
+3. `end_of_list_is_visible_with_two_row_items` (`tests/tui_state.rs` + render): 50 entradas `pkg00`…`pkg49`, tamanho `(100, 20)`, `Msg::Resize(100, 20)`, `End` ⇒ o render contém `pkg49` e a linha dele começa (depois da borda) com a barra.
+4. `page_down_moves_ten_items` (`tests/tui_state.rs`): 50 entradas, `PageDown` ⇒ `selected == 10`.
+
+#### Checks beyond the steps
+
+1. Página em itens: mutate trocando `/ (ITEM_ROWS + ITEM_GAP)` por `/ 1` em `clamp` ⇒ PEGA (teste 3).
+2. Estilo da seleção: mutate trocando `sel_title` por `name()` no selecionado ⇒ PEGA (teste 1).
+3. Segunda linha: mutate omitindo a descrição ⇒ PEGA (teste 2).
+
+**Commit:** `feat(tui): two-row list items with a selection bar`
+
+---
+
+### Task 65: Barra de status em pepitas e ajuda contextual
+
+#### Where this fits
+
+Depende de Task 64. Troca a frase fixa do rodapé (`src/tui/view.rs:533-553`) por uma barra de status no estilo do exemplo `layout` do Lip Gloss e uma barra de ajuda no estilo do `help` do Bubbles, que muda por aba. A ajuda completa (`?`, `view.rs:555-592`) fica em colunas.
+
+#### What binds this task
+
+- Módulo novo `src/tui/help.rs` (registrar em `src/tui/mod.rs`):
+  - `pub fn hints(app: &App) -> Vec<(&'static str, &'static str)>`: com foco nos detalhes começa por `("esc", "voltar")`; depois `("↑/↓", "mover")`, `("←/→", "aba")`, `("enter", "detalhes")`; Pesquisar acrescenta `("i", "instalar")`; Instalados `("u", "remover")`; Atualizações `("U", "atualizar")`; as três abas de lista `("ctrl+s", "fonte")`; sempre por último `("?", "ajuda")`.
+  - `pub fn help_line(hints: &[(&str, &str)], width: usize, theme: &Theme) -> Line<'static>`: `"tecla desc"` separados por `" • "`; tecla `help_key`, descrição `help_desc`, separador `help_sep`; põe dicas em ordem enquanto couberem deixando espaço para `" …"`; se alguma ficou de fora, termina com `" …"` (`help_sep`). Nunca corta uma dica no meio.
+- Barras de status e ajuda começam em `BAR_PAD_X` (`src/tui/layout.rs`) e terminam `BAR_PAD_X` antes da borda direita.
+- Barra de status (linha acima da ajuda): à esquerda, se `app.status` existe, pepita `pill_msg` `" {status} "`; senão `"{sel+1} de {visíveis}"` em `fg_dim` (Pesquisar acrescenta `" · {total} no catálogo"`). À direita: pepita `pill_a` `" {spinner} atualizando "` enquanto `refreshing`; `" offline "` em `alert` + `BOLD` quando offline; pepita `pill_b` `" {glyph refresh} índice {idade} "` quando há idade. O `corner_line` sai da linha da busca.
+- Altura ≥ 20: status + ajuda (2 linhas); abaixo de 20: só status (D6). `CHROME_ROWS` passa a 8 e `clamp` usa 7 quando a altura < 20 (função `pub fn chrome_rows(height: u16) -> usize` em `src/tui/app.rs`, usada por `clamp` e pela view).
+- Ajuda completa: diálogo arredondado com borda `accent`, conteúdo em `inset(.., DIALOG_PAD_X, DIALOG_PAD_Y)` (já aplicado na Task 62); cada linha `tecla` (`accent` + `BOLD`, coluna de 12) + descrição (`fg`); mesmas teclas de hoje.
+
+**Files:**
+- Create (novo): `src/tui/help.rs`
+- Modify: `src/tui/mod.rs`, `src/tui/view.rs`, `src/tui/app.rs`
+- Test: `tests/tui_view.rs` e os `.snap` de `tests/snapshots/tui_view__*.snap`
+
+Testes:
+1. `hints_change_with_the_tab`: aba Pesquisar ⇒ chaves `["↑/↓", "←/→", "enter", "i", "ctrl+s", "?"]`; Instalados ⇒ `["↑/↓", "←/→", "enter", "u", "ctrl+s", "?"]`; Atualizações ⇒ `[…, "U", "ctrl+s", "?"]`; foco nos detalhes ⇒ primeira chave `"esc"`.
+2. `help_line_truncates_whole_hints_with_ellipsis`: dicas da Pesquisar, largura 40 ⇒ o texto termina com `" …"`, tem no máximo 40 colunas e cada dica presente aparece inteira; largura 200 ⇒ sem `"…"` e contém `"? ajuda"`.
+3. `status_message_is_a_pink_pill`: TrueColor; `app.status = Some("Instalado: rg".into())`, 100×24 ⇒ a célula do `I` de `Instalado` tem `bg == theme.pill_msg().bg`.
+4. `short_terminal_hides_the_help_line`: 100×18 ⇒ o render não contém `"? ajuda"`; 100×24 contém.
+5. `help_line_colors_keys_and_descriptions`: TrueColor ⇒ a célula da tecla `i` tem `fg == theme.help_key().fg` e a primeira letra de `instalar` tem `fg == theme.help_desc().fg`.
+
+#### Checks beyond the steps
+
+1. Dicas por aba: mutate mostrando `("i", "instalar")` em todas as abas ⇒ PEGA (teste 1).
+2. Corte inteiro: mutate cortando no limite exato de colunas (`take(width)`) ⇒ PEGA (teste 2).
+3. Pepita: mutate desenhando a mensagem com `warn` sem fundo ⇒ PEGA (teste 3).
+4. Altura: mutate trocando o limiar 20 por 0 ⇒ PEGA (teste 4).
+
+**Commit:** `feat(tui): status pills and contextual help bar`
+
+---
+
+### Task 66: Toasts para eventos, com relógio injetado
+
+#### Where this fits
+
+Depende de Task 65 (barra de status em pepitas, que vira o destino do toast em terminal pequeno) e de Task 62 (margens). Hoje todo aviso é uma string em `app.status` que fica até a próxima mensagem (`src/tui/app.rs`, por exemplo `:369` `falha ao ler o catálogo`, `:687` resumo da operação, `:703` falha). Proposta e tabela "o que vira toast" em `tui-design.md` §2.7. Regra: **toast = evento que aconteceu; barra de status = estado verdadeiro agora.**
+
+#### What binds this task
+
+- Tipos em `src/tui/app.rs`: `pub enum ToastKind { Success, Info, Warning, Error }`; `pub struct Toast { pub kind: ToastKind, pub text: String, pub expires: Option<std::time::Instant>, pub count: u32 }`. Durações: `Success` 3 s, `Info` 4 s, `Warning` 6 s, `Error` `None` (fixo até `Esc`; D9). Constante `pub const MAX_TOASTS: usize = 3`.
+- `App` ganha `pub now: std::time::Instant` (`App::new` usa `Instant::now()`; **o laço atualiza `app.now = Instant::now()` antes de aplicar cada lote**; os testes atribuem à mão — nada de `sleep` nos testes) e `pub toasts: Vec<Toast>` (índice 0 = mais novo).
+- `pub fn push_toast(&mut self, kind: ToastKind, text: impl Into<String>)`: se o toast mais novo com o mesmo `kind` e `text` existe em qualquer posição, ele sobe para a posição 0, `count += 1` e o prazo recomeça de `now`; senão insere em 0 com `count = 1`. Se passar de `MAX_TOASTS`, remove o **mais velho com prazo**; se todos forem `Error`, remove o mais velho.
+- `pub fn prune_toasts(&mut self)`: remove os que têm `expires <= now`. Chamado no começo de `update` para **toda** mensagem (assim um toast vencido some mesmo que outra mensagem chegue antes do despertar).
+- `pub fn next_toast_deadline(&self) -> Option<Instant>`: o menor `expires` entre os toasts; `None` se não há toast com prazo.
+- `Msg::Clock` (nova): só provoca o `prune_toasts` e um redesenho.
+- `Esc` (fora de diálogo): se existe toast `Error`, remove o mais novo deles e **para** (não volta foco, não limpa busca, não sai). Toasts com prazo não reagem ao `Esc`. Dentro de diálogo, o `Esc` continua do diálogo.
+- **Conversões** (cada `app.status = Some(..)` listado vira `push_toast`; o resto continua em `status`):
+  - `Success`: resumo de `on_finished` `Ok`; `Resíduos removidos`; atualização do catálogo terminada sem falha **quando pedida com Ctrl+R** (`App` ganha `refresh_forced: bool`, ligado no Ctrl+R, desligado em `RefreshFinished`/`RefreshBusy`), texto `"catálogo atualizado"`.
+  - `Info`: `resíduos mantidos`; `Aguardando: outra atualização em andamento`; `aguarde: operação em andamento`.
+  - `Warning`: `outra instalação em andamento`; `instalação na fase 2d`; `NOT_OURS`; `Falha ao atualizar (…)` quando **todas** as falhas são offline.
+  - `Error`: `falha ao ler o catálogo: …` (`Msg::CatalogFailed` e `Msg::Booted` com `Err`); `falha ao ler instalados: …`; `Falha ao limpar resíduos: …`; erro de `on_planned`; `InstallFail::Other`; `Falha ao atualizar (…)` com alguma falha não offline.
+  - Continua em `status`: `planejando…` e qualquer texto de progresso/andamento. `Msg::Booted` com `Ok` continua limpando `status`.
+- **Laço** (`src/tui/run.rs`): `app.now = Instant::now()` antes do `update` de cada lote; ramo novo no `select!`: `_ = tokio::time::sleep_until(tokio::time::Instant::from_std(d)), if let Some(d) = wake => Msg::Clock`, com `let wake = app.next_toast_deadline();` calculado antes do `select!` (se o `select!` desta versão do tokio não aceitar `if let` na pré-condição, use `wake.is_some()` e `wake.unwrap_or(app.now)` — `unwrap_or`, não `unwrap`). **Nenhum `Interval` novo**: o despertar é um prazo único recalculado a cada volta, então não existe tick perdido para acumular. `needs_draw` (Task 53) trata `Msg::Clock` como mensagem que desenha.
+- **Desenho** (`src/tui/toast.rs`, novo; registrar em `src/tui/mod.rs`): `pub fn draw_toasts(frame: &mut Frame, window: Rect, toasts: &[Toast], theme: &Theme, glyphs: &Glyphs)` chamado por último em `view` (por cima de diálogos). Cada toast: largura `min(44, window.width - 2*TOAST_MARGIN_X)`, borda arredondada na cor do tipo (`ok`/`accent`/`warn`/`err`), `Clear` embaixo, texto em `inset(.., TOAST_PAD_X, 0)`; linha 1 = glifo + título (`Sucesso`/`Info`/`Aviso`/`Erro`, cor do tipo + `BOLD`) + `" ×N"` quando `count > 1`; depois o texto em `fg`, quebrado em até 3 linhas (o resto vira `…`); `Error` acrescenta a linha `"esc fecha"` em `help_desc`. Posição: borda direita do toast a `TOAST_MARGIN_X` colunas da borda direita da janela; o primeiro toast começa `TOAST_MARGIN_Y` linha abaixo do topo da janela (linha 3 + 1 = 4 com as abas de Task 63); os seguintes logo abaixo do anterior; o que não couber na altura não é desenhado.
+- Glifos novos em `Glyphs` (`src/tui/theme.rs`): `toast_ok`, `toast_info`, `toast_warn`, `toast_err` = Nerd `"\u{f00c}"`, `"\u{f05a}"`, `"\u{f071}"`, `"\u{f057}"`; Unicode `"✓"`, `"ℹ"`, `"⚠"`, `"✗"`; Ascii `"+"`, `"i"`, `"!"`, `"x"`.
+- **Terminal pequeno** (largura < 40 ou altura < 12): nenhuma caixa; a pepita de mensagem da barra de status (Task 65) mostra o texto do toast mais novo quando `status` está vazio.
+- Dica de ajuda (`src/tui/help.rs`): com algum toast `Error`, acrescenta `("esc", "fecha erro")` antes de `("?", "ajuda")`.
+
+**Files:**
+- Create (novo): `src/tui/toast.rs`
+- Modify: `src/tui/mod.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/view.rs`, `src/tui/theme.rs`, `src/tui/help.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`, `tests/tui_loop.rs`; testes existentes que conferem `a.status` dessas mensagens (ex.: `installed_failure_shows_status`, `busy_shows_status_and_rescans`, `finished_ok_rescans_and_reports`, `planning_error_becomes_status`, `refresh_busy_is_not_offline_and_says_in_progress` em `tests/tui_state.rs`) passam a conferir o toast — mantenha o nome do teste e registre a troca no relatório.
+
+Testes (`let t0 = a.now;`, avanço com `a.now = t0 + Duration::from_millis(..)`):
+1. `success_toast_expires_after_three_seconds` (`tests/tui_state.rs`): `Msg::InstallFinished(Ok(Done { summary: "Instalado: rg".into(), residues: None }))` ⇒ `a.toasts[0].kind == ToastKind::Success` e texto `"Instalado: rg"`; `a.now = t0 + 2999 ms`, `Msg::Clock` ⇒ ainda 1; `t0 + 3001 ms`, `Msg::Clock` ⇒ vazio.
+2. `catalog_error_toast_stays_until_esc` (`tests/tui_state.rs`): `Msg::CatalogFailed("database is locked".into())` ⇒ `Error`, `expires == None`; `a.now = t0 + 600 s`, `Msg::Clock` ⇒ continua; `Esc` ⇒ some, comandos vazios (não saiu).
+3. `esc_ignores_timed_toasts` (`tests/tui_state.rs`): toast de sucesso + digitar `ab`; `Esc` ⇒ `query` vazio e o toast continua.
+4. `stack_keeps_three_and_drops_the_oldest_timed` (`tests/tui_state.rs`): `push_toast(Error, "E")`, `(Success, "S1")`, `(Success, "S2")`, `(Success, "S3")` ⇒ textos `["S3", "S2", "E"]`.
+5. `repeated_toast_counts_and_restarts_its_timer` (`tests/tui_state.rs`): `(Success, "x")` em `t0`, de novo em `t0 + 2 s` ⇒ um toast, `count == 2`, `expires == t0 + 5 s`.
+6. `next_deadline_is_the_earliest_timed_toast` (`tests/tui_state.rs`): `(Warning, "w")` em `t0`, `(Success, "s")` em `t0` ⇒ `Some(t0 + 3 s)`; só um `Error` ⇒ `None`.
+7. `forced_refresh_success_toasts_and_automatic_is_silent` (`tests/tui_state.rs`): `Ctrl+R`, `RefreshStarted`, `RefreshFinished(vec![])` ⇒ toast `"catálogo atualizado"`; sem `Ctrl+R`: `RefreshStarted`, `RefreshFinished(vec![])` ⇒ nenhum toast.
+8. `offline_refresh_failure_is_a_warning` (`tests/tui_state.rs`): `RefreshFinished(failed_report(true))` ⇒ `Warning`; `failed_report(false)` ⇒ `Error` (helper existente).
+9. `planning_stays_in_the_status_bar` (`tests/tui_state.rs`): `i` num pacote scoop ⇒ `status == Some("planejando…")` e nenhum toast.
+10. `expired_toast_disappears_on_any_message` (`tests/tui_state.rs`): toast de sucesso em `t0`; `a.now = t0 + 4 s`; `update(Msg::Resize(100, 24))` ⇒ sem toasts.
+11. `toast_box_sits_top_right_with_margins` (`tests/tui_view.rs`): Ascii, NoColor, 100×24, um toast `Success` `"Instalado: rg"` ⇒ na linha 4, a coluna 97 é `╮` (borda direita do toast), a coluna 98 é `" "` e a 99 é a borda da janela; a linha 5 contém `"+ Sucesso"` e a linha 6 contém `"Instalado: rg"` precedido de um espaço depois da borda (`TOAST_PAD_X`).
+12. `small_terminal_puts_the_toast_in_the_status_bar` (`tests/tui_view.rs`): 50×10, mesmo toast ⇒ nenhum `╮` nas colunas 40–49 das linhas 3–6; a última linha contém `"Instalado: rg"`.
+13. `clock_message_draws` (`tests/tui_loop.rs`): `needs_draw(&[Msg::Clock], false) == true`.
+
+#### Checks beyond the steps
+
+1. Prazo: mutate trocando a duração de `Success` de 3 s para 30 s ⇒ PEGA (teste 1).
+2. Erro fixo: mutate dando prazo de 4 s ao `Error` ⇒ PEGA (teste 2).
+3. Esc não engole: mutate fazendo o `Esc` remover qualquer toast ⇒ PEGA (teste 3).
+4. Pilha: mutate removendo o mais velho de qualquer tipo ⇒ PEGA (teste 4).
+5. Despertar único: mutate fazendo `next_toast_deadline` devolver o **maior** prazo ⇒ PEGA (teste 6).
+6. Silêncio do automático: mutate dando toast em todo `RefreshFinished` sem falha ⇒ PEGA (teste 7).
+7. Poda em toda mensagem: mutate podando só em `Msg::Clock` ⇒ PEGA (teste 10).
+8. Margem: mutate trocando `TOAST_MARGIN_X` por 0 no cálculo da posição ⇒ PEGA (teste 11).
+
+**Commit:** `feat(tui): event toasts with a single wake-up deadline`
+
+---
+
+### Task 67: `[behavior]` no `config.toml` com gravação ler-modificar-gravar
+
+#### Where this fits
+
+Independente (paralelo a Task 59). Prepara a aba Ajustes (Task 68) e o uso dos ajustes (Task 69). Hoje `src/config.rs` tem `scoop_buckets`, `buckets`, `glyphs`, `theme` e `save` (temporário + `rename`, `config.rs:63-77`).
+
+#### What binds this task
+
+- Em `src/config.rs`:
+  - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)] #[serde(rename_all = "lowercase")] pub enum ConfirmMode { #[default] Always, Removals, Never }`
+  - `pub enum ResidueMode { #[default] Ask, High, Keep }` com os mesmos derives e `rename_all`.
+  - `#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)] #[serde(default)] pub struct Behavior { pub confirm: ConfirmMode, pub purge: bool, pub keep_old: bool, pub residues: ResidueMode }`
+  - `Config` ganha `pub behavior: Behavior` (`Default` = `Behavior::default()`); no arquivo, a seção `[behavior]`.
+  - `pub fn update_file(path: &Path, change: impl FnOnce(&mut Config)) -> Result<Config, ConfigError>`: **relê** o arquivo (`Config::load`, arquivo ausente ⇒ padrão), aplica `change`, grava com `save` e devolve o que gravou. Motivo: a TUI fica aberta enquanto a CLI pode ter feito `bucket add`; gravar uma cópia antiga em memória apagaria o bucket.
+- Arquivo antigo sem `[behavior]` carrega com os padrões. Valor inválido (`confirm = "as vezes"`) ⇒ `ConfigError::Parse` com o caminho (comportamento atual de arquivo inválido).
+- Nada usa os campos ainda (Task 68/Task 69). Nenhuma mudança na CLI.
+
+**Files:**
+- Modify: `src/config.rs`
+- Test: `tests/config.rs`
+
+Testes:
+1. `missing_behavior_section_gives_defaults`: arquivo `scoop_buckets = ["main"]\n` ⇒ `c.behavior == Behavior::default()`, `confirm == ConfirmMode::Always`, `residues == ResidueMode::Ask`, `!purge`, `!keep_old`.
+2. `behavior_values_are_read`: arquivo `"[behavior]\nconfirm = \"removals\"\npurge = true\nkeep_old = true\nresidues = \"high\"\n"` ⇒ campos correspondentes.
+3. `behavior_round_trips_through_save`: `Behavior { confirm: Never, purge: true, keep_old: false, residues: Keep }` ⇒ `save` + `load` igual.
+4. `invalid_confirm_value_mentions_the_path`: `"[behavior]\nconfirm = \"as vezes\"\n"` ⇒ erro cujo texto contém `config.toml`.
+5. `update_file_keeps_changes_made_meanwhile`: grava config com `buckets = [{name = "x", repo = "a/x"}]`; carrega uma cópia; outra gravação adiciona o bucket `y`; `update_file(&p, |c| c.behavior.purge = true)` ⇒ arquivo final tem `x`, `y` e `purge == true`.
+
+#### Checks beyond the steps
+
+1. Releitura: mutate trocando o `Config::load(path)` de `update_file` por `Config::default()` ⇒ PEGA (teste 5).
+2. Padrão: mutate trocando o `#[default]` de `ConfirmMode` para `Never` ⇒ PEGA (teste 1).
+3. Nomes no arquivo: mutate removendo `rename_all = "lowercase"` de `ResidueMode` ⇒ PEGA (teste 2).
+
+**Commit:** `feat(config): behavior section with read-modify-write updates`
+
+---
+
+### Task 68: Aba Ajustes
+
+#### Where this fits
+
+Depende de Task 66 (toasts; Task 66 já vem depois de Task 65) e Task 67 (`Behavior`, `update_file`). Quarta aba, desenho em `tui-design.md` §2.4. Esta tarefa mostra, muda e grava os ajustes; **usá-los nas operações é a Task 69**.
+
+#### What binds this task
+
+- Módulo novo `src/tui/settings.rs` (registrar em `src/tui/mod.rs`):
+  - `pub enum SettingId { Confirm, Purge, KeepOld, Residues, Glyphs, Theme }` e `pub const ORDER: [SettingId; 6]` nessa ordem.
+  - `pub struct SettingsState { pub selected: usize, pub behavior: Behavior, pub glyphs: GlyphSet, pub dark: bool, pub glyphs_forced: bool, pub saved: (Behavior, GlyphSet, bool) }` (o `saved` guarda o último valor gravado com sucesso).
+  - Rótulos e opções (UI em português): Confirmar antes de aplicar = `sempre`/`só remoções`/`nunca`; Ao remover, apagar dados (purge) = `não`/`sim`; Ao atualizar, manter versão antiga = `não`/`sim`; Resíduos após remover = `perguntar`/`só alta confiança`/`manter`; Glifos = `nerd`/`unicode`/`ascii`; Tema = `escuro`/`claro`. Descrição de uma linha por ajuste (ex.: Confirmar: "Mostra o plano e espera Enter antes de instalar, atualizar ou remover.").
+  - `pub fn cycle(&mut self, forward: bool) -> bool`: muda o valor do ajuste selecionado (circular); devolve `false` sem mudar quando o ajuste é Glifos e `glyphs_forced`.
+- `src/tui/app.rs`: `Tab::Settings` depois de `Updates` no ciclo de `next_tab`/`prev_tab` (Task 57; vale para `Tab`, `BackTab`, `←` e `→`); `App` ganha `pub settings: SettingsState` (em `App::new`, padrão de `Config::default()` com os glifos recebidos) e `pub buckets_summary: String`. Na aba Ajustes: `↑/↓/j/k` mudam `settings.selected` (0..=5); `Enter`/Espaço/`l` chamam `cycle(true)` e `h` chama `cycle(false)`; `←`/`→` trocam de aba como nas outras abas (Task 57); se mudou, aplica na hora (`app.glyphs`, `app.dark`) e devolve `Cmd::SaveSettings { behavior, glyphs: "nerd"|"unicode"|"ascii", theme: "dark"|"light" }`, status `"salvando…"`. Letras não vão para a busca nesta aba; `q`, `?`, `Esc`, `Ctrl+C`, `Tab` funcionam como nas outras. `Msg::SettingsSaved(Result<(), String>)`: `Ok` ⇒ `saved` = atual, `status = None` e `push_toast(Success, "ajustes salvos")` (repetições somam `×N`, Task 66); `Err(e)` ⇒ volta ao `saved` (e `app.glyphs`/`app.dark`), `status = None` e `push_toast(Error, format!("falha ao salvar: {e}"))`.
+- `App` ganha `pub dark: bool`; `src/tui/run.rs` guarda o `Theme` numa variável do laço e o recria com `Theme::new(app.dark, depth)` quando `app.dark` muda.
+- `run` passa a receber se os glifos vieram da flag: `pub fn run(glyphs: GlyphSet, glyphs_forced: bool)`; `src/cli/mod.rs:908` passa `cli.glyphs.is_some()`. `run` preenche `app.settings` a partir do `config.toml` lido e `app.buckets_summary` (nomes de `scoop_buckets` + `buckets`, separados por `", "`).
+- Execução de `Cmd::SaveSettings` em `src/tui/run.rs`: `spawn_job` existente (handle aguardado, pânico ⇒ `Msg::Panicked`) chamando `pub fn save_settings(path: &Path, behavior: Behavior, glyphs: &str, theme: &str) -> Result<(), String>` em `src/tui/jobs.rs`, que usa `Config::update_file`.
+- Desenho: seções "Operações", "Aparência", "Fontes (somente leitura)"; ajuste selecionado com a barra de seleção (`sel_bar`) e rótulo `sel_title`; opção atual `‹ valor ›` em `accent` + `BOLD`, as outras em `fg_dim`; Glifos forçado mostra `"(substituído por --glyphs nesta sessão)"`; última linha a descrição do ajuste selecionado (`fg_dim` + itálico). Dicas da ajuda (`src/tui/help.rs`) na aba: `("↑/↓", "escolher")`, `("enter", "mudar")`, `("←/→", "aba")`, `("?", "ajuda")`. A aba ganha rótulo `Ajustes` com `glyphs.tab_settings`.
+
+**Files:**
+- Create (novo): `src/tui/settings.rs`
+- Modify: `src/tui/mod.rs`, `src/tui/app.rs`, `src/tui/view.rs`, `src/tui/help.rs`, `src/tui/run.rs`, `src/tui/jobs.rs`, `src/cli/mod.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`, `tests/tui_jobs.rs`, snapshot novo `tests/snapshots/tui_view__settings_screen_snapshot.snap` (gerado)
+
+Testes:
+1. `settings_tab_is_in_the_tab_cycle` (`tests/tui_state.rs`): `Tab` ×4 a partir de Pesquisar ⇒ Instalados, Atualizações, Ajustes, Pesquisar; `BackTab` de Pesquisar ⇒ Ajustes; `Right` a partir de Atualizações ⇒ Ajustes; `Left` a partir de Pesquisar ⇒ Ajustes.
+2. `enter_changes_confirm_and_requests_save` (`tests/tui_state.rs`): na aba Ajustes, `Enter` ⇒ `settings.behavior.confirm == ConfirmMode::Removals` e comandos `[Cmd::SaveSettings { behavior.confirm: Removals, glyphs: "nerd", theme: "dark" }]`.
+3. `failed_save_restores_the_last_saved_value` (`tests/tui_state.rs`): depois do 2, `Msg::SettingsSaved(Err("disco cheio".into()))` ⇒ `confirm == Always`, `a.toasts[0].kind == ToastKind::Error` e texto contém `"disco cheio"`.
+4. `forced_glyphs_cannot_be_changed` (`tests/tui_state.rs`): `settings.glyphs_forced = true`, selecionar Glifos (4× `Down`), `Enter` ⇒ nenhum comando, `app.glyphs` inalterado.
+5. `letters_do_not_type_in_settings` (`tests/tui_state.rs`): `x` ⇒ `query` vazio.
+6. `theme_setting_flips_dark` (`tests/tui_state.rs`): selecionar Tema (5× `Down`), `Enter` ⇒ `!app.dark`.
+7. `h_cycles_backwards_and_arrows_leave_settings` (`tests/tui_state.rs`): na aba Ajustes com Confirmar selecionado, `h` ⇒ `confirm == ConfirmMode::Never`; `Right` ⇒ aba Pesquisar e `confirm` inalterado.
+8. `settings_screen_snapshot` (`tests/tui_view.rs`): Ascii, NoColor, 100×24, `buckets_summary = "main, extras"`.
+9. `save_settings_keeps_buckets` (`tests/tui_jobs.rs`): tempdir com `config.toml` contendo um bucket `x`; `save_settings(&p, Behavior { purge: true, ..Default::default() }, "ascii", "light")` ⇒ arquivo tem o bucket `x`, `purge = true`, `glyphs = "ascii"`, `theme = "light"`.
+
+#### Checks beyond the steps
+
+1. Gravação pedida: mutate removendo o `Cmd::SaveSettings` do ramo de `Enter` ⇒ PEGA (teste 2).
+2. Reversão: mutate ignorando `Err` em `SettingsSaved` ⇒ PEGA (teste 3).
+3. Flag manda: mutate ignorando `glyphs_forced` em `cycle` ⇒ PEGA (teste 4).
+4. Arquivo preservado: mutate fazendo `save_settings` gravar `Config::default()` modificado em vez de `update_file` ⇒ PEGA (teste 9).
+5. Setas laterais: mutate fazendo `Right` chamar `cycle` na aba Ajustes ⇒ PEGA (teste 7).
+
+**Commit:** `feat(tui): settings tab persisted to config.toml`
+
+---
+
+### Task 69: Ajustes aplicados às operações da TUI
+
+#### Where this fits
+
+Depende de Task 68. Hoje a TUI sempre confirma (`src/tui/app.rs:661-681`), remove sem purge (`src/tui/jobs.rs:100`, `plan_uninstall(c, app, false)`), atualiza sem manter a versão antiga (`jobs.rs:87` e `jobs.rs:133`, `plan_for(c, &cand, false)`) e sempre abre a lista de resíduos (`app.rs:683-707`). Esta tarefa liga os ajustes de `app.settings.behavior` a esses pontos. **Só na TUI** (D1 = A); a CLI não muda.
+
+#### What binds this task
+
+- Comandos levam o ajuste do momento da tecla: `Cmd::PlanRemove { app, purge: bool }`, `Cmd::PlanInstall { source_name, id, keep: bool }`, `Cmd::PlanUpgradeAll { keep: bool }`. Instalar um pacote novo (`i`) usa `keep: false`.
+- `src/tui/jobs.rs`: `plan_remove(c, app, purge)` passa `purge` para `ops::plan_uninstall`; a última linha do texto do plano é `"Os dados persistentes do app são mantidos."` sem purge e `"Os dados persistentes do app serão APAGADOS (purge)."` com purge. `plan_install(c, source_name, id, keep)` e `plan_upgrade_all(c, keep)` passam `keep` para `ops::plan_for`. Atualize as chamadas existentes de `jobs::plan_remove` em `tests/tui_jobs.rs` para a nova assinatura.
+- Confirmação (`on_planned`, `Planned::Ready`): `pub fn needs_confirm(mode: ConfirmMode, action: &Action) -> bool` = `Always` ⇒ `true`; `Removals` ⇒ só `Action::Remove`; `Never` ⇒ `false`. Sem confirmação: mesmo caminho do Enter no diálogo (`Modal::Running` com `action.label()` + `Cmd::Execute(action)`). `Planned::Choose` sempre abre o seletor (nunca se escolhe pacote pelo usuário).
+- Resíduos (`on_finished`, remoção com resíduos): `Ask` ⇒ seletor como hoje; `High` ⇒ os `residues` com `preselected == true`: se houver algum, `Modal::Running` com `"Limpando resíduos de {app}"` + `Cmd::CleanResidues { app, residues: <só os pré-marcados> }`; se nenhum, `push_toast(Info, format!("resíduos mantidos: {n} itens"))`; `Keep` ⇒ o mesmo toast `Info`, sem seletor. `Cmd::ScanInstalled` continua saindo sempre.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/jobs.rs`, `src/tui/run.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_jobs.rs`
+
+Testes:
+1. `never_confirm_executes_directly` (`tests/tui_state.rs`): `settings.behavior.confirm = ConfirmMode::Never`; `update(ready("a"))` ⇒ `modal` é `Running` e comandos `[Cmd::Execute(apply_action("a"))]`.
+2. `removals_mode_confirms_only_removals` (`tests/tui_state.rs`): `Removals`; `ready("a")` (Apply) ⇒ `Execute`; `Msg::Planned(Ok(Planned::Ready { text, action: Action::Remove(<UninstallPlan mínimo de src/install/plan.rs, app "a">) }))` ⇒ `Modal::Confirm`.
+3. `ambiguous_target_still_opens_the_picker` (`tests/tui_state.rs`): `Never`; `Planned::Choose(vec![candidate("main"), candidate("extras")])` ⇒ `Modal::Picking`.
+4. `remove_carries_the_purge_setting` (`tests/tui_state.rs`): `on_tab(Tab::Installed, vec![irow("a", "wingetrs", "scoop:main", false)])`, `purge = true`, tecla `u` ⇒ `[Cmd::PlanRemove { app: "a", purge: true }]`.
+5. `upgrade_carries_the_keep_setting` (`tests/tui_state.rs`): `on_tab(Tab::Updates, vec![irow("a", "wingetrs", "scoop:main", true)])`, `keep_old = true`, tecla `U` ⇒ `[Cmd::PlanInstall { keep: true, .. }]`; com seleção vazia (`vec![]`) ⇒ `[Cmd::PlanUpgradeAll { keep: true }]`.
+6. `high_residue_mode_cleans_only_preselected` (`tests/tui_state.rs`): `ResidueMode::High`; `Msg::InstallFinished(Ok(Done { summary, residues: Some(("a".into(), vec![residue("p1", true), residue("p2", false)])) }))` ⇒ comandos contêm `ScanInstalled` e `CleanResidues { app: "a", residues: [p1] }`; `modal` é `Running`.
+7. `keep_residue_mode_opens_nothing` (`tests/tui_state.rs`): `ResidueMode::Keep`, mesmos resíduos ⇒ `modal` é `None`, `a.toasts[0].kind == ToastKind::Info` e texto contém `"2 itens"`.
+8. `purge_plan_says_data_will_be_deleted` (`tests/tui_jobs.rs`, `World` existente): app instalado; `jobs::plan_remove(&ctx, "leaf", true)` ⇒ `Planned::Ready` com texto contendo `"APAGADOS"` e `Action::Remove(p)` com `p.purge == true`; com `false` ⇒ texto contém `"mantidos"` e `p.purge == false`.
+
+#### Checks beyond the steps
+
+1. Confirmação: mutate fazendo `needs_confirm` devolver `true` sempre ⇒ PEGA (teste 1).
+2. Só remoções: mutate trocando `Action::Remove` por `Action::Apply` no ramo `Removals` ⇒ PEGA (teste 2).
+3. Seletor nunca pulado: mutate executando o primeiro candidato em `Never` ⇒ PEGA (teste 3).
+4. Purge: mutate passando `false` fixo para `ops::plan_uninstall` em `plan_remove` ⇒ PEGA (teste 8).
+5. Keep: mutate emitindo `keep: false` fixo no `U` ⇒ PEGA (teste 5).
+6. Resíduos: mutate limpando todos os resíduos no modo `High` (sem filtrar `preselected`) ⇒ PEGA (teste 6).
+
+**Commit:** `feat(tui): apply confirm, purge, keep and residue settings`

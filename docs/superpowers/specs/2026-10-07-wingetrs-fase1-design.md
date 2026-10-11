@@ -248,6 +248,13 @@ Abas:
 - **Instalados:** resultado do `list`; seções para correlacionados, ambíguos e não correlacionados.
 - **Atualizações:** só os atualizáveis; o contador aparece no título da aba.
 
+> **Emenda (2026-10-11, redesenho no estilo Bubble Tea, aprovada pelo usuário).** O layout acima é substituído por:
+> - Abas encaixadas no topo (caixas arredondadas; a ativa abre para a janela de conteúdo; badge ` wingetrs ` à direita; modo compacto de uma linha em terminal estreito). Quarta aba **Ajustes** (fase 2a §10).
+> - Uma janela única sob as abas: linha da busca, uma linha em branco, lista | divisor | detalhes, com escala de espaçamento num lugar só (`src/tui/layout.rs`: recuo de 1 coluna dentro das caixas, 1 coluna de cada lado do divisor, diálogos com 2×1 de recuo).
+> - Itens da lista em duas linhas (nome + versão; id · descrição), seleção por barra vertical `┃` à esquerda e cor rosa, sem fundo.
+> - Rodapé com barra de status em "pepitas" (mensagem, atualizando, idade do índice) e, com altura ≥ 20, barra de ajuda contextual por aba (`tecla desc • …`, cortada em dicas inteiras com `…`).
+> - Toasts no canto superior direito para **eventos** (sucesso 3 s, info 4 s, aviso 6 s, erro fixo até `Esc`; no máximo 3; repetidos somam `×N`); a barra de status mostra só **estado** atual. Terminal pequeno: o toast vai para a pepita da barra.
+
 ### 7.2 Teclas
 
 | Tecla | Ação |
@@ -263,6 +270,8 @@ Abas:
 | `?` | ajuda |
 | `q` / `Ctrl+C` | sair |
 | `i` | instalar — exibido desabilitado ("fase 2") |
+
+> **Emenda (2026-10-11).** `←` / `→` também trocam de aba (anterior/próxima, circular, incluindo Ajustes), em qualquer aba e com foco na lista ou nos detalhes; com um diálogo aberto as setas são do diálogo. Na aba Ajustes, `Enter`/Espaço avançam o valor do ajuste selecionado (as setas laterais continuam trocando de aba).
 
 ### 7.3 Estilo visual
 
@@ -293,6 +302,8 @@ Todos os estilos vêm de `tui/theme.rs`; views não usam cores literais.
   - `nerd` (padrão): ícones Nerd Font.
   - `unicode`: `✓ ↑ ? ⚠ ⟳ ●`.
   - `ascii`.
+
+> **Emenda (2026-10-11).** Paleta do Charm (Lip Gloss/Bubbles): `accent` roxo `#7D56F4` (escuro) / `#874BFD` (claro) no lugar de azul/ciano; tokens novos `sel_bar`, `sel_title`, `sel_desc` (seleção rosa), `badge`, `help_key`/`help_desc`/`help_sep` (texto de ajuda clareado para `#6C6C6C`), `pill_msg`/`pill_a`/`pill_b` (barra de status) e `spinner`; spinner `Dot` do Bubbles (`⣾⣽⣻⢿⡿⣟⣯⣷`) nos glifos `nerd`/`unicode`. A linha selecionada deixa de ter fundo e `▶` (barra `┃`; ver §7.1). `NO_COLOR`: pepitas e badge em vídeo reverso.
 
 ### 7.4 Modelo de eventos
 
