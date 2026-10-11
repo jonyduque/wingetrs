@@ -24,6 +24,67 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const TICK: Duration = Duration::from_millis(100);
 const DETAILS_DEBOUNCE: Duration = Duration::from_millis(150);
+/// A `draw` slower than this (one 60 Hz frame) is logged at debug level.
+const SLOW_DRAW_US: u64 = 16_000;
+
+/// Loop counters for measuring responsiveness; logged once when the loop ends, on every path.
+struct LoopStats {
+    start: Instant,
+    frames: u64,
+    keys: u64,
+    ticks: u64,
+    max_draw_us: u64,
+}
+
+impl LoopStats {
+    fn new() -> LoopStats {
+        LoopStats {
+            start: Instant::now(),
+            frames: 0,
+            keys: 0,
+            ticks: 0,
+            max_draw_us: 0,
+        }
+    }
+
+    fn count(&mut self, msg: &Msg) {
+        match msg {
+            Msg::Key(_) => self.keys += 1,
+            Msg::Tick => self.ticks += 1,
+            _ => {}
+        }
+    }
+
+    /// Times one `draw`; `batch` is how many messages it covers.
+    fn draw(
+        &mut self,
+        batch: usize,
+        f: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let t = Instant::now();
+        let r = f();
+        let draw_us = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.frames += 1;
+        self.max_draw_us = self.max_draw_us.max(draw_us);
+        if draw_us > SLOW_DRAW_US {
+            tracing::debug!(draw_us, batch, "frame lento");
+        }
+        r
+    }
+}
+
+impl Drop for LoopStats {
+    fn drop(&mut self) {
+        tracing::info!(
+            frames = self.frames,
+            keys = self.keys,
+            ticks = self.ticks,
+            max_draw_us = self.max_draw_us,
+            secs = self.start.elapsed().as_secs_f64(),
+            "tui stats"
+        );
+    }
+}
 
 struct Ctx {
     data: DataDir,
@@ -97,6 +158,7 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
     spawn_boot(&ctx);
+    let mut stats = LoopStats::new();
 
     loop {
         let msg = tokio::select! {
@@ -111,6 +173,7 @@ async fn event_loop(
             _ = ticker.tick(), if app.refreshing || details_loading(&app) => Msg::Tick,
         };
         let msg = jobs::propagate(msg);
+        stats.count(&msg);
         let is_tick = matches!(msg, Msg::Tick);
         let refresh_msg = matches!(msg, Msg::RefreshFinished(_));
         let cmds = update(&mut app, msg);
@@ -142,7 +205,7 @@ async fn event_loop(
         }
         // Ticks only matter while something animates.
         if !is_tick || app.refreshing || details_loading(&app) {
-            terminal.draw(|f| view(&app, theme, f))?;
+            stats.draw(1, || terminal.draw(|f| view(&app, theme, f)).map(|_| ()))?;
         }
     }
 }
