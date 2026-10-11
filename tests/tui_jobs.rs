@@ -61,6 +61,7 @@ struct World {
     registry: FakeRegistry,
     http: Http,
     catalog: Catalog,
+    packages: Vec<NewPackage>,
 }
 
 impl World {
@@ -92,11 +93,17 @@ impl World {
             registry: FakeRegistry::new(),
             http: Http::new().unwrap(),
             catalog: Catalog::open_in_memory().unwrap(),
+            packages: Vec::new(),
         }
     }
 
     /// Serves a zip and puts a manifest for `id` in the in-memory `scoop:main` catalog.
     async fn add(&mut self, id: &str) {
+        self.add_env(id, false).await;
+    }
+
+    /// Like `add`; with `env` the manifest also sets `<ID>_HOME`. Packages accumulate.
+    async fn add_env(&mut self, id: &str, env: bool) {
         let zip = zip_of(&[(&format!("pkg/{id}.exe"), &fake_pe(3))]);
         let sha = hex::encode(Sha256::digest(&zip));
         let name = format!("{id}-1.0.zip");
@@ -105,27 +112,32 @@ impl World {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
             .mount(&self.server)
             .await;
-        let raw = serde_json::json!({
+        let mut m = serde_json::json!({
             "version": "1.0",
             "url": format!("{}/{name}", self.server.uri()),
             "hash": sha,
             "extract_dir": "pkg",
             "bin": format!("{id}.exe"),
-        })
-        .to_string();
+        });
+        if env {
+            m["env_set"] = serde_json::json!({ format!("{}_HOME", id.to_uppercase()): "$dir" });
+        }
+        let raw = m.to_string();
+        self.packages.retain(|p| p.id != id);
+        self.packages.push(NewPackage {
+            id: id.into(),
+            name: id.into(),
+            version: "1.0".into(),
+            raw: Some(raw),
+            ..Default::default()
+        });
         self.catalog
             .replace_source(
                 "scoop:main",
                 SourceKind::Scoop,
                 "v",
                 1,
-                &[NewPackage {
-                    id: id.into(),
-                    name: id.into(),
-                    version: "1.0".into(),
-                    raw: Some(raw),
-                    ..Default::default()
-                }],
+                &self.packages,
                 &WingetMaps::default(),
             )
             .unwrap();
@@ -199,6 +211,28 @@ async fn run_action_installs_reports_progress_and_then_removes() {
     assert_eq!(done.summary, "leaf removido");
     assert!(done.residues.is_some());
     assert!(!w.layout.current("leaf").exists());
+}
+
+#[tokio::test]
+async fn run_action_applies_all_groups_with_one_broadcast() {
+    let mut w = World::new().await;
+    w.add_env("aa", true).await;
+    w.add_env("bb", true).await;
+    let ctx = w.ctx(LockWait::NoWait, &quiet);
+    let mut groups = Vec::new();
+    for id in ["aa", "bb"] {
+        let Ok(Planned::Ready {
+            action: Action::Apply(g),
+            ..
+        }) = jobs::plan_install(&ctx, "scoop:main", id)
+        else {
+            panic!("expected Ready");
+        };
+        groups.extend(g);
+    }
+    let done = jobs::run_action(&ctx, Action::Apply(groups)).await.unwrap();
+    assert_eq!(done.summary, "Instalado: aa, bb");
+    assert_eq!(w.env.dump().1, 1);
 }
 
 #[tokio::test]

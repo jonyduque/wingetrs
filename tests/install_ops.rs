@@ -11,8 +11,8 @@ use wingetrs::core::SourceKind;
 use wingetrs::http::Http;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::ops::{
-    OpsCtx, OpsError, ResidueScan, Resolution, apply, plan_for, plan_uninstall, repair,
-    resolve_target, uninstall, upgradable,
+    OpsCtx, OpsError, ResidueScan, Resolution, apply, apply_groups, merge_groups, plan_for,
+    plan_uninstall, repair, resolve_target, uninstall, upgradable,
 };
 use wingetrs::install::plan::InstallPlan;
 use wingetrs::install::residue::{Confidence, ResidueKind};
@@ -907,4 +907,85 @@ async fn repair_ignores_shims_that_escape_the_app_folder() {
     repair(&w.ctx()).unwrap();
     let shims = summary(&w.state())[0].3.clone();
     assert_eq!(shims, ["leaf"]);
+}
+
+#[tokio::test]
+async fn merge_groups_keeps_order_and_drops_repeated_apps() {
+    let mut w = World::new().await;
+    for id in ["leaf", "a", "b", "c"] {
+        w.add(app(id, &[])).await;
+    }
+    let mut g1 = w.plans("leaf").unwrap();
+    g1.extend(w.plans("a").unwrap());
+    let mut g2 = w.plans("leaf").unwrap();
+    for p in &mut g2 {
+        p.app = p.app.to_uppercase();
+    }
+    g2.extend(w.plans("b").unwrap());
+    let g3 = w.plans("c").unwrap();
+    let merged = merge_groups(vec![g1, g2, g3]);
+    assert_eq!(names(&merged), ["leaf", "a", "b", "c"]);
+}
+
+#[tokio::test]
+async fn apply_groups_broadcasts_once_for_two_env_apps() {
+    let mut w = World::new().await;
+    w.add(App {
+        env: true,
+        ..app("a", &[])
+    })
+    .await;
+    w.add(App {
+        env: true,
+        ..app("b", &[])
+    })
+    .await;
+    let groups = vec![w.plans("a").unwrap(), w.plans("b").unwrap()];
+    let done = apply_groups(&w.ctx(), groups).await.unwrap();
+    assert_eq!(names(&done), ["a", "b"]);
+    assert_eq!(w.broadcasts(), 1);
+    assert!(w.state().get("a").unwrap().is_some());
+    assert!(w.state().get("b").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn apply_groups_reports_what_was_applied_when_a_later_app_fails() {
+    let mut w = World::new().await;
+    w.add(app("a", &[])).await;
+    let junk = b"this is not a zip".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/b-1.0.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(junk.clone()))
+        .mount(&w.server)
+        .await;
+    let raw = serde_json::json!({
+        "version": "1.0",
+        "url": format!("{}/b-1.0.zip", w.server.uri()),
+        "hash": sha256_hex(&junk),
+        "bin": "b.exe",
+    })
+    .to_string();
+    w.put_raw("b", "1.0", raw);
+    let groups = vec![w.plans("a").unwrap(), w.plans("b").unwrap()];
+    match apply_groups(&w.ctx(), groups).await {
+        Err(OpsError::PartlyApplied { applied, .. }) => assert_eq!(applied, ["a"]),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.state().get("a").unwrap().is_some());
+    assert!(w.state().get("b").unwrap().is_none());
+    assert!(!w.layout.root().join("apps").join("b").exists());
+}
+
+#[tokio::test]
+async fn apply_groups_refuses_a_target_installed_meanwhile_even_in_the_middle() {
+    let mut w = World::new().await;
+    w.add(app("a", &[])).await;
+    w.add(app("b", &[])).await;
+    let groups = vec![w.plans("a").unwrap(), w.plans("b").unwrap()];
+    w.install("a").await;
+    match apply_groups(&w.ctx(), groups).await {
+        Err(OpsError::StateChanged(a)) => assert_eq!(a, "a"),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.state().get("b").unwrap().is_none());
 }

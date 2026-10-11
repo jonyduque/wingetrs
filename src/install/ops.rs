@@ -523,14 +523,14 @@ pub fn plan_for(
 fn revalidate<'p>(
     state: &StateDb,
     plans: &'p [InstallPlan],
+    targets: &std::collections::HashSet<String>,
 ) -> Result<Vec<&'p InstallPlan>, OpsError> {
-    let last = plans.len().saturating_sub(1);
     let mut run = Vec::with_capacity(plans.len());
-    for (i, plan) in plans.iter().enumerate() {
+    for plan in plans {
         let now = state.get(&plan.app)?.map(|(r, _)| r.version);
         if now == plan.upgrade_from {
             run.push(plan);
-        } else if i < last && plan.upgrade_from.is_none() {
+        } else if !targets.contains(&plan.app.to_lowercase()) && plan.upgrade_from.is_none() {
             // A dependency someone else installed meanwhile: already satisfied.
         } else {
             return Err(OpsError::StateChanged(plan.app.clone()));
@@ -544,10 +544,50 @@ fn revalidate<'p>(
 /// `PartlyApplied`). The environment change is broadcast once at the end when any
 /// variable ended up different.
 pub async fn apply(ctx: &OpsCtx<'_>, plans: &[InstallPlan]) -> Result<(), OpsError> {
+    let targets = plans
+        .last()
+        .map(|p| p.app.to_lowercase())
+        .into_iter()
+        .collect();
+    apply_with_targets(ctx, plans, &targets).await
+}
+
+/// Concatenates plan groups in order, dropping a plan whose app (case-insensitive) already
+/// appeared earlier (a shared dependency runs once, at its first position).
+pub fn merge_groups(groups: Vec<Vec<InstallPlan>>) -> Vec<InstallPlan> {
+    let mut seen = std::collections::HashSet::new();
+    groups
+        .into_iter()
+        .flatten()
+        .filter(|p| seen.insert(p.app.to_lowercase()))
+        .collect()
+}
+
+/// Applies several plan groups in one `apply` (one lock, one broadcast). The target of each
+/// group (its last plan) is never skipped by revalidation. Returns the merged plans.
+pub async fn apply_groups(
+    ctx: &OpsCtx<'_>,
+    groups: Vec<Vec<InstallPlan>>,
+) -> Result<Vec<InstallPlan>, OpsError> {
+    let targets = groups
+        .iter()
+        .filter_map(|g| g.last())
+        .map(|p| p.app.to_lowercase())
+        .collect();
+    let merged = merge_groups(groups);
+    apply_with_targets(ctx, &merged, &targets).await?;
+    Ok(merged)
+}
+
+async fn apply_with_targets(
+    ctx: &OpsCtx<'_>,
+    plans: &[InstallPlan],
+    targets: &std::collections::HashSet<String>,
+) -> Result<(), OpsError> {
     let layout = layout(ctx);
     let _lock = lock_async(&layout, ctx.wait).await?;
     let mut state = open_state(&layout)?;
-    let plans = revalidate(&state, plans)?;
+    let plans = revalidate(&state, plans, targets)?;
     let names = env_names(plans.iter().flat_map(|p| &p.steps).filter_map(|s| match s {
         Step::EnvSet { name, .. } => Some(name.clone()),
         _ => None,

@@ -426,11 +426,8 @@ async fn upgrade(
         println!("Cancelado.");
         return Ok(());
     }
-    for g in &groups {
-        ops::apply(ctx, g).await?;
-        for p in g {
-            println!("Atualizado: {} {}", p.app, p.version);
-        }
+    for p in ops::apply_groups(ctx, groups).await? {
+        println!("Atualizado: {} {}", p.app, p.version);
     }
     Ok(())
 }

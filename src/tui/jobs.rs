@@ -141,11 +141,8 @@ fn fail(e: OpsError) -> InstallFail {
 pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallFail> {
     match action {
         Action::Apply(groups) => {
-            let mut names: Vec<String> = Vec::new();
-            for group in &groups {
-                ops::apply(o, group).await.map_err(fail)?;
-                names.extend(group.iter().map(|p| p.app.clone()));
-            }
+            let applied = ops::apply_groups(o, groups).await.map_err(fail)?;
+            let names: Vec<String> = applied.into_iter().map(|p| p.app).collect();
             Ok(Done {
                 summary: format!("Instalado: {}", names.join(", ")),
                 residues: None,
