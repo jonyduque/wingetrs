@@ -128,6 +128,7 @@ impl UninstallPlan {
         self.artifacts
             .iter()
             .map(|a| match a.kind {
+                // Assumes `remove_path_entry == true` (fixed by `from_state`); the executor keeps PATH when false.
                 K::Path => match self.path_users.iter().find(|(t, _)| *t == a.target) {
                     Some((_, users)) => format!(
                         "Manter entrada no PATH: {} (ainda usada por: {})",

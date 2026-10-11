@@ -257,3 +257,22 @@ fn uninstall_plan_only_path_artifacts_consult_other_users() {
     let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
     assert!(plan.path_users.is_empty(), "{:?}", plan.path_users);
 }
+
+#[test]
+fn uninstall_plan_purge_line_is_pinned() {
+    use wingetrs::install::plan::UninstallPlan;
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    db.record(&rec("a", "1"), &[art(ArtifactKind::Persist, "conf", None)])
+        .unwrap();
+    let purge = UninstallPlan::from_state(&db, "a", true).unwrap().unwrap();
+    assert_eq!(
+        purge.artifact_lines(),
+        vec!["Apagar conf (dados persistentes)".to_string()]
+    );
+    let keep = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
+    assert_eq!(
+        keep.artifact_lines(),
+        vec!["Manter conf (dados persistentes; use --purge)".to_string()]
+    );
+}
