@@ -583,8 +583,10 @@ pub async fn apply_groups(
 
 /// Downloads every source of every plan at once (inside the lock: the blob index is not
 /// safe across processes), so a failed download aborts before any change and the executor
-/// then finds each file in the blob cache.
+/// then finds each file in the blob cache. Only the revalidated plans are fetched.
 async fn prefetch(ctx: &OpsCtx<'_>, plans: &[&InstallPlan]) -> Result<(), OpsError> {
+    // The same file in two plans is fetched once; an error names its first owner.
+    let mut seen = HashSet::new();
     let (apps, sources): (Vec<&str>, Vec<_>) = plans
         .iter()
         .flat_map(|p| {
@@ -593,6 +595,7 @@ async fn prefetch(ctx: &OpsCtx<'_>, plans: &[&InstallPlan]) -> Result<(), OpsErr
                 _ => None,
             })
         })
+        .filter(|(_, src)| seen.insert(download::algo_key(&src.hash)))
         .unzip();
     let results = download::fetch_each(ctx.http, ctx.data, &sources, ctx.progress).await;
     for (app, r) in apps.into_iter().zip(results) {

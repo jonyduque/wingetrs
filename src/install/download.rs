@@ -49,7 +49,8 @@ fn io_err(p: &Path, e: std::io::Error) -> DownloadError {
     DownloadError::Io(format!("{}: {e}", p.display()))
 }
 
-fn algo_key(spec: &HashSpec) -> String {
+/// Cache key of a hash: `<algo>:<lowercase hex>`.
+pub(crate) fn algo_key(spec: &HashSpec) -> String {
     let a = match spec.algo {
         HashAlgo::Sha256 => "sha256",
         HashAlgo::Sha1 => "sha1",

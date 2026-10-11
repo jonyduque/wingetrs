@@ -1078,3 +1078,66 @@ async fn apply_fails_before_any_change_when_a_download_fails() {
     assert!(!w.layout.root().join("apps").join("a").exists());
     assert_eq!(w.broadcasts(), 0);
 }
+
+#[tokio::test]
+async fn prefetch_downloads_a_shared_source_once() {
+    let mut w = World::new().await;
+    let zip = zip_of(&[("pkg/a.exe", &fake_pe(3)), ("pkg/b.exe", &fake_pe(3))]);
+    let sha = sha256_hex(&zip);
+    Mock::given(method("GET"))
+        .and(path("/shared.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
+        .expect(1)
+        .mount(&w.server)
+        .await;
+    let url = format!("{}/shared.zip", w.server.uri());
+    for id in ["a", "b"] {
+        let raw = serde_json::json!({
+            "version": "1.0",
+            "url": url,
+            "hash": sha,
+            "extract_dir": "pkg",
+            "bin": format!("{id}.exe"),
+        })
+        .to_string();
+        w.put_raw(id, "1.0", raw);
+    }
+    let mut plans = w.plans("a").unwrap();
+    plans.extend(w.plans("b").unwrap());
+    apply(&w.ctx(), &plans).await.unwrap();
+    assert!(w.state().get("a").unwrap().is_some());
+    assert!(w.state().get("b").unwrap().is_some());
+    w.server.verify().await;
+}
+
+#[tokio::test]
+async fn prefetch_skips_dependencies_installed_meanwhile() {
+    let mut w = World::new().await;
+    w.add(app("a", &["leaf"])).await;
+    // `leaf`'s zip may be fetched once: by the outside install, never by the batch.
+    let zip = zip_of(&[("pkg/leaf.exe", &fake_pe(3))]);
+    let sha = sha256_hex(&zip);
+    Mock::given(method("GET"))
+        .and(path("/leaf-once.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
+        .expect(1)
+        .mount(&w.server)
+        .await;
+    let raw = serde_json::json!({
+        "version": "1.0",
+        "url": format!("{}/leaf-once.zip", w.server.uri()),
+        "hash": sha,
+        "extract_dir": "pkg",
+        "bin": "leaf.exe",
+    })
+    .to_string();
+    w.put_raw("leaf", "1.0", raw);
+    let plans = w.plans("a").unwrap();
+    assert_eq!(names(&plans), ["leaf", "a"]);
+    w.install("leaf").await;
+    // The outside install left the blob cached; drop it so a second fetch would hit the mock.
+    std::fs::remove_dir_all(w.data.blobs_dir()).unwrap();
+    apply(&w.ctx(), &plans).await.unwrap();
+    assert!(w.state().get("a").unwrap().is_some());
+    w.server.verify().await;
+}
