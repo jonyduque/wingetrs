@@ -2508,3 +2508,872 @@ Testes:
 
 ---
 
+
+## Desempenho do `update` (Tasks 54–56)
+
+Origem: spans da Task 45 num `wingetrs update` real (~2 s): `update.search_idx` ~409 ms, `update.catalog_write{source=winget}` ~1,06 s, `update.parse` (winget) ~364 ms. Três investigações (2026-10-11, base `ae7ec20`; os arquivos de `src/` tocados aqui não mudaram até `ddce967`; linhas citadas conferidas nesse HEAD) mediram cada etapa e prototiparam a correção. **Todas as medidas foram feitas com a máquina carregada** (outros agentes compilando; i7-10750H, 12 CPUs lógicas, sem SHA-NI), então só os deltas intercalados contam; os valores absolutos estão inflados ~1,5×.
+
+Regras comuns (repetidas em cada tarefa): **cada tarefa roda sozinha** (nenhum outro agente durante a tarefa e a medição, `scripts/leftovers.ps1` limpo antes); nenhum teste com limiar de relógio (`docs/ARMADILHAS.md`, "Teste com limiar de relógio"); os spans da Task 45 **não mudam** de nome, de lugar nem de pai (o A/B do orquestrador lê esses spans no log); ganho sem medição A/B ⇒ revert.
+
+### Task 54: `search.idx` direto das linhas do SQLite, numa conexão
+
+**Modelo:** sonnet (patch pronto num arquivo; o risco é de equivalência byte a byte, coberto pelo teste 1).
+
+#### Where this fits
+
+Independente das Tasks 55–56; roda primeiro e sozinha. `update.search_idx` (`src/update.rs:276`, `write_search_index` em `src/update.rs:284-289`) chama `index_file::write` (`src/catalog/index_file.rs:37-97`), que lê tudo com `Catalog::load_entries` (`src/catalog/mod.rs:394`: 8 conexões só-leitura, uma faixa de rowid por thread, um `PackageEntry` com `String`s por linha; `tags`/`commands` passam por `split_words` e voltam com `join(" ")`).
+
+Medido (sob carga):
+- Modo normal: ~100 ms (leitura 61, serializar 11, `fs::write` 2,5, `rename` 3,7, `drop` dos 19,6 mil `PackageEntry` 22).
+- Modo travado (bimodal): só a leitura leva **430–1040 ms**, com os 8 workers parados juntos pelo mesmo tempo (ex.: 8 × 579–582 ms; 1ª linha em < 0,5 ms; sem busy handler; `mmap`, WAL, checkpoint e espera de 2 s não explicam). Os 409 ms do usuário estão nessa faixa. Só acontece dentro do processo do `update`; em processo separado e quieto o paralelo não travou.
+- Uma conexão, codificando direto das linhas: 0 travamentos em 34 execuções (máx. 218 ms).
+- A/B com binários intercalados (10 + 10, `update` real): mediana **219 → 64,5 ms**; delta pareado mediano **−128 ms**; pior caso **1040 → 190 ms**; `search.idx` **byte a byte idêntico** (3 031 711 bytes, mesmo SHA-256).
+
+Outros chamadores de `index_file::write` (`src/buckets.rs:200`, `bucket add`/`rm`) ganham o mesmo caminho. `load_entries` continua existindo (TUI, `install::target`, testes) e **não muda**.
+
+#### What binds this task
+
+- `src/catalog/index_file.rs` `write(catalog, path) -> Result<usize, IndexFileError>`: mesma assinatura, mesmo retorno (`Ok(n)` = número de registros), mesma gravação atômica (`path.tmp` + `rename` com 5 tentativas a 20 ms; vira `fn persist(path, &[u8])`, comportamento inalterado). Não chama mais `load_entries`.
+- Nova `pub fn encode_catalog(catalog: &Catalog) -> Result<(Vec<u8>, usize), IndexFileError>`: **um** `SELECT {ENTRY_COLS} FROM packages ORDER BY rowid` em `catalog.connection()` (`src/catalog/mod.rs:252`; `ENTRY_COLS` em `:199`), cada coluna lida por `get_ref(i)` emprestada da linha (sem `PackageEntry`, sem `String` por campo). **Nenhuma thread, nenhuma conexão nova.** Um statement = uma transação de leitura = um snapshot.
+- Obrigatórias (`source`, `kind`, `id`, `name`, `version`, `tags`, `commands`) com `as_str()` (NULL é erro, como `r.get::<String>` hoje); opcionais (`moniker`, `publisher`, `description`) com `as_str_or_null()`. `kind` via `super::kind_from_db` (`src/catalog/mod.rs:194`, mesmo fallback para Winget). Erros de SQLite viram `IndexFileError::Catalog`.
+- `tags` e `commands` gravados por `fn put_words`: palavras de `split_whitespace` unidas por **um** espaço — o mesmo texto que `split_words` + `join(" ")` dá hoje (espaço duplo, tab, espaço no começo/fim). O arquivo sai **byte a byte igual** ao do HEAD.
+- Cabeçalho e trailer num `fn assemble(n, &offsets, &body) -> Result<Vec<u8>, IndexFileError>` (mesmos `MAGIC`, contagem `u32`, reservado `0u32`, `body_len u64`).
+- **O codificador antigo (laço sobre `&[PackageEntry]`) sai de `src/`:** o único usuário era `write`. A equivalência fica provada contra uma cópia congelada dele **no teste** (`reference_bytes`, abaixo), que passa a ser o teste de formato do arquivo. Se você achar outro chamador do codificador antigo em `src/`, pare e relate (não mantenha dois caminhos sem decidir).
+- Doc comment de `write` atualizado; `grep -n "load_entries" src/catalog/index_file.rs` ⇒ **0 linhas**.
+- Não mexer em `load_entries`, `rowid_ranges`, `open_worker_connection`, `search_on_disk`, nem no paralelismo de `index_file::search` (`PARALLEL_MIN`): fora do `update` o paralelo não travou e é ~2× mais rápido.
+- `docs/ARMADILHAS.md`, seção Desempenho, item novo (texto literal): "**Leitura paralela travando dentro do `update`.** Task 54: 8 conexões só-leitura no mesmo processo que acabou de parsear e gravar o catálogo travaram juntas por 0,4–1 s (sem busy handler, 1ª linha em < 0,5 ms; mmap, WAL e espera de 2 s não explicam); uma conexão só: 55–65 ms, nunca travou. Paralelismo que ganha no harness precisa ser medido no processo real."
+
+Código de referência (protótipo medido; nomes podem mudar, comportamento não):
+
+```rust
+/// The column's whitespace-separated words joined by one space (= `split_words` + `join(" ")`).
+fn put_words(out: &mut Vec<u8>, s: &str) {
+    let at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    for (i, w) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(b' ');
+        }
+        out.extend_from_slice(w.as_bytes());
+    }
+    let n = (out.len() - at - 4) as u32;
+    out[at..at + 4].copy_from_slice(&n.to_le_bytes());
+}
+
+fn sql(e: rusqlite::Error) -> IndexFileError {
+    IndexFileError::Catalog(e.into())
+}
+
+/// File bytes for every package, borrowing each column from the row (no `PackageEntry`).
+/// One statement on the catalog's own connection: one snapshot, no worker threads (parallel
+/// readers stalled 0.4–1 s inside `update`, see docs/ARMADILHAS.md).
+pub fn encode_catalog(catalog: &Catalog) -> Result<(Vec<u8>, usize), IndexFileError> {
+    let mut st = catalog
+        .connection()
+        .prepare(&format!(
+            "SELECT {} FROM packages ORDER BY rowid",
+            super::ENTRY_COLS
+        ))
+        .map_err(sql)?;
+    let mut rows = st.query([]).map_err(sql)?;
+    let mut offsets: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    let mut n = 0usize;
+    while let Some(r) = rows.next().map_err(sql)? {
+        let start = u32::try_from(body.len())
+            .map_err(|_| IndexFileError::Invalid("corpo grande demais"))?;
+        offsets.extend_from_slice(&start.to_le_bytes());
+        n += 1;
+        let s = |i: usize| -> Result<&str, IndexFileError> {
+            r.get_ref(i).map_err(sql)?.as_str().map_err(|e| sql(e.into()))
+        };
+        let o = |i: usize| -> Result<Option<&str>, IndexFileError> {
+            r.get_ref(i).map_err(sql)?.as_str_or_null().map_err(|e| sql(e.into()))
+        };
+        body.push(match super::kind_from_db(s(1)?) {
+            SourceKind::Winget => 0,
+            SourceKind::Scoop => 1,
+        });
+        put_str(&mut body, Some(s(0)?));
+        put_str(&mut body, Some(s(2)?));
+        put_str(&mut body, Some(s(3)?));
+        put_str(&mut body, o(4)?);
+        put_str(&mut body, Some(s(5)?));
+        put_str(&mut body, o(6)?);
+        put_str(&mut body, o(7)?);
+        put_words(&mut body, s(8)?);
+        put_words(&mut body, s(9)?);
+    }
+    Ok((assemble(n, &offsets, &body)?, n))
+}
+```
+
+(`kind_from_db` e `ENTRY_COLS` são privados de `src/catalog/mod.rs`; `index_file` é submódulo e enxerga `super::…`.)
+
+**Files:**
+- Modify: `src/catalog/index_file.rs`, `docs/ARMADILHAS.md`
+- Test: `tests/index_file.rs`
+
+Testes (literais não compilados por quem escreveu o plano — ajuste tipos/imports se o compilador pedir, **nunca** a asserção; rode clippy nos testes):
+
+1. `streamed_bytes_equal_the_frozen_entry_encoder_including_odd_whitespace` (`tests/index_file.rs`):
+
+```rust
+/// Frozen copy of the pre-Task-54 encoder (entries -> file bytes): the file-format pin.
+fn reference_bytes(entries: &[wingetrs::core::PackageEntry]) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, s: Option<&str>) {
+        match s {
+            Some(s) => {
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            None => out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()),
+        }
+    }
+    let mut offsets = Vec::new();
+    let mut body = Vec::new();
+    for e in entries {
+        offsets.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        body.push(match e.source {
+            SourceKind::Winget => 0,
+            SourceKind::Scoop => 1,
+        });
+        put(&mut body, Some(&e.source_name));
+        put(&mut body, Some(&e.id));
+        put(&mut body, Some(&e.name));
+        put(&mut body, e.moniker.as_deref());
+        put(&mut body, Some(&e.version));
+        put(&mut body, e.publisher.as_deref());
+        put(&mut body, e.description.as_deref());
+        put(&mut body, Some(&e.tags.join(" ")));
+        put(&mut body, Some(&e.commands.join(" ")));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&offsets);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(MAGIC);
+    out
+}
+
+#[test]
+fn streamed_bytes_equal_the_frozen_entry_encoder_including_odd_whitespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let mk = |i: usize| NewPackage {
+        id: format!("P.{i}"),
+        name: format!("Name {i} ✓"),
+        moniker: i.is_multiple_of(2).then(|| format!("m{i}")),
+        version: format!("1.{i}"),
+        publisher: i.is_multiple_of(3).then(|| "Pub".into()),
+        description: i.is_multiple_of(5).then(String::new),
+        // join(" ") of these stores doubled/leading/tab whitespace in the column;
+        // load_entries splits it, so the stored text differs from the file text.
+        tags: vec![" lead".into(), "a\tb".into(), String::new(), format!("t{i} ")],
+        commands: if i.is_multiple_of(4) { vec![] } else { vec!["c  d".into()] },
+        ..Default::default()
+    };
+    let w: Vec<NewPackage> = (0..3000).map(mk).collect();
+    c.replace_source("winget", SourceKind::Winget, "v", 1, &w, &WingetMaps::default())
+        .unwrap();
+    let s: Vec<NewPackage> = (3000..3400).map(mk).collect();
+    c.replace_source("scoop:main", SourceKind::Scoop, "e", 1, &s, &WingetMaps::default())
+        .unwrap();
+    // Re-import winget so rowids are not contiguous by source (winget lands after scoop).
+    c.replace_source("winget", SourceKind::Winget, "v2", 2, &w, &WingetMaps::default())
+        .unwrap();
+    let (bytes, n) = index_file::encode_catalog(&c).unwrap();
+    assert_eq!(n, 3400);
+    // Not assert_eq!: a 3400-record diff would flood the log.
+    assert!(bytes == reference_bytes(&c.load_entries().unwrap()), "streamed bytes differ");
+}
+```
+
+2. `write_writes_the_reference_bytes` (`tests/index_file.rs`): com o `catalog(500)` existente, `index_file::write(&cat, &idx)` devolve `666` e `std::fs::read(&idx).unwrap() == reference_bytes(&cat.load_entries().unwrap())` (de novo `assert!(a == b)`), e `idx.with_extension("idx.tmp")` não existe.
+3. `round_trip_every_entry` e `index_search_matches_in_memory_and_sqlite_exactly` (equivalência memória × `search.idx` × SQLite, resultado a resultado) continuam verdes **sem mudança**. Os demais testes de `tests/index_file.rs` também.
+
+#### Checks beyond the steps
+
+Mutações (`scripts/mutate.ps1 -Path src/catalog/index_file.rs -Anchor '<âncora>' -Replacement '<troca>' -TestCommand 'cargo test --quiet --test index_file streamed_bytes'`; nunca corte a saída do `mutate.ps1` com `Select-Object -First`: o pipe para antes do restore e a rodada seguinte dá falso "SOBREVIVEU"):
+1. Tags normalizadas: `put_words(&mut body, s(8)?);` → `put_str(&mut body, Some(s(8)?));` ⇒ PEGA (teste 1).
+2. Commands normalizados: o mesmo com `s(9)` ⇒ PEGA (teste 1).
+3. Ordem dos campos: `put_str(&mut body, o(6)?);` → `put_str(&mut body, o(7)?);` ⇒ PEGA (teste 1).
+4. NULL ≠ vazio: `put_str(&mut body, o(4)?);` → `put_str(&mut body, Some(o(4)?.unwrap_or_default()));` ⇒ PEGA (teste 1: `moniker` é NULL nos ímpares).
+5. Ordem dos registros: `ORDER BY rowid` → `ORDER BY id` ⇒ PEGA (teste 1: winget reimportado fica depois do scoop; `"P.10" < "P.2"`).
+6. Sem caminho antigo e sem thread: `grep -n "load_entries\|open_worker_connection\|rowid_ranges" src/catalog/index_file.rs` ⇒ nada; `encode_catalog`/`write`/`persist` sem `thread::` (o revisor confere no diff; o `thread::scope` de `search` já existia).
+7. Gate: `pwsh -File scripts/verify.ps1` verde; erros só via `Select-String` em `target/verify.log`.
+
+**Medição do orquestrador (A/B, decide se a tarefa fica).** Rode sozinho, depois do gate, com `scripts/leftovers.ps1` limpo. `$S` = scratchpad da sessão; `$BASE` = SHA registrado antes de despachar a tarefa.
+
+a) Binários (base num worktree temporário; cópias fixas para builds posteriores não trocarem o arquivo):
+
+```powershell
+$S = '<scratchpad>'; $BASE = '<sha base>'
+git worktree add --detach "$S\wt-base-54" $BASE
+$env:CARGO_TARGET_DIR = "$S\tgt-base-54"; cargo build --release --quiet --manifest-path "$S\wt-base-54\Cargo.toml"; Remove-Item Env:CARGO_TARGET_DIR
+Copy-Item "$S\tgt-base-54\release\wingetrs.exe" "$S\ab54-base.exe"
+git worktree remove --force "$S\wt-base-54"
+cargo build --release --quiet; Copy-Item target\release\wingetrs.exe "$S\ab54-new.exe"
+```
+
+b) Entrada fixa, sem rede: o **mesmo** `source2.msix` para as Tasks 54–56, servido localmente (`WINGETRS_WINGET_INDEX_URL`, `src/update.rs:24-29`); scoop aponta para porta morta (falha offline e mantém as linhas do scoop). Uma vez: `New-Item -ItemType Directory -Force "$S\ab-msix"; Copy-Item "$S\inv-read\dl\source2.msix" "$S\ab-msix\"` (3 766 341 bytes, baixado em 2026-10-11; se não existir, `curl.exe -L -o "$S\ab-msix\source2.msix" https://cdn.winget.microsoft.com/cache/source2.msix`).
+
+c) Salve como `$S\ab-update.ps1` (reusado nas Tasks 55 e 56). Cada raiz (`LOCALAPPDATA` temporário) parte de uma **cópia** do `catalog.db` real (só leitura do real; nada é escrito em `%LOCALAPPDATA%\wingetrs`); cada execução apaga o `http.json` e o log da raiz e roda `update --force` (reimporta o winget ⇒ `catalog_write`, `parse` e `search_idx` acontecem); ordem base/new sorteada por rodada; 2 rodadas de aquecimento descartadas.
+
+```powershell
+param(
+    [Parameter(Mandatory)] [string]$Tag,
+    [Parameter(Mandatory)] [string]$Base,
+    [Parameter(Mandatory)] [string]$New,
+    # Regex of the span prefix in the file log, e.g. 'update\.search_idx'.
+    [Parameter(Mandatory)] [string]$Span,
+    [int]$Runs = 10,
+    [int]$Port = 8765
+)
+$ErrorActionPreference = 'Stop'
+$S = '<scratchpad>'
+$real = Join-Path $env:LOCALAPPDATA 'wingetrs'
+$roots = @{}
+foreach ($k in 'base', 'new') {
+    $r = "$S\ab$Tag-root-$k"
+    if (Test-Path $r) { Remove-Item -Recurse -Force $r }
+    $d = New-Item -ItemType Directory -Force "$r\wingetrs"
+    foreach ($f in 'catalog.db', 'catalog.db-wal', 'catalog.db-shm', 'config.toml') {
+        if (Test-Path "$real\$f") { Copy-Item "$real\$f" $d }
+    }
+    $roots[$k] = $r
+}
+function Busy([string]$root) {
+    $log = Get-ChildItem "$root\wingetrs\log" -Filter 'wingetrs.log.*' | Sort-Object Name | Select-Object -Last 1
+    $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+    if (-not $m) { throw "span ausente em $root" }
+    $v = [double]$m.Matches[0].Groups[1].Value
+    switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+}
+$srv = Start-Process python -ArgumentList '-I', '-m', 'http.server', "$Port", '--bind', '127.0.0.1', '--directory', "$S\ab-msix" -PassThru -WindowStyle Hidden
+$orig = $env:LOCALAPPDATA
+$env:WINGETRS_WINGET_INDEX_URL = "http://127.0.0.1:$Port/source2.msix"
+$env:WINGETRS_SCOOP_BASE_URL = 'http://127.0.0.1:9'
+$exes = @{ base = $Base; new = $New }
+$ms = @{ base = @(); new = @() }
+try {
+    Start-Sleep -Milliseconds 500
+    for ($i = 0; $i -lt $Runs + 2; $i++) {
+        $round = @{}
+        foreach ($k in @('base', 'new') | Sort-Object { Get-Random }) {
+            $env:LOCALAPPDATA = $roots[$k]
+            Remove-Item -Force -ErrorAction SilentlyContinue "$($roots[$k])\wingetrs\http.json"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$($roots[$k])\wingetrs\log"
+            & $exes[$k] update --force *> $null
+            $round[$k] = Busy $roots[$k]
+        }
+        if ($i -ge 2) { $ms.base += $round.base; $ms.new += $round.new }
+    }
+} finally {
+    $env:LOCALAPPDATA = $orig
+    Remove-Item Env:WINGETRS_WINGET_INDEX_URL, Env:WINGETRS_SCOOP_BASE_URL -ErrorAction SilentlyContinue
+    Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+}
+function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+$d = for ($j = 0; $j -lt $ms.base.Count; $j++) { $ms.new[$j] - $ms.base[$j] }
+foreach ($k in 'base', 'new') {
+    $x = $ms[$k] | Measure-Object -Minimum -Maximum
+    '{0}: n={1} mediana={2:N1} min={3:N1} max={4:N1} ms; >400 ms: {5}' -f $k, $ms[$k].Count, (Med $ms[$k]), $x.Minimum, $x.Maximum, @($ms[$k] | Where-Object { $_ -gt 400 }).Count
+}
+$x = $d | Measure-Object -Minimum -Maximum
+'delta pareado (new - base): mediana={0:N1} min={1:N1} max={2:N1} ms' -f (Med $d), $x.Minimum, $x.Maximum
+'brutos base: ' + ($ms.base -join ', ')
+'brutos new:  ' + ($ms.new -join ', ')
+```
+
+d) Rodada desta tarefa: `pwsh -File "$S\ab-update.ps1" -Tag 54 -Base "$S\ab54-base.exe" -New "$S\ab54-new.exe" -Span 'update\.search_idx' -Runs 10`. Depois, mesmos bytes no real: `(Get-FileHash "$S\ab54-root-base\wingetrs\search.idx").Hash -eq (Get-FileHash "$S\ab54-root-new\wingetrs\search.idx").Hash` ⇒ `True` (as duas raizes tiveram a mesma história: mesma semente, mesmo msix, mesmo número de imports). Confirme com `Get-Process python -ErrorAction SilentlyContinue` que o servidor morreu; `leftovers.ps1` limpo.
+
+e) **Critério (mediana E pior caso):** fica se (1) delta pareado mediano ≤ −30 ms, (2) nenhuma execução `new` > 400 ms (limiar do modo travado) e `max(new) ≤ max(base)`, (3) hashes do `search.idx` iguais. Qualquer item falhando ⇒ `git revert --no-edit <sha da tarefa>` e registro no ledger com os números colados. Observação: sem o scoop no processo o modo travado da base pode nem aparecer; nesse caso (2) e (3) ainda decidem e o ganho esperado cai para o modo normal (~100 → ~60 ms). Cole no ledger as 4 linhas de resumo e os brutos.
+
+**Commit:** `perf(update): encode search.idx straight from catalog rows on one connection`
+
+---
+
+### Task 55: Gravação do catálogo — esvaziar de uma vez os mapas que são todos da fonte
+
+**Modelo:** sonnet (mudança pequena num arquivo; a armadilha é a regra "linha alheia ou órfã ⇒ caminho antigo", coberta pelos testes 1 e 3).
+
+#### Where this fits
+
+Depois da Task 54 (independente no código; em série porque mede tempo). `update.catalog_write{source=winget}` (`src/update.rs:303`, corpo de `apply`) mede ~1,06 s; ~70 % vai para as tabelas `map_*` (146 059 linhas, 9,4 por pacote, 12,5 dos 16,1 MB do `catalog.db`). Com o catálogo **já populado** (caso normal do `update`), o maior item é apagar as linhas antigas dos mapas em `delete_source_rows` (`src/catalog/mod.rs:168-179`: `DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)` em cada uma das 5 tabelas).
+
+Medido (harness com o `source2.msix` real, modo "replace", sob carga, medianas da mesma bateria):
+- Total da gravação: 1296 [925–3691] ms; `DELETE` nos 5 mapas: **420 [323–752] ms**.
+- Com `DELETE FROM map_x` (caminho de truncate do SQLite) quando todas as linhas do mapa são da fonte: delete dos mapas **420 → 127 ms** (bateria ab3) e **514 → 146 ms** (ab2); total **−133 ms** (ab3) e **−359 ms** (ab2).
+- `update` real com catálogo populado (máquina muito carregada): o `del` foi 635–1766 ms.
+- Catálogo vazio (1º import): ganho 0 (nada a apagar).
+- Equivalência no protótipo: digest SHA-256 de `packages` com rowid, dos 5 mapas como multiconjunto `(key, package)`, de `meta` e do schema iguais em todas as variantes; `integrity_check` ok.
+
+Esta tarefa faz **só** isso. Ficam para uma tarefa separada, depois desta medida (não implementar aqui): (P2) derrubar os 5 índices `ix_*` dentro da transação e recriá-los no fim, só quando o import tem mapas — mediu −213 a −303 ms a mais, mas tem riscos próprios (DDL transacional precisa de teste de rollback; rebuild num import do scoop custaria 100–300 ms por bucket); (P3) `cache_size` de 64 MiB durante o import — −43 a −304 ms, ruidoso; (P4) mapas `WITHOUT ROWID` — exige migração de schema. `synchronous=NORMAL`, inserts ordenados e `ATTACH` + `INSERT … SELECT` foram medidos sem ganho ou piores.
+
+#### What binds this task
+
+- `delete_source_rows(tx, source)` (`src/catalog/mod.rs:168`): para cada tabela de `MAP_TABLES` (`:49`), se **nenhuma** linha tem `package` fora dos rowids da fonte — `SELECT EXISTS(SELECT 1 FROM {t} WHERE package NOT IN (SELECT rowid FROM packages WHERE source = ?1))` é falso — apaga com `DELETE FROM {t}` **sem `WHERE`**; senão mantém o `DELETE … WHERE package IN (…)` atual, literal.
+- Linha **órfã** (`package` sem pacote) conta como alheia ⇒ caminho antigo ⇒ a órfã continua lá, exatamente como hoje. (Por isso a checagem é `NOT IN (rowids da fonte)`, não "existe pacote de outra fonte".)
+- `delete_source_rows` passa a devolver `DeletedRows { packages: usize, truncated_maps: usize }` (struct privada do módulo; `truncated_maps` = tabelas esvaziadas pelo `DELETE` sem `WHERE`). `replace_source` (`:301`) ignora o valor; `remove_source` (`:292-299`) devolve `packages` como hoje. Nenhuma assinatura pública muda.
+- Vale para `replace_source` e `remove_source` (mesma função). No `update` real só o winget tem mapas ⇒ o import do winget sempre pega o caminho rápido; o import de um bucket do scoop acha linhas do winget ⇒ caminho antigo (a checagem para na primeira linha alheia).
+- Nada muda em `SCHEMA`, índices, `lookup`, `ImportStats`, `cache_size`, `synchronous` nem na ordem dos inserts.
+
+**Files:**
+- Modify: `src/catalog/mod.rs`
+- Test: `#[cfg(test)] mod tests` novo no fim de `src/catalog/mod.rs` (precisa de `delete_source_rows` e `conn`, privados) e `tests/catalog.rs`
+
+Testes (literais não compilados por quem escreveu o plano — ajuste tipos/imports se o compilador pedir, nunca a asserção):
+
+1. `truncating_owned_map_tables_equals_the_per_row_delete` (unitário, `src/catalog/mod.rs`). Oráculo = o algoritmo antigo literal, em catálogos montados de forma idêntica; compara tudo que um leitor observa:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkg(id: &str) -> NewPackage {
+        NewPackage {
+            id: id.into(),
+            name: id.into(),
+            version: "1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn maps(ids: &[&str]) -> WingetMaps {
+        let pairs = |p: &str| -> Vec<(String, String)> {
+            ids.iter().map(|id| (format!("{p}_{id}"), (*id).to_string())).collect()
+        };
+        WingetMaps {
+            productcodes: pairs("PC"),
+            upgradecodes: pairs("UC"),
+            pfns: pairs("PFN"),
+            norm_names: pairs("nn"),
+            norm_publishers: pairs("np"),
+        }
+    }
+
+    /// Everything a reader can observe: packages with rowid, map rows as a multiset, meta,
+    /// and integrity.
+    fn content(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut q = |sql: &str| {
+            let mut st = conn.prepare(sql).unwrap();
+            let rows = st
+                .query_map([], |r| {
+                    (0..r.as_ref().column_count())
+                        .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            for row in rows {
+                out.push(row.unwrap().join("|"));
+            }
+        };
+        q("SELECT rowid, * FROM packages ORDER BY rowid");
+        for t in MAP_TABLES {
+            q(&format!("SELECT '{t}', key, package FROM {t} ORDER BY key, package"));
+        }
+        q("SELECT * FROM meta ORDER BY source");
+        q("PRAGMA integrity_check");
+        out
+    }
+
+    /// Pre-change algorithm, literal: per-row delete in every map table.
+    fn delete_per_row(tx: &rusqlite::Transaction<'_>, source: &str) -> usize {
+        for t in MAP_TABLES {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"
+                ),
+                params![source],
+            )
+            .unwrap();
+        }
+        tx.execute("DELETE FROM packages WHERE source = ?1", params![source])
+            .unwrap()
+    }
+
+    fn winget_only(c: &mut Catalog) {
+        c.replace_source(
+            "winget",
+            SourceKind::Winget,
+            "v",
+            1,
+            &[pkg("W.1"), pkg("W.2"), pkg("W.3")],
+            &maps(&["W.1", "W.2", "W.3"]),
+        )
+        .unwrap();
+        c.replace_source(
+            "scoop:main",
+            SourceKind::Scoop,
+            "e",
+            1,
+            &[pkg("S.1"), pkg("S.2")],
+            &WingetMaps::default(),
+        )
+        .unwrap();
+    }
+
+    fn two_owners(c: &mut Catalog) {
+        winget_only(c);
+        c.replace_source("other", SourceKind::Winget, "o", 1, &[pkg("O.1")], &maps(&["O.1"]))
+            .unwrap();
+    }
+
+    fn orphan_pfn(c: &mut Catalog) {
+        winget_only(c);
+        c.conn
+            .execute("INSERT INTO map_pfn (key, package) VALUES ('orphan', 999999)", [])
+            .unwrap();
+    }
+
+    fn check(setup: fn(&mut Catalog), source: &str, truncated: usize) {
+        let mut a = Catalog::open_in_memory().unwrap();
+        let mut b = Catalog::open_in_memory().unwrap();
+        setup(&mut a);
+        setup(&mut b);
+        let tx = a.conn.transaction().unwrap();
+        let got = delete_source_rows(&tx, source).unwrap();
+        tx.commit().unwrap();
+        let tx = b.conn.transaction().unwrap();
+        let want = delete_per_row(&tx, source);
+        tx.commit().unwrap();
+        assert_eq!(got.packages, want, "{source}");
+        assert_eq!(got.truncated_maps, truncated, "{source}");
+        assert_eq!(content(&a.conn), content(&b.conn), "{source}");
+    }
+
+    #[test]
+    fn truncating_owned_map_tables_equals_the_per_row_delete() {
+        // Only winget has maps: every table is truncated.
+        check(winget_only, "winget", 5);
+        // A source without maps sees winget rows: nothing truncated.
+        check(winget_only, "scoop:main", 0);
+        // Two sources with maps: per-row path for both, the other source's rows stay.
+        check(two_owners, "winget", 0);
+        check(two_owners, "other", 0);
+        // An orphan row counts as foreign: map_pfn keeps it, the other four are truncated.
+        check(orphan_pfn, "winget", 4);
+    }
+}
+```
+
+2. `replace_keeps_map_rows_of_another_source` (`tests/catalog.rs`, usa o `pkg` existente do arquivo):
+
+```rust
+#[test]
+fn replace_keeps_map_rows_of_another_source() {
+    let pfn = |k: &str, id: &str| WingetMaps {
+        pfns: vec![(k.into(), id.into())],
+        ..Default::default()
+    };
+    let mut c = Catalog::open_in_memory().unwrap();
+    c.replace_source("a", SourceKind::Winget, "1", 1, &[pkg("A.A", "Alpha", "1")], &pfn("PFN_A", "A.A"))
+        .unwrap();
+    c.replace_source("b", SourceKind::Winget, "1", 1, &[pkg("B.B", "Beta", "1")], &pfn("PFN_B", "B.B"))
+        .unwrap();
+    c.replace_source("a", SourceKind::Winget, "2", 2, &[pkg("A.A", "Alpha", "2")], &pfn("PFN_A2", "A.A"))
+        .unwrap();
+    assert_eq!(c.lookup(MapTable::Pfn, "pfn_b").unwrap(), ["B.B"]);
+    assert!(c.lookup(MapTable::Pfn, "pfn_a").unwrap().is_empty());
+    assert_eq!(c.lookup(MapTable::Pfn, "pfn_a2").unwrap(), ["A.A"]);
+}
+```
+
+3. `remove_source_keeps_other_sources_maps` (`tests/catalog.rs`): as fontes `a` e `b` do teste 2 (dois primeiros `replace_source`); `c.remove_source("a").unwrap() == 1`; `lookup(MapTable::Pfn, "pfn_b") == ["B.B"]`; `lookup(MapTable::Pfn, "pfn_a")` vazio.
+4. Os testes atuais de `tests/catalog.rs` (inclusive `replace_source_only_touches_that_source`, `dangling_map_rolls_back_whole_import`, `code_lookup_folds_case_in_both_directions`, `reader_keeps_old_snapshot_while_writer_replaces`) e de `tests/update.rs` continuam verdes sem mudança.
+
+#### Checks beyond the steps
+
+Mutações (`scripts/mutate.ps1 -Path src/catalog/mod.rs -Anchor '<âncora>' -Replacement '<troca>' -TestCommand '<comando>'`; âncora = o texto exato que você escreveu — ajuste ao seu código):
+1. Truncate só sem linha alheia: a condição que escolhe o `DELETE` sem `WHERE` vira sempre verdadeira (ex.: `if foreign {` → `if false {`) ⇒ PEGA (teste 1 `two_owners`/`orphan_pfn`; teste 2; teste 3). `-TestCommand 'cargo test --quiet --lib truncating_owned'`.
+2. O caminho rápido é usado: a condição vira sempre falsa (sempre o `DELETE … IN`) ⇒ PEGA (teste 1, `truncated_maps == 5`).
+3. Órfã é alheia: a checagem trocada por "existe pacote de **outra** fonte" (`SELECT EXISTS(SELECT 1 FROM {t} m JOIN packages p ON p.rowid = m.package WHERE p.source <> ?1)`) ⇒ PEGA (teste 1, `orphan_pfn`: a órfã seria apagada e `truncated_maps` daria 5).
+4. Gate: `pwsh -File scripts/verify.ps1` verde.
+
+**Medição do orquestrador (A/B, decide se a tarefa fica).** Sozinho, `leftovers.ps1` limpo, mesmo `$S\ab-msix\source2.msix` e mesmo `$S\ab-update.ps1` da Task 54 (passos a e c de lá, com `-Tag 55`, `wt-base-55`, `tgt-base-55`, `ab55-base.exe`, `ab55-new.exe`; base = HEAD antes desta tarefa):
+
+`pwsh -File "$S\ab-update.ps1" -Tag 55 -Base "$S\ab55-base.exe" -New "$S\ab55-new.exe" -Span 'update\.catalog_write\{source=winget\}' -Runs 10`
+
+Equivalência no catálogo real (as duas raizes tiveram a mesma história). Salve como `$S\catdigest.py` e rode `python -I "$S\catdigest.py" "$S\ab55-root-base\wingetrs\catalog.db" "$S\ab55-root-new\wingetrs\catalog.db"` ⇒ os dois digests iguais e `ok` nos dois (`fetched_at` fica de fora: é o relógio de cada execução):
+
+```python
+import hashlib, sqlite3, sys
+
+MAPS = ("map_productcode", "map_upgradecode", "map_pfn", "map_norm_name", "map_norm_publisher")
+
+def digest(path):
+    c = sqlite3.connect(path)
+    h = hashlib.sha256()
+    def feed(sql):
+        for row in c.execute(sql):
+            h.update(repr(row).encode())
+        h.update(b"|")
+    feed("SELECT rowid, * FROM packages ORDER BY rowid")
+    for t in MAPS:  # multiset: the map row's own rowid is not observable (lookup orders by p.rowid)
+        feed(f"SELECT key, package FROM {t} ORDER BY key, package")
+    feed("SELECT source, kind, source_version FROM meta ORDER BY source")
+    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+    c.close()
+    return h.hexdigest(), ok
+
+for p in sys.argv[1:]:
+    print(p, *digest(p))
+```
+
+**Critério (mediana E pior caso):** fica se (1) delta pareado mediano ≤ −100 ms (o protótipo mediu −133 a −359 ms), (2) `max(new) ≤ max(base)` — se só (2) falhar, repita uma rodada de 10; falhou de novo ⇒ revert —, (3) digests iguais e `integrity_check` = `ok` nas duas raizes. Senão `git revert --no-edit <sha da tarefa>` e ledger com os números. Os spans `catalog_write` do scoop não aparecem nesse A/B (scoop offline): o custo novo para eles é um `EXISTS` que para na 1ª linha alheia — **não medido**, registre assim.
+
+**Commit:** `perf(catalog): empty a map table at once when every row belongs to the replaced source`
+
+---
+
+### Task 56: Validação do msix do winget em pipeline (inflate + hashes)
+
+**Modelo:** opus (concorrência com threads e precedência de erros; o oráculo serial é o que prova).
+
+#### Where this fits
+
+Depois da Task 55 (independente no código; em série porque mede tempo). `update.parse` do winget (`src/sources/winget/mod.rs:59`, em volta de `validate_msix` + gravação do `.db` temporário + `read_index`) mediu 364 ms no `update` real. `validate_msix` (`src/sources/winget/index.rs:61-103`) faz em série: inflate de `Public/index.db` (8,7 MB, 133 blocos de 64 KiB), SHA-256 de cada bloco contra o `AppxBlockMap.xml` e SHA-256 do arquivo inteiro (`FileHash`) — os mesmos 8,7 MB hasheados duas vezes, em software (sem SHA-NI).
+
+Medido (harness, catálogo real, 9 rodadas, sob carga, ~1,5× acima do run de 364 ms): inflate **67 ms** (11 %), hash por bloco **85,5 ms** (14 %), `FileHash` **83,9 ms** (14 %); leitura do SQLite + `String` ~55 %. Pipeline só dos hashes (inflate numa thread, as duas somas em duas outras): delta pareado **−170 ms** (11 rodadas) e **−162 ms** (15 rodadas), resultado idêntico ao do código atual em todas as rodadas. O ganho ponta a ponta só foi medido para o protótipo completo (pipeline + leitura paralela: `update.parse` 591 → 317 ms, −252 ms pareado); **só o pipeline, ponta a ponta: não medido** — é o que a medição desta tarefa decide. Projeção (não medida) na carga do run citado: ~364 → ~250 ms.
+
+Fora desta tarefa, de propósito: a leitura do `index.db` com conexões SQLite extras em paralelo (−191 a −205 ms no harness). **Não abra conexões novas**: dentro do `update`, conexões paralelas no mesmo processo travaram juntas por 430–1040 ms na investigação do `search.idx` (`docs/ARMADILHAS.md`, Desempenho: conexões paralelas competem no `prepare`; e o item da Task 54). Também fora: `spawn_blocking` do parse (não medido) e menos alocações no formato de import.
+
+#### What binds this task
+
+- `validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError>`: mesma assinatura, **mesmos bytes** e **mesmo erro** que hoje para qualquer entrada, inclusive quando há mais de um defeito. Precedência atual (a ser preservada): (1) `ZipArchive::new` falha ⇒ `Zip`; (2) `Public/index.db` ausente ⇒ `MissingEntry("Public/index.db")`; (3) erro ao inflar `index.db` (inclusive CRC) ⇒ `Zip`; (4) `AppxBlockMap.xml` ausente ⇒ `MissingEntry("AppxBlockMap.xml")`; XML inválido ou sem `<File Name="Public\index.db">` ⇒ `BlockMap`; (5) contagem de blocos ≠ `db.len().div_ceil(65536)` ⇒ `BlockMap("esperados {n} blocos, encontrados {m}")`; (6) primeiro bloco cujo `base64(sha256)` difere ⇒ `Integrity { block }`; (7) `FileHash` presente e diferente ⇒ `FileHash`.
+- Como o pipeline precisa dos hashes **antes** de inflar, o blockmap é lido primeiro; para manter (3) antes de (4): se a leitura do blockmap falhar, infle `index.db` inteiro com o `read_entry` atual (propagando o erro dele) e só então devolva o erro do blockmap. Custo zero no caminho feliz.
+- Pipeline: `std::thread::scope`; a thread chamadora infla em blocos de 64 KiB (`read_block` preenche até 64 KiB ou fim) e envia cada bloco como `Arc<Vec<u8>>` por dois `std::sync::mpsc::sync_channel(32)`; uma thread devolve o índice do **primeiro** bloco ruim (blocos além de `hashes.len()` não são comparados), a outra devolve se o `FileHash` (quando existe) confere. Os dois `Sender` são soltos, **as duas threads são juntadas (pânico ⇒ `std::panic::resume_unwind`) antes de qualquer `?`**, e só então vêm, nesta ordem: erro de leitura do produtor (`Zip`), contagem, `Integrity`, `FileHash`. Receptor fechado (worker em pânico) ⇒ o produtor para de mandar e o `join` relança o pânico.
+- Buffer inicial = `min(tamanho declarado no zip, 64 MiB)`: o tamanho declarado é dado externo e não pode virar uma alocação gigante.
+- **Nenhuma conexão SQLite nova; `read_index` e `fetch_index` não mudam.** Sem crate nem feature nova; sem `unwrap`/`expect` fora de testes; nenhuma thread fora do `scope`. `FileHash` continua conferido (no pipeline ele não está no caminho crítico).
+- Spans da Task 45 intactos (`update.parse` continua em volta das mesmas três etapas).
+
+Código de referência (protótipo medido + a regra de precedência acima; nomes podem mudar, comportamento não):
+
+```rust
+/// Fills `buf` unless the reader ends first; returns the bytes read.
+fn read_block<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// Block hashes and the optional whole-file hash of Public\index.db, from AppxBlockMap.xml.
+fn read_blockmap<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<(Vec<String>, Option<String>), IndexError> {
+    let map = read_entry(zip, BLOCKMAP_ENTRY)?;
+    let xml = std::str::from_utf8(&map).map_err(|e| IndexError::BlockMap(e.to_string()))?;
+    let doc = roxmltree::Document::parse(xml).map_err(|e| IndexError::BlockMap(e.to_string()))?;
+    let file = doc
+        .descendants()
+        .find(|n| n.has_tag_name("File") && n.attribute("Name") == Some(INDEX_BLOCKMAP_NAME))
+        .ok_or_else(|| IndexError::BlockMap("entrada Public\\index.db ausente".into()))?;
+    let hashes = file
+        .children()
+        .filter(|n| n.has_tag_name("Block"))
+        .filter_map(|n| n.attribute("Hash"))
+        .map(str::to_owned)
+        .collect();
+    // b4:FileHash is a child element of <File> carrying the base64 sha256 in `Hash`.
+    let file_hash = file
+        .children()
+        .find(|n| n.has_tag_name("FileHash"))
+        .and_then(|n| n.attribute("Hash"))
+        .map(str::to_owned);
+    Ok((hashes, file_hash))
+}
+
+/// Cap for the up-front buffer: the declared size comes from the download.
+const PREALLOC_MAX: usize = 64 << 20;
+
+/// Returns the validated bytes of Public/index.db.
+/// Inflate, per-block hashes and the whole-file hash run as a pipeline (this thread plus two
+/// scoped workers); serially they cost ~235 ms under load on a CPU without SHA-NI.
+pub fn validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
+    use std::sync::{Arc, mpsc};
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(msix))
+        .map_err(|e| IndexError::Zip(e.to_string()))?;
+    if zip.index_for_name(INDEX_ENTRY).is_none() {
+        return Err(IndexError::MissingEntry(INDEX_ENTRY));
+    }
+    let (hashes, file_hash) = match read_blockmap(&mut zip) {
+        Ok(m) => m,
+        Err(e) => {
+            // index.db used to be inflated first, so its read error wins.
+            read_entry(&mut zip, INDEX_ENTRY)?;
+            return Err(e);
+        }
+    };
+    let mut entry = zip
+        .by_name(INDEX_ENTRY)
+        .map_err(|e| IndexError::Zip(e.to_string()))?;
+    let cap = usize::try_from(entry.size()).map_or(PREALLOC_MAX, |n| n.min(PREALLOC_MAX));
+    let (hashes, file_hash) = (&hashes, file_hash.as_deref());
+    std::thread::scope(|s| {
+        let (block_tx, block_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(32);
+        let (file_tx, file_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(32);
+        let blocks = s.spawn(move || {
+            let mut first_bad = None;
+            for (i, block) in block_rx.into_iter().enumerate() {
+                if first_bad.is_none()
+                    && hashes
+                        .get(i)
+                        .is_some_and(|h| STANDARD.encode(Sha256::digest(&block[..])) != *h)
+                {
+                    first_bad = Some(i);
+                }
+            }
+            first_bad
+        });
+        let whole = s.spawn(move || {
+            let mut h = Sha256::new();
+            for block in file_rx {
+                h.update(&block[..]);
+            }
+            file_hash.is_none_or(|expected| STANDARD.encode(h.finalize()) == expected)
+        });
+        let mut db = Vec::with_capacity(cap);
+        let produced = (|| -> Result<(), IndexError> {
+            loop {
+                let mut buf = vec![0u8; BLOCK_SIZE];
+                let n = read_block(&mut entry, &mut buf)
+                    .map_err(|e| IndexError::Zip(e.to_string()))?;
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.truncate(n);
+                db.extend_from_slice(&buf);
+                let buf = Arc::new(buf);
+                // A closed receiver means that worker panicked; the join below re-raises it.
+                if block_tx.send(Arc::clone(&buf)).is_err() || file_tx.send(buf).is_err() {
+                    return Ok(());
+                }
+            }
+        })();
+        // Closing both channels ends the workers' loops; join both before any `?`.
+        drop(block_tx);
+        drop(file_tx);
+        let first_bad = blocks.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        let file_ok = whole.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        produced?;
+        if hashes.len() != db.len().div_ceil(BLOCK_SIZE) {
+            return Err(IndexError::BlockMap(format!(
+                "esperados {} blocos, encontrados {}",
+                db.len().div_ceil(BLOCK_SIZE),
+                hashes.len()
+            )));
+        }
+        if let Some(block) = first_bad {
+            return Err(IndexError::Integrity { block });
+        }
+        if !file_ok {
+            return Err(IndexError::FileHash);
+        }
+        Ok(db)
+    })
+}
+```
+
+**Files:**
+- Modify: `src/sources/winget/index.rs`
+- Test: `tests/winget_index.rs`
+
+Testes (os existentes — `valid_msix_yields_exact_index_bytes`, `corrupt_block_is_rejected`, `missing_block_is_rejected`, `bad_file_hash_is_rejected`, `not_a_zip_is_an_error`, `reads_packages_and_all_maps`, `unsupported_major_version_is_refused` e os de `fetch_index` — continuam verdes sem mudança). Literais não compilados por quem escreveu o plano — ajuste tipos/imports (`zip::write::SimpleFileOptions`, `zip::CompressionMethod`) se o compilador pedir, nunca a asserção:
+
+1. `pipelined_validate_msix_equals_serial_reference` (`tests/winget_index.rs`): oráculo = `validate_msix` do HEAD **copiado literalmente** para o teste (com o `read_entry` dele); cada entrada é passada aos dois e o resultado precisa ser igual (bytes, ou o `Debug` do erro: variante + mensagem/bloco). As entradas cobrem cada degrau da precedência, mais de um defeito ao mesmo tempo e mais blocos que a capacidade do canal (41 > 32):
+
+```rust
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use sha2::{Digest, Sha256};
+
+/// Pre-Task-56 validate_msix, literal (serial: inflate, block hashes, file hash).
+fn validate_msix_serial(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
+    fn read_entry<R: std::io::Read + std::io::Seek>(
+        zip: &mut zip::ZipArchive<R>,
+        name: &'static str,
+    ) -> Result<Vec<u8>, IndexError> {
+        let mut f = zip.by_name(name).map_err(|e| match e {
+            zip::result::ZipError::FileNotFound => IndexError::MissingEntry(name),
+            other => IndexError::Zip(other.to_string()),
+        })?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut f, &mut buf).map_err(|e| IndexError::Zip(e.to_string()))?;
+        Ok(buf)
+    }
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(msix))
+        .map_err(|e| IndexError::Zip(e.to_string()))?;
+    let db = read_entry(&mut zip, "Public/index.db")?;
+    let map = read_entry(&mut zip, "AppxBlockMap.xml")?;
+    let xml = std::str::from_utf8(&map).map_err(|e| IndexError::BlockMap(e.to_string()))?;
+    let doc = roxmltree::Document::parse(xml).map_err(|e| IndexError::BlockMap(e.to_string()))?;
+    let file = doc
+        .descendants()
+        .find(|n| n.has_tag_name("File") && n.attribute("Name") == Some("Public\\index.db"))
+        .ok_or_else(|| IndexError::BlockMap("entrada Public\\index.db ausente".into()))?;
+    let hashes: Vec<&str> = file
+        .children()
+        .filter(|n| n.has_tag_name("Block"))
+        .filter_map(|n| n.attribute("Hash"))
+        .collect();
+    if hashes.len() != db.len().div_ceil(65536) {
+        return Err(IndexError::BlockMap(format!(
+            "esperados {} blocos, encontrados {}",
+            db.len().div_ceil(65536),
+            hashes.len()
+        )));
+    }
+    for (i, (chunk, expected)) in db.chunks(65536).zip(&hashes).enumerate() {
+        if STANDARD.encode(Sha256::digest(chunk)) != *expected {
+            return Err(IndexError::Integrity { block: i });
+        }
+    }
+    let file_hash = file
+        .children()
+        .find(|n| n.has_tag_name("FileHash"))
+        .and_then(|n| n.attribute("Hash"));
+    if let Some(expected) = file_hash
+        && STANDARD.encode(Sha256::digest(&db)) != expected
+    {
+        return Err(IndexError::FileHash);
+    }
+    Ok(db)
+}
+
+/// (name, bytes, stored) entries in order; stored = no compression (lets a test corrupt them).
+fn zip_of(files: &[(&str, &[u8], bool)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        for (name, bytes, stored) in files {
+            let o = zip::write::SimpleFileOptions::default();
+            let o = if *stored { o.compression_method(zip::CompressionMethod::Stored) } else { o };
+            z.start_file(*name, o).unwrap();
+            z.write_all(bytes).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+fn fixture_blockmap() -> Vec<u8> {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(MSIX)).unwrap();
+    let mut v = Vec::new();
+    std::io::Read::read_to_end(&mut z.by_name("AppxBlockMap.xml").unwrap(), &mut v).unwrap();
+    v
+}
+
+/// 41 blocks (> the channel capacity of 32) with a hand-written blockmap.
+fn synthetic(bad_block: Option<usize>, bad_file_hash: bool) -> Vec<u8> {
+    let data: Vec<u8> = (0..40 * 65536 + 123).map(|i: usize| (i % 251) as u8).collect();
+    let mut xml = String::from(r#"<BlockMap><File Name="Public\index.db">"#);
+    for c in data.chunks(65536) {
+        xml.push_str(&format!(r#"<Block Hash="{}"/>"#, STANDARD.encode(Sha256::digest(c))));
+    }
+    let fh = if bad_file_hash { Sha256::digest(b"x") } else { Sha256::digest(&data) };
+    xml.push_str(&format!(r#"<FileHash Hash="{}"/></File></BlockMap>"#, STANDARD.encode(fh)));
+    let mut stored = data;
+    if let Some(b) = bad_block {
+        stored[b * 65536 + 7] ^= 0xFF;
+    }
+    zip_of(&[("Public/index.db", &stored, false), ("AppxBlockMap.xml", xml.as_bytes(), false)])
+}
+
+#[test]
+fn pipelined_validate_msix_equals_serial_reference() {
+    let bm = fixture_blockmap();
+    let flip = |at: &[usize]| {
+        let mut d = DB.to_vec();
+        for &i in at {
+            d[i] ^= 0xFF;
+        }
+        d
+    };
+    let last_block = flip(&[DB.len() - 1]);
+    let two_bad = flip(&[65536 + 5, 3 * 65536 + 5]);
+    let mut bad_and_long = flip(&[5]);
+    bad_and_long.extend_from_slice(&[0u8; 65536]);
+    // Stored index.db with one byte flipped inside the zip: the CRC check fails on read.
+    let crc_broken = |map: &[u8]| {
+        let mut z = zip_of(&[("Public/index.db", DB, true), ("AppxBlockMap.xml", map, false)]);
+        let at = z.windows(16).position(|w| w == &DB[..16]).unwrap();
+        z[at + 70_000] ^= 0xFF;
+        z
+    };
+    let cases: Vec<Vec<u8>> = vec![
+        MSIX.to_vec(),
+        CORRUPT.to_vec(),
+        MISSING_BLOCK.to_vec(),
+        BAD_FILEHASH.to_vec(),
+        b"hello".to_vec(),
+        zip_of(&[("AppxManifest.xml", b"<x/>", false)]),
+        zip_of(&[("Public/index.db", DB, false)]),
+        zip_of(&[("Public/index.db", DB, false), ("AppxBlockMap.xml", b"<not xml", false)]),
+        zip_of(&[("Public/index.db", DB, false), ("AppxBlockMap.xml", b"<BlockMap/>", false)]),
+        zip_of(&[("Public/index.db", &last_block, false), ("AppxBlockMap.xml", &bm, false)]),
+        zip_of(&[("Public/index.db", &two_bad, false), ("AppxBlockMap.xml", &bm, false)]),
+        zip_of(&[("Public/index.db", &bad_and_long, false), ("AppxBlockMap.xml", &bm, false)]),
+        crc_broken(&bm),
+        crc_broken(b"<not xml"),
+        synthetic(None, false),
+        synthetic(Some(37), false),
+        synthetic(None, true),
+    ];
+    let outcome = |r: Result<Vec<u8>, IndexError>| r.map_err(|e| format!("{e:?}"));
+    let mut seen = Vec::new();
+    for (i, msix) in cases.iter().enumerate() {
+        let want = outcome(validate_msix_serial(msix));
+        let got = outcome(validate_msix(msix));
+        assert!(got == want, "case {i}: got {:?}, want {:?}", got.as_ref().err(), want.as_ref().err());
+        seen.push(want.err().unwrap_or_else(|| "Ok".into()));
+    }
+    // Guard against degenerate inputs: every rung of the precedence is exercised.
+    for kind in ["Ok", "Zip(", "MissingEntry(\"Public", "MissingEntry(\"Appx", "BlockMap(", "Integrity", "FileHash"] {
+        assert!(seen.iter().any(|s| s.starts_with(kind)), "no case yields {kind}: {seen:?}");
+    }
+    // Two defects at once: the serial order decides.
+    assert!(seen[11].starts_with("BlockMap("), "count before Integrity: {}", seen[11]);
+    assert!(seen[12].starts_with("Zip("), "read error before Integrity: {}", seen[12]);
+    assert!(seen[13].starts_with("Zip("), "read error before BlockMap: {}", seen[13]);
+    assert_eq!(seen[10], "Integrity { block: 1 }");
+    assert_eq!(seen[15], "Integrity { block: 37 }");
+}
+```
+
+(Se o `Debug` de algum erro `Zip` diferir só no texto da mensagem entre os dois caminhos, as duas mensagens vêm do mesmo `io::Error` do `zip`; faça o caminho novo produzir o mesmo texto — não afrouxe a comparação.)
+
+#### Checks beyond the steps
+
+Mutações (`scripts/mutate.ps1 -Path src/sources/winget/index.rs -Anchor '<âncora>' -Replacement '<troca>' -TestCommand 'cargo test --quiet --test winget_index'`; âncoras = texto exato do seu código):
+1. Hash por bloco: a thread de blocos devolve sempre `None` (`first_bad = Some(i);` → `first_bad = None;`) ⇒ PEGA (`corrupt_block_is_rejected`, teste 1).
+2. `FileHash`: a thread do arquivo devolve sempre `true` ⇒ PEGA (`bad_file_hash_is_rejected`, teste 1 caso `synthetic(None, true)`).
+3. `MissingEntry` do índice primeiro: remova o `if zip.index_for_name(INDEX_ENTRY).is_none() { … }` ⇒ PEGA (teste 1: o zip só com `AppxManifest.xml` daria `MissingEntry("AppxBlockMap.xml")`).
+4. Erro de leitura antes do blockmap: no `Err(e)` de `read_blockmap`, tire o `read_entry(&mut zip, INDEX_ENTRY)?;` ⇒ PEGA (teste 1, caso `crc_broken(b"<not xml")`).
+5. Erro de leitura antes de `Integrity`: mova o `produced?;` para depois do `if let Some(block) = first_bad` ⇒ PEGA (teste 1, caso `crc_broken(&bm)`).
+6. Contagem antes de `Integrity`: troque a ordem dos dois `if` ⇒ PEGA (teste 1, caso `bad_and_long`).
+7. **Não** rode a mutação "tirar `drop(block_tx)`": ela trava o teste para sempre (os workers nunca terminam) e o `mutate.ps1` não volta. O revisor confere por leitura que os dois `Sender` são soltos antes dos `join` e que os dois `join` vêm antes de qualquer `?`.
+8. Regras: `pwsh -File scripts/check_rules.ps1` (join que engole pânico); `grep -n "open_with_flags\|Connection::open" src/sources/winget/index.rs` ⇒ só a linha que já existia em `read_index`.
+9. Gate: `pwsh -File scripts/verify.ps1` verde.
+
+**Medição do orquestrador (A/B, decide se a tarefa fica).** Sozinho, `leftovers.ps1` limpo, mesmo `$S\ab-msix\source2.msix` e mesmo `$S\ab-update.ps1` da Task 54 (passos a e c de lá, com `-Tag 56`, `wt-base-56`, `tgt-base-56`, `ab56-base.exe`, `ab56-new.exe`; base = HEAD antes desta tarefa):
+
+`pwsh -File "$S\ab-update.ps1" -Tag 56 -Base "$S\ab56-base.exe" -New "$S\ab56-new.exe" -Span 'update\.fetch\{source=winget\}:update\.parse' -Runs 10`
+
+Equivalência no real: `search.idx` com o mesmo hash nas duas raizes (comando do passo d da Task 54 com `ab56-root-*`) e `python -I "$S\catdigest.py"` (Task 55) nas duas `catalog.db` ⇒ digests iguais, `ok`.
+
+**Critério (mediana E pior caso):** fica se (1) delta pareado mediano ≤ −80 ms (metade dos −162/−170 ms do harness), (2) `max(new) ≤ max(base)` — se só (2) falhar, repita uma rodada de 10; falhou de novo ⇒ revert —, (3) `search.idx` e digests iguais. Senão `git revert --no-edit <sha da tarefa>` e ledger com os números colados. Se o pipeline mostrar o mesmo tipo de travamento bimodal da Task 54 (execuções `new` muito acima da base sem padrão), registre em `docs/ARMADILHAS.md` mesmo revertendo.
+
+**Commit:** `perf(winget): validate the index msix as an inflate and hash pipeline`
