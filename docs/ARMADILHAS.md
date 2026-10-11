@@ -10,12 +10,14 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 - **Corpo literal de teste no plano também passa pelo clippy.** `nonminimal_bool`, `double_comparisons`, `manual_is_multiple_of`, `assertions_on_constants` dispararam em testes transcritos. Ao escrever o plano, compile os testes num rascunho ou já escreva na forma aceita.
 - **Caso degenerado esconde a regra.** Task 41: alvos = "último plano de cada grupo", testado só com grupos de 1 plano — `first()` e `last()` coincidem e a mutação sobreviveu. Ao escrever teste de regra sobre posição/ordem/conjunto, use entradas onde as alternativas erradas dão resultado diferente (grupo com dependência, lista com ≥ 2 itens fora de ordem).
 - **Span criado não é span medido.** Task 45: o teste contava spans fechados; `let _x = debug_span!(..)` sem entrar, ou `.instrument(Span::none())`, fecha o span com duração ~0 e passava. Teste de instrumentação conta só spans entrados (`on_enter`) e confere o pai (etapa dentro da operação).
+- **Teste com limiar de relógio quebra o gate sob carga.** Quatro gates vermelhos num dia com agentes compilando em paralelo (`elapsed() < 5 s`, `< 400 ms`…). Prove ordem, concorrência ou contagem (barreira, chegadas, quem soltou o lock primeiro); limiar só como detector de travamento, com margem ≥ 10×.
 - **wiremock 0.6 divide valores de header por vírgula.** `header("If-Modified-Since", "Wed, 07 Oct …")` nunca casa; use `headers(name, vec!["Wed", "07 Oct …"])`.
 
 - **Instrumento que para de vigiar em silêncio.** `check_rules.ps1` com `StrictMode`: `Get-Content` de arquivo de **uma linha** devolve string, `.Count` falhava, o arquivo era pulado e o script saía 0. Achado pelo revisor da Task 27 (stubs `//!`). Correção: `@(Get-Content …)` + `$ErrorActionPreference = 'Stop'`; provado plantando violação num arquivo de uma linha. Todo instrumento novo: prove com violação plantada **no menor caso** (arquivo vazio, uma linha).
 
 ## Concorrência
 
+- **Poll com waker falso perde o despertar.** Task 53: `now_or_never()` num `EventStream` do crossterm registra um waker noop, e o crossterm só guarda um waker até ser acordado ⇒ a próxima tecla acorda ninguém e a TUI congela. Teste com stream falso não pega: o falso precisa imitar o comportamento da biblioteca real. Drene sempre com o `cx` da tarefa (`poll_fn`).
 - **Thread antecipada órfã** (Tasks 18 e 20): `spawn` antes de um `?` sem `join` em todos os caminhos. Use guard com `Drop` ou junte antes do `?`.
 - **Pânico engolido** (`join().ok()`, `if let Ok(..) = h.join()`, `unwrap_or_default`) devolve resultado parcial em silêncio. `scripts/check_rules.ps1` (no gate) barra os padrões conhecidos.
 - **Handle de `spawn_blocking` descartado** faz o tokio engolir o pânico (a TUI nunca carregava os instalados).
