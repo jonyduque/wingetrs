@@ -2452,3 +2452,59 @@ Testes (os de integridade já existem e são os que pegam as mutações perigosa
 
 ---
 
+
+## TUI — navegação (Task 53)
+
+### Task 53: Navegação nunca espera os detalhes
+
+#### Where this fits
+
+O usuário relata que na aba Atualizações "só passa para o próximo item depois que os detalhes carregam". O `update` não espera nada (`src/tui/app.rs:322-331`: `move_to` só devolve `Cmd::LoadDetails`). O que trava é o laço em volta (`src/tui/run.rs:101-147`): (1) o ticker do spinner é `tokio::time::interval(TICK)` (`run.rs:98`) com o padrão `MissedTickBehavior::Burst`; o ramo só é consultado enquanto `details_loading` (`run.rs:111`), mas o relógio continua contando, e ao selecionar um item sem detalhes **todos os ticks perdidos disparam em rajada**, cada um com um `terminal.draw` (`run.rs:144-146`), disputando o `select!` com as teclas até os detalhes chegarem; (2) um `draw` por mensagem, sem juntar teclas; (3) `details_loading` (`run.rs:151-154`) fica verdadeiro para sempre depois de `Booted`/`CatalogLoaded`/`InstalledLoaded`/troca de aba/Esc, porque esses caminhos não pedem detalhes (`app.rs:362-366`, `372-396`, `398-402`, `333-342`, `526-537`). Nada disso foi medido; esta tarefa também põe os contadores que permitem medir.
+
+#### What binds this task
+
+- **Estado de detalhe pendente em `App`** (`src/tui/app.rs`): campo novo `pub details_pending: Option<String>` (chave `"{source}/{id}"`). `details_cmd` passa a `&mut self`: quando emite `Cmd::LoadDetails` grava a chave em `details_pending`; quando a seleção não tem chave ou a chave já está em `details`, grava `None`. `Msg::DetailsLoaded { key, .. }` sempre insere no cache, e só limpa `details_pending` se for **a mesma chave**. Método novo `pub fn animating(&self) -> bool { self.refreshing || self.details_pending.is_some() }`. `Msg::Tick` avança `spinner_frame` só se `animating()`.
+- **Todo caminho que muda a linha selecionada termina em `details_cmd()`**: `move_to` (já), `set_tab`, `Msg::Booted` com catálogo `Ok`, `Msg::CatalogLoaded`, `Msg::InstalledLoaded`, Esc que limpa a busca, Backspace, digitação, Ctrl+S (os três últimos já). Quando `set_tab` devolve `Cmd::ScanInstalled`, devolve também o `details_cmd()` (que dará vazio se não houver linha).
+- **Laço** (`src/tui/run.rs`):
+  - `pub fn spinner_ticker() -> tokio::time::Interval`: `interval(TICK)` com `set_missed_tick_behavior(MissedTickBehavior::Skip)`. O laço usa esta função; o ramo do tick fica condicionado a `app.animating()`. Apague `details_loading`.
+  - `pub fn drain_ready<S: futures_util::Stream<Item = Msg> + Unpin>(first: Msg, more: &mut S, cap: usize) -> Vec<Msg>`: devolve `first` seguido de tudo que `more` já tem pronto, sem esperar (`futures_util::FutureExt::now_or_never` sobre `more.next()`: `None` = nada pronto ⇒ para; `Some(None)` = fim ⇒ para), no máximo `cap` itens no total. O laço drena **as teclas e o canal `rx`** com `cap = 256` antes de desenhar. Erro do `EventStream` continua encerrando o laço com `Err` como hoje (`run.rs:107`); `Msg::Panicked` continua passando por `jobs::propagate` antes do `update`.
+  - `pub fn last_details_only(cmds: Vec<Cmd>) -> Vec<Cmd>`: remove todo `Cmd::LoadDetails` exceto o último; os demais comandos ficam na ordem original.
+  - `pub fn needs_draw(batch: &[Msg], animating: bool) -> bool`: verdadeiro se o lote tem qualquer mensagem que não seja `Msg::Tick`, ou se tem `Msg::Tick` e `animating`. Avaliado antes de aplicar o lote. **Um `draw` por lote**, não por mensagem.
+  - Os comandos do lote inteiro passam por `last_details_only` antes de executar.
+  - `spawn_details` aguarda o trabalho por um `JoinHandle` (regra do CLAUDE.md: pânico nunca engolido): `pub async fn join_details(key: String, h: tokio::task::JoinHandle<Msg>) -> Msg` devolve a mensagem; pânico ⇒ `Msg::Panicked(payload)`; cancelamento ⇒ `Msg::DetailsLoaded { key, result: Err(<texto>) }`. Debounce de 150 ms e descarte por geração (`run.rs:241-255`) ficam como estão.
+  - **Contadores** (instrumentação para medir, não otimização): o laço conta `frames`, `keys`, `ticks` e o maior `draw` em µs; ao sair, `tracing::info!(frames, keys, ticks, max_draw_us, secs, "tui stats")`; `tracing::debug!(draw_us, batch, "frame lento")` só quando um `draw` passa de 16 000 µs. Nada em stdout.
+- Não mude a aparência (snapshots de `tests/tui_view.rs` iguais), nem a lógica de debounce, nem `jobs.rs`.
+- Commits separados: (1) contadores sozinhos, para servir de base de comparação; (2) o resto.
+
+**Files:**
+- Modify: `src/tui/run.rs`, `src/tui/app.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`, `tests/tui_loop.rs` (novo arquivo de teste)
+
+Testes:
+1. `selection_moves_while_details_are_pending` (`tests/tui_state.rs`): `on_tab(Tab::Updates, vec![irow("a", "wingetrs", "scoop:main", true), irow("b", "wingetrs", "scoop:main", true), irow("c", "wingetrs", "scoop:main", true)])`; `update(Down)` ⇒ `[Cmd::LoadDetails { source: "scoop:main", id: "b" }]`; **sem entregar** `DetailsLoaded`, `update(Down)` ⇒ `a.selected == 2`, comandos `[Cmd::LoadDetails { id: "c", .. }]`, `a.details_pending == Some("scoop:main/c".into())`. (Passa no código atual também: é a guarda contra introduzir a espera.)
+2. `selected_row_moves_on_screen_while_details_load` (`tests/tui_view.rs`): `App::new(entries(), GlyphSet::Ascii)`, duas setas para baixo sem `DetailsLoaded`; `render(&a, 100, 16)` ⇒ a linha do buffer que começa com `"│> "` contém `"powertoys"` (o 3º item; ordem do snapshot `offline`), e o buffer contém `"carregando"`.
+3. `every_view_change_requests_details_for_the_new_selection` (`tests/tui_state.rs`): (a) `App::new(vec![], GlyphSet::Nerd)` + `Msg::CatalogLoaded(<as 3 entradas de app()>)` ⇒ comandos contêm `LoadDetails` do primeiro hit; o mesmo com `Msg::Booted { catalog: Ok(<as 3 entradas>), age: None, needs_refresh: false }` ⇒ comandos contêm `ScanInstalled` e `LoadDetails`; (b) `on_tab(Tab::Updates, vec![])` + `Msg::InstalledLoaded(vec![irow("a", "wingetrs", "scoop:main", true)])` ⇒ `LoadDetails { id: "a", .. }`; (c) app com `installed` não vazio na aba Pesquisar, tecla `Tab` ⇒ `LoadDetails` da linha 0 de Instalados; (d) digitar `z` e Esc ⇒ `LoadDetails` do primeiro hit da busca vazia.
+4. `spinner_stops_when_the_selected_details_arrive` (`tests/tui_state.rs`): depois de (a) do teste 3, `DetailsLoaded` com a chave pendente ⇒ `!a.animating()`; `Msg::Tick` ⇒ `spinner_frame` inalterado.
+5. `stale_details_keep_the_spinner_for_the_current_item` (`tests/tui_state.rs`): Down (pendente b), Down (pendente c), `DetailsLoaded` de b ⇒ `a.animating()` verdadeiro e `a.details` contém b; `DetailsLoaded` de c ⇒ falso.
+6. `spinner_ticker_skips_missed_ticks` (`tests/tui_loop.rs`, `#[tokio::test]`): `spinner_ticker().missed_tick_behavior() == MissedTickBehavior::Skip`.
+7. `drain_ready_takes_what_is_queued_up_to_the_cap` (`tests/tui_loop.rs`): `let mut s = futures_util::stream::iter((0..4).map(|_| key(KeyCode::Down))).chain(futures_util::stream::pending());` ⇒ `drain_ready(key(KeyCode::Down), &mut s, 256).len() == 5`; com outro stream igual e `cap = 3` ⇒ 3; com `futures_util::stream::pending()` ⇒ 1.
+8. `last_details_only_keeps_the_newest_request` (`tests/tui_loop.rs`): `[LoadDetails a, Refresh { force: true }, LoadDetails b, ScanInstalled]` ⇒ `[Refresh { force: true }, LoadDetails b, ScanInstalled]`.
+9. `idle_ticks_do_not_draw` (`tests/tui_loop.rs`): `needs_draw(&[Msg::Tick, Msg::Tick], false) == false`; `needs_draw(&[Msg::Tick], true) == true`; `needs_draw(&[key(KeyCode::Down)], false) == true`.
+10. `details_worker_panic_reaches_the_loop` (`tests/tui_loop.rs`, `#[tokio::test]`): `join_details("k".into(), tokio::spawn(async { panic!("x") }))` ⇒ `Msg::Panicked(_)`; com uma tarefa abortada (`h.abort()` antes do `await`) ⇒ `Msg::DetailsLoaded { key: "k", result: Err(_) }`.
+
+#### Checks beyond the steps
+
+1. Navegação não espera: mutate inserindo `if self.details_pending.is_some() { return Vec::new(); }` no início de `move_to` ⇒ PEGA (teste 1).
+2. Troca de aba pede detalhes: mutate removendo o `details_cmd()` de `set_tab` ⇒ PEGA (teste 3).
+3. Resultado velho não encerra o spinner: mutate limpando `details_pending` em todo `DetailsLoaded` ⇒ PEGA (teste 5).
+4. Sem rajada: mutate trocando `Skip` por `Burst` ⇒ PEGA (teste 6).
+5. Teto do lote: mutate ignorando `cap` em `drain_ready` ⇒ PEGA (teste 7).
+6. Último pedido vence: mutate mantendo o primeiro `LoadDetails` ⇒ PEGA (teste 8).
+7. Tick ocioso não desenha: mutate fazendo `needs_draw` devolver `true` sempre ⇒ PEGA (teste 9).
+8. Pânico não engolido: mutate trocando o ramo de pânico de `join_details` por `DetailsLoaded { result: Err(..) }` ⇒ PEGA (teste 10).
+9. Medição (orquestrador, quando o usuário puder abrir a TUI): no commit dos contadores e no final, abrir a TUI, ficar 30 s parado na aba Atualizações e depois segurar ↓ 5 s; comparar a linha `tui stats` do log (`frames`, `ticks`, `max_draw_us`). Esperado (não medido): parado ⇒ `ticks` ≈ 0; segurando ⇒ `frames` bem menor que `keys`. Sem a TUI aberta, registrar "não medido".
+
+**Commit:** `fix(tui): navigation never waits for details; one frame per batch`
+
+---
+
