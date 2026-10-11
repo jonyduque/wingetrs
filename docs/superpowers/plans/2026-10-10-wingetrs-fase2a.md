@@ -2233,3 +2233,222 @@ Testes (sem `sleep`; tempo injetado; rede só por wiremock ou porta 9 recusada):
 **Commit:** `fix(update): back off background refresh after an attempt and never wait for the lock`
 
 **Foco extra do revisor:** (a) dois comandos simultâneos podem ainda ler o arquivo antes de qualquer um gravar e disparar dois processos — aceito: o 2º sai na hora pelo `NoWait`; confira que não foi "resolvido" com lock de arquivo extra no caminho quente do `search`; (b) o caminho quente do `search` ganhou uma leitura de arquivo pequeno só quando `needs_refresh` já é verdadeiro — confira a ordem (`needs_refresh` primeiro, arquivo depois) para não ler disco à toa no caso comum; (c) os testes de `tests/cli_offline.rs` que já existem disparam `update --background` reais contra a porta 9 / wiremock — depois desta tarefa, no máximo um por raiz temporária; rode `scripts/leftovers.ps1` depois do gate.
+
+## Correções restantes (Tasks 48–52)
+
+### Task 48: O plano de uninstall diz o que acontecerá com a entrada do PATH
+
+#### Where this fits
+
+Defeito visto na validação da fase 2a (`docs/superpowers/reports/2026-10-10-fase2a-validacao.md`, "Pendências"): `uninstall` imprime "Desfazer entrada no PATH: …\shims" mesmo quando outro app ainda usa a pasta de shims, e o executor corretamente **mantém** a entrada (refcount em `src/install/executor.rs:767-783` via `StateDb::path_users`, `src/install/state.rs:194`). O texto vem de `src/cli/output.rs:250` (`_ => format!("Desfazer {}: {}", …)`), sem consultar o refcount. A TUI tem o mesmo problema e ainda imprime `Debug` (`src/tui/jobs.rs:92-93`: `"  - {:?} {}"`, ex.: `- Path C:\…\shims`). O plano é montado por `UninstallPlan::from_state` (`src/install/plan.rs:95-110`), que já recebe o `StateDb`.
+
+#### What binds this task
+
+- `UninstallPlan` (`src/install/plan.rs`) ganha `pub path_users: Vec<(String, Vec<String>)>`: para cada artefato `ArtifactKind::Path` do app, se `state.path_users(app, &a.target)` não for vazio, um par `(a.target.clone(), users)`. Preenchido em `from_state`, na ordem dos artefatos. Sem consulta nova ao banco além de `path_users`.
+- Nova `pub fn artifact_lines(&self) -> Vec<String>` em `impl UninstallPlan` (`src/install/plan.rs`), uma linha por artefato, **na ordem de `artifacts`**:
+  - `Path` com usuários: `"Manter entrada no PATH: {target} (ainda usada por: {a, b})"` (nomes unidos por `", "`).
+  - `Path` sem usuários: `"Desfazer entrada no PATH: {target}"` (texto atual, inalterado).
+  - `Persist` com `purge`: `"Apagar {target} (dados persistentes)"`; sem `purge`: `"Manter {target} (dados persistentes; use --purge)"` (texto atual).
+  - Demais tipos: `"Desfazer {tipo}: {target}"` com os nomes atuais de `artifact_kind` (`src/cli/output.rs:215-224`), que se mudam para `plan.rs`.
+- `uninstall_plan_text` (`src/cli/output.rs:227`) passa a ser: cabeçalho + `Apagar <app_dir>` + `artifact_lines()` numeradas. Saída idêntica à de hoje quando nenhum PATH é compartilhado.
+- `plan_remove` (`src/tui/jobs.rs:89`) usa `artifact_lines()` (`"  - {linha}\n"`) em vez de `{:?}`; a linha final sobre dados persistentes continua.
+- O executor **não muda**: ele reconfere o refcount na execução (o plano é uma previsão feita fora do lock; o texto descreve o estado no momento do plano).
+- `tests/tui_state.rs:575` constrói `UninstallPlan` literal: acrescente `path_users: vec![]`.
+
+**Files:**
+- Modify: `src/install/plan.rs`, `src/cli/output.rs`, `src/tui/jobs.rs`
+- Test: `tests/install_state.rs`, `tests/tui_jobs.rs`, `tests/tui_state.rs` (só o literal)
+
+Testes (use os helpers `rec`/`art` de `tests/install_state.rs`; caminhos-texto sintéticos):
+1. `uninstall_plan_keeps_a_shared_path_entry_and_undoes_its_own` (`tests/install_state.rs`): `a` grava `[Path "C:\R\shims", Path "C:\R\apps\a\current\bin", Shim "rg"]`; `b` grava `[Path r"c:\r\shims\"]` (equivalência de caminho); `c` grava `[Env "C:\R\shims"]` (outro tipo, não conta). `UninstallPlan::from_state(&db, "a", false)` ⇒ `path_users == [("C:\R\shims", ["b"])]`; `artifact_lines()` ⇒ exatamente `["Manter entrada no PATH: C:\R\shims (ainda usada por: b)", "Desfazer entrada no PATH: C:\R\apps\a\current\bin", "Desfazer atalho de linha de comando: rg"]`. (Um plano com uma entrada mantida **e** uma desfeita: "sempre Manter" e "sempre Desfazer" falham.)
+2. `uninstall_plan_lists_every_other_user_of_the_entry` (`tests/install_state.rs`): `a`, `b`, `c` gravam `Path "C:\R\shims"` ⇒ linha de `a` termina em `"(ainda usada por: b, c)"`.
+3. `uninstall_plan_text_is_unchanged_without_shared_entries` (`tests/install_state.rs`): só `a` com `[Path "C:\R\shims", Persist "conf"]`, `purge = false`; `wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R"))` ⇒ igual ao literal `"Desinstalar a 1\n  1. Apagar C:\R\apps\a\n  2. Desfazer entrada no PATH: C:\R\shims\n  3. Manter conf (dados persistentes; use --purge)\n"` (confira o formato do cabeçalho com `rec("a","1")`).
+4. `uninstall_plan_text_says_kept_when_shared` (`tests/install_state.rs`): cenário do teste 1 ⇒ o texto da CLI contém `"Manter entrada no PATH: C:\R\shims (ainda usada por: b)"` e não contém `"Desfazer entrada no PATH: C:\R\shims"`.
+5. `plan_remove_text_uses_the_plan_lines` (`tests/tui_jobs.rs`, `World` existente; o fluxo que instala `leaf` já existe na l. ~190–207): depois de instalar `leaf`, `jobs::plan_remove(&ctx, "leaf")` ⇒ `Planned::Ready { text, .. }` com `text` contendo `"Desfazer entrada no PATH: "` e **sem** `"Path "` nem `"Shim "` (o `Debug` antigo).
+
+#### Checks beyond the steps
+
+1. Refcount no texto: mutate trocando o ramo "Manter" por "Desfazer" em `artifact_lines` ⇒ PEGA (testes 1, 4).
+2. Só `Path` conta: mutate fazendo `from_state` consultar `path_users` para todo artefato ⇒ PEGA (teste 1: `Shim "rg"` não pode virar "Manter"; e `path_users` teria 2 pares).
+3. Lista completa: mutate usando só `users[0]` ⇒ PEGA (teste 2).
+4. CLI usa a função comum: mutate devolvendo `uninstall_plan_text` ao `match` antigo ⇒ PEGA (teste 4).
+5. TUI usa a função comum: mutate voltando `plan_remove` para `{:?}` ⇒ PEGA (teste 5).
+
+**Commit:** `fix(uninstall): plan text says when a shared PATH entry is kept`
+
+---
+
+### Task 49: `bin` com argumentos extras, alias e argumentos validados
+
+#### Where this fits
+
+`resolve` recusa item de `bin` com mais de 3 elementos (`src/install/manifest.rs:322`: `tuple_items(field(root, variant, "bin"), "bin", 3)`; `:189` devolve `Invalid("bin: item com 4 elementos")`). Isso derruba `main/zigup` (`["zigup.exe","zigup","--path-link","\"$persist_dir\\zig\\zig.exe\""]`, Task 40/`examples/oracle_2a.rs`). Nos buckets locais em `~/scoop/buckets` há 3 manifestos assim (contagem nesta sessão: itens de 2 elementos 725, 3 elementos 329, 4 elementos 2 — `zigup`, `wgcf` —, 5 elementos 1 — `stdiscosrv`).
+
+Comportamento do scoop (conferido no código instalado, `~/scoop/apps/scoop/current`, commit `e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f`): `lib/install.ps1:179` faz `$target, $name, $arg = shim_def $_` — a atribuição múltipla do PowerShell põe **todos** os elementos a partir do 3º em `$arg` (array); `lib/core.ps1:989/1003/1019/…` interpolam `$arg` em string (`"args = $arg"`, `"… $arg %*"`), e o PowerShell junta array interpolado com `$OFS` = **um espaço**. `substitute` (`$dir`, `$persist_dir`, `$original_dir`) é aplicado a cada elemento. Alias vazio: `core.ps1:953` `if (!$name) { $name = strip_ext (fname $path) }`.
+
+Duas lacunas de segurança achadas no mesmo trecho (regra "Todo caminho vindo de manifesto passa por `install::safepath`"):
+- O alias vira nome de arquivo em `shims\` e **não** é validado no planejador (`src/install/planner.rs:229`). Só `shim::create_shim` recusa (`src/install/shim.rs:147-155`), na execução, depois do download — e `make_shim` (`src/install/executor.rs:651-665`) já leu (e no rollback regrava) `shims\<alias>.{exe,shim,cmd,ps1}` antes disso, com `alias = "..\\x"` fora de `shims\`.
+- `args` vai cru para a linha `args = …` do `.shim` (`src/install/shim.rs:195-196`). Um `\r`/`\n` no argumento injeta uma linha `path = …` no arquivo que o lançador lê. Nenhum manifesto local tem caractere de controle em args (contado: 0).
+
+#### What binds this task
+
+- `src/install/manifest.rs`: o item de `bin` aceita **qualquer** número de elementos ≥ 1 (lista vazia continua `Invalid`; elemento não-texto continua `Invalid`). `BinEntry.args` = elementos a partir do 3º unidos com `" "` (um espaço, como o `$OFS` do scoop), `None` quando há só 1 ou 2 elementos. `shortcuts` (máx. 4) e `persist` (máx. 2) não mudam.
+- Planejador (`src/install/planner.rs`, laço de `m.bin`):
+  - alias `Some("")` ⇒ usa `stem(path)` (como o scoop).
+  - o nome final do shim precisa ser **um** componente seguro: mesma regra de `shim::check_name` (sem `/` nem `\`, `safepath::safe_components(name)` com exatamente 1 componente) ⇒ senão `PlanError::UnsafePath(name)`. Não duplique a regra: torne `check_name` (ou um predicado `pub(crate) fn is_safe_shim_name`) reutilizável e chame-o dos dois lugares.
+  - `args` (já substituído) com qualquer caractere de controle (`char::is_control`) ⇒ nova `PlanError::UnsafeArgs(String)` com mensagem `"argumento inseguro no manifesto: {0}"` (mostre o texto com `{:?}`).
+- Substituição de variáveis continua por `substitute` sobre o texto já unido (equivalente a substituir elemento a elemento, porque o separador é espaço).
+- Nada muda no executor nem em `shim.rs` além de expor o predicado.
+
+**Files:**
+- Modify: `src/install/manifest.rs`, `src/install/planner.rs`, `src/install/shim.rs` (só visibilidade do predicado)
+- Test: `tests/install_manifest.rs`, `tests/install_planner.rs`
+
+Testes (JSON literal no teste; **não** crie fixture nova — `tests/install_planner.rs:229-250` gera snapshot `insta` para cada arquivo de `tests/fixtures/scoop/manifests`):
+1. `bin_with_four_elements_joins_the_extra_args` (`tests/install_manifest.rs`): `{"version":"1","url":"https://x/z.zip","hash":"<64 hex>","bin":[["zigup.exe","zigup","--path-link","\"$persist_dir\\zig\\zig.exe\""]]}` ⇒ `bin[0].alias == Some("zigup")`, `bin[0].args == Some("--path-link \"$persist_dir\\zig\\zig.exe\"")`.
+2. `bin_with_five_elements_joins_all_three` (`tests/install_manifest.rs`): `["s.exe","s","-a 1","-b 2","-c 3"]` ⇒ `args == Some("-a 1 -b 2 -c 3")`.
+3. `bin_with_three_and_two_elements_is_unchanged` (`tests/install_manifest.rs`): `["a.exe","a","--x"]` ⇒ `args == Some("--x")`; `["b.exe","b"]` ⇒ `args == None`; `"c.exe"` ⇒ alias `None`, args `None`.
+4. `garbage_is_an_error_not_a_panic` (existente) continua verde com `"bin":[[]]`; acrescente `r#"{"version":"1","bin":[["a.exe","a","x",5]]}"#` (não-texto) à lista.
+5. `zigup_args_are_substituted` (`tests/install_planner.rs`, use o helper de plano do arquivo com JSON literal): o manifesto do teste 1 ⇒ `Step::Shim` com `name == "zigup"` e `args == Some(format!("--path-link \"{}\\zig\\zig.exe\"", layout.persist_dir("app").display()))`.
+6. `empty_alias_falls_back_to_the_file_stem` (`tests/install_planner.rs`): `[["tools\\run.exe",""]]` ⇒ shim `name == "run"`.
+7. `unsafe_shim_alias_is_refused_by_the_planner` (`tests/install_planner.rs`): para cada alias em `["..\\evil", "a/b", "CON", "x."]` ⇒ `Err(PlanError::UnsafePath(_))`; e o alias `"ok"` no mesmo manifesto ⇒ `Ok` (garante que a recusa vem do alias).
+8. `control_characters_in_args_are_refused` (`tests/install_planner.rs`): `[["a.exe","a","--x\r\npath = C:\\evil.exe"]]` ⇒ `Err(PlanError::UnsafeArgs(_))`; com `"--x path = C:\\evil.exe"` (sem quebra) ⇒ `Ok`.
+
+#### Checks beyond the steps
+
+1. Limite removido: mutate voltando o máximo de `bin` para 3 ⇒ PEGA (teste 1).
+2. Separador: mutate trocando `join(" ")` por `join("")` ⇒ PEGA (testes 1, 2).
+3. Só o 3º elemento: mutate pegando apenas o elemento de índice 2 ⇒ PEGA (testes 1, 2).
+4. Alias vazio: mutate removendo o fallback para `stem` ⇒ PEGA (teste 6).
+5. Alias inseguro: mutate removendo a checagem do nome no planejador ⇒ PEGA (teste 7).
+6. Controle em args: mutate removendo a checagem de `is_control` ⇒ PEGA (teste 8).
+7. Orquestrador: rodar `cargo run --release --example oracle_2a -- tests/fixtures/scoop/manifests %LOCALAPPDATA%\wingetrs\catalog.db 50` e conferir que `zigup` sai da lista de falhas (2365 → 2366 planejam, se o catálogo não mudou).
+
+**Commit:** `fix(manifest): accept bin entries with extra args and validate shim names`
+
+---
+
+### Task 50: Limites contra bomba de descompressão na extração
+
+#### Where this fits
+
+Follow-up aberto desde a Task 26 (`.claude/tasks/progress.md`, linha da Task 26: "Follow-up: limite contra zip bomb"; `.claude/tasks/task-26-report.md:36`). Hoje `write_entry` copia sem limite (`src/install/extract.rs:184`: `io::copy(src, &mut out)?`) e `extract_zip`/`extract_tar_gz` (`:189`, `:216`) não contam entradas nem bytes. O hash do manifesto não protege: um mantenedor de bucket (ou um bucket de terceiro) publica o hash do arquivo malicioso.
+
+Medição desta sessão (90 arquivos zip/tar.gz/nupkg em `%LOCALAPPDATA%\wingetrs\blobs` e `~/scoop/cache`, tamanhos declarados): razão descompactado/compactado do **arquivo inteiro** no máximo 7,5 (terminal-icons .nupkg; go 3,0; tesseract-languages 2,0); maior total 668 MB (tesseract-languages, 335 MB compactado); maior número de entradas 15 639 (go 1.27.1). Uma **entrada** isolada chega a razão 230 (go, arquivo de teste cheio de zeros) — por isso **não** há limite de razão por entrada.
+
+#### What binds this task
+
+- Novo `pub struct Limits { pub ratio: u64, pub floor: u64, pub ceiling: u64, pub max_entries: u64 }` em `src/install/extract.rs` e `pub const DEFAULT_LIMITS: Limits = Limits { ratio: 100, floor: 1 << 30, ceiling: 32 << 30, max_entries: 200_000 }`. Justificativa no comentário de uma linha: razão 100 = 13× o maior medido (7,5); piso 1 GiB cobre qualquer arquivo pequeno de texto; teto 32 GiB = 48× o maior total medido; 200 000 entradas = 12× o maior medido (15 639).
+- Orçamento de bytes **por arquivo compactado**: `budget = clamp(tamanho_do_arquivo × ratio, floor, ceiling)` (tamanho por `fs::metadata(file).len()`, aritmética com `saturating_mul`).
+- Nova `pub fn extract_all_with(sources: &[ExtractSource<'_>], dest: &Path, limits: &Limits) -> Result<(), ExtractError>`; `extract_all` vira `extract_all_with(sources, dest, &DEFAULT_LIMITS)`; `extract` (usado pelo lançador de shims) também usa `DEFAULT_LIMITS`. Assinaturas atuais preservadas.
+- Novas variantes: `ExtractError::TooLarge { limit: u64 }` — `"arquivo descompactado passa de {limit} bytes (possível bomba de descompressão)"` — e `ExtractError::TooManyEntries { limit: u64 }` — `"arquivo com mais de {limit} entradas (possível bomba de descompressão)"`.
+- **zip**: no laço de validação que já existe (antes de escrever qualquer coisa, `src/install/extract.rs:192-201`), `zip.len() > max_entries` ⇒ `TooManyEntries`; soma dos `size()` declarados (`by_index_raw`) > `budget` ⇒ `TooLarge`. Nada é escrito nesses casos.
+- **zip e tar.gz**: a cópia passa por um leitor que conta os bytes **realmente** escritos (soma do arquivo inteiro, não por entrada) e falha com `TooLarge` ao passar do orçamento — cabeçalho declarado pode mentir; o tar.gz não tem diretório central. tar.gz: contador de entradas (todas as entradas iteradas, inclusive as puladas) > `max_entries` ⇒ `TooManyEntries`.
+- Falha no meio ⇒ comportamento atual de erro: o `TempGuard` apaga a pasta temporária, `dest` intacto (já testado para outros erros; acrescente o teste 5).
+- Arquivo solto (sem extração) não tem limite (é copiado byte a byte do blob já verificado).
+
+**Files:**
+- Modify: `src/install/extract.rs`
+- Test: `tests/install_extract.rs` (use `zip_with`/`targz_with` existentes, l. 5 e 19)
+
+Testes (fixtures geradas em memória; cada uma falha **só** na checagem que testa — a mesma entrada passa com o limite folgado):
+1. `zip_over_the_byte_budget_is_refused_before_writing` : zip com uma entrada `big.bin` de 2 MiB de zeros (comprime para poucos KiB); `Limits { ratio: 100, floor: 1 << 20, ceiling: 1 << 40, max_entries: 10 }` ⇒ `Err(TooLarge { limit: 1 << 20 })` e `dest` não existe; o **mesmo** zip com `floor: 4 << 20` ⇒ `Ok` e `big.bin` tem 2 MiB.
+2. `ratio_raises_the_budget_above_the_floor`: zip de 3 entradas de 1 MiB de bytes pseudoaleatórios incompressíveis (xorshift32 com semente fixa, `x ^= x << 13; x ^= x >> 17; x ^= x << 5`, um byte por iteração — **não** use `i * constante`, que tem período 256 e comprime; total 3 MiB, arquivo ≈ 3 MiB) com `floor: 1 << 20, ratio: 2` ⇒ `Ok` (orçamento ≈ 6 MiB > 3 MiB); com `ratio: 0` (orçamento = piso 1 MiB) ⇒ `TooLarge`. (Prova que o orçamento usa o tamanho do arquivo, não só o piso.)
+3. `zip_with_too_many_entries_is_refused`: zip com 11 entradas de 1 byte; `max_entries: 10` ⇒ `Err(TooManyEntries { limit: 10 })`; `max_entries: 11` ⇒ `Ok`.
+4. `tar_gz_over_the_byte_budget_is_refused`: tar.gz com `big.bin` de 2 MiB de zeros; `floor: 1 << 20` ⇒ `TooLarge`; `floor: 4 << 20` ⇒ `Ok`. (O tar não tem tamanho declarado separado: só o contador pega.)
+5. `tar_gz_with_too_many_entries_is_refused`: 11 entradas; `max_entries: 10` ⇒ `TooManyEntries`, `dest` não existe e não sobra `.wingetrs-extract-*` no pai; `11` ⇒ `Ok`.
+6. `budget_is_for_the_whole_archive_not_per_entry`: **tar.gz** (no zip a checagem prévia dos tamanhos declarados pegaria antes do contador) com duas entradas de 600 KiB de zeros, `floor: 1 << 20` ⇒ `TooLarge` (cada uma cabe sozinha, a soma não); com `floor: 2 << 20` ⇒ `Ok`.
+7. `default_limits_are_the_measured_ones`: `DEFAULT_LIMITS` == os quatro números acima (pina a decisão; o revisor confere o comentário de justificativa).
+8. **Cabeçalho mentiroso (exploratório, opus)**: gere um zip de `big.bin` com 2 MiB de zeros e altere nos bytes o tamanho descompactado declarado (diretório central, offset 24 do registro `PK\x01\x02`; cabeçalho local, offset 22 de `PK\x03\x04`) para 1 KiB. Rode com `floor: 1 << 20`. Se o crate `zip` 8.6 já recusar a entrada sozinho (erro de tamanho/CRC), registre isso no relatório e afirme `Err(_)` sem escrever mais que o orçamento; se ele entregar os 2 MiB, o contador tem que dar `TooLarge`. O relatório diz qual dos dois aconteceu.
+
+#### Checks beyond the steps
+
+1. Contador: mutate removendo o leitor que conta bytes ⇒ PEGA (testes 4 e 6). Zip com as duas defesas removidas (soma declarada **e** contador) ⇒ PEGA (teste 1). Remover **só** a soma declarada do zip é mutação equivalente no resultado observável (o contador dá o mesmo `TooLarge` e o `TempGuard` apaga o que foi escrito): o relatório registra isso como "mutação equivalente" (ARMADILHAS, "Mutação equivalente existe") — a soma fica por não escrever nada antes de recusar.
+2. Orçamento por arquivo inteiro: mutate zerando o contador a cada entrada ⇒ PEGA (teste 6).
+3. Razão: mutate ignorando `ratio` (orçamento = `floor`) ⇒ PEGA (teste 2).
+4. Entradas: mutate trocando `>` por `>=` na comparação de entradas ⇒ PEGA (testes 3 e 5: 11 entradas com `max_entries: 11` precisam passar).
+5. tar: mutate removendo o contador de entradas do tar ⇒ PEGA (teste 5).
+6. Padrões: mutate trocando `ratio: 100` por `ratio: 10` ⇒ PEGA (teste 7).
+7. Orquestrador: nenhuma regressão nos testes ao vivo de instalação (`cargo test --quiet --release -- --ignored`, se autorizado) — os pacotes reais medidos ficam ≥ 13× abaixo de cada limite.
+
+**Commit:** `fix(extract): refuse decompression bombs by size and entry count`
+
+---
+
+### Task 51: Reinstalar uma versão que ficou no disco (keep_old e sobras)
+
+#### Where this fits
+
+Follow-up aberto da Task 31 (`.claude/tasks/task-31-report.md:73`: "downgrade to a version kept with keep_old (Promote refuses an existing version dir)"; também no ledger, linha da Task 31). O defeito, preciso:
+
+- `Step::Promote` (`src/install/executor.rs:483-488`) faz `if fs::symlink_metadata(&vdir).is_ok() { return Err("<vdir> já existe") }`.
+- `apps\<app>\<versão>` pode existir sem ser a versão instalada em dois casos reais: (a) `upgrade --keep` de 1.0 para 2.0 deixa `apps\app\1.0` (o planejador omite `RemoveOldVersion` com `keep_old`, `src/install/planner.rs:265-271`); (b) `RemoveOldVersion` que falhou só vira aviso (`src/install/executor.rs:364-379`) e deixa a pasta.
+- Voltar a essa versão — `install main/app` quando o bucket reverteu para 1.0, ou instalar de outro bucket que está em 1.0: o planejador gera upgrade de 2.0 para 1.0 (`planner.rs:191-199`, versão diferente ⇒ `upgrade_from`) — falha **depois** de baixar e extrair, no passo "promover versão", com uma mensagem que não diz o que fazer. O único remédio hoje é `uninstall` + `install`.
+- O scoop, nesse caso, instala por cima da pasta existente (`lib/install.ps1:48` `ensure (versiondir …)`) e, com `--force` na mesma versão, move a antiga para `_<versão>.old` (`libexec/scoop-update.ps1:364-375`).
+
+#### What binds this task
+
+(Decisão do usuário, 2026-10-11: substituir com desfazer.)
+- `Step::Promote`: se `vdir` existe **e** não é o alvo atual de `current` (compare com `link::target(current)` normalizado; se for o alvo, mantenha o erro atual), renomeie `vdir` para `apps\<app>\.replaced-<versão>-<pid>-<seq>` (mesmo estilo de `.staging-<v>` de `src/install/layout.rs:26`; `seq` de um `AtomicU64` como os temporários existentes), empilhe um novo `Undo::RestoreAside { aside, original }` (rollback renomeia de volta) **antes** do `rename` de staging, e siga o fluxo atual.
+- Depois do sucesso (mesma fase de `remove_upgrade_leftovers`/`RemoveOldVersion`, `executor.rs:361-380`): apaga a pasta `.replaced-*`; falha ⇒ `tracing::warn!`, nunca erro (mesma política).
+- Ordem do rollback: o `Undo::RemovePath(vdir)` da versão nova roda antes do `RestoreAside` (pilha LIFO já garante, se empilhar na ordem acima — teste 2 prova).
+- O texto do plano não muda (o planejador é puro em relação ao disco e não sabe se a pasta existe); a pasta substituída é cópia antiga — os dados do usuário estão em `persist\`.
+- Nada muda em `planner.rs`, `ops.rs` ou `target.rs`.
+
+**Files:**
+- Modify: `src/install/executor.rs`
+- Test: `tests/install_executor.rs` (use `setup`, `install`, `v2_plan`, `plan_from`, `ctx_with_hook`, `FailAt` e `current_target` existentes; o manifesto da v1 é o que `setup` monta — reaproveite a mesma url/sha)
+
+Testes:
+1. `reinstalling_a_kept_version_replaces_its_folder` : instala 1.0; `v2_plan(&s, true)` (keep_old) e instala; escreve `apps\app\1.0\stale.txt`; planeja de novo o manifesto 1.0 (`plan_from`, agora `upgrade_from == Some("2.0")`) e executa ⇒ `Ok`; `current_target` termina em `1.0`; `apps\app\1.0\tool.exe` existe e `stale.txt` **não**; nenhuma entrada `.replaced-*` em `apps\app`; `apps\app\2.0` foi removida (plano sem keep_old); `state.db` registra `1.0`.
+2. `failure_after_replacing_a_kept_version_restores_it` : mesmo preparo do teste 1; execute o plano 1.0 com `FailAt(k)` para `k` = índice do passo `LinkCurrent` **e** para o índice do `RecordState` ⇒ `Err`; em ambos: `apps\app\1.0\stale.txt` existe de novo, `current_target` termina em `2.0`, nenhum `.replaced-*` nem `.staging-*` sobra, `state.db` registra `2.0`.
+3. `promote_still_refuses_the_folder_current_points_to` : monte à mão um estado em que `current` aponta para `apps\app\1.0` mas o `state.db` registra outra versão (ex.: grave o registro de `app` com versão `0.9` via `s.state.record`), planeje o manifesto 1.0 ⇒ execução `Err` com mensagem contendo `"já existe"` e `apps\app\1.0` intacta.
+4. `upgrade_with_keep_old_keeps_v1` (existente) continua verde.
+
+#### Checks beyond the steps
+
+1. Substituição: mutate voltando o `Promote` a recusar toda pasta existente ⇒ PEGA (teste 1).
+2. Rollback: mutate removendo o `push(Undo::RestoreAside …)` ⇒ PEGA (teste 2).
+3. Limpeza: mutate removendo a remoção do `.replaced-*` após o sucesso ⇒ PEGA (teste 1).
+4. Proteção do alvo de `current`: mutate removendo a comparação com `current` ⇒ PEGA (teste 3).
+5. Snapshot de rollback geral: os testes de "falha injetada em cada passo" existentes continuam verdes.
+
+**Commit:** `fix(executor): reinstall a version whose folder was kept on disk`
+
+---
+
+### Task 52: Um SHA-256 por blob (cache e download)
+
+#### Where this fits
+
+Em `cached` (`src/install/download.rs:91-100`), para hash `sha256` o nome do blob **é** o hash do manifesto; `BlobStore::get` (`src/cache/mod.rs:164-167`) lê o arquivo inteiro e confere `sha256(conteúdo) == nome`, e logo depois `verify(spec, &bytes)` calcula o **mesmo** SHA-256 de novo. No download (`download.rs:131-137`) é igual: `verify` (SHA-256) e depois `Sha256::digest` para o nome. Desde a Task 42, `apply` passa por `fetch_each` (prefetch) e o executor passa de novo por `fetch_all` no `Step::Download` (`src/install/executor.rs:433-447`), então um blob em cache é lido 2× e hasheado 4× por `install`; baixado, 3 leituras e 4 hashes. A correção abaixo tira a duplicata **dentro** de cada chamada (4 → 2 hashes); a revalidação do executor fica (é a checagem de integridade imediatamente antes de extrair — mudar isso é outra decisão, ver "Itens não incluídos").
+
+Ganho: **não medido**. Ordem de grandeza: o maior blob em cache (tesseract-languages, 335 MB) passa duas vezes a menos pelo SHA-256.
+
+#### What binds this task
+
+- `cached`: quando `spec.algo == HashAlgo::Sha256`, devolve o caminho se `BlobStore::get(&name)` for `Some` **sem** chamar `verify` (o `get` já provou `sha256(bytes) == name == spec.hex` em minúsculas). Para `sha1`/`sha512`/`md5` nada muda: `get` (integridade do blob pelo nome) **e** `verify` (hash do manifesto) — são hashes diferentes.
+- `download_one`: quando `spec.algo == HashAlgo::Sha256`, `name = src.hash.hex.to_ascii_lowercase()` depois do `verify` (sem `Sha256::digest`). Outros algoritmos: inalterado.
+- A integridade continua verificada **uma** vez por chamada em todos os caminhos. Nenhuma mudança de assinatura, de `index.json` ou de nome de blob.
+
+**Files:**
+- Modify: `src/install/download.rs`
+- Test: `tests/install_download.rs`
+
+Testes (os de integridade já existem e são os que pegam as mutações perigosas):
+1. `tampered_cached_blob_is_redownloaded` (existente, l. 99): continua verde.
+2. `index_pointing_at_wrong_blob_is_not_trusted` (existente, l. 123, MD5): continua verde.
+3. `uppercase_sha256_in_manifest_lands_in_a_lowercase_blob`: fonte com o SHA-256 de `b"abc"` em **maiúsculas**; `fetch_all` ⇒ o caminho devolvido termina no hex minúsculo, a listagem de `blobs\` (ignorando `index.json`) tem exatamente esse nome em minúsculas; segunda chamada ⇒ 1 requisição no total (cache).
+4. `sha512_cached_blob_with_wrong_content_is_redownloaded`: baixa uma fonte `sha512`; sobrescreve o blob **e** renomeia para o SHA-256 do conteúdo novo, atualizando `index.json` para apontar para ele (blob íntegro pelo nome, errado pelo manifesto) ⇒ segunda `fetch_all` baixa de novo (2 requisições) e devolve `b"abc"`.
+
+#### Checks beyond the steps
+
+1. Não pular demais: mutate pulando `verify` para **todos** os algoritmos em `cached` ⇒ PEGA (testes 2 e 4).
+2. Não pular a integridade do blob: mutate trocando `BlobStore::get` por leitura sem conferência no ramo sha256 ⇒ PEGA (teste 1).
+3. Nome minúsculo: mutate usando `src.hash.hex` sem `to_ascii_lowercase` ⇒ PEGA (teste 3: o NTFS não diferencia caixa, então confira o **nome** do arquivo listado em `blobs\`, não só `exists()`).
+4. A redução de hash em si é comportamento-preservante e não tem teste que falhe — **no mutation proof** para o ganho. O orquestrador mede A/B (`bench.ps1 -Baseline`) de um `install` com blob grande em cache e raiz temporária, se quiser número; senão o relatório diz "não medido".
+
+**Commit:** `perf(download): hash a cached or downloaded blob once`
+
+---
+
