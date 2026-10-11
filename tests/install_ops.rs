@@ -14,7 +14,7 @@ use wingetrs::http::Http;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::ops::{
     OpsCtx, OpsError, ResidueScan, Resolution, apply, apply_groups, merge_groups, plan_for,
-    plan_uninstall, repair, resolve_target, uninstall, upgradable,
+    plan_uninstall, repair, resolve_installed, resolve_target, uninstall, upgradable,
 };
 use wingetrs::install::plan::InstallPlan;
 use wingetrs::install::residue::{Confidence, ResidueKind};
@@ -1224,4 +1224,87 @@ async fn planning_spans_wrap_resolve_and_plan() {
     for once in ["target.resolve", "plan.build", "upgrade.list"] {
         assert_eq!(closed.count(once), 1, "{once}: {:?}", closed.names());
     }
+}
+
+/// Catalog with `vscode` in two buckets, a mixed-case id and a package whose name is another id.
+async fn world_with_extras() -> World {
+    let mut w = World::new().await;
+    w.add(app("ripgrep", &[])).await;
+    w.add(app("Git", &[])).await;
+    w.add(app("vscode", &[])).await;
+    w.catalog
+        .replace_source(
+            "scoop:extras",
+            SourceKind::Scoop,
+            "v",
+            1,
+            &[
+                NewPackage {
+                    id: "vscode".into(),
+                    name: "vscode".into(),
+                    version: "2".into(),
+                    ..Default::default()
+                },
+                NewPackage {
+                    id: "zed".into(),
+                    name: "ripgrep".into(),
+                    version: "1".into(),
+                    ..Default::default()
+                },
+            ],
+            &WingetMaps::default(),
+        )
+        .unwrap();
+    w
+}
+
+#[tokio::test]
+async fn resolve_installed_matches_resolve_target_for_every_installed_shape() {
+    let w = world_with_extras().await;
+    let ctx = w.ctx();
+    for (bucket, id) in [
+        ("main", "ripgrep"),
+        ("main", "Git"),
+        ("main", "vscode"),
+        ("extras", "vscode"),
+        ("extras", "zed"),
+    ] {
+        match (
+            resolve_target(&ctx, id, Some(bucket)).unwrap(),
+            resolve_installed(&ctx, id, bucket).unwrap(),
+        ) {
+            (Resolution::One(old), Resolution::One(new)) => assert_eq!(old, new, "{bucket}/{id}"),
+            (old, new) => panic!("{bucket}/{id}: antigo {old:?}, novo {new:?}"),
+        }
+    }
+    for (bucket, id) in [("main", "zed"), ("main", "nada")] {
+        assert!(
+            matches!(
+                resolve_target(&ctx, id, Some(bucket)).unwrap(),
+                Resolution::NotFound { .. }
+            ),
+            "{bucket}/{id}"
+        );
+        assert!(
+            matches!(
+                resolve_installed(&ctx, id, bucket).unwrap(),
+                Resolution::NotFound { .. }
+            ),
+            "{bucket}/{id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolve_installed_never_matches_by_name() {
+    let w = world_with_extras().await;
+    let ctx = w.ctx();
+    match resolve_target(&ctx, "ripgrep", Some("extras")).unwrap() {
+        Resolution::One(c) => assert_eq!(c.entry.id, "zed"),
+        other => panic!("esperado One(zed), veio {other:?}"),
+    }
+    assert!(matches!(
+        resolve_installed(&ctx, "ripgrep", "extras").unwrap(),
+        Resolution::NotFound { .. }
+    ));
 }

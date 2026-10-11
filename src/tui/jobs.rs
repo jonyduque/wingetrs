@@ -126,8 +126,9 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>) -> Result<Planned, String> {
         let bucket = buckets
             .iter()
             .find(|(a, _)| a == app)
-            .map(|(_, b)| b.as_str());
-        match ops::resolve_target(c, app, bucket).map_err(|e| e.to_string())? {
+            .map(|(_, b)| b.as_str())
+            .ok_or_else(|| format!("{app}: não está no registro do wingetrs"))?;
+        match ops::resolve_installed(c, app, bucket).map_err(|e| e.to_string())? {
             Resolution::One(cand) => {
                 groups.push(ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?);
             }

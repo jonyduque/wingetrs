@@ -327,6 +327,25 @@ fn manifest_raw(catalog: &Catalog, source: &str, id: &str) -> Result<Option<Stri
     Ok(catalog.get(source, id)?.and_then(|p| p.raw))
 }
 
+/// Upgrade target of an installed app: its exact catalog row `(scoop:<bucket>, app)`, one
+/// indexed lookup instead of `resolve_target`'s full catalog load. Never matches by name.
+pub fn resolve_installed(
+    ctx: &OpsCtx<'_>,
+    app: &str,
+    bucket: &str,
+) -> Result<Resolution, OpsError> {
+    let _span = tracing::debug_span!("target.resolve_installed").entered();
+    match ctx
+        .catalog
+        .get(&crate::sources::scoop::source_name(bucket), app)?
+    {
+        Some(p) => Ok(Resolution::One(target::candidate(&p.entry))),
+        None => Ok(Resolution::NotFound {
+            suggestions: Vec::new(),
+        }),
+    }
+}
+
 /// Exact-id resolution (Task 35); `resolve_target` never fuzzy-matches.
 pub fn resolve_target(
     ctx: &OpsCtx<'_>,

@@ -33,7 +33,7 @@ fn split_bucket(query: &str) -> (Option<&str>, &str) {
     }
 }
 
-fn candidate(entry: &PackageEntry) -> Candidate {
+pub(crate) fn candidate(entry: &PackageEntry) -> Candidate {
     let scoop = entry.source == SourceKind::Scoop;
     Candidate {
         entry: entry.clone(),

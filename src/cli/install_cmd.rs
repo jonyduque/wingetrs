@@ -409,7 +409,7 @@ async fn upgrade(
         let Some((rec, _)) = state.get(app)? else {
             bail!("{app} não está instalado pelo wingetrs");
         };
-        let cand = match ops::resolve_target(ctx, app, Some(&rec.bucket))? {
+        let cand = match ops::resolve_installed(ctx, app, &rec.bucket)? {
             Resolution::One(c) => c,
             _ => bail!("{app} não foi encontrado no bucket {}", rec.bucket),
         };
