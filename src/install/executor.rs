@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::Instrument;
 
@@ -69,6 +70,11 @@ const PATH_VAR: &str = "Path";
 enum Undo {
     /// A file, directory tree or link this run created.
     RemovePath(PathBuf),
+    /// `original` was renamed to `aside` to make room: rename it back.
+    RestoreAside {
+        aside: PathBuf,
+        original: PathBuf,
+    },
     /// A directory this run created; removed only if empty again.
     RemoveEmptyDir(PathBuf),
     /// `current` before `LinkCurrent` (`None` = there was none).
@@ -251,6 +257,9 @@ fn apply_undo(u: Undo, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
     match u {
         Undo::RemovePath(p) => remove_any(&p).map_err(|e| io_msg(&p, e)),
         Undo::RemoveEmptyDir(p) => not_found_ok(fs::remove_dir(&p)).map_err(|e| io_msg(&p, e)),
+        Undo::RestoreAside { aside, original } => {
+            fs::rename(&aside, &original).map_err(|e| io_msg(&original, e))
+        }
         Undo::RestoreCurrent { link: l, previous } => {
             not_found_ok(remove_any(&l)).map_err(|e| io_msg(&l, e))?;
             match previous {
@@ -390,6 +399,7 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
     }
     // Same policy as removing the old version: the install stands, failures are warnings.
     remove_upgrade_leftovers(&run, ctx);
+    remove_replaced_folders(&run);
     for (i, step) in cleanup {
         let Step::RemoveOldVersion { version } = step else {
             continue;
@@ -433,6 +443,34 @@ fn remove_upgrade_leftovers(run: &Run<'_>, ctx: &mut ExecCtx<'_>) {
                 run.plan.app
             );
         }
+    }
+}
+
+/// Version folders moved aside by `Promote` (a kept copy of the version being installed).
+fn remove_replaced_folders(run: &Run<'_>) {
+    for (_, u) in &run.journal {
+        if let Undo::RestoreAside { aside, .. } = u
+            && let Err(e) = remove_any(aside)
+        {
+            tracing::warn!(
+                "{}: a cópia antiga {} ficou: {e}",
+                run.plan.app,
+                aside.display()
+            );
+        }
+    }
+}
+
+static ASIDE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// True when `current` resolves to `dir` (both normalized; a broken link never matches).
+fn current_points_to(current: &Path, dir: &Path) -> bool {
+    let Ok(target) = link::target(current) else {
+        return false;
+    };
+    match (fs::canonicalize(&target), fs::canonicalize(dir)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -516,7 +554,21 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let staging = layout.staging_dir(app, version);
             let vdir = layout.version_dir(app, version);
             if fs::symlink_metadata(&vdir).is_ok() {
-                return Err(format!("{} já existe", vdir.display()));
+                if current_points_to(&layout.current(app), &vdir) {
+                    return Err(format!("{} já existe", vdir.display()));
+                }
+                // A copy of this version left on disk (kept on upgrade, or a failed removal):
+                // replaced, and put back if anything below fails.
+                let aside = layout.app_dir(app).join(format!(
+                    ".replaced-{version}-{}-{}",
+                    std::process::id(),
+                    ASIDE_SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::rename(&vdir, &aside).map_err(|e| io_msg(&vdir, e))?;
+                run.push(Undo::RestoreAside {
+                    aside,
+                    original: vdir.clone(),
+                });
             }
             fs::rename(&staging, &vdir).map_err(|e| io_msg(&vdir, e))?;
             run.push(Undo::RemovePath(vdir.clone()));

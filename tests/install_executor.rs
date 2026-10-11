@@ -109,6 +109,8 @@ struct World {
     state_path: PathBuf,
     http: Http,
     plan: InstallPlan,
+    /// Manifest JSON of the 1.0 plan built by `setup` (same url/sha).
+    v1_manifest: String,
 }
 
 const ORIGINAL_PATH: &str = r"C:\Existing";
@@ -238,9 +240,11 @@ async fn setup() -> World {
             manifest_sha256: String::new(),
             steps: Vec::new(),
         },
+        v1_manifest: String::new(),
     };
     let (url, sha) = w.serve("pkg-1.0.zip", fixture_zip()).await;
-    w.plan = w.plan_from("app", &manifest_json(&url, &sha), false);
+    w.v1_manifest = manifest_json(&url, &sha);
+    w.plan = w.plan_from("app", &w.v1_manifest, false);
     w
 }
 
@@ -974,4 +978,107 @@ async fn uninstall_removes_path_variable_the_install_created() {
         "no empty Path left behind"
     );
     assert_eq!(s.env.dump(), before);
+}
+
+/// Installs 1.0, upgrades to 2.0 keeping 1.0, marks the kept 1.0 folder and plans 1.0 again.
+async fn kept_v1_world() -> (World, InstallPlan) {
+    let s = setup().await;
+    install(&s, &s.plan).await;
+    let p2 = v2_plan(&s, true).await;
+    install(&s, &p2).await;
+    std::fs::write(s.layout.version_dir("app", "1.0").join("stale.txt"), b"old").unwrap();
+    let back = s.plan_from("app", &s.v1_manifest, false);
+    assert_eq!(back.upgrade_from.as_deref(), Some("2.0"));
+    (s, back)
+}
+
+fn leftovers_in_app_dir(s: &World) -> Vec<String> {
+    std::fs::read_dir(s.layout.app_dir("app"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".replaced-") || n.starts_with(".staging-"))
+        .collect()
+}
+
+#[tokio::test]
+async fn reinstalling_a_kept_version_replaces_its_folder() {
+    let (s, back) = kept_v1_world().await;
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    wingetrs::install::executor::execute_install(&back, &mut ctx)
+        .await
+        .unwrap();
+    assert!(
+        current_target(&s).ends_with("1.0"),
+        "{}",
+        current_target(&s)
+    );
+    let v1 = s.layout.version_dir("app", "1.0");
+    assert!(v1.join("tool.exe").exists());
+    assert!(!v1.join("stale.txt").exists(), "old folder replaced");
+    assert!(
+        leftovers_in_app_dir(&s).is_empty(),
+        "{:?}",
+        leftovers_in_app_dir(&s)
+    );
+    assert!(!s.layout.version_dir("app", "2.0").exists(), "2.0 removed");
+    assert_eq!(s.state.get("app").unwrap().unwrap().0.version, "1.0");
+}
+
+#[tokio::test]
+async fn failure_after_replacing_a_kept_version_restores_it() {
+    let probe = kept_v1_world().await.1;
+    let link_at = probe
+        .steps
+        .iter()
+        .position(|st| matches!(st, Step::LinkCurrent))
+        .unwrap();
+    let record_at = probe
+        .steps
+        .iter()
+        .position(|st| matches!(st, Step::RecordState))
+        .unwrap();
+    for k in [link_at, record_at] {
+        let (s, back) = kept_v1_world().await;
+        let mut ctx = s.ctx_with_hook(&FailAt(k));
+        let err = wingetrs::install::executor::execute_install(&back, &mut ctx).await;
+        assert!(err.is_err(), "step {k}");
+        assert!(
+            s.layout
+                .version_dir("app", "1.0")
+                .join("stale.txt")
+                .exists(),
+            "kept 1.0 restored after failing at {k}"
+        );
+        assert!(
+            current_target(&s).ends_with("2.0"),
+            "{}",
+            current_target(&s)
+        );
+        assert!(
+            leftovers_in_app_dir(&s).is_empty(),
+            "{:?}",
+            leftovers_in_app_dir(&s)
+        );
+        assert_eq!(s.state.get("app").unwrap().unwrap().0.version, "2.0");
+    }
+}
+
+#[tokio::test]
+async fn promote_still_refuses_the_folder_current_points_to() {
+    let mut s = setup().await;
+    install(&s, &s.plan).await;
+    let (mut rec, arts) = s.state.get("app").unwrap().unwrap();
+    rec.version = "0.9".into();
+    s.state.record(&rec, &arts).unwrap();
+    let again = s.plan_from("app", &s.v1_manifest, false);
+    std::fs::write(s.layout.version_dir("app", "1.0").join("mine.txt"), b"keep").unwrap();
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let err = wingetrs::install::executor::execute_install(&again, &mut ctx)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("já existe"), "{err}");
+    let v1 = s.layout.version_dir("app", "1.0");
+    assert!(v1.join("tool.exe").exists());
+    assert!(v1.join("mine.txt").exists(), "1.0 untouched");
+    assert!(current_target(&s).ends_with("1.0"));
 }
