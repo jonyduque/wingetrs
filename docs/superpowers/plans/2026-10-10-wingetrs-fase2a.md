@@ -1333,6 +1333,7 @@ Origem: prova ao vivo da Task 40 (relatório §1). Medido: `install` com cache e
 - TUI `run_action` (`src/tui/jobs.rs`, `Action::Apply(groups)`): usa `apply_groups`; o resumo continua "Instalado: a, b".
 - Falha no 2º app de um lote depois do 1º aplicado ⇒ `OpsError::PartlyApplied { applied: ["<1º>"], .. }` (hoje a CLI perde essa informação porque cada grupo é uma chamada).
 - Nada muda em `install` de um alvo só (já é um grupo).
+- **Raízes no `revalidate`** (`src/install/ops.rs` ~523): hoje só o **último** plano é tratado como alvo (`i < last && upgrade_from.is_none()` ⇒ dependência instalada por outro meio é pulada). Num lote mesclado, o alvo de cada grupo pode estar no meio. `apply_groups` deve passar o conjunto de alvos (o último plano de cada grupo, sem caixa) e o `revalidate` só pula **não-alvos**; um alvo que divergiu do `state.db` é sempre `StateChanged`. `apply(ctx, plans)` mantém a assinatura e o comportamento (alvo = último).
 
 **Files:**
 - Modify: `src/install/ops.rs`, `src/cli/install_cmd.rs`, `src/tui/jobs.rs`
@@ -1342,6 +1343,7 @@ Testes (literais em prosa; use o `World` existente de cada arquivo):
 1. `merge_groups_keeps_order_and_drops_repeated_apps` (`tests/install_ops.rs`): grupos `[[leaf, a], [LEAF, b], [c]]` (planos reais via `w.plans`, ou construídos) ⇒ apps `["leaf", "a", "b", "c"]`.
 2. `apply_groups_broadcasts_once_for_two_env_apps` (`tests/install_ops.rs`): dois apps independentes com `env: true` (campo `App.env` do teste), `apply_groups(ctx, vec![plans_a, plans_b])` ⇒ `w.broadcasts() == 1` e ambos no `state.db`.
 3. `apply_groups_reports_what_was_applied_when_a_later_app_fails` (`tests/install_ops.rs`): app `a` normal; app `b` cujo zip servido é lixo com o SHA-256 **certo** (o hash confere, a extração falha) ⇒ `Err(PartlyApplied { applied == ["a"] })`, `a` no `state.db`, `b` não, `apps\b` não existe.
+5. `apply_groups_refuses_a_target_installed_meanwhile_even_in_the_middle` (`tests/install_ops.rs`): planos de dois alvos novos `a` e `b` (grupos `[[a],[b]]`); antes de aplicar, instale `a` por fora (`w.install("a")`) ⇒ `apply_groups` devolve `Err(StateChanged("a"))` e `b` não foi instalado.
 4. `run_action_applies_all_groups_with_one_broadcast` (`tests/tui_jobs.rs`): `Action::Apply(vec![g1, g2])` com dois apps que mexem em env ⇒ um broadcast (amplie o `World` do arquivo com env se preciso).
 
 #### Checks beyond the steps
@@ -1349,6 +1351,7 @@ Testes (literais em prosa; use o `World` existente de cada arquivo):
 1. Dedupe de `merge_groups`: mutate removendo o filtro de repetidos ⇒ PEGA (teste 1).
 2. Um broadcast: mutate fazendo `apply_groups` chamar `apply` por grupo ⇒ PEGA (teste 2).
 3. TUI usa o lote: mutate voltando `run_action` ao laço por grupo ⇒ PEGA (teste 4).
+4. Alvo no meio: mutate fazendo o `revalidate` voltar a usar só `i < last` ⇒ PEGA (teste 5).
 
 **Commit:** `perf(ops): apply a batch of upgrades under one lock and one broadcast`
 
