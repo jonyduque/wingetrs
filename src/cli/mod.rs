@@ -318,24 +318,76 @@ pub fn stderr_logging(cli: &Cli) -> bool {
     cli.command.is_some() && cli.verbose > 0
 }
 
+/// File log filter: our crate at DEBUG, dependencies only from WARN.
+pub fn file_log_filter() -> tracing_subscriber::filter::Targets {
+    use tracing::Level;
+    tracing_subscriber::filter::Targets::new()
+        .with_default(Level::WARN)
+        .with_target("wingetrs", Level::DEBUG)
+}
+
+/// Stderr log filter for `-v`/`-vv`: same principle, dependencies stay at WARN.
+fn stderr_log_filter(verbose: u8) -> tracing_subscriber::filter::Targets {
+    use tracing::Level;
+    let level = if verbose > 1 {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
+    tracing_subscriber::filter::Targets::new()
+        .with_default(Level::WARN)
+        .with_target("wingetrs", level)
+}
+
+/// Number of daily log files kept.
+const LOG_KEEP: usize = 14;
+
+/// Delete the oldest `wingetrs.log.YYYY-MM-DD` files beyond the `keep` newest.
+/// I/O errors are only logged; other files are ignored.
+pub fn prune_logs(dir: &std::path::Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            n.strip_prefix("wingetrs.log.").is_some_and(|d| {
+                d.len() == 10
+                    && d.bytes().enumerate().all(|(i, b)| {
+                        if i == 4 || i == 7 {
+                            b == b'-'
+                        } else {
+                            b.is_ascii_digit()
+                        }
+                    })
+            })
+        })
+        .collect();
+    names.sort();
+    let excess = names.len().saturating_sub(keep);
+    for n in &names[..excess] {
+        if let Err(e) = std::fs::remove_file(dir.join(n)) {
+            tracing::warn!("could not remove old log {n}: {e}");
+        }
+    }
+}
+
 fn init_logging(data: &DataDir, verbose: u8) -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+    prune_logs(&data.log_dir(), LOG_KEEP);
     let appender = tracing_appender::rolling::daily(data.log_dir(), "wingetrs.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
     let file = tracing_subscriber::fmt::layer()
         .with_writer(writer)
-        .with_ansi(false);
+        .with_ansi(false)
+        .with_filter(file_log_filter());
     let stderr = (verbose > 0).then(|| {
-        let level = if verbose > 1 {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::INFO
-        };
         tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
-            .with_filter(tracing_subscriber::filter::LevelFilter::from_level(level))
+            .with_filter(stderr_log_filter(verbose))
     });
     let _ = tracing_subscriber::registry()
         .with(file)
@@ -820,5 +872,48 @@ mod early_tests {
         })));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| early.join()));
         assert!(r.is_err(), "worker panic must be resumed, not swallowed");
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use tracing::Level;
+
+    #[test]
+    fn file_filter_keeps_wingetrs_debug_and_drops_dependency_noise() {
+        let f = file_log_filter();
+        assert!(f.would_enable("wingetrs::install::ops", &Level::DEBUG));
+        assert!(!f.would_enable("wingetrs", &Level::TRACE));
+        assert!(!f.would_enable("h2::proto::streams", &Level::TRACE));
+        assert!(!f.would_enable("hyper_util::client", &Level::DEBUG));
+        assert!(f.would_enable("rustls", &Level::WARN));
+    }
+
+    #[test]
+    fn prune_logs_keeps_the_newest_and_ignores_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in 1..=16 {
+            std::fs::write(dir.path().join(format!("wingetrs.log.2026-09-{d:02}")), "x").unwrap();
+        }
+        std::fs::write(dir.path().join("outro.txt"), "x").unwrap();
+        prune_logs(dir.path(), 14);
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let mut want: Vec<String> = (3..=16)
+            .map(|d| format!("wingetrs.log.2026-09-{d:02}"))
+            .collect();
+        want.push("outro.txt".into());
+        want.sort();
+        assert_eq!(names, want);
+    }
+
+    #[test]
+    fn prune_logs_on_a_missing_dir_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        prune_logs(&dir.path().join("nope"), 14);
     }
 }
