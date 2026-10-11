@@ -195,8 +195,9 @@ fn delete_source_rows(
                 params![source],
             )?;
         } else {
-            tx.execute(&format!("DELETE FROM {t}"), [])?;
-            truncated_maps += 1;
+            if tx.execute(&format!("DELETE FROM {t}"), [])? > 0 {
+                truncated_maps += 1;
+            }
         }
     }
     let packages = tx.execute("DELETE FROM packages WHERE source = ?1", params![source])?;
@@ -319,7 +320,9 @@ impl Catalog {
 
     /// Removes a source with its packages, map rows and meta; returns the packages removed.
     pub fn remove_source(&mut self, source: &str) -> Result<usize, CatalogError> {
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let n = delete_source_rows(&tx, source)?.packages;
         tx.execute("DELETE FROM meta WHERE source = ?1", params![source])?;
         tx.commit()?;
@@ -336,7 +339,9 @@ impl Catalog {
         maps: &WingetMaps,
     ) -> Result<ImportStats, CatalogError> {
         // Dropping `tx` on an early return rolls the whole import back.
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let deleted = delete_source_rows(&tx, source)?;
         tracing::debug!(
             truncated_maps = deleted.truncated_maps,

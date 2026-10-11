@@ -441,3 +441,45 @@ fn remove_source_keeps_other_sources_maps() {
     assert_eq!(c.lookup(MapTable::Pfn, "pfn_b").unwrap(), ["B.B"]);
     assert!(c.lookup(MapTable::Pfn, "pfn_a").unwrap().is_empty());
 }
+
+#[test]
+fn replace_waits_for_a_concurrent_writer_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut a = Catalog::open(&path).unwrap();
+    a.replace_source(
+        "a",
+        SourceKind::Winget,
+        "1",
+        1,
+        &[pkg("A.A", "Alpha", "1")],
+        &pfn_map("PFN_A", "A.A"),
+    )
+    .unwrap();
+    let b = rusqlite::Connection::open(&path).unwrap();
+    b.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        a.replace_source(
+            "a",
+            SourceKind::Winget,
+            "2",
+            2,
+            &[pkg("A.A", "Alpha", "2")],
+            &pfn_map("PFN_A2", "A.A"),
+        )
+    });
+    started_rx.recv().unwrap();
+    // Let the writer reach its first statement, then change the database under it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    b.execute(
+        "INSERT INTO meta (source, kind, source_version, fetched_at) VALUES ('x', 'winget', '1', 1)",
+        [],
+    )
+    .unwrap();
+    b.execute_batch("COMMIT").unwrap();
+    worker.join().unwrap().unwrap();
+    let r = Catalog::open(&path).unwrap();
+    assert_eq!(r.lookup(MapTable::Pfn, "pfn_a2").unwrap(), ["A.A"]);
+}
