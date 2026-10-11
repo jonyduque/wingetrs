@@ -59,46 +59,138 @@ fn read_entry<R: Read + std::io::Seek>(
     Ok(buf)
 }
 
-/// Returns the validated bytes of Public/index.db.
-pub fn validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(msix))
-        .map_err(|e| IndexError::Zip(e.to_string()))?;
-    let db = read_entry(&mut zip, INDEX_ENTRY)?;
-    let map = read_entry(&mut zip, BLOCKMAP_ENTRY)?;
+/// Fills `buf` unless the reader ends first; returns the bytes read.
+fn read_block<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// Block hashes and the optional whole-file hash of Public\index.db, from AppxBlockMap.xml.
+fn read_blockmap<R: Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<(Vec<String>, Option<String>), IndexError> {
+    let map = read_entry(zip, BLOCKMAP_ENTRY)?;
     let xml = std::str::from_utf8(&map).map_err(|e| IndexError::BlockMap(e.to_string()))?;
     let doc = roxmltree::Document::parse(xml).map_err(|e| IndexError::BlockMap(e.to_string()))?;
     let file = doc
         .descendants()
         .find(|n| n.has_tag_name("File") && n.attribute("Name") == Some(INDEX_BLOCKMAP_NAME))
         .ok_or_else(|| IndexError::BlockMap("entrada Public\\index.db ausente".into()))?;
-    let hashes: Vec<&str> = file
+    let hashes = file
         .children()
         .filter(|n| n.has_tag_name("Block"))
         .filter_map(|n| n.attribute("Hash"))
+        .map(str::to_owned)
         .collect();
-    if hashes.len() != db.len().div_ceil(BLOCK_SIZE) {
-        return Err(IndexError::BlockMap(format!(
-            "esperados {} blocos, encontrados {}",
-            db.len().div_ceil(BLOCK_SIZE),
-            hashes.len()
-        )));
-    }
-    for (i, (chunk, expected)) in db.chunks(BLOCK_SIZE).zip(&hashes).enumerate() {
-        if STANDARD.encode(Sha256::digest(chunk)) != *expected {
-            return Err(IndexError::Integrity { block: i });
-        }
-    }
     // b4:FileHash is a child element of <File> carrying the base64 sha256 in `Hash`.
     let file_hash = file
         .children()
         .find(|n| n.has_tag_name("FileHash"))
-        .and_then(|n| n.attribute("Hash"));
-    if let Some(expected) = file_hash
-        && STANDARD.encode(Sha256::digest(&db)) != expected
-    {
-        return Err(IndexError::FileHash);
+        .and_then(|n| n.attribute("Hash"))
+        .map(str::to_owned);
+    Ok((hashes, file_hash))
+}
+
+/// Cap for the up-front buffer: the declared size comes from the download.
+const PREALLOC_MAX: usize = 64 << 20;
+
+/// Returns the validated bytes of Public/index.db.
+/// Inflate, per-block hashes and the whole-file hash run as a pipeline (this thread plus two
+/// scoped workers); serially they cost ~235 ms under load on a CPU without SHA-NI.
+/// Errors keep the serial precedence: Zip, missing index, index read error, missing/invalid
+/// blockmap, block count, first bad block, file hash.
+pub fn validate_msix(msix: &[u8]) -> Result<Vec<u8>, IndexError> {
+    use std::sync::{Arc, mpsc};
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(msix))
+        .map_err(|e| IndexError::Zip(e.to_string()))?;
+    if zip.index_for_name(INDEX_ENTRY).is_none() {
+        return Err(IndexError::MissingEntry(INDEX_ENTRY));
     }
-    Ok(db)
+    let (hashes, file_hash) = match read_blockmap(&mut zip) {
+        Ok(m) => m,
+        Err(e) => {
+            // index.db used to be inflated first, so its read error wins.
+            read_entry(&mut zip, INDEX_ENTRY)?;
+            return Err(e);
+        }
+    };
+    let mut entry = zip
+        .by_name(INDEX_ENTRY)
+        .map_err(|e| IndexError::Zip(e.to_string()))?;
+    let cap = usize::try_from(entry.size()).map_or(PREALLOC_MAX, |n| n.min(PREALLOC_MAX));
+    let (hashes, file_hash) = (&hashes, file_hash.as_deref());
+    std::thread::scope(|s| {
+        let (block_tx, block_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(32);
+        let (file_tx, file_rx) = mpsc::sync_channel::<Arc<Vec<u8>>>(32);
+        let blocks = s.spawn(move || {
+            let mut first_bad = None;
+            for (i, block) in block_rx.into_iter().enumerate() {
+                if first_bad.is_none()
+                    && hashes
+                        .get(i)
+                        .is_some_and(|h| STANDARD.encode(Sha256::digest(&block[..])) != *h)
+                {
+                    first_bad = Some(i);
+                }
+            }
+            first_bad
+        });
+        let whole = s.spawn(move || {
+            let mut h = Sha256::new();
+            for block in file_rx {
+                h.update(&block[..]);
+            }
+            file_hash.is_none_or(|expected| STANDARD.encode(h.finalize()) == expected)
+        });
+        let mut db = Vec::with_capacity(cap);
+        let produced = (|| -> Result<(), IndexError> {
+            loop {
+                let mut buf = vec![0u8; BLOCK_SIZE];
+                let n =
+                    read_block(&mut entry, &mut buf).map_err(|e| IndexError::Zip(e.to_string()))?;
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.truncate(n);
+                db.extend_from_slice(&buf);
+                let buf = Arc::new(buf);
+                // A closed receiver means that worker panicked; the join below re-raises it.
+                if block_tx.send(Arc::clone(&buf)).is_err() || file_tx.send(buf).is_err() {
+                    return Ok(());
+                }
+            }
+        })();
+        // Closing both channels ends the workers' loops; join both before any `?`.
+        drop(block_tx);
+        drop(file_tx);
+        let first_bad = blocks
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+        let file_ok = whole
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+        produced?;
+        if hashes.len() != db.len().div_ceil(BLOCK_SIZE) {
+            return Err(IndexError::BlockMap(format!(
+                "esperados {} blocos, encontrados {}",
+                db.len().div_ceil(BLOCK_SIZE),
+                hashes.len()
+            )));
+        }
+        if let Some(block) = first_bad {
+            return Err(IndexError::Integrity { block });
+        }
+        if !file_ok {
+            return Err(IndexError::FileHash);
+        }
+        Ok(db)
+    })
 }
 
 fn pairs(c: &rusqlite::Connection, query: &str) -> Result<Vec<(i64, String)>, IndexError> {
