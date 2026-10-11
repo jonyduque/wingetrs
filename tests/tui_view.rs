@@ -275,3 +275,25 @@ fn closed_modal_leaves_the_screen_alone() {
     assert!(a.modal.is_none());
     assert!(!render(&a, 100, 16).contains("Confirmar"));
 }
+
+#[test]
+fn selected_row_moves_on_screen_while_details_load() {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    for _ in 0..2 {
+        update(
+            &mut a,
+            Msg::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+        );
+    }
+    let screen = render(&a, 100, 16);
+    let selected = screen
+        .lines()
+        .map(|l| l.trim_start_matches('"'))
+        .find(|l| l.starts_with("│> "))
+        .expect("a selected row");
+    assert!(selected.contains("powertoys"), "{selected}");
+    assert!(screen.contains("carregando"), "{screen}");
+}

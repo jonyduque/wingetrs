@@ -16,7 +16,7 @@ use crate::tui::view::view;
 use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update};
 use anyhow::Context;
 use crossterm::event::{Event, EventStream};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -24,6 +24,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const TICK: Duration = Duration::from_millis(100);
 const DETAILS_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Most messages folded into one frame.
+const BATCH_CAP: usize = 256;
 /// A `draw` slower than this (one 60 Hz frame) is logged at debug level.
 const SLOW_DRAW_US: u64 = 16_000;
 
@@ -156,28 +158,53 @@ async fn event_loop(
         details_gen: AtomicU64::new(0),
     });
     let mut events = EventStream::new();
-    let mut ticker = tokio::time::interval(TICK);
+    let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
     let mut stats = LoopStats::new();
 
     loop {
-        let msg = tokio::select! {
+        let first = tokio::select! {
             ev = events.next() => match ev {
-                Some(Ok(Event::Key(k))) => Msg::Key(k),
-                Some(Ok(Event::Resize(w, h))) => Msg::Resize(w, h),
-                Some(Ok(_)) => continue,
+                Some(Ok(ev)) => match input_msg(ev) {
+                    Some(m) => m,
+                    None => continue,
+                },
                 Some(Err(e)) => return Err(e.into()),
                 None => return Ok(()),
             },
             Some(m) = rx.recv() => m,
-            _ = ticker.tick(), if app.refreshing || details_loading(&app) => Msg::Tick,
+            _ = ticker.tick(), if app.animating() => Msg::Tick,
         };
-        let msg = jobs::propagate(msg);
-        stats.count(&msg);
-        let is_tick = matches!(msg, Msg::Tick);
-        let refresh_msg = matches!(msg, Msg::RefreshFinished(_));
-        let cmds = update(&mut app, msg);
-        for cmd in cmds {
+        // Take every key and job message already queued, so one frame covers them all.
+        let mut input_err = None;
+        let batch = {
+            let keys = (&mut events).filter_map(|ev| {
+                futures_util::future::ready(match ev {
+                    Ok(ev) => input_msg(ev),
+                    Err(e) => {
+                        input_err.get_or_insert(e);
+                        None
+                    }
+                })
+            });
+            let jobs = futures_util::stream::poll_fn(|cx| rx.poll_recv(cx));
+            let mut queued = futures_util::stream::select(keys, jobs);
+            drain_ready(first, &mut queued, BATCH_CAP)
+        };
+        if let Some(e) = input_err {
+            return Err(e.into());
+        }
+        let draw = needs_draw(&batch, app.animating());
+        let batch_len = batch.len();
+        let mut cmds = Vec::new();
+        let mut refresh_msg = false;
+        for msg in batch {
+            let msg = jobs::propagate(msg);
+            stats.count(&msg);
+            refresh_msg |= matches!(msg, Msg::RefreshFinished(_));
+            cmds.extend(update(&mut app, msg));
+        }
+        for cmd in last_details_only(cmds) {
             match cmd {
                 Cmd::Quit => return Ok(()),
                 Cmd::Refresh { force } => spawn_refresh(&ctx, force),
@@ -203,17 +230,75 @@ async fn event_loop(
                 app.index_age_secs = Some(age);
             }
         }
-        // Ticks only matter while something animates.
-        if !is_tick || app.refreshing || details_loading(&app) {
-            stats.draw(1, || terminal.draw(|f| view(&app, theme, f)).map(|_| ()))?;
+        if draw {
+            stats.draw(batch_len, || {
+                terminal.draw(|f| view(&app, theme, f)).map(|_| ())
+            })?;
         }
     }
 }
 
-/// True while the selected package's details have been requested but have not arrived.
-fn details_loading(app: &App) -> bool {
-    app.selected_key()
-        .is_some_and(|(s, id)| !app.details.contains_key(&format!("{s}/{id}")))
+/// Terminal events the app reacts to; the rest are dropped.
+fn input_msg(ev: Event) -> Option<Msg> {
+    match ev {
+        Event::Key(k) => Some(Msg::Key(k)),
+        Event::Resize(w, h) => Some(Msg::Resize(w, h)),
+        _ => None,
+    }
+}
+
+/// Spinner clock; ticks missed while nothing animated are skipped, never fired in a burst.
+pub fn spinner_ticker() -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker
+}
+
+/// `first` followed by whatever `more` already has ready, without waiting; at most `cap` items.
+pub fn drain_ready<S: futures_util::Stream<Item = Msg> + Unpin>(
+    first: Msg,
+    more: &mut S,
+    cap: usize,
+) -> Vec<Msg> {
+    let mut batch = vec![first];
+    while batch.len() < cap {
+        match more.next().now_or_never() {
+            Some(Some(m)) => batch.push(m),
+            // Nothing ready, or the stream ended.
+            Some(None) | None => break,
+        }
+    }
+    batch
+}
+
+/// Drops every `Cmd::LoadDetails` but the last; other commands keep their order.
+pub fn last_details_only(cmds: Vec<Cmd>) -> Vec<Cmd> {
+    let last = cmds
+        .iter()
+        .rposition(|c| matches!(c, Cmd::LoadDetails { .. }));
+    cmds.into_iter()
+        .enumerate()
+        .filter(|(i, c)| !matches!(c, Cmd::LoadDetails { .. }) || Some(*i) == last)
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// Whether a batch changes the screen: anything but a tick does, a tick only while animating.
+pub fn needs_draw(batch: &[Msg], animating: bool) -> bool {
+    batch.iter().any(|m| !matches!(m, Msg::Tick) || animating)
+}
+
+/// Awaits a detail worker: a panic travels to the loop as `Msg::Panicked`, a cancellation
+/// becomes a failed load for `key`.
+pub async fn join_details(key: String, h: tokio::task::JoinHandle<Msg>) -> Msg {
+    match h.await {
+        Ok(msg) => msg,
+        Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
+        Err(e) => Msg::DetailsLoaded {
+            key,
+            result: Err(format!("tarefa cancelada: {e}")),
+        },
+    }
 }
 
 /// Loads the catalog off the UI path, then reports what the startup refresh should do.
@@ -310,10 +395,16 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
             return;
         }
         let key = format!("{source}/{id}");
-        let result = load_details(&ctx, &source, &id)
-            .await
-            .map_err(|e| format!("{e:#}"));
-        let _ = ctx.tx.send(Msg::DetailsLoaded { key, result });
+        let work = tokio::spawn({
+            let (ctx, key) = (Arc::clone(&ctx), key.clone());
+            async move {
+                let result = load_details(&ctx, &source, &id)
+                    .await
+                    .map_err(|e| format!("{e:#}"));
+                Msg::DetailsLoaded { key, result }
+            }
+        });
+        let _ = ctx.tx.send(join_details(key, work).await);
     });
 }
 
@@ -323,9 +414,16 @@ async fn load_details(
     id: &str,
 ) -> anyhow::Result<crate::core::PackageDetails> {
     let (data_path, source, id) = (ctx.data.catalog_path(), source.to_owned(), id.to_owned());
-    let pkg = tokio::task::spawn_blocking(move || Catalog::open(&data_path)?.get(&source, &id))
-        .await??
-        .context("pacote não encontrado no catálogo")?;
+    let read = tokio::task::spawn_blocking(move || Catalog::open(&data_path)?.get(&source, &id));
+    let pkg = match read.await {
+        Ok(r) => r?,
+        // A panic in the read re-panics this task, so `join_details` reports it.
+        Err(e) => match e.try_into_panic() {
+            Ok(p) => std::panic::resume_unwind(p),
+            Err(e) => return Err(e.into()),
+        },
+    }
+    .context("pacote não encontrado no catálogo")?;
     match pkg.entry.source {
         SourceKind::Winget => {
             let hash = pkg

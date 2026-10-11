@@ -22,15 +22,15 @@ fn entry(source: SourceKind, id: &str, name: &str) -> PackageEntry {
         commands: vec![],
     }
 }
+fn app_entries() -> Vec<PackageEntry> {
+    vec![
+        entry(SourceKind::Winget, "Microsoft.PowerToys", "PowerToys"),
+        entry(SourceKind::Scoop, "ripgrep", "ripgrep"),
+        entry(SourceKind::Winget, "Zeal.Zeal", "Zeal"),
+    ]
+}
 fn app() -> App {
-    App::new(
-        vec![
-            entry(SourceKind::Winget, "Microsoft.PowerToys", "PowerToys"),
-            entry(SourceKind::Scoop, "ripgrep", "ripgrep"),
-            entry(SourceKind::Winget, "Zeal.Zeal", "Zeal"),
-        ],
-        GlyphSet::Nerd,
-    )
+    App::new(app_entries(), GlyphSet::Nerd)
 }
 fn key(c: KeyCode) -> Msg {
     Msg::Key(KeyEvent::new(c, KeyModifiers::NONE))
@@ -71,7 +71,8 @@ fn escape_ladder_and_quit() {
     assert!(update(&mut a, key(KeyCode::Esc)).is_empty());
     assert_eq!(a.focus, Focus::List);
     update(&mut a, key(KeyCode::Char('x')));
-    assert!(update(&mut a, key(KeyCode::Esc)).is_empty());
+    // Clearing the query changes the selection, so it asks for the new row's details.
+    assert_eq!(update(&mut a, key(KeyCode::Esc)), vec![details_for(&a)]);
     assert_eq!(a.query, "");
     assert_eq!(update(&mut a, key(KeyCode::Esc)), vec![Cmd::Quit]);
     assert_eq!(update(&mut app(), ctrl('c')), vec![Cmd::Quit]);
@@ -703,7 +704,7 @@ fn boot_with_a_populated_fresh_catalog_loads_it_and_does_not_refresh() {
     assert_eq!(a.search.entries().len(), 2);
     assert_eq!(a.status, None);
     assert_eq!(a.index_age_secs, Some(42));
-    assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+    assert_eq!(cmds, vec![Cmd::ScanInstalled, details_for(&a)]);
 }
 
 #[test]
@@ -732,7 +733,11 @@ fn boot_refreshes_when_the_catalog_is_empty_or_stale() {
     );
     assert_eq!(
         cmds,
-        vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]
+        vec![
+            Cmd::ScanInstalled,
+            details_for(&b),
+            Cmd::Refresh { force: false }
+        ]
     );
 }
 
@@ -746,4 +751,118 @@ fn a_failed_reload_keeps_the_entries_and_shows_the_error() {
     let status = a.status.clone().unwrap_or_default();
     assert!(status.contains("falha ao ler o catálogo"), "{status}");
     assert!(status.contains("database is locked"), "{status}");
+}
+
+fn details_for(a: &App) -> Cmd {
+    let (source, id) = a.selected_key().unwrap();
+    Cmd::LoadDetails { source, id }
+}
+
+fn loaded(key: &str) -> Msg {
+    Msg::DetailsLoaded {
+        key: key.into(),
+        result: Err("x".into()),
+    }
+}
+
+fn three_updates() -> App {
+    on_tab(
+        Tab::Updates,
+        vec![
+            irow("a", "wingetrs", "scoop:main", true),
+            irow("b", "wingetrs", "scoop:main", true),
+            irow("c", "wingetrs", "scoop:main", true),
+        ],
+    )
+}
+
+#[test]
+fn selection_moves_while_details_are_pending() {
+    let mut a = three_updates();
+    assert_eq!(
+        update(&mut a, key(KeyCode::Down)),
+        vec![Cmd::LoadDetails {
+            source: "scoop:main".into(),
+            id: "b".into()
+        }]
+    );
+    let cmds = update(&mut a, key(KeyCode::Down));
+    assert_eq!(a.selected, 2);
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::LoadDetails { id, .. }] if id == "c"),
+        "{cmds:?}"
+    );
+    assert_eq!(a.details_pending, Some("scoop:main/c".into()));
+}
+
+#[test]
+fn every_view_change_requests_details_for_the_new_selection() {
+    // (a) catalog arrives, by reload and by boot.
+    let mut a = App::new(vec![], GlyphSet::Nerd);
+    let cmds = update(&mut a, Msg::CatalogLoaded(app_entries()));
+    assert!(cmds.contains(&details_for(&a)), "{cmds:?}");
+    let mut a = App::new(vec![], GlyphSet::Nerd);
+    let cmds = update(
+        &mut a,
+        Msg::Booted {
+            catalog: Ok(app_entries()),
+            age: None,
+            needs_refresh: false,
+        },
+    );
+    assert!(cmds.contains(&Cmd::ScanInstalled), "{cmds:?}");
+    assert!(cmds.contains(&details_for(&a)), "{cmds:?}");
+    // (b) installed rows arrive.
+    let mut a = on_tab(Tab::Updates, vec![]);
+    let cmds = update(
+        &mut a,
+        Msg::InstalledLoaded(vec![irow("a", "wingetrs", "scoop:main", true)]),
+    );
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::LoadDetails { id, .. } if id == "a")),
+        "{cmds:?}"
+    );
+    // (c) tab switch.
+    let mut a = on_tab(
+        Tab::Search,
+        vec![irow("a", "wingetrs", "scoop:main", false)],
+    );
+    let cmds = update(&mut a, key(KeyCode::Tab));
+    assert_eq!(a.tab, Tab::Installed);
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::LoadDetails { id, .. } if id == "a")),
+        "{cmds:?}"
+    );
+    // (d) Esc clears the query.
+    let mut a = app();
+    update(&mut a, key(KeyCode::Char('z')));
+    let cmds = update(&mut a, key(KeyCode::Esc));
+    assert!(a.query.is_empty());
+    assert!(cmds.contains(&details_for(&a)), "{cmds:?}");
+}
+
+#[test]
+fn spinner_stops_when_the_selected_details_arrive() {
+    let mut a = App::new(vec![], GlyphSet::Nerd);
+    update(&mut a, Msg::CatalogLoaded(app_entries()));
+    let pending = a.details_pending.clone().unwrap();
+    update(&mut a, loaded(&pending));
+    assert!(!a.animating());
+    let frame = a.spinner_frame;
+    update(&mut a, Msg::Tick);
+    assert_eq!(a.spinner_frame, frame);
+}
+
+#[test]
+fn stale_details_keep_the_spinner_for_the_current_item() {
+    let mut a = three_updates();
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, loaded("scoop:main/b"));
+    assert!(a.animating());
+    assert!(a.details.contains_key("scoop:main/b"));
+    update(&mut a, loaded("scoop:main/c"));
+    assert!(!a.animating());
 }

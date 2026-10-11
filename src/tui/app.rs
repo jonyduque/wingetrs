@@ -187,6 +187,8 @@ pub struct App {
     pub hits: Vec<SearchHit>,
     pub installed: Vec<ListRow>,
     pub details: HashMap<String, Result<PackageDetails, String>>,
+    /// `"{source}/{id}"` of the selected package while its details are being loaded.
+    pub details_pending: Option<String>,
     pub refreshing: bool,
     pub offline: bool,
     pub index_age_secs: Option<i64>,
@@ -218,6 +220,7 @@ impl App {
             hits: Vec::new(),
             installed: Vec::new(),
             details: HashMap::new(),
+            details_pending: None,
             refreshing: false,
             offline: false,
             index_age_secs: None,
@@ -310,12 +313,28 @@ impl App {
         }
     }
 
-    fn details_cmd(&self) -> Vec<Cmd> {
+    /// True while something on screen animates the spinner.
+    pub fn animating(&self) -> bool {
+        self.refreshing || self.details_pending.is_some()
+    }
+
+    /// Requests the selected package's details unless cached; records what is pending.
+    fn details_cmd(&mut self) -> Vec<Cmd> {
         match self.selected_key() {
-            Some((source, id)) if !self.details.contains_key(&format!("{source}/{id}")) => {
-                vec![Cmd::LoadDetails { source, id }]
+            Some((source, id)) => {
+                let key = format!("{source}/{id}");
+                if self.details.contains_key(&key) {
+                    self.details_pending = None;
+                    Vec::new()
+                } else {
+                    self.details_pending = Some(key);
+                    vec![Cmd::LoadDetails { source, id }]
+                }
             }
-            _ => Vec::new(),
+            None => {
+                self.details_pending = None;
+                Vec::new()
+            }
         }
     }
 
@@ -334,11 +353,13 @@ impl App {
         self.tab = tab;
         self.focus = Focus::List;
         self.refresh_view();
-        if tab != Tab::Search && self.installed.is_empty() {
+        let mut cmds = if tab != Tab::Search && self.installed.is_empty() {
             vec![Cmd::ScanInstalled]
         } else {
             Vec::new()
-        }
+        };
+        cmds.extend(self.details_cmd());
+        cmds
     }
 }
 
@@ -351,10 +372,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Tick => {
-            let loading_details = app
-                .selected_key()
-                .is_some_and(|(s, id)| !app.details.contains_key(&format!("{s}/{id}")));
-            if app.refreshing || loading_details {
+            if app.animating() {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
             Vec::new()
@@ -363,7 +381,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.search = SearchIndex::new(entries);
             app.research();
             app.clamp();
-            Vec::new()
+            app.details_cmd()
         }
         Msg::CatalogFailed(e) => {
             app.status = Some(format!("falha ao ler o catálogo: {e}"));
@@ -376,12 +394,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         } => {
             app.status = None;
             app.index_age_secs = age;
+            let mut cmds = vec![Cmd::ScanInstalled];
             let refresh = match catalog {
                 Ok(entries) => {
                     let empty = entries.is_empty();
                     app.search = SearchIndex::new(entries);
                     app.research();
                     app.clamp();
+                    cmds.extend(app.details_cmd());
                     empty || needs_refresh
                 }
                 Err(e) => {
@@ -389,7 +409,6 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
                     true
                 }
             };
-            let mut cmds = vec![Cmd::ScanInstalled];
             if refresh {
                 cmds.push(Cmd::Refresh { force: false });
             }
@@ -398,13 +417,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::InstalledLoaded(rows) => {
             app.installed = rows;
             app.clamp();
-            Vec::new()
+            app.details_cmd()
         }
         Msg::InstalledFailed(reason) => {
             app.status = Some(format!("falha ao ler instalados: {reason}"));
             Vec::new()
         }
         Msg::DetailsLoaded { key, result } => {
+            if app.details_pending.as_deref() == Some(key.as_str()) {
+                app.details_pending = None;
+            }
             app.details.insert(key, result);
             Vec::new()
         }
@@ -530,7 +552,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             } else if !empty {
                 app.query.clear();
                 app.refresh_view();
-                Vec::new()
+                app.details_cmd()
             } else {
                 vec![Cmd::Quit]
             }
