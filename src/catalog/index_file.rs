@@ -34,53 +34,101 @@ fn put_str(out: &mut Vec<u8>, s: Option<&str>) {
     }
 }
 
-/// Serializes the catalog's search columns (load_entries order) and writes `path` atomically
-/// (write `path.tmp`, then rename; retry the rename up to 5 times, 20 ms apart, because a
-/// concurrent reader on Windows can make it fail transiently).
-pub fn write(catalog: &Catalog, path: &Path) -> Result<usize, IndexFileError> {
-    let entries = catalog.load_entries()?;
-    let mut offsets: Vec<u8> = Vec::with_capacity(entries.len() * 4);
-    let mut body: Vec<u8> = Vec::new();
-    for e in &entries {
-        let start = u32::try_from(body.len())
-            .map_err(|_| IndexFileError::Invalid("corpo grande demais"))?;
-        offsets.extend_from_slice(&start.to_le_bytes());
-        body.push(match e.source {
-            SourceKind::Winget => 0,
-            SourceKind::Scoop => 1,
-        });
-        put_str(&mut body, Some(&e.source_name));
-        put_str(&mut body, Some(&e.id));
-        put_str(&mut body, Some(&e.name));
-        put_str(&mut body, e.moniker.as_deref());
-        put_str(&mut body, Some(&e.version));
-        put_str(&mut body, e.publisher.as_deref());
-        put_str(&mut body, e.description.as_deref());
-        put_str(&mut body, Some(&e.tags.join(" ")));
-        put_str(&mut body, Some(&e.commands.join(" ")));
+/// The column's whitespace-separated words joined by one space (= `split_words` + `join(" ")`).
+fn put_words(out: &mut Vec<u8>, s: &str) {
+    let at = out.len();
+    out.extend_from_slice(&[0; 4]);
+    for (i, w) in s.split_whitespace().enumerate() {
+        if i > 0 {
+            out.push(b' ');
+        }
+        out.extend_from_slice(w.as_bytes());
     }
-    let count =
-        u32::try_from(entries.len()).map_err(|_| IndexFileError::Invalid("entradas demais"))?;
+    let n = (out.len() - at - 4) as u32;
+    out[at..at + 4].copy_from_slice(&n.to_le_bytes());
+}
+
+fn sql(e: rusqlite::Error) -> IndexFileError {
+    IndexFileError::Catalog(e.into())
+}
+
+/// Header + offsets + body + trailer.
+fn assemble(n: usize, offsets: &[u8], body: &[u8]) -> Result<Vec<u8>, IndexFileError> {
+    let count = u32::try_from(n).map_err(|_| IndexFileError::Invalid("entradas demais"))?;
     let mut out = Vec::with_capacity(HEADER + offsets.len() + body.len() + 8);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&count.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&(body.len() as u64).to_le_bytes());
-    out.extend_from_slice(&offsets);
-    out.extend_from_slice(&body);
+    out.extend_from_slice(offsets);
+    out.extend_from_slice(body);
     out.extend_from_slice(MAGIC);
+    Ok(out)
+}
 
+/// File bytes for every package, borrowing each column from the row (no `PackageEntry`).
+/// One statement on the catalog's own connection: one snapshot, no worker threads (parallel
+/// readers stalled 0.4-1 s inside `update`, see docs/ARMADILHAS.md).
+pub fn encode_catalog(catalog: &Catalog) -> Result<(Vec<u8>, usize), IndexFileError> {
+    let mut st = catalog
+        .connection()
+        .prepare(&format!(
+            "SELECT {} FROM packages ORDER BY rowid",
+            super::ENTRY_COLS
+        ))
+        .map_err(sql)?;
+    let mut rows = st.query([]).map_err(sql)?;
+    let mut offsets: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
+    let mut n = 0usize;
+    while let Some(r) = rows.next().map_err(sql)? {
+        let start = u32::try_from(body.len())
+            .map_err(|_| IndexFileError::Invalid("corpo grande demais"))?;
+        offsets.extend_from_slice(&start.to_le_bytes());
+        n += 1;
+        let s = |i: usize| -> Result<&str, IndexFileError> {
+            r.get_ref(i)
+                .map_err(sql)?
+                .as_str()
+                .map_err(|e| sql(e.into()))
+        };
+        let o = |i: usize| -> Result<Option<&str>, IndexFileError> {
+            r.get_ref(i)
+                .map_err(sql)?
+                .as_str_or_null()
+                .map_err(|e| sql(e.into()))
+        };
+        body.push(match super::kind_from_db(s(1)?) {
+            SourceKind::Winget => 0,
+            SourceKind::Scoop => 1,
+        });
+        put_str(&mut body, Some(s(0)?));
+        put_str(&mut body, Some(s(2)?));
+        put_str(&mut body, Some(s(3)?));
+        put_str(&mut body, o(4)?);
+        put_str(&mut body, Some(s(5)?));
+        put_str(&mut body, o(6)?);
+        put_str(&mut body, o(7)?);
+        put_words(&mut body, s(8)?);
+        put_words(&mut body, s(9)?);
+    }
+    Ok((assemble(n, &offsets, &body)?, n))
+}
+
+/// Writes `bytes` to `path` atomically (write `path.tmp`, then rename; retry the rename up to
+/// 5 times, 20 ms apart, because a concurrent reader on Windows can make it fail transiently).
+fn persist(path: &Path, bytes: &[u8]) -> Result<(), IndexFileError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
-    if let Err(e) = std::fs::write(&tmp, &out) {
+    if let Err(e) = std::fs::write(&tmp, bytes) {
         let _ = std::fs::remove_file(&tmp);
         return Err(IndexFileError::Io(e.to_string()));
     }
     let mut last = None;
     for attempt in 0..5 {
         match std::fs::rename(&tmp, path) {
-            Ok(()) => return Ok(entries.len()),
+            Ok(()) => return Ok(()),
             Err(e) => {
                 last = Some(e);
                 if attempt < 4 {
@@ -93,6 +141,14 @@ pub fn write(catalog: &Catalog, path: &Path) -> Result<usize, IndexFileError> {
     Err(IndexFileError::Io(
         last.map(|e| e.to_string()).unwrap_or_default(),
     ))
+}
+
+/// Encodes the catalog's search columns straight from its rows (rowid order, one connection,
+/// see `encode_catalog`) and writes `path` atomically. Returns the record count.
+pub fn write(catalog: &Catalog, path: &Path) -> Result<usize, IndexFileError> {
+    let (bytes, n) = encode_catalog(catalog)?;
+    persist(path, &bytes)?;
+    Ok(n)
 }
 
 /// Cheap validity check (header + file size only): the entry count of a well-formed file.

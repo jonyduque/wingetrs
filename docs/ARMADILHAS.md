@@ -30,6 +30,7 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 - **Abrir conexão SQLite + primeira consulta custa 11–15 ms** (medido também em Python) e 8 conexões paralelas competem no `prepare` (4 → 16–20 ms). Para leitura quente, prefira um arquivo próprio lido de uma vez (`search.idx`).
 - **`COUNT(*)` percorre a tabela**; para "está vazio?" use `EXISTS`. `Catalog::open` roda DDL do schema; para leitura use `open_read_only`.
 - **`WM_SETTINGCHANGE` custa meio segundo.** `SendMessageTimeout(HWND_BROADCAST, …, "Environment")` mediu 438–568 ms (2,5 s com uma janela lenta) e é metade do `install` real com cache (~1 s); benchmarks com `WINGETRS_TEST_ENV_KEY` não fazem broadcast e mostram ~0,5 s. Faça no máximo um por operação em lote.
+- **Leitura paralela travando dentro do `update`.** Task 54: 8 conexões só-leitura no mesmo processo que acabou de parsear e gravar o catálogo travaram juntas por 0,4–1 s (sem busy handler, 1ª linha em < 0,5 ms; mmap, WAL e espera de 2 s não explicam); uma conexão só: 55–65 ms, nunca travou. Paralelismo que ganha no harness precisa ser medido no processo real.
 - **Processos órfãos de agentes distorcem medições.** Rode `scripts/leftovers.ps1` antes de medir e depois de cada tarefa.
 
 - **Caminho do manifesto é dado externo.** `extract_to`/`extract_dir` (Task 26) e `persist`/`env_add_path`/`bin`/`shortcuts` (Task 28) aceitavam `..` e absolutos; o scoop recusa `env_add_path` fora do app ("outside of app directory") e ignora entradas vazias. Regra: tudo passa por `install::safepath`.

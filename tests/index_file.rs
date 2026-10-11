@@ -225,3 +225,121 @@ fn rewriting_while_a_reader_loops_never_fails_or_tears() {
         assert!(reads.load(Ordering::Relaxed) >= 5);
     });
 }
+/// Frozen copy of the pre-Task-54 encoder (entries -> file bytes): the file-format pin.
+fn reference_bytes(entries: &[wingetrs::core::PackageEntry]) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, s: Option<&str>) {
+        match s {
+            Some(s) => {
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            None => out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()),
+        }
+    }
+    let mut offsets = Vec::new();
+    let mut body = Vec::new();
+    for e in entries {
+        offsets.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        body.push(match e.source {
+            SourceKind::Winget => 0,
+            SourceKind::Scoop => 1,
+        });
+        put(&mut body, Some(&e.source_name));
+        put(&mut body, Some(&e.id));
+        put(&mut body, Some(&e.name));
+        put(&mut body, e.moniker.as_deref());
+        put(&mut body, Some(&e.version));
+        put(&mut body, e.publisher.as_deref());
+        put(&mut body, e.description.as_deref());
+        put(&mut body, Some(&e.tags.join(" ")));
+        put(&mut body, Some(&e.commands.join(" ")));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&offsets);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(MAGIC);
+    out
+}
+
+#[test]
+fn streamed_bytes_equal_the_frozen_entry_encoder_including_odd_whitespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    let mk = |i: usize| NewPackage {
+        id: format!("P.{i}"),
+        name: format!("Name {i} ✓"),
+        moniker: i.is_multiple_of(2).then(|| format!("m{i}")),
+        version: format!("1.{i}"),
+        publisher: i.is_multiple_of(3).then(|| "Pub".into()),
+        description: i.is_multiple_of(5).then(String::new),
+        // join(" ") of these stores doubled/leading/tab whitespace in the column;
+        // load_entries splits it, so the stored text differs from the file text.
+        tags: vec![
+            " lead".into(),
+            "a\tb".into(),
+            String::new(),
+            format!("t{i} "),
+        ],
+        commands: if i.is_multiple_of(4) {
+            vec![]
+        } else {
+            vec!["c  d".into()]
+        },
+        ..Default::default()
+    };
+    let w: Vec<NewPackage> = (0..3000).map(mk).collect();
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v",
+        1,
+        &w,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    let s: Vec<NewPackage> = (3000..3400).map(mk).collect();
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "e",
+        1,
+        &s,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    // Re-import winget so rowids are not contiguous by source (winget lands after scoop).
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v2",
+        2,
+        &w,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    let (bytes, n) = index_file::encode_catalog(&c).unwrap();
+    assert_eq!(n, 3400);
+    // Not assert_eq!: a 3400-record diff would flood the log.
+    assert!(
+        bytes == reference_bytes(&c.load_entries().unwrap()),
+        "streamed bytes differ"
+    );
+}
+
+#[test]
+fn write_writes_the_reference_bytes() {
+    let (d, db) = catalog(500);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    assert_eq!(index_file::write(&cat, &idx).unwrap(), 666);
+    assert!(
+        std::fs::read(&idx).unwrap() == reference_bytes(&cat.load_entries().unwrap()),
+        "written bytes differ"
+    );
+    assert!(!idx.with_extension("idx.tmp").exists());
+}
