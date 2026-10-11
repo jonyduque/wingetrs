@@ -916,4 +916,15 @@ mod log_tests {
         let dir = tempfile::tempdir().unwrap();
         prune_logs(&dir.path().join("nope"), 14);
     }
+
+    #[test]
+    fn stderr_filter_follows_verbosity_and_drops_dependency_noise() {
+        let f = stderr_log_filter(1);
+        assert!(f.would_enable("wingetrs::x", &Level::INFO));
+        assert!(!f.would_enable("wingetrs::x", &Level::DEBUG));
+        assert!(!f.would_enable("h2", &Level::DEBUG));
+        let f = stderr_log_filter(2);
+        assert!(f.would_enable("wingetrs::x", &Level::DEBUG));
+        assert!(!f.would_enable("hyper", &Level::DEBUG));
+    }
 }
