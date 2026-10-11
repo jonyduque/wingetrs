@@ -371,3 +371,73 @@ fn open_read_only_does_not_write_and_sees_data() {
     );
     assert!(!dir.path().join("missing.db").exists());
 }
+
+fn pfn_map(k: &str, id: &str) -> WingetMaps {
+    WingetMaps {
+        pfns: vec![(k.into(), id.into())],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn replace_keeps_map_rows_of_another_source() {
+    let pfn = pfn_map;
+    let mut c = Catalog::open_in_memory().unwrap();
+    c.replace_source(
+        "a",
+        SourceKind::Winget,
+        "1",
+        1,
+        &[pkg("A.A", "Alpha", "1")],
+        &pfn("PFN_A", "A.A"),
+    )
+    .unwrap();
+    c.replace_source(
+        "b",
+        SourceKind::Winget,
+        "1",
+        1,
+        &[pkg("B.B", "Beta", "1")],
+        &pfn("PFN_B", "B.B"),
+    )
+    .unwrap();
+    c.replace_source(
+        "a",
+        SourceKind::Winget,
+        "2",
+        2,
+        &[pkg("A.A", "Alpha", "2")],
+        &pfn("PFN_A2", "A.A"),
+    )
+    .unwrap();
+    assert_eq!(c.lookup(MapTable::Pfn, "pfn_b").unwrap(), ["B.B"]);
+    assert!(c.lookup(MapTable::Pfn, "pfn_a").unwrap().is_empty());
+    assert_eq!(c.lookup(MapTable::Pfn, "pfn_a2").unwrap(), ["A.A"]);
+}
+
+#[test]
+fn remove_source_keeps_other_sources_maps() {
+    let pfn = pfn_map;
+    let mut c = Catalog::open_in_memory().unwrap();
+    c.replace_source(
+        "a",
+        SourceKind::Winget,
+        "1",
+        1,
+        &[pkg("A.A", "Alpha", "1")],
+        &pfn("PFN_A", "A.A"),
+    )
+    .unwrap();
+    c.replace_source(
+        "b",
+        SourceKind::Winget,
+        "1",
+        1,
+        &[pkg("B.B", "Beta", "1")],
+        &pfn("PFN_B", "B.B"),
+    )
+    .unwrap();
+    assert_eq!(c.remove_source("a").unwrap(), 1);
+    assert_eq!(c.lookup(MapTable::Pfn, "pfn_b").unwrap(), ["B.B"]);
+    assert!(c.lookup(MapTable::Pfn, "pfn_a").unwrap().is_empty());
+}

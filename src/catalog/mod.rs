@@ -165,17 +165,45 @@ pub(crate) fn rowid_ranges(lo: i64, hi: i64) -> Vec<(i64, i64)> {
         .collect()
 }
 
+struct DeletedRows {
+    packages: usize,
+    /// Map tables emptied by a `DELETE` without `WHERE`.
+    truncated_maps: usize,
+}
+
 /// Deletes map rows and packages of `source` (not its meta row).
-fn delete_source_rows(tx: &rusqlite::Transaction<'_>, source: &str) -> Result<usize, CatalogError> {
+/// A map table whose rows all belong to `source` is emptied at once (SQLite truncate path);
+/// a foreign or orphan row keeps the per-row delete.
+fn delete_source_rows(
+    tx: &rusqlite::Transaction<'_>,
+    source: &str,
+) -> Result<DeletedRows, CatalogError> {
+    let mut truncated_maps = 0;
     for t in MAP_TABLES {
-        tx.execute(
+        let foreign: bool = tx.query_row(
             &format!(
-                "DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"
+                "SELECT EXISTS(SELECT 1 FROM {t} WHERE package NOT IN (SELECT rowid FROM packages WHERE source = ?1))"
             ),
             params![source],
+            |r| r.get(0),
         )?;
+        if foreign {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"
+                ),
+                params![source],
+            )?;
+        } else {
+            tx.execute(&format!("DELETE FROM {t}"), [])?;
+            truncated_maps += 1;
+        }
     }
-    Ok(tx.execute("DELETE FROM packages WHERE source = ?1", params![source])?)
+    let packages = tx.execute("DELETE FROM packages WHERE source = ?1", params![source])?;
+    Ok(DeletedRows {
+        packages,
+        truncated_maps,
+    })
 }
 
 pub struct Catalog {
@@ -292,7 +320,7 @@ impl Catalog {
     /// Removes a source with its packages, map rows and meta; returns the packages removed.
     pub fn remove_source(&mut self, source: &str) -> Result<usize, CatalogError> {
         let tx = self.conn.transaction()?;
-        let n = delete_source_rows(&tx, source)?;
+        let n = delete_source_rows(&tx, source)?.packages;
         tx.execute("DELETE FROM meta WHERE source = ?1", params![source])?;
         tx.commit()?;
         Ok(n)
@@ -309,7 +337,11 @@ impl Catalog {
     ) -> Result<ImportStats, CatalogError> {
         // Dropping `tx` on an early return rolls the whole import back.
         let tx = self.conn.transaction()?;
-        delete_source_rows(&tx, source)?;
+        let deleted = delete_source_rows(&tx, source)?;
+        tracing::debug!(
+            truncated_maps = deleted.truncated_maps,
+            "catalog: replaced source rows"
+        );
         let mut rowids: HashMap<&str, i64> = HashMap::with_capacity(packages.len());
         {
             let mut ins = tx.prepare(&format!(
@@ -494,5 +526,151 @@ impl Catalog {
             .conn
             .query_row("SELECT EXISTS(SELECT 1 FROM packages)", [], |r| r.get(0))?;
         Ok(n == 0)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn pkg(id: &str) -> NewPackage {
+        NewPackage {
+            id: id.into(),
+            name: id.into(),
+            version: "1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn maps(ids: &[&str]) -> WingetMaps {
+        let pairs = |p: &str| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|id| (format!("{p}_{id}"), (*id).to_string()))
+                .collect()
+        };
+        WingetMaps {
+            productcodes: pairs("PC"),
+            upgradecodes: pairs("UC"),
+            pfns: pairs("PFN"),
+            norm_names: pairs("nn"),
+            norm_publishers: pairs("np"),
+        }
+    }
+
+    /// Everything a reader can observe: packages with rowid, map rows as a multiset, meta,
+    /// and integrity.
+    fn content(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut q = |sql: &str| {
+            let mut st = conn.prepare(sql).unwrap();
+            let rows = st
+                .query_map([], |r| {
+                    (0..r.as_ref().column_count())
+                        .map(|i| r.get_ref(i).map(|v| format!("{v:?}")))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            for row in rows {
+                out.push(row.unwrap().join("|"));
+            }
+        };
+        q("SELECT rowid, * FROM packages ORDER BY rowid");
+        for t in MAP_TABLES {
+            q(&format!(
+                "SELECT '{t}', key, package FROM {t} ORDER BY key, package"
+            ));
+        }
+        q("SELECT * FROM meta ORDER BY source");
+        q("PRAGMA integrity_check");
+        out
+    }
+
+    /// Pre-change algorithm, literal: per-row delete in every map table.
+    fn delete_per_row(tx: &rusqlite::Transaction<'_>, source: &str) -> usize {
+        for t in MAP_TABLES {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)"
+                ),
+                params![source],
+            )
+            .unwrap();
+        }
+        tx.execute("DELETE FROM packages WHERE source = ?1", params![source])
+            .unwrap()
+    }
+
+    fn winget_only(c: &mut Catalog) {
+        c.replace_source(
+            "winget",
+            SourceKind::Winget,
+            "v",
+            1,
+            &[pkg("W.1"), pkg("W.2"), pkg("W.3")],
+            &maps(&["W.1", "W.2", "W.3"]),
+        )
+        .unwrap();
+        c.replace_source(
+            "scoop:main",
+            SourceKind::Scoop,
+            "e",
+            1,
+            &[pkg("S.1"), pkg("S.2")],
+            &WingetMaps::default(),
+        )
+        .unwrap();
+    }
+
+    fn two_owners(c: &mut Catalog) {
+        winget_only(c);
+        c.replace_source(
+            "other",
+            SourceKind::Winget,
+            "o",
+            1,
+            &[pkg("O.1")],
+            &maps(&["O.1"]),
+        )
+        .unwrap();
+    }
+
+    fn orphan_pfn(c: &mut Catalog) {
+        winget_only(c);
+        c.conn
+            .execute(
+                "INSERT INTO map_pfn (key, package) VALUES ('orphan', 999999)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn check(setup: fn(&mut Catalog), source: &str, truncated: usize) {
+        let mut a = Catalog::open_in_memory().unwrap();
+        let mut b = Catalog::open_in_memory().unwrap();
+        setup(&mut a);
+        setup(&mut b);
+        let tx = a.conn.transaction().unwrap();
+        let got = delete_source_rows(&tx, source).unwrap();
+        tx.commit().unwrap();
+        let tx = b.conn.transaction().unwrap();
+        let want = delete_per_row(&tx, source);
+        tx.commit().unwrap();
+        assert_eq!(got.packages, want, "{source}");
+        assert_eq!(got.truncated_maps, truncated, "{source}");
+        assert_eq!(content(&a.conn), content(&b.conn), "{source}");
+    }
+
+    #[test]
+    fn truncating_owned_map_tables_equals_the_per_row_delete() {
+        // Only winget has maps: every table is truncated.
+        check(winget_only, "winget", 5);
+        // A source without maps sees winget rows: nothing truncated.
+        check(winget_only, "scoop:main", 0);
+        // Two sources with maps: per-row path for both, the other source's rows stay.
+        check(two_owners, "winget", 0);
+        check(two_owners, "other", 0);
+        // An orphan row counts as foreign: map_pfn keeps it, the other four are truncated.
+        check(orphan_pfn, "winget", 4);
     }
 }
