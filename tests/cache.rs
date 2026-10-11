@@ -112,7 +112,8 @@ fn acquire_timeout_waits_then_gives_up() {
     let el = start.elapsed();
     assert!(r.is_none());
     assert!(
-        el >= Duration::from_millis(300) && el < Duration::from_secs(2),
+        // Lower bound only: an upper bound would measure the machine, not the rule.
+        el >= Duration::from_millis(300),
         "{el:?}"
     );
 }

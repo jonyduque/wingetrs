@@ -173,16 +173,16 @@ async fn no_wait_returns_busy_immediately() {
     let _held = wingetrs::cache::UpdateLock::try_acquire(&data.lock_path())
         .unwrap()
         .unwrap();
-    let t = std::time::Instant::now();
-    let e = run_update(&data, &ep, &Http::new().unwrap(), true, LockWait::NoWait)
-        .await
-        .unwrap_err();
+    // The lock stays held for the whole call, so a run that waited (default 30 s) could only end
+    // by the 60 s hang detector; no millisecond threshold.
+    let e = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run_update(&data, &ep, &Http::new().unwrap(), true, LockWait::NoWait),
+    )
+    .await
+    .expect("NoWait must not wait for the held lock")
+    .unwrap_err();
     assert!(matches!(e, UpdateError::Busy), "{e:?}");
-    assert!(
-        t.elapsed() < std::time::Duration::from_millis(100),
-        "{:?}",
-        t.elapsed()
-    );
 }
 
 #[test]

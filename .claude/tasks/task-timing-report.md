@@ -22,3 +22,11 @@
 - tests/correlate.rs:253-274 `elapsed < 500 ms`
 - tests/http.rs:91-102, install_download.rs:181-297 use server delays vs client timeouts (design-timing, margins 3-5x)
 - tests/install_win_scan.rs:188-191 only records times (no assert seen)
+
+## Second pass (remaining timing asserts)
+- tests/update.rs no_wait_returns_busy_immediately: `<100ms` -> call wrapped in tokio timeout(60 s) with the lock held; mutation NoWait=>600 s in src/update.rs: [OK] mutação PEGA.
+- tests/install_ops.rs busy_lock_with_nowait_is_busy: `<2s` -> same timeout(60 s) wrapper; mutation NoWait=>600 s in src/install/ops.rs: [OK] mutação PEGA.
+- tests/cache.rs acquire_timeout_waits_then_gives_up: dropped upper bound, kept `>=300ms` (cannot flake); mutation `left = ZERO` in acquire_timeout: [OK] mutação PEGA.
+- tests/install_ops.rs apply_downloads_the_batch_in_parallel: server delay 400 -> 2000 ms, bound = the delay (gap expected a few ms, so >=10x margin; sequential gap >= delay by construction). Not a pure ordering proof (wiremock delay is not observable per-completion). Mutation Semaphore::new(1) in download.rs: [OK] mutação PEGA. Cost: test now ~2 s.
+- tests/correlate.rs live_list_runs_under_budget: unchanged. It is #[ignore = live] (outside the gate) and its rule IS a perf budget (500 ms, release only); left as is.
+5x loops of update/cache/install_ops all green; gate green (477 passed).

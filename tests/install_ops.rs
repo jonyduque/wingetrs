@@ -411,12 +411,11 @@ async fn busy_lock_with_nowait_is_busy() {
         .unwrap()
         .unwrap();
     let ctx = w.ctx_with(LockWait::NoWait, &nothing_in_use);
-    let t = std::time::Instant::now();
-    assert!(matches!(apply(&ctx, &plans).await, Err(OpsError::Busy)));
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(2),
-        "NoWait never waits"
-    );
+    // The lock stays held during the call: a waiting apply could only end by the hang detector.
+    let r = tokio::time::timeout(std::time::Duration::from_secs(60), apply(&ctx, &plans))
+        .await
+        .expect("NoWait never waits");
+    assert!(matches!(r, Err(OpsError::Busy)));
     assert!(!w.layout.app_dir("leaf").exists(), "nothing ran");
     drop(held);
     apply(&ctx, &plans).await.unwrap();
@@ -1060,7 +1059,7 @@ async fn apply_downloads_the_batch_in_parallel() {
     let mut w = World::new().await;
     for id in ["a", "b", "c"] {
         w.add(App {
-            delay_ms: 400,
+            delay_ms: 2000,
             ..app(id, &[])
         })
         .await;
@@ -1069,8 +1068,9 @@ async fn apply_downloads_the_batch_in_parallel() {
     plans.extend(w.plans("b").unwrap());
     plans.extend(w.plans("c").unwrap());
     apply(&w.ctx(), &plans).await.unwrap();
-    // Each response is delayed 400 ms: if the last request arrived before the first response
-    // could have finished, the downloads overlapped. No absolute wall-clock threshold.
+    // Each response is delayed 2000 ms: sequential downloads would put the last request at least
+    // one full delay after the first (structural), parallel ones a few ms. The bound is the
+    // delay itself, >=10x the expected gap; it is a ratio, not an absolute machine-speed budget.
     let arrivals = w.arrivals.lock().unwrap().clone();
     assert_eq!(arrivals.len(), 3);
     let (first, last) = (
@@ -1078,7 +1078,7 @@ async fn apply_downloads_the_batch_in_parallel() {
         arrivals.iter().max().unwrap(),
     );
     assert!(
-        last.duration_since(*first) < std::time::Duration::from_millis(400),
+        last.duration_since(*first) < std::time::Duration::from_millis(2000),
         "downloads did not overlap: {:?}",
         last.duration_since(*first)
     );
