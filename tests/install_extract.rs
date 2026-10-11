@@ -465,4 +465,57 @@ mod limits {
         );
         assert!(!dest.exists());
     }
+
+    #[test]
+    fn zip_declared_size_over_budget_is_refused_even_if_content_is_small() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.zip");
+        let small = vec![7u8; 1024];
+        let mut bytes = zip_with(&[("small.bin", &small)]);
+        lie_about_size(&mut bytes, 4 << 20);
+        std::fs::write(&f, bytes).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.zip", &dest, &lim(100, 1 << 20, 10));
+        assert!(
+            matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 1 << 20),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+        run(&f, "a.zip", &dest, &lim(100, 8 << 20, 10)).unwrap();
+        assert_eq!(std::fs::read(dest.join("small.bin")).unwrap(), small);
+    }
+
+    #[test]
+    fn tar_gz_skipped_entries_count_against_the_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.tar.gz");
+        let big = vec![0u8; 2 << 20];
+        std::fs::write(
+            &f,
+            targz_with(&[("other/big.bin", &big), ("pkg/a.txt", b"a")], None),
+        )
+        .unwrap();
+        let with_dir = |dest: &Path, floor: u64| {
+            extract_all_with(
+                &[ExtractSource {
+                    file: &f,
+                    file_name: "a.tar.gz",
+                    extract_dir: Some("pkg"),
+                    extract_to: None,
+                }],
+                dest,
+                &lim(100, floor, 10),
+            )
+        };
+        let dest = d.path().join("out");
+        let r = with_dir(&dest, 1 << 20);
+        assert!(
+            matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 1 << 20),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+        with_dir(&dest, 4 << 20).unwrap();
+        assert!(dest.join("a.txt").exists());
+        assert!(!dest.join("big.bin").exists());
+    }
 }

@@ -288,6 +288,7 @@ fn extract_zip(
         if e.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             return Err(ExtractError::UnsafePath(e.name().to_string()));
         }
+        // Counts entries filtered out by extract_dir too: conservative on purpose.
         declared = declared.saturating_add(e.size());
     }
     if declared > budget.limit {
@@ -333,11 +334,15 @@ fn extract_tar_gz(
             return Err(ExtractError::UnsafePath(name));
         }
         let is_dir = ty.is_dir();
-        if !is_dir && !ty.is_file() {
-            continue;
-        }
-        if let Some(rel) = mapper.map(comps) {
-            write_entry(root, &rel, is_dir, &mut entry, &mut budget)?;
+        let rel = if is_dir || ty.is_file() {
+            mapper.map(comps)
+        } else {
+            None
+        };
+        match rel {
+            Some(rel) => write_entry(root, &rel, is_dir, &mut entry, &mut budget)?,
+            // Skipped entries are still decompressed by the tar reader: charge them too.
+            None => budget.charge(entry.size())?,
         }
     }
     Ok(())
