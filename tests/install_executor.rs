@@ -1040,8 +1040,14 @@ async fn failure_after_replacing_a_kept_version_restores_it() {
     for k in [link_at, record_at] {
         let (s, back) = kept_v1_world().await;
         let mut ctx = s.ctx_with_hook(&FailAt(k));
-        let err = wingetrs::install::executor::execute_install(&back, &mut ctx).await;
-        assert!(err.is_err(), "step {k}");
+        let err = wingetrs::install::executor::execute_install(&back, &mut ctx)
+            .await
+            .unwrap_err();
+        // The failure must come from the injected step, after Promote replaced the folder.
+        match err {
+            ExecError::Failed { index, .. } => assert_eq!(index, k, "failed elsewhere"),
+            other => panic!("unexpected error: {other}"),
+        }
         assert!(
             s.layout
                 .version_dir("app", "1.0")
@@ -1080,5 +1086,46 @@ async fn promote_still_refuses_the_folder_current_points_to() {
     let v1 = s.layout.version_dir("app", "1.0");
     assert!(v1.join("tool.exe").exists());
     assert!(v1.join("mine.txt").exists(), "1.0 untouched");
+    assert!(current_target(&s).ends_with("1.0"));
+}
+
+#[tokio::test]
+async fn replaced_name_already_taken_picks_another() {
+    let (s, back) = kept_v1_world().await;
+    // Stale asides from a "crashed run" of this process, covering the next candidates.
+    for seq in 0..32 {
+        let d = s
+            .layout
+            .app_dir("app")
+            .join(format!(".replaced-1.0-{}-{seq}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("old.txt"), b"x").unwrap();
+    }
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    wingetrs::install::executor::execute_install(&back, &mut ctx)
+        .await
+        .unwrap();
+    assert!(current_target(&s).ends_with("1.0"));
+    assert!(
+        !s.layout
+            .version_dir("app", "1.0")
+            .join("stale.txt")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn stale_replaced_folders_are_swept_after_success() {
+    let s = setup().await;
+    let app = s.layout.app_dir("app");
+    let stale = app.join(".replaced-x");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("old.txt"), b"x").unwrap();
+    let real = s.layout.version_dir("app", "0.5");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("keep.txt"), b"x").unwrap();
+    install(&s, &s.plan).await;
+    assert!(!stale.exists(), "stale .replaced-* swept");
+    assert!(real.join("keep.txt").exists(), "real version folder kept");
     assert!(current_target(&s).ends_with("1.0"));
 }

@@ -399,7 +399,7 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
     }
     // Same policy as removing the old version: the install stands, failures are warnings.
     remove_upgrade_leftovers(&run, ctx);
-    remove_replaced_folders(&run);
+    remove_replaced_folders(&run, ctx.layout);
     for (i, step) in cleanup {
         let Step::RemoveOldVersion { version } = step else {
             continue;
@@ -446,22 +446,62 @@ fn remove_upgrade_leftovers(run: &Run<'_>, ctx: &mut ExecCtx<'_>) {
     }
 }
 
-/// Version folders moved aside by `Promote` (a kept copy of the version being installed).
-fn remove_replaced_folders(run: &Run<'_>) {
+/// Version folders moved aside by `Promote` (a kept copy of the version being installed),
+/// then any `.replaced-*` a crashed run left in this app's folder.
+fn remove_replaced_folders(run: &Run<'_>, layout: &Layout) {
+    let app = run.plan.app.as_str();
+    let warn = |p: &Path, e: &dyn std::fmt::Display| {
+        tracing::warn!("{app}: a cópia antiga {} ficou: {e}", p.display());
+    };
     for (_, u) in &run.journal {
         if let Undo::RestoreAside { aside, .. } = u
             && let Err(e) = remove_any(aside)
         {
-            tracing::warn!(
-                "{}: a cópia antiga {} ficou: {e}",
-                run.plan.app,
-                aside.display()
-            );
+            warn(aside, &e);
+        }
+    }
+    let entries = match fs::read_dir(layout.app_dir(app)) {
+        Ok(entries) => entries,
+        Err(e) => return warn(&layout.app_dir(app), &e),
+    };
+    let current = layout.current(app);
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let stale = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(REPLACED_PREFIX));
+        if !stale || current_points_to(&current, &p) {
+            continue;
+        }
+        if let Err(e) = remove_any(&p) {
+            warn(&p, &e);
         }
     }
 }
 
+const REPLACED_PREFIX: &str = ".replaced-";
 static ASIDE_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Names tried before giving up on a free `.replaced-*` (a crashed run may have left some).
+const ASIDE_TRIES: usize = 64;
+
+/// A free `apps\<app>\.replaced-<version>-<pid>-<seq>` path.
+fn free_aside(layout: &Layout, app: &str, version: &str) -> Result<PathBuf, String> {
+    for _ in 0..ASIDE_TRIES {
+        let aside = layout.app_dir(app).join(format!(
+            "{REPLACED_PREFIX}{version}-{}-{}",
+            std::process::id(),
+            ASIDE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::symlink_metadata(&aside).is_err() {
+            return Ok(aside);
+        }
+    }
+    Err(format!(
+        "nenhum nome livre para afastar {}",
+        layout.version_dir(app, version).display()
+    ))
+}
 
 /// True when `current` resolves to `dir` (both normalized; a broken link never matches).
 fn current_points_to(current: &Path, dir: &Path) -> bool {
@@ -559,11 +599,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 }
                 // A copy of this version left on disk (kept on upgrade, or a failed removal):
                 // replaced, and put back if anything below fails.
-                let aside = layout.app_dir(app).join(format!(
-                    ".replaced-{version}-{}-{}",
-                    std::process::id(),
-                    ASIDE_SEQ.fetch_add(1, Ordering::Relaxed)
-                ));
+                let aside = free_aside(layout, app, version)?;
                 fs::rename(&vdir, &aside).map_err(|e| io_msg(&vdir, e))?;
                 run.push(Undo::RestoreAside {
                     aside,
