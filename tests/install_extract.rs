@@ -262,3 +262,207 @@ fn many_sources_land_in_dest_with_a_single_move_and_failure_leaves_nothing() {
     assert!(matches!(r, Err(ExtractError::UnsafePath(_))));
     assert!(!dest2.exists());
 }
+
+mod limits {
+    use super::{targz_with, zip_with};
+    use std::path::Path;
+    use wingetrs::install::extract::{
+        DEFAULT_LIMITS, ExtractError, ExtractSource, Limits, extract_all_with,
+    };
+
+    fn lim(ratio: u64, floor: u64, max_entries: u64) -> Limits {
+        Limits {
+            ratio,
+            floor,
+            ceiling: 1 << 40,
+            max_entries,
+        }
+    }
+
+    fn run(file: &Path, name: &str, dest: &Path, l: &Limits) -> Result<(), ExtractError> {
+        extract_all_with(
+            &[ExtractSource {
+                file,
+                file_name: name,
+                extract_dir: None,
+                extract_to: None,
+            }],
+            dest,
+            l,
+        )
+    }
+
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn leftovers(parent: &Path) -> usize {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wingetrs-extract-")
+            })
+            .count()
+    }
+
+    #[test]
+    fn zip_over_the_byte_budget_is_refused_before_writing() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.zip");
+        let big = vec![0u8; 2 << 20];
+        std::fs::write(&f, zip_with(&[("big.bin", &big)])).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.zip", &dest, &lim(100, 1 << 20, 10));
+        assert!(
+            matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 1 << 20),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+        run(&f, "a.zip", &dest, &lim(100, 4 << 20, 10)).unwrap();
+        assert_eq!(
+            std::fs::metadata(dest.join("big.bin")).unwrap().len(),
+            2 << 20
+        );
+    }
+
+    #[test]
+    fn ratio_raises_the_budget_above_the_floor() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.zip");
+        let (a, b, c) = (noise(1 << 20, 1), noise(1 << 20, 2), noise(1 << 20, 3));
+        std::fs::write(&f, zip_with(&[("a", &a), ("b", &b), ("c", &c)])).unwrap();
+        assert!(std::fs::metadata(&f).unwrap().len() > 3 << 20);
+        run(&f, "a.zip", &d.path().join("ok"), &lim(2, 1 << 20, 10)).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.zip", &dest, &lim(0, 1 << 20, 10));
+        assert!(matches!(r, Err(ExtractError::TooLarge { .. })), "{r:?}");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn zip_with_too_many_entries_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.zip");
+        let names: Vec<String> = (0..11).map(|i| format!("f{i}")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        std::fs::write(&f, zip_with(&entries)).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.zip", &dest, &lim(100, 1 << 20, 10));
+        assert!(
+            matches!(r, Err(ExtractError::TooManyEntries { limit: 10 })),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+        run(&f, "a.zip", &dest, &lim(100, 1 << 20, 11)).unwrap();
+        assert!(dest.join("f10").exists());
+    }
+
+    #[test]
+    fn tar_gz_over_the_byte_budget_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.tar.gz");
+        let big = vec![0u8; 2 << 20];
+        std::fs::write(&f, targz_with(&[("big.bin", &big)], None)).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.tar.gz", &dest, &lim(100, 1 << 20, 10));
+        assert!(
+            matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 1 << 20),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+        run(&f, "a.tar.gz", &dest, &lim(100, 4 << 20, 10)).unwrap();
+        assert_eq!(
+            std::fs::metadata(dest.join("big.bin")).unwrap().len(),
+            2 << 20
+        );
+    }
+
+    #[test]
+    fn tar_gz_with_too_many_entries_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.tar.gz");
+        let names: Vec<String> = (0..11).map(|i| format!("f{i}")).collect();
+        let entries: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), &b"x"[..])).collect();
+        std::fs::write(&f, targz_with(&entries, None)).unwrap();
+        let parent = d.path().join("apps");
+        std::fs::create_dir(&parent).unwrap();
+        let dest = parent.join("out");
+        let r = run(&f, "a.tar.gz", &dest, &lim(100, 1 << 20, 10));
+        assert!(
+            matches!(r, Err(ExtractError::TooManyEntries { limit: 10 })),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+        assert_eq!(leftovers(&parent), 0);
+        run(&f, "a.tar.gz", &dest, &lim(100, 1 << 20, 11)).unwrap();
+        assert!(dest.join("f10").exists());
+    }
+
+    #[test]
+    fn budget_is_for_the_whole_archive_not_per_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.tar.gz");
+        let part = vec![0u8; 600 << 10];
+        std::fs::write(&f, targz_with(&[("a.bin", &part), ("b.bin", &part)], None)).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.tar.gz", &dest, &lim(100, 1 << 20, 10));
+        assert!(matches!(r, Err(ExtractError::TooLarge { .. })), "{r:?}");
+        assert!(!dest.exists());
+        run(&f, "a.tar.gz", &dest, &lim(100, 2 << 20, 10)).unwrap();
+        assert!(dest.join("b.bin").exists());
+    }
+
+    #[test]
+    fn default_limits_are_the_measured_ones() {
+        assert_eq!(DEFAULT_LIMITS.ratio, 100);
+        assert_eq!(DEFAULT_LIMITS.floor, 1 << 30);
+        assert_eq!(DEFAULT_LIMITS.ceiling, 32 << 30);
+        assert_eq!(DEFAULT_LIMITS.max_entries, 200_000);
+    }
+
+    /// Rewrites the declared uncompressed size of every entry (local + central headers).
+    fn lie_about_size(bytes: &mut [u8], size: u32) {
+        let mut i = 0;
+        while i + 4 <= bytes.len() {
+            let off = match &bytes[i..i + 4] {
+                b"PK\x03\x04" => Some(22),
+                b"PK\x01\x02" => Some(24),
+                _ => None,
+            };
+            if let Some(off) = off {
+                bytes[i + off..i + off + 4].copy_from_slice(&size.to_le_bytes());
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn lying_zip_header_does_not_bypass_the_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.zip");
+        let big = vec![0u8; 2 << 20];
+        let mut bytes = zip_with(&[("big.bin", &big)]);
+        lie_about_size(&mut bytes, 1024);
+        std::fs::write(&f, bytes).unwrap();
+        let dest = d.path().join("out");
+        let r = run(&f, "a.zip", &dest, &lim(100, 1 << 20, 10));
+        // Measured: zip 8.6 streams past the declared 1 KiB; only the byte counter stops it.
+        assert!(
+            matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 1 << 20),
+            "{r:?}"
+        );
+        assert!(!dest.exists());
+    }
+}
