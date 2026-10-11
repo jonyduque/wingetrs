@@ -120,6 +120,7 @@ fn garbage_is_an_error_not_a_panic() {
         r#"{"version":1}"#,
         r#"{"version":"1","url":5,"hash":"x"}"#,
         r#"{"version":"1","bin":[[]]}"#,
+        r#"{"version":"1","bin":[["a.exe","a","x",5]]}"#,
     ] {
         assert!(resolve(s, Arch::X64).is_err(), "{s}");
     }
@@ -231,4 +232,45 @@ fn host_arch_preference_and_hash_parse() {
     assert!(HashSpec::parse("zzz:ab").is_none());
     let h = HashSpec::parse("ABC").unwrap();
     assert_eq!((h.algo, h.hex.as_str()), (HashAlgo::Sha256, "abc"));
+}
+
+fn bin_json(bin: &str) -> String {
+    format!(
+        r#"{{"version":"1","url":"https://x/z.zip","hash":"{}","bin":{bin}}}"#,
+        "a".repeat(64)
+    )
+}
+
+#[test]
+fn bin_with_four_elements_joins_the_extra_args() {
+    let j = bin_json(r#"[["zigup.exe","zigup","--path-link","\"$persist_dir\\zig\\zig.exe\""]]"#);
+    let r = resolve(&j, Arch::X64).unwrap();
+    assert_eq!(r.bin[0].alias.as_deref(), Some("zigup"));
+    assert_eq!(
+        r.bin[0].args.as_deref(),
+        Some(r#"--path-link "$persist_dir\zig\zig.exe""#)
+    );
+}
+
+#[test]
+fn bin_with_five_elements_joins_all_three() {
+    let r = resolve(
+        &bin_json(r#"[["s.exe","s","-a 1","-b 2","-c 3"]]"#),
+        Arch::X64,
+    )
+    .unwrap();
+    assert_eq!(r.bin[0].args.as_deref(), Some("-a 1 -b 2 -c 3"));
+}
+
+#[test]
+fn bin_with_three_and_two_elements_is_unchanged() {
+    let r = resolve(
+        &bin_json(r#"[["a.exe","a","--x"],["b.exe","b"],"c.exe"]"#),
+        Arch::X64,
+    )
+    .unwrap();
+    assert_eq!(r.bin[0].args.as_deref(), Some("--x"));
+    assert_eq!(r.bin[1].args, None);
+    assert_eq!(r.bin[2].alias, None);
+    assert_eq!(r.bin[2].args, None);
 }

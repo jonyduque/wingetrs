@@ -37,6 +37,8 @@ pub enum PlanError {
     ShimConflict(String),
     #[error("caminho inseguro no manifesto: {0}")]
     UnsafePath(String),
+    #[error("argumento inseguro no manifesto: {0}")]
+    UnsafeArgs(String),
 }
 
 /// Replaces scoop manifest variables (`$dir`, `$persist_dir`, `$version`, `$app`,
@@ -226,14 +228,24 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
 
     let mut names = HashSet::new();
     for b in &m.bin {
-        let name = b.alias.clone().unwrap_or_else(|| stem(&b.path));
+        let name = match b.alias.as_deref() {
+            Some(a) if !a.is_empty() => a.to_string(),
+            _ => stem(&b.path),
+        };
+        if !crate::install::shim::is_safe_shim_name(&name) {
+            return Err(PlanError::UnsafePath(name));
+        }
+        let args = b.args.as_deref().map(sub);
+        if let Some(a) = args.as_deref().filter(|a| a.chars().any(char::is_control)) {
+            return Err(PlanError::UnsafeArgs(format!("{a:?}")));
+        }
         if !names.insert(name.to_lowercase()) {
             return Err(PlanError::ShimConflict(name));
         }
         steps.push(Step::Shim(ShimSpec {
             name,
             target: join_rel(&current, &b.path)?,
-            args: b.args.as_deref().map(sub),
+            args,
             kind: shim_kind(&b.path),
         }));
     }

@@ -319,15 +319,16 @@ pub fn resolve(raw_json: &str, host: Arch) -> Result<Resolved, ManifestError> {
     }
 
     let sources = build_sources(root, variant)?;
-    let bin = tuple_items(field(root, variant, "bin"), "bin", 3)?
+    let bin = tuple_items(field(root, variant, "bin"), "bin", usize::MAX)?
         .into_iter()
         .map(|t| {
             let mut it = t.into_iter();
-            BinEntry {
-                path: it.next().unwrap_or_default(),
-                alias: it.next(),
-                args: it.next(),
-            }
+            let path = it.next().unwrap_or_default();
+            let alias = it.next();
+            // scoop interpolates the remaining elements joined by `$OFS` (one space).
+            let rest: Vec<String> = it.collect();
+            let args = (!rest.is_empty()).then(|| rest.join(" "));
+            BinEntry { path, alias, args }
         })
         .collect();
     let mut shortcuts = Vec::new();

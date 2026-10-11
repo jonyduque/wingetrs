@@ -391,3 +391,66 @@ fn persist_with_a_different_target() {
     assert_eq!(ps[0].in_persist, PathBuf::from("settings.ini"));
     assert_eq!(ps[0].kind, PersistKind::File);
 }
+
+fn plan_bin(bin: &str) -> Result<wingetrs::install::plan::InstallPlan, PlanError> {
+    let j = format!(
+        r#"{{"version":"1","url":"https://x/z.zip","hash":"{}","bin":{bin}}}"#,
+        "a".repeat(64)
+    );
+    let m = resolve(&j, Arch::X64).unwrap();
+    let l = root();
+    plan_install(&PlanInput {
+        app: "app",
+        bucket: "main",
+        manifest: &m,
+        layout: &l,
+        shortcut_root: Path::new(SC),
+        installed: None,
+        launcher_present: false,
+        keep_old: false,
+        manifest_sha256: "",
+    })
+}
+
+fn shims(p: &wingetrs::install::plan::InstallPlan) -> Vec<(String, Option<String>)> {
+    p.steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Shim(x) => Some((x.name.clone(), x.args.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn zigup_args_are_substituted() {
+    let p = plan_bin(r#"[["zigup.exe","zigup","--path-link","\"$persist_dir\\zig\\zig.exe\""]]"#)
+        .unwrap();
+    let expected = format!(
+        "--path-link \"{}\\zig\\zig.exe\"",
+        root().persist_dir("app").display()
+    );
+    assert_eq!(shims(&p), [("zigup".to_string(), Some(expected))]);
+}
+
+#[test]
+fn empty_alias_falls_back_to_the_file_stem() {
+    let p = plan_bin(r#"[["tools\\run.exe",""]]"#).unwrap();
+    assert_eq!(shims(&p)[0].0, "run");
+}
+
+#[test]
+fn unsafe_shim_alias_is_refused_by_the_planner() {
+    for alias in ["..\\\\evil", "a/b", "CON", "x."] {
+        let r = plan_bin(&format!(r#"[["a.exe","{alias}"]]"#));
+        assert!(matches!(r, Err(PlanError::UnsafePath(_))), "{alias}: {r:?}");
+    }
+    assert!(plan_bin(r#"[["a.exe","ok"]]"#).is_ok());
+}
+
+#[test]
+fn control_characters_in_args_are_refused() {
+    let r = plan_bin(r#"[["a.exe","a","--x\r\npath = C:\\evil.exe"]]"#);
+    assert!(matches!(r, Err(PlanError::UnsafeArgs(_))), "{r:?}");
+    assert!(plan_bin(r#"[["a.exe","a","--x path = C:\\evil.exe"]]"#).is_ok());
+}

@@ -144,10 +144,13 @@ fn read_header(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// A shim name must be exactly one safe path component (it comes from a manifest alias).
+pub(crate) fn is_safe_shim_name(name: &str) -> bool {
+    !name.contains(['/', '\\'])
+        && crate::install::safepath::safe_components(name).is_some_and(|c| c.len() == 1)
+}
+
 fn check_name(name: &str) -> Result<(), ShimError> {
-    let ok = !name.contains(['/', '\\'])
-        && crate::install::safepath::safe_components(name).is_some_and(|c| c.len() == 1);
-    if ok {
+    if is_safe_shim_name(name) {
         Ok(())
     } else {
         Err(ShimError::Io(format!("nome de shim inseguro: {name}")))
