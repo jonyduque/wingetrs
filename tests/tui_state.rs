@@ -661,3 +661,89 @@ fn update_reraises_a_worker_panic() {
     }));
     assert!(r.is_err());
 }
+
+#[test]
+fn boot_with_an_unreadable_catalog_keeps_entries_shows_the_error_and_refreshes() {
+    let mut a = app();
+    let before = a.search.entries().len();
+    assert!(before > 0);
+    let cmds = update(
+        &mut a,
+        Msg::Booted {
+            catalog: Err("file is not a database".into()),
+            age: None,
+            needs_refresh: false,
+        },
+    );
+    let status = a.status.clone().unwrap_or_default();
+    assert!(status.contains("falha ao ler o catálogo"), "{status}");
+    assert!(status.contains("file is not a database"), "{status}");
+    assert_eq!(a.search.entries().len(), before);
+    assert_eq!(
+        cmds,
+        vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]
+    );
+}
+
+#[test]
+fn boot_with_a_populated_fresh_catalog_loads_it_and_does_not_refresh() {
+    let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+    a.status = Some("carregando catálogo…".into());
+    let cmds = update(
+        &mut a,
+        Msg::Booted {
+            catalog: Ok(vec![
+                entry(SourceKind::Scoop, "ripgrep", "ripgrep"),
+                entry(SourceKind::Winget, "Zeal.Zeal", "Zeal"),
+            ]),
+            age: Some(42),
+            needs_refresh: false,
+        },
+    );
+    assert_eq!(a.search.entries().len(), 2);
+    assert_eq!(a.status, None);
+    assert_eq!(a.index_age_secs, Some(42));
+    assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+}
+
+#[test]
+fn boot_refreshes_when_the_catalog_is_empty_or_stale() {
+    let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+    let cmds = update(
+        &mut a,
+        Msg::Booted {
+            catalog: Ok(vec![]),
+            age: None,
+            needs_refresh: false,
+        },
+    );
+    assert_eq!(
+        cmds,
+        vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]
+    );
+    let mut b = App::new(Vec::new(), GlyphSet::Nerd);
+    let cmds = update(
+        &mut b,
+        Msg::Booted {
+            catalog: Ok(vec![entry(SourceKind::Scoop, "ripgrep", "ripgrep")]),
+            age: Some(5000),
+            needs_refresh: true,
+        },
+    );
+    assert_eq!(
+        cmds,
+        vec![Cmd::ScanInstalled, Cmd::Refresh { force: false }]
+    );
+}
+
+#[test]
+fn a_failed_reload_keeps_the_entries_and_shows_the_error() {
+    let mut a = app();
+    let before = a.search.entries().len();
+    assert!(before > 0);
+    update(&mut a, Msg::CatalogFailed("database is locked".into()));
+    assert_eq!(a.search.entries().len(), before);
+    let status = a.status.clone().unwrap_or_default();
+    assert!(status.contains("falha ao ler o catálogo"), "{status}");
+    assert!(status.contains("database is locked"), "{status}");
+}

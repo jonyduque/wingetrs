@@ -37,8 +37,17 @@ pub enum Msg {
     Resize(u16, u16),
     Tick,
     CatalogLoaded(Vec<PackageEntry>),
+    /// Reloading the catalog failed; the current index is kept.
+    CatalogFailed(String),
+    /// Startup load finished: the catalog (or why it could not be read), its age and
+    /// whether the startup refresh is due.
+    Booted {
+        catalog: Result<Vec<PackageEntry>, String>,
+        age: Option<i64>,
+        needs_refresh: bool,
+    },
     InstalledLoaded(Vec<ListRow>),
-    /// Reading or correlating the installed apps failed (error or worker panic).
+    /// Reading or correlating the installed apps failed (a worker panic is re-raised instead).
     InstalledFailed(String),
     DetailsLoaded {
         key: String,
@@ -355,6 +364,36 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.research();
             app.clamp();
             Vec::new()
+        }
+        Msg::CatalogFailed(e) => {
+            app.status = Some(format!("falha ao ler o catálogo: {e}"));
+            Vec::new()
+        }
+        Msg::Booted {
+            catalog,
+            age,
+            needs_refresh,
+        } => {
+            app.status = None;
+            app.index_age_secs = age;
+            let refresh = match catalog {
+                Ok(entries) => {
+                    let empty = entries.is_empty();
+                    app.search = SearchIndex::new(entries);
+                    app.research();
+                    app.clamp();
+                    empty || needs_refresh
+                }
+                Err(e) => {
+                    app.status = Some(format!("falha ao ler o catálogo: {e}"));
+                    true
+                }
+            };
+            let mut cmds = vec![Cmd::ScanInstalled];
+            if refresh {
+                cmds.push(Cmd::Refresh { force: false });
+            }
+            cmds
         }
         Msg::InstalledLoaded(rows) => {
             app.installed = rows;

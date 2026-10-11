@@ -1,10 +1,13 @@
 //! Install/remove/upgrade jobs of the TUI. Every function takes the `OpsCtx` as a parameter so
 //! tests drive them with fakes; `run.rs` builds the production context.
+use crate::catalog::Catalog;
+use crate::core::PackageEntry;
 use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
 use crate::tui::app::{Action, Done, InstallFail, Msg, Planned};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -48,6 +51,13 @@ pub async fn join_job(handle: tokio::task::JoinHandle<Msg>) -> Msg {
         Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
         Err(e) => Msg::Planned(Err(format!("tarefa cancelada: {e}"))),
     }
+}
+
+/// Reads every catalog entry; an unreadable catalog is an error, never an empty list.
+pub fn read_catalog(path: &Path) -> Result<Vec<PackageEntry>, String> {
+    Catalog::open(path)
+        .and_then(|c| c.load_entries())
+        .map_err(|e| e.to_string())
 }
 
 /// Main-loop side of [`join_job`]: re-raises a worker panic, passes other messages on.

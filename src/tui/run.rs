@@ -73,13 +73,6 @@ pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
     result.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
-/// What the background load found; decides the startup refresh.
-struct Boot {
-    empty: bool,
-    needs_refresh: bool,
-    age: Option<i64>,
-}
-
 fn index_age(data: &DataDir) -> Option<i64> {
     let catalog = Catalog::open(&data.catalog_path()).ok()?;
     let newest = catalog.sources().ok()?.iter().map(|s| s.fetched_at).max()?;
@@ -103,9 +96,7 @@ async fn event_loop(
     });
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
-    let (boot_tx, mut boot_rx) = tokio::sync::oneshot::channel::<Boot>();
-    let mut booting = true;
-    spawn_boot(&ctx, boot_tx);
+    spawn_boot(&ctx);
 
     loop {
         let msg = tokio::select! {
@@ -117,16 +108,6 @@ async fn event_loop(
                 None => return Ok(()),
             },
             Some(m) = rx.recv() => m,
-            Ok(boot) = &mut boot_rx, if booting => {
-                booting = false;
-                app.status = None;
-                app.index_age_secs = boot.age;
-                spawn_scan(&ctx);
-                if boot.empty || boot.needs_refresh {
-                    spawn_refresh(&ctx, false);
-                }
-                Msg::Resize(app.size.0, app.size.1)
-            }
             _ = ticker.tick(), if app.refreshing || details_loading(&app) => Msg::Tick,
         };
         let msg = jobs::propagate(msg);
@@ -173,22 +154,16 @@ fn details_loading(app: &App) -> bool {
 }
 
 /// Loads the catalog off the UI path, then reports what the startup refresh should do.
-fn spawn_boot(ctx: &Arc<Ctx>, boot_tx: tokio::sync::oneshot::Sender<Boot>) {
-    let ctx = Arc::clone(ctx);
-    tokio::task::spawn_blocking(move || {
-        let entries = Catalog::open(&ctx.data.catalog_path())
-            .and_then(|c| c.load_entries())
-            .unwrap_or_default();
-        let empty = entries.is_empty();
-        let _ = ctx.tx.send(Msg::CatalogLoaded(entries));
-        let age = index_age(&ctx.data);
-        let needs_refresh = startup_needs_refresh(&ctx);
-        let _ = boot_tx.send(Boot {
-            empty,
-            needs_refresh,
-            age,
-        });
-    });
+fn spawn_boot(ctx: &Arc<Ctx>) {
+    spawn_job(ctx, |c, _| boot_msg(c));
+}
+
+fn boot_msg(c: &Ctx) -> Msg {
+    Msg::Booted {
+        catalog: jobs::read_catalog(&c.data.catalog_path()),
+        age: index_age(&c.data),
+        needs_refresh: startup_needs_refresh(c),
+    }
 }
 
 fn startup_needs_refresh(ctx: &Ctx) -> bool {
@@ -231,52 +206,34 @@ fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
 }
 
 fn spawn_reload(ctx: &Arc<Ctx>) {
-    let ctx = Arc::clone(ctx);
-    tokio::task::spawn_blocking(move || {
-        match Catalog::open(&ctx.data.catalog_path()).and_then(|c| c.load_entries()) {
-            Ok(entries) => {
-                let _ = ctx.tx.send(Msg::CatalogLoaded(entries));
-            }
-            Err(e) => tracing::warn!("falha ao recarregar catálogo: {e}"),
+    spawn_job(ctx, |c, _| {
+        match jobs::read_catalog(&c.data.catalog_path()) {
+            Ok(e) => Msg::CatalogLoaded(e),
+            Err(e) => Msg::CatalogFailed(e),
         }
     });
 }
 
 fn spawn_scan(ctx: &Arc<Ctx>) {
-    let ctx = Arc::clone(ctx);
-    let job = tokio::task::spawn_blocking({
-        let ctx = Arc::clone(&ctx);
-        move || {
-            // Tracking loads while the collectors run; joined on every path, even if the scan panics.
-            let tracking_job = std::thread::spawn(crate::installed::winget_tracking::load_default);
-            let scan = std::panic::catch_unwind(scan_all);
-            let tracking = tracking_job.join();
-            let scan = scan.unwrap_or_else(|p| std::panic::resume_unwind(p));
-            let tracking = tracking.unwrap_or_else(|p| std::panic::resume_unwind(p));
-            for e in &scan.errors {
-                tracing::warn!("scan: {e}");
-            }
-            Catalog::open(&ctx.data.catalog_path())
-                .and_then(|c| correlate(&scan.apps, &c, &NameNormalizer::new(), &tracking))
+    spawn_job(ctx, |c, _| {
+        // Tracking loads while the collectors run; joined on every path, even if the scan panics.
+        let tracking_job = std::thread::spawn(crate::installed::winget_tracking::load_default);
+        let scan = std::panic::catch_unwind(scan_all);
+        let tracking = tracking_job.join();
+        let scan = scan.unwrap_or_else(|p| std::panic::resume_unwind(p));
+        let tracking = tracking.unwrap_or_else(|p| std::panic::resume_unwind(p));
+        for e in &scan.errors {
+            tracing::warn!("scan: {e}");
         }
-    });
-    tokio::spawn(async move {
-        let msg = match job.await {
-            Ok(Ok(rows)) => Msg::InstalledLoaded(rows),
-            Ok(Err(e)) => {
+        match Catalog::open(&c.data.catalog_path())
+            .and_then(|cat| correlate(&scan.apps, &cat, &NameNormalizer::new(), &tracking))
+        {
+            Ok(rows) => Msg::InstalledLoaded(rows),
+            Err(e) => {
                 tracing::warn!("correlação falhou: {e}");
                 Msg::InstalledFailed(e.to_string())
             }
-            Err(e) => {
-                tracing::error!("coleta de instalados falhou: {e}");
-                Msg::InstalledFailed(if e.is_panic() {
-                    "pânico interno".into()
-                } else {
-                    e.to_string()
-                })
-            }
-        };
-        let _ = ctx.tx.send(msg);
+        }
     });
 }
 

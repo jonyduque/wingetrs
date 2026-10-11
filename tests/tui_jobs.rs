@@ -278,3 +278,35 @@ fn progress_is_coalesced_to_about_twenty_per_second() {
     assert!(!t.admit(at(60), 5, Some(100)));
     assert!(t.admit(at(61), 100, Some(100)), "the final one always does");
 }
+
+#[test]
+fn read_catalog_reports_an_unreadable_file_instead_of_an_empty_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    std::fs::write(&path, vec![b'x'; 4096]).unwrap();
+    let err = jobs::read_catalog(&path).unwrap_err();
+    assert!(!err.is_empty());
+}
+
+#[test]
+fn read_catalog_of_a_good_catalog_lists_its_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "v",
+        1,
+        &[NewPackage {
+            id: "ripgrep".into(),
+            name: "ripgrep".into(),
+            version: "1".into(),
+            ..Default::default()
+        }],
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    drop(c);
+    assert_eq!(jobs::read_catalog(&path).unwrap().len(), 1);
+}
