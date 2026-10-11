@@ -147,3 +147,43 @@ fn list_without_catalog_and_without_network_fails_cleanly_and_fast() {
     assert!(!err.contains("panicked"), "{err}");
     assert!(t.elapsed() < std::time::Duration::from_secs(5));
 }
+
+fn update_with_lock_held(
+    args: &[&str],
+    timeout_ms: &str,
+) -> (std::process::Output, std::time::Duration) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("wingetrs");
+    std::fs::create_dir_all(&root).unwrap();
+    let _held = wingetrs::cache::UpdateLock::try_acquire(&root.join("update.lock"))
+        .unwrap()
+        .unwrap();
+    let t = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_wingetrs"))
+        .args(args)
+        .env("LOCALAPPDATA", dir.path())
+        .env("WINGETRS_LOCK_TIMEOUT_MS", timeout_ms)
+        .env("WINGETRS_WINGET_INDEX_URL", "http://127.0.0.1:9/x")
+        .env("WINGETRS_SCOOP_BASE_URL", "http://127.0.0.1:9")
+        .output()
+        .unwrap();
+    (out, t.elapsed())
+}
+
+#[test]
+fn background_update_gives_up_at_once_when_another_update_holds_the_lock() {
+    let (out, took) = update_with_lock_held(&["update", "--background"], "10000");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+}
+
+#[test]
+fn foreground_update_still_waits_for_the_lock() {
+    let (out, took) = update_with_lock_held(&["update"], "1500");
+    assert!(!out.status.success());
+    assert!(took >= std::time::Duration::from_millis(1400), "{took:?}");
+}

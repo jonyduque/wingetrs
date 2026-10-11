@@ -4,7 +4,10 @@ mod spans;
 use wingetrs::cache::{DataDir, HttpEntry, HttpState};
 use wingetrs::catalog::Catalog;
 use wingetrs::http::Http;
-use wingetrs::update::{Endpoints, LockWait, Outcome, UpdateError, needs_refresh, run_update};
+use wingetrs::update::{
+    Endpoints, LockWait, Outcome, RETRY_SECS, UpdateError, background_due,
+    claim_background_refresh, needs_refresh, run_update,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -310,4 +313,93 @@ async fn update_emits_a_fetch_span_per_source_and_parse_only_for_downloaded_ones
     assert_eq!(closed.count("update.catalog_write"), 2);
     assert_eq!(closed.count("update.state_save"), 1);
     assert_eq!(closed.count("update.search_idx"), 1);
+}
+
+#[test]
+fn background_refresh_backs_off_after_an_attempt() {
+    let stale = HttpState::default();
+    let now = 10_000;
+    assert!(background_due(&stale, &["u"], None, now), "nunca tentou");
+    assert!(!background_due(
+        &stale,
+        &["u"],
+        Some(now - (RETRY_SECS - 1)),
+        now
+    ));
+    assert!(background_due(&stale, &["u"], Some(now - RETRY_SECS), now));
+    assert!(
+        background_due(&stale, &["u"], Some(now + 60), now),
+        "relógio voltou: não trava"
+    );
+    let mut fresh = HttpState::default();
+    fresh.set(
+        "u",
+        HttpEntry {
+            checked_at: now - 10,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !background_due(&fresh, &["u"], None, now),
+        "catálogo novo: nada a fazer"
+    );
+}
+
+#[test]
+fn claim_records_the_attempt_and_refuses_a_second_claim_inside_the_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let urls = ["http://127.0.0.1:9/x"];
+    assert!(claim_background_refresh(&data, &urls, 10_000));
+    let read = || std::fs::read_to_string(data.refresh_attempt_path()).unwrap();
+    assert_eq!(read().trim(), "10000");
+    assert!(!claim_background_refresh(&data, &urls, 10_060));
+    assert_eq!(read().trim(), "10000", "recusa não regrava");
+    assert!(claim_background_refresh(&data, &urls, 10_000 + RETRY_SECS));
+    assert_eq!(read().trim(), (10_000 + RETRY_SECS).to_string());
+}
+
+#[test]
+fn unreadable_attempt_file_does_not_block_the_refresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    std::fs::write(data.refresh_attempt_path(), "lixo").unwrap();
+    let urls = ["http://127.0.0.1:9/x"];
+    assert!(claim_background_refresh(&data, &urls, 10_000));
+    let got = std::fs::read_to_string(data.refresh_attempt_path()).unwrap();
+    assert_eq!(got.trim(), "10000");
+}
+
+#[tokio::test]
+async fn a_failed_source_does_not_respawn_on_every_command() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        true,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    let urls: Vec<&str> = std::iter::once(ep.winget_index.as_str())
+        .chain(ep.scoop.iter().map(|(_, u)| u.as_str()))
+        .collect();
+    let now = wingetrs::cache::now_unix();
+    assert!(
+        needs_refresh(&HttpState::load(&data.http_state_path()), &urls, now),
+        "extras falhou: continua velho"
+    );
+    assert!(claim_background_refresh(&data, &urls, now));
+    for later in [1, 30, RETRY_SECS - 1] {
+        assert!(
+            !claim_background_refresh(&data, &urls, now + later),
+            "+{later}s"
+        );
+    }
 }

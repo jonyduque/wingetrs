@@ -73,6 +73,10 @@ impl DataDir {
     pub fn http_state_path(&self) -> PathBuf {
         self.root.join("http.json")
     }
+    /// Unix seconds (text) of the last detached-refresh attempt.
+    pub fn refresh_attempt_path(&self) -> PathBuf {
+        self.root.join("refresh.attempt")
+    }
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")
     }

@@ -85,6 +85,39 @@ pub fn needs_refresh(state: &HttpState, urls: &[&str], now: i64) -> bool {
     })
 }
 
+/// Minimum seconds between detached refresh attempts.
+pub const RETRY_SECS: i64 = 300;
+
+/// A detached refresh is due when a source is stale and the last attempt is at least
+/// RETRY_SECS old (or in the future: the clock went back, never block forever).
+pub fn background_due(
+    state: &HttpState,
+    urls: &[&str],
+    last_attempt: Option<i64>,
+    now: i64,
+) -> bool {
+    needs_refresh(state, urls, now) && last_attempt.is_none_or(|t| t > now || now - t >= RETRY_SECS)
+}
+
+/// Decides whether to spawn a detached refresh and records the attempt if so.
+pub fn claim_background_refresh(data: &DataDir, urls: &[&str], now: i64) -> bool {
+    let state = HttpState::load(&data.http_state_path());
+    // needs_refresh first: the attempt file is only read when a refresh could be due.
+    if !needs_refresh(&state, urls, now) {
+        return false;
+    }
+    let last = std::fs::read_to_string(data.refresh_attempt_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    if !background_due(&state, urls, last, now) {
+        return false;
+    }
+    if let Err(e) = std::fs::write(data.refresh_attempt_path(), now.to_string()) {
+        tracing::warn!(error = %e, "could not record the refresh attempt");
+    }
+    true
+}
+
 // Short-lived value; boxing the imports buys nothing.
 #[allow(clippy::large_enum_variant)]
 enum Fetched {

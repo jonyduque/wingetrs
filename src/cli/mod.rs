@@ -5,7 +5,7 @@ pub mod picker;
 #[cfg(windows)]
 mod run_win;
 
-use crate::cache::{DataDir, HttpState, now_unix};
+use crate::cache::{DataDir, now_unix};
 use crate::catalog::Catalog;
 use crate::catalog::CatalogError;
 use crate::catalog::index_file;
@@ -15,7 +15,9 @@ use crate::core::SourceKind;
 use crate::http::Http;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState, correlate};
 use crate::tui::theme::GlyphSet;
-use crate::update::{Endpoints, LockWait, Outcome, SourceReport, needs_refresh, run_update};
+use crate::update::{
+    Endpoints, LockWait, Outcome, SourceReport, UpdateError, claim_background_refresh, run_update,
+};
 use anyhow::Context;
 use std::str::FromStr;
 
@@ -448,8 +450,7 @@ fn all_urls(ep: &Endpoints) -> Vec<&str> {
 
 /// Triggers a detached refresh when any source was not checked recently.
 fn refresh_if_stale(data: &DataDir, ep: &Endpoints) {
-    let state = HttpState::load(&data.http_state_path());
-    if needs_refresh(&state, &all_urls(ep), now_unix()) {
+    if claim_background_refresh(data, &all_urls(ep), now_unix()) {
         spawn_background_update();
     }
 }
@@ -626,7 +627,18 @@ async fn run_async(
     match cmd {
         Command::Update { force, background } => {
             let ep = Endpoints::production(&cfg)?;
-            let reports = run_update(&data, &ep, &http, force, LockWait::from_env()).await?;
+            let wait = if background {
+                LockWait::NoWait
+            } else {
+                LockWait::from_env()
+            };
+            let reports = match run_update(&data, &ep, &http, force, wait).await {
+                Err(UpdateError::Busy) if background => {
+                    tracing::debug!("another update holds the lock; background refresh skipped");
+                    return Ok(());
+                }
+                other => other?,
+            };
             if !background {
                 print_reports(&reports);
             }
