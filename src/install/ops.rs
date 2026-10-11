@@ -10,7 +10,7 @@ use crate::catalog::{Catalog, CatalogError};
 use crate::core::SourceKind;
 use crate::core::version::Version;
 use crate::http::Http;
-use crate::install::download::Progress;
+use crate::install::download::{self, DownloadError, Progress};
 use crate::install::executor::{self, ExecCtx, ExecError, InUseCheck, NoHook};
 use crate::install::layout::Layout;
 use crate::install::manifest::{self, Arch, ManifestError, Resolved};
@@ -168,6 +168,8 @@ pub enum OpsError {
     Busy,
     #[error("não foi possível obter o install.lock: {0}")]
     Lock(String),
+    #[error("falha ao baixar {app}: {error}")]
+    Download { app: String, error: DownloadError },
     #[error("o estado de {0} mudou desde o planejamento; tente de novo")]
     StateChanged(String),
     #[error("{error} (já instalados: {})", .applied.join(", "))]
@@ -579,6 +581,31 @@ pub async fn apply_groups(
     Ok(merged)
 }
 
+/// Downloads every source of every plan at once (inside the lock: the blob index is not
+/// safe across processes), so a failed download aborts before any change and the executor
+/// then finds each file in the blob cache.
+async fn prefetch(ctx: &OpsCtx<'_>, plans: &[&InstallPlan]) -> Result<(), OpsError> {
+    let (apps, sources): (Vec<&str>, Vec<_>) = plans
+        .iter()
+        .flat_map(|p| {
+            p.steps.iter().filter_map(|s| match s {
+                Step::Download { source, .. } => Some((p.app.as_str(), source.clone())),
+                _ => None,
+            })
+        })
+        .unzip();
+    let results = download::fetch_each(ctx.http, ctx.data, &sources, ctx.progress).await;
+    for (app, r) in apps.into_iter().zip(results) {
+        if let Err(error) = r {
+            return Err(OpsError::Download {
+                app: app.to_string(),
+                error,
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn apply_with_targets(
     ctx: &OpsCtx<'_>,
     plans: &[InstallPlan],
@@ -588,6 +615,7 @@ async fn apply_with_targets(
     let _lock = lock_async(&layout, ctx.wait).await?;
     let mut state = open_state(&layout)?;
     let plans = revalidate(&state, plans, targets)?;
+    prefetch(ctx, &plans).await?;
     let names = env_names(plans.iter().flat_map(|p| &p.steps).filter_map(|s| match s {
         Step::EnvSet { name, .. } => Some(name.clone()),
         _ => None,

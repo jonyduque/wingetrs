@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use wingetrs::install::download::{DownloadError, fetch_all, verify};
+use wingetrs::install::download::{DownloadError, fetch_all, fetch_each, verify};
 use wingetrs::install::manifest::{HashSpec, Source};
 
 use wingetrs::cache::DataDir;
@@ -276,4 +276,50 @@ async fn at_most_four_downloads_run_at_once() {
     assert_eq!(paths.len(), 8);
     let m = max.load(Ordering::SeqCst);
     assert!((2..=4).contains(&m), "max concurrent = {m}");
+}
+
+#[tokio::test]
+async fn fetch_each_keeps_order_and_reports_each_failure() {
+    use sha2::{Digest, Sha256};
+    let hex = |b: &[u8]| -> String {
+        Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    };
+    let server = MockServer::start().await;
+    // ok1 finishes last, so an order-of-completion result would be visibly wrong.
+    Mock::given(method("GET"))
+        .and(path("/ok1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(b"one".to_vec())
+                .set_delay(std::time::Duration::from_millis(300)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/missing"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    serve(&server, "/ok2", b"two").await;
+    let td = tempfile::tempdir().unwrap();
+    let data = DataDir::new(td.path());
+    let http = Http::new().unwrap();
+    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let sources = [
+        src(&server, "/ok1", &hex(b"one")),
+        src(&server, "/missing", &hex(b"gone")),
+        src(&server, "/ok2", &hex(b"two")),
+    ];
+    let r = fetch_each(&http, &data, &sources, &progress).await;
+    assert_eq!(r.len(), 3);
+    let p1 = r[0].as_ref().unwrap();
+    assert!(r[1].is_err(), "{:?}", r[1]);
+    let p2 = r[2].as_ref().unwrap();
+    assert_eq!(*p1, data.blobs_dir().join(hex(b"one")));
+    assert_eq!(*p2, data.blobs_dir().join(hex(b"two")));
+    assert_eq!(std::fs::read(p1).unwrap(), b"one");
+    assert_eq!(std::fs::read(p2).unwrap(), b"two");
 }

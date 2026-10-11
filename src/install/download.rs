@@ -144,13 +144,28 @@ async fn download_one(
     Ok((target, name))
 }
 
-/// Returns the local path of each source's verified file (in blobs), same order as `sources`.
+/// Returns the local path of each source's verified file (in blobs), same order as `sources`;
+/// the first failure wins.
 pub async fn fetch_all(
     http: &Http,
     data: &DataDir,
     sources: &[Source],
     progress: Progress<'_>,
 ) -> Result<Vec<PathBuf>, DownloadError> {
+    fetch_each(http, data, sources, progress)
+        .await
+        .into_iter()
+        .collect()
+}
+
+/// One result per source, same order as `sources`. Cache first; at most `MAX_PARALLEL`
+/// downloads at once across all sources; `index.json` written once with the new entries.
+pub async fn fetch_each(
+    http: &Http,
+    data: &DataDir,
+    sources: &[Source],
+    progress: Progress<'_>,
+) -> Vec<Result<PathBuf, DownloadError>> {
     let idx = read_index(data);
     let sem = tokio::sync::Semaphore::new(MAX_PARALLEL);
     let tasks = sources.iter().map(|src| {
@@ -170,32 +185,25 @@ pub async fn fetch_all(
     let results = futures_util::future::join_all(tasks).await;
     let mut new_idx = idx.clone();
     let mut dirty = false;
-    let mut paths = Vec::with_capacity(results.len());
-    let mut first_err = None;
-    for r in results {
-        match r {
-            Ok((p, entry)) => {
+    let paths = results
+        .into_iter()
+        .map(|r| {
+            r.map(|(p, entry)| {
                 if let Some((k, v)) = entry
                     && !k.starts_with("sha256:")
                 {
                     new_idx.insert(k, v);
                     dirty = true;
                 }
-                paths.push(p);
-            }
-            Err(e) => {
-                first_err.get_or_insert(e);
-            }
-        }
-    }
+                p
+            })
+        })
+        .collect();
     if dirty {
         // Blobs are already verified; a lost index only costs a re-download.
         if let Err(e) = write_index(data, &new_idx) {
             tracing::warn!("não foi possível gravar blobs/index.json: {e}");
         }
     }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(paths),
-    }
+    paths
 }

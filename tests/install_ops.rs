@@ -71,6 +71,7 @@ struct App<'a> {
     version: &'a str,
     depends: &'a [&'a str],
     env: bool,
+    delay_ms: u64,
 }
 
 fn app<'a>(id: &'a str, depends: &'a [&'a str]) -> App<'a> {
@@ -79,6 +80,7 @@ fn app<'a>(id: &'a str, depends: &'a [&'a str]) -> App<'a> {
         version: "1.0",
         depends,
         env: false,
+        delay_ms: 0,
     }
 }
 
@@ -158,7 +160,11 @@ impl World {
         let name = format!("{}-{}.zip", a.id, a.version);
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(zip)
+                    .set_delay(std::time::Duration::from_millis(a.delay_ms)),
+            )
             .mount(&self.server)
             .await;
         let url = format!("{}/{name}", self.server.uri());
@@ -877,9 +883,17 @@ async fn uninstall_refuses_a_plan_made_stale_by_an_outside_change() {
 async fn failure_after_a_dependency_names_what_was_installed() {
     let mut w = World::new().await;
     w.add(app("leaf", &[])).await;
+    // `top` downloads fine but is not a zip: it fails in the executor, after `leaf`.
+    let junk = b"this is not a zip".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/top-junk.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(junk.clone()))
+        .mount(&w.server)
+        .await;
     let raw = w.add(app("top", &["leaf"])).await;
     let mut m: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    m["hash"] = serde_json::json!("0".repeat(64));
+    m["url"] = serde_json::json!(format!("{}/top-junk.zip", w.server.uri()));
+    m["hash"] = serde_json::json!(sha256_hex(&junk));
     w.put_raw("top", "1.0", m.to_string());
     let plans = w.plans("top").unwrap();
     let err = apply(&w.ctx(), &plans).await.unwrap_err();
@@ -1017,4 +1031,50 @@ async fn apply_groups_skips_a_dependency_installed_meanwhile_but_not_targets() {
     apply_groups(&w.ctx(), groups).await.unwrap();
     assert!(w.state().get("a").unwrap().is_some());
     assert!(w.state().get("b").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn apply_downloads_the_batch_in_parallel() {
+    let mut w = World::new().await;
+    for id in ["a", "b", "c"] {
+        w.add(App {
+            delay_ms: 400,
+            ..app(id, &[])
+        })
+        .await;
+    }
+    let mut plans = w.plans("a").unwrap();
+    plans.extend(w.plans("b").unwrap());
+    plans.extend(w.plans("c").unwrap());
+    let t0 = std::time::Instant::now();
+    apply(&w.ctx(), &plans).await.unwrap();
+    let ms = t0.elapsed().as_millis();
+    eprintln!("apply_downloads_the_batch_in_parallel: {ms} ms");
+    assert!(ms < 1000, "{ms} ms");
+    for id in ["a", "b", "c"] {
+        assert!(w.state().get(id).unwrap().is_some(), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn apply_fails_before_any_change_when_a_download_fails() {
+    let mut w = World::new().await;
+    w.add(app("a", &[])).await;
+    let raw = serde_json::json!({
+        "version": "1.0",
+        "url": format!("{}/b-1.0.zip", w.server.uri()),
+        "hash": "0".repeat(64),
+        "bin": "b.exe",
+    })
+    .to_string();
+    w.put_raw("b", "1.0", raw);
+    let mut plans = w.plans("a").unwrap();
+    plans.extend(w.plans("b").unwrap());
+    match apply(&w.ctx(), &plans).await {
+        Err(OpsError::Download { app, .. }) => assert_eq!(app, "b"),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.state().apps().unwrap().is_empty());
+    assert!(!w.layout.root().join("apps").join("a").exists());
+    assert_eq!(w.broadcasts(), 0);
 }
