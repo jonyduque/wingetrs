@@ -45,6 +45,19 @@ no PATH" mesmo quando outro app ainda a usa): instalados ripgrep e delta, removi
 continua no PATH; removido delta → sai. `HKCU\Environment` final idêntico ao inicial. O efeito está
 certo; o texto do plano engana (pendência abaixo).
 
+`--purge` ao vivo: o `persist\cpu-z\cpuz.ini` deixado acima recebeu uma linha marcadora e foi criada
+uma pasta sentinela `persist\zz-sentinel\keep.txt`. `install cpu-z --yes` reaproveitou o ini
+persistido (marcador presente em `apps\cpu-z\current\cpuz.ini`, 2 links). `uninstall cpu-z --purge
+--dry-run --yes` listou "Apagar cpuz.ini (dados persistentes)" e não apagou nada. `uninstall cpu-z
+--purge --yes`: exit 0, `persist\cpu-z` removido, sentinela intacta, `apps\` vazio,
+`HKCU\Environment` e `.lnk` idênticos aos iniciais. A sentinela foi apagada em seguida. O `--purge`
+apaga direto (não usa a Lixeira), como a spec §6.3 define.
+
+Tempo de `install` com download em cache e efeitos reais: ~1000 ms (3 rodadas × 3 pacotes: 982–1105 ms,
+um ponto fora de 3836 ms), contra 522 ms medidos na raiz temporária com chave de teste. A diferença é
+sobretudo o `WM_SETTINGCHANGE`: medido isolado com `SendMessageTimeout` igual ao do código, 438–568 ms
+(uma vez 2538 ms). Com a chave de teste não há broadcast.
+
 ## 2. Ciclo completo em raiz temporária (substituto isolado, não é a prova ao vivo)
 
 Ambiente: `LOCALAPPDATA=<scratchpad>\la` (catálogo copiado do real com `sqlite3 ".backup"`, aberto
@@ -212,6 +225,8 @@ Leitura:
   saiu, a chave não). Apagada pelo orquestrador com autorização do usuário (`reg delete`, conferida vazia antes).
 - O plano do `uninstall` mostra "Desfazer entrada no PATH: …\shims" mesmo quando outro app ainda usa a
   entrada (que corretamente fica). Deveria dizer que a entrada é mantida.
-- `--purge` não foi exercitado ao vivo (`persist\cpu-z\cpuz.ini` ficou no disco do usuário).
+- `upgrade --all` chama `ops::apply` uma vez por app: um lock e, se o ambiente mudou, um broadcast
+  (~0,5 s) por app; downloads de apps diferentes são sequenciais.
+- O log em arquivo não tem filtro de nível: o `update --background` grava TRACE do `h2` (9,5 MB num dia).
 - Sem spans por etapa no `install`/`uninstall`; a divisão do tempo de execução não foi medida.
 - `bin` com mais de 3 elementos é recusado (zigup).
