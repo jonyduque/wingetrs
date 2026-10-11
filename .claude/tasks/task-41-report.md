@@ -17,3 +17,7 @@ Mutation proofs (all "[OK] mutação PEGA"):
 
 Decisions: apply keeps its signature, delegating to private apply_with_targets (targets = last plan). tui_jobs World now accumulates packages (add_env) since replace_source replaced the whole source.
 Concerns: cargo fmt also touched src/cli/mod.rs (Task 43's file) possibly; not staged by me.
+
+Follow-up (review): added apply_groups_targets_are_the_last_plan_of_each_group and apply_groups_skips_a_dependency_installed_meanwhile_but_not_targets.
+[OK] mutação PEGA: '.filter_map(|g| g.last())' -> '.filter_map(|g| g.first())' fez o teste falhar (exit 101). (both tests)
+Gate: [OK]   test (417 passed, 16 ignored) 79s / [OK]   gate verde

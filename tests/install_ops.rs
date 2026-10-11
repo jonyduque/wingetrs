@@ -989,3 +989,32 @@ async fn apply_groups_refuses_a_target_installed_meanwhile_even_in_the_middle() 
     }
     assert!(w.state().get("b").unwrap().is_none());
 }
+
+#[tokio::test]
+async fn apply_groups_targets_are_the_last_plan_of_each_group() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.add(app("a", &["leaf"])).await;
+    w.add(app("b", &[])).await;
+    let groups = vec![w.plans("a").unwrap(), w.plans("b").unwrap()];
+    assert_eq!(names(&groups[0]), ["leaf", "a"]);
+    w.install("a").await;
+    match apply_groups(&w.ctx(), groups).await {
+        Err(OpsError::StateChanged(a)) => assert_eq!(a, "a"),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.state().get("b").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn apply_groups_skips_a_dependency_installed_meanwhile_but_not_targets() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.add(app("a", &["leaf"])).await;
+    w.add(app("b", &[])).await;
+    let groups = vec![w.plans("a").unwrap(), w.plans("b").unwrap()];
+    w.install("leaf").await;
+    apply_groups(&w.ctx(), groups).await.unwrap();
+    assert!(w.state().get("a").unwrap().is_some());
+    assert!(w.state().get("b").unwrap().is_some());
+}
