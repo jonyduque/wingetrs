@@ -1090,3 +1090,34 @@ fn end_keeps_selection_visible_when_the_help_bar_hides() {
         assert!(out.contains(&name), "h={h}");
     }
 }
+
+#[test]
+fn full_help_has_key_column_and_accent_keys() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    key(&mut a, crossterm::event::KeyCode::Char('?'));
+    let buf = screen_cells(&a, 100, 30, &theme);
+    let rows: Vec<(u16, String)> = (0..30).map(|y| (y, row_text(&buf, y))).collect();
+    let find = |needle: &str| {
+        rows.iter()
+            .find_map(|(y, t)| t.find(needle).map(|b| (col_of(t, b), *y)))
+            .expect(needle)
+    };
+    let (kx, ky) = find("←→ / Tab");
+    let (dx, dy) = find("trocar aba");
+    assert_eq!((dy, dx), (ky, kx + 12));
+    for (key_text, desc) in [("PgUp PgDn", "mover de 10"), ("Ctrl+S", "filtrar fonte")] {
+        let (k, ky) = find(key_text);
+        let (d, dy) = find(desc);
+        assert_eq!((dy, d), (ky, kx + 12), "{desc}");
+        assert_eq!(k, kx, "{key_text}");
+    }
+    let cell = &buf[(kx, ky)];
+    assert_eq!(cell.fg, theme.accent().fg.unwrap());
+    assert!(cell.modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(dx, dy)].fg, theme.fg().fg.unwrap());
+    // Dialog border: the corner cell above-left of the padded content.
+    let (_, title_y) = find(" Ajuda ");
+    let (tx, _) = find(" Ajuda ");
+    assert_eq!(buf[(tx - 1, title_y)].fg, theme.accent().fg.unwrap());
+}

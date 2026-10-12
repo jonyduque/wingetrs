@@ -29,3 +29,8 @@ Decisions:
 Concerns:
 - A ajuda completa (`?`) nao foi reorganizada em colunas: mantive o dialogo existente com as mesmas teclas (inclui "←→ / Tab"); o brief fixa so "mesmas teclas".
 - Usei CARGO_TARGET_DIR=target/t65 (removido) porque target/debug/wingetrs.exe estava travado.
+
+Adendo (ajuda completa): o dialogo ja atendia o brief (borda accent, inset DIALOG_PAD, coluna de 12, tecla accent+BOLD, descricao fg); adicionado o teste full_help_has_key_column_and_accent_keys.
+Mutacao: [OK] mutação PEGA: 'theme.accent().add_modifier(Modifier::BOLD),...' -> 'theme.fg(),...' fez o teste falhar.
+Gate: [OK]   test (564 passed, 16 ignored) / [OK]   gate verde
+Concern anterior sobre "colunas" resolvido: coluna de teclas de 12 celulas verificada.
