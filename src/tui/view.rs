@@ -2,6 +2,7 @@
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{App, Focus, Modal, RunProgress, Tab};
+use crate::tui::layout::{BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, PAD_X, inset};
 use crate::tui::picker::{Picker, window};
 use crate::tui::theme::{Glyphs, Theme};
 use ratatui::Frame;
@@ -149,7 +150,7 @@ fn draw_search_box(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area
     let blk = block(theme, app.focus == Focus::List)
         .title(tabs_line(app, theme))
         .title(corner_line(app, theme, g));
-    let prompt = Span::styled(format!(" {} ", g.search), theme.accent());
+    let prompt = Span::styled(format!("{} ", g.search), theme.accent());
     let query = if app.query.is_empty() {
         Line::from(vec![
             prompt,
@@ -162,7 +163,9 @@ fn draw_search_box(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area
             Span::styled("▏", theme.accent()),
         ])
     };
-    frame.render_widget(Paragraph::new(query).block(blk), area);
+    let inner = inset(blk.inner(area), PAD_X, 0);
+    frame.render_widget(blk, area);
+    frame.render_widget(Paragraph::new(query), inner);
 }
 
 fn source_glyph<'a>(theme: &Theme, g: &Glyphs, kind: SourceKind) -> Span<'a> {
@@ -335,7 +338,7 @@ fn list_lines<'a>(
 fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect, chrome: bool) {
     let inner = if chrome {
         let blk = block(theme, app.focus == Focus::List);
-        let inner = blk.inner(area);
+        let inner = inset(blk.inner(area), PAD_X, 0);
         frame.render_widget(blk, area);
         inner
     } else {
@@ -554,10 +557,10 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
 
 fn draw_details(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
     let blk = block(theme, app.focus == Focus::Details);
-    let p = Paragraph::new(details_lines(app, theme, g))
-        .block(blk)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(p, area);
+    let inner = inset(blk.inner(area), PAD_X, 0);
+    frame.render_widget(blk, area);
+    let p = Paragraph::new(details_lines(app, theme, g)).wrap(Wrap { trim: true });
+    frame.render_widget(p, inner);
 }
 
 fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
@@ -565,14 +568,15 @@ fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         Tab::Search => app.search.entries().len(),
         Tab::Installed | Tab::Updates => app.installed.len(),
     };
+    let pad = " ".repeat(usize::from(BAR_PAD_X));
     let line = match &app.status {
         Some(s) => Line::from(Span::styled(
-            format!(" {s}"),
+            format!("{pad}{s}"),
             theme.warn().add_modifier(Modifier::ITALIC),
         )),
         None => Line::from(Span::styled(
             format!(
-                " {} de {} · ↑↓ mover · ←→ aba · Enter detalhes · Ctrl+R refresh · ? ajuda",
+                "{pad}{} de {} · ↑↓ mover · ←→ aba · Enter detalhes · Ctrl+R refresh · ? ajuda",
                 app.visible_len(),
                 total
             ),
@@ -583,14 +587,7 @@ fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
 }
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let w = area.width.min(52);
-    let h = area.height.min(15);
-    let rect = Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    );
+    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 15 + 2 * DIALOG_PAD_Y);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(
@@ -618,7 +615,26 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         " Ajuda ",
         theme.accent().add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(Paragraph::new(lines).block(blk), rect);
+    let inner = inset(blk.inner(rect), DIALOG_PAD_X, DIALOG_PAD_Y);
+    frame.render_widget(blk, rect);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Draws a bordered dialog and its padded text.
+fn render_dialog(frame: &mut Frame, rect: Rect, blk: Block, body: Paragraph) {
+    let inner = inset(blk.inner(rect), DIALOG_PAD_X, DIALOG_PAD_Y);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(blk, rect);
+    frame.render_widget(body, inner);
+}
+
+/// Outer size of a dialog that holds `text_w` x `text_h` of text.
+fn dialog_size(area: Rect, text_w: u16, text_h: u16) -> Rect {
+    centered(
+        area,
+        text_w.saturating_add(2 * (BORDER + DIALOG_PAD_X)),
+        text_h.saturating_add(2 * (BORDER + DIALOG_PAD_Y)),
+    )
 }
 
 /// Centered rectangle of at most `w` x `h` inside `area`.
@@ -651,16 +667,13 @@ fn draw_modal(modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
                 "Enter confirma · Esc cancela",
                 theme.accent(),
             )));
-            let h = u16::try_from(lines.len())
-                .unwrap_or(u16::MAX)
-                .saturating_add(2);
-            let rect = centered(area, 90, h);
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .block(modal_block(theme, "Confirmar"))
-                    .wrap(Wrap { trim: false }),
+            let h = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+            let rect = dialog_size(area, 88, h);
+            render_dialog(
+                frame,
                 rect,
+                modal_block(theme, "Confirmar"),
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
             );
         }
         Modal::Picking { picker, .. } => {
@@ -689,13 +702,12 @@ fn draw_modal(modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
             if let Some(p) = progress {
                 lines.push(progress_line(p, theme));
             }
-            let rect = centered(area, 70, if progress.is_some() { 4 } else { 3 });
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(lines)
-                    .block(modal_block(theme, "Em andamento"))
-                    .wrap(Wrap { trim: true }),
+            let rect = dialog_size(area, 68, if progress.is_some() { 2 } else { 1 });
+            render_dialog(
+                frame,
                 rect,
+                modal_block(theme, "Em andamento"),
+                Paragraph::new(lines).wrap(Wrap { trim: true }),
             );
         }
     }
@@ -727,7 +739,9 @@ fn draw_picker(
     area: Rect,
 ) {
     let items = picker.items();
-    let rows = usize::from(area.height.saturating_sub(4)).clamp(1, 12);
+    // Rows left after borders, vertical padding, the footer line and one spare line.
+    let spare = 2 * (BORDER + DIALOG_PAD_Y) + 2;
+    let rows = usize::from(area.height.saturating_sub(spare)).clamp(1, 12);
     let range = window(picker.selected(), items.len(), rows);
     let mut lines: Vec<Line> = Vec::new();
     for i in range {
@@ -758,14 +772,11 @@ fn draw_picker(
         )));
     }
     lines.push(Line::from(Span::styled(footer.to_string(), theme.accent())));
-    let h = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let rect = centered(area, 100, h);
-    frame.render_widget(Clear, rect);
+    let h = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let rect = dialog_size(area, 98, h);
     let blk = block(theme, true).title(Span::styled(
         format!(" {title} "),
         theme.accent().add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(Paragraph::new(lines).block(blk), rect);
+    render_dialog(frame, rect, blk, Paragraph::new(lines));
 }

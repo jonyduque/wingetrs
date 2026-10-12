@@ -304,7 +304,7 @@ fn selected_row_moves_on_screen_while_details_load() {
     let selected = screen
         .lines()
         .map(|l| l.trim_start_matches('"'))
-        .find(|l| l.starts_with("│> "))
+        .find(|l| l.starts_with("│ > "))
         .expect("a selected row");
     assert!(selected.contains("powertoys"), "{selected}");
     assert!(screen.contains("carregando"), "{screen}");
@@ -353,7 +353,7 @@ fn long_list_end_is_rendered() {
     let line = out
         .lines()
         .map(|l| l.trim_start_matches('"'))
-        .find(|l| l.starts_with("│> "))
+        .find(|l| l.starts_with("│ > "))
         .unwrap();
     assert!(line.contains("pkg0999"), "{line}");
     assert!(!out.contains("pkg0000"));
@@ -439,4 +439,94 @@ fn scrolled_selection_highlights_the_selected_row() {
     }
     assert_eq!(highlighted.len(), 1, "{highlighted:?}");
     assert!(highlighted[0].contains("pkg0999"), "{highlighted:?}");
+}
+
+fn cell(out: &str, x: usize, y: usize) -> String {
+    out.lines()
+        .nth(y)
+        .map(|l| {
+            l.trim_matches('"')
+                .chars()
+                .nth(x)
+                .unwrap_or('?')
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn inset_saturates_on_tiny_rects() {
+    use ratatui::layout::Rect;
+    use wingetrs::tui::layout::inset;
+    let tiny = inset(Rect::new(0, 0, 1, 1), 1, 1);
+    assert_eq!((tiny.width, tiny.height), (0, 0));
+    assert_eq!(inset(Rect::new(2, 3, 10, 5), 1, 1), Rect::new(3, 4, 8, 3));
+}
+
+#[test]
+fn split_with_gutter_leaves_blank_columns() {
+    use ratatui::layout::Rect;
+    use wingetrs::tui::layout::split_with_gutter;
+    let (left, divider, right) = split_with_gutter(Rect::new(0, 0, 100, 10), 55);
+    assert_eq!(left, Rect::new(0, 0, 55, 10));
+    assert_eq!(divider, 56);
+    assert_eq!(right.x, 58);
+    assert_eq!(right.right() - 1, 99);
+    assert_eq!(right.width, 42);
+}
+
+#[test]
+fn list_and_details_text_start_one_column_after_the_border() {
+    let out = render(&typed("powert"), 100, 16);
+    for y in 4..=6 {
+        assert_eq!(cell(&out, 1, y), " ", "{out}");
+        let c2 = cell(&out, 2, y);
+        assert!(c2 == ">" || c2 == " ", "{out}");
+        let glyph = cell(&out, 4, y);
+        assert!(glyph == "W" || glyph == "S", "{out}");
+    }
+    assert_eq!(cell(&out, 55, 4), "│", "{out}");
+    assert_eq!(cell(&out, 56, 4), " ", "{out}");
+    assert_eq!(cell(&out, 57, 4), "P", "{out}");
+}
+
+#[test]
+fn confirm_dialog_has_inner_padding() {
+    let out = render(&with_confirm(), 100, 24);
+    let rows: Vec<Vec<char>> = out
+        .lines()
+        .map(|l| l.trim_matches('"').chars().collect())
+        .collect();
+    let top = rows
+        .iter()
+        .position(|r| r.iter().collect::<String>().contains("Confirmar"))
+        .expect("dialog title");
+    let left = rows[top].iter().position(|c| *c == '╭').expect("corner");
+    let right = rows[top].iter().rposition(|c| *c == '╮').expect("corner");
+    let inner = |y: usize| -> String { rows[y][left + 1..right].iter().collect() };
+    assert!(inner(top + 1).chars().all(|c| c == ' '), "{out}");
+    let first_text = inner(top + 2);
+    assert!(first_text.starts_with("  Instalar"), "{first_text:?}");
+    assert!(inner(top + 3).starts_with("  "), "{out}");
+}
+
+#[test]
+fn layout_constants_are_the_documented_scale() {
+    use wingetrs::tui::layout::*;
+    assert_eq!(
+        [
+            PAD_X,
+            FILTER_GAP,
+            GUTTER,
+            ITEM_GAP,
+            DIALOG_PAD_X,
+            DIALOG_PAD_Y,
+            TOAST_PAD_X,
+            TOAST_MARGIN_X,
+            TOAST_MARGIN_Y,
+            TAB_PAD_X,
+            BAR_PAD_X
+        ],
+        [1, 1, 1, 0, 2, 1, 1, 2, 1, 1, 1]
+    );
 }
