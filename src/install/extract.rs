@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::fs_retry;
 use crate::install::safepath;
 
 #[derive(Debug, thiserror::Error)]
@@ -105,7 +106,7 @@ struct TempGuard {
 impl Drop for TempGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = fs_retry::retry("apagar", &self.path, || fs::remove_dir_all(&self.path));
         }
     }
 }
@@ -204,7 +205,7 @@ pub fn extract_all_with(
     }
     merge_into(&tmp, dest)?;
     guard.armed = false;
-    let _ = fs::remove_dir_all(&tmp);
+    let _ = fs_retry::retry("apagar", &tmp, || fs::remove_dir_all(&tmp));
     Ok(())
 }
 
@@ -356,7 +357,8 @@ fn extract_tar_gz(
 /// Moves the contents of `src` into `dest`, merging with existing directories.
 fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
     if !dest.exists() {
-        fs::rename(src, dest).map_err(io_at("renomear", src))?;
+        fs_retry::retry("renomear", src, || fs::rename(src, dest))
+            .map_err(io_at("renomear", src))?;
         return Ok(());
     }
     for entry in fs::read_dir(src).map_err(io_at("listar", src))? {
@@ -371,13 +373,16 @@ fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
             if to.exists() {
                 merge_into(&from, &to)?;
             } else {
-                fs::rename(&from, &to).map_err(io_at("renomear", &from))?;
+                fs_retry::retry("renomear", &from, || fs::rename(&from, &to))
+                    .map_err(io_at("renomear", &from))?;
             }
         } else {
             if to.exists() {
-                fs::remove_file(&to).map_err(io_at("apagar", &to))?;
+                fs_retry::retry("apagar", &to, || fs::remove_file(&to))
+                    .map_err(io_at("apagar", &to))?;
             }
-            fs::rename(&from, &to).map_err(io_at("renomear", &from))?;
+            fs_retry::retry("renomear", &from, || fs::rename(&from, &to))
+                .map_err(io_at("renomear", &from))?;
         }
     }
     Ok(())

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::Instrument;
 
 use crate::cache::DataDir;
+use crate::fs_retry;
 use crate::http::Http;
 use crate::install::download::{self, Progress};
 use crate::install::layout::Layout;
@@ -120,12 +121,12 @@ fn remove_any(p: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     };
     if meta.file_type().is_symlink() {
-        return link::remove(p).or_else(|_| fs::remove_file(p));
+        return link::remove(p).or_else(|_| fs_retry::retry("apagar", p, || fs::remove_file(p)));
     }
     if meta.is_dir() {
-        fs::remove_dir_all(p)
+        fs_retry::retry("apagar", p, || fs::remove_dir_all(p))
     } else {
-        fs::remove_file(p)
+        fs_retry::retry("apagar", p, || fs::remove_file(p))
     }
 }
 
@@ -258,7 +259,8 @@ fn apply_undo(u: Undo, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
         Undo::RemovePath(p) => remove_any(&p).map_err(|e| io_msg(&p, e)),
         Undo::RemoveEmptyDir(p) => not_found_ok(fs::remove_dir(&p)).map_err(|e| io_msg(&p, e)),
         Undo::RestoreAside { aside, original } => {
-            fs::rename(&aside, &original).map_err(|e| io_msg(&original, e))
+            fs_retry::retry("renomear", &aside, || fs::rename(&aside, &original))
+                .map_err(|e| io_msg(&original, e))
         }
         Undo::RestoreCurrent { link: l, previous } => {
             not_found_ok(remove_any(&l)).map_err(|e| io_msg(&l, e))?;
@@ -600,13 +602,15 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 // A copy of this version left on disk (kept on upgrade, or a failed removal):
                 // replaced, and put back if anything below fails.
                 let aside = free_aside(layout, app, version)?;
-                fs::rename(&vdir, &aside).map_err(|e| io_msg(&vdir, e))?;
+                fs_retry::retry("renomear", &vdir, || fs::rename(&vdir, &aside))
+                    .map_err(|e| io_msg(&vdir, e))?;
                 run.push(Undo::RestoreAside {
                     aside,
                     original: vdir.clone(),
                 });
             }
-            fs::rename(&staging, &vdir).map_err(|e| io_msg(&vdir, e))?;
+            fs_retry::retry("renomear", &staging, || fs::rename(&staging, &vdir))
+                .map_err(|e| io_msg(&vdir, e))?;
             run.push(Undo::RemovePath(vdir.clone()));
             let arch = plan.arch.map(|a| a.key());
             state::write_install_json(&vdir, &plan.bucket, arch, version)
@@ -815,7 +819,8 @@ fn persist(run: &mut Run<'_>, spec: &PersistSpec, layout: &Layout) -> Result<(),
     let mut created = false;
     match (src_meta.is_some(), dst_meta.is_some()) {
         (true, false) => {
-            fs::rename(&src, &dst).map_err(|e| io_msg(&dst, e))?;
+            fs_retry::retry("renomear", &src, || fs::rename(&src, &dst))
+                .map_err(|e| io_msg(&dst, e))?;
             created = true;
         }
         (_, true) => {

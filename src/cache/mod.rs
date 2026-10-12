@@ -145,7 +145,8 @@ impl HttpState {
         f.write_all(&json).map_err(|e| io_err(&tmp, e))?;
         f.sync_all().map_err(|e| io_err(&tmp, e))?;
         drop(f);
-        std::fs::rename(&tmp, path).map_err(|e| io_err(path, e))
+        crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, path))
+            .map_err(|e| io_err(path, e))
     }
 
     pub fn get(&self, url: &str) -> Option<&HttpEntry> {
@@ -184,7 +185,8 @@ impl BlobStore {
         let target = self.dir.join(&actual);
         let tmp = self.dir.join(format!("{actual}.tmp"));
         std::fs::write(&tmp, bytes).map_err(|e| io_err(&tmp, e))?;
-        std::fs::rename(&tmp, &target).map_err(|e| io_err(&target, e))
+        crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &target))
+            .map_err(|e| io_err(&target, e))
     }
 }
 

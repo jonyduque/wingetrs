@@ -237,7 +237,8 @@ pub fn write_install_json(
     let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;
     let tmp = version_dir.join("install.json.tmp");
     std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, version_dir.join("install.json"))
+    let dst = version_dir.join("install.json");
+    crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &dst))
 }
 
 fn read_install_json(app_dir: &Path) -> Option<serde_json::Value> {

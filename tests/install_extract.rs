@@ -545,3 +545,90 @@ fn extract_io_error_names_operation_and_path() {
         other => panic!("expected Io error, got {other:?}"),
     }
 }
+
+/// Test layer: on the thread that installed it, the first "retrying" event drops the held file.
+#[cfg(windows)]
+mod release_on_retry {
+    use std::fs::File;
+    use std::sync::{Arc, Mutex};
+
+    pub type Held = Arc<Mutex<Option<File>>>;
+
+    thread_local! {
+        static CURRENT: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct Message(bool);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            if f.name() == "message" && format!("{v:?}") == "transient fs error, retrying" {
+                self.0 = true;
+            }
+        }
+    }
+
+    struct Releaser;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Releaser {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut m = Message(false);
+            event.record(&mut m);
+            if m.0 {
+                CURRENT.with(|c| {
+                    if let Some(h) = c.borrow().as_ref() {
+                        h.lock().unwrap().take();
+                    }
+                });
+            }
+        }
+    }
+
+    /// Process-global subscriber (installed once) routing to the calling thread's `held`.
+    pub fn install(held: &Held) -> Installed {
+        use tracing_subscriber::layer::SubscriberExt;
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(Releaser),
+            );
+        });
+        CURRENT.with(|c| *c.borrow_mut() = Some(held.clone()));
+        Installed
+    }
+
+    pub struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            CURRENT.with(|c| *c.borrow_mut() = None);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn extraction_retries_a_held_file_until_it_is_released() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.zip");
+    std::fs::write(&f, zip_with(&[("x.txt", b"new")])).unwrap();
+    let dest = d.path().join("out");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("x.txt"), b"old").unwrap();
+    let held: release_on_retry::Held = std::sync::Arc::new(std::sync::Mutex::new(Some(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dest.join("x.txt"))
+            .unwrap(),
+    )));
+    let _routing = release_on_retry::install(&held);
+    extract(&f, "a.zip", None, None, &dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("x.txt")).unwrap(), b"new");
+    assert!(held.lock().unwrap().is_none(), "the retry path never ran");
+}

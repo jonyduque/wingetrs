@@ -386,21 +386,14 @@ fn scan(
     Ok(out)
 }
 
-/// Windows ERROR_SHARING_VIOLATION (antivirus or another process holding the file).
-const SHARING_VIOLATION: i32 = 32;
-
 /// Reads `path`, retrying transient locks up to 5 times, 10 ms apart: on Windows a reader that
 /// opens the file while `write` renames over it gets "access denied", and a scanner holding the
 /// fresh file gives a sharing violation.
 fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
-    let transient = |e: &std::io::Error| {
-        e.kind() == std::io::ErrorKind::PermissionDenied
-            || e.raw_os_error() == Some(SHARING_VIOLATION)
-    };
     let mut attempt = 0;
     loop {
         match std::fs::read(path) {
-            Err(e) if transient(&e) && attempt < 5 => {
+            Err(e) if crate::fs_retry::is_transient(&e) && attempt < 5 => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }

@@ -9,6 +9,7 @@ use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::cache::{BlobStore, DataDir};
+use crate::fs_retry;
 use crate::http::Http;
 use crate::install::manifest::{HashAlgo, HashSpec, Source};
 
@@ -81,7 +82,7 @@ fn write_index(data: &DataDir, idx: &BTreeMap<String, String>) -> Result<(), Dow
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&tmp, json).map_err(|e| io_err(&tmp, e))?;
-    std::fs::rename(&tmp, &p).map_err(|e| {
+    fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &p)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         io_err(&p, e)
     })
@@ -146,7 +147,8 @@ async fn download_one(
     std::fs::create_dir_all(&blobs).map_err(|e| io_err(&blobs, e))?;
     let target = blobs.join(&name);
     // std rename replaces an existing (e.g. tampered) blob of the same name.
-    std::fs::rename(&tmp, &target).map_err(|e| io_err(&target, e))?;
+    fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &target))
+        .map_err(|e| io_err(&target, e))?;
     guard.0 = None;
     Ok((target, name))
 }

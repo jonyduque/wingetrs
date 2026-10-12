@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod cli;
 pub mod config;
 pub mod core;
+pub mod fs_retry;
 pub mod http;
 pub mod install;
 pub mod installed;
