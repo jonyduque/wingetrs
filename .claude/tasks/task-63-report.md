@@ -1,4 +1,4 @@
-Status: DONE_WITH_CONCERNS
+Status: DONE
 
 Commits:
 (see below; feature commit first, report commit after)
@@ -48,3 +48,9 @@ Decisions:
 Concerns:
 - Perdeu-se o realce de foco (border_focus) da lista/detalhes: não há mais caixas separadas; o foco em Detalhes não tem indicação visual. Fica para o orquestrador decidir (ex.: divisor em border_focus).
 - Teste 3 literal do brief não pega a mutação do limiar sozinho (ver acima).
+
+Follow-up (pedido do coordenador):
+- Divisor com border_focus quando Focus::Details (token border caso contrário); teste divider_is_focus_colored_only_when_details_has_focus. Mutação "sempre border" (if false): [OK] mutação PEGA.
+- Assinatura draw_tabs(.., labels: &[TabLabel{text, warn}], ..); teste warn_label_is_warn_when_inactive_and_accent_when_active. Mutação "ignorar warn" (else if false): [OK] mutação PEGA.
+- Gate: [OK]   test (548 passed, 16 ignored) 135s / [OK]   gate verde
+- Concerns anteriores resolvidos.

@@ -2,13 +2,13 @@
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, Modal, RunProgress, Tab};
+use crate::tui::app::{App, Focus, Modal, RunProgress, Tab};
 use crate::tui::layout::{
     BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, PAD_X, PICKER_FOOTER_SLACK, inset,
     split_with_gutter,
 };
 use crate::tui::picker::{Picker, window};
-use crate::tui::tabs::draw_tabs;
+use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{Glyphs, Theme};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -72,10 +72,15 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     } else {
         let (left, divider, right) = split_with_gutter(body, 55);
         draw_list(app, theme, g, frame, left);
+        let divider_style = if app.focus == Focus::Details {
+            theme.border_focus()
+        } else {
+            theme.border()
+        };
         for y in body.y..body.bottom() {
             frame
                 .buffer_mut()
-                .set_string(divider, y, "│", theme.border());
+                .set_string(divider, y, "│", divider_style);
         }
         draw_details(app, theme, g, frame, right);
     }
@@ -116,7 +121,7 @@ fn updates_count(app: &App) -> usize {
         .count()
 }
 
-fn tab_labels(app: &App, g: &Glyphs) -> Vec<String> {
+fn tab_labels(app: &App, g: &Glyphs) -> Vec<TabLabel> {
     let count = updates_count(app);
     let with_glyph = |glyph: &str, name: &str| {
         if glyph.is_empty() {
@@ -125,13 +130,17 @@ fn tab_labels(app: &App, g: &Glyphs) -> Vec<String> {
             format!("{glyph} {name}")
         }
     };
+    let plain = |text: String| TabLabel { text, warn: false };
     vec![
-        with_glyph(g.tab_search, "Pesquisar"),
-        with_glyph(g.tab_installed, "Instalados"),
-        if count > 0 {
-            with_glyph(g.tab_updates, &format!("Atualizações {count}"))
-        } else {
-            with_glyph(g.tab_updates, "Atualizações")
+        plain(with_glyph(g.tab_search, "Pesquisar")),
+        plain(with_glyph(g.tab_installed, "Instalados")),
+        TabLabel {
+            text: if count > 0 {
+                with_glyph(g.tab_updates, &format!("Atualizações {count}"))
+            } else {
+                with_glyph(g.tab_updates, "Atualizações")
+            },
+            warn: count > 0,
         },
     ]
 }

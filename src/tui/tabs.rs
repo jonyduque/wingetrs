@@ -8,11 +8,17 @@ use ratatui::text::{Line, Span};
 
 const BADGE: &str = " wingetrs ";
 
+/// One tab label; `warn` colors it as a warning while the tab is inactive.
+pub struct TabLabel {
+    pub text: String,
+    pub warn: bool,
+}
+
 /// Label style: the active tab is bold accent; an inactive Updates tab with a count is `warn`.
-fn label_style(labels: &[String], i: usize, active: usize, theme: &Theme) -> Style {
+fn label_style(labels: &[TabLabel], i: usize, active: usize, theme: &Theme) -> Style {
     if i == active {
         theme.accent().add_modifier(Modifier::BOLD)
-    } else if i == 2 && labels[i].chars().last().is_some_and(|c| c.is_ascii_digit()) {
+    } else if labels[i].warn {
         theme.warn()
     } else {
         theme.fg_dim()
@@ -20,13 +26,16 @@ fn label_style(labels: &[String], i: usize, active: usize, theme: &Theme) -> Sty
 }
 
 /// Draws the three header lines into `area` (needs height 3 and width >= 2 to draw fully).
-pub fn draw_tabs(frame: &mut Frame, area: Rect, labels: &[String], active: usize, theme: &Theme) {
+pub fn draw_tabs(frame: &mut Frame, area: Rect, labels: &[TabLabel], active: usize, theme: &Theme) {
     if area.width < 2 || area.height == 0 {
         return;
     }
     let width = usize::from(area.width);
     let pad = " ".repeat(usize::from(TAB_PAD_X));
-    let interiors: Vec<String> = labels.iter().map(|l| format!("{pad}{l}{pad}")).collect();
+    let interiors: Vec<String> = labels
+        .iter()
+        .map(|l| format!("{pad}{}{pad}", l.text))
+        .collect();
     let widths: Vec<usize> = interiors
         .iter()
         .map(|s| Span::raw(s.as_str()).width())
@@ -42,7 +51,7 @@ pub fn draw_tabs(frame: &mut Frame, area: Rect, labels: &[String], active: usize
                 spans.push(Span::styled(" · ", theme.fg_dim()));
             }
             spans.push(Span::styled(
-                l.clone(),
+                l.text.clone(),
                 label_style(labels, i, active, theme),
             ));
         }

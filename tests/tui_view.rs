@@ -563,10 +563,13 @@ fn residue_conflict_warning_survives_narrow_terminals() {
 
 // ---- Task 63: tabs joined to the content window ----
 
-fn tab_labels() -> Vec<String> {
+fn tab_labels() -> Vec<wingetrs::tui::tabs::TabLabel> {
     ["Pesquisar", "Instalados", "Atualizações 2"]
         .iter()
-        .map(|s| s.to_string())
+        .map(|s| wingetrs::tui::tabs::TabLabel {
+            text: s.to_string(),
+            warn: false,
+        })
         .collect()
 }
 
@@ -764,4 +767,41 @@ fn tabs_threshold_is_exact() {
     assert!(buf_row(&wide, 0).starts_with('╭'));
     let narrow = tab_buffer(45, 0, &theme);
     assert_eq!(buf_row(&narrow, 0).trim(), "");
+}
+
+#[test]
+fn warn_label_is_warn_when_inactive_and_accent_when_active() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let mut labels = tab_labels();
+    labels[2].warn = true;
+    let draw = |active: usize| {
+        let mut t = Terminal::new(TestBackend::new(60, 3)).unwrap();
+        t.draw(|f| wingetrs::tui::tabs::draw_tabs(f, f.area(), &labels, active, &theme))
+            .unwrap();
+        t.backend().buffer().clone()
+    };
+    // 'A' of "Atualizações 2" sits at column 29.
+    let inactive = draw(0);
+    assert_eq!(inactive[(29, 1)].symbol(), "A");
+    assert_eq!(inactive[(29, 1)].fg, theme.warn().fg.unwrap());
+    let active = draw(2);
+    assert_eq!(active[(29, 1)].fg, theme.accent().fg.unwrap());
+}
+
+#[test]
+fn divider_is_focus_colored_only_when_details_has_focus() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let paint = |a: &App| {
+        let mut t = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        t.draw(|f| view(a, &theme, f)).unwrap();
+        t.backend().buffer().clone()
+    };
+    let mut a = typed("powert");
+    // Divider at column 55, first list row is screen row 5.
+    let b = paint(&a);
+    assert_eq!(b[(55, 5)].symbol(), "│");
+    assert_eq!(b[(55, 5)].fg, theme.border().fg.unwrap());
+    key(&mut a, crossterm::event::KeyCode::Enter);
+    let b = paint(&a);
+    assert_eq!(b[(55, 5)].fg, theme.border_focus().fg.unwrap());
 }
