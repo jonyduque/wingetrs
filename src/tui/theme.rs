@@ -30,9 +30,14 @@ pub struct Glyphs {
     pub id: &'static str,
     pub selected: &'static str,
     pub spinner: &'static [&'static str],
+    pub tab_search: &'static str,
+    pub tab_installed: &'static str,
+    pub tab_updates: &'static str,
+    pub tab_settings: &'static str,
+    pub bar: &'static str,
 }
 
-const BRAILLE: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BRAILLE: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
 const ASCII_SPINNER: &[&str] = &["|", "/", "-", "\\"];
 
 static NERD: Glyphs = Glyphs {
@@ -50,6 +55,11 @@ static NERD: Glyphs = Glyphs {
     id: "\u{f1b2}",
     selected: "▶",
     spinner: BRAILLE,
+    tab_search: "\u{f002}",
+    tab_installed: "\u{f0a0}",
+    tab_updates: "\u{f06b0}",
+    tab_settings: "\u{f013}",
+    bar: "┃",
 };
 
 static UNICODE: Glyphs = Glyphs {
@@ -67,6 +77,11 @@ static UNICODE: Glyphs = Glyphs {
     id: "#",
     selected: "▶",
     spinner: BRAILLE,
+    tab_search: "⌕",
+    tab_installed: "▤",
+    tab_updates: "↑",
+    tab_settings: "⚙",
+    bar: "┃",
 };
 
 static ASCII: Glyphs = Glyphs {
@@ -84,6 +99,11 @@ static ASCII: Glyphs = Glyphs {
     id: "#",
     selected: ">",
     spinner: ASCII_SPINNER,
+    tab_search: "",
+    tab_installed: "",
+    tab_updates: "",
+    tab_settings: "",
+    bar: "|",
 };
 
 impl Glyphs {
@@ -122,6 +142,17 @@ pub struct Theme {
     bg_selected: Style,
     border: Style,
     border_focus: Style,
+    sel_bar: Style,
+    sel_desc: Style,
+    sel_title: Style,
+    help_key: Style,
+    help_desc: Style,
+    help_sep: Style,
+    badge: Style,
+    pill_msg: Style,
+    pill_a: Style,
+    pill_b: Style,
+    spinner: Style,
 }
 
 /// (rgb, indexed-256 approximation)
@@ -131,41 +162,55 @@ impl Theme {
     pub fn new(dark: bool, depth: ColorDepth) -> Theme {
         let fg = |p: Pair| Self::fg_style(depth, p);
         let bg = |p: Pair| Self::bg_style(depth, p);
-        // dark / light palettes
-        let (accent, ok, warn, muted, alert, err, winget, scoop, text, dim, sel, border, focus) =
-            if dark {
-                (
-                    ((122, 162, 247), 111),
-                    ((158, 206, 106), 114),
-                    ((224, 175, 104), 179),
-                    ((86, 95, 137), 60),
-                    ((255, 158, 100), 209),
-                    ((247, 118, 142), 204),
-                    ((42, 195, 222), 45),
-                    ((187, 154, 247), 141),
-                    ((192, 202, 245), 189),
-                    ((130, 139, 184), 103),
-                    ((41, 46, 66), 236),
-                    ((59, 66, 97), 238),
-                    ((122, 162, 247), 111),
-                )
-            } else {
-                (
-                    ((52, 84, 138), 24),
-                    ((72, 120, 20), 64),
-                    ((143, 94, 21), 94),
-                    ((120, 125, 150), 102),
-                    ((177, 85, 20), 130),
-                    ((186, 40, 70), 125),
-                    ((15, 130, 150), 30),
-                    ((100, 60, 180), 97),
-                    ((52, 59, 88), 238),
-                    ((100, 108, 140), 60),
-                    ((210, 214, 230), 253),
-                    ((170, 176, 200), 249),
-                    ((52, 84, 138), 24),
-                )
-            };
+        // dark / light palettes (Charm Lip Gloss / Bubbles)
+        let pick = |d: Pair, l: Pair| if dark { d } else { l };
+        let accent = pick(((0x7D, 0x56, 0xF4), 99), ((0x87, 0x4B, 0xFD), 99));
+        let sel_bar = pick(((0xAD, 0x58, 0xB4), 133), ((0xF7, 0x93, 0xFF), 219));
+        let sel_title = ((0xEE, 0x6F, 0xF8), 213);
+        let pill_fg: Pair = ((0xFF, 0xFD, 0xF5), 230);
+        let (ok, warn, muted, alert, err, winget, scoop, sel) = if dark {
+            (
+                ((0x73, 0xF5, 0x9F), 85),
+                ((224, 175, 104), 179),
+                ((86, 95, 137), 60),
+                ((255, 158, 100), 209),
+                ((247, 118, 142), 204),
+                ((42, 195, 222), 45),
+                ((187, 154, 247), 141),
+                ((41, 46, 66), 236),
+            )
+        } else {
+            (
+                ((0x43, 0xBF, 0x6D), 71),
+                ((143, 94, 21), 94),
+                ((120, 125, 150), 102),
+                ((177, 85, 20), 130),
+                ((186, 40, 70), 125),
+                ((15, 130, 150), 30),
+                ((100, 60, 180), 97),
+                ((210, 214, 230), 253),
+            )
+        };
+        let text = pick(((0xDD, 0xDD, 0xDD), 253), ((0x1A, 0x1A, 0x1A), 234));
+        let dim = pick(((0x77, 0x77, 0x77), 243), ((0xA4, 0x9F, 0xA5), 247));
+        let border = pick(((0x38, 0x38, 0x38), 237), ((0xD9, 0xDC, 0xCF), 253));
+        let help_key = pick(((0x62, 0x62, 0x62), 241), ((0x90, 0x90, 0x90), 246));
+        let help_desc = pick(((0x6C, 0x6C, 0x6C), 242), ((0xB2, 0xB2, 0xB2), 249));
+        let help_sep = pick(((0x3C, 0x3C, 0x3C), 237), ((0xDA, 0xDA, 0xDA), 253));
+        let spinner = pick(((0x74, 0x73, 0x73), 243), ((0x8E, 0x8E, 0x8E), 245));
+        let both = |f: Pair, b: Pair, extra: Modifier| {
+            let mut st = Style::new().add_modifier(extra);
+            if let Some(c) = Self::color(depth, f) {
+                st = st.fg(c);
+            }
+            if let Some(c) = Self::color(depth, b) {
+                st = st.bg(c);
+            }
+            if depth == ColorDepth::NoColor {
+                st = st.add_modifier(Modifier::REVERSED);
+            }
+            st
+        };
         Theme {
             depth,
             accent: fg(accent),
@@ -180,7 +225,22 @@ impl Theme {
             fg_dim: fg(dim),
             bg_selected: bg(sel),
             border: fg(border),
-            border_focus: fg(focus),
+            border_focus: fg(accent),
+            sel_bar: fg(sel_bar),
+            sel_desc: fg(sel_bar),
+            sel_title: fg(sel_title),
+            help_key: fg(help_key),
+            help_desc: fg(help_desc),
+            help_sep: fg(help_sep),
+            badge: both(
+                ((0xFF, 0xFF, 0xD7), 230),
+                ((0x5F, 0x5F, 0xD7), 62),
+                Modifier::BOLD,
+            ),
+            pill_msg: both(pill_fg, ((0xFF, 0x5F, 0x87), 204), Modifier::empty()),
+            pill_a: both(pill_fg, ((0xA5, 0x50, 0xDF), 134), Modifier::empty()),
+            pill_b: both(pill_fg, ((0x61, 0x24, 0xDF), 56), Modifier::empty()),
+            spinner: fg(spinner),
         }
     }
 
@@ -241,6 +301,39 @@ impl Theme {
     }
     pub fn border_focus(&self) -> Style {
         self.border_focus
+    }
+    pub fn sel_bar(&self) -> Style {
+        self.sel_bar
+    }
+    pub fn sel_desc(&self) -> Style {
+        self.sel_desc
+    }
+    pub fn sel_title(&self) -> Style {
+        self.sel_title
+    }
+    pub fn help_key(&self) -> Style {
+        self.help_key
+    }
+    pub fn help_desc(&self) -> Style {
+        self.help_desc
+    }
+    pub fn help_sep(&self) -> Style {
+        self.help_sep
+    }
+    pub fn badge(&self) -> Style {
+        self.badge
+    }
+    pub fn pill_msg(&self) -> Style {
+        self.pill_msg
+    }
+    pub fn pill_a(&self) -> Style {
+        self.pill_a
+    }
+    pub fn pill_b(&self) -> Style {
+        self.pill_b
+    }
+    pub fn spinner(&self) -> Style {
+        self.spinner
     }
     pub fn name(&self) -> Style {
         self.fg.add_modifier(Modifier::BOLD)
