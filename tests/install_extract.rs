@@ -519,3 +519,29 @@ mod limits {
         assert!(!dest.join("big.bin").exists());
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn extract_io_error_names_operation_and_path() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.zip");
+    std::fs::write(&f, zip_with(&[("x.txt", b"new")])).unwrap();
+    let dest = d.path().join("out");
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(dest.join("x.txt"), b"old").unwrap();
+    // Held exclusively for the whole call: removing it can never succeed.
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(dest.join("x.txt"))
+        .unwrap();
+    let r = extract(&f, "a.zip", None, None, &dest);
+    match r {
+        Err(ExtractError::Io(m)) => {
+            assert!(m.contains("apagar"), "{m}");
+            assert!(m.contains("x.txt"), "{m}");
+        }
+        other => panic!("expected Io error, got {other:?}"),
+    }
+}

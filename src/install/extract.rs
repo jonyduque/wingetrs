@@ -83,6 +83,11 @@ impl From<io::Error> for ExtractError {
     }
 }
 
+/// Maps a filesystem error to `ExtractError::Io` naming the operation (Portuguese) and the path.
+fn io_at<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> ExtractError + 'a {
+    move |e| ExtractError::Io(format!("{op} {}: {e}", path.display()))
+}
+
 /// Splits an archive path on `/` and `\` into safe components; refuses `..`,
 /// absolute paths, drive prefixes, UNC and `\\?\` forms.
 fn safe_components(raw: &str) -> Result<Vec<String>, ExtractError> {
@@ -183,13 +188,13 @@ pub fn extract_all_with(
         });
     }
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).map_err(io_at("criar pasta", parent))?;
     let tmp = parent.join(format!(
         ".wingetrs-extract-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir(&tmp)?;
+    fs::create_dir(&tmp).map_err(io_at("criar pasta", &tmp))?;
     let mut guard = TempGuard {
         path: tmp.clone(),
         armed: true,
@@ -224,9 +229,9 @@ fn extract_one(
             target.push(c);
         }
         if let Some(p) = target.parent() {
-            fs::create_dir_all(p)?;
+            fs::create_dir_all(p).map_err(io_at("criar pasta", p))?;
         }
-        fs::copy(s.file, &target)?;
+        fs::copy(s.file, &target).map_err(io_at("copiar", &target))?;
         mapper.dir_seen = true;
     }
     if !mapper.dir.is_empty() && !mapper.dir_seen {
@@ -246,12 +251,12 @@ fn write_entry(
 ) -> Result<(), ExtractError> {
     let target = root.join(rel);
     if is_dir {
-        fs::create_dir_all(&target)?;
+        fs::create_dir_all(&target).map_err(io_at("criar pasta", &target))?;
     } else {
         if let Some(p) = target.parent() {
-            fs::create_dir_all(p)?;
+            fs::create_dir_all(p).map_err(io_at("criar pasta", p))?;
         }
-        let mut out = fs::File::create(&target)?;
+        let mut out = fs::File::create(&target).map_err(io_at("criar arquivo", &target))?;
         // Count bytes actually produced: declared sizes can lie and tar has none up front.
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -262,7 +267,7 @@ fn write_entry(
                 Err(e) => return Err(e.into()),
             };
             budget.charge(n as u64)?;
-            out.write_all(&buf[..n])?;
+            out.write_all(&buf[..n]).map_err(io_at("gravar", &target))?;
         }
     }
     Ok(())
@@ -351,23 +356,28 @@ fn extract_tar_gz(
 /// Moves the contents of `src` into `dest`, merging with existing directories.
 fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
     if !dest.exists() {
-        fs::rename(src, dest)?;
+        fs::rename(src, dest).map_err(io_at("renomear", src))?;
         return Ok(());
     }
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
+    for entry in fs::read_dir(src).map_err(io_at("listar", src))? {
+        let entry = entry.map_err(io_at("listar", src))?;
+        let from = entry.path();
         let to = dest.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        if entry
+            .file_type()
+            .map_err(io_at("ler tipo", &from))?
+            .is_dir()
+        {
             if to.exists() {
-                merge_into(&entry.path(), &to)?;
+                merge_into(&from, &to)?;
             } else {
-                fs::rename(entry.path(), &to)?;
+                fs::rename(&from, &to).map_err(io_at("renomear", &from))?;
             }
         } else {
             if to.exists() {
-                fs::remove_file(&to)?;
+                fs::remove_file(&to).map_err(io_at("apagar", &to))?;
             }
-            fs::rename(entry.path(), &to)?;
+            fs::rename(&from, &to).map_err(io_at("renomear", &from))?;
         }
     }
     Ok(())
