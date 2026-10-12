@@ -246,8 +246,6 @@ fn with_residues() -> App {
             )),
         })),
     );
-    // The summary toast would sit on top of the dialog; these tests look at the dialog.
-    a.toasts.clear();
     a
 }
 
@@ -565,8 +563,6 @@ fn residue_conflict_warning_survives_narrow_terminals() {
             )),
         })),
     );
-    // The summary toast would sit on top of the dialog; this test looks at the dialog.
-    a.toasts.clear();
     for w in [100, 80, 60] {
         let out = render(&a, w, 16);
         let line = out
@@ -1186,4 +1182,51 @@ fn small_terminal_puts_the_toast_in_the_status_bar() {
         "{}",
         row_text(&buf, 9)
     );
+}
+
+#[test]
+fn toasts_never_cover_a_dialog() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let mut a = with_residues();
+    assert!(a.modal.is_some());
+    assert_eq!(a.toasts.len(), 1);
+    let buf = screen_cells(&a, 100, 24, &theme);
+    // Dialog rectangle: from its top-left corner (the title row) to its bottom-left corner.
+    let top = (0..24)
+        .find(|&y| row_text(&buf, y).contains("Resíduos de powertoys"))
+        .expect("dialog title");
+    let text = row_text(&buf, top);
+    let left = col_of(&text, text.find("╭ Resíduos").unwrap());
+    let right = (left + 1..100)
+        .find(|&x| buf[(x, top)].symbol() == "╮")
+        .expect("dialog top-right corner");
+    let bottom = (top + 1..24)
+        .find(|&y| buf[(left, y)].symbol() == "╰")
+        .expect("dialog bottom-left corner");
+    for y in top..=bottom {
+        for x in left..=right {
+            let on_edge = y == top || y == bottom || x == left || x == right;
+            let sym = buf[(x, y)].symbol();
+            if !on_edge {
+                assert!(
+                    !["╭", "╮", "╰", "╯", "│", "─"].contains(&sym),
+                    "toast border inside the dialog at ({x},{y}): {}",
+                    row_text(&buf, y)
+                );
+            } else if y == top && x > left && x < right {
+                assert!(sym != "╭" && sym != "╮", "({x},{y}): {}", row_text(&buf, y));
+            }
+        }
+    }
+    assert!((0..24).all(|y| !row_text(&buf, y).contains("Sucesso")));
+    assert!(
+        row_text(&buf, 22).contains("powertoys removido"),
+        "{}",
+        row_text(&buf, 22)
+    );
+    // Closing the dialog brings the toast back as a box while it is still due.
+    press(&mut a, crossterm::event::KeyCode::Esc);
+    assert!(a.modal.is_none());
+    let out = render(&a, 100, 24);
+    assert!(out.contains("+ Sucesso"), "{out}");
 }

@@ -34,18 +34,20 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     if let Some(modal) = &app.modal {
         draw_modal(modal, theme, frame, area);
     }
-    // Toasts go on top of everything, dialogs included; small terminals use the status bar.
+    // Toast boxes never cover a dialog (the residue picker decides what gets deleted);
+    // with a dialog open, or on a small terminal, the newest toast goes to the status bar.
     if let Some(window) = window
-        && !small_for_toasts(area)
+        && !toasts_in_status_bar(app, area)
     {
         let g = Glyphs::for_set(app.glyphs);
         draw_toasts(frame, window, &app.toasts, theme, g);
     }
 }
 
-/// Below this size toasts are not boxes: the newest shows in the status bar.
-fn small_for_toasts(area: Rect) -> bool {
-    area.width < TOAST_MIN_WIDTH || area.height < TOAST_MIN_HEIGHT
+/// On a small terminal or with a dialog open toasts are not boxes: the newest shows in the
+/// status bar.
+fn toasts_in_status_bar(app: &App, area: Rect) -> bool {
+    app.modal.is_some() || area.width < TOAST_MIN_WIDTH || area.height < TOAST_MIN_HEIGHT
 }
 
 /// Smallest terminal that draws toast boxes.
@@ -702,9 +704,9 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
     // The right pills win: the left text is cut to what is left, minus a 2-cell gap.
     let rw: usize = right.iter().map(Span::width).sum();
     let room = usize::from(bar.width).saturating_sub(rw + 2);
-    // On a small terminal the newest toast takes the message pill when there is no status.
+    // Without toast boxes the newest toast takes the message pill when there is no status.
     let message = app.status.as_deref().or_else(|| {
-        small_for_toasts(frame.area())
+        toasts_in_status_bar(app, frame.area())
             .then(|| app.toasts.first().map(|t| t.text.as_str()))
             .flatten()
     });

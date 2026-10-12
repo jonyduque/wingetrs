@@ -1,4 +1,4 @@
-Status: DONE_WITH_CONCERNS
+Status: DONE
 
 Commits:
 ```
@@ -51,7 +51,27 @@ Decisions:
 - O laço usa `wake.is_some()` + `sleep_until(from_std(wake.unwrap_or(app.now)))` (forma alternativa do brief). `view::clip` virou `pub(crate)` para o toast cortar a 3ª linha. A quebra de texto mede células com `Span::width`.
 - Um toast só é desenhado se cabe inteiro acima da borda inferior da janela. Teste unitário extra em `toast.rs`, cobrindo a quebra por células com CJK e o corte em 3 linhas com `…`.
 
+Correção pedida pelo orquestrador (toast nunca cobre diálogo):
+- `view.rs`: `small_for_toasts(area)` virou `toasts_in_status_bar(app, area)` = `app.modal.is_some() || largura < 40 || altura < 12`. Com qualquer diálogo aberto, nenhuma caixa de toast é desenhada; o toast mais novo vai para a pepita de mensagem da barra de status quando `status` está vazio (mesmo caminho do terminal pequeno). A pilha e os prazos não mudam. Quando o diálogo fecha, os toasts ainda no prazo voltam a aparecer em caixa.
+- Removi o `a.toasts.clear()` dos 2 testes de diálogo (`with_residues()` e `residue_conflict_warning_survives_narrow_terminals`). Os dois passam sem ele.
+- Snapshot `tui_view__residues_modal_snapshot.snap` revertido ao conteúdo da base d832dca (`git diff d832dca -- tests/snapshots/` vazio). Com a regra nova, a última linha volta a mostrar ` powertoys removido`: antes era o `status`, agora é o toast de sucesso na pepita, porque há diálogo aberto e o `status` está vazio.
+- Teste novo `toasts_never_cover_a_dialog` (`tests/tui_view.rs`), em 100×24 com remoção + resíduos abertos. Confere quatro coisas:
+  - nenhuma célula interna do retângulo do diálogo tem `╭╮╰╯│─`, e a borda de cima não tem cantos alheios;
+  - nenhuma linha contém `Sucesso`;
+  - a linha 22 (barra de status) contém `powertoys removido`;
+  - depois do `Esc` o diálogo fecha e aparece `+ Sucesso`.
+- Mutação: `pwsh -File scripts/mutate.ps1 -Path src/tui/view.rs -Anchor '        && !toasts_in_status_bar(app, area)' -Replacement '        && !(area.width < TOAST_MIN_WIDTH || area.height < TOAST_MIN_HEIGHT)' -TestCommand 'cargo test --quiet --test tui_view toasts_never_cover_a_dialog'`
+  `[OK] mutação PEGA: '        && !toasts_in_status_bar(app, area)' -> '        && !(area.width < TOAST_MIN_WIDTH || area.height < TOAST_MIN_HEIGHT)' fez o teste falhar (exit 101).` A asserção que pegou foi a de `Sucesso` (linha 1221). Em 100×24 o diálogo de resíduos, centralizado, começa abaixo da caixa do toast (linhas 4–7), então a varredura de bordas sozinha não teria pegado nesse tamanho.
+- Gate depois da correção:
+```
+[OK]   rules 2s
+[OK]   rules-selftest 9s
+[OK]   fmt 1s
+[OK]   clippy 96s
+[OK]   test (580 passed, 16 ignored) 116s
+[OK]   gate verde
+```
+
 Concerns:
-- O toast de resumo do `on_finished` agora aparece por cima do diálogo de resíduos que abre junto com ele, cobrindo o canto superior direito do diálogo por 3 s (é o que o brief pede: toasts por cima de diálogos). Em `tests/tui_view.rs`, `with_residues()` e `residue_conflict_warning_survives_narrow_terminals` passaram a chamar `a.toasts.clear()` antes de renderizar, sem mudar as asserções. O snapshot `tui_view__residues_modal_snapshot.snap` foi atualizado: a última linha passou de `powertoys removido` (que era o `status`) para `1 de 3 · 3 no catálogo`. O orquestrador pode querer decidir se o toast deve esperar o diálogo fechar.
 - Em terminal pequeno, a pepita mostra o toast mais novo enquanto ele não vence; um `Error` fica lá até `Esc`.
 - Não medido: custo de desenho dos toasts e acordadas do laço (nenhum benchmark pedido).
