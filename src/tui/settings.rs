@@ -49,7 +49,9 @@ impl SettingId {
             SettingId::Confirm => {
                 "Mostra o plano e espera Enter antes de instalar, atualizar ou remover."
             }
-            SettingId::Purge => "Apaga também os dados do app (persist) ao removê-lo.",
+            SettingId::Purge => {
+                "Apaga também os dados do app (persist) ao removê-lo. Com confirmação \"nunca\", apaga sem perguntar."
+            }
             SettingId::KeepOld => "Mantém a versão anterior no disco depois de atualizar.",
             SettingId::Residues => "O que fazer com restos deixados no sistema após remover.",
             SettingId::Glyphs => "Conjunto de ícones da interface.",

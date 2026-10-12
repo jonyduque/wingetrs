@@ -280,6 +280,9 @@ pub struct App {
     pub planning: bool,
     /// `keep` of the plan in flight, carried to the candidate picker if one opens.
     pub planning_keep: bool,
+    /// `confirm` setting when the plan key was pressed (a later change does not skip the dialog);
+    /// `None` = no plan key pending, the current setting applies.
+    pub planning_confirm: Option<ConfirmMode>,
     /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
     pub now: Instant,
     /// Toasts on screen, newest first.
@@ -342,6 +345,7 @@ impl App {
             modal: None,
             planning: false,
             planning_keep: false,
+            planning_confirm: None,
             now: Instant::now(),
             toasts: Vec::new(),
             refresh_forced: false,
@@ -917,6 +921,7 @@ fn start_planning(app: &mut App, cmd: Cmd) -> Vec<Cmd> {
         Cmd::PlanInstall { keep, .. } | Cmd::PlanUpgradeAll { keep } => keep,
         _ => false,
     };
+    app.planning_confirm = Some(app.settings.behavior.confirm);
     app.status = Some("planejando…".to_string());
     vec![cmd]
 }
@@ -1039,9 +1044,13 @@ fn execute(app: &mut App, action: Action) -> Vec<Cmd> {
 fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
     app.planning = false;
     app.status = None;
+    let confirm = app
+        .planning_confirm
+        .take()
+        .unwrap_or(app.settings.behavior.confirm);
     match result {
         Ok(Planned::Ready { text, action }) => {
-            if !needs_confirm(app.settings.behavior.confirm, &action) {
+            if !needs_confirm(confirm, &action) {
                 return execute(app, action);
             }
             app.modal = Some(Modal::Confirm {
@@ -1098,7 +1107,7 @@ fn handle_residues(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<C
     }
     let n = residues.len();
     let chosen: Vec<Residue> = match mode {
-        ResidueMode::High => residues.into_iter().filter(|r| r.preselected).collect(),
+        ResidueMode::High => crate::install::residue::auto_clean(&residues),
         _ => Vec::new(),
     };
     if chosen.is_empty() {

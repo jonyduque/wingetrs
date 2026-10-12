@@ -303,12 +303,7 @@ fn clean_residues(
         return Ok(());
     }
     let selected: Vec<Residue> = if yes {
-        // Only what the classifier is sure about and pre-selected itself.
-        residues
-            .iter()
-            .filter(|r| r.confidence == Confidence::High && r.preselected)
-            .cloned()
-            .collect()
+        crate::install::residue::auto_clean(residues)
     } else if ui.interactive() {
         let items = residues
             .iter()

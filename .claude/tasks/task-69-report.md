@@ -59,3 +59,20 @@ Follow-up mutation proofs:
   `[OK] mutação PEGA: '                        id: c.entry.id.clone(), ... fez o teste falhar` (the output line is cut at the line break in the multi-line anchor; exit 101)
 - `keep: true` fixed when the picker opens (test picker_after_install_never_keeps):
   `[OK] mutação PEGA: 'keep: app.planning_keep,' -> 'keep: true,' fez o teste falhar (exit 101).`
+
+Review Minors (follow-up 2):
+1. `pub fn auto_clean(&[Residue]) -> Vec<Residue>` in `src/install/residue.rs` (High && preselected) is now used by both the CLI `--yes` (`src/cli/install_cmd.rs`) and the TUI `High` mode. Test `install_residue::auto_clean_takes_only_high_and_preselected`. The TUI's "High" mode now also requires `Confidence::High`, where before it only checked `preselected`.
+   `[OK] mutação PEGA: '.filter(|r| r.confidence == Confidence::High && r.preselected)' -> '.filter(|r| r.preselected)' fez o teste falhar (exit 101).`
+2. `confirm` is captured in `start_planning` as `App::planning_confirm: Option<ConfirmMode>`. `on_planned` uses it with `take()`, and only when no plan key is pending does it fall back to the current setting. That fallback keeps the brief's literal tests 1 and 2 (Ready with no key pressed) valid. Test `confirm_setting_is_taken_at_key_time`.
+   `[OK] mutação PEGA: 'app.planning_confirm = Some(app.settings.behavior.confirm);' -> 'app.planning_confirm = None;' fez o teste falhar (exit 101).`
+3. The Purge description in `src/tui/settings.rs` now warns that with confirmation "nunca" it deletes without asking. The `settings_screen_snapshot` snapshot doesn't render descriptions, so it didn't change (no `.snap.new`).
+4. Test `second_upgrade_while_running_does_nothing`: with `Modal::Running` open, a second `U` gives no command. It passed without any code change (regression test), so there's no mutation.
+Gate:
+```
+[OK]   rules 2s
+[OK]   rules-selftest 9s
+[OK]   fmt 1s
+[OK]   clippy 14s
+[OK]   test (612 passed, 16 ignored) 133s
+[OK]   gate verde
+```

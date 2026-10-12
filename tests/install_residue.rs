@@ -1,7 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use wingetrs::install::residue::{Confidence, Residue, ResidueInput, ResidueKind, classify, clean};
+use wingetrs::install::residue::{
+    Confidence, Residue, ResidueInput, ResidueKind, auto_clean, classify, clean,
+};
 use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
 use wingetrs::install::traits::{EffectError, Effects, RegHit, RegistryScan};
 
@@ -635,4 +637,23 @@ fn malformed_github_homepage_gives_no_owner_candidate() {
         ];
         assert!(i.run().is_empty(), "{hp}: {:?}", i.run());
     }
+}
+
+#[test]
+fn auto_clean_takes_only_high_and_preselected() {
+    let item = |path: &str, confidence: Confidence, preselected: bool| Residue {
+        kind: ResidueKind::Folder { path: path.into() },
+        confidence,
+        preselected,
+        note: None,
+    };
+    let residues = vec![
+        item("C:/high-unmarked", Confidence::High, false),
+        item("C:/low-marked", Confidence::Low, true),
+        item("C:/high-marked", Confidence::High, true),
+    ];
+    assert_eq!(
+        auto_clean(&residues),
+        vec![item("C:/high-marked", Confidence::High, true)]
+    );
 }

@@ -97,6 +97,16 @@ pub fn github_owner(homepage: &str) -> Option<&str> {
     valid.then_some(owner)
 }
 
+/// What is removed without asking (`--yes` in the CLI, "alta" in the TUI): only items the
+/// classifier is sure about and pre-selected itself.
+pub fn auto_clean(residues: &[Residue]) -> Vec<Residue> {
+    residues
+        .iter()
+        .filter(|r| r.confidence == Confidence::High && r.preselected)
+        .cloned()
+        .collect()
+}
+
 pub fn classify(input: &ResidueInput<'_>) -> Vec<Residue> {
     let dir = norm(&input.removed_dir.to_string_lossy());
     let mut out: Vec<Residue> = Vec::new();

@@ -1721,3 +1721,37 @@ fn picker_after_install_never_keeps() {
         "{cmds:?}"
     );
 }
+
+#[test]
+fn confirm_setting_is_taken_at_key_time() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("a", "wingetrs", "scoop:main", false)],
+    );
+    a.settings.behavior.confirm = ConfirmMode::Always;
+    assert_eq!(update(&mut a, key(KeyCode::Char('u'))).len(), 1);
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    let cmds = update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Remover a".into(),
+            action: removal("a"),
+        })),
+    );
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(confirm_open(&a));
+}
+
+#[test]
+fn second_upgrade_while_running_does_nothing() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![irow("a", "wingetrs", "scoop:main", true)],
+    );
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    assert_eq!(update(&mut a, key(KeyCode::Char('U'))).len(), 1);
+    update(&mut a, ready("a"));
+    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+    assert!(update(&mut a, key(KeyCode::Char('U'))).is_empty());
+    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+}
