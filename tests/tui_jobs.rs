@@ -271,12 +271,65 @@ fn progress_is_coalesced_to_about_twenty_per_second() {
     let base = Instant::now();
     let t = ProgressThrottle::new(base);
     let at = |ms: u64| base + Duration::from_millis(ms);
-    assert!(t.admit(at(0), 1, Some(100)), "first goes through");
-    assert!(!t.admit(at(10), 2, Some(100)));
-    assert!(!t.admit(at(49), 3, Some(100)));
-    assert!(t.admit(at(50), 4, Some(100)));
-    assert!(!t.admit(at(60), 5, Some(100)));
-    assert!(t.admit(at(61), 100, Some(100)), "the final one always does");
+    let r = |done: u64| Some(("u1".to_string(), done, Some(100)));
+    assert_eq!(
+        t.admit(at(0), "u1", 1, Some(100)),
+        r(1),
+        "first goes through"
+    );
+    assert_eq!(t.admit(at(10), "u1", 2, Some(100)), None);
+    assert_eq!(t.admit(at(49), "u1", 3, Some(100)), None);
+    assert_eq!(t.admit(at(50), "u1", 4, Some(100)), r(4));
+    assert_eq!(t.admit(at(60), "u1", 5, Some(100)), None);
+    assert_eq!(
+        t.admit(at(61), "u1", 100, Some(100)),
+        r(100),
+        "the final one always does"
+    );
+}
+
+#[test]
+fn parallel_downloads_are_summed_not_alternated() {
+    let base = Instant::now();
+    let t = ProgressThrottle::new(base);
+    let at = |ms: u64| base + Duration::from_millis(ms);
+    assert_eq!(
+        t.admit(at(0), "u1", 10, Some(100)),
+        Some(("u1".to_string(), 10, Some(100)))
+    );
+    assert_eq!(
+        t.admit(at(60), "u2", 5, Some(50)),
+        Some(("2 arquivos".to_string(), 15, Some(150)))
+    );
+    assert_eq!(
+        t.admit(at(120), "u1", 40, Some(100)),
+        Some(("2 arquivos".to_string(), 45, Some(150)))
+    );
+}
+
+#[test]
+fn unknown_total_makes_the_sum_unknown() {
+    let base = Instant::now();
+    let t = ProgressThrottle::new(base);
+    let at = |ms: u64| base + Duration::from_millis(ms);
+    assert!(t.admit(at(0), "u1", 10, Some(100)).is_some());
+    assert_eq!(
+        t.admit(at(60), "u2", 5, None),
+        Some(("2 arquivos".to_string(), 15, None))
+    );
+}
+
+#[test]
+fn one_finished_file_does_not_bypass_the_gap_while_others_run() {
+    let base = Instant::now();
+    let t = ProgressThrottle::new(base);
+    let at = |ms: u64| base + Duration::from_millis(ms);
+    assert!(t.admit(at(0), "u1", 10, Some(100)).is_some());
+    assert_eq!(t.admit(at(10), "u2", 50, Some(50)), None);
+    assert_eq!(
+        t.admit(at(20), "u1", 100, Some(100)),
+        Some(("2 arquivos".to_string(), 150, Some(150)))
+    );
 }
 
 #[test]

@@ -7,18 +7,25 @@ use crate::install::plan::InstallPlan;
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
 use crate::tui::app::{Action, Done, InstallFail, Msg, Planned};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Minimum gap between two forwarded progress messages (about 20 per second).
 const PROGRESS_GAP: Duration = Duration::from_millis(50);
 
-/// Lets at most one progress message per `PROGRESS_GAP` through, plus the final one.
+/// Per-label progress state: `(done, total)`.
+type Entries = BTreeMap<String, (u64, Option<u64>)>;
+
+/// Sums progress across parallel downloads and lets at most one aggregate per `PROGRESS_GAP`
+/// through, plus the moment the whole batch is complete.
 pub struct ProgressThrottle {
     base: Instant,
     /// Milliseconds since `base` of the last admitted message; `u64::MAX` = none yet.
     last_ms: AtomicU64,
+    entries: Mutex<Entries>,
 }
 
 impl ProgressThrottle {
@@ -26,21 +33,39 @@ impl ProgressThrottle {
         ProgressThrottle {
             base,
             last_ms: AtomicU64::new(u64::MAX),
+            entries: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// True when the message observed at `now` should be forwarded.
-    pub fn admit(&self, now: Instant, done: u64, total: Option<u64>) -> bool {
+    /// Records `label`'s progress; returns the aggregate `(label, done, total)` when it should
+    /// be forwarded.
+    pub fn admit(
+        &self,
+        now: Instant,
+        label: &str,
+        done: u64,
+        total: Option<u64>,
+    ) -> Option<(String, u64, Option<u64>)> {
         let ms = u64::try_from(now.saturating_duration_since(self.base).as_millis())
             .unwrap_or(u64::MAX - 1);
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries.insert(label.to_string(), (done, total));
+        let sum_done: u64 = entries.values().map(|(d, _)| *d).sum();
+        let sum_total: Option<u64> = entries.values().map(|(_, t)| *t).sum();
         let last = self.last_ms.load(Ordering::Relaxed);
         let due = last == u64::MAX
             || ms.saturating_sub(last) >= PROGRESS_GAP.as_millis() as u64
-            || total == Some(done);
-        if due {
-            self.last_ms.store(ms, Ordering::Relaxed);
+            || sum_total == Some(sum_done);
+        if !due {
+            return None;
         }
-        due
+        self.last_ms.store(ms, Ordering::Relaxed);
+        let name = if entries.len() == 1 {
+            label.to_string()
+        } else {
+            format!("{} arquivos", entries.len())
+        };
+        Some((name, sum_done, sum_total))
     }
 }
 
