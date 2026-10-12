@@ -966,3 +966,127 @@ fn installed_second_line_explains_missing_correlation() {
     assert!(out.contains("sem correspondência no catálogo"), "{out}");
     assert!(out.contains("correspondência ambígua"), "{out}");
 }
+
+fn keys_of(h: &[(&str, &str)]) -> Vec<String> {
+    h.iter().map(|(k, _)| (*k).to_string()).collect()
+}
+
+#[test]
+fn hints_change_with_the_tab() {
+    use wingetrs::tui::app::{Focus, Tab};
+    use wingetrs::tui::help::hints;
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.tab = Tab::Search;
+    assert_eq!(
+        keys_of(&hints(&a)),
+        ["↑/↓", "←/→", "enter", "i", "ctrl+s", "?"]
+    );
+    a.tab = Tab::Installed;
+    assert_eq!(
+        keys_of(&hints(&a)),
+        ["↑/↓", "←/→", "enter", "u", "ctrl+s", "?"]
+    );
+    a.tab = Tab::Updates;
+    assert_eq!(
+        keys_of(&hints(&a)),
+        ["↑/↓", "←/→", "enter", "U", "ctrl+s", "?"]
+    );
+    a.focus = Focus::Details;
+    assert_eq!(keys_of(&hints(&a))[0], "esc");
+}
+
+fn line_text(l: &ratatui::text::Line) -> String {
+    l.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+#[test]
+fn help_line_truncates_whole_hints_with_ellipsis() {
+    use wingetrs::tui::help::{help_line, hints};
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let a = App::new(entries(), GlyphSet::Ascii);
+    let h = hints(&a);
+    let line = help_line(&h, 40, &theme);
+    let text = line_text(&line);
+    assert!(text.ends_with(" …"), "{text}");
+    assert!(line.width() <= 40, "{text}");
+    let body = text.trim_end_matches(" …");
+    let shown: Vec<&str> = body.split(" • ").collect();
+    assert!(shown.len() < h.len());
+    for (s, (k, d)) in shown.iter().zip(h.iter()) {
+        assert_eq!(*s, format!("{k} {d}"));
+    }
+    for w in 0..=100usize {
+        let l = help_line(&h, w, &theme);
+        let t = line_text(&l);
+        assert!(l.width() <= w, "w={w}: {t}");
+        let whole =
+            t.matches(" • ").count() + usize::from(!t.is_empty()) == h.len() && !t.contains('…');
+        assert!(whole || t.ends_with(" …") || t.is_empty(), "w={w}: {t}");
+        for piece in t
+            .trim_end_matches(" …")
+            .split(" • ")
+            .filter(|p| !p.is_empty())
+        {
+            assert!(
+                h.iter().any(|(k, d)| piece == format!("{k} {d}")),
+                "w={w}: {piece}"
+            );
+        }
+    }
+    let wide = line_text(&help_line(&h, 200, &theme));
+    assert!(!wide.contains('…'), "{wide}");
+    assert!(wide.contains("? ajuda"), "{wide}");
+}
+
+fn col_of(text: &str, byte: usize) -> u16 {
+    u16::try_from(text[..byte].chars().count()).unwrap()
+}
+
+#[test]
+fn status_message_is_a_pink_pill() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.status = Some("Instalado: rg".into());
+    let buf = screen_cells(&a, 100, 24, &theme);
+    let (x, y) = (0..24)
+        .find_map(|y| {
+            row_text(&buf, y)
+                .find("Instalado:")
+                .map(|b| (col_of(&row_text(&buf, y), b), y))
+        })
+        .expect("status text");
+    assert_eq!(buf[(x, y)].bg, theme.pill_msg().bg.unwrap());
+}
+
+#[test]
+fn short_terminal_hides_the_help_line() {
+    let a = App::new(entries(), GlyphSet::Ascii);
+    assert!(!render(&a, 100, 18).contains("? ajuda"));
+    assert!(render(&a, 100, 24).contains("? ajuda"));
+}
+
+#[test]
+fn help_line_colors_keys_and_descriptions() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let a = App::new(entries(), GlyphSet::Ascii);
+    let buf = screen_cells(&a, 100, 24, &theme);
+    let y = (0..24)
+        .find(|&y| row_text(&buf, y).contains("i instalar"))
+        .expect("help row");
+    let text = row_text(&buf, y);
+    let x = col_of(&text, text.find("i instalar").unwrap());
+    assert_eq!(buf[(x, y)].fg, theme.help_key().fg.unwrap());
+    assert_eq!(buf[(x + 2, y)].fg, theme.help_desc().fg.unwrap());
+}
+
+#[test]
+fn end_keeps_selection_visible_when_the_help_bar_hides() {
+    for h in [19u16, 20] {
+        let mut a = App::new(long_entries(300), GlyphSet::Ascii);
+        update(&mut a, Msg::Resize(100, h));
+        key(&mut a, crossterm::event::KeyCode::End);
+        let name = format!("pkg{:04}", a.selected);
+        let out = render(&a, 100, h);
+        assert!(out.contains(&name), "h={h}");
+    }
+}

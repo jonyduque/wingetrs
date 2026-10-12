@@ -2,7 +2,8 @@
 use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, Focus, ITEM_ROWS, Modal, RunProgress, Tab};
+use crate::tui::app::{App, Focus, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, RunProgress, Tab};
+use crate::tui::help::{help_line, hints};
 use crate::tui::layout::{
     BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X,
     PICKER_FOOTER_SLACK, inset, split_with_gutter,
@@ -11,7 +12,7 @@ use crate::tui::picker::{Picker, window};
 use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{Glyphs, Theme};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
@@ -40,10 +41,12 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         draw_list(app, theme, g, frame, area);
         return;
     }
+    let help_rows = u16::from(area.height >= HELP_BAR_MIN_HEIGHT);
     let rows = Layout::vertical([
         Constraint::Length(TABS_ROWS),
         Constraint::Min(1),
         Constraint::Length(1),
+        Constraint::Length(help_rows),
     ])
     .split(area);
     draw_tabs(
@@ -84,7 +87,12 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         }
         draw_details(app, theme, g, frame, right);
     }
-    draw_status(app, theme, frame, rows[2]);
+    draw_status(app, theme, g, frame, rows[2]);
+    if help_rows > 0 {
+        let bar = bar_area(rows[3]);
+        let line = help_line(&hints(app), usize::from(bar.width), theme);
+        frame.render_widget(Paragraph::new(line), bar);
+    }
     if app.show_help {
         draw_help(theme, frame, area);
     }
@@ -161,29 +169,6 @@ fn spinner(app: &App, g: &Glyphs) -> &'static str {
         .unwrap_or("")
 }
 
-fn corner_line<'a>(app: &App, theme: &Theme, g: &Glyphs) -> Line<'a> {
-    let mut spans = Vec::new();
-    if app.refreshing {
-        spans.push(Span::styled(
-            format!("{} atualizando ", spinner(app, g)),
-            theme.accent(),
-        ));
-    }
-    if app.offline {
-        spans.push(Span::styled(
-            format!("{} offline ", g.offline),
-            theme.alert().add_modifier(Modifier::BOLD),
-        ));
-    }
-    if let Some(age) = app.index_age_secs {
-        spans.push(Span::styled(
-            format!("{} índice {} ", g.refresh, format_age(age)),
-            theme.fg_dim(),
-        ));
-    }
-    Line::from(spans).alignment(Alignment::Right)
-}
-
 fn draw_search_line(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
     let prompt = Span::styled(format!("{} ", g.search), theme.accent());
     let query = if app.query.is_empty() {
@@ -199,10 +184,6 @@ fn draw_search_line(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, are
         ])
     };
     frame.render_widget(Paragraph::new(query), area);
-    frame.render_widget(
-        Paragraph::new(corner_line(app, theme, g)).alignment(Alignment::Right),
-        area,
-    );
 }
 
 fn source_glyph<'a>(theme: &Theme, g: &Glyphs, kind: SourceKind) -> Span<'a> {
@@ -667,27 +648,53 @@ fn draw_details(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: R
     frame.render_widget(p, area);
 }
 
-fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let total = match app.tab {
-        Tab::Search => app.search.entries().len(),
-        Tab::Installed | Tab::Updates => app.installed.len(),
+/// A bar row with `BAR_PAD_X` of margin on both sides.
+fn bar_area(area: Rect) -> Rect {
+    inset(area, BAR_PAD_X, 0)
+}
+
+fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
+    let left = match &app.status {
+        Some(s) => vec![Span::styled(format!(" {s} "), theme.pill_msg())],
+        None => {
+            let len = app.visible_len();
+            let mut text = format!("{} de {len}", if len == 0 { 0 } else { app.selected + 1 });
+            if app.tab == Tab::Search {
+                text.push_str(&format!(" · {} no catálogo", app.search.entries().len()));
+            }
+            vec![Span::styled(text, theme.fg_dim())]
+        }
     };
-    let pad = " ".repeat(usize::from(BAR_PAD_X));
-    let line = match &app.status {
-        Some(s) => Line::from(Span::styled(
-            format!("{pad}{s}"),
-            theme.warn().add_modifier(Modifier::ITALIC),
-        )),
-        None => Line::from(Span::styled(
-            format!(
-                "{pad}{} de {} · ↑↓ mover · ←→ aba · Enter detalhes · Ctrl+R refresh · ? ajuda",
-                app.visible_len(),
-                total
-            ),
-            italic_muted(theme),
-        )),
+    let mut right: Vec<Span> = Vec::new();
+    let mut push = |span: Span<'static>| {
+        if !right.is_empty() {
+            right.push(Span::raw(" "));
+        }
+        right.push(span);
     };
-    frame.render_widget(Paragraph::new(line), area);
+    if app.refreshing {
+        push(Span::styled(
+            format!(" {} atualizando ", spinner(app, g)),
+            theme.pill_a(),
+        ));
+    }
+    if app.offline {
+        push(Span::styled(
+            " offline ",
+            theme.alert().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(age) = app.index_age_secs {
+        push(Span::styled(
+            format!(" {} índice {} ", g.refresh, format_age(age)),
+            theme.pill_b(),
+        ));
+    }
+    let bar = bar_area(area);
+    frame.render_widget(
+        Paragraph::new(compose(left, right, usize::from(bar.width))),
+        bar,
+    );
 }
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {

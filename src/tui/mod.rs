@@ -1,5 +1,6 @@
 //! Terminal user interface.
 pub mod app;
+pub mod help;
 pub mod jobs;
 pub mod layout;
 pub mod picker;

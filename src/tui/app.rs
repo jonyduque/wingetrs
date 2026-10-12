@@ -233,8 +233,14 @@ pub fn run_search(index: &SearchIndex, query: &str, kind: Option<SourceKind>) ->
 const PAGE: usize = 10;
 /// Screen lines per list item: title and description.
 pub const ITEM_ROWS: usize = 2;
-/// Rows of screen taken by tabs (3), search line, filter gap, bottom border and status bar.
-const CHROME_ROWS: usize = 3 + 1 + FILTER_GAP as usize + 1 + 1;
+/// Terminal height from which the help bar shows under the status bar.
+pub const HELP_BAR_MIN_HEIGHT: u16 = 20;
+/// Rows of screen taken by tabs (3), search line, filter gap, bottom border, status bar and,
+/// on tall terminals, the help bar.
+pub fn chrome_rows(height: u16) -> usize {
+    let help = usize::from(height >= HELP_BAR_MIN_HEIGHT);
+    3 + 1 + FILTER_GAP as usize + 1 + 1 + help
+}
 
 impl App {
     pub fn new(entries: Vec<PackageEntry>, glyphs: GlyphSet) -> App {
@@ -382,7 +388,7 @@ impl App {
     fn clamp(&mut self) {
         let len = self.visible_len();
         self.selected = self.selected.min(len.saturating_sub(1));
-        let page = (usize::from(self.size.1).saturating_sub(CHROME_ROWS)
+        let page = (usize::from(self.size.1).saturating_sub(chrome_rows(self.size.1))
             / (ITEM_ROWS + usize::from(ITEM_GAP)))
         .max(1);
         if self.selected < self.scroll {
