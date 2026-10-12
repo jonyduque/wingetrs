@@ -11,6 +11,7 @@ use crate::tui::layout::{
 use crate::tui::picker::{Picker, window};
 use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{Glyphs, Theme};
+use crate::tui::toast::draw_toasts;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -29,17 +30,34 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    draw_screen(app, theme, frame, area);
+    let window = draw_screen(app, theme, frame, area);
     if let Some(modal) = &app.modal {
         draw_modal(modal, theme, frame, area);
     }
+    // Toasts go on top of everything, dialogs included; small terminals use the status bar.
+    if let Some(window) = window
+        && !small_for_toasts(area)
+    {
+        let g = Glyphs::for_set(app.glyphs);
+        draw_toasts(frame, window, &app.toasts, theme, g);
+    }
 }
 
-fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
+/// Below this size toasts are not boxes: the newest shows in the status bar.
+fn small_for_toasts(area: Rect) -> bool {
+    area.width < TOAST_MIN_WIDTH || area.height < TOAST_MIN_HEIGHT
+}
+
+/// Smallest terminal that draws toast boxes.
+const TOAST_MIN_WIDTH: u16 = 40;
+const TOAST_MIN_HEIGHT: u16 = 12;
+
+/// Draws the screen; returns the main window's rectangle when there is one.
+fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Option<Rect> {
     let g = Glyphs::for_set(app.glyphs);
     if area.height < MIN_HEIGHT_FOR_CHROME {
         draw_list(app, theme, g, frame, area);
-        return;
+        return None;
     }
     let help_rows = u16::from(area.height >= HELP_BAR_MIN_HEIGHT);
     let rows = Layout::vertical([
@@ -96,6 +114,7 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     if app.show_help {
         draw_help(theme, frame, area);
     }
+    Some(rows[1])
 }
 
 fn tab_index(tab: Tab) -> usize {
@@ -280,7 +299,7 @@ pub fn list_window(
 
 /// Cuts `text` to at most `max` terminal cells (wide chars count 2), ending in an
 /// ellipsis when it was cut. Control whitespace becomes a plain space first.
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     let cell_width = |c: char| Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
     let text: String = text
         .chars()
@@ -683,7 +702,13 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
     // The right pills win: the left text is cut to what is left, minus a 2-cell gap.
     let rw: usize = right.iter().map(Span::width).sum();
     let room = usize::from(bar.width).saturating_sub(rw + 2);
-    let left = match &app.status {
+    // On a small terminal the newest toast takes the message pill when there is no status.
+    let message = app.status.as_deref().or_else(|| {
+        small_for_toasts(frame.area())
+            .then(|| app.toasts.first().map(|t| t.text.as_str()))
+            .flatten()
+    });
+    let left = match message {
         Some(s) => vec![Span::styled(
             format!(" {} ", clip(s, room.saturating_sub(2))),
             theme.pill_msg(),

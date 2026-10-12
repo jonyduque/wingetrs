@@ -1,5 +1,5 @@
 //! Contextual key hints for the bottom help bar.
-use crate::tui::app::{App, Focus, Tab};
+use crate::tui::app::{App, Focus, Tab, ToastKind};
 use crate::tui::theme::Theme;
 use ratatui::text::{Line, Span};
 
@@ -21,6 +21,9 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Updates => out.push(("U", "atualizar")),
     }
     out.push(("ctrl+s", "fonte"));
+    if app.toasts.iter().any(|t| t.kind == ToastKind::Error) {
+        out.push(("esc", "fecha erro"));
+    }
     out.push(("?", "ajuda"));
     out
 }

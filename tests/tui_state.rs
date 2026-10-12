@@ -254,7 +254,8 @@ fn refresh_busy_is_not_offline_and_says_in_progress() {
     update(&mut a, Msg::RefreshBusy);
     assert!(!a.refreshing);
     assert!(!a.offline);
-    let status = a.status.unwrap();
+    assert_eq!(a.toasts[0].kind, wingetrs::tui::app::ToastKind::Info);
+    let status = a.toasts[0].text.clone();
     assert!(status.contains("atualização em andamento"), "{status}");
 }
 
@@ -273,7 +274,7 @@ fn only_network_failures_mark_offline() {
     let mut a = app();
     update(&mut a, Msg::RefreshFinished(failed_report(false)));
     assert!(!a.offline);
-    assert!(a.status.is_some());
+    assert!(!a.toasts.is_empty());
     update(&mut a, Msg::RefreshFinished(failed_report(true)));
     assert!(a.offline);
 }
@@ -282,7 +283,7 @@ fn only_network_failures_mark_offline() {
 fn installed_failure_shows_status() {
     let mut a = app();
     update(&mut a, Msg::InstalledFailed("pânico interno".into()));
-    let status = a.status.unwrap();
+    let status = a.toasts[0].text.clone();
     assert!(status.contains("falha ao ler instalados"), "{status}");
 }
 // ---- install / remove / upgrade (Task 39) ----
@@ -382,7 +383,7 @@ fn i_on_winget_does_not_open_anything_and_says_why() {
     let cmds = update(&mut a, key(KeyCode::Char('i')));
     assert!(cmds.is_empty(), "{cmds:?}");
     assert!(a.modal.is_none());
-    assert!(a.status.as_deref().unwrap().contains("fase 2d"));
+    assert!(a.toasts[0].text.contains("fase 2d"));
 }
 
 #[test]
@@ -452,7 +453,7 @@ fn busy_shows_status_and_rescans() {
     let cmds = update(&mut a, Msg::InstallFinished(Err(InstallFail::Busy)));
     assert_eq!(cmds, vec![Cmd::ScanInstalled]);
     assert!(a.modal.is_none());
-    assert_eq!(a.status.as_deref(), Some("outra instalação em andamento"));
+    assert_eq!(a.toasts[0].text, "outra instalação em andamento");
 }
 
 #[test]
@@ -467,7 +468,7 @@ fn finished_ok_rescans_and_reports() {
     let cmds = update(&mut a, Msg::InstallFinished(Ok(done)));
     assert_eq!(cmds, vec![Cmd::ScanInstalled]);
     assert!(a.modal.is_none());
-    assert_eq!(a.status.as_deref(), Some("Instalado: ripgrep"));
+    assert_eq!(a.toasts[0].text, "Instalado: ripgrep");
 }
 
 fn residue(path: &str, preselected: bool) -> Residue {
@@ -554,7 +555,7 @@ fn planning_error_becomes_status() {
     let mut a = app();
     update(&mut a, Msg::Planned(Err("não suportado: x".into())));
     assert!(a.modal.is_none());
-    assert_eq!(a.status.as_deref(), Some("não suportado: x"));
+    assert_eq!(a.toasts[0].text, "não suportado: x");
 }
 
 #[test]
@@ -567,7 +568,7 @@ fn u_removes_only_wingetrs_apps_on_installed_tab() {
         ],
     );
     assert!(update(&mut a, key(KeyCode::Char('u'))).is_empty());
-    assert!(a.status.is_some());
+    assert!(!a.toasts.is_empty());
     a.selected = 1;
     assert_eq!(
         update(&mut a, key(KeyCode::Char('u'))),
@@ -621,7 +622,7 @@ fn upper_u_upgrades_selected_or_all() {
     );
     let mut foreign = on_tab(Tab::Updates, vec![irow("gamma", "arp", "winget", true)]);
     assert!(update(&mut foreign, key(KeyCode::Char('U'))).is_empty());
-    assert!(foreign.status.is_some());
+    assert!(!foreign.toasts.is_empty());
 }
 
 #[test]
@@ -677,7 +678,7 @@ fn boot_with_an_unreadable_catalog_keeps_entries_shows_the_error_and_refreshes()
             needs_refresh: false,
         },
     );
-    let status = a.status.clone().unwrap_or_default();
+    let status = a.toasts.first().map(|t| t.text.clone()).unwrap_or_default();
     assert!(status.contains("falha ao ler o catálogo"), "{status}");
     assert!(status.contains("file is not a database"), "{status}");
     assert_eq!(a.search.entries().len(), before);
@@ -749,7 +750,7 @@ fn a_failed_reload_keeps_the_entries_and_shows_the_error() {
     assert!(before > 0);
     update(&mut a, Msg::CatalogFailed("database is locked".into()));
     assert_eq!(a.search.entries().len(), before);
-    let status = a.status.clone().unwrap_or_default();
+    let status = a.toasts.first().map(|t| t.text.clone()).unwrap_or_default();
     assert!(status.contains("falha ao ler o catálogo"), "{status}");
     assert!(status.contains("database is locked"), "{status}");
 }
@@ -1219,4 +1220,136 @@ fn end_scrolls_by_two_row_items() {
     // (20 - chrome_rows(20) = 8) / ITEM_ROWS 2 = 6 items per page: the window is 44..50.
     assert_eq!(a.selected, 49);
     assert_eq!(a.scroll, 44);
+}
+
+// ---- toasts (Task 66) ----
+
+use std::time::Duration;
+use wingetrs::tui::app::ToastKind;
+
+fn toast_texts(a: &App) -> Vec<&str> {
+    a.toasts.iter().map(|t| t.text.as_str()).collect()
+}
+
+#[test]
+fn success_toast_expires_after_three_seconds() {
+    let mut a = app();
+    let t0 = a.now;
+    update(
+        &mut a,
+        Msg::InstallFinished(Ok(Done {
+            summary: "Instalado: rg".into(),
+            residues: None,
+        })),
+    );
+    assert_eq!(a.toasts[0].kind, ToastKind::Success);
+    assert_eq!(a.toasts[0].text, "Instalado: rg");
+    a.now = t0 + Duration::from_millis(2999);
+    update(&mut a, Msg::Clock);
+    assert_eq!(a.toasts.len(), 1);
+    a.now = t0 + Duration::from_millis(3001);
+    update(&mut a, Msg::Clock);
+    assert!(a.toasts.is_empty());
+}
+
+#[test]
+fn catalog_error_toast_stays_until_esc() {
+    let mut a = app();
+    let t0 = a.now;
+    update(&mut a, Msg::CatalogFailed("database is locked".into()));
+    assert_eq!(a.toasts[0].kind, ToastKind::Error);
+    assert_eq!(a.toasts[0].expires, None);
+    a.now = t0 + Duration::from_secs(600);
+    update(&mut a, Msg::Clock);
+    assert_eq!(a.toasts.len(), 1);
+    let cmds = update(&mut a, key(KeyCode::Esc));
+    assert!(a.toasts.is_empty());
+    assert!(cmds.is_empty(), "{cmds:?}");
+}
+
+#[test]
+fn esc_ignores_timed_toasts() {
+    let mut a = app();
+    a.push_toast(ToastKind::Success, "ok");
+    update(&mut a, key(KeyCode::Char('a')));
+    update(&mut a, key(KeyCode::Char('b')));
+    update(&mut a, key(KeyCode::Esc));
+    assert_eq!(a.query, "");
+    assert_eq!(a.toasts.len(), 1);
+}
+
+#[test]
+fn stack_keeps_three_and_drops_the_oldest_timed() {
+    let mut a = app();
+    a.push_toast(ToastKind::Error, "E");
+    a.push_toast(ToastKind::Success, "S1");
+    a.push_toast(ToastKind::Success, "S2");
+    a.push_toast(ToastKind::Success, "S3");
+    assert_eq!(toast_texts(&a), vec!["S3", "S2", "E"]);
+}
+
+#[test]
+fn repeated_toast_counts_and_restarts_its_timer() {
+    let mut a = app();
+    let t0 = a.now;
+    a.push_toast(ToastKind::Success, "x");
+    a.now = t0 + Duration::from_secs(2);
+    a.push_toast(ToastKind::Success, "x");
+    assert_eq!(a.toasts.len(), 1);
+    assert_eq!(a.toasts[0].count, 2);
+    assert_eq!(a.toasts[0].expires, Some(t0 + Duration::from_secs(5)));
+}
+
+#[test]
+fn next_deadline_is_the_earliest_timed_toast() {
+    let mut a = app();
+    let t0 = a.now;
+    a.push_toast(ToastKind::Warning, "w");
+    a.push_toast(ToastKind::Success, "s");
+    assert_eq!(a.next_toast_deadline(), Some(t0 + Duration::from_secs(3)));
+    let mut b = app();
+    b.push_toast(ToastKind::Error, "e");
+    assert_eq!(b.next_toast_deadline(), None);
+}
+
+#[test]
+fn forced_refresh_success_toasts_and_automatic_is_silent() {
+    let mut a = app();
+    update(&mut a, ctrl('r'));
+    update(&mut a, Msg::RefreshStarted);
+    update(&mut a, Msg::RefreshFinished(vec![]));
+    assert_eq!(toast_texts(&a), vec!["catálogo atualizado"]);
+    let mut b = app();
+    update(&mut b, Msg::RefreshStarted);
+    update(&mut b, Msg::RefreshFinished(vec![]));
+    assert!(b.toasts.is_empty());
+}
+
+#[test]
+fn offline_refresh_failure_is_a_warning() {
+    let mut a = app();
+    update(&mut a, Msg::RefreshFinished(failed_report(true)));
+    assert_eq!(a.toasts[0].kind, ToastKind::Warning);
+    let mut b = app();
+    update(&mut b, Msg::RefreshFinished(failed_report(false)));
+    assert_eq!(b.toasts[0].kind, ToastKind::Error);
+}
+
+#[test]
+fn planning_stays_in_the_status_bar() {
+    let mut a = app();
+    select_source(&mut a, SourceKind::Scoop);
+    update(&mut a, key(KeyCode::Char('i')));
+    assert_eq!(a.status.as_deref(), Some("planejando…"));
+    assert!(a.toasts.is_empty());
+}
+
+#[test]
+fn expired_toast_disappears_on_any_message() {
+    let mut a = app();
+    let t0 = a.now;
+    a.push_toast(ToastKind::Success, "ok");
+    a.now = t0 + Duration::from_secs(4);
+    update(&mut a, Msg::Resize(100, 24));
+    assert!(a.toasts.is_empty());
 }

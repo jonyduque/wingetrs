@@ -128,3 +128,8 @@ async fn search_worker_panic_reaches_the_loop() {
         Msg::SearchDone { generation: 7, .. }
     ));
 }
+
+#[test]
+fn clock_message_draws() {
+    assert!(needs_draw(&[Msg::Clock], false));
+}

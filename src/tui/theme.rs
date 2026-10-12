@@ -35,6 +35,10 @@ pub struct Glyphs {
     pub tab_updates: &'static str,
     pub tab_settings: &'static str,
     pub bar: &'static str,
+    pub toast_ok: &'static str,
+    pub toast_info: &'static str,
+    pub toast_warn: &'static str,
+    pub toast_err: &'static str,
 }
 
 const BRAILLE: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
@@ -60,6 +64,10 @@ static NERD: Glyphs = Glyphs {
     tab_updates: "\u{f06b0}",
     tab_settings: "\u{f013}",
     bar: "┃",
+    toast_ok: "\u{f00c}",
+    toast_info: "\u{f05a}",
+    toast_warn: "\u{f071}",
+    toast_err: "\u{f057}",
 };
 
 static UNICODE: Glyphs = Glyphs {
@@ -82,6 +90,10 @@ static UNICODE: Glyphs = Glyphs {
     tab_updates: "↑",
     tab_settings: "⚙",
     bar: "┃",
+    toast_ok: "✓",
+    toast_info: "ℹ",
+    toast_warn: "⚠",
+    toast_err: "✗",
 };
 
 static ASCII: Glyphs = Glyphs {
@@ -104,6 +116,10 @@ static ASCII: Glyphs = Glyphs {
     tab_updates: "",
     tab_settings: "",
     bar: "|",
+    toast_ok: "+",
+    toast_info: "i",
+    toast_warn: "!",
+    toast_err: "x",
 };
 
 impl Glyphs {

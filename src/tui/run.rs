@@ -165,6 +165,7 @@ async fn event_loop(
     let mut stats = LoopStats::new();
 
     loop {
+        let wake = app.next_toast_deadline();
         let first = tokio::select! {
             ev = events.next() => match ev {
                 Some(Ok(ev)) => match input_msg(ev) {
@@ -176,6 +177,9 @@ async fn event_loop(
             },
             Some(m) = rx.recv() => m,
             _ = ticker.tick(), if app.animating() => Msg::Tick,
+            // One deadline, recomputed every turn: nothing to pile up while asleep.
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake.unwrap_or(app.now))),
+                if wake.is_some() => Msg::Clock,
         };
         // Take every key and job message already queued, so one frame covers them all.
         let mut input_err = None;
@@ -200,6 +204,7 @@ async fn event_loop(
         let batch_len = batch.len();
         let mut cmds = Vec::new();
         let mut refresh_msg = false;
+        app.now = Instant::now();
         for msg in batch {
             let msg = jobs::propagate(msg);
             stats.count(&msg);
@@ -292,7 +297,8 @@ pub fn last_details_only(cmds: Vec<Cmd>) -> Vec<Cmd> {
         .collect()
 }
 
-/// Whether a batch changes the screen: anything but a tick does, a tick only while animating.
+/// Whether a batch changes the screen: anything but a tick does (`Msg::Clock` included),
+/// a tick only while animating.
 pub fn needs_draw(batch: &[Msg], animating: bool) -> bool {
     batch.iter().any(|m| !matches!(m, Msg::Tick) || animating)
 }

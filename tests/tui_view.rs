@@ -246,6 +246,8 @@ fn with_residues() -> App {
             )),
         })),
     );
+    // The summary toast would sit on top of the dialog; these tests look at the dialog.
+    a.toasts.clear();
     a
 }
 
@@ -563,6 +565,8 @@ fn residue_conflict_warning_survives_narrow_terminals() {
             )),
         })),
     );
+    // The summary toast would sit on top of the dialog; this test looks at the dialog.
+    a.toasts.clear();
     for w in [100, 80, 60] {
         let out = render(&a, w, 16);
         let line = out
@@ -1143,4 +1147,43 @@ fn long_status_keeps_right_pills_visible() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn toast_box_sits_top_right_with_margins() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.push_toast(wingetrs::tui::app::ToastKind::Success, "Instalado: rg");
+    let buf = screen_cells(&a, 100, 24, &theme);
+    assert_eq!(buf[(97, 4)].symbol(), "╮");
+    assert_eq!(buf[(98, 4)].symbol(), " ");
+    assert_eq!(buf[(99, 4)].symbol(), "│");
+    assert!(
+        row_text(&buf, 5).contains("+ Sucesso"),
+        "{}",
+        row_text(&buf, 5)
+    );
+    assert!(
+        row_text(&buf, 6).contains("│ Instalado: rg"),
+        "{}",
+        row_text(&buf, 6)
+    );
+}
+
+#[test]
+fn small_terminal_puts_the_toast_in_the_status_bar() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.push_toast(wingetrs::tui::app::ToastKind::Success, "Instalado: rg");
+    let buf = screen_cells(&a, 50, 10, &theme);
+    for y in 3..=6 {
+        for x in 40..50 {
+            assert_ne!(buf[(x, y)].symbol(), "╮", "({x},{y})");
+        }
+    }
+    assert!(
+        row_text(&buf, 9).contains("Instalado: rg"),
+        "{}",
+        row_text(&buf, 9)
+    );
 }

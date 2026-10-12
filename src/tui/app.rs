@@ -12,6 +12,7 @@ use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -38,6 +39,8 @@ pub enum Msg {
     Key(KeyEvent),
     Resize(u16, u16),
     Tick,
+    /// A toast deadline passed: prune and redraw.
+    Clock,
     CatalogLoaded(Vec<PackageEntry>),
     /// Reloading the catalog failed; the current index is kept.
     CatalogFailed(String),
@@ -193,6 +196,39 @@ pub enum Cmd {
     },
 }
 
+/// What kind of event a toast reports; decides its color, glyph and lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Success,
+    Info,
+    Warning,
+    Error,
+}
+
+impl ToastKind {
+    /// Time on screen; `None` stays until `Esc`.
+    fn lifetime(self) -> Option<Duration> {
+        match self {
+            ToastKind::Success => Some(Duration::from_secs(3)),
+            ToastKind::Info => Some(Duration::from_secs(4)),
+            ToastKind::Warning => Some(Duration::from_secs(6)),
+            ToastKind::Error => None,
+        }
+    }
+}
+
+/// A notice for something that happened; the status bar holds what is true now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub text: String,
+    pub expires: Option<Instant>,
+    pub count: u32,
+}
+
+/// Most toasts on screen at once.
+pub const MAX_TOASTS: usize = 3;
+
 pub struct App {
     pub tab: Tab,
     pub focus: Focus,
@@ -222,6 +258,12 @@ pub struct App {
     pub modal: Option<Modal>,
     /// A plan is being computed; further plan keys are ignored until it arrives.
     pub planning: bool,
+    /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
+    pub now: Instant,
+    /// Toasts on screen, newest first.
+    pub toasts: Vec<Toast>,
+    /// The refresh in flight was asked for with Ctrl+R (its success is announced).
+    pub refresh_forced: bool,
 }
 
 const MAX_HITS: usize = 1000;
@@ -268,9 +310,58 @@ impl App {
             size: (80, 24),
             modal: None,
             planning: false,
+            now: Instant::now(),
+            toasts: Vec::new(),
+            refresh_forced: false,
         };
         app.research();
         app
+    }
+
+    /// Shows a toast; a repeat of one already shown moves it to the top, counts it and
+    /// restarts its timer. Past `MAX_TOASTS`, the oldest timed toast goes (or the oldest).
+    pub fn push_toast(&mut self, kind: ToastKind, text: impl Into<String>) {
+        let text = text.into();
+        let expires = kind.lifetime().map(|d| self.now + d);
+        if let Some(i) = self
+            .toasts
+            .iter()
+            .position(|t| t.kind == kind && t.text == text)
+        {
+            let mut t = self.toasts.remove(i);
+            t.count += 1;
+            t.expires = expires;
+            self.toasts.insert(0, t);
+            return;
+        }
+        self.toasts.insert(
+            0,
+            Toast {
+                kind,
+                text,
+                expires,
+                count: 1,
+            },
+        );
+        if self.toasts.len() > MAX_TOASTS {
+            let victim = self
+                .toasts
+                .iter()
+                .rposition(|t| t.expires.is_some())
+                .unwrap_or(self.toasts.len() - 1);
+            self.toasts.remove(victim);
+        }
+    }
+
+    /// Drops the toasts whose time is up.
+    pub fn prune_toasts(&mut self) {
+        let now = self.now;
+        self.toasts.retain(|t| t.expires.is_none_or(|e| e > now));
+    }
+
+    /// When the loop must wake to drop a toast: the earliest deadline.
+    pub fn next_toast_deadline(&self) -> Option<Instant> {
+        self.toasts.iter().filter_map(|t| t.expires).min()
     }
 
     /// Installed rows visible in the Installed/Updates tabs after query and source filter.
@@ -449,8 +540,10 @@ impl App {
 }
 
 pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
+    app.prune_toasts();
     match msg {
         Msg::Key(k) => on_key(app, k),
+        Msg::Clock => Vec::new(),
         Msg::Resize(w, h) => {
             app.size = (w, h);
             app.clamp();
@@ -469,7 +562,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.details_cmd()
         }
         Msg::CatalogFailed(e) => {
-            app.status = Some(format!("falha ao ler o catálogo: {e}"));
+            app.push_toast(ToastKind::Error, format!("falha ao ler o catálogo: {e}"));
             Vec::new()
         }
         Msg::Booted {
@@ -490,7 +583,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
                     empty || needs_refresh
                 }
                 Err(e) => {
-                    app.status = Some(format!("falha ao ler o catálogo: {e}"));
+                    app.push_toast(ToastKind::Error, format!("falha ao ler o catálogo: {e}"));
                     true
                 }
             };
@@ -505,7 +598,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.details_cmd()
         }
         Msg::InstalledFailed(reason) => {
-            app.status = Some(format!("falha ao ler instalados: {reason}"));
+            app.push_toast(
+                ToastKind::Error,
+                format!("falha ao ler instalados: {reason}"),
+            );
             Vec::new()
         }
         Msg::DetailsLoaded { key, result } => {
@@ -521,7 +617,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::RefreshBusy => {
             app.refreshing = false;
-            app.status = Some("Aguardando: outra atualização em andamento".to_string());
+            app.refresh_forced = false;
+            app.push_toast(
+                ToastKind::Info,
+                "Aguardando: outra atualização em andamento",
+            );
             Vec::new()
         }
         Msg::SearchDone { generation, hits } => app.search_done(generation, hits),
@@ -540,29 +640,42 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::InstallFinished(result) => on_finished(app, result),
         Msg::ResiduesCleaned(errors) => {
             app.modal = None;
-            app.status = Some(if errors.is_empty() {
-                "Resíduos removidos".to_string()
+            if errors.is_empty() {
+                app.push_toast(ToastKind::Success, "Resíduos removidos");
             } else {
-                format!("Falha ao limpar resíduos: {}", errors.join("; "))
-            });
+                app.push_toast(
+                    ToastKind::Error,
+                    format!("Falha ao limpar resíduos: {}", errors.join("; ")),
+                );
+            }
             Vec::new()
         }
         Msg::RefreshFinished(reports) => {
             app.refreshing = false;
+            let forced = std::mem::take(&mut app.refresh_forced);
             let mut failed: Vec<String> = Vec::new();
             let mut any_offline = false;
+            let mut all_offline = true;
             for r in &reports {
                 if let Outcome::Failed { message, offline } = &r.outcome {
                     failed.push(format!("{}: {message}", r.source));
                     any_offline |= *offline;
+                    all_offline &= *offline;
                 }
             }
             app.offline = any_offline;
             if failed.is_empty() {
                 app.index_age_secs = Some(0);
-                app.status = None;
+                if forced {
+                    app.push_toast(ToastKind::Success, "catálogo atualizado");
+                }
             } else {
-                app.status = Some(format!("Falha ao atualizar ({})", failed.join("; ")));
+                let kind = if all_offline {
+                    ToastKind::Warning
+                } else {
+                    ToastKind::Error
+                };
+                app.push_toast(kind, format!("Falha ao atualizar ({})", failed.join("; ")));
             }
             Vec::new()
         }
@@ -579,7 +692,10 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => vec![Cmd::Quit],
-            KeyCode::Char('r') => vec![Cmd::Refresh { force: true }],
+            KeyCode::Char('r') => {
+                app.refresh_forced = true;
+                vec![Cmd::Refresh { force: true }]
+            }
             KeyCode::Char('s') => {
                 app.filter = match app.filter {
                     SourceFilter::All => SourceFilter::Winget,
@@ -621,7 +737,11 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             app.details_cmd()
         }
         KeyCode::Esc => {
-            if app.focus == Focus::Details {
+            // An error toast stays until dismissed: Esc closes the newest and does nothing else.
+            if let Some(i) = app.toasts.iter().position(|t| t.kind == ToastKind::Error) {
+                app.toasts.remove(i);
+                Vec::new()
+            } else if app.focus == Focus::Details {
                 app.focus = Focus::List;
                 Vec::new()
             } else if !empty {
@@ -673,7 +793,7 @@ fn install_selected(app: &mut App) -> Vec<Cmd> {
         return Vec::new();
     };
     if e.source != SourceKind::Scoop {
-        app.status = Some("instalação na fase 2d".to_string());
+        app.push_toast(ToastKind::Warning, "instalação na fase 2d");
         return Vec::new();
     }
     let cmd = Cmd::PlanInstall {
@@ -689,7 +809,7 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
         None => return Vec::new(),
         Some(r) if r.origin == "wingetrs" => r.name.clone(),
         Some(_) => {
-            app.status = Some(NOT_OURS.to_string());
+            app.push_toast(ToastKind::Warning, NOT_OURS);
             return Vec::new();
         }
     };
@@ -715,7 +835,7 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
             start_planning(app, Cmd::PlanInstall { source_name, id })
         }
         _ => {
-            app.status = Some(NOT_OURS.to_string());
+            app.push_toast(ToastKind::Warning, NOT_OURS);
             Vec::new()
         }
     }
@@ -769,7 +889,7 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
                 candidates,
             });
         }
-        Err(message) => app.status = Some(message),
+        Err(message) => app.push_toast(ToastKind::Error, message),
     }
     Vec::new()
 }
@@ -778,7 +898,7 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
     app.modal = None;
     match result {
         Ok(done) => {
-            app.status = Some(done.summary);
+            app.push_toast(ToastKind::Success, done.summary);
             if let Some((name, residues)) = done.residues
                 && !residues.is_empty()
             {
@@ -792,9 +912,9 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
             }
         }
         Err(InstallFail::Busy) => {
-            app.status = Some("outra instalação em andamento".to_string());
+            app.push_toast(ToastKind::Warning, "outra instalação em andamento");
         }
-        Err(InstallFail::Other(message)) => app.status = Some(message),
+        Err(InstallFail::Other(message)) => app.push_toast(ToastKind::Error, message),
     }
     // Success or not, the disk may have changed.
     vec![Cmd::ScanInstalled]
@@ -843,7 +963,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         Modal::Running { label, progress } => {
             // The operation cannot be abandoned half-way: keys wait for it.
             if ctrl_c {
-                app.status = Some("aguarde: operação em andamento".to_string());
+                app.push_toast(ToastKind::Info, "aguarde: operação em andamento");
             }
             app.modal = Some(Modal::Running { label, progress });
             Vec::new()
@@ -862,7 +982,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 Vec::new()
             }
             PickOutcome::Cancelled => {
-                app.status = Some("resíduos mantidos".to_string());
+                app.push_toast(ToastKind::Info, "resíduos mantidos");
                 Vec::new()
             }
             PickOutcome::Picked(chosen) => {
@@ -871,7 +991,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     .filter_map(|&i| residues.get(i).cloned())
                     .collect();
                 if selected.is_empty() {
-                    app.status = Some("resíduos mantidos".to_string());
+                    app.push_toast(ToastKind::Info, "resíduos mantidos");
                     return Vec::new();
                 }
                 app.modal = Some(Modal::Running {
