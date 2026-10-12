@@ -1,11 +1,11 @@
 //! Pure rendering of `App` (spec §7.1). Colors come only from `Theme` tokens.
-use crate::core::{PackageDetails, PackageEntry, SourceKind};
+use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, Focus, Modal, RunProgress, Tab};
+use crate::tui::app::{App, Focus, ITEM_ROWS, Modal, RunProgress, Tab};
 use crate::tui::layout::{
-    BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, PAD_X, PICKER_FOOTER_SLACK, inset,
-    split_with_gutter,
+    BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X,
+    PICKER_FOOTER_SLACK, inset, split_with_gutter,
 };
 use crate::tui::picker::{Picker, window};
 use crate::tui::tabs::{TabLabel, draw_tabs};
@@ -297,7 +297,19 @@ pub fn list_window(
     start..(start + height).min(len)
 }
 
-/// Builds only the lines in `window` (indices into the full row list).
+/// Cuts `text` to at most `max` columns, ending in an ellipsis when it was cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Builds only the items in `window` (indices into the full row list): `ITEM_ROWS`
+/// lines each, `ITEM_GAP` blank lines between items.
 fn list_lines<'a>(
     app: &'a App,
     theme: &Theme,
@@ -305,45 +317,82 @@ fn list_lines<'a>(
     width: usize,
     window: std::ops::Range<usize>,
 ) -> Vec<Line<'a>> {
-    let marker = |sel: bool| {
+    let bar = |sel: bool| {
         if sel {
-            Span::styled(format!("{} ", g.selected), theme.accent())
+            Span::styled(format!("{} ", g.bar), theme.sel_bar())
         } else {
             Span::raw("  ")
         }
     };
-    let mut lines: Vec<Line<'a>> = match app.tab {
-        Tab::Search => app
-            .hits
-            .iter()
-            .enumerate()
-            .skip(window.start)
-            .take(window.len())
-            .filter_map(|(i, h)| {
-                let e: &PackageEntry = app.search.entries().get(h.index)?;
-                let mut left = vec![
-                    marker(i == app.selected),
-                    source_glyph(theme, g, e.source),
-                    Span::raw(" "),
-                ];
-                left.extend(name_spans(theme, &e.name, &h.name_indices));
+    let title_style = |sel: bool| {
+        if sel {
+            theme.sel_title().add_modifier(Modifier::BOLD)
+        } else {
+            theme.name()
+        }
+    };
+    let desc_style = |sel: bool| {
+        if sel {
+            theme.sel_desc()
+        } else {
+            theme.fg_dim()
+        }
+    };
+    // Name spans restyled for the selected row (matched letters keep underline).
+    let name_for = |sel: bool, name: &str, matched: &[u32]| -> Vec<Span<'a>> {
+        let mut spans = name_spans(theme, name, matched);
+        if sel {
+            for sp in &mut spans {
+                if sp.style == theme.name() {
+                    sp.style = title_style(true);
+                }
+            }
+        }
+        spans
+    };
+    let second = |sel: bool, text: String| -> Line<'a> {
+        let room = width.saturating_sub(4);
+        Line::from(vec![
+            bar(sel),
+            Span::raw("  "),
+            Span::styled(clip(&text, room), desc_style(sel)),
+        ])
+    };
+    let mut items: Vec<[Line<'a>; ITEM_ROWS]> = Vec::new();
+    match app.tab {
+        Tab::Search => {
+            for (i, h) in app
+                .hits
+                .iter()
+                .enumerate()
+                .skip(window.start)
+                .take(window.len())
+            {
+                let Some(e) = app.search.entries().get(h.index) else {
+                    continue;
+                };
+                let sel = i == app.selected;
+                let mut left = vec![bar(sel), source_glyph(theme, g, e.source), Span::raw(" ")];
+                left.extend(name_for(sel, &e.name, &h.name_indices));
                 let right = vec![Span::styled(e.version.clone(), theme.fg_dim())];
-                Some(compose(left, right, width))
-            })
-            .collect(),
-        Tab::Installed | Tab::Updates => app
-            .installed_view()
-            .into_iter()
-            .enumerate()
-            .skip(window.start)
-            .take(window.len())
-            .map(|(i, r)| {
-                let mut left = vec![
-                    marker(i == app.selected),
-                    row_source_glyph(theme, g, r),
-                    Span::raw(" "),
-                ];
-                left.extend(name_spans(theme, &r.name, &[]));
+                let detail = match e.description.as_deref().filter(|d| !d.is_empty()) {
+                    Some(d) => format!("{} · {d}", e.id),
+                    None => format!("{} · {}", e.id, e.source_name),
+                };
+                items.push([compose(left, right, width), second(sel, detail)]);
+            }
+        }
+        Tab::Installed | Tab::Updates => {
+            for (i, r) in app
+                .installed_view()
+                .into_iter()
+                .enumerate()
+                .skip(window.start)
+                .take(window.len())
+            {
+                let sel = i == app.selected;
+                let mut left = vec![bar(sel), row_source_glyph(theme, g, r), Span::raw(" ")];
+                left.extend(name_for(sel, &r.name, &[]));
                 let old = r.installed_version.clone().unwrap_or_default();
                 let right = match (&r.state, app.tab) {
                     (UpdateState::Available { latest }, Tab::Updates) => vec![
@@ -357,17 +406,23 @@ fn list_lines<'a>(
                         state_span(theme, g, r),
                     ],
                 };
-                compose(left, right, width)
-            })
-            .collect(),
-    };
-    // The selected row gets the background token across the whole line.
-    if let Some(l) = app
-        .selected
-        .checked_sub(window.start)
-        .and_then(|i| lines.get_mut(i))
-    {
-        l.style = theme.bg_selected();
+                let detail = match &r.correlation {
+                    Correlation::Matched {
+                        source, package_id, ..
+                    } => format!("{package_id} · {source}"),
+                    Correlation::Unmatched => "sem correspondência no catálogo".to_string(),
+                    Correlation::Ambiguous { .. } => "correspondência ambígua".to_string(),
+                };
+                items.push([compose(left, right, width), second(sel, detail)]);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    for (n, item) in items.into_iter().enumerate() {
+        if n > 0 {
+            lines.extend((0..ITEM_GAP).map(|_| Line::raw("")));
+        }
+        lines.extend(item);
     }
     lines
 }
@@ -386,7 +441,8 @@ fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect
         return;
     }
     let len = app.visible_len();
-    let h = usize::from(inner.height);
+    let per_item = ITEM_ROWS + usize::from(ITEM_GAP);
+    let h = ((usize::from(inner.height) + usize::from(ITEM_GAP)) / per_item).max(1);
     let sel = app.selected.min(len.saturating_sub(1));
     let window = list_window(sel, app.scroll, len, h);
     let lines = list_lines(app, theme, g, usize::from(inner.width), window);

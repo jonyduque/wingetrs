@@ -105,12 +105,12 @@ fn narrow_terminal_hides_details_panel() {
     let a = App::new(entries(), GlyphSet::Ascii);
     let s = render(&a, 50, 12);
     assert!(
-        !s.contains("Utilitários"),
+        !s.contains("versão"),
         "details panel must be hidden below 60 columns:\n{s}"
     );
     let s = render(&a, 100, 12);
     assert!(
-        s.contains("Utilitários"),
+        s.contains("versão"),
         "details panel visible at 100 columns:\n{s}"
     );
 }
@@ -304,7 +304,7 @@ fn selected_row_moves_on_screen_while_details_load() {
     let selected = screen
         .lines()
         .map(|l| l.trim_start_matches('"'))
-        .find(|l| l.starts_with("│ > "))
+        .find(|l| l.starts_with("│ | "))
         .expect("a selected row");
     assert!(selected.contains("powertoys"), "{selected}");
     assert!(screen.contains("carregando"), "{screen}");
@@ -353,7 +353,7 @@ fn long_list_end_is_rendered() {
     let line = out
         .lines()
         .map(|l| l.trim_start_matches('"'))
-        .find(|l| l.starts_with("│ > "))
+        .find(|l| l.starts_with("│ | "))
         .unwrap();
     assert!(line.contains("pkg0999"), "{line}");
     assert!(!out.contains("pkg0000"));
@@ -424,21 +424,30 @@ fn scrolled_selection_highlights_the_selected_row() {
         )),
     );
     let theme = Theme::new(true, ColorDepth::TrueColor);
-    let sel_bg = theme.bg_selected().bg.expect("selected background");
+    let sel_bar = theme.sel_bar().fg.expect("bar color");
+    let sel_title = theme.sel_title().fg.expect("title color");
     let mut t = Terminal::new(TestBackend::new(100, 20)).unwrap();
     t.draw(|f| view(&a, &theme, f)).unwrap();
     let buf = t.backend().buffer().clone();
-    let mut highlighted = Vec::new();
+    let mut barred = Vec::new();
     for y in 0..buf.area.height {
         let text: String = (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().to_string())
             .collect();
-        if text.contains("pkg") && buf[(3, y)].bg == sel_bg {
-            highlighted.push(text);
+        if text.contains("pkg") && buf[(2, y)].symbol() == "|" {
+            assert_eq!(buf[(2, y)].fg, sel_bar, "{text}");
+            barred.push((y, text));
         }
     }
-    assert_eq!(highlighted.len(), 1, "{highlighted:?}");
-    assert!(highlighted[0].contains("pkg0999"), "{highlighted:?}");
+    // Title line plus description line of the one selected item, nothing else.
+    assert_eq!(barred.len(), 2, "{barred:?}");
+    assert!(barred[0].1.contains("pkg0999"), "{barred:?}");
+    assert_eq!(barred[1].0, barred[0].0 + 1, "{barred:?}");
+    let name_x = (0..buf.area.width)
+        .find(|&x| buf[(x, barred[0].0)].symbol() == "p")
+        .expect("name cell");
+    assert_eq!(buf[(name_x, barred[0].0)].fg, sel_title);
+    assert!(buf[(name_x, barred[0].0)].modifier.contains(Modifier::BOLD));
 }
 
 fn cell(out: &str, x: usize, y: usize) -> String {
@@ -481,9 +490,12 @@ fn list_and_details_text_start_one_column_after_the_border() {
     for y in 5..=7 {
         assert_eq!(cell(&out, 1, y), " ", "{out}");
         let c2 = cell(&out, 2, y);
-        assert!(c2 == ">" || c2 == " ", "{out}");
-        let glyph = cell(&out, 4, y);
-        assert!(glyph == "W" || glyph == "S", "{out}");
+        assert!(c2 == "|" || c2 == " ", "{out}");
+        if y % 2 == 1 {
+            // Title lines (rows 5 and 7) carry the source glyph; description lines do not.
+            let glyph = cell(&out, 4, y);
+            assert!(glyph == "W" || glyph == "S", "{out}");
+        }
     }
     assert_eq!(cell(&out, 55, 5), "│", "{out}");
     assert_eq!(cell(&out, 56, 5), " ", "{out}");
@@ -745,7 +757,7 @@ fn end_and_page_down_keep_the_selection_on_screen_at_100x24() {
     let line = out
         .lines()
         .map(|l| l.trim_start_matches('"'))
-        .find(|l| l.starts_with("│ > "))
+        .find(|l| l.starts_with("│ | "))
         .expect("selected row");
     assert!(line.contains(&name), "{line}");
     key(&mut a, crossterm::event::KeyCode::End);
@@ -754,7 +766,7 @@ fn end_and_page_down_keep_the_selection_on_screen_at_100x24() {
     let line = out
         .lines()
         .map(|l| l.trim_start_matches('"'))
-        .find(|l| l.starts_with("│ > "))
+        .find(|l| l.starts_with("│ | "))
         .expect("selected row");
     assert!(line.contains(&name), "{line}");
 }
@@ -804,4 +816,90 @@ fn divider_is_focus_colored_only_when_details_has_focus() {
     key(&mut a, crossterm::event::KeyCode::Enter);
     let b = paint(&a);
     assert_eq!(b[(55, 5)].fg, theme.border_focus().fg.unwrap());
+}
+
+fn screen_cells(a: &App, w: u16, h: u16, theme: &Theme) -> ratatui::buffer::Buffer {
+    let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+    t.draw(|f| view(a, theme, f)).unwrap();
+    t.backend().buffer().clone()
+}
+
+fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buf.area.width)
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect()
+}
+
+#[test]
+fn selected_item_has_bar_and_pink_title() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let a = App::new(entries(), GlyphSet::Nerd);
+    let buf = screen_cells(&a, 100, 20, &theme);
+    let y1 = (0..20)
+        .find(|&y| row_text(&buf, y).contains("EverythingPowerToys"))
+        .expect("first item");
+    assert_eq!(buf[(2, y1)].symbol(), "┃");
+    assert_eq!(buf[(2, y1)].fg, theme.sel_bar().fg.unwrap());
+    let nx = (0..100u16)
+        .find(|&x| buf[(x, y1)].symbol() == "E")
+        .expect("name");
+    assert_eq!(buf[(nx, y1)].fg, theme.sel_title().fg.unwrap());
+    assert!(buf[(nx, y1)].modifier.contains(Modifier::BOLD));
+    // Second item: its name is not selected-colored.
+    let y2 = y1 + 2;
+    assert!(row_text(&buf, y2).contains("PowerToys"));
+    let nx2 = (0..100u16)
+        .find(|&x| buf[(x, y2)].symbol() == "P")
+        .expect("name 2");
+    assert_eq!(buf[(nx2, y2)].fg, theme.fg().fg.unwrap());
+    assert_ne!(buf[(2, y2)].symbol(), "┃");
+}
+
+#[test]
+fn second_line_shows_id_and_description() {
+    let a = App::new(entries(), GlyphSet::Ascii);
+    let out = render(&a, 120, 20);
+    let lines: Vec<&str> = out.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.contains("PowerToys") && !l.contains("Everything"))
+        .expect("title line");
+    assert!(
+        lines[i + 1].contains("Microsoft.PowerToys · Utilitários para power users"),
+        "{}",
+        lines[i + 1]
+    );
+}
+
+#[test]
+fn end_of_list_is_visible_with_two_row_items() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let a0 = App::new(long_entries(50), GlyphSet::Ascii);
+    let mut a = a0;
+    update(&mut a, Msg::Resize(100, 20));
+    key(&mut a, crossterm::event::KeyCode::End);
+    let buf = screen_cells(&a, 100, 20, &theme);
+    let y = (0..20)
+        .find(|&y| buf[(2, y)].symbol() == "|" && row_text(&buf, y).contains("pkg0049"))
+        .expect("last item visible");
+    assert_eq!(buf[(2, y)].symbol(), "|", "{}", row_text(&buf, y));
+}
+
+#[test]
+fn end_and_page_keep_selection_on_screen_at_other_heights() {
+    // Page in items = (height - CHROME_ROWS) / 2.
+    for h in [12u16, 40] {
+        let mut a = App::new(long_entries(300), GlyphSet::Ascii);
+        update(&mut a, Msg::Resize(100, h));
+        key(&mut a, crossterm::event::KeyCode::PageDown);
+        key(&mut a, crossterm::event::KeyCode::End);
+        let name = format!("pkg{:04}", a.selected);
+        let out = render(&a, 100, h);
+        let line = out
+            .lines()
+            .map(|l| l.trim_start_matches('"'))
+            .find(|l| l.starts_with("│ | "))
+            .expect("selected row");
+        assert!(line.contains(&name), "h={h}: {line}");
+    }
 }

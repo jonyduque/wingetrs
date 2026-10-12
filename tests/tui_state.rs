@@ -1185,3 +1185,38 @@ fn typing_does_not_search_on_the_ui_thread() {
     );
     assert_eq!(a.hits, before);
 }
+
+#[test]
+fn page_down_moves_ten_items() {
+    let es: Vec<PackageEntry> = (0..50)
+        .map(|i| {
+            entry(
+                SourceKind::Winget,
+                &format!("pkg{i:02}"),
+                &format!("pkg{i:02}"),
+            )
+        })
+        .collect();
+    let mut a = App::new(es, GlyphSet::Ascii);
+    update(&mut a, key(KeyCode::PageDown));
+    assert_eq!(a.selected, 10);
+}
+
+#[test]
+fn end_scrolls_by_two_row_items() {
+    let es: Vec<PackageEntry> = (0..50)
+        .map(|i| {
+            entry(
+                SourceKind::Winget,
+                &format!("pkg{i:02}"),
+                &format!("pkg{i:02}"),
+            )
+        })
+        .collect();
+    let mut a = App::new(es, GlyphSet::Ascii);
+    update(&mut a, Msg::Resize(100, 20));
+    update(&mut a, key(KeyCode::End));
+    // (20 - CHROME_ROWS 7) / ITEM_ROWS 2 = 6 items per page: the window is 44..50.
+    assert_eq!(a.selected, 49);
+    assert_eq!(a.scroll, 44);
+}

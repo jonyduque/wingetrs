@@ -5,7 +5,7 @@ use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::layout::FILTER_GAP;
+use crate::tui::layout::{FILTER_GAP, ITEM_GAP};
 use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
@@ -232,6 +232,8 @@ pub fn run_search(index: &SearchIndex, query: &str, kind: Option<SourceKind>) ->
 }
 const PAGE: usize = 10;
 /// Rows of screen taken by tabs (3), search line, filter gap, bottom border and status bar.
+/// Screen lines per list item: title and description.
+pub const ITEM_ROWS: usize = 2;
 const CHROME_ROWS: usize = 3 + 1 + FILTER_GAP as usize + 1 + 1;
 
 impl App {
@@ -380,7 +382,9 @@ impl App {
     fn clamp(&mut self) {
         let len = self.visible_len();
         self.selected = self.selected.min(len.saturating_sub(1));
-        let page = usize::from(self.size.1).saturating_sub(CHROME_ROWS).max(1);
+        let page = (usize::from(self.size.1).saturating_sub(CHROME_ROWS)
+            / (ITEM_ROWS + usize::from(ITEM_GAP)))
+        .max(1);
         if self.selected < self.scroll {
             self.scroll = self.selected;
         } else if self.selected >= self.scroll + page {
