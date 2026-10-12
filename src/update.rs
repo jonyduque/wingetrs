@@ -228,7 +228,8 @@ pub async fn run_update(
     });
     let results = futures_util::future::join_all(fetches).await;
 
-    let mut catalog = Catalog::open(&data.catalog_path())?;
+    let mut catalog = tracing::debug_span!("update.catalog_open")
+        .in_scope(|| Catalog::open(&data.catalog_path()))?;
     let mut reports = Vec::new();
     for (job, res) in jobs.iter().zip(results) {
         let outcome = match res {
