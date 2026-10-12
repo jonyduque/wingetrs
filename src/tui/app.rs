@@ -5,6 +5,7 @@ use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
+use crate::tui::layout::FILTER_GAP;
 use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
@@ -230,8 +231,8 @@ pub fn run_search(index: &SearchIndex, query: &str, kind: Option<SourceKind>) ->
     index.search(query, kind, MAX_HITS)
 }
 const PAGE: usize = 10;
-/// Rows of screen taken by tabs, search box, status bar and borders.
-const CHROME_ROWS: usize = 6;
+/// Rows of screen taken by tabs (3), search line, filter gap, bottom border and status bar.
+const CHROME_ROWS: usize = 3 + 1 + FILTER_GAP as usize + 1 + 1;
 
 impl App {
     pub fn new(entries: Vec<PackageEntry>, glyphs: GlyphSet) -> App {

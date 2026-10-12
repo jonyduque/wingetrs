@@ -2,14 +2,16 @@
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, Focus, Modal, RunProgress, Tab};
+use crate::tui::app::{App, Modal, RunProgress, Tab};
 use crate::tui::layout::{
-    BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, PAD_X, PICKER_FOOTER_SLACK, inset,
+    BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, PAD_X, PICKER_FOOTER_SLACK, inset,
+    split_with_gutter,
 };
 use crate::tui::picker::{Picker, window};
+use crate::tui::tabs::draw_tabs;
 use crate::tui::theme::{Glyphs, Theme};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
@@ -18,6 +20,8 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 const MIN_WIDTH_FOR_DETAILS: u16 = 60;
 /// Below this height only the list is drawn.
 const MIN_HEIGHT_FOR_CHROME: u16 = 8;
+/// Lines taken by the tab header.
+const TABS_ROWS: u16 = 3;
 
 pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
@@ -33,29 +37,59 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
 fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
     let g = Glyphs::for_set(app.glyphs);
     if area.height < MIN_HEIGHT_FOR_CHROME {
-        draw_list(app, theme, g, frame, area, false);
+        draw_list(app, theme, g, frame, area);
         return;
     }
     let rows = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(TABS_ROWS),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
-    draw_search_box(app, theme, g, frame, rows[0]);
+    draw_tabs(
+        frame,
+        rows[0],
+        &tab_labels(app, g),
+        tab_index(app.tab),
+        theme,
+    );
+    let window = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent());
+    let inner = inset(window.inner(rows[1]), PAD_X, 0);
+    frame.render_widget(window, rows[1]);
+    let parts = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(FILTER_GAP),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    draw_search_line(app, theme, g, frame, parts[0]);
+    let body = parts[2];
     if area.width < MIN_WIDTH_FOR_DETAILS {
-        draw_list(app, theme, g, frame, rows[1], true);
+        draw_list(app, theme, g, frame, body);
     } else {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(rows[1]);
-        draw_list(app, theme, g, frame, cols[0], true);
-        draw_details(app, theme, g, frame, cols[1]);
+        let (left, divider, right) = split_with_gutter(body, 55);
+        draw_list(app, theme, g, frame, left);
+        for y in body.y..body.bottom() {
+            frame
+                .buffer_mut()
+                .set_string(divider, y, "│", theme.border());
+        }
+        draw_details(app, theme, g, frame, right);
     }
     draw_status(app, theme, frame, rows[2]);
     if app.show_help {
         draw_help(theme, frame, area);
+    }
+}
+
+fn tab_index(tab: Tab) -> usize {
+    match tab {
+        Tab::Search => 0,
+        Tab::Installed => 1,
+        Tab::Updates => 2,
     }
 }
 
@@ -82,32 +116,24 @@ fn updates_count(app: &App) -> usize {
         .count()
 }
 
-fn tabs_line<'a>(app: &App, theme: &Theme) -> Line<'a> {
+fn tab_labels(app: &App, g: &Glyphs) -> Vec<String> {
     let count = updates_count(app);
-    let tabs = [
-        (Tab::Search, "Pesquisar".to_string()),
-        (Tab::Installed, "Instalados".to_string()),
-        (
-            Tab::Updates,
-            if count > 0 {
-                format!("Atualizações ({count})")
-            } else {
-                "Atualizações".to_string()
-            },
-        ),
-    ];
-    let mut spans = vec![Span::raw(" ")];
-    for (tab, label) in tabs {
-        let style = if tab == app.tab {
-            theme.accent().add_modifier(Modifier::BOLD)
-        } else if tab == Tab::Updates && count > 0 {
-            theme.warn()
+    let with_glyph = |glyph: &str, name: &str| {
+        if glyph.is_empty() {
+            name.to_string()
         } else {
-            theme.fg_dim()
-        };
-        spans.push(Span::styled(format!(" {label} "), style));
-    }
-    Line::from(spans)
+            format!("{glyph} {name}")
+        }
+    };
+    vec![
+        with_glyph(g.tab_search, "Pesquisar"),
+        with_glyph(g.tab_installed, "Instalados"),
+        if count > 0 {
+            with_glyph(g.tab_updates, &format!("Atualizações {count}"))
+        } else {
+            with_glyph(g.tab_updates, "Atualizações")
+        },
+    ]
 }
 
 fn format_age(secs: i64) -> String {
@@ -149,10 +175,7 @@ fn corner_line<'a>(app: &App, theme: &Theme, g: &Glyphs) -> Line<'a> {
     Line::from(spans).alignment(Alignment::Right)
 }
 
-fn draw_search_box(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
-    let blk = block(theme, app.focus == Focus::List)
-        .title(tabs_line(app, theme))
-        .title(corner_line(app, theme, g));
+fn draw_search_line(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
     let prompt = Span::styled(format!("{} ", g.search), theme.accent());
     let query = if app.query.is_empty() {
         Line::from(vec![
@@ -166,9 +189,11 @@ fn draw_search_box(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area
             Span::styled("▏", theme.accent()),
         ])
     };
-    let inner = inset(blk.inner(area), PAD_X, 0);
-    frame.render_widget(blk, area);
-    frame.render_widget(Paragraph::new(query), inner);
+    frame.render_widget(Paragraph::new(query), area);
+    frame.render_widget(
+        Paragraph::new(corner_line(app, theme, g)).alignment(Alignment::Right),
+        area,
+    );
 }
 
 fn source_glyph<'a>(theme: &Theme, g: &Glyphs, kind: SourceKind) -> Span<'a> {
@@ -338,15 +363,8 @@ fn list_lines<'a>(
     lines
 }
 
-fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect, chrome: bool) {
-    let inner = if chrome {
-        let blk = block(theme, app.focus == Focus::List);
-        let inner = inset(blk.inner(area), PAD_X, 0);
-        frame.render_widget(blk, area);
-        inner
-    } else {
-        area
-    };
+fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
+    let inner = area;
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -559,11 +577,8 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
 }
 
 fn draw_details(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
-    let blk = block(theme, app.focus == Focus::Details);
-    let inner = inset(blk.inner(area), PAD_X, 0);
-    frame.render_widget(blk, area);
     let p = Paragraph::new(details_lines(app, theme, g)).wrap(Wrap { trim: true });
-    frame.render_widget(p, inner);
+    frame.render_widget(p, area);
 }
 
 fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {

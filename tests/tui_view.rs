@@ -478,16 +478,16 @@ fn split_with_gutter_leaves_blank_columns() {
 #[test]
 fn list_and_details_text_start_one_column_after_the_border() {
     let out = render(&typed("powert"), 100, 16);
-    for y in 4..=6 {
+    for y in 5..=7 {
         assert_eq!(cell(&out, 1, y), " ", "{out}");
         let c2 = cell(&out, 2, y);
         assert!(c2 == ">" || c2 == " ", "{out}");
         let glyph = cell(&out, 4, y);
         assert!(glyph == "W" || glyph == "S", "{out}");
     }
-    assert_eq!(cell(&out, 55, 4), "│", "{out}");
-    assert_eq!(cell(&out, 56, 4), " ", "{out}");
-    assert_eq!(cell(&out, 57, 4), "P", "{out}");
+    assert_eq!(cell(&out, 55, 5), "│", "{out}");
+    assert_eq!(cell(&out, 56, 5), " ", "{out}");
+    assert_eq!(cell(&out, 57, 5), "P", "{out}");
 }
 
 #[test]
@@ -559,4 +559,209 @@ fn residue_conflict_warning_survives_narrow_terminals() {
             .unwrap_or_else(|| panic!("no residue row at {w}: {out}"));
         assert!(line.contains("(outra instalação?)"), "{w}: {line}");
     }
+}
+
+// ---- Task 63: tabs joined to the content window ----
+
+fn tab_labels() -> Vec<String> {
+    ["Pesquisar", "Instalados", "Atualizações 2"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn tab_buffer(w: u16, active: usize, theme: &Theme) -> ratatui::buffer::Buffer {
+    let labels = tab_labels();
+    let mut t = Terminal::new(TestBackend::new(w, 3)).unwrap();
+    t.draw(|f| {
+        wingetrs::tui::tabs::draw_tabs(f, f.area(), &labels, active, theme);
+    })
+    .unwrap();
+    t.backend().buffer().clone()
+}
+
+fn buf_row(b: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()
+}
+
+#[test]
+fn active_first_tab_opens_into_the_window() {
+    let b = tab_buffer(60, 0, &Theme::new(true, ColorDepth::NoColor));
+    assert_eq!(
+        buf_row(&b, 0),
+        format!(
+            "╭{}╮╭{}╮╭{}╮{}",
+            "─".repeat(11),
+            "─".repeat(12),
+            "─".repeat(16),
+            " ".repeat(15)
+        )
+    );
+    assert_eq!(
+        buf_row(&b, 1),
+        format!(
+            "│ Pesquisar ││ Instalados ││ Atualizações 2 │{} wingetrs  ",
+            " ".repeat(4)
+        )
+    );
+    assert_eq!(
+        buf_row(&b, 2),
+        format!(
+            "│{}└┴{}┴┴{}┴{}╮",
+            " ".repeat(11),
+            "─".repeat(12),
+            "─".repeat(16),
+            "─".repeat(14)
+        )
+    );
+}
+
+#[test]
+fn active_middle_tab_tees_the_first_corner() {
+    let b = tab_buffer(60, 1, &Theme::new(true, ColorDepth::NoColor));
+    assert_eq!(
+        buf_row(&b, 2),
+        format!(
+            "├{}┴┘{}└┴{}┴{}╮",
+            "─".repeat(11),
+            " ".repeat(12),
+            "─".repeat(16),
+            "─".repeat(14)
+        )
+    );
+}
+
+#[test]
+fn tabs_fall_back_to_one_line_when_narrow() {
+    let b = tab_buffer(30, 0, &Theme::new(true, ColorDepth::NoColor));
+    assert_eq!(buf_row(&b, 0).trim(), "");
+    assert!(buf_row(&b, 1).contains("Pesquisar · Instalados"));
+    assert_eq!(buf_row(&b, 2), format!("╭{}╮", "─".repeat(28)));
+}
+
+#[test]
+fn active_label_is_bold_accent_and_others_dim() {
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let b = tab_buffer(60, 0, &theme);
+    let p = &b[(2, 1)];
+    assert_eq!(p.symbol(), "P");
+    assert_eq!(p.fg, theme.accent().fg.unwrap());
+    assert!(p.modifier.contains(Modifier::BOLD));
+    let i = &b[(15, 1)];
+    assert_eq!(i.symbol(), "I");
+    assert_eq!(i.fg, theme.fg_dim().fg.unwrap());
+}
+
+#[test]
+fn tabs_never_panic_on_tiny_widths() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let labels = tab_labels();
+    for w in 0..=12u16 {
+        for h in 0..=3u16 {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| wingetrs::tui::tabs::draw_tabs(f, f.area(), &labels, 1, &theme))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn window_spacing_matches_the_scale() {
+    let screen = render(&typed("powert"), 100, 16);
+    let rows: Vec<Vec<char>> = screen
+        .lines()
+        .map(|l| {
+            l.trim_start_matches('"')
+                .trim_end_matches('"')
+                .chars()
+                .collect()
+        })
+        .collect();
+    for (y, r) in rows.iter().enumerate().take(14).skip(3) {
+        assert_eq!(r[1], ' ', "PAD_X on row {y}: {screen}");
+    }
+    let gap = &rows[4];
+    assert_eq!(gap[0], '│', "{screen}");
+    assert_eq!(gap[gap.len() - 1], '│', "{screen}");
+    assert!(
+        gap[1..gap.len() - 1].iter().all(|c| *c == ' '),
+        "FILTER_GAP row not blank: {screen}"
+    );
+    let d = rows[5]
+        .iter()
+        .enumerate()
+        .skip(2)
+        .find(|(_, c)| **c == '│')
+        .map(|(i, _)| i)
+        .expect("divider");
+    for (y, r) in rows.iter().enumerate().take(14).skip(5) {
+        assert_eq!(r[d], '│', "divider row {y}: {screen}");
+        assert_eq!(r[d - 1], ' ', "GUTTER left row {y}");
+        assert_eq!(r[d + 1], ' ', "GUTTER right row {y}");
+    }
+}
+
+fn long_entries(n: usize) -> Vec<PackageEntry> {
+    (0..n)
+        .map(|i| {
+            let name = format!("pkg{i:04}");
+            PackageEntry {
+                source: SourceKind::Winget,
+                source_name: "winget".into(),
+                id: name.clone(),
+                name,
+                moniker: None,
+                version: "1".into(),
+                publisher: None,
+                description: None,
+                tags: vec![],
+                commands: vec![],
+            }
+        })
+        .collect()
+}
+
+fn key(a: &mut App, code: crossterm::event::KeyCode) {
+    update(
+        a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+}
+
+#[test]
+fn end_and_page_down_keep_the_selection_on_screen_at_100x24() {
+    let mut a = App::new(long_entries(300), GlyphSet::Ascii);
+    update(&mut a, Msg::Resize(100, 24));
+    key(&mut a, crossterm::event::KeyCode::PageDown);
+    let sel = a.selected;
+    let name = format!("pkg{sel:04}");
+    let out = render(&a, 100, 24);
+    let line = out
+        .lines()
+        .map(|l| l.trim_start_matches('"'))
+        .find(|l| l.starts_with("│ > "))
+        .expect("selected row");
+    assert!(line.contains(&name), "{line}");
+    key(&mut a, crossterm::event::KeyCode::End);
+    let name = format!("pkg{:04}", a.selected);
+    let out = render(&a, 100, 24);
+    let line = out
+        .lines()
+        .map(|l| l.trim_start_matches('"'))
+        .find(|l| l.starts_with("│ > "))
+        .expect("selected row");
+    assert!(line.contains(&name), "{line}");
+}
+
+#[test]
+fn tabs_threshold_is_exact() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    // The three boxes need 45 columns plus one closing column.
+    let wide = tab_buffer(46, 0, &theme);
+    assert!(buf_row(&wide, 0).starts_with('╭'));
+    let narrow = tab_buffer(45, 0, &theme);
+    assert_eq!(buf_row(&narrow, 0).trim(), "");
 }
