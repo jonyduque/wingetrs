@@ -311,12 +311,12 @@ pub async fn join_details(key: String, h: tokio::task::JoinHandle<Msg>) -> Msg {
 }
 
 /// Awaits a search worker: a panic travels to the loop as `Msg::Panicked`; a cancelled search
-/// sends nothing (the list keeps its current hits).
-pub async fn join_search(h: tokio::task::JoinHandle<Msg>) -> Option<Msg> {
+/// becomes `Msg::SearchCancelled`, which frees the in-flight slot for the next search.
+pub async fn join_search(generation: u64, h: tokio::task::JoinHandle<Msg>) -> Msg {
     match h.await {
-        Ok(msg) => Some(msg),
-        Err(e) if e.is_panic() => Some(Msg::Panicked(e.into_panic())),
-        Err(_) => None,
+        Ok(msg) => msg,
+        Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
+        Err(_) => Msg::SearchCancelled { generation },
     }
 }
 
@@ -334,9 +334,7 @@ fn spawn_search(
             generation,
             hits: run_search(&index, &query, kind),
         });
-        if let Some(msg) = join_search(work).await {
-            let _ = tx.send(msg);
-        }
+        let _ = tx.send(join_search(generation, work).await);
     });
 }
 

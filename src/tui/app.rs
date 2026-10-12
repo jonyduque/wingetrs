@@ -75,6 +75,10 @@ pub enum Msg {
         generation: u64,
         hits: Vec<SearchHit>,
     },
+    /// The search of this generation was cancelled without a result; the list keeps its hits.
+    SearchCancelled {
+        generation: u64,
+    },
     /// A worker thread panicked; the event loop re-raises it before `update` sees it.
     Panicked(Box<dyn std::any::Any + Send>),
 }
@@ -510,6 +514,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::SearchDone { generation, hits } => app.search_done(generation, hits),
+        Msg::SearchCancelled { generation } => {
+            app.search_in_flight.take_if(|f| f.0 == generation);
+            Vec::new()
+        }
         Msg::Planned(result) => on_planned(app, result),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {

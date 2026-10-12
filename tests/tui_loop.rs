@@ -109,11 +109,14 @@ async fn refresh_worker_panic_reaches_the_loop() {
 
 #[tokio::test]
 async fn search_worker_panic_reaches_the_loop() {
-    let msg = join_search(tokio::spawn(async { panic!("x") })).await;
-    assert!(matches!(msg, Some(Msg::Panicked(_))));
+    let msg = join_search(7, tokio::spawn(async { panic!("x") })).await;
+    assert!(matches!(msg, Msg::Panicked(_)));
     let h = tokio::spawn(std::future::pending::<Msg>());
     h.abort();
-    assert!(join_search(h).await.is_none());
+    assert!(matches!(
+        join_search(7, h).await,
+        Msg::SearchCancelled { generation: 7 }
+    ));
     let ok = tokio::spawn(async {
         Msg::SearchDone {
             generation: 7,
@@ -121,7 +124,7 @@ async fn search_worker_panic_reaches_the_loop() {
         }
     });
     assert!(matches!(
-        join_search(ok).await,
-        Some(Msg::SearchDone { generation: 7, .. })
+        join_search(7, ok).await,
+        Msg::SearchDone { generation: 7, .. }
     ));
 }

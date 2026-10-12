@@ -2,7 +2,8 @@ Status: DONE_WITH_CONCERNS
 
 Commits:
 8fdf455 perf(tui): search off the UI thread with generations
-(+ commit de correção da revisão, SHA na mensagem ao orquestrador: fix(tui): coalesce searches, drop stale and off-tab results)
+a04f668 fix(tui): coalesce searches, drop stale and off-tab results
+(+ commit da re-revisão: test(tui): filter change and tab return during a search; cancelled search frees the slot — SHA na mensagem ao orquestrador)
 
 Passo 0 (medição, `cargo build --release --example tui_frame`, catálogo real, 19 646 entradas, 50 repetições cada; duas execuções):
 
@@ -64,6 +65,15 @@ Latência da rajada c,o,d,e a cada 30 ms (da última tecla até os hits finais; 
 - antes (busca síncrona por tecla, simulada com tempos reais de `run_search`): `median 29139 us max 43313 us` / `median 43789 us max 83086 us`
 - depois (worker real + coalescência): `median 16494 us max 29948 us` / `median 11535 us max 53274 us`
 - versão intermediária 8fdf455 (async sem coalescência): não medido.
+
+Re-revisão (sobre a04f668):
+- `filter_change_during_a_search_is_searched_next` (Ctrl+S com busca em voo => próxima busca com `kind: Some(Winget)`).
+- Fim de `search_result_off_the_search_tab_is_dropped`: `x` na aba Instalados, `BackTab` => `Cmd::Search "px"`; entregue => hits de "px".
+- run.rs: cancelamento vira `Msg::SearchCancelled { generation }` (`join_search(generation, h) -> Msg`), que libera `search_in_flight` da mesma geração sem mexer nos hits; teste de tui_loop ajustado, mais `cancelled_search_frees_the_slot` em tui_state.
+- Gate: `[OK]   rules 3s` / `[OK]   rules-selftest 10s` / `[OK]   fmt 1s` / `[OK]   clippy 112s` / `[OK]   test (532 passed, 16 ignored) 215s` / `[OK]   gate verde`
+- `[OK] mutação PEGA: 'if query != self.query || kind != self.search_kind() {' -> 'if query != self.query {' fez o teste falhar (exit 101).` (filter_change_during_a_search_is_searched_next)
+- `[OK] mutação PEGA: '        if self.tab != Tab::Search {` (reinserindo `self.search_in_flight = Some((generation, query, kind));` no ramo fora da aba; search_result_off_the_search_tab_is_dropped; linha truncada pelo grep na quebra da âncora)
+- `[OK] mutação PEGA: '            app.search_in_flight.take_if(|f| f.0 == generation);' -> '' fez o teste falhar (exit 101).` (cancelled_search_frees_the_slot)
 
 Decisions:
 - `SearchIndex::search`/`search_with_threads` passaram a `&self` (o campo `matcher` saiu; o caminho sequencial cria um `Matcher` por chamada): sem isso `Arc<SearchIndex>` e `run_search(&SearchIndex, ..)` do brief não compilam. Removidos `let mut` que viraram aviso em `src/install/target.rs`, `tests/search.rs`, `tests/index_file.rs` (fora da lista Files).

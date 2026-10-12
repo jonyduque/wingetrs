@@ -1110,6 +1110,49 @@ fn search_result_off_the_search_tab_is_dropped() {
     assert_eq!(a.selected, 1);
     assert!(answer(&mut a, &cmds[0]).is_empty());
     assert_eq!(a.selected, 1);
+    // The slot is free again: back on Search, the query typed meanwhile is searched.
+    update(&mut a, key(KeyCode::Char('x')));
+    let back = update(&mut a, key(KeyCode::BackTab));
+    assert_eq!(a.tab, Tab::Search);
+    let search: Vec<&Cmd> = back
+        .iter()
+        .filter(|c| matches!(c, Cmd::Search { .. }))
+        .collect();
+    assert!(
+        matches!(search[..], [Cmd::Search { query, .. }] if query == "px"),
+        "{back:?}"
+    );
+    answer(&mut a, search[0]);
+    assert_eq!(a.hits, a.search.search("px", None, 1000));
+}
+
+#[test]
+fn filter_change_during_a_search_is_searched_next() {
+    let mut a = app();
+    let p = update(&mut a, key(KeyCode::Char('p')));
+    assert!(update(&mut a, ctrl('s')).is_empty());
+    let next = answer(&mut a, &p[0]);
+    assert!(
+        matches!(&next[..], [Cmd::Search { query, kind: Some(SourceKind::Winget), .. }] if query == "p"),
+        "{next:?}"
+    );
+    answer(&mut a, &next[0]);
+    assert_eq!(a.hits, a.search.search("p", Some(SourceKind::Winget), 1000));
+}
+
+#[test]
+fn cancelled_search_frees_the_slot() {
+    let mut a = app();
+    let p = update(&mut a, key(KeyCode::Char('p')));
+    let Cmd::Search { generation, .. } = p[0] else {
+        panic!("{p:?}");
+    };
+    assert!(update(&mut a, Msg::SearchCancelled { generation }).is_empty());
+    let o = update(&mut a, key(KeyCode::Char('o')));
+    assert!(
+        matches!(&o[..], [Cmd::Search { query, .. }] if query == "po"),
+        "{o:?}"
+    );
 }
 
 #[test]
