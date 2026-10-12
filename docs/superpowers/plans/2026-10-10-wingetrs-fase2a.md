@@ -3921,3 +3921,1442 @@ Testes:
 6. Resíduos: mutate limpando todos os resíduos no modo `High` (sem filtrar `preselected`) ⇒ PEGA (teste 6).
 
 **Commit:** `feat(tui): apply confirm, purge, keep and residue settings`
+
+---
+
+## Desempenho e robustez (Tasks 70–78)
+
+Preparado em 2026-10-12 sobre HEAD `922a995`. Fontes: rascunho `tasks-perf.md` (P1–P8, escrito em `97d1341`), ledger das Tasks 44–69, relatório `inv-catalog-write.md`. Cada premissa foi reconferida no código de HEAD (arquivo:linha abaixo). **Nada foi medido nesta preparação**: todo ganho citado é do relatório de origem ou hipótese.
+
+Para colar no plano `docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md` sob um `## ` novo (o orquestrador escolhe o título). Cada seção `### Task N` é autocontida: o `scripts/brief.ps1` copia só a seção da tarefa e o `## Global Constraints`, então o protocolo de medição está **repetido dentro de cada tarefa** (de propósito). Nenhuma seção usa cabeçalho `## ` (cortaria o brief).
+
+**Resumo do lote**
+
+| Task | Título | Origem | Depende de | Tier | Arquivos |
+|---|---|---|---|---|---|
+| 70 | `show` winget: versionData em cache pelo hash do catálogo | P1 | 45 | **design ⇒ opus** (sonda decide se há código) | `src/sources/winget/details.rs`, `src/cli/mod.rs` (spans), `tests/winget_details.rs` |
+| 71 | Catálogo: `prepare_cached` em `get`/`find_by_id`/`lookup` | P2 | 45 | transcrição ⇒ sonnet | `src/catalog/mod.rs`, `tests/catalog.rs` |
+| 72 | `Http` preguiçoso e runtime de thread única nos comandos locais | P3 | 45 | transcrição ⇒ sonnet (com portão) | `src/http.rs`, `src/cli/mod.rs` |
+| 73 | `find_by_id` com índice de expressão `lower(id)` | P4 | 71 (mesmo arquivo) | transcrição ⇒ sonnet | `src/catalog/mod.rs`, `tests/catalog.rs` |
+| 74 | `list`: threads de varredura logo após o log (com portão) | P5 | 72 (portão medido depois dela) | transcrição ⇒ sonnet | `src/cli/mod.rs` |
+| 75 | Fonte Scoop sem varrer os mapas; `bucket rm` sem regravar índice à toa | P6 | 73 (mesmo arquivo) | transcrição ⇒ sonnet | `src/catalog/mod.rs`, `src/buckets.rs`, `tests/catalog.rs`, `tests/buckets.rs` |
+| 76 | `update`: catálogo aberto e `http.json` gravado só quando algo mudou | P7 | 73 (nota do índice) | transcrição ⇒ sonnet | `src/update.rs`, `tests/update.rs` |
+| 77 | Gravação do catálogo: índices dos mapas reconstruídos uma vez por import do winget (+ `cache_size` medido à parte) | `inv-catalog-write.md` (P2/P3 de lá) | 75 (mesma função), 55 (feita) | transcrição ⇒ sonnet (patch pronto; revisor opus: DDL transacional) | `src/catalog/mod.rs`, `tests/catalog.rs` |
+| 78 | Investigação do "Acesso negado" (os error 5) intermitente nos testes sob carga | ledger (pendência OPEN) | — | **design ⇒ opus** | diagnóstico: worktree descartável; correção (condicional à evidência): `src/fs_retry.rs` (novo), `src/lib.rs`, `src/install/extract.rs`, `src/install/executor.rs`, `src/cache/mod.rs`, `src/install/download.rs`, `src/install/state.rs`, `src/catalog/index_file.rs`, `tests/install_extract.rs`, `tests/index_file.rs` |
+
+**Conflitos de arquivo** (todas as tarefas de desempenho rodam sozinhas, então conflito só impõe ordem; a coluna "Depende de" já serializa):
+- `src/catalog/mod.rs` e `tests/catalog.rs`: 71, 73, 75, 77 (77 mexe em `delete_source_rows`/`replace_source`/`SCHEMA` que 73 e 75 também mudam — rode 77 por último dos quatro e localize pelos símbolos).
+- `src/cli/mod.rs`: 70 (só spans), 72, 74.
+- `src/buckets.rs`, `tests/buckets.rs`: só 75. `src/update.rs`, `tests/update.rs`: só 76. `src/http.rs`: só 72. `src/sources/winget/details.rs`: só 70.
+- 78 não divide arquivo com 70–77. **Mas** ela gera carga de propósito (reprodução): nunca em paralelo com uma tarefa que mede tempo. Sugestão de ordem: 78 primeiro (deixa o gate confiável para o resto do lote) ou por último; nunca no meio de uma medição.
+
+**Ordem sugerida das de desempenho:** 77 tem o maior ganho esperado (−200 a −400 ms no `update`, medido no protótipo) mas depende de 75 por arquivo; se o orquestrador preferir o ganho antes, rode 77 antes de 73/75 e ajuste os testes de 73/75 ao `delete_source_rows` resultante (as tarefas citam símbolos, não só linhas).
+
+**Descartada:**
+- **P8** (`bucket rm` filtrar o `search.idx` em vez de reler o catálogo): a premissa era "regrava o índice relendo o catálogo inteiro (`load_entries`, várias conexões; `update.search_idx` 409 ms)". A Task 54 trocou isso por um único `SELECT` na conexão do catálogo (`src/catalog/index_file.rs:72-116`, `encode_catalog`), medido 68 → 31 ms no `update`. Sobra ≤ ~30 ms num comando raro, ao preço de um segundo caminho para o mesmo resultado (teste de equivalência obrigatório). Reabrir só se a Task 75 medir `bucket.rm.index_write` ≥ 20 ms **e** ≥ 40 % do delta do `bucket rm`.
+
+**Achado fora do escopo (não virou tarefa):** os detalhes da TUI ainda abrem o catálogo como escritor a cada seleção — `Catalog::open` (WAL + DDL do `SCHEMA`) em `src/tui/run.rs:529` (`load_details`), e também em `:153`, `:488`, `:601`; para leitura o projeto usa `Catalog::open_read_only` (ARMADILHAS: "`Catalog::open` roda DDL"). Era o item 3 da lista "Para o redesign da TUI" do rascunho; as Tasks 57–69 não tocaram nisso.
+
+---
+
+### Task 70: `show` winget — versionData em cache pelo hash do catálogo
+
+**Modelo:** opus (a sonda decide se existe código; o ramo de hash divergente precisa de desenho).
+
+#### Where this fits
+
+Depende só da Task 45 (feita). `show <id>` de pacote winget e o painel de detalhes da TUI (`src/tui/run.rs:523-560`, `load_details`, que chama a mesma função) fazem **sempre** um GET de `versionData.mszyml`: `src/sources/winget/details.rs:17-19` — o comentário diz "versionData has no known content hash, so it is always downloaded". Mas a URL é `packages/<id>/<hex8>/versionData.mszyml` com `hex8` = 4 primeiros bytes do `winget_hash` do catálogo (`src/sources/winget/version_data.rs:64-68`, `version_data_path`), e a fixture mostra que o hash inteiro é o SHA-256 do arquivo: `HASH_HEX` (`tests/winget_details.rs:10`) = SHA-256 de `tests/fixtures/winget/powertoys.versionData.mszyml`. Se isso valer no catálogo real, o versionData é endereçado por conteúdo e pode ir para o `BlobStore` verificado (`src/cache/mod.rs:169-188`: `get` relê e confere o SHA-256 do conteúdo contra o nome; `put_verified` recusa bytes que não conferem). Ganho esperado: um round-trip HTTPS (com TLS quando a conexão é nova) por `show` e por seleção na TUI — **não medido**.
+
+Linhas conferidas em HEAD `922a995`; tarefas anteriores do lote podem deslocá-las — localize pelo símbolo citado junto.
+
+#### What binds this task
+
+- **(a) Spans (commit 1, item 5 do protocolo).** Em `src/cli/mod.rs`, braço `Command::Show` (`:683-734`): `show.find_by_id` em volta de `catalog.find_by_id(&id)` (`:690`). Em `details` (`details.rs`): `show.version_data` (GET + `version_data::decode_and_parse`) e `show.manifest` (blob ou GET + `manifest::parse`), com `.instrument(..)` nos trechos que têm `.await`. O nome tem prefixo `show.` mesmo quando a TUI chama (é a função).
+- **(b) Sonda — portão antes de qualquer código da otimização.** Na raiz isolada (protocolo, item 3), salve `<S>\vd-probe.py` e rode `python -I "<S>\vd-probe.py" "<S>\la\wingetrs\catalog.db" "<S>\vd"`:
+  ```python
+  import hashlib, pathlib, sqlite3, sys, urllib.request
+  db, out = sys.argv[1], pathlib.Path(sys.argv[2])
+  out.mkdir(exist_ok=True)
+  c = sqlite3.connect(pathlib.Path(db).as_uri() + "?mode=ro", uri=True)
+  rows = c.execute(
+      "SELECT id, lower(hex(winget_hash)) FROM packages "
+      "WHERE source = 'winget' AND winget_hash IS NOT NULL LIMIT 5 OFFSET 1000"
+  ).fetchall()
+  for i, (pid, h) in enumerate(rows):
+      url = f"https://cdn.winget.microsoft.com/cache/packages/{pid}/{h[:8]}/versionData.mszyml"
+      body = urllib.request.urlopen(url, timeout=30).read()
+      (out / str(i)).write_bytes(body)  # só para hashear; nunca executado nem importado
+      got = hashlib.sha256(body).hexdigest()
+      print(pid, h, got, "OK" if got == h else "DIVERGE")
+  ```
+  Cole as 5 linhas. **Qualquer `DIVERGE` ⇒ pare: `BLOCKED: versionData não é endereçado pelo winget_hash`, com a tabela; só o commit de spans fica.** Apague `<S>\vd` no fim.
+- **(c) Mudança (commit 2), em `details`:**
+  - Chave do blob = `hex::encode(hash)` (hash inteiro, minúsculo). `blobs.get(&chave)` devolveu bytes ⇒ usa (o `get` já confere o SHA-256). Senão: GET e `blobs.put_verified(&chave, &bytes)`.
+  - `put_verified` com `Err(CacheError::HashMismatch { .. })` ⇒ **não grava**, `tracing::warn!` e segue com os bytes baixados (comportamento de hoje: o `show` não falha por isso). Outro erro de cache ⇒ `WingetError::Cache(e)`, como no manifesto (`details.rs:34-37`).
+  - Reescreva o comentário da linha 17 (agora há hash). Nada muda no manifesto nem na lista de versões.
+- **(d) Medição** com o protocolo abaixo (base = commit 1, nova = commit 2), mesma raiz para os dois lados (as 2 rodadas de aquecimento do `ab-cmd.ps1` deixam o manifesto em cache nos dois e o versionData em cache na nova): `-CmdArgs 'show Microsoft.PowerToys --source winget' -Span 'show\.version_data'`. Antes, cole a mediana dos três spans do commit 1 (item 5).
+- **Reversão.** Métrica = `wall`; **L = 50 ms** (a mudança troca rede por disco; abaixo disso é ruído de rede). Esperado também `span` da nova ≤ 5 ms na mediana (cole; não decide). Equivalência: testes 1–3 verdes.
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf70-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-70" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-70\Cargo.toml" --target-dir "<S>\tgt-base-70"
+   Copy-Item "<S>\tgt-base-70\release\wingetrs.exe" "<S>\perf70-base.exe"
+   git worktree remove --force "<S>\wt-base-70"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf70-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf70-base.exe" -New "<S>\perf70-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-70`, `<S>\perf70-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-70`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/sources/winget/details.rs`, `src/cli/mod.rs` (só spans)
+- Test: `tests/winget_details.rs`
+
+Testes (use `HASH_HEX`, `VD`, `MANIFEST` do arquivo; cada teste com um `MockServer` próprio e `.expect(n)` no mock do versionData — o wiremock confere no `drop`; mesma base de URL dos testes atuais):
+1. `version_data_is_cached_by_catalog_hash`: mock do versionData com `.expect(1)`; `details(..)` duas vezes com o mesmo `BlobStore` (tempdir) ⇒ os dois `PackageDetails` iguais (`assert_eq!`) e `blobs.get(HASH_HEX).is_some()`.
+2. `tampered_cached_version_data_is_refetched`: antes, grave lixo em `<dir do BlobStore>/<HASH_HEX>`; versionData `.expect(1)`; uma chamada ⇒ versão `0.101.2362.0` e 115 versões; depois `blobs.get(HASH_HEX).is_some()` (o blob passou a conferir).
+3. `version_data_with_another_hash_is_shown_but_not_cached`: hash = bytes de `HASH_HEX` com o **último** byte trocado (mesmos 4 primeiros bytes ⇒ mesma URL); versionData `.expect(2)`; duas chamadas ⇒ ambas `Ok` com versão `0.101.2362.0`; `blobs.get(<hex do hash trocado>)` é `None`.
+
+#### Checks beyond the steps
+
+Mutações (`pwsh -File scripts/mutate.ps1 -Path <arquivo> -Anchor '<texto exato>' -Replacement '<texto>' -TestCommand 'cargo test --quiet --test winget_details <nome>'`; com a TUI do usuário aberta, use `$env:CARGO_TARGET_DIR` separado e confira na saída o **nome do teste** que falhou — ARMADILHAS: "Mutação PEGA por falha de build"):
+1. Cache usado: a consulta `blobs.get(&<chave>)` do versionData trocada por `None::<Vec<u8>>` ⇒ PEGA (teste 1, `expect(1)`).
+2. Chave certa: `hex::encode(hash)` → `hex::encode(&hash[..4])` ⇒ PEGA (teste 1: o `put_verified` com chave curta falha e a 2ª chamada baixa de novo).
+3. Verificação na leitura: em `src/cache/mod.rs` `BlobStore::get`, `.then_some(bytes)` → `.then_some(bytes).or(Some(Vec::new()))` ⇒ PEGA (teste 2). (Mutação temporária em código existente; o `mutate.ps1` restaura.)
+4. Hash divergente não derruba o `show`: o ramo `HashMismatch` passando a devolver erro (`return Err(WingetError::ManifestIntegrity)`) ⇒ PEGA (teste 3).
+5. Orquestrador: a tabela da sonda colada no relatório; sem ela a tarefa não é aceita.
+
+**Commit:** `perf(show): cache winget versionData by its catalog hash` (precedido de `perf(show): spans for find_by_id, version_data and manifest`)
+
+---
+
+### Task 71: Catálogo — `prepare_cached` em `get`, `find_by_id` e `lookup`
+
+**Modelo:** sonnet (mudança mecânica; a prova é o A/B).
+
+#### Where this fits
+
+Depende só da Task 45. `list` correlaciona cada app instalado com várias consultas ao catálogo, e cada uma compila o SQL de novo: `Catalog::get` (`src/catalog/mod.rs:494-503`, `query_row(&format!(..))`), `find_by_id` (`:505-512`, `prepare`) e `lookup` (`:514-527`, `prepare`). Em `src/installed/correlate.rs` um app ARP passa por `by_key` (`:108-119`, `lookup` em `:117`), `by_name_and_publisher` (até 3 `lookup`: `:136-144`) e `get` (`:163`, `:243`, `:270`); o install também chama `get`/`find_by_id` (`src/install/ops.rs:327`, `:340`, `:396`, `:884`). O span `step{step="correlate"}` (`crate::installed::timed`, `src/installed/mod.rs:107-114`) mediu 39 ms no log real de 2026-10-10 (79–96 ms em 2026-10-07). `prepare_cached` usa o cache de instruções da conexão (capacidade padrão 16; são 7 SQL distintos: `get`, `find_by_id` e um `lookup` por tabela de mapa). Ganho **não medido**.
+
+#### What binds this task
+
+- **(a) Medir antes:** o span já existe (sem commit de spans). Base = HEAD antes da tarefa.
+- **(b) Mudança:** em `get`, `find_by_id` e `lookup`, `self.conn.prepare_cached(&sql)?` no lugar de `prepare`/`query_row(&sql, ..)`; para `get`: `self.conn.prepare_cached(&sql)?.query_row(params![source, id], stored_from_row).optional()?`. Texto do SQL idêntico; colunas lidas idênticas; nada mais muda.
+- **(c) Medição:** protocolo abaixo, `-CmdArgs 'list' -Span 'step\{step=.correlate.\}'` (os pontos casam as aspas da linha do log).
+- **Reversão.** Métrica = `span` (`correlate`); **L = max(3 ms, 10 % da mediana do span na base)**. Não-regressão: `wall` com delta pareado mediano ≤ +5 ms.
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf71-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-71" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-71\Cargo.toml" --target-dir "<S>\tgt-base-71"
+   Copy-Item "<S>\tgt-base-71\release\wingetrs.exe" "<S>\perf71-base.exe"
+   git worktree remove --force "<S>\wt-base-71"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf71-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf71-base.exe" -New "<S>\perf71-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-71`, `<S>\perf71-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-71`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/catalog/mod.rs`
+- Test: `tests/catalog.rs`
+
+Testes:
+1. `cached_statements_return_fresh_rows_for_each_key`: `Catalog::open_in_memory()`; `replace_source("winget", SourceKind::Winget, "v", 1, &[pkg("A.App","A","1"), pkg("B.App","B","1")], &WingetMaps { productcodes: vec![("{PC-A}".into(),"A.App".into()), ("{PC-B}".into(),"B.App".into())], norm_names: vec![("aapp".into(),"A.App".into())], ..Default::default() })` (use o `pkg` do arquivo). Em sequência intercalada: `lookup(ProductCode, "{pc-a}") == ["A.App"]`; `lookup(ProductCode, "{PC-B}") == ["B.App"]`; `get("winget","B.App")` com `entry.id == "B.App"`; `lookup(NormName, "aapp") == ["A.App"]`; `lookup(ProductCode, "{PC-A}") == ["A.App"]` de novo; `find_by_id("a.app")` com 1 item de id `A.App`; `get("winget","A.App")` com `entry.id == "A.App"`.
+2. `cached_statements_see_a_replaced_source`: o cenário do teste 1 (com as mesmas consultas já feitas, para os statements estarem no cache), depois `replace_source("winget", ..)` com o mapa `productcodes = [("{PC-A}", "B.App")]` ⇒ `lookup(ProductCode, "{PC-A}") == ["B.App"]` e `get("winget","A.App")` ainda `Some` (nenhum resultado guardado entre chamadas).
+3. Regressão: `tests/catalog.rs`, `tests/correlate.rs` e `tests/install_ops.rs` verdes sem mudança.
+
+#### Checks beyond the steps
+
+1. Teste 1 não degenerado (consultas a tabelas diferentes não se confundem): em `lookup`, `table.table()` → `MapTable::ProductCode.table()` ⇒ PEGA (teste 1, `NormName`). `pwsh -File scripts/mutate.ps1 -Path src/catalog/mod.rs -Anchor 'table.table()' -Replacement 'MapTable::ProductCode.table()' -TestCommand 'cargo test --quiet --test catalog cached_statements'`.
+2. A otimização em si não muda resultado: "sem mutação aplicável; a prova de desempenho é o A/B colado". Sem o A/B colado, a mudança é revertida.
+
+**Commit:** `perf(catalog): reuse prepared statements for per-app lookups`
+
+---
+
+### Task 72: `Http` preguiçoso e runtime de thread única nos comandos locais
+
+**Modelo:** sonnet (com portão de medição no início).
+
+#### Where this fits
+
+Depende só da Task 45. Todo comando de CLI monta **dois** `reqwest::Client` com rustls em `Http::with_timeouts` (`src/http.rs:50-67`), chamado em `run_async` (`src/cli/mod.rs:623`, antes do `match`) — inclusive `bucket`, que nem recebe `http` (`run_bucket(action, &data, cfg)`, `:815`) — e um runtime tokio multi-thread (`tokio::runtime::Runtime::new()`, `:910`; cria uma thread por núcleo e as junta no fim). Sem rede no caminho comum: `bucket add|list|rm`; `search` com índice válido (`:647-682`); `list`; `show` de pacote Scoop; `uninstall` (rede só via `ensure_catalog_ran`, `:465`, quando o catálogo está vazio). Download (`dl_client`) só em install/upgrade. A TUI também chama `Http::new()` (`src/tui/run.rs:170`) e ganha a preguiça de graça. `spawn_blocking` (`src/update.rs:194`, `src/install/ops.rs:277`) funciona nos dois sabores de runtime; não há `block_in_place` no código (conferido com grep). Ganho **não medido**.
+
+#### What binds this task
+
+- **(a) Spans e portão (commit 1).** `startup.runtime` em volta da construção do runtime (`:910`), `startup.runtime_drop` em volta de um `drop(rt)` explícito depois do `block_on` (guarde o resultado do `block_on` antes), `startup.http` em volta de `Http::new()` (`:623`). Meça (item 5 do protocolo) com 15 execuções de `bucket list`:
+  ```powershell
+  . "<S>\perf-env.ps1"; Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$W\log"
+  1..15 | ForEach-Object { & "<S>\perf72-new.exe" bucket list *> $null }
+  Select-String -Path "$W\log\wingetrs.log.*" -Pattern 'startup\.(runtime|runtime_drop|http).*close time\.busy' | ForEach-Object Line
+  ```
+  Cole as linhas e a mediana de cada um. **Se a soma das três medianas for < 2 ms, pare: relatório "não vale", só o commit de spans fica.**
+- **(b) Mudança 1 — `Http` preguiçoso (commit 2, `src/http.rs`).** `Http::new()`/`with_timeouts` só guardam `connect`, `total` e `chunk_timeout`; `client` e `dl_client` viram `Arc<std::sync::OnceLock<reqwest::Client>>`, construídos no primeiro uso (`get_conditional` e `get` usam `client`; `get_to_file` usa `dl_client`). Erro de construção no primeiro uso ⇒ `HttpError::Network(e.to_string())` (o mesmo de hoje). Clones compartilham o `Arc` (um clone que inicializa serve a todos). Assinaturas públicas não mudam (`new()` continua devolvendo `Result`). Use `OnceLock::get_or_init` com o builder dentro de uma função que devolve `Result` guardado (ex.: `OnceLock<Result<Client, String>>`), sem `unwrap`/`expect`.
+- **(c) Mudança 2 — runtime por comando (commit 3, `src/cli/mod.rs` `run`).** Função pura `fn wants_multi_thread(cmd: &Command) -> bool`: `false` para `Search`, `List`, `Bucket`; `true` para o resto. `false` ⇒ `tokio::runtime::Builder::new_current_thread().enable_all().build()?`. Motivo de manter multi-thread em update/install/upgrade/show/uninstall/repair: as tarefas de conexão do hyper rodam nos workers enquanto o futuro principal faz trabalho síncrono (decode MSZIP, import SQLite, extração, hash); em thread única elas param. Consequência aceita: `search`/`list` com catálogo **vazio** (1ª execução) fazem o `update` bloqueante em thread única — correto, mais lento; registre no relatório.
+- **(d) Medição** (protocolo abaixo), duas decisões independentes: mudança 1 com base = commit 1 e nova = commit 2; mudança 2 com base = commit 2 e nova = commit 3. Para cada uma: métrica em `-CmdArgs 'bucket list'` (só custo fixo) e não-regressão em `-CmdArgs 'search powertoys'` e `-CmdArgs 'list'`.
+- **Reversão.** Métrica = `wall` de `bucket list`; **L = max(5 ms, 10 % do "sobre o piso" da base)**. Não-regressão: `search powertoys` e `list` com delta pareado mediano ≤ +L. Reverta só o commit (2 ou 3) que falhar.
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf72-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-72" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-72\Cargo.toml" --target-dir "<S>\tgt-base-72"
+   Copy-Item "<S>\tgt-base-72\release\wingetrs.exe" "<S>\perf72-base.exe"
+   git worktree remove --force "<S>\wt-base-72"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf72-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf72-base.exe" -New "<S>\perf72-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-72`, `<S>\perf72-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-72`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/http.rs`, `src/cli/mod.rs`
+- Test: `#[cfg(test)] mod tests` em `src/http.rs`; `mod early_tests` em `src/cli/mod.rs` (já existe, `:914-915`)
+
+Testes:
+1. `http_builds_no_client_until_used` (`src/http.rs`, `#[tokio::test]`, wiremock): helper `#[cfg(test)] fn built(&self) -> (bool, bool)` (= `client` e `dl_client` inicializados). `Http::new()` ⇒ `(false, false)`; após `get(<mock 200>)` ⇒ `(true, false)`; após `get_to_file(<mock 200>, <tempfile>, |_, _| {})` ⇒ `(true, true)`.
+2. `http_clones_share_built_clients`: `let a = Http::new().unwrap(); let b = a.clone(); b.get(<mock>).await.unwrap();` ⇒ `a.built().0`.
+3. `runtime_flavor_by_command` (`src/cli/mod.rs`): `Cli::try_parse_from` de `["wingetrs","search","x"]`, `["wingetrs","list"]`, `["wingetrs","bucket","list"]` ⇒ `wants_multi_thread(..) == false`; `["wingetrs","update"]`, `["wingetrs","install","x"]`, `["wingetrs","show","x"]`, `["wingetrs","upgrade","--all"]`, `["wingetrs","uninstall","x"]` ⇒ `true`.
+4. Regressão: `tests/cli_offline.rs`, `tests/cli_install.rs`, `tests/http.rs`, `tests/update.rs` verdes (a rede via wiremock passa pelo cliente preguiçoso).
+
+#### Checks beyond the steps
+
+Mutações (`scripts/mutate.ps1`, `-TestCommand 'cargo test --quiet --lib <nome>'`; confira o nome do teste que falhou):
+1. Preguiça: construir o `client` dentro de `with_timeouts` (chamar o `get_or_init` do `client` no construtor) ⇒ PEGA (teste 1).
+2. Compartilhamento: `Arc<OnceLock<..>>` → `OnceLock<..>` sem `Arc` com `Clone` que copia o estado antes do init ⇒ PEGA (teste 2).
+3. Sabor: incluir `Command::Update { .. }` no ramo `false` ⇒ PEGA (teste 3).
+
+**Commit:** `perf(cli): build http clients on first use` e `perf(cli): single-thread runtime for local commands` (precedidos de `perf(cli): spans for runtime and http setup`)
+
+---
+
+### Task 73: `find_by_id` com índice de expressão `lower(id)`
+
+**Modelo:** sonnet.
+
+#### Where this fits
+
+Depois da Task 71 (mesmo arquivo; rodam em série). `find_by_id` (`src/catalog/mod.rs:505-512`) faz `WHERE lower(id) = lower(?1)` sem índice: varre toda a tabela `packages`, cujas linhas carregam `raw` (manifesto JSON do Scoop) — páginas inteiras lidas para achar um id. Usado por `show` (`src/cli/mod.rs:690`) e pela resolução de dependências do install (`src/install/ops.rs:396`). O SQLite usa um índice de expressão quando o `WHERE` repete a mesma expressão, então **o SQL da consulta não muda**. Ganho **não medido**.
+
+#### What binds this task
+
+- **(a) Medir antes:** span `show.find_by_id` (criado na Task 70; se a 70 parou na sonda ou foi revertida, o commit de spans dela continua lá; se não existir, crie-o aqui num commit de spans, item 5 do protocolo). `EXPLAIN QUERY PLAN` na cópia isolada, colado: `python -I -c "import pathlib,sqlite3,sys; c=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); print(*c.execute('EXPLAIN QUERY PLAN SELECT rowid FROM packages WHERE lower(id) = lower(?1)', ('git',)), sep=chr(10))" "<S>\la\wingetrs\catalog.db"` — esperado `SCAN packages`.
+- **(b) Mudança:** `SCHEMA` (`:10-45`) ganha `CREATE INDEX IF NOT EXISTS ix_pkg_id_lower ON packages(lower(id));`. O `WHERE` de `find_by_id` sai para `const FIND_BY_ID_WHERE: &str = "lower(id) = lower(?1)";` usado no `format!` do SQL (texto final idêntico ao de hoje), para o teste de plano exercitar o texto real. Nada mais muda. Catálogos existentes ganham o índice no próximo `Catalog::open` (escritores: `update`, `bucket rm`, partes da TUI); `open_read_only` continua sem DDL e uma consulta sem índice continua correta.
+- **(c) Medição com duas raízes** (o binário base usaria o índice se ele existisse no arquivo): `perf-root.ps1 -Name la` (base) e `-Name la2` (nova); `update` com o binário base em `la` e com o novo em `la2` (cria o índice). Confirme com o mesmo `EXPLAIN` em `la2`: `SEARCH packages USING INDEX ix_pkg_id_lower (<expr>=?)`. Séries, nesta ordem:
+  1. Métrica: `-RootBase "<S>\la" -RootNew "<S>\la2" -CmdArgs 'show git --source scoop' -Span 'show\.find_by_id'`.
+  2. Não-regressão: `-RootBase "<S>\la" -RootNew "<S>\la2" -CmdArgs 'install ripgrep --dry-run'`.
+  3. Custo de escrita (com o servidor local do msix abaixo; reimporta o winget a cada execução): `-RootBase "<S>\la" -RootNew "<S>\la2" -CmdArgs 'update --force' -Drop http.json -Span 'update\.catalog_write\{source=winget\}'`.
+- **Reversão.** Métrica = `wall` da série 1; **L = max(5 ms, 10 % do "sobre o piso" da base)**. Não-regressão: série 2 com delta pareado mediano ≤ +L; série 3 com delta pareado mediano do `span` ≤ +10 % da mediana da base (senão reverte mesmo com ganho na série 1).
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf73-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-73" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-73\Cargo.toml" --target-dir "<S>\tgt-base-73"
+   Copy-Item "<S>\tgt-base-73\release\wingetrs.exe" "<S>\perf73-base.exe"
+   git worktree remove --force "<S>\wt-base-73"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf73-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf73-base.exe" -New "<S>\perf73-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-73`, `<S>\perf73-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-73`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Servidor local do msix** (entrada fixa, sem rede no laço; o servidor vive só dentro da chamada de shell que mede e morre no `finally`):
+   ```powershell
+   New-Item -ItemType Directory -Force "<S>\ab-msix" | Out-Null
+   # Uma vez: o MESMO arquivo serve os dois lados (baixado da CDN; só é lido pelo wingetrs).
+   if (-not (Test-Path "<S>\ab-msix\source2.msix")) { curl.exe -sSL -o "<S>\ab-msix\source2.msix" https://cdn.winget.microsoft.com/cache/source2.msix }
+   $srv = Start-Process python -ArgumentList '-I', '-m', 'http.server', '8765', '--bind', '127.0.0.1', '--directory', "<S>\ab-msix" -PassThru -WindowStyle Hidden
+   try {
+       . "<S>\perf-env.ps1"
+       $env:WINGETRS_WINGET_INDEX_URL = 'http://127.0.0.1:8765/source2.msix'
+       $env:WINGETRS_SCOOP_BASE_URL = 'http://127.0.0.1:9'   # porta morta: scoop falha offline e mantém suas linhas
+       Start-Sleep -Milliseconds 700
+       # <comandos desta tarefa aqui>
+   } finally { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
+   ```
+   (`WINGETRS_WINGET_INDEX_URL`/`WINGETRS_SCOOP_BASE_URL`: `src/update.rs:24-37`; scoop vira `<base>/<bucket>.tgz`.)
+
+**Files:**
+- Modify: `src/catalog/mod.rs`
+- Test: `#[cfg(test)] mod tests` em `src/catalog/mod.rs` (já existe, `:538`; precisa da `const` privada) e `tests/catalog.rs`
+
+Testes:
+1. `find_by_id_where_uses_the_lower_id_index` (unitário, `src/catalog/mod.rs`): `Catalog::open_in_memory()`; `EXPLAIN QUERY PLAN SELECT rowid FROM packages WHERE {FIND_BY_ID_WHERE}` com o parâmetro `"x"` na própria `conn` ⇒ alguma linha (coluna `detail`) contém `ix_pkg_id_lower`.
+2. `find_by_id_is_the_same_with_and_without_the_index` (`tests/catalog.rs`): catálogo em arquivo (tempdir) com fontes `winget` (`Git.Git`) e `scoop:main` (`git`, `Ünïcode`); para cada consulta em `["GIT.GIT", "git", "Git", "ünïcode", "ÜNÏCODE", "Ünïcode"]` guarde os `(source_name, id)` de `find_by_id`; feche, `DROP INDEX ix_pkg_id_lower` por uma `rusqlite::Connection` à parte, reabra com `Catalog::open_read_only` e repita ⇒ listas idênticas, e, nos dois casos, `find_by_id("GIT.GIT") == [("winget", "Git.Git")]` e `find_by_id("Git") == [("scoop:main", "git")]` (`lower("Git.Git")` é `git.git`). Fixa também que o `lower()` do SQLite é só ASCII: `"ünïcode"` não acha `Ünïcode` nos dois casos.
+
+#### Checks beyond the steps
+
+1. Índice existe e é usado: remover a linha `CREATE INDEX IF NOT EXISTS ix_pkg_id_lower ON packages(lower(id));` ⇒ PEGA (teste 1). `-TestCommand 'cargo test --quiet --lib find_by_id_where'`.
+2. Consulta continua usando a expressão: `FIND_BY_ID_WHERE` → `"id = ?1 COLLATE NOCASE"` ⇒ PEGA (teste 1: o plano deixa de citar o índice).
+3. Equivalência com e sem índice: `FIND_BY_ID_WHERE` → `"lower(id) = ?1"` ⇒ PEGA (teste 2: `"GIT.GIT"` deixa de achar).
+
+**Commit:** `perf(catalog): index lower(id) for case-insensitive id lookups`
+
+---
+
+### Task 74: `list` — threads de varredura logo após o log
+
+**Modelo:** sonnet (portão de medição no início).
+
+#### Where this fits
+
+Depois da Task 72 (o portão é medido com ela integrada). `list` dispara varredura, rastreamento do winget e normalizador (`src/cli/mod.rs:740-756`, braço `Command::List` em `:735-799`) só dentro de `run_async`, depois de `data.ensure()`, `init_logging` e `Config::load` (`:893-895`), da construção do runtime (`:910`) e de `Http::new()` (`:623`). O `search` já antecipa a busca no topo de `run()` (`EarlySearch`, `:559-584`; criação em `:877-892`). As threads precisam começar **depois** de `init_logging` (antes dele os spans `scan_*` das threads se perdem: o subscriber global ainda não existe), então o ganho máximo é `Config::load` + runtime + `Http::new` — que a Task 72 encolhe. Por isso há portão.
+
+#### What binds this task
+
+- **(a) Medida e portão (commit 1).** Guarde um `Instant` logo depois de `init_logging` em `run()` e, no braço `List`, imediatamente antes do primeiro `spawn`, emita `tracing::debug!(ms = <decorrido>, "list.setup")` (um evento, não span: atravessaria o `block_on`). 15 execuções de `list` na raiz isolada e `Select-String -Path "$W\log\wingetrs.log.*" -Pattern 'list\.setup' | ForEach-Object Line`. **Mediana < 3 ms ⇒ pare: "não vale", só o commit 1 fica.**
+- **(b) Mudança (commit 2).** Guard `EarlyList` no molde exato de `EarlySearch` (`:559-584`): três `Option<JoinHandle<_>>`, `join_all(&mut self)` que devolve os três resultados propagando pânico com `std::panic::resume_unwind`, e `Drop` que junta todos (com o ramo `std::thread::panicking()` de `EarlySearch`, `:575-582`). Em `run()`, logo após `init_logging`, se o comando é `List` cria o guard; `run_async` recebe `Option<EarlyList>` e o braço `List` usa os handles em vez de criar threads. Os joins continuam **antes** de propagar o erro do catálogo (`:757-762`). O evento `list.setup` continua (agora medindo quase nada).
+- **(c) Medição:** protocolo abaixo, base = commit 1, nova = commit 2, `-CmdArgs 'list'`.
+- **Reversão.** Métrica = `wall`; **L = max(5 ms, 10 % do "sobre o piso" da base)**.
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf74-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-74" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-74\Cargo.toml" --target-dir "<S>\tgt-base-74"
+   Copy-Item "<S>\tgt-base-74\release\wingetrs.exe" "<S>\perf74-base.exe"
+   git worktree remove --force "<S>\wt-base-74"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf74-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf74-base.exe" -New "<S>\perf74-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-74`, `<S>\perf74-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-74`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/cli/mod.rs`
+- Test: `mod early_tests` em `src/cli/mod.rs`
+
+Testes:
+1. `early_list_propagates_worker_panic`: como `early_search_propagates_worker_panic` (`:918-925`), com um dos três handles em pânico ⇒ `catch_unwind` de `join_all` é `Err`.
+2. `early_list_joins_every_thread_on_drop`: três threads que esperam uma `std::sync::Barrier` compartilhada com o teste e depois marcam um `Arc<AtomicBool>` cada; o teste cria o guard, passa a barreira e faz `drop(guard)` ⇒ os três `true` (sem `sleep`: ARMADILHAS, "Teste com limiar de relógio").
+3. Regressão: `list_without_catalog_and_without_network_fails_cleanly_and_fast` (`tests/cli_offline.rs`) verde.
+
+#### Checks beyond the steps
+
+1. `Drop` junta: corpo do `Drop` de `EarlyList` esvaziado ⇒ PEGA (teste 2).
+2. Pânico propagado: `std::panic::resume_unwind(p)` → `Default::default()`/`None` no `join_all` ⇒ PEGA (teste 1) — e o `check_rules.ps1` do gate barra `.ok()`/`unwrap_or_default` em `join`.
+
+**Commit:** `perf(list): start the installed scan right after logging setup` (precedido de `perf(list): measure setup before the scan threads`)
+
+---
+
+### Task 75: Fonte Scoop sem varrer os mapas do winget; `bucket rm` sem regravar índice à toa
+
+**Modelo:** sonnet.
+
+#### Where this fits
+
+Depois da Task 73 (mesmo arquivo). Desde a Task 55, `delete_source_rows` (`src/catalog/mod.rs:174-208`) faz, para cada tabela de mapa, `SELECT EXISTS(SELECT 1 FROM {t} WHERE package NOT IN (SELECT rowid FROM packages WHERE source = ?1))` e então esvazia a tabela inteira (todas as linhas são da fonte) ou cai no `DELETE FROM {t} WHERE package IN (SELECT rowid FROM packages WHERE source = ?1)`. Os índices dos mapas são só em `key` (`:40-44`), então esse `DELETE` varre a tabela de mapa inteira. Para uma fonte **Scoop** o `EXISTS` acha linha alheia (do winget) na 1ª linha ⇒ sempre o caminho por linha ⇒ 5 varreduras das 146 mil linhas de mapa do winget para apagar **nada** (o Scoop nunca grava mapa: `src/update.rs:260` passa `&WingetMaps::default()`). Acontece em todo import de bucket (`replace_source`, `:332`) e no `bucket rm` (`remove_source`, `:321-330`). Além disso `bucket rm` (`src/buckets.rs:182-216`, `remove_and_cleanup`) descarta o número de linhas removidas (`:196-198`) e **sempre** regrava o `search.idx` (`:199-203`; desde a Task 54, um `SELECT` de todo o `packages` em `index_file::encode_catalog`), mesmo quando o bucket foi adicionado e nunca baixado (0 linhas). Ganho **não medido**.
+
+#### What binds this task
+
+- **(a) Spans (commit 1):** `catalog.delete_source_rows` em volta do corpo de `delete_source_rows` e `bucket.rm.index_write` em volta do `index_file::write` de `remove_and_cleanup`.
+- **(b) Mudança 1 — mapas (commit 2, `src/catalog/mod.rs`).** `delete_source_rows(tx, source, kind: SourceKind)` pula os 5 `DELETE`/`EXISTS` de mapa quando `kind == SourceKind::Scoop` (`truncated_maps` = 0). `replace_source` passa o `kind` que recebe; `remove_source` lê `SELECT kind FROM meta WHERE source = ?1` dentro da transação e, **sem linha em `meta`, trata como winget** (apaga mapas: caminho seguro). Para a premissa não apodrecer: `replace_source` com `kind == Scoop` e algum mapa não vazio ⇒ `Err(CatalogError::MapsForScoop(source.to_string()))` (variante nova, mensagem `"fonte scoop não aceita mapeamentos: {0}"`) **antes** de abrir a transação. O teste de equivalência existente (`check`, `:653-680`, contra o `delete_per_row` literal) ganha o parâmetro `kind` e continua comparando conteúdo: `check(winget_only, "winget", Winget, 5)`, `check(winget_only, "scoop:main", Scoop, 0)`, `check(two_owners, "winget", Winget, 0)`, `check(two_owners, "other", Winget, 0)`, `check(orphan_pfn, "winget", Winget, 4)`.
+- **(c) Mudança 2 — `bucket rm` (commit 3, `src/buckets.rs`).** `let n = catalog.remove_source(..)?;` e regrava o `search.idx` só se `n > 0 || !idx.exists()`.
+- **(d) Medição** (protocolo abaixo). `bucket rm` é destrutivo: restauração antes de cada execução com `-Pristine`. Preparação, numa chamada:
+  ```powershell
+  . "<S>\perf-env.ps1"
+  & "<S>\perf75-new.exe" bucket list       # confira que extras está configurado
+  python -I -c "import pathlib,sqlite3,sys; c=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); print(c.execute('SELECT count(*) FROM packages WHERE source = ?', (sys.argv[2],)).fetchone()[0])" "$W\catalog.db" scoop:extras
+  New-Item -ItemType Directory -Force "<S>\pristine75a" | Out-Null
+  Copy-Item "$W\catalog.db", "$W\search.idx", "$W\http.json" "<S>\pristine75a\"; if (Test-Path "$W\config.toml") { Copy-Item "$W\config.toml" "<S>\pristine75a\" }
+  & "<S>\perf75-new.exe" bucket add perfx ScoopInstaller/Versions --yes   # bucket configurado e nunca baixado
+  New-Item -ItemType Directory -Force "<S>\pristine75b" | Out-Null
+  Copy-Item "$W\catalog.db", "$W\search.idx", "$W\http.json", "$W\config.toml" "<S>\pristine75b\"
+  ```
+  (Se o `print` acima der 0, use outro bucket com linhas que `bucket list` mostre e registre qual.) Séries:
+  - Cenário (i), bucket com linhas: `-CmdArgs 'bucket rm extras' -Pristine "<S>\pristine75a" -Span 'catalog\.delete_source_rows'`.
+  - Cenário (ii), bucket nunca baixado: `-CmdArgs 'bucket rm perfx' -Pristine "<S>\pristine75b"`.
+- **Reversão** (por mudança; reverta só o commit que falhar). Mudança 1 (base = commit 1, nova = commit 2): métrica = `span` no cenário (i); **L = max(5 ms, 10 % da mediana do span na base)**; não-regressão: `wall` do cenário (i) com delta pareado mediano ≤ +5 ms. Mudança 2 (base = commit 2, nova = commit 3): métrica = `wall` no cenário (ii); **L = max(5 ms, 10 % do "sobre o piso" da base)**. Registre também a mediana de `bucket.rm.index_write` no cenário (i) (é o número que reabriria a P8 descartada).
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf75-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-75" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-75\Cargo.toml" --target-dir "<S>\tgt-base-75"
+   Copy-Item "<S>\tgt-base-75\release\wingetrs.exe" "<S>\perf75-base.exe"
+   git worktree remove --force "<S>\wt-base-75"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf75-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf75-base.exe" -New "<S>\perf75-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-75`, `<S>\perf75-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-75`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/catalog/mod.rs`, `src/buckets.rs`
+- Test: `tests/catalog.rs`, `tests/buckets.rs`, `mod tests` de `src/catalog/mod.rs`
+
+Testes:
+1. `scoop_source_with_maps_is_refused` (`tests/catalog.rs`): `replace_source("scoop:main", SourceKind::Scoop, "v", 1, &[pkg("x","x","1")], &WingetMaps { productcodes: vec![("{X}".into(), "x".into())], ..Default::default() })` ⇒ `Err(CatalogError::MapsForScoop(_))`; `sources()` não lista `scoop:main`.
+2. `removing_a_scoop_source_keeps_winget_maps` (`tests/catalog.rs`): fonte `winget` com `productcodes = [("{PC-A}", "A.App")]` e fonte `scoop:main` com 2 pacotes; `remove_source("scoop:main") == 2` e `lookup(ProductCode, "{PC-A}") == ["A.App"]`; idem depois de um novo `replace_source` da `scoop:main`.
+3. `removing_a_winget_source_still_drops_its_maps` (`tests/catalog.rs`): mesmo cenário em arquivo temporário; `remove_source("winget")` ⇒ `lookup(ProductCode, "{PC-A}")` vazio e, por uma `rusqlite::Connection` à parte, `SELECT count(*) FROM map_productcode` == 0.
+4. `truncating_owned_map_tables_equals_the_per_row_delete` (unitário existente) com o parâmetro `kind`, nas 5 chamadas do item (b).
+5. `rm_of_a_never_updated_bucket_keeps_search_idx` (`tests/buckets.rs`): raiz temporária (`DataDir::new`), catálogo com uma fonte `scoop:main` de 1 pacote, `search.idx` gravado por `index_file::write`, mtime do `.idx` ajustado para `UNIX_EPOCH + 1_000_000 s` (`std::fs::File::options().write(true).open(..)?.set_modified(..)`); `add(&mut cfg, "perfx", "me/scoop-perfx", true)` sem linhas no catálogo; `remove_and_cleanup(&data, &mut cfg, "perfx", &db)` ⇒ mtime inalterado e bytes iguais.
+6. Regressão: `remove_and_cleanup_purges_catalog_index_and_http_state` e `remove_source_clears_map_rows` (`tests/buckets.rs`) verdes.
+
+#### Checks beyond the steps
+
+1. Winget ainda limpa mapas: `delete_source_rows` pulando os mapas para qualquer `kind` (`if kind == SourceKind::Scoop` → `if true`) ⇒ PEGA (teste 3).
+2. Premissa protegida: remover a recusa `MapsForScoop` ⇒ PEGA (teste 1).
+3. Índice só quando mudou: `n > 0 ||` → `true ||` ⇒ PEGA (teste 5).
+4. Sem `meta` ⇒ trata como winget: não há caminho público que crie pacotes sem `meta`; o revisor confere no diff (registre "sem mutação aplicável").
+
+**Commit:** `perf(catalog): skip winget map scans for scoop sources` e `perf(buckets): keep search.idx when rm removed no rows` (precedidos de `perf(catalog): spans for delete_source_rows and bucket rm index write`)
+
+---
+
+### Task 76: `update` — catálogo aberto e `http.json` gravado só quando algo mudou
+
+**Modelo:** sonnet.
+
+#### Where this fits
+
+Depois da Task 73 (nota abaixo). `run_update` (`src/update.rs:184-280`) sempre faz `Catalog::open` (`:231`; escritor: `journal_mode=WAL` + DDL do `SCHEMA`) e sempre grava `http.json` com `sync_all` (`:269-270`; `HttpState::save`, `src/cache/mod.rs:139-149`). Com todas as fontes `Fresh` (`update` dentro da janela de 15 min) nada mudou e as duas coisas são trabalho morto; com tudo `304` o `http.json` precisa ser gravado (o `checked_at` muda, `:236-241`) mas o catálogo não precisa ser aberto, salvo se o `search.idx` faltar (`:271-278`). Ganho esperado pequeno (ARMADILHAS: abrir SQLite + 1ª consulta custa 11–15 ms) — **não medido**.
+
+Nota de interação com a Task 73: depois desta tarefa, um catálogo antigo só ganha o índice `ix_pkg_id_lower` num `update` que importe algo (ou num `bucket rm`). Aceitável: a consulta continua correta sem índice.
+
+#### What binds this task
+
+- **(a) Span (commit 1):** `update.catalog_open` em volta do `Catalog::open` (`:231`). Os spans da Task 45 (`update.state_save`, `update.search_idx`, `update.catalog_write`) **não mudam** de nome, lugar nem pai.
+- **(b) Mudança (commit 2, `src/update.rs`):**
+  - Função pura `fn needs_catalog(results: &[Option<Result<Fetched, (String, bool)>>], index_exists: bool) -> bool` = algum `Some(Ok(Fetched::Winget(..) | Fetched::Scoop(..)))` **ou** `!index_exists`. O catálogo é aberto uma vez, só se ela der `true`; os relatórios saem idênticos. Sem `unwrap`/`expect`: se um ramo de import ficar sem catálogo por construção, ele vira `Outcome::Failed` com mensagem interna e é registrado no relatório como inalcançável (mutação equivalente — ARMADILHAS).
+  - `state.save` só quando algum relatório é `Outcome::Unchanged` ou `Outcome::Updated { .. }` (são os únicos que mudam um `HttpEntry`); tudo `Fresh`/`Failed` ⇒ não grava.
+- **(c) Medição** (protocolo abaixo; base = commit 1, nova = commit 2), duas séries:
+  1. Tudo `Fresh` (sem rede), raiz `la` logo depois do `update` do item 4 do protocolo: `-CmdArgs 'update'` (sem `-Span`: na nova o `update.state_save` não acontece; a métrica é `wall`).
+  2. Tudo `304` com servidor local, numa raiz **vazia** própria (sem copiar o catálogo real):
+     ```powershell
+     $srv304 = "<S>\srv304"; New-Item -ItemType Directory -Force $srv304 | Out-Null
+     Copy-Item tests\fixtures\winget\source2-mini.msix "$srv304\source2.msix"
+     Copy-Item tests\fixtures\scoop\Main-mini.tar.gz "$srv304\main.tgz"; Copy-Item tests\fixtures\scoop\Main-mini.tar.gz "$srv304\extras.tgz"
+     $srv = Start-Process python -ArgumentList '-I', '-m', 'http.server', '8766', '--bind', '127.0.0.1', '--directory', $srv304 -PassThru -WindowStyle Hidden
+     try {
+         $env:WINGETRS_WINGET_INDEX_URL = 'http://127.0.0.1:8766/source2.msix'
+         $env:WINGETRS_SCOOP_BASE_URL = 'http://127.0.0.1:8766'
+         New-Item -ItemType Directory -Force "<S>\la304\wingetrs" | Out-Null
+         Start-Sleep -Milliseconds 700
+         $env:LOCALAPPDATA = "<S>\la304"; & "<S>\perf76-new.exe" update --force; $env:LOCALAPPDATA = "<S>\la"
+         pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf76-base.exe" -New "<S>\perf76-new.exe" -CmdArgs 'update --force' -RootBase "<S>\la304" -Runs 15
+     } finally { Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue }
+     ```
+     (O `http.server` do Python responde 304 a `If-Modified-Since`, e o wingetrs manda esse cabeçalho a partir do `Last-Modified` gravado.) Confirme numa execução avulsa com `-v` que os três resultados saem `Unchanged`. No fim, apague `<S>\srv304` e `<S>\la304`.
+- **Reversão.** Métrica = `wall`; **L = max(5 ms, 10 % do "sobre o piso" da base)**. Fica se pelo menos uma das duas séries passar no critério e a outra tiver delta pareado mediano ≤ +L; senão reverte o commit 2.
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório). Rode tudo **da raiz do repositório**. O shell da ferramenta **não guarda variáveis entre chamadas**: toda chamada que mede começa com `. "<S>\perf-env.ps1"`.
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando durante a medição (o piso de processo nesta máquina varia de 38 a 300 ms com a carga — ARMADILHAS, "Piso de processo"). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre (o modo automático bloqueia). Meça só com o gate verde.
+2. **Binários fixos.** `cargo build --release --quiet; cargo build --release --example noop --quiet`, depois `Copy-Item target\release\wingetrs.exe "<S>\perf76-new.exe"` (builds seguintes não trocam o arquivo medido). Base = o commit imediatamente **antes** do commit da otimização (se a tarefa tem commit de spans, a base é ele: os dois lados têm o mesmo instrumento):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-76" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-76\Cargo.toml" --target-dir "<S>\tgt-base-76"
+   Copy-Item "<S>\tgt-base-76\release\wingetrs.exe" "<S>\perf76-base.exe"
+   git worktree remove --force "<S>\wt-base-76"
+   ```
+3. **Raiz isolada** (a raiz real só é lida; nada é escrito em `%LOCALAPPDATA%\wingetrs`). Salve `<S>\perf-root.ps1` e rode `pwsh -File "<S>\perf-root.ps1"` (padrão `-Name la`; segunda raiz: `-Name la2`):
+   ```powershell
+   param([string]$Name = 'la')
+   $ErrorActionPreference = 'Stop'
+   $S = '<S>'
+   $real = [Environment]::GetFolderPath('LocalApplicationData')   # pasta real, mesmo com $env:LOCALAPPDATA redirecionado
+   $R = "$real\wingetrs"; $LA = "$S\$Name"; $W = "$LA\wingetrs"
+   if (Test-Path $LA) { Remove-Item -Recurse -Force $LA }
+   New-Item -ItemType Directory -Force $W | Out-Null
+   # Cópia consistente do catálogo (arquivo do próprio wingetrs), lido em modo só-leitura.
+   python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$R\catalog.db" "$W\catalog.db"
+   if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+   foreach ($f in 'search.idx', 'http.json', 'config.toml') { if (Test-Path "$R\$f") { Copy-Item "$R\$f" $W } }
+   # Para `list`: cópia do rastreamento do winget; o original nunca é aberto pelo binário medido.
+   $T = 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\Microsoft.Winget.Source_8wekyb3d8bbwe'
+   if (Test-Path "$real\$T\installed.db") { New-Item -ItemType Directory -Force "$LA\$T" | Out-Null; Copy-Item "$real\$T\installed.db" "$LA\$T\" }
+   "raiz pronta: $W"
+   ```
+   e `<S>\perf-env.ps1` (dot-source em toda chamada que mede):
+   ```powershell
+   $S = '<S>'; $LA = "$S\la"; $W = "$LA\wingetrs"
+   $env:LOCALAPPDATA = $LA
+   $env:WINGETRS_TEST_ENV_KEY = 'Software\wingetrs-test\perf'
+   $env:WINGETRS_TEST_SHORTCUT_DIR = "$S\sc"
+   ```
+4. **Catálogo fresco.** Antes de cada série: `. "<S>\perf-env.ps1"; & "<S>\perf76-new.exe" update` (renova `checked_at`; `MAX_AGE_SECS` = 900 em `src/update.rs:13`, então nenhum `update --background` nos 15 min seguintes; com duas raízes, rode também com `$env:LOCALAPPDATA = "<S>\la2"`). Série que passar de 10 min: repita o `update` antes da próxima. O `ab-cmd.ps1` avisa se sobrou `wingetrs` rodando no fim (refresh em 2º plano ⇒ série inválida, repita).
+5. **Spans.** Span que a tarefa manda criar vai num **primeiro commit separado** (`perf(<mod>): spans for <etapa>`), no formato da Task 45: `tracing::debug_span!("<comando>.<etapa>")`, `.in_scope(..)` em código síncrono, `.instrument(..)` em assíncrono (nunca `span.enter()` atravessando `.await`), sempre criado depois de `init_logging` (antes dele o span se perde). Prova de que mede a etapa: as linhas do log coladas, com `time.busy` > 0 e coerente com a etapa — `Select-String -Path "$W\log\wingetrs.log.*" -Pattern '<regex do span>.*close time\.busy' | Select-Object -Last 15` (ARMADILHAS: "Span criado não é span medido").
+6. **A/B intercalado.** Salve `<S>\ab-cmd.ps1` (cada rodada sorteia a ordem base/nova/noop; 2 rodadas de aquecimento descartadas; `-Pristine` restaura arquivos antes de cada execução, fora do cronômetro; `-Drop` apaga arquivos da raiz antes de cada execução):
+   ```powershell
+   param(
+       [Parameter(Mandatory)] [string]$Base,
+       [Parameter(Mandatory)] [string]$New,
+       [Parameter(Mandatory)] [string]$CmdArgs,
+       [string]$Span = '',
+       [string]$RootBase = '',
+       [string]$RootNew = '',
+       [string]$Pristine = '',
+       [string[]]$Drop = @(),
+       [int]$Runs = 15
+   )
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   if (-not $RootBase) { $RootBase = "$S\la" }
+   if (-not $RootNew) { $RootNew = $RootBase }
+   $roots = @{ base = $RootBase; new = $RootNew }
+   $exes = @{ base = $Base; new = $New }
+   $noop = (Resolve-Path 'target\release\examples\noop.exe').Path
+   $argv = -split $CmdArgs
+   function Busy([string]$w) {
+       $log = Get-ChildItem "$w\log" -Filter 'wingetrs.log.*' -ErrorAction SilentlyContinue | Sort-Object Name | Select-Object -Last 1
+       if (-not $log) { throw "sem log em $w" }
+       $m = Select-String -Path $log.FullName -Pattern ($Span + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span '$Span' ausente em $w" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $orig = $env:LOCALAPPDATA
+   $ms = @{ base = @(); new = @(); noop = @(); sbase = @(); snew = @() }
+   try {
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           $r = @{}
+           foreach ($k in @('base', 'new', 'noop') | Sort-Object { Get-Random }) {
+               if ($k -eq 'noop') {
+                   $sw = [Diagnostics.Stopwatch]::StartNew(); & $noop *> $null; $r.noop = $sw.Elapsed.TotalMilliseconds
+                   continue
+               }
+               $w = Join-Path $roots[$k] 'wingetrs'
+               if ($Pristine) {
+                   Remove-Item -Force -ErrorAction SilentlyContinue "$w\catalog.db-wal", "$w\catalog.db-shm"
+                   Copy-Item "$Pristine\*" $w -Force
+               }
+               foreach ($f in $Drop) { Remove-Item -Force -ErrorAction SilentlyContinue "$w\$f" }
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$w\log"
+               $exe = $exes[$k]
+               $env:LOCALAPPDATA = $roots[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe @argv *> $null
+               $r[$k] = $sw.Elapsed.TotalMilliseconds
+               $code = $LASTEXITCODE
+               $env:LOCALAPPDATA = $orig
+               if ($code -ne 0) { throw "$k '$CmdArgs' saiu com $code" }
+               if ($Span) { $r["s$k"] = Busy $w }
+           }
+           if ($i -ge 2) { foreach ($key in @($r.Keys)) { $ms[$key] += $r[$key] } }
+       }
+   } finally { $env:LOCALAPPDATA = $orig }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   function Row([string]$name, $b, $n) {
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-4} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado (nova-base) med={5,8:N1} ms' -f `
+           $name, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+   }
+   function Raw($a) { ($a | ForEach-Object { '{0:N1}' -f $_ }) -join ' ' }
+   Row 'wall' $ms.base $ms.new
+   'piso noop med={0:N1} ms | sobre o piso: base {1:N1}, nova {2:N1} ms' -f (Med $ms.noop), ((Med $ms.base) - (Med $ms.noop)), ((Med $ms.new) - (Med $ms.noop))
+   if ($Span) { Row 'span' $ms.sbase $ms.snew }
+   'brutos wall base: ' + (Raw $ms.base); 'brutos wall nova: ' + (Raw $ms.new)
+   if ($Span) { 'brutos span base: ' + (Raw $ms.sbase); 'brutos span nova: ' + (Raw $ms.snew) }
+   if (Get-Process wingetrs -ErrorAction SilentlyContinue) { 'AVISO: wingetrs ainda rodando (refresh em 2º plano?): série inválida, repita' }
+   ```
+   Rode `. "<S>\perf-env.ps1"; pwsh -File "<S>\ab-cmd.ps1" -Base "<S>\perf76-base.exe" -New "<S>\perf76-new.exe" -CmdArgs '<args>' [-Span '<regex>'] -Runs 15` e cole a saída **inteira** (resumo e brutos).
+7. **Decisão**, com a métrica e o limiar `L` do item **Reversão** desta tarefa. Fica se **todas**: (1) mediana do delta pareado (nova − base) da métrica ≤ −L; (2) pior caso: `max(nova) ≤ max(base)` na métrica — se só (2) falhar, rode mais uma série; falhou de novo ⇒ reverte; (3) as não-regressões e equivalências da tarefa. Senão: `git revert --no-edit <sha da otimização>` (spans e testes que continuam válidos ficam) e o relatório diz "sem ganho medido" com os números colados. Número que você não mediu é escrito "não medido".
+8. **Limpeza.** Apague `<S>\la*`, `<S>\pristine*`, `<S>\tgt-base-76`, `<S>\perf76-*.exe`, `<S>\sc`; `git worktree list` sem `wt-base-76`; `reg query HKCU\Software\wingetrs-test\perf` ⇒ chave inexistente (nenhum comando medido escreve no ambiente); todo `python` que você iniciou, encerrado pelo PID que você guardou; `pwsh -File scripts/leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/update.rs`
+- Test: `tests/update.rs` e `#[cfg(test)] mod tests` novo em `src/update.rs` (a função e o `Fetched` são privados)
+
+Testes:
+1. `needs_catalog_only_for_imports_or_missing_index` (`src/update.rs`): `[None, Some(Ok(Fetched::NotModified)), Some(Err(("x".into(), true)))]` com índice ⇒ `false`; o mesmo sem índice ⇒ `true`; `[Some(Ok(Fetched::Scoop(BucketImport { packages: vec![], skipped: vec![] }, HttpEntry::default())))]` com índice ⇒ `true`; idem com `Fetched::Winget(WingetImport { packages: vec![], maps: WingetMaps::default() }, HttpEntry::default())`.
+2. `fresh_update_touches_neither_http_json_nor_the_catalog` (`tests/update.rs`): wiremock com os mocks `.expect(0)`; `http.json` com todas as URLs dos `Endpoints` com `checked_at = now_unix()` (via `HttpState::set` + `save`); `search.idx` presente (`index_file::write(&Catalog::open_in_memory().unwrap(), &data.search_index_path())`); mtime do `http.json` ajustado para `UNIX_EPOCH + 1_000_000 s`; **sem** `catalog.db`; `run_update(.., force = false, ..)` ⇒ todos `Outcome::Fresh`, mtime inalterado e `!data.catalog_path().exists()`.
+3. `not_modified_update_still_refreshes_checked_at` (`tests/update.rs`): wiremock respondendo 304 para tudo e `http.json` com `checked_at = 1` ⇒ todos `Outcome::Unchanged` e o `checked_at` de cada URL, lido de volta com `HttpState::load`, > 1. (Se já existir teste equivalente, cite-o em vez de duplicar.)
+
+#### Checks beyond the steps
+
+1. Abertura condicional: `needs_catalog` devolvendo sempre `true` ⇒ PEGA (testes 1 e 2).
+2. Índice ausente ainda força abrir: `|| !index_exists` removido ⇒ PEGA (teste 1).
+3. Sem gravação à toa: `state.save` incondicional de volta ⇒ PEGA (teste 2).
+4. 304 ainda grava: condição de gravação só com `Outcome::Updated { .. }` ⇒ PEGA (teste 3).
+
+**Commit:** `perf(update): open the catalog and save http state only when something changed` (precedido de `perf(update): span for catalog open`)
+
+---
+
+### Task 77: Gravação do catálogo — índices dos mapas reconstruídos uma vez por import do winget
+
+**Modelo:** sonnet (patch pronto no relatório de investigação; revisor opus: DDL dentro da transação).
+
+#### Where this fits
+
+Depois da Task 75 (mesma função `delete_source_rows`/`replace_source`) e da Task 55 (feita: esvaziar de uma vez os mapas que são todos da fonte). `update.catalog_write{source=winget}` (`src/update.rs:303`, corpo de `apply`) mede ~1,06–1,2 s no `update` real (log de 2026-10-12: 1,20 s); ~70 % vai para as tabelas `map_*` (146 059 linhas, 5 índices em `key`, `src/catalog/mod.rs:40-44`). Investigação de 2026-10-11 (harness com o `source2.msix` real, A/B intercalado sob carga, deltas da mesma bateria):
+- Inserir as 146 mil linhas mantendo os 5 índices linha a linha custa ~500 ms; derrubar os índices dentro da transação e recriá-los no fim (build ordenado) tirou **−213 ms** a mais sobre truncate+cache (bateria ab3, modo "replace") e **−303 ms** sozinho (ab1); no catálogo vazio, −239/−241 ms.
+- `cache_size` de 64 MiB durante o import: −43 ms (ab3), −304 ms (ab1, ruidoso). Fica num **commit separado**, medido à parte.
+- Medido e descartado (não implementar): `synchronous=NORMAL`, inserts ordenados por chave, `ATTACH` + `INSERT … SELECT`. Fora do escopo: mapas `WITHOUT ROWID` (exige migração de schema; não há `user_version`).
+- Equivalência no protótipo: digest SHA-256 de `packages` com rowid, dos 5 mapas como multiconjunto `(key, package)`, de `meta` e do schema iguais em todas as variantes; `integrity_check` ok.
+
+Riscos: DDL é transacional no SQLite — erro no meio (ex.: `DanglingMap`) faz rollback e os índices voltam (precisa de teste). Leitores WAL abertos (TUI) ficam no snapshot antigo; depois do commit o schema cookie muda e o `sqlite3_prepare_v2` reprepara sozinho (inclusive statements em cache da Task 71; precisa de teste). Rebuild num import do **scoop** (sem mapas) custaria 100–300 ms de `CREATE INDEX` por bucket ⇒ só reconstruir quando o import **tem** mapas.
+
+#### What binds this task
+
+- **Commit 1 (índices):**
+  - Os 5 `CREATE INDEX` saem de `SCHEMA` para `const MAP_INDEXES: &str` (mesmo texto, mesmos nomes), executada logo depois de `SCHEMA` em `Catalog::open` (`:258-268`) e `open_in_memory` (`:315-319`). `const DROP_MAP_INDEXES: &str = "DROP INDEX IF EXISTS ix_pc; DROP INDEX IF EXISTS ix_uc; DROP INDEX IF EXISTS ix_pfn; DROP INDEX IF EXISTS ix_nn; DROP INDEX IF EXISTS ix_np;"`. Schema final igual ao de hoje.
+  - Função pura `pub(crate) fn rebuilds_map_indexes(maps: &WingetMaps) -> bool`: `true` se qualquer um dos 5 vetores não estiver vazio.
+  - `replace_source` delega para `fn replace_source_impl(&mut self, source, kind, source_version, fetched_at, packages, maps, rebuild: bool)`; o público passa `rebuild = rebuilds_map_indexes(maps)`. Com `rebuild`: `tx.execute_batch(DROP_MAP_INDEXES)` **dentro da transação, antes** de `delete_source_rows`, e `tx.execute_batch(MAP_INDEXES)` **dentro da transação, depois** do upsert em `meta` e antes do `commit`. Qualquer erro antes do commit desfaz tudo, inclusive o `DROP` (o drop de `tx` já faz rollback). Sem `rebuild`, nada muda em relação a hoje.
+  - `remove_source`, `lookup`, `ImportStats` e o formato do arquivo não mudam.
+- **Commit 2 (`cache_size`, decidido à parte):** em `replace_source_impl`, antes da transação, `let prev: i64 = self.conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;` e `self.conn.pragma_update(None, "cache_size", -65536i64)?;`; depois do commit **ou do erro**, restaurar `prev` (um guard com `Drop` ou o resultado guardado antes do `?`; o erro original tem precedência sobre um erro da restauração). Memória: até 64 MiB a mais durante o import (registre).
+- **Medição** (protocolo abaixo; a tarefa usa o seu próprio A/B de `update`). Dois A/B: commit 1 contra a base (HEAD antes da tarefa), e commit 2 contra o commit 1.
+- **Reversão.** Commit 1: métrica = span `update.catalog_write{source=winget}`; fica se (1) delta pareado mediano ≤ **−100 ms**, (2) `max(nova) ≤ max(base)` no span — se só (2) falhar, mais uma série de 10; falhou de novo ⇒ reverte —, (3) digests do catálogo iguais e `integrity_check` = `ok` nas duas raízes, schema igual, `search.idx` com o mesmo hash, (4) série com scoop servido localmente: delta pareado mediano do span `update.catalog_write{source=scoop:main}` ≤ +10 ms (o rebuild não pode rodar para o scoop). Commit 2: mesmas regras com **−40 ms** em (1); falhou ⇒ `git revert` só do commit 2.
+
+#### Protocolo de medição (completo; não depende de nenhuma outra seção do plano)
+
+`<S>` = caminho absoluto do scratchpad do agente (nunca dentro do repositório); rode da raiz do repositório; o shell da ferramenta não guarda variáveis entre chamadas (cada chamada abaixo é autossuficiente).
+
+1. **Sozinho.** Nenhum outro agente, build ou teste rodando (o piso de processo varia 38–300 ms com a carga). `pwsh -File scripts/leftovers.ps1` antes e depois; processo de outro projeto: anote, não encerre. Só com o gate verde.
+2. **Binários fixos** (base num worktree temporário; cópias fixas):
+   ```powershell
+   git worktree add --detach "<S>\wt-base-77" <sha da base>
+   cargo build --release --quiet --manifest-path "<S>\wt-base-77\Cargo.toml" --target-dir "<S>\tgt-base-77"
+   Copy-Item "<S>\tgt-base-77\release\wingetrs.exe" "<S>\ab77-base.exe"
+   git worktree remove --force "<S>\wt-base-77"
+   cargo build --release --quiet; Copy-Item target\release\wingetrs.exe "<S>\ab77-new.exe"
+   ```
+   Para o commit 2: `ab77-c1.exe` (build do commit 1, pelo mesmo worktree) e `ab77-c2.exe` (cabeça).
+3. **Entrada fixa:** o mesmo `source2.msix` para todas as séries: `New-Item -ItemType Directory -Force "<S>\ab-msix" | Out-Null; if (-not (Test-Path "<S>\ab-msix\source2.msix")) { curl.exe -sSL -o "<S>\ab-msix\source2.msix" https://cdn.winget.microsoft.com/cache/source2.msix }`. Para a série com scoop: `Copy-Item tests\fixtures\scoop\Main-mini.tar.gz "<S>\ab-msix\main.tgz"; Copy-Item tests\fixtures\scoop\Main-mini.tar.gz "<S>\ab-msix\extras.tgz"`.
+4. **A/B intercalado.** Salve `<S>\ab-update77.ps1`. Cada raiz (`LOCALAPPDATA` temporário) parte de uma **cópia** do catálogo real (o real só é lido); cada execução apaga `http.json` e o log da raiz e roda `update --force` (reimporta ⇒ `catalog_write`, `parse` e `search_idx` acontecem); ordem base/nova sorteada por rodada; 2 rodadas de aquecimento descartadas; servidor local do msix; scoop em porta morta (falha offline e mantém suas linhas) ou, com `-ScoopLocal`, servido pelo mesmo servidor:
+   ```powershell
+   param([string]$Base, [string]$New, [int]$Runs = 10, [int]$Port = 8765, [switch]$ScoopLocal)
+   $ErrorActionPreference = 'Stop'
+   [Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
+   $S = '<S>'
+   $spans = [ordered]@{
+       catalog_write = 'update\.catalog_write\{source=winget\}'
+       search_idx    = 'update\.search_idx'
+       parse         = 'update\.fetch\{source=winget\}:update\.parse'
+   }
+   if ($ScoopLocal) { $spans['scoop_write'] = 'update\.catalog_write\{source=scoop:main\}' }
+   $real = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'wingetrs'
+   $roots = @{}
+   foreach ($k in 'base', 'new') {
+       $r = "$S\ab77-root-$k"
+       if (Test-Path $r) { Remove-Item -Recurse -Force $r }
+       $d = New-Item -ItemType Directory -Force "$r\wingetrs"
+       python -I -c "import pathlib,sqlite3,sys; s=sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri()+'?mode=ro', uri=True); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()" "$real\catalog.db" "$d\catalog.db"
+       if ($LASTEXITCODE -ne 0) { throw 'cópia do catálogo falhou' }
+       if (Test-Path "$real\config.toml") { Copy-Item "$real\config.toml" $d }
+       $roots[$k] = $r
+   }
+   function Busy([string]$root, [string]$pat) {
+       $log = Get-ChildItem "$root\wingetrs\log" -Filter 'wingetrs.log.*' | Sort-Object Name | Select-Object -Last 1
+       $m = Select-String -Path $log.FullName -Pattern ($pat + '.*close time\.busy=([\d.]+)(ms|µs|s)\b') | Select-Object -Last 1
+       if (-not $m) { throw "span $pat ausente em $root" }
+       $v = [double]$m.Matches[0].Groups[1].Value
+       switch -CaseSensitive ($m.Matches[0].Groups[2].Value) { 'µs' { $v / 1000 } 's' { $v * 1000 } default { $v } }
+   }
+   $srv = Start-Process python -ArgumentList '-I', '-m', 'http.server', "$Port", '--bind', '127.0.0.1', '--directory', "$S\ab-msix" -PassThru -WindowStyle Hidden
+   $orig = $env:LOCALAPPDATA
+   $env:WINGETRS_WINGET_INDEX_URL = "http://127.0.0.1:$Port/source2.msix"
+   $env:WINGETRS_SCOOP_BASE_URL = if ($ScoopLocal) { "http://127.0.0.1:$Port" } else { 'http://127.0.0.1:9' }
+   $exes = @{ base = $Base; new = $New }
+   $ms = @{}
+   foreach ($k in 'base', 'new') { $ms[$k] = @{}; foreach ($s in @($spans.Keys) + 'wall') { $ms[$k][$s] = @() } }
+   try {
+       Start-Sleep -Milliseconds 700
+       for ($i = 0; $i -lt $Runs + 2; $i++) {
+           foreach ($k in @('base', 'new') | Sort-Object { Get-Random }) {
+               $env:LOCALAPPDATA = $roots[$k]
+               Remove-Item -Force -ErrorAction SilentlyContinue "$($roots[$k])\wingetrs\http.json"
+               Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$($roots[$k])\wingetrs\log"
+               $exe = $exes[$k]
+               $sw = [Diagnostics.Stopwatch]::StartNew()
+               & $exe update --force *> $null
+               $sw.Stop()
+               $env:LOCALAPPDATA = $orig
+               if ($i -ge 2) {
+                   foreach ($s in $spans.Keys) { $ms[$k][$s] += Busy $roots[$k] $spans[$s] }
+                   $ms[$k]['wall'] += $sw.Elapsed.TotalMilliseconds
+               }
+           }
+       }
+   } finally {
+       $env:LOCALAPPDATA = $orig
+       Remove-Item Env:WINGETRS_WINGET_INDEX_URL, Env:WINGETRS_SCOOP_BASE_URL -ErrorAction SilentlyContinue
+       Stop-Process -Id $srv.Id -Force -ErrorAction SilentlyContinue
+   }
+   function Med($a) { $s = @($a | Sort-Object); $s[[int][math]::Floor($s.Count / 2)] }
+   foreach ($s in @($spans.Keys) + 'wall') {
+       $b = $ms.base[$s]; $n = $ms.new[$s]
+       $d = for ($j = 0; $j -lt $b.Count; $j++) { $n[$j] - $b[$j] }
+       '{0,-14} base med={1,8:N1} max={2,8:N1} | nova med={3,8:N1} max={4,8:N1} | delta pareado med={5,8:N1} ms' -f $s, (Med $b), ($b | Measure-Object -Maximum).Maximum, (Med $n), ($n | Measure-Object -Maximum).Maximum, (Med $d)
+       "  brutos base: $($b -join ' ')"; "  brutos nova: $($n -join ' ')"
+   }
+   'search.idx igual: ' + ((Get-FileHash "$($roots.base)\wingetrs\search.idx").Hash -eq (Get-FileHash "$($roots.new)\wingetrs\search.idx").Hash)
+   ```
+   Rodadas: `pwsh -File "<S>\ab-update77.ps1" -Base "<S>\ab77-base.exe" -New "<S>\ab77-new.exe" -Runs 10` (decide o commit 1) e `pwsh -File "<S>\ab-update77.ps1" -Base "<S>\ab77-base.exe" -New "<S>\ab77-new.exe" -Runs 10 -ScoopLocal` (só o item (4) da reversão: `scoop_write`). Para o commit 2: as mesmas duas com `ab77-c1.exe`/`ab77-c2.exe`. Cole a saída inteira de cada rodada.
+5. **Equivalência do conteúdo** (as duas raízes tiveram a mesma história: mesmo msix, mesmo número de imports). Salve `<S>\catdigest.py` e rode `python -I "<S>\catdigest.py" "<S>\ab77-root-base\wingetrs\catalog.db" "<S>\ab77-root-new\wingetrs\catalog.db"` depois de **cada** rodada ⇒ as duas linhas com o mesmo digest de conteúdo, o mesmo digest de schema e `ok` (`fetched_at` fica de fora: é o relógio de cada execução):
+   ```python
+   import hashlib, pathlib, sqlite3, sys
+
+   MAPS = ("map_productcode", "map_upgradecode", "map_pfn", "map_norm_name", "map_norm_publisher")
+
+   def digest(path):
+       c = sqlite3.connect(pathlib.Path(path).as_uri() + "?mode=ro", uri=True)
+       h, sh = hashlib.sha256(), hashlib.sha256()
+       def feed(hh, sql):
+           for row in c.execute(sql):
+               hh.update(repr(row).encode())
+           hh.update(b"|")
+       feed(h, "SELECT rowid, * FROM packages ORDER BY rowid")
+       for t in MAPS:  # multiset: the map row's own rowid is not observable (lookup orders by p.rowid)
+           feed(h, f"SELECT key, package FROM {t} ORDER BY key, package")
+       feed(h, "SELECT source, kind, source_version FROM meta ORDER BY source")
+       feed(sh, "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
+       ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+       c.close()
+       return h.hexdigest(), sh.hexdigest()[:16], ok
+
+   for p in sys.argv[1:]:
+       print(p, *digest(p))
+   ```
+6. **Decisão:** regras do item **Reversão** acima. Reverter = `git revert --no-edit <sha do commit>`; ledger com os números colados.
+7. **Limpeza:** apagar `<S>\ab77-root-*`, `<S>\tgt-base-77`, `<S>\ab77-*.exe` (o `<S>\ab-msix` pode ficar para outras tarefas); `git worktree list` sem `wt-base-77`; `Get-Process python -ErrorAction SilentlyContinue` sem o servidor que você iniciou; `leftovers.ps1` limpo.
+
+**Files:**
+- Modify: `src/catalog/mod.rs`
+- Test: `tests/catalog.rs` e `mod tests` de `src/catalog/mod.rs`
+
+Testes:
+1. `rebuilds_map_indexes_only_for_imports_with_maps` (unitário): `WingetMaps::default()` ⇒ `false`; só `norm_publishers` com um par ⇒ `true`; só `productcodes` com um par ⇒ `true`.
+2. `rebuilt_import_equals_the_import_that_keeps_indexes` (unitário; equivalência obrigatória — dois caminhos para o mesmo resultado): dois `Catalog::open_in_memory()`; nos dois, o mesmo histórico: `winget_only` (helper existente) e depois `replace_source_impl("winget", Winget, "v2", 2, &[pkg("W.2"), pkg("W.4")], &maps(&["W.2", "W.4"]), rebuild)` com `rebuild = true` num e `false` no outro ⇒ `content(&a.conn) == content(&b.conn)` (helper existente: pacotes com rowid, mapas como multiconjunto, `meta`, `integrity_check`) e `SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name` igual nos dois. Repita a partir de catálogo vazio (1º import).
+3. `replace_with_maps_keeps_the_schema_of_a_fresh_catalog` (`tests/catalog.rs`): catálogo em disco (tempdir); `SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name` logo depois de `Catalog::open` e de novo depois de um `replace_source` com mapas nas 5 tabelas (por uma `rusqlite::Connection` à parte) ⇒ iguais, e `EXPLAIN QUERY PLAN SELECT package FROM map_productcode WHERE key = 'x'` cita `ix_pc`.
+4. `dangling_map_rollback_keeps_the_map_indexes` (`tests/catalog.rs`): catálogo em disco com um import válido com mapas; segundo import com mapa apontando para id inexistente ⇒ `Err(CatalogError::DanglingMap(_))`; os 5 `ix_*` continuam em `sqlite_master` e `lookup` do import válido continua respondendo.
+5. `reader_sees_new_rows_after_an_index_rebuild` (`tests/catalog.rs`): catálogo em disco; leitor `Catalog::open_read_only` faz `lookup(Pfn, "pfn_a") == ["A.A"]`; escritor (`Catalog::open`) faz `replace_source` com `pfns = [("PFN_B", "A.A")]`; o mesmo leitor ⇒ `lookup(Pfn, "pfn_b") == ["A.A"]` e `lookup(Pfn, "pfn_a")` vazio (o statement do leitor sobrevive à troca de schema).
+6. Commit 2: `import_restores_cache_size` (unitário): `PRAGMA cache_size` lido antes == lido depois de um `replace_source` com sucesso **e** depois de um que falha com `DanglingMap`.
+7. Regressão: `replace_keeps_map_rows_of_another_source`, `remove_source_keeps_other_sources_maps`, `dangling_map_rolls_back_whole_import`, `code_lookup_folds_case_in_both_directions`, `truncating_owned_map_tables_equals_the_per_row_delete` verdes sem mudança.
+
+#### Checks beyond the steps
+
+1. Índices recriados: remover o `tx.execute_batch(MAP_INDEXES)` do fim de `replace_source_impl` ⇒ PEGA (teste 3).
+2. Scoop não reconstrói: `rebuilds_map_indexes` devolvendo sempre `true` ⇒ PEGA (teste 1).
+3. Equivalência: no ramo `rebuild`, recriar só 4 dos 5 índices (tirar `ix_np` da string) ⇒ PEGA (teste 2, schema).
+4. `DROP` dentro da transação: mover o `DROP_MAP_INDEXES` para antes de `transaction_with_behavior` (fora da transação) ⇒ PEGA (teste 4).
+5. Commit 2: remover a restauração do `cache_size` ⇒ PEGA (teste 6).
+
+**Commit:** `perf(catalog): rebuild map indexes once per winget import` e (se ficar) `perf(catalog): larger page cache during imports`
+
+---
+
+### Task 78: Investigação do "Acesso negado" (os error 5) intermitente sob carga
+
+**Modelo:** opus (diagnóstico; a correção depende da evidência).
+
+#### Where this fits
+
+Independente das Tasks 70–77, mas **nunca em paralelo com tarefa que mede tempo** (a reprodução gera carga de propósito). Pendência `OPEN` no ledger: 4+ falhas sob carga que passam isoladas. Evidência já registrada nos relatórios:
+- `task-50-report.md:24`: `install_executor`, passo `extrair [1]` ⇒ `E/S: Acesso negado. (os error 5)`.
+- `task-66-report.md:18`: `install_ops::apply_skips_a_dependency_installed_meanwhile` (`tests/install_ops.rs:862-871`) ⇒ `E/S: Acesso negado. (os error 5)` na extração.
+- `task-69-report.md:43`: `install_executor::failure_after_replacing_a_kept_version_restores_it` (`tests/install_executor.rs:1028-1070`) ⇒ "Acesso negado (os error 5)" ao extrair.
+- `task-54-report.md:14`, `task-67-report.md:12`: `install_executor` "Acesso negado" e "index_file lock test" (nome exato não registrado).
+- Ledger `idx-flaky` (8de8685): 1/200 "Acesso negado" real durante o `rename` do `search.idx` ⇒ leitura com 5 tentativas (`src/catalog/index_file.rs:392-411`, `read_retrying`) e `persist` com 5 tentativas (`:118-145`).
+
+Código no caminho das falhas (HEAD `922a995`):
+- Extração: `extract_all_with` (`src/install/extract.rs:164-204`) extrai para `.wingetrs-extract-<pid>-<seq>` ao lado do destino (`:192-197`) e chama `merge_into` (`:352-375`), que **renomeia a pasta recém-escrita** (`fs::rename(src, dest)`, `:354`) ou, com destino existente, `remove_file(&to)` + `rename` por arquivo (`:364-370`). Todo `io::Error` vira `ExtractError::Io(e.to_string())` por `From` (`:80-84`): **a mensagem perde a operação e o caminho**.
+- Executor: `Step::Promote` renomeia a versão antiga para o lado e o staging para a versão (`src/install/executor.rs:595-614`); desfazer renomeia de volta (`:261`); `remove_any` (`:115-130`); `persist` (`:818`).
+- Nomes temporários: extração e "aside" usam pid + contador atômico (`extract.rs:192-197`, `executor.rs:489-504`); downloads `dl-<pid>-<seq>.part` (`src/install/download.rs:125-129`); cada teste usa o próprio `tempfile::tempdir()` (`tests/install_executor.rs:202`, `tests/install_ops.rs:124`, `tests/index_file.rs:8`).
+- `tests/index_file.rs:163-191` (`search_retries_while_the_file_is_briefly_locked`) depende de relógio: o leitor tem ~50 ms de tentativas e a thread que segura o arquivo dorme 5 ms antes de soltar — sob carga, a thread pode ficar fora da CPU por mais que isso.
+
+Hipóteses a separar **com evidência** (nenhuma está provada):
+- **H1 — scanner externo** (Windows Defender em tempo real, indexador) abre o arquivo recém-escrito; enquanto o handle existe, o `rename` da pasta que o contém (ou do próprio arquivo) falha com 5 (ou 32, sharing violation).
+- **H1b — "delete pending"**: `remove_file` seguido de criar/renomear para o mesmo nome enquanto um handle externo mantém o arquivo antigo pendente de exclusão ⇒ 5.
+- **H2 — handle nosso ainda aberto** na hora do `rename`/`remove` (um `File`, `ZipArchive` ou `GzDecoder` vivo).
+- **H3 — temporários compartilhados** entre testes paralelos (mesmo caminho usado por dois testes).
+- **H4 — só no `index_file`**: o teste de trava acima falha por relógio (ARMADILHAS: "Teste com limiar de relógio"), não por código de produção.
+
+#### What binds this task
+
+- **Passo 1 — instrumento (commit 1, permanente: também ajuda o usuário).** Erro de E/S da extração diz operação e caminho: helper `fn io_at(op: &'static str, path: &Path) -> impl FnOnce(io::Error) -> ExtractError` que produz `ExtractError::Io(format!("{op} {}: {e}", path.display()))` com `op` em português (`"renomear"`, `"apagar"`, `"criar pasta"`, `"criar arquivo"`), aplicado a toda chamada de `fs::*` em `merge_into`, `write_entry` e `extract_all_with`. O `From<io::Error>` fica para as leituras do arquivo compactado. Teste `extract_io_error_names_operation_and_path` (abaixo).
+- **Passo 2 — sonda do mecanismo (sem commit; cole a saída).** Programa descartável em `<S>\probe78\` (crate própria, `cargo new`, só `std`; nunca no repositório) que, numa pasta temporária, cria `d\f.txt` e tenta `rename(d, d2)` com um handle aberto em `f.txt` em cada modo de compartilhamento do Windows (`share_mode` 0, `1|2` = leitura+escrita, `1|2|4` = +exclusão, via `std::os::windows::fs::OpenOptionsExt`), e também `remove_file(f)` + `File::create(f)` com handle `1|2|4` aberto. Tabela: modo ⇒ `Ok` ou `raw_os_error`. Isso diz quais erros um handle externo **pode** causar em cada operação do caminho (H1/H1b plausíveis ou não).
+- **Passo 3 — reprodução (sem commit).** Binários de teste num target separado (`$env:CARGO_TARGET_DIR = "<S>\t78"; cargo test --no-run --quiet --test install_executor --test install_ops --test index_file`). Salve `<S>\eacces-loop.ps1` e rode-o duas vezes — carregado (`-Parallel 4`) e controle quieto (`-Parallel 1 -Threads 1`) — com o **mesmo** `-Rounds` (comece com 40; zero falhas carregado ⇒ suba para 120 e `-Parallel 6`, uma vez):
+  ```powershell
+  param([int]$Rounds = 40, [int]$Parallel = 4, [int]$Threads = 0, [string]$Tag = 'load')
+  $ErrorActionPreference = 'Stop'
+  $S = '<S>'; $repo = (Get-Location).Path
+  $bins = foreach ($n in 'install_executor', 'install_ops', 'index_file') {
+      Get-ChildItem "$S\t78\debug\deps\$n-*.exe" | Sort-Object LastWriteTime | Select-Object -Last 1
+  }
+  $out = "$S\eacces-$Tag"; if (Test-Path $out) { Remove-Item -Recurse -Force $out }; New-Item -ItemType Directory $out | Out-Null
+  $runs = 0; $fails = 0
+  for ($r = 0; $r -lt $Rounds; $r++) {
+      $procs = foreach ($b in $bins) {
+          foreach ($p in 1..$Parallel) {
+              $a = @('--quiet'); if ($Threads -gt 0) { $a += "--test-threads=$Threads" }
+              Start-Process $b.FullName -ArgumentList $a -WorkingDirectory $repo -PassThru -WindowStyle Hidden `
+                  -RedirectStandardOutput "$out\r$r-$($b.BaseName)-$p.out" -RedirectStandardError "$out\r$r-$($b.BaseName)-$p.err"
+          }
+      }
+      $procs | Wait-Process
+      foreach ($p in $procs) { $runs++; if ($p.ExitCode -ne 0) { $fails++ } }
+  }
+  "execuções=$runs falhas=$fails"
+  Select-String -Path "$out\*.out" -Pattern '^---- .* stdout ----|os error (5|32)|Acesso negado|negado' | ForEach-Object { "$($_.Filename): $($_.Line.Trim())" } | Sort-Object -Unique
+  ```
+  Cole o resumo dos dois modos e as linhas de falha (nome do teste + mensagem com operação e caminho, graças ao passo 1). Antes e depois: `Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AMRunningMode` (só leitura; se negar, registre). **Não** mude configuração do Defender nem crie exclusões.
+- **Passo 4 — discriminador H1 × H2 (sem commit).** Worktree descartável `<S>\wt-78-diag` (de HEAD + commit 1), target `<S>\t78d`. Nele, cada `fs::rename`/`fs::remove_file`/`fs::remove_dir_all` dos arquivos citados acima passa por `diag(op, path, || ..)`: no erro 5 ou 32, repete a **mesma** operação a cada 5 ms por até 5 s, **sem o código avançar** (a thread fica presa ali), e anexa uma linha `op;caminho;código;ms_até_liberar_ou_TIMEOUT` em `%TEMP%\wingetrs-diag-<pid>.txt`. Rode o laço do passo 3 com esses binários. Leitura: liberou sozinho em `t` ms sem o nosso código andar ⇒ o dono do handle é **outro** (H1/H1b, ou H3 se o caminho é de outro teste); `TIMEOUT` ⇒ o handle é **nosso** e está aberto naquele ponto (H2): ache-o pelo caminho. Cole a distribuição (mín/mediana/máx de `t`, contagem por operação). H3: para cada caminho que falhou, mostre que ele está dentro do tempdir **do próprio teste** e liste (`grep -n`) toda construção de nome temporário de `src/install` e `src/cache` — nome sem pid+seq dentro de pasta compartilhada é H3.
+- **Passo 5 — correção conforme a evidência** (commit 2; nada de correção sem os passos 3–4 colados):
+  - **H1/H1b** (externo): módulo novo `src/fs_retry.rs` (declarado em `src/lib.rs`): `pub fn is_transient(e: &io::Error) -> bool` (= `PermissionDenied` ou `raw_os_error() == Some(32)`, a mesma regra de `read_retrying`, que passa a usar esta função); `pub fn retry_with<T>(delays: &[Duration], f: impl FnMut() -> io::Result<T>, sleep: impl FnMut(Duration)) -> io::Result<T>` (núcleo testável: tenta, e a cada erro transitório chama `sleep(delays[i])` e tenta de novo; erro não transitório ou atraso esgotado ⇒ devolve o último erro); `pub fn retry<T>(op: &'static str, path: &Path, f: impl FnMut() -> io::Result<T>) -> io::Result<T>` = `retry_with(DELAYS, f, std::thread::sleep)` com `tracing::debug!(op, path = %path.display(), attempt, "transient fs error, retrying")` antes de cada espera e `tracing::warn!` ao desistir. `DELAYS`: escada dobrando a partir de 10 ms cujo total seja ≥ 2× o maior `t` medido no passo 4 e ≤ 2 s (justifique o número com a distribuição colada). Aplique a: `merge_into` (rename e remove), `TempGuard`/limpeza do temporário da extração, `Step::Promote` e o desfazer `RestoreAside`, `remove_any`, `persist` do executor, `BlobStore::put_verified` e `HttpState::save` (rename em `src/cache/mod.rs:148`, `:187`), os dois `rename` de `src/install/download.rs` (`:84`, `:149`) e o de `src/install/state.rs:240`. Os laços próprios de `index_file` (`persist`, `read_retrying`) ficam como estão (têm testes próprios), só trocando o predicado. Erro genuíno de permissão também é `PermissionDenied`: custa o total da escada e falha com a mesma mensagem — aceito e registrado.
+  - **H2**: feche o handle antes da operação (drop explícito no ponto achado) e teste que, logo depois da função, cada arquivo do destino abre com `share_mode(0)` (exclusivo) — sem retry.
+  - **H3**: nome único (pid + contador) no ponto achado e teste que dois usos simultâneos não colidem (barreira, sem relógio).
+  - **H4**: reescreva `search_retries_while_the_file_is_briefly_locked` sem relógio: núcleo `fn read_retrying_with(path, sleep: impl FnMut(Duration))` em `index_file`, e um teste unitário em que o `sleep` injetado solta o handle exclusivo na 1ª chamada (determinístico); o teste de integração por relógio sai.
+  - Hipótese sem evidência ⇒ **sem** correção para ela.
+- **Passo 6 — prova depois da correção:** o mesmo laço carregado do passo 3, com o mesmo `-Rounds` e `-Parallel`, sobre os binários da cabeça. Critério: o modo carregado da base teve **≥ 5 falhas** e a cabeça **0** no mesmo N (se a base teve < 5, aumente N até ter, ou registre "taxa baixa demais para concluir" e `DONE_WITH_CONCERNS`). E o gate (`scripts/verify.ps1`) 3× seguidas verde.
+- **Sem reprodução** (0 falhas carregado depois de subir para 120 rodadas): **nenhuma correção de produção**; fica só o commit 1 (instrumento), relatório `DONE_WITH_CONCERNS` com os números, a tabela da sonda do passo 2 e a recomendação; a pendência continua `OPEN` no ledger (o orquestrador atualiza).
+- **Limpeza:** apagar `<S>\t78`, `<S>\t78d`, `<S>\probe78`, `<S>\eacces-*`, `%TEMP%\wingetrs-diag-*.txt`; `git worktree remove --force "<S>\wt-78-diag"`; nenhum binário de teste vivo (`Get-Process install_executor-*, install_ops-*, index_file-* -ErrorAction SilentlyContinue` vazio); `leftovers.ps1` limpo.
+
+**Files:**
+- Modify (commit 1): `src/install/extract.rs`; Test: `tests/install_extract.rs`
+- Create/Modify (commit 2, só o que a evidência pedir): `src/fs_retry.rs` (novo), `src/lib.rs`, `src/install/extract.rs`, `src/install/executor.rs`, `src/cache/mod.rs`, `src/install/download.rs`, `src/install/state.rs`, `src/catalog/index_file.rs`; Test: `#[cfg(test)] mod tests` em `src/fs_retry.rs`, `tests/install_extract.rs`, `tests/index_file.rs`
+- Nunca no repositório: sonda, laço, worktree de diagnóstico.
+
+Testes:
+1. `extract_io_error_names_operation_and_path` (`tests/install_extract.rs`, `#[cfg(windows)]`): destino `out` já existe com `x.txt` aberto com `share_mode(0)` durante toda a chamada (o teste nunca solta o handle); `extract` de um zip com `x.txt` ⇒ `Err(ExtractError::Io(m))` com `m` contendo `"apagar"` e `"x.txt"`. Depois do commit 2 o erro só sai ao fim da escada de tentativas — continua determinístico.
+2. `retry_with_succeeds_after_transient_errors` (`src/fs_retry.rs`): `f` falha 2× com `io::ErrorKind::PermissionDenied` e depois `Ok(7)`; `sleep` grava os atrasos ⇒ `Ok(7)` e atrasos `== [DELAYS[0], DELAYS[1]]`.
+3. `retry_with_gives_up_after_the_last_delay`: `f` sempre `PermissionDenied` ⇒ `Err` com esse `kind` e atrasos `== DELAYS` (todos, nenhum a mais).
+4. `retry_with_does_not_retry_other_errors`: `f` devolve `NotFound` ⇒ `Err(NotFound)` e nenhum atraso; `raw_os_error 32` (`io::Error::from_raw_os_error(32)`) ⇒ conta como transitório.
+5. `rename_of_a_dir_with_an_open_child_waits_for_release` (`src/fs_retry.rs`, `#[cfg(windows)]`, sistema de arquivos real): `tmp/a/f.txt` aberto no modo que o passo 2 mostrou bloquear o `rename` da pasta; `retry_with(DELAYS, || fs::rename(a, b), |_| { held.take(); })` ⇒ `Ok` e `b/f.txt` existe; com `sleep` que não solta ⇒ `Err` com `raw_os_error() == Some(<código do passo 2>)`. Determinístico: quem solta é o próprio `sleep` injetado.
+6. `extraction_retries_a_held_file_until_it_is_released` (`tests/install_extract.rs`, `#[cfg(windows)]`): como o teste 1, mas o handle fica num `Arc<Mutex<Option<File>>>` e uma camada `tracing` de teste (subscriber global instalado uma vez + `thread_local!` por teste, como `tests/spans/mod.rs` `Closed::install`) solta o handle no `on_event` cuja mensagem é `"transient fs error, retrying"` ⇒ `extract` `Ok`, `x.txt` com o conteúdo novo e o `Option` vazio (o caminho de retry rodou). Sem relógio.
+7. (Só se H4) `read_retrying_survives_a_lock_released_by_the_retry` (unitário em `src/catalog/index_file.rs`), no molde do teste 5.
+
+#### Checks beyond the steps
+
+1. Instrumento: em `merge_into`, a chamada com `io_at("apagar", ..)` trocada por `?` puro ⇒ PEGA (teste 1).
+2. Retry ligado na produção: em `merge_into`, `fs_retry::retry("apagar", &to, || fs::remove_file(&to))` → `fs::remove_file(&to)` ⇒ PEGA (teste 6).
+3. Escada inteira: em `retry_with`, `for d in delays` → `for d in delays.iter().take(1)` ⇒ PEGA (teste 3).
+4. Só transitórios: `is_transient` devolvendo `true` para tudo ⇒ PEGA (teste 4).
+5. Prova estatística (passo 6) colada: base ≥ 5 falhas, cabeça 0 no mesmo N; sem ela, a correção não é aceita.
+6. Mutação "PEGA" só conta com o nome do teste na saída (target separado: `$env:CARGO_TARGET_DIR`), nunca por falha de build (ARMADILHAS).
+
+**Commit:** `fix(install): extraction io errors name the operation and path` e (conforme a evidência) `fix(install): retry renames and removals blocked by a transient external handle`
