@@ -42,11 +42,7 @@ CREATE INDEX IF NOT EXISTS ix_uc  ON map_upgradecode(key);
 CREATE INDEX IF NOT EXISTS ix_pfn ON map_pfn(key);
 CREATE INDEX IF NOT EXISTS ix_nn  ON map_norm_name(key);
 CREATE INDEX IF NOT EXISTS ix_np  ON map_norm_publisher(key);
-CREATE INDEX IF NOT EXISTS ix_pkg_id_lower ON packages(lower(id));
 ";
-
-/// Must repeat the indexed expression of `ix_pkg_id_lower` for SQLite to use the index.
-const FIND_BY_ID_WHERE: &str = "lower(id) = lower(?1)";
 
 type MapPair = (String, String);
 
@@ -507,7 +503,7 @@ impl Catalog {
     /// Finds by id across sources (case-insensitive); used by `show <id>` without --source.
     pub fn find_by_id(&self, id: &str) -> Result<Vec<StoredPackage>, CatalogError> {
         let sql =
-            format!("SELECT {PKG_COLS} FROM packages WHERE {FIND_BY_ID_WHERE} ORDER BY rowid");
+            format!("SELECT {PKG_COLS} FROM packages WHERE lower(id) = lower(?1) ORDER BY rowid");
         let mut st = self.conn.prepare_cached(&sql)?;
         let rows = st.query_map(params![id], stored_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -541,22 +537,6 @@ impl Catalog {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn find_by_id_where_uses_the_lower_id_index() {
-        let c = Catalog::open_in_memory().unwrap();
-        let sql = format!("EXPLAIN QUERY PLAN SELECT rowid FROM packages WHERE {FIND_BY_ID_WHERE}");
-        let mut st = c.conn.prepare(&sql).unwrap();
-        let details: Vec<String> = st
-            .query_map(["x"], |r| r.get::<_, String>("detail"))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(
-            details.iter().any(|d| d.contains("ix_pkg_id_lower")),
-            "plan: {details:?}"
-        );
-    }
 
     fn pkg(id: &str) -> NewPackage {
         NewPackage {
