@@ -160,12 +160,26 @@ fn missing_file_is_none_and_damaged_files_are_errors_never_panics() {
     assert_eq!(&good[..8], MAGIC);
 }
 
-#[test]
-fn rewriting_while_a_reader_loops_never_fails_or_tears() {
-    let (d, db) = catalog(300);
-    let idx = d.path().join("search.idx");
-    let cat = Catalog::open(&db).unwrap();
-    index_file::write(&cat, &idx).unwrap();
+/// Sets `stop` when dropped, so the reader stops on every exit of the writer (return, `?` or
+/// panic). Without it a failed write panicked inside `thread::scope`, which then joined a reader
+/// that only stops on `stop`: the test hung instead of failing (Task 79).
+struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Rewrites `idx` (expecting `count` records each time) while a reader loops over it, calling
+/// `before_write(n)` before the n-th rewrite. Returns the reads that found results, or the first
+/// write error; a reader panic is propagated.
+fn rewrite_while_reading(
+    cat: &Catalog,
+    idx: &std::path::Path,
+    count: usize,
+    mut before_write: impl FnMut(usize),
+) -> Result<u32, index_file::IndexFileError> {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     let stop = AtomicBool::new(false);
     let reads = AtomicU32::new(0);
@@ -175,25 +189,85 @@ fn rewriting_while_a_reader_loops_never_fails_or_tears() {
                 // Ok(None) ("not found" for an instant during the rename, measured 1 in 200
                 // stressed runs) is fine: the caller falls back to the catalog. Err or a torn
                 // file is not.
-                if let Some(r) = index_file::search(&idx, "power", None, 5).unwrap() {
+                if let Some(r) = index_file::search(idx, "power", None, 5).unwrap() {
                     assert!(!r.is_empty());
                     reads.fetch_add(1, Ordering::Relaxed);
                 }
             }
         });
-        // Under load the writer could finish before the reader's first read; keep rewriting
-        // until reads and writes have overlapped for a while.
-        let mut writes = 0;
-        while writes < 10 || (reads.load(Ordering::Relaxed) < 5 && !reader.is_finished()) {
-            assert_eq!(index_file::write(&cat, &idx).unwrap(), 400);
-            writes += 1;
-        }
-        stop.store(true, Ordering::Relaxed);
+        let written = {
+            let _stop = StopOnDrop(&stop);
+            // Under load the writer could finish before the reader's first read; keep rewriting
+            // until reads and writes have overlapped for a while.
+            let mut writes = 0;
+            let mut write = || -> Result<(), index_file::IndexFileError> {
+                while writes < 10 || (reads.load(Ordering::Relaxed) < 5 && !reader.is_finished()) {
+                    before_write(writes);
+                    assert_eq!(index_file::write(cat, idx)?, count);
+                    writes += 1;
+                }
+                Ok(())
+            };
+            write()
+        };
         if let Err(p) = reader.join() {
             std::panic::resume_unwind(p);
         }
-        assert!(reads.load(Ordering::Relaxed) >= 5);
+        written.map(|()| reads.load(Ordering::Relaxed))
+    })
+}
+
+#[test]
+fn rewriting_while_a_reader_loops_never_fails_or_tears() {
+    let (d, db) = catalog(300);
+    let idx = d.path().join("search.idx");
+    let cat = Catalog::open(&db).unwrap();
+    index_file::write(&cat, &idx).unwrap();
+    let reads = rewrite_while_reading(&cat, &idx, 400, |_| {}).unwrap();
+    assert!(reads >= 5);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_failed_rewrite_stops_the_reader_and_returns_the_error() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let (d, db) = catalog(300);
+    // Owned by a worker so a hang is detected (60 s, a normal run takes < 1 s) instead of
+    // blocking the suite.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let idx = d.path().join("search.idx");
+        let cat = Catalog::open(&db).unwrap();
+        index_file::write(&cat, &idx).unwrap();
+        let tmp = d.path().join("search.idx.tmp");
+        let mut held = None;
+        // A scanner-like holder with no sharing on the temp file: the 4th rewrite cannot
+        // create it (os error 32).
+        let r = rewrite_while_reading(&cat, &idx, 400, |n| {
+            if n == 3 {
+                held = Some(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .share_mode(0)
+                        .open(&tmp)
+                        .unwrap(),
+                );
+            }
+        });
+        assert!(held.is_some(), "the failure was never injected");
+        let _ = tx.send(());
+        r
     });
+    if rx.recv_timeout(std::time::Duration::from_secs(60)).is_err() && !worker.is_finished() {
+        panic!("a failed rewrite left the reader looping (hang)");
+    }
+    let r = worker
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p));
+    let e = r.unwrap_err();
+    assert!(e.to_string().contains("os error 32"), "{e}");
 }
 /// Frozen copy of the pre-Task-54 encoder (entries -> file bytes): the file-format pin.
 fn reference_bytes(entries: &[wingetrs::core::PackageEntry]) -> Vec<u8> {
