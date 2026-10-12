@@ -50,8 +50,10 @@ impl ProgressThrottle {
             .unwrap_or(u64::MAX - 1);
         let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
         entries.insert(label.to_string(), (done, total));
-        let sum_done: u64 = entries.values().map(|(d, _)| *d).sum();
-        let sum_total: Option<u64> = entries.values().map(|(_, t)| *t).sum();
+        let sum_done: u64 = entries.values().fold(0, |a, (d, _)| a.saturating_add(*d));
+        let sum_total: Option<u64> = entries
+            .values()
+            .try_fold(0u64, |a, (_, t)| t.map(|t| a.saturating_add(t)));
         let last = self.last_ms.load(Ordering::Relaxed);
         let due = last == u64::MAX
             || ms.saturating_sub(last) >= PROGRESS_GAP.as_millis() as u64
@@ -65,6 +67,9 @@ impl ProgressThrottle {
         } else {
             format!("{} arquivos", entries.len())
         };
+        if sum_total == Some(sum_done) {
+            entries.clear();
+        }
         Some((name, sum_done, sum_total))
     }
 }

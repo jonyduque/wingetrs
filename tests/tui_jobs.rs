@@ -333,6 +333,21 @@ fn one_finished_file_does_not_bypass_the_gap_while_others_run() {
 }
 
 #[test]
+fn finished_batch_resets_for_the_next_app() {
+    let base = Instant::now();
+    let t = ProgressThrottle::new(base);
+    let at = |ms: u64| base + Duration::from_millis(ms);
+    assert_eq!(
+        t.admit(at(0), "u1", 100, Some(100)),
+        Some(("u1".to_string(), 100, Some(100)))
+    );
+    assert_eq!(
+        t.admit(at(100), "u2", 10, Some(50)),
+        Some(("u2".to_string(), 10, Some(50)))
+    );
+}
+
+#[test]
 fn read_catalog_reports_an_unreadable_file_instead_of_an_empty_list() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("catalog.db");
