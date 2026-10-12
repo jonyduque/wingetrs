@@ -687,7 +687,8 @@ async fn run_async(
             json,
         } => {
             let catalog = ensure_catalog(&data, &cfg, &http).await?;
-            let mut found = catalog.find_by_id(&id)?;
+            let mut found =
+                tracing::debug_span!("show.find_by_id").in_scope(|| catalog.find_by_id(&id))?;
             if let Some(k) = source {
                 found.retain(|p| p.entry.source == k);
             }
