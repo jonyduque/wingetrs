@@ -138,6 +138,8 @@ pub enum CatalogError {
     Sqlite(#[from] rusqlite::Error),
     #[error("mapeamento aponta para pacote inexistente: {0}")]
     DanglingMap(String),
+    #[error("fonte scoop não aceita mapeamentos: {0}")]
+    MapsForScoop(String),
 }
 
 /// Read-only connection with the settings used by every reader.
@@ -174,20 +176,28 @@ struct DeletedRows {
 /// Deletes map rows and packages of `source` (not its meta row).
 /// A map table whose rows all belong to `source` is emptied at once (SQLite truncate path);
 /// a foreign or orphan row keeps the per-row delete.
+/// A Scoop source never owns map rows (`replace_source` refuses them), so its maps are skipped.
 fn delete_source_rows(
     tx: &rusqlite::Transaction<'_>,
     source: &str,
+    kind: SourceKind,
 ) -> Result<DeletedRows, CatalogError> {
     tracing::debug_span!("catalog.delete_source_rows")
-        .in_scope(|| delete_source_rows_inner(tx, source))
+        .in_scope(|| delete_source_rows_inner(tx, source, kind))
 }
 
 fn delete_source_rows_inner(
     tx: &rusqlite::Transaction<'_>,
     source: &str,
+    kind: SourceKind,
 ) -> Result<DeletedRows, CatalogError> {
     let mut truncated_maps = 0;
-    for t in MAP_TABLES {
+    let maps: &[&str] = if kind == SourceKind::Scoop {
+        &[]
+    } else {
+        &MAP_TABLES
+    };
+    for t in maps {
         let foreign: bool = tx.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM {t} WHERE package NOT IN (SELECT rowid FROM packages WHERE source = ?1))"
@@ -331,7 +341,15 @@ impl Catalog {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let n = delete_source_rows(&tx, source)?.packages;
+        let kind = tx
+            .query_row(
+                "SELECT kind FROM meta WHERE source = ?1",
+                params![source],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .map_or(SourceKind::Winget, |k| kind_from_db(&k));
+        let n = delete_source_rows(&tx, source, kind)?.packages;
         tx.execute("DELETE FROM meta WHERE source = ?1", params![source])?;
         tx.commit()?;
         Ok(n)
@@ -346,11 +364,19 @@ impl Catalog {
         packages: &[NewPackage],
         maps: &WingetMaps,
     ) -> Result<ImportStats, CatalogError> {
+        let has_maps = !(maps.productcodes.is_empty()
+            && maps.upgradecodes.is_empty()
+            && maps.pfns.is_empty()
+            && maps.norm_names.is_empty()
+            && maps.norm_publishers.is_empty());
+        if kind == SourceKind::Scoop && has_maps {
+            return Err(CatalogError::MapsForScoop(source.to_string()));
+        }
         // Dropping `tx` on an early return rolls the whole import back.
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let deleted = delete_source_rows(&tx, source)?;
+        let deleted = delete_source_rows(&tx, source, kind)?;
         tracing::debug!(
             truncated_maps = deleted.truncated_maps,
             "catalog: replaced source rows"
@@ -657,13 +683,13 @@ mod tests {
             .unwrap();
     }
 
-    fn check(setup: fn(&mut Catalog), source: &str, truncated: usize) {
+    fn check(setup: fn(&mut Catalog), source: &str, kind: SourceKind, truncated: usize) {
         let mut a = Catalog::open_in_memory().unwrap();
         let mut b = Catalog::open_in_memory().unwrap();
         setup(&mut a);
         setup(&mut b);
         let tx = a.conn.transaction().unwrap();
-        let got = delete_source_rows(&tx, source).unwrap();
+        let got = delete_source_rows(&tx, source, kind).unwrap();
         tx.commit().unwrap();
         let tx = b.conn.transaction().unwrap();
         let want = delete_per_row(&tx, source);
@@ -676,13 +702,13 @@ mod tests {
     #[test]
     fn truncating_owned_map_tables_equals_the_per_row_delete() {
         // Only winget has maps: every table is truncated.
-        check(winget_only, "winget", 5);
+        check(winget_only, "winget", SourceKind::Winget, 5);
         // A source without maps sees winget rows: nothing truncated.
-        check(winget_only, "scoop:main", 0);
+        check(winget_only, "scoop:main", SourceKind::Scoop, 0);
         // Two sources with maps: per-row path for both, the other source's rows stay.
-        check(two_owners, "winget", 0);
-        check(two_owners, "other", 0);
+        check(two_owners, "winget", SourceKind::Winget, 0);
+        check(two_owners, "other", SourceKind::Winget, 0);
         // An orphan row counts as foreign: map_pfn keeps it, the other four are truncated.
-        check(orphan_pfn, "winget", 4);
+        check(orphan_pfn, "winget", SourceKind::Winget, 4);
     }
 }

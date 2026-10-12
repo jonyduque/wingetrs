@@ -547,3 +547,98 @@ fn cached_statements_see_a_replaced_source() {
     );
     assert!(c.get("winget", "A.App").unwrap().is_some());
 }
+
+fn winget_with_productcode(c: &mut Catalog) {
+    let maps = WingetMaps {
+        productcodes: vec![("{PC-A}".into(), "A.App".into())],
+        ..Default::default()
+    };
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v",
+        1,
+        &[pkg("A.App", "App", "1")],
+        &maps,
+    )
+    .unwrap();
+}
+
+#[test]
+fn scoop_source_with_maps_is_refused() {
+    let mut c = Catalog::open_in_memory().unwrap();
+    let maps = WingetMaps {
+        productcodes: vec![("{X}".into(), "x".into())],
+        ..Default::default()
+    };
+    let e = c
+        .replace_source(
+            "scoop:main",
+            SourceKind::Scoop,
+            "v",
+            1,
+            &[pkg("x", "x", "1")],
+            &maps,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(e, wingetrs::catalog::CatalogError::MapsForScoop(_)),
+        "{e:?}"
+    );
+    assert!(
+        c.sources()
+            .unwrap()
+            .iter()
+            .all(|s| s.source != "scoop:main")
+    );
+}
+
+#[test]
+fn removing_a_scoop_source_keeps_winget_maps() {
+    let mut c = Catalog::open_in_memory().unwrap();
+    winget_with_productcode(&mut c);
+    let two = [pkg("s1", "s1", "1"), pkg("s2", "s2", "1")];
+    let no = WingetMaps::default();
+    c.replace_source("scoop:main", SourceKind::Scoop, "v", 1, &two, &no)
+        .unwrap();
+    assert_eq!(c.remove_source("scoop:main").unwrap(), 2);
+    assert_eq!(
+        c.lookup(MapTable::ProductCode, "{PC-A}").unwrap(),
+        ["A.App"]
+    );
+    c.replace_source("scoop:main", SourceKind::Scoop, "v", 1, &two, &no)
+        .unwrap();
+    assert_eq!(
+        c.lookup(MapTable::ProductCode, "{PC-A}").unwrap(),
+        ["A.App"]
+    );
+}
+
+#[test]
+fn removing_a_winget_source_still_drops_its_maps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&path).unwrap();
+    winget_with_productcode(&mut c);
+    let two = [pkg("s1", "s1", "1"), pkg("s2", "s2", "1")];
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "v",
+        1,
+        &two,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    assert_eq!(c.remove_source("winget").unwrap(), 1);
+    assert!(
+        c.lookup(MapTable::ProductCode, "{PC-A}")
+            .unwrap()
+            .is_empty()
+    );
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    let n: i64 = raw
+        .query_row("SELECT count(*) FROM map_productcode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
+}
