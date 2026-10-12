@@ -15,12 +15,29 @@ pub async fn details(
     hash: &[u8],
     version: Option<&str>,
 ) -> Result<PackageDetails, WingetError> {
-    // versionData has no known content hash, so it is always downloaded (~5 KB).
+    // versionData is content-addressed: the catalog's winget_hash is its SHA-256 (probed in
+    // Task 70), so it is cached in the verified BlobStore under the full hash.
+    let vd_key = hex::encode(hash);
     let vd_url = format!("{cdn_base}{}", version_data::version_data_path(id, hash));
-    let vd =
-        async { Ok::<_, WingetError>(version_data::decode_and_parse(&http.get(&vd_url).await?)?) }
-            .instrument(tracing::debug_span!("show.version_data"))
-            .await?;
+    let vd = async {
+        let bytes = match blobs.get(&vd_key) {
+            Some(b) => b,
+            None => {
+                let b = http.get(&vd_url).await?;
+                match blobs.put_verified(&vd_key, &b) {
+                    Ok(()) => {}
+                    Err(crate::cache::CacheError::HashMismatch { expected, actual }) => {
+                        tracing::warn!(%expected, %actual, url = %vd_url, "versionData does not match the catalog hash; not cached");
+                    }
+                    Err(other) => return Err(WingetError::Cache(other)),
+                }
+                b
+            }
+        };
+        Ok::<_, WingetError>(version_data::decode_and_parse(&bytes)?)
+    }
+    .instrument(tracing::debug_span!("show.version_data"))
+    .await?;
 
     let entry = match version {
         Some(v) => vd.entries.iter().find(|e| e.version == v),

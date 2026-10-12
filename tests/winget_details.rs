@@ -86,3 +86,79 @@ async fn unknown_version_is_reported() {
     .await;
     assert!(r.unwrap_err().to_string().contains("9.9.9"));
 }
+
+async fn server_expecting(vd_calls: u64) -> MockServer {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/packages/Microsoft.PowerToys/d193b67a/versionData.mszyml",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(VD.to_vec()))
+        .expect(vd_calls)
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/manifests/m/Microsoft/PowerToys/0.101.2362.0/509b"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(MANIFEST.to_vec()))
+        .mount(&s)
+        .await;
+    s
+}
+
+#[tokio::test]
+async fn version_data_is_cached_by_catalog_hash() {
+    let s = server_expecting(1).await;
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = BlobStore::new(dir.path().to_path_buf());
+    let http = Http::new().unwrap();
+    let base = format!("{}/", s.uri());
+    let hash = hex::decode(HASH_HEX).unwrap();
+    let first = details(&http, &blobs, &base, "Microsoft.PowerToys", &hash, None)
+        .await
+        .unwrap();
+    let second = details(&http, &blobs, &base, "Microsoft.PowerToys", &hash, None)
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert!(blobs.get(HASH_HEX).is_some());
+}
+
+#[tokio::test]
+async fn tampered_cached_version_data_is_refetched() {
+    let s = server_expecting(1).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(HASH_HEX), b"garbage").unwrap();
+    let blobs = BlobStore::new(dir.path().to_path_buf());
+    let d = details(
+        &Http::new().unwrap(),
+        &blobs,
+        &format!("{}/", s.uri()),
+        "Microsoft.PowerToys",
+        &hex::decode(HASH_HEX).unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(d.version, "0.101.2362.0");
+    assert_eq!(d.available_versions.len(), 115);
+    assert!(blobs.get(HASH_HEX).is_some());
+}
+
+#[tokio::test]
+async fn version_data_with_another_hash_is_shown_but_not_cached() {
+    let s = server_expecting(2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let blobs = BlobStore::new(dir.path().to_path_buf());
+    let http = Http::new().unwrap();
+    let base = format!("{}/", s.uri());
+    let mut hash = hex::decode(HASH_HEX).unwrap();
+    let last = hash.len() - 1;
+    hash[last] ^= 0xff;
+    for _ in 0..2 {
+        let d = details(&http, &blobs, &base, "Microsoft.PowerToys", &hash, None)
+            .await
+            .unwrap();
+        assert_eq!(d.version, "0.101.2362.0");
+    }
+    assert!(blobs.get(&hex::encode(&hash)).is_none());
+}
