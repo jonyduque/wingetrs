@@ -937,3 +937,45 @@ fn arrows_are_ignored_while_help_is_open() {
     assert_eq!(a.tab, tab);
     assert!(a.show_help);
 }
+
+#[test]
+fn cached_installed_view_matches_a_fresh_filter() {
+    let rows = vec![
+        irow("Alpha", "arp", "winget", true),
+        irow("beta", "scoop", "scoop:main", false),
+        irow("Gamma", "arp", "winget", false),
+        irow("alfa", "scoop", "scoop:extras", true),
+        irow("Zed", "arp", "winget", true),
+        irow("zebra", "scoop", "scoop:main", false),
+    ];
+    for tab in [Tab::Installed, Tab::Updates] {
+        for toggles in 0..3 {
+            for q in ["", "a", "ze"] {
+                let mut a = on_tab(tab, rows.clone());
+                for _ in 0..toggles {
+                    update(&mut a, ctrl('s'));
+                }
+                for c in q.chars() {
+                    update(&mut a, key(KeyCode::Char(c)));
+                }
+                // Reference: the plain filter over `installed`.
+                let expected: Vec<&str> = rows
+                    .iter()
+                    .filter(|r| {
+                        tab != Tab::Updates || matches!(r.state, UpdateState::Available { .. })
+                    })
+                    .filter(|r| r.name.to_lowercase().contains(q))
+                    .filter(|r| match (toggles, &r.correlation) {
+                        (0, _) => true,
+                        (1, Correlation::Matched { source, .. }) => source == "winget",
+                        (2, Correlation::Matched { source, .. }) => source.starts_with("scoop"),
+                        _ => false,
+                    })
+                    .map(|r| r.name.as_str())
+                    .collect();
+                let got: Vec<&str> = a.installed_view().iter().map(|r| r.name.as_str()).collect();
+                assert_eq!(got, expected, "tab {tab:?} toggles {toggles} query {q:?}");
+            }
+        }
+    }
+}
