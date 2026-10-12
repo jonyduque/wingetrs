@@ -155,6 +155,8 @@ pub enum Modal {
     Picking {
         picker: Picker,
         candidates: Vec<Candidate>,
+        /// `keep` of the plan that asked (install: false; upgrade: setting at key time).
+        keep: bool,
     },
     Running {
         label: String,
@@ -276,6 +278,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// A plan is being computed; further plan keys are ignored until it arrives.
     pub planning: bool,
+    /// `keep` of the plan in flight, carried to the candidate picker if one opens.
+    pub planning_keep: bool,
     /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
     pub now: Instant,
     /// Toasts on screen, newest first.
@@ -337,6 +341,7 @@ impl App {
             size: (80, 24),
             modal: None,
             planning: false,
+            planning_keep: false,
             now: Instant::now(),
             toasts: Vec::new(),
             refresh_forced: false,
@@ -908,6 +913,10 @@ fn start_planning(app: &mut App, cmd: Cmd) -> Vec<Cmd> {
         return Vec::new();
     }
     app.planning = true;
+    app.planning_keep = match cmd {
+        Cmd::PlanInstall { keep, .. } | Cmd::PlanUpgradeAll { keep } => keep,
+        _ => false,
+    };
     app.status = Some("planejando…".to_string());
     vec![cmd]
 }
@@ -1045,6 +1054,7 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
             app.modal = Some(Modal::Picking {
                 picker: Picker::single(items),
                 candidates,
+                keep: app.planning_keep,
             });
         }
         Err(message) => app.push_toast(ToastKind::Error, message),
@@ -1122,9 +1132,14 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         Modal::Picking {
             mut picker,
             candidates,
+            keep,
         } => match picker.key(key) {
             PickOutcome::Pending => {
-                app.modal = Some(Modal::Picking { picker, candidates });
+                app.modal = Some(Modal::Picking {
+                    picker,
+                    candidates,
+                    keep,
+                });
                 Vec::new()
             }
             PickOutcome::Cancelled => Vec::new(),
@@ -1133,7 +1148,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     let cmd = Cmd::PlanInstall {
                         source_name: c.entry.source_name.clone(),
                         id: c.entry.id.clone(),
-                        keep: false,
+                        keep,
                     };
                     start_planning(app, cmd)
                 }

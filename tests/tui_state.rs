@@ -1682,3 +1682,42 @@ fn keep_residue_mode_opens_nothing() {
     assert_eq!(a.toasts[0].kind, ToastKind::Info);
     assert!(a.toasts[0].text.contains("2 itens"), "{}", a.toasts[0].text);
 }
+
+fn two_candidates() -> Msg {
+    Msg::Planned(Ok(Planned::Choose(vec![
+        candidate("main"),
+        candidate("extras"),
+    ])))
+}
+
+#[test]
+fn picker_after_upgrade_keeps_the_keep_setting() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![irow("a", "wingetrs", "scoop:main", true)],
+    );
+    a.settings.behavior.keep_old = true;
+    assert_eq!(update(&mut a, key(KeyCode::Char('U'))).len(), 1);
+    update(&mut a, two_candidates());
+    assert!(matches!(a.modal, Some(Modal::Picking { .. })));
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::PlanInstall { keep: true, .. }]),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn picker_after_install_never_keeps() {
+    let mut a = app();
+    a.settings.behavior.keep_old = true;
+    select_source(&mut a, SourceKind::Scoop);
+    assert_eq!(update(&mut a, key(KeyCode::Char('i'))).len(), 1);
+    update(&mut a, two_candidates());
+    assert!(matches!(a.modal, Some(Modal::Picking { .. })));
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::PlanInstall { keep: false, .. }]),
+        "{cmds:?}"
+    );
+}
