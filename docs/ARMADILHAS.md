@@ -21,6 +21,7 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 - **Poll com waker falso perde o despertar.** Task 53: `now_or_never()` num `EventStream` do crossterm registra um waker noop, e o crossterm só guarda um waker até ser acordado ⇒ a próxima tecla acorda ninguém e a TUI congela. Teste com stream falso não pega: o falso precisa imitar o comportamento da biblioteca real. Drene sempre com o `cx` da tarefa (`poll_fn`).
 - **Thread antecipada órfã** (Tasks 18 e 20): `spawn` antes de um `?` sem `join` em todos os caminhos. Use guard com `Drop` ou junte antes do `?`.
 - **Pânico engolido** (`join().ok()`, `if let Ok(..) = h.join()`, `unwrap_or_default`) devolve resultado parcial em silêncio. `scripts/check_rules.ps1` (no gate) barra os padrões conhecidos.
+- **Teste concorrente que trava em vez de falhar.** Task 79: o escritor entrava em pânico (`unwrap()` de um `Err`) dentro de `thread::scope`; o scope esperava o leitor, que só parava com uma flag ligada no sucesso ⇒ travou 2/120 rodadas e o erro real ficou escondido. Sinal de parada vai num guard com `Drop` (liga em Ok, Err e pânico), e teste com laço concorrente tem detector de travamento.
 - **Handle de `spawn_blocking` descartado** faz o tokio engolir o pânico (a TUI nunca carregava os instalados).
 
 ## Desempenho (Windows, esta máquina)
