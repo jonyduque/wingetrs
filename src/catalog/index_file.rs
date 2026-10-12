@@ -390,12 +390,20 @@ fn scan(
 /// opens the file while `write` renames over it gets "access denied", and a scanner holding the
 /// fresh file gives a sharing violation.
 fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_retrying_with(path, std::thread::sleep)
+}
+
+/// [`read_retrying`] with an injected `sleep` (tests release the lock from it, without a clock).
+fn read_retrying_with(
+    path: &Path,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> std::io::Result<Vec<u8>> {
     let mut attempt = 0;
     loop {
         match std::fs::read(path) {
             Err(e) if crate::fs_retry::is_transient(&e) && attempt < 5 => {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                sleep(std::time::Duration::from_millis(10));
             }
             r => return r,
         }
@@ -466,4 +474,42 @@ pub fn search(
         });
     }
     Ok(Some(found))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn read_retrying_survives_a_lock_released_by_the_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("search.idx");
+        std::fs::write(&p, b"bytes").unwrap();
+        // No sharing at all: every read fails until the handle is dropped.
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&p)
+                .unwrap()
+        };
+        let mut held = Some(open());
+        let mut slept = 0;
+        let r = read_retrying_with(&p, |_| {
+            slept += 1;
+            held.take();
+        });
+        assert_eq!(r.unwrap(), b"bytes");
+        assert_eq!(slept, 1);
+
+        // Never released: gives up after the 5 retries with the sharing violation.
+        let _held = open();
+        let mut slept = 0;
+        let e = read_retrying_with(&p, |_| slept += 1).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(32));
+        assert_eq!(slept, 5);
+    }
 }

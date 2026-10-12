@@ -160,36 +160,6 @@ fn missing_file_is_none_and_damaged_files_are_errors_never_panics() {
     assert_eq!(&good[..8], MAGIC);
 }
 
-#[cfg(windows)]
-#[test]
-fn search_retries_while_the_file_is_briefly_locked() {
-    use std::os::windows::fs::OpenOptionsExt;
-    let (d, db) = catalog(300);
-    let idx = d.path().join("search.idx");
-    let cat = Catalog::open(&db).unwrap();
-    index_file::write(&cat, &idx).unwrap();
-    // No sharing at all: any concurrent open fails with "access denied" until it is dropped.
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&idx)
-        .unwrap();
-    // The reader's whole retry budget is ~50 ms of wall clock, so the lock is released after a
-    // few ms (not 20): a descheduled holder thread under load is the only remaining risk, and
-    // the barrier makes both sides start together so the reader always hits the lock first.
-    let start = std::sync::Barrier::new(2);
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            start.wait();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            drop(lock);
-        });
-        start.wait();
-        let r = index_file::search(&idx, "power", None, 5).unwrap().unwrap();
-        assert!(!r.is_empty());
-    });
-}
-
 #[test]
 fn rewriting_while_a_reader_loops_never_fails_or_tears() {
     let (d, db) = catalog(300);
