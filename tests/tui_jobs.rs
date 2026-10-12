@@ -173,7 +173,8 @@ async fn plan_install_gives_a_confirmation_for_a_scoop_package() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { text, action }) = jobs::plan_install(&ctx, "scoop:main", "leaf") else {
+    let Ok(Planned::Ready { text, action }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    else {
         panic!("expected Ready");
     };
     assert!(text.contains("Instalar leaf 1.0"), "{text}");
@@ -185,8 +186,8 @@ async fn plan_install_reports_unknown_packages_and_non_scoop_sources() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    assert!(jobs::plan_install(&ctx, "scoop:main", "ghost").is_err());
-    assert!(jobs::plan_install(&ctx, "winget", "leaf").is_err());
+    assert!(jobs::plan_install(&ctx, "scoop:main", "ghost", false).is_err());
+    assert!(jobs::plan_install(&ctx, "winget", "leaf", false).is_err());
 }
 
 #[tokio::test]
@@ -196,7 +197,8 @@ async fn run_action_installs_reports_progress_and_then_removes() {
     let seen: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     let record = |_: &str, done: u64, _: Option<u64>| seen.lock().unwrap().push(done);
     let ctx = w.ctx(LockWait::NoWait, &record);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf") else {
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    else {
         panic!("expected Ready");
     };
     let done = jobs::run_action(&ctx, action).await.unwrap();
@@ -204,7 +206,7 @@ async fn run_action_installs_reports_progress_and_then_removes() {
     assert!(!seen.lock().unwrap().is_empty(), "progress was reported");
     assert!(w.layout.current("leaf").exists());
 
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_remove(&ctx, "leaf") else {
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_remove(&ctx, "leaf", false) else {
         panic!("expected Ready");
     };
     let done = jobs::run_action(&ctx, action).await.unwrap();
@@ -224,7 +226,7 @@ async fn run_action_applies_all_groups_with_one_broadcast() {
         let Ok(Planned::Ready {
             action: Action::Apply(g),
             ..
-        }) = jobs::plan_install(&ctx, "scoop:main", id)
+        }) = jobs::plan_install(&ctx, "scoop:main", id, false)
         else {
             panic!("expected Ready");
         };
@@ -240,7 +242,8 @@ async fn held_install_lock_is_busy_not_a_failure_text() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf") else {
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    else {
         panic!("expected Ready");
     };
     let _held = UpdateLock::try_acquire(&w.layout.install_lock())
@@ -384,11 +387,12 @@ async fn plan_remove_text_uses_the_plan_lines() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf") else {
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    else {
         panic!("expected Ready");
     };
     jobs::run_action(&ctx, action).await.unwrap();
-    let Ok(Planned::Ready { text, .. }) = jobs::plan_remove(&ctx, "leaf") else {
+    let Ok(Planned::Ready { text, .. }) = jobs::plan_remove(&ctx, "leaf", false) else {
         panic!("expected Ready");
     };
     assert!(text.contains("Desfazer entrada no PATH: "), "{text}");
@@ -432,4 +436,34 @@ fn save_settings_without_glyphs_keeps_the_file_value() {
     jobs::save_settings(&p, Default::default(), None, "dark").unwrap();
     let text = std::fs::read_to_string(&p).unwrap();
     assert!(text.contains("glyphs = \"unicode\""), "{text}");
+}
+
+#[tokio::test]
+async fn purge_plan_says_data_will_be_deleted() {
+    let mut w = World::new().await;
+    w.add("leaf").await;
+    let ctx = w.ctx(LockWait::NoWait, &quiet);
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    else {
+        panic!("expected Ready");
+    };
+    jobs::run_action(&ctx, action).await.unwrap();
+    let Ok(Planned::Ready {
+        text,
+        action: Action::Remove(p),
+    }) = jobs::plan_remove(&ctx, "leaf", true)
+    else {
+        panic!("expected Ready remove");
+    };
+    assert!(text.contains("APAGADOS"), "{text}");
+    assert!(p.purge);
+    let Ok(Planned::Ready {
+        text,
+        action: Action::Remove(p),
+    }) = jobs::plan_remove(&ctx, "leaf", false)
+    else {
+        panic!("expected Ready remove");
+    };
+    assert!(text.contains("mantidos"), "{text}");
+    assert!(!p.purge);
 }

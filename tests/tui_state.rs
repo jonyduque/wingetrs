@@ -370,7 +370,8 @@ fn i_on_scoop_plans_and_planned_opens_confirm() {
         cmds,
         vec![Cmd::PlanInstall {
             source_name: "scoop:main".into(),
-            id: "ripgrep".into()
+            id: "ripgrep".into(),
+            keep: false
         }]
     );
     assert!(a.modal.is_none());
@@ -546,7 +547,8 @@ fn many_candidates_open_the_picker_and_pick_replans() {
         cmds,
         vec![Cmd::PlanInstall {
             source_name: "scoop:main".into(),
-            id: "tool".into()
+            id: "tool".into(),
+            keep: false
         }]
     );
     assert!(a.modal.is_none());
@@ -574,7 +576,10 @@ fn u_removes_only_wingetrs_apps_on_installed_tab() {
     a.selected = 1;
     assert_eq!(
         update(&mut a, key(KeyCode::Char('u'))),
-        vec![Cmd::PlanRemove { app: "beta".into() }]
+        vec![Cmd::PlanRemove {
+            app: "beta".into(),
+            purge: false
+        }]
     );
     let removal = UninstallPlan {
         app: "beta".into(),
@@ -614,13 +619,14 @@ fn upper_u_upgrades_selected_or_all() {
         update(&mut a, key(KeyCode::Char('U'))),
         vec![Cmd::PlanInstall {
             source_name: "scoop:main".into(),
-            id: "beta".into()
+            id: "beta".into(),
+            keep: false
         }]
     );
     let mut empty = on_tab(Tab::Updates, vec![]);
     assert_eq!(
         update(&mut empty, key(KeyCode::Char('U'))),
-        vec![Cmd::PlanUpgradeAll]
+        vec![Cmd::PlanUpgradeAll { keep: false }]
     );
     let mut foreign = on_tab(Tab::Updates, vec![irow("gamma", "arp", "winget", true)]);
     assert!(update(&mut foreign, key(KeyCode::Char('U'))).is_empty());
@@ -647,7 +653,7 @@ fn a_failed_plan_frees_the_keys_again() {
     let mut a = on_tab(Tab::Updates, vec![]);
     assert_eq!(
         update(&mut a, key(KeyCode::Char('U'))),
-        vec![Cmd::PlanUpgradeAll]
+        vec![Cmd::PlanUpgradeAll { keep: false }]
     );
     assert!(update(&mut a, key(KeyCode::Char('U'))).is_empty());
     update(
@@ -1549,4 +1555,130 @@ fn only_one_save_in_flight_and_the_newest_follows() {
     assert!(update(&mut a, Msg::SettingsSaved(Ok(()))).is_empty());
     assert_eq!(a.settings.saved.0, a.settings.behavior);
     assert_eq!(a.toasts.len(), 1);
+}
+
+use wingetrs::config::ResidueMode;
+
+fn removal(app: &str) -> Action {
+    Action::Remove(UninstallPlan {
+        app: app.into(),
+        version: "1".into(),
+        purge: false,
+        artifacts: vec![],
+        path_users: vec![],
+        remove_path_entry: true,
+    })
+}
+
+#[test]
+fn never_confirm_executes_directly() {
+    let mut a = app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    let cmds = update(&mut a, ready("a"));
+    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+    assert_eq!(cmds, vec![Cmd::Execute(apply_action("a"))]);
+}
+
+#[test]
+fn removals_mode_confirms_only_removals() {
+    let mut a = app();
+    a.settings.behavior.confirm = ConfirmMode::Removals;
+    let cmds = update(&mut a, ready("a"));
+    assert_eq!(cmds, vec![Cmd::Execute(apply_action("a"))]);
+    let mut b = app();
+    b.settings.behavior.confirm = ConfirmMode::Removals;
+    let cmds = update(
+        &mut b,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Remover a".into(),
+            action: removal("a"),
+        })),
+    );
+    assert!(cmds.is_empty());
+    assert!(confirm_open(&b));
+}
+
+#[test]
+fn ambiguous_target_still_opens_the_picker() {
+    let mut a = app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    let cmds = update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Choose(vec![
+            candidate("main"),
+            candidate("extras"),
+        ]))),
+    );
+    assert!(cmds.is_empty());
+    assert!(matches!(a.modal, Some(Modal::Picking { .. })));
+}
+
+#[test]
+fn remove_carries_the_purge_setting() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("a", "wingetrs", "scoop:main", false)],
+    );
+    a.settings.behavior.purge = true;
+    assert_eq!(
+        update(&mut a, key(KeyCode::Char('u'))),
+        vec![Cmd::PlanRemove {
+            app: "a".into(),
+            purge: true
+        }]
+    );
+}
+
+#[test]
+fn upgrade_carries_the_keep_setting() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![irow("a", "wingetrs", "scoop:main", true)],
+    );
+    a.settings.behavior.keep_old = true;
+    let cmds = update(&mut a, key(KeyCode::Char('U')));
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::PlanInstall { keep: true, .. }]),
+        "{cmds:?}"
+    );
+    let mut empty = on_tab(Tab::Updates, vec![]);
+    empty.settings.behavior.keep_old = true;
+    assert_eq!(
+        update(&mut empty, key(KeyCode::Char('U'))),
+        vec![Cmd::PlanUpgradeAll { keep: true }]
+    );
+}
+
+fn removed_with_residues() -> Msg {
+    Msg::InstallFinished(Ok(Done {
+        summary: "a removido".into(),
+        residues: Some(("a".into(), vec![residue("p1", true), residue("p2", false)])),
+    }))
+}
+
+#[test]
+fn high_residue_mode_cleans_only_preselected() {
+    let mut a = app();
+    a.settings.behavior.residues = ResidueMode::High;
+    let cmds = update(&mut a, removed_with_residues());
+    assert!(cmds.contains(&Cmd::ScanInstalled), "{cmds:?}");
+    assert!(
+        cmds.contains(&Cmd::CleanResidues {
+            app: "a".into(),
+            residues: vec![residue("p1", true)]
+        }),
+        "{cmds:?}"
+    );
+    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+}
+
+#[test]
+fn keep_residue_mode_opens_nothing() {
+    let mut a = app();
+    a.settings.behavior.residues = ResidueMode::Keep;
+    let cmds = update(&mut a, removed_with_residues());
+    assert!(cmds.contains(&Cmd::ScanInstalled), "{cmds:?}");
+    assert!(a.modal.is_none());
+    assert_eq!(a.toasts[0].kind, ToastKind::Info);
+    assert!(a.toasts[0].text.contains("2 itens"), "{}", a.toasts[0].text);
 }

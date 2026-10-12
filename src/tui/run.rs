@@ -233,11 +233,21 @@ async fn event_loop(
                 Cmd::LoadDetails { source, id } => {
                     spawn_details(&ctx, source, id);
                 }
-                Cmd::PlanInstall { source_name, id } => {
-                    spawn_plan(&ctx, move |o| jobs::plan_install(o, &source_name, &id));
+                Cmd::PlanInstall {
+                    source_name,
+                    id,
+                    keep,
+                } => {
+                    spawn_plan(&ctx, move |o| {
+                        jobs::plan_install(o, &source_name, &id, keep)
+                    });
                 }
-                Cmd::PlanRemove { app } => spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app)),
-                Cmd::PlanUpgradeAll => spawn_plan(&ctx, jobs::plan_upgrade_all),
+                Cmd::PlanRemove { app, purge } => {
+                    spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app, purge));
+                }
+                Cmd::PlanUpgradeAll { keep } => {
+                    spawn_plan(&ctx, move |o| jobs::plan_upgrade_all(o, keep));
+                }
                 Cmd::SaveSettings {
                     behavior,
                     glyphs,

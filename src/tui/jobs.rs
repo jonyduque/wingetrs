@@ -107,14 +107,20 @@ fn plans_text(groups: &[Vec<InstallPlan>]) -> String {
         .join("\n")
 }
 
-/// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`.
-pub fn plan_install(c: &OpsCtx<'_>, source_name: &str, id: &str) -> Result<Planned, String> {
+/// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`; `keep` keeps
+/// the old version on an upgrade.
+pub fn plan_install(
+    c: &OpsCtx<'_>,
+    source_name: &str,
+    id: &str,
+    keep: bool,
+) -> Result<Planned, String> {
     let bucket = source_name
         .strip_prefix("scoop:")
         .ok_or_else(|| format!("{id} não vem de um bucket do scoop"))?;
     match ops::resolve_target(c, id, Some(bucket)) {
         Ok(Resolution::One(cand)) => {
-            let plans = ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?;
+            let plans = ops::plan_for(c, &cand, keep).map_err(|e| e.to_string())?;
             Ok(Planned::Ready {
                 text: plans_text(std::slice::from_ref(&plans)),
                 action: Action::Apply(vec![plans]),
@@ -126,20 +132,26 @@ pub fn plan_install(c: &OpsCtx<'_>, source_name: &str, id: &str) -> Result<Plann
     }
 }
 
-pub fn plan_remove(c: &OpsCtx<'_>, app: &str) -> Result<Planned, String> {
-    let plan = ops::plan_uninstall(c, app, false).map_err(|e| e.to_string())?;
+/// Plans removing `app`; `purge` also deletes its persistent data.
+pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, String> {
+    let plan = ops::plan_uninstall(c, app, purge).map_err(|e| e.to_string())?;
     let mut text = format!("Remover {} {}\n", plan.app, plan.version);
     for l in plan.artifact_lines() {
         text.push_str(&format!("  - {l}\n"));
     }
-    text.push_str("Os dados persistentes do app são mantidos.\n");
+    text.push_str(if plan.purge {
+        "Os dados persistentes do app serão APAGADOS (purge).\n"
+    } else {
+        "Os dados persistentes do app são mantidos.\n"
+    });
     Ok(Planned::Ready {
         text,
         action: Action::Remove(plan),
     })
 }
 
-pub fn plan_upgrade_all(c: &OpsCtx<'_>) -> Result<Planned, String> {
+/// Plans upgrading every upgradable app; `keep` keeps the old versions.
+pub fn plan_upgrade_all(c: &OpsCtx<'_>, keep: bool) -> Result<Planned, String> {
     let list = ops::upgradable(c).map_err(|e| e.to_string())?;
     if list.upgradable.is_empty() {
         return Err("nenhum app para atualizar".to_string());
@@ -160,7 +172,7 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>) -> Result<Planned, String> {
             .ok_or_else(|| format!("{app}: não está no registro do wingetrs"))?;
         match ops::resolve_installed(c, app, bucket).map_err(|e| e.to_string())? {
             Resolution::One(cand) => {
-                groups.push(ops::plan_for(c, &cand, false).map_err(|e| e.to_string())?);
+                groups.push(ops::plan_for(c, &cand, keep).map_err(|e| e.to_string())?);
             }
             _ => return Err(format!("{app}: não foi possível resolver no catálogo")),
         }

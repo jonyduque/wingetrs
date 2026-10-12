@@ -1,6 +1,6 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
 use crate::catalog::search::{SearchHit, SearchIndex};
-use crate::config::{Behavior, Config};
+use crate::config::{Behavior, Config, ConfirmMode, ResidueMode};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
@@ -179,15 +179,21 @@ pub enum Cmd {
     },
     ScanInstalled,
     /// Plan installing (or upgrading) one catalog package.
+    /// `keep`: keep the old version when this is an upgrade (setting at key time).
     PlanInstall {
         source_name: String,
         id: String,
+        keep: bool,
     },
+    /// `purge`: also delete the app's persistent data (setting at key time).
     PlanRemove {
         app: String,
+        purge: bool,
     },
     /// Plan upgrading every app with a newer catalog version.
-    PlanUpgradeAll,
+    PlanUpgradeAll {
+        keep: bool,
+    },
     Execute(Action),
     CleanResidues {
         app: String,
@@ -918,9 +924,11 @@ fn install_selected(app: &mut App) -> Vec<Cmd> {
         app.push_toast(ToastKind::Warning, "instalação na fase 2d");
         return Vec::new();
     }
+    // A new package has no old version to keep.
     let cmd = Cmd::PlanInstall {
         source_name: e.source_name.clone(),
         id: e.id.clone(),
+        keep: false,
     };
     start_planning(app, cmd)
 }
@@ -935,13 +943,15 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
             return Vec::new();
         }
     };
-    start_planning(app, Cmd::PlanRemove { app: name })
+    let purge = app.settings.behavior.purge;
+    start_planning(app, Cmd::PlanRemove { app: name, purge })
 }
 
 /// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.
 fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
+    let keep = app.settings.behavior.keep_old;
     let (ours, source) = match app.installed_view().get(app.selected) {
-        None => return start_planning(app, Cmd::PlanUpgradeAll),
+        None => return start_planning(app, Cmd::PlanUpgradeAll { keep }),
         Some(r) => (
             r.origin == "wingetrs",
             match &r.correlation {
@@ -953,9 +963,14 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
         ),
     };
     match source {
-        Some((source_name, id)) if ours => {
-            start_planning(app, Cmd::PlanInstall { source_name, id })
-        }
+        Some((source_name, id)) if ours => start_planning(
+            app,
+            Cmd::PlanInstall {
+                source_name,
+                id,
+                keep,
+            },
+        ),
         _ => {
             app.push_toast(ToastKind::Warning, NOT_OURS);
             Vec::new()
@@ -994,11 +1009,32 @@ fn residue_item(r: &Residue) -> PickerItem {
     }
 }
 
+/// Whether a ready plan asks before executing, per the `confirm` setting.
+pub fn needs_confirm(mode: ConfirmMode, action: &Action) -> bool {
+    match mode {
+        ConfirmMode::Always => true,
+        ConfirmMode::Removals => matches!(action, Action::Remove(_)),
+        ConfirmMode::Never => false,
+    }
+}
+
+/// Same path as Enter on the confirmation dialog.
+fn execute(app: &mut App, action: Action) -> Vec<Cmd> {
+    app.modal = Some(Modal::Running {
+        label: action.label(),
+        progress: None,
+    });
+    vec![Cmd::Execute(action)]
+}
+
 fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
     app.planning = false;
     app.status = None;
     match result {
         Ok(Planned::Ready { text, action }) => {
+            if !needs_confirm(app.settings.behavior.confirm, &action) {
+                return execute(app, action);
+            }
             app.modal = Some(Modal::Confirm {
                 plan_text: text,
                 action,
@@ -1018,19 +1054,15 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
     app.modal = None;
+    // Success or not, the disk may have changed.
+    let mut cmds = vec![Cmd::ScanInstalled];
     match result {
         Ok(done) => {
             app.push_toast(ToastKind::Success, done.summary);
             if let Some((name, residues)) = done.residues
                 && !residues.is_empty()
             {
-                let items: Vec<PickerItem> = residues.iter().map(residue_item).collect();
-                let initial: Vec<bool> = residues.iter().map(|r| r.preselected).collect();
-                app.modal = Some(Modal::Residues {
-                    picker: Picker::multi(items, &initial),
-                    app: name,
-                    residues,
-                });
+                cmds.extend(handle_residues(app, name, residues));
             }
         }
         Err(InstallFail::Busy) => {
@@ -1038,8 +1070,39 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
         }
         Err(InstallFail::Other(message)) => app.push_toast(ToastKind::Error, message),
     }
-    // Success or not, the disk may have changed.
-    vec![Cmd::ScanInstalled]
+    cmds
+}
+
+/// Leftovers after a removal, per the `residues` setting.
+fn handle_residues(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<Cmd> {
+    let mode = app.settings.behavior.residues;
+    if mode == ResidueMode::Ask {
+        let items: Vec<PickerItem> = residues.iter().map(residue_item).collect();
+        let initial: Vec<bool> = residues.iter().map(|r| r.preselected).collect();
+        app.modal = Some(Modal::Residues {
+            picker: Picker::multi(items, &initial),
+            app: name,
+            residues,
+        });
+        return Vec::new();
+    }
+    let n = residues.len();
+    let chosen: Vec<Residue> = match mode {
+        ResidueMode::High => residues.into_iter().filter(|r| r.preselected).collect(),
+        _ => Vec::new(),
+    };
+    if chosen.is_empty() {
+        app.push_toast(ToastKind::Info, format!("resíduos mantidos: {n} itens"));
+        return Vec::new();
+    }
+    app.modal = Some(Modal::Running {
+        label: format!("Limpando resíduos de {name}"),
+        progress: None,
+    });
+    vec![Cmd::CleanResidues {
+        app: name,
+        residues: chosen,
+    }]
 }
 
 fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
@@ -1049,13 +1112,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     };
     match modal {
         Modal::Confirm { plan_text, action } => match key.code {
-            KeyCode::Enter => {
-                app.modal = Some(Modal::Running {
-                    label: action.label(),
-                    progress: None,
-                });
-                vec![Cmd::Execute(action)]
-            }
+            KeyCode::Enter => execute(app, action),
             KeyCode::Esc => Vec::new(),
             _ => {
                 app.modal = Some(Modal::Confirm { plan_text, action });
@@ -1076,6 +1133,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     let cmd = Cmd::PlanInstall {
                         source_name: c.entry.source_name.clone(),
                         id: c.entry.id.clone(),
+                        keep: false,
                     };
                     start_planning(app, cmd)
                 }
