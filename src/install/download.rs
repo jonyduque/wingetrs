@@ -147,8 +147,18 @@ async fn download_one(
     std::fs::create_dir_all(&blobs).map_err(|e| io_err(&blobs, e))?;
     let target = blobs.join(&name);
     // std rename replaces an existing (e.g. tampered) blob of the same name.
-    fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &target))
-        .map_err(|e| io_err(&target, e))?;
+    // The retry sleeps: keep it off the runtime worker shared with the other downloads.
+    let rename = tokio::task::spawn_blocking({
+        let (tmp, target) = (tmp.clone(), target.clone());
+        move || fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &target))
+    });
+    match rename.await {
+        Ok(r) => r.map_err(|e| io_err(&target, e))?,
+        Err(e) => match e.try_into_panic() {
+            Ok(p) => std::panic::resume_unwind(p),
+            Err(e) => return Err(DownloadError::Io(e.to_string())),
+        },
+    }
     guard.0 = None;
     Ok((target, name))
 }

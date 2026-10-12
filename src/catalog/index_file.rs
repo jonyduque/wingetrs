@@ -388,12 +388,8 @@ fn scan(
 
 /// Reads `path`, retrying transient locks up to 5 times, 10 ms apart: on Windows a reader that
 /// opens the file while `write` renames over it gets "access denied", and a scanner holding the
-/// fresh file gives a sharing violation.
-fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
-    read_retrying_with(path, std::thread::sleep)
-}
-
-/// [`read_retrying`] with an injected `sleep` (tests release the lock from it, without a clock).
+/// fresh file gives a sharing violation. `sleep` is injected (tests release the lock from it,
+/// without a clock).
 fn read_retrying_with(
     path: &Path,
     mut sleep: impl FnMut(std::time::Duration),
@@ -419,7 +415,18 @@ pub fn search(
     filter: Option<SourceKind>,
     limit: usize,
 ) -> Result<Option<Vec<Found>>, IndexFileError> {
-    let bytes = match read_retrying(path) {
+    search_with(path, query, filter, limit, std::thread::sleep)
+}
+
+/// [`search`] with the read retry's `sleep` injected.
+fn search_with(
+    path: &Path,
+    query: &str,
+    filter: Option<SourceKind>,
+    limit: usize,
+    sleep: impl FnMut(std::time::Duration),
+) -> Result<Option<Vec<Found>>, IndexFileError> {
+    let bytes = match read_retrying_with(path, sleep) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(IndexFileError::Io(e.to_string())),
@@ -511,5 +518,27 @@ mod tests {
         let e = read_retrying_with(&p, |_| slept += 1).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(32));
         assert_eq!(slept, 5);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn search_reads_through_the_retry() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("search.idx");
+        // A valid index with no entries.
+        std::fs::write(&p, assemble(0, &[], &[]).unwrap()).unwrap();
+        let mut held = Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&p)
+                .unwrap(),
+        );
+        let r = search_with(&p, "power", None, 5, |_| {
+            held.take();
+        });
+        assert_eq!(r.unwrap().unwrap().len(), 0);
+        assert!(held.is_none(), "the retry path never ran");
     }
 }

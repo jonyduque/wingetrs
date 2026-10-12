@@ -354,12 +354,15 @@ fn extract_tar_gz(
     Ok(())
 }
 
+/// Renames `from` to `to`, waiting out a transient external handle (a scanner on a fresh file).
+fn rename_retrying(from: &Path, to: &Path) -> Result<(), ExtractError> {
+    fs_retry::retry("renomear", from, || fs::rename(from, to)).map_err(io_at("renomear", from))
+}
+
 /// Moves the contents of `src` into `dest`, merging with existing directories.
 fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
     if !dest.exists() {
-        fs_retry::retry("renomear", src, || fs::rename(src, dest))
-            .map_err(io_at("renomear", src))?;
-        return Ok(());
+        return rename_retrying(src, dest);
     }
     for entry in fs::read_dir(src).map_err(io_at("listar", src))? {
         let entry = entry.map_err(io_at("listar", src))?;
@@ -373,17 +376,45 @@ fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
             if to.exists() {
                 merge_into(&from, &to)?;
             } else {
-                fs_retry::retry("renomear", &from, || fs::rename(&from, &to))
-                    .map_err(io_at("renomear", &from))?;
+                rename_retrying(&from, &to)?;
             }
         } else {
             if to.exists() {
                 fs_retry::retry("apagar", &to, || fs::remove_file(&to))
                     .map_err(io_at("apagar", &to))?;
             }
-            fs_retry::retry("renomear", &from, || fs::rename(&from, &to))
-                .map_err(io_at("renomear", &from))?;
+            rename_retrying(&from, &to)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::fs_retry::release_on_retry;
+
+    #[cfg(windows)]
+    #[test]
+    fn merge_into_a_missing_dest_waits_for_a_held_child_to_be_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let (src, dest) = (d.path().join("src"), d.path().join("dest"));
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("f.txt"), b"x").unwrap();
+        // Full sharing, like a scanner: renaming the folder still fails until it is closed.
+        let held: release_on_retry::Held = std::sync::Arc::new(std::sync::Mutex::new(Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1 | 2 | 4)
+                .open(src.join("f.txt"))
+                .unwrap(),
+        )));
+        let _routing = release_on_retry::install(&held);
+        merge_into(&src, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("f.txt")).unwrap(), b"x");
+        assert!(!src.exists());
+        assert!(held.lock().unwrap().is_none(), "the retry path never ran");
+    }
 }

@@ -170,3 +170,69 @@ mod tests {
         assert_eq!(slept, DELAYS.len());
     }
 }
+
+/// Test layer: on the thread that installed it, each "retrying" event drops the held file.
+#[cfg(test)]
+pub(crate) mod release_on_retry {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::fs::File;
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) type Held = Arc<Mutex<Option<File>>>;
+
+    thread_local! {
+        static CURRENT: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct Message(bool);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            if f.name() == "message" && format!("{v:?}") == "transient fs error, retrying" {
+                self.0 = true;
+            }
+        }
+    }
+
+    struct Releaser;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Releaser {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut m = Message(false);
+            event.record(&mut m);
+            if m.0 {
+                CURRENT.with(|c| {
+                    if let Some(h) = c.borrow().as_ref() {
+                        h.lock().unwrap().take();
+                    }
+                });
+            }
+        }
+    }
+
+    /// Process-global subscriber (installed once: a per-test `set_default` races on the
+    /// callsite interest cache) routing to the calling thread's `held` until the guard drops.
+    pub(crate) fn install(held: &Held) -> Installed {
+        use tracing_subscriber::layer::SubscriberExt;
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(Releaser),
+            );
+        });
+        CURRENT.with(|c| *c.borrow_mut() = Some(held.clone()));
+        Installed
+    }
+
+    pub(crate) struct Installed;
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            CURRENT.with(|c| *c.borrow_mut() = None);
+        }
+    }
+}
