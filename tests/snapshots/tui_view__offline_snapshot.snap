@@ -1,6 +1,5 @@
 ---
 source: tests/tui_view.rs
-assertion_line: 80
 expression: "render(&a, 100, 12)"
 ---
 "╭  Pesquisar  Instalados  Atualizações ──────────────────────────────────────x offline ~ índice 3h ╮"
@@ -14,4 +13,4 @@ expression: "render(&a, 100, 12)"
 "│                                                     ││                                           │"
 "│                                                     ││| carregando…                              │"
 "╰─────────────────────────────────────────────────────╯╰───────────────────────────────────────────╯"
-" 3 de 3 · ↑↓ mover · Tab aba · Enter detalhes · Ctrl+R refresh · ? ajuda                            "
+" 3 de 3 · ↑↓ mover · ←→ aba · Enter detalhes · Ctrl+R refresh · ? ajuda                             "

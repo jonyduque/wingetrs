@@ -1,6 +1,5 @@
 ---
 source: tests/tui_view.rs
-assertion_line: 72
 expression: "render(&App::new(vec![], GlyphSet::Ascii), 80, 12)"
 ---
 "╭  Pesquisar  Instalados  Atualizações ────────────────────────────────────────╮"
@@ -14,4 +13,4 @@ expression: "render(&App::new(vec![], GlyphSet::Ascii), 80, 12)"
 "│                                          ││                                  │"
 "│                                          ││                                  │"
 "╰──────────────────────────────────────────╯╰──────────────────────────────────╯"
-" 0 de 0 · ↑↓ mover · Tab aba · Enter detalhes · Ctrl+R refresh · ? ajuda        "
+" 0 de 0 · ↑↓ mover · ←→ aba · Enter detalhes · Ctrl+R refresh · ? ajuda         "

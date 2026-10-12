@@ -542,7 +542,7 @@ fn draw_status(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) {
         )),
         None => Line::from(Span::styled(
             format!(
-                " {} de {} · ↑↓ mover · Tab aba · Enter detalhes · Ctrl+R refresh · ? ajuda",
+                " {} de {} · ↑↓ mover · ←→ aba · Enter detalhes · Ctrl+R refresh · ? ajuda",
                 app.visible_len(),
                 total
             ),
@@ -573,7 +573,7 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
     let lines = vec![
         key("↑↓ j k", "mover seleção"),
         key("PgUp PgDn", "mover de 10 em 10"),
-        key("Tab", "próxima aba"),
+        key("←→ / Tab", "trocar aba"),
         key("Enter", "foco nos detalhes"),
         key("i", "instalar (aba Busca, scoop)"),
         key("u", "remover (aba Instalados)"),

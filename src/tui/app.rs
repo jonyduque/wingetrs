@@ -522,22 +522,8 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         KeyCode::PageUp => app.move_to(app.selected.saturating_sub(PAGE)),
         KeyCode::Home => app.move_to(0),
         KeyCode::End => app.move_to(last),
-        KeyCode::Tab => {
-            let next = match app.tab {
-                Tab::Search => Tab::Installed,
-                Tab::Installed => Tab::Updates,
-                Tab::Updates => Tab::Search,
-            };
-            app.set_tab(next)
-        }
-        KeyCode::BackTab => {
-            let prev = match app.tab {
-                Tab::Search => Tab::Updates,
-                Tab::Installed => Tab::Search,
-                Tab::Updates => Tab::Installed,
-            };
-            app.set_tab(prev)
-        }
+        KeyCode::Tab | KeyCode::Right => app.set_tab(next_tab(app.tab)),
+        KeyCode::BackTab | KeyCode::Left => app.set_tab(prev_tab(app.tab)),
         KeyCode::Enter => {
             if app.visible_len() == 0 {
                 return Vec::new();
@@ -812,5 +798,23 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 }]
             }
         },
+    }
+}
+
+/// Next tab in the cycle (single place to extend when a tab is added).
+pub fn next_tab(tab: Tab) -> Tab {
+    match tab {
+        Tab::Search => Tab::Installed,
+        Tab::Installed => Tab::Updates,
+        Tab::Updates => Tab::Search,
+    }
+}
+
+/// Previous tab in the cycle.
+pub fn prev_tab(tab: Tab) -> Tab {
+    match tab {
+        Tab::Search => Tab::Updates,
+        Tab::Installed => Tab::Search,
+        Tab::Updates => Tab::Installed,
     }
 }

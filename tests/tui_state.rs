@@ -867,3 +867,61 @@ fn stale_details_keep_the_spinner_for_the_current_item() {
     update(&mut a, loaded("scoop:main/c"));
     assert!(!a.animating());
 }
+
+#[test]
+fn right_and_left_arrows_cycle_tabs() {
+    let mut a = app();
+    for want in [Tab::Installed, Tab::Updates, Tab::Search] {
+        update(&mut a, key(KeyCode::Right));
+        assert_eq!(a.tab, want);
+    }
+    update(&mut a, key(KeyCode::Left));
+    assert_eq!(a.tab, Tab::Updates);
+    update(&mut a, key(KeyCode::Left));
+    assert_eq!(a.tab, Tab::Installed);
+}
+
+#[test]
+fn arrows_match_tab_and_backtab() {
+    for start in [Tab::Search, Tab::Installed, Tab::Updates] {
+        for (arrow, other) in [
+            (KeyCode::Right, KeyCode::Tab),
+            (KeyCode::Left, KeyCode::BackTab),
+        ] {
+            let mut x = on_tab(start, Vec::new());
+            let mut y = on_tab(start, Vec::new());
+            update(&mut x, key(arrow));
+            update(&mut y, key(other));
+            assert_eq!(x.tab, y.tab);
+        }
+    }
+}
+
+#[test]
+fn arrows_switch_tabs_with_text_and_from_details() {
+    let mut a = app();
+    update(&mut a, key(KeyCode::Char('p')));
+    update(&mut a, key(KeyCode::Char('o')));
+    update(&mut a, key(KeyCode::Right));
+    assert_eq!(a.tab, Tab::Installed);
+    assert_eq!(a.query, "po");
+    let mut b = app();
+    update(&mut b, key(KeyCode::Enter));
+    assert_eq!(b.focus, Focus::Details);
+    update(&mut b, key(KeyCode::Right));
+    assert_eq!(b.tab, Tab::Installed);
+}
+
+#[test]
+fn arrows_belong_to_an_open_dialog() {
+    let mut a = app();
+    select_source(&mut a, SourceKind::Scoop);
+    update(&mut a, key(KeyCode::Char('i')));
+    update(&mut a, ready("ripgrep"));
+    assert!(confirm_open(&a));
+    let tab = a.tab;
+    update(&mut a, key(KeyCode::Right));
+    update(&mut a, key(KeyCode::Left));
+    assert_eq!(a.tab, tab);
+    assert!(confirm_open(&a));
+}
