@@ -383,3 +383,48 @@ fn installed_details_show_the_catalog_publisher() {
     assert_eq!(a.tab, Tab::Installed);
     assert!(render(&a, 120, 30).contains("Acme Corp"));
 }
+
+#[test]
+fn scrolled_selection_highlights_the_selected_row() {
+    let es: Vec<PackageEntry> = (0..1500)
+        .map(|i| {
+            let n = format!("pkg{i:04}");
+            PackageEntry {
+                source: SourceKind::Winget,
+                source_name: "winget".into(),
+                id: n.clone(),
+                name: n,
+                moniker: None,
+                version: "1".into(),
+                publisher: None,
+                description: None,
+                tags: vec![],
+                commands: vec![],
+            }
+        })
+        .collect();
+    let mut a = App::new(es, GlyphSet::Ascii);
+    update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    let sel_bg = theme.bg_selected().bg.expect("selected background");
+    let mut t = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    t.draw(|f| view(&a, &theme, f)).unwrap();
+    let buf = t.backend().buffer().clone();
+    let mut highlighted = Vec::new();
+    for y in 0..buf.area.height {
+        let text: String = (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        if text.contains("pkg") && buf[(3, y)].bg == sel_bg {
+            highlighted.push(text);
+        }
+    }
+    assert_eq!(highlighted.len(), 1, "{highlighted:?}");
+    assert!(highlighted[0].contains("pkg0999"), "{highlighted:?}");
+}

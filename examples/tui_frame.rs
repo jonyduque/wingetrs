@@ -68,7 +68,7 @@ fn scenario(entries: &[PackageEntry], tabs: usize, query: &str) -> (u128, u128) 
 
 fn main() {
     let data = DataDir::from_env().expect("data dir");
-    let entries = Catalog::open(&data.catalog_path())
+    let entries = Catalog::open_read_only(&data.catalog_path())
         .expect("open catalog")
         .load_entries()
         .expect("load entries");
