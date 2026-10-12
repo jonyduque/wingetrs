@@ -41,3 +41,17 @@ Decisions:
 - config.toml dos pristines montado à mão (scoop_buckets = ["main","extras"]; 75b com [[buckets]] perfx), pois a raiz real não tem config.toml e o `bucket rm` da 1ª execução tirava extras do config.
 
 Concerns: none (as séries em worktrees/exes foram apagadas; `git worktree list` limpo).
+
+## Adendo (revisão)
+
+Testes novos (src/catalog/mod.rs, mod tests): `removing_a_source_without_meta_row_drops_its_maps_as_winget` e `removing_a_source_with_unknown_kind_drops_its_maps_as_winget`. Gate: `[OK]   test (634 passed, 16 ignored)` / `[OK]   gate verde`.
+- `map_or(SourceKind::Winget,` -> `map_or(SourceKind::Scoop,`: `[OK] mutação PEGA: 'map_or(SourceKind::Winget,' -> 'map_or(SourceKind::Scoop,' fez o teste falhar (exit 101).` (teste: o de "without_meta_row"; o de "unknown_kind" passa, pois tem linha em meta)
+- `s.parse().unwrap_or(SourceKind::Winget)` -> `...Scoop)`: `[OK] mutação PEGA: ... fez o teste falhar (exit 101).` Teste que falhou: `catalog::tests::removing_a_source_with_unknown_kind_drops_its_maps_as_winget`.
+
+Comandos e raízes de medição. S = ...\scratchpad do agente (fora do repo). Todos os comandos que mediram rodaram com `. "$S\perf-env.ps1"` (LOCALAPPDATA = `$S\la`, raiz isolada `$S\la\wingetrs`, copiada de `%LOCALAPPDATA%\wingetrs` por `perf-root.ps1`; WINGETRS_TEST_ENV_KEY=Software\wingetrs-test\perf; WINGETRS_TEST_SHORTCUT_DIR=$S\sc):
+- `pwsh -File $S\perf-root.ps1`; `perf75-new.exe update`; `bucket list`; `bucket add perfx ScoopInstaller/Versions --yes`
+- `ab-cmd.ps1 -Base perf75-base.exe -New perf75-mid.exe -CmdArgs 'bucket rm extras' -Pristine $S\pristine75a -Span 'catalog\.delete_source_rows' -Runs 15`
+- `ab-cmd.ps1 -Base perf75-mid.exe -New perf75-new.exe -CmdArgs 'bucket rm perfx' -Pristine $S\pristine75b -Runs 15` (2 séries)
+- `ab-cmd.ps1 -Base perf75-mid.exe -New perf75-new.exe -CmdArgs 'bucket rm extras' -Pristine $S\pristine75a -Span 'bucket\.rm\.index_write' -Runs 15`
+Nenhum comando de medição rodou contra a raiz real; a raiz real foi só lida (cópia do catálogo em modo ro). Fora das medições, os testes/mutações rodaram com CARGO_TARGET_DIR próprio e usam diretórios temporários. O catalog.db real escrito às 18:25 não veio de mim (não medido a causa; possivelmente refresh em 2º plano de outro processo/usuário).
+A frase "o 1º `bucket rm extras` removia extras do config" refere-se à raiz isolada `$S\la\wingetrs` (config.toml gravado ali pelo `bucket add perfx`/`bucket rm`), não à real, que não tem config.toml.

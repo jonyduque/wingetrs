@@ -711,4 +711,38 @@ mod tests {
         // An orphan row counts as foreign: map_pfn keeps it, the other four are truncated.
         check(orphan_pfn, "winget", SourceKind::Winget, 4);
     }
+
+    fn map_counts(c: &Catalog) -> Vec<i64> {
+        MAP_TABLES
+            .iter()
+            .map(|t| {
+                c.conn
+                    .query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn removing_a_source_without_meta_row_drops_its_maps_as_winget() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        two_owners(&mut c);
+        c.conn
+            .execute("DELETE FROM meta WHERE source = 'winget'", [])
+            .unwrap();
+        assert_eq!(c.remove_source("winget").unwrap(), 3);
+        // Only the other source's single row per map table remains.
+        assert_eq!(map_counts(&c), vec![1; 5]);
+    }
+
+    #[test]
+    fn removing_a_source_with_unknown_kind_drops_its_maps_as_winget() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        two_owners(&mut c);
+        c.conn
+            .execute("UPDATE meta SET kind = 'bogus' WHERE source = 'winget'", [])
+            .unwrap();
+        assert_eq!(c.remove_source("winget").unwrap(), 3);
+        assert_eq!(map_counts(&c), vec![1; 5]);
+    }
 }
