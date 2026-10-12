@@ -25,3 +25,13 @@ Decisions:
 - Option columns are not aligned across rows (the current value has ‹ › so widths differ); left as is.
 
 Concerns: none
+
+## Round 2 (review fixes)
+Gate: [OK]   test (599 passed, 16 ignored) / [OK]   gate verde
+Mutation proofs (all `[OK] mutação PEGA ... (exit 101)`, run with CARGO_TARGET_DIR=target/t68):
+- glyphs always sent: `(s.glyphs_touched && !s.glyphs_forced)` -> `true` => forced_glyphs_are_not_written_when_another_setting_changes
+- save_settings writes glyphs when None: `glyphs.or(Some("nerd"))` => save_settings_without_glyphs_keeps_the_file_value
+- save on every Enter: `if app.save_in_flight.is_some()` -> `if false` => only_one_save_in_flight_and_the_newest_follows
+Decisions:
+- `Cmd::SaveSettings.glyphs: Option<String>`; `Some` only when the user changed Glifos this session (`SettingsState.glyphs_touched`) and not forced. This also protects an unrecognizable value in the file. Test 2 now expects `glyphs: None`.
+- One save in flight (`App.save_in_flight`). Changes meanwhile only update state. At `SettingsSaved`: Ok records the sent values as `saved`; if current differs from what was sent, one new SaveSettings with the current values is emitted and no toast/revert yet (the final result decides). Err with a newer change pending does not revert: the retry carries the newest; Err with nothing newer reverts to `saved` and toasts the error.

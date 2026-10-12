@@ -216,12 +216,14 @@ pub fn clean(o: &OpsCtx<'_>, app: &str, residues: &[Residue]) -> Vec<String> {
 pub fn save_settings(
     path: &Path,
     behavior: crate::config::Behavior,
-    glyphs: &str,
+    glyphs: Option<&str>,
     theme: &str,
 ) -> Result<(), String> {
     crate::config::update_file(path, |c| {
         c.behavior = behavior;
-        c.glyphs = glyphs.to_string();
+        if let Some(g) = glyphs {
+            c.glyphs = g.to_string();
+        }
         c.theme = theme.to_string();
     })
     .map(|_| ())

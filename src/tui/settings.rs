@@ -68,6 +68,8 @@ pub struct SettingsState {
     pub glyphs_forced: bool,
     /// Last value written successfully.
     pub saved: (Behavior, GlyphSet, bool),
+    /// The user changed Glifos this session; only then is `glyphs` written to the file.
+    pub glyphs_touched: bool,
 }
 
 fn step(i: usize, len: usize, forward: bool) -> usize {
@@ -87,6 +89,7 @@ impl SettingsState {
             dark,
             glyphs_forced,
             saved: (behavior, glyphs, dark),
+            glyphs_touched: false,
         }
     }
 

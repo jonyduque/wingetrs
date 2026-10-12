@@ -196,7 +196,8 @@ pub enum Cmd {
     /// Write the settings to `config.toml` (`glyphs`: nerd|unicode|ascii, `theme`: dark|light).
     SaveSettings {
         behavior: Behavior,
-        glyphs: String,
+        /// `None` leaves `glyphs` in the file as it is (flag in force, or Glifos never changed).
+        glyphs: Option<String>,
         theme: String,
     },
     /// Run `run_search` off the UI thread and answer with `Msg::SearchDone`.
@@ -281,6 +282,9 @@ pub struct App {
     pub dark: bool,
     /// Bucket names for the read-only sources section.
     pub buckets_summary: String,
+    /// The values (behavior, glyphs, dark) of the one save in flight. Further changes only
+    /// update the state; when the save ends, one more save carries the newest values.
+    save_in_flight: Option<(Behavior, GlyphSet, bool)>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -333,6 +337,7 @@ impl App {
             settings: SettingsState::new(Config::default().behavior, glyphs, true, false),
             dark: true,
             buckets_summary: String::new(),
+            save_in_flight: None,
         };
         app.research();
         app
@@ -652,14 +657,25 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::SettingsSaved(result) => {
+            let sent = app.save_in_flight.take();
+            let current = (
+                app.settings.behavior,
+                app.settings.glyphs,
+                app.settings.dark,
+            );
+            // A newer change was made while saving: it gets its own save and the outcome
+            // (toast, and on failure the revert) is decided by that one. A failure with a
+            // newer change pending therefore does not revert; the retry carries the newest.
+            let newer = sent.is_some_and(|s| s != current);
+            if let (Ok(()), Some(sent)) = (&result, sent) {
+                app.settings.saved = sent;
+            }
+            if newer {
+                return request_save(app);
+            }
             app.status = None;
             match result {
                 Ok(()) => {
-                    app.settings.saved = (
-                        app.settings.behavior,
-                        app.settings.glyphs,
-                        app.settings.dark,
-                    );
                     app.push_toast(ToastKind::Success, "ajustes salvos");
                 }
                 Err(e) => {
@@ -855,11 +871,26 @@ fn change_setting(app: &mut App, forward: bool) -> Vec<Cmd> {
     }
     app.glyphs = app.settings.glyphs;
     app.dark = app.settings.dark;
+    if app.settings.selected == SETTING_GLYPHS {
+        app.settings.glyphs_touched = true;
+    }
+    request_save(app)
+}
+
+const SETTING_GLYPHS: usize = 4;
+
+/// Starts a save unless one is in flight (then its end sends the newest values).
+fn request_save(app: &mut App) -> Vec<Cmd> {
+    if app.save_in_flight.is_some() {
+        return Vec::new();
+    }
+    let s = &app.settings;
+    app.save_in_flight = Some((s.behavior, s.glyphs, s.dark));
     app.status = Some("salvando…".to_string());
     vec![Cmd::SaveSettings {
-        behavior: app.settings.behavior,
-        glyphs: glyphs_name(app.settings.glyphs).to_string(),
-        theme: if app.settings.dark { "dark" } else { "light" }.to_string(),
+        behavior: s.behavior,
+        glyphs: (s.glyphs_touched && !s.glyphs_forced).then(|| glyphs_name(s.glyphs).to_string()),
+        theme: if s.dark { "dark" } else { "light" }.to_string(),
     }]
 }
 

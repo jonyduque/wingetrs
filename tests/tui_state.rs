@@ -1422,7 +1422,7 @@ fn enter_changes_confirm_and_requests_save() {
                 confirm: ConfirmMode::Removals,
                 ..Default::default()
             },
-            glyphs: "nerd".into(),
+            glyphs: None,
             theme: "dark".into(),
         }]
     );
@@ -1507,4 +1507,46 @@ fn list_keys_do_not_break_the_settings_tab() {
     }
     assert_eq!(a.selected, 0);
     assert_eq!(a.settings.selected, 0);
+}
+
+#[test]
+fn forced_glyphs_are_not_written_when_another_setting_changes() {
+    let mut a = on_settings();
+    a.settings.glyphs_forced = true;
+    update(&mut a, key(KeyCode::Down));
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::SaveSettings { glyphs: None, behavior, .. }] if behavior.purge
+    ));
+}
+
+#[test]
+fn changed_glyphs_are_written() {
+    let mut a = on_settings();
+    for _ in 0..4 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::SaveSettings { glyphs: Some(g), .. }] if g == "unicode"
+    ));
+}
+
+#[test]
+fn only_one_save_in_flight_and_the_newest_follows() {
+    let mut a = on_settings();
+    assert_eq!(update(&mut a, key(KeyCode::Enter)).len(), 1);
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    let cmds = update(&mut a, Msg::SettingsSaved(Ok(())));
+    assert_eq!(cmds.len(), 1);
+    assert!(matches!(
+        &cmds[0],
+        Cmd::SaveSettings { behavior, .. } if behavior.confirm == ConfirmMode::Never
+    ));
+    assert!(a.toasts.is_empty());
+    assert!(update(&mut a, Msg::SettingsSaved(Ok(()))).is_empty());
+    assert_eq!(a.settings.saved.0, a.settings.behavior);
+    assert_eq!(a.toasts.len(), 1);
 }

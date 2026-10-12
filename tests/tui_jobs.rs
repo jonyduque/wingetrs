@@ -413,7 +413,7 @@ repo = \"o/x\"
             purge: true,
             ..Default::default()
         },
-        "ascii",
+        Some("ascii"),
         "light",
     )
     .unwrap();
@@ -422,4 +422,14 @@ repo = \"o/x\"
     assert!(text.contains("purge = true"), "{text}");
     assert!(text.contains("glyphs = \"ascii\""), "{text}");
     assert!(text.contains("theme = \"light\""), "{text}");
+}
+
+#[test]
+fn save_settings_without_glyphs_keeps_the_file_value() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "glyphs = \"unicode\"\n").unwrap();
+    jobs::save_settings(&p, Default::default(), None, "dark").unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(text.contains("glyphs = \"unicode\""), "{text}");
 }

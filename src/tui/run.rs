@@ -247,7 +247,7 @@ async fn event_loop(
                         Msg::SettingsSaved(jobs::save_settings(
                             &c.data.config_path(),
                             behavior,
-                            &glyphs,
+                            glyphs.as_deref(),
                             &theme,
                         ))
                     });
