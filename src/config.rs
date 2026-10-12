@@ -9,6 +9,36 @@ pub struct BucketEntry {
     pub repo: String,
 }
 
+/// When to ask for confirmation before acting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmMode {
+    #[default]
+    Always,
+    Removals,
+    Never,
+}
+
+/// What to do with leftovers after a removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResidueMode {
+    #[default]
+    Ask,
+    High,
+    Keep,
+}
+
+/// `[behavior]` section of `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct Behavior {
+    pub confirm: ConfirmMode,
+    pub purge: bool,
+    pub keep_old: bool,
+    pub residues: ResidueMode,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -18,6 +48,7 @@ pub struct Config {
     pub buckets: Vec<BucketEntry>,
     pub glyphs: String,
     pub theme: String,
+    pub behavior: Behavior,
 }
 
 impl Default for Config {
@@ -27,6 +58,7 @@ impl Default for Config {
             buckets: Vec::new(),
             glyphs: "nerd".into(),
             theme: "dark".into(),
+            behavior: Behavior::default(),
         }
     }
 }
@@ -75,4 +107,13 @@ impl Config {
         std::fs::write(&tmp, text).map_err(io)?;
         std::fs::rename(&tmp, path).map_err(io)
     }
+}
+
+/// Re-reads the file, applies `change`, saves and returns what was written.
+/// Re-reading avoids overwriting edits made meanwhile (e.g. `bucket add` in the CLI).
+pub fn update_file(path: &Path, change: impl FnOnce(&mut Config)) -> Result<Config, ConfigError> {
+    let mut cfg = Config::load(path)?;
+    change(&mut cfg);
+    cfg.save(path)?;
+    Ok(cfg)
 }

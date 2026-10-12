@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use wingetrs::config::Config;
+use wingetrs::config::{Behavior, Config, ConfirmMode, ResidueMode, update_file};
 
 #[test]
 fn missing_file_gives_defaults() {
@@ -28,4 +28,88 @@ fn invalid_toml_error_mentions_path() {
     std::fs::write(&p, "scoop_buckets = [").unwrap();
     let e = Config::load(&p).unwrap_err();
     assert!(e.to_string().contains("config.toml"), "{e}");
+}
+
+#[test]
+fn missing_behavior_section_gives_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "scoop_buckets = [\"main\"]\n").unwrap();
+    let c = Config::load(&p).unwrap();
+    assert_eq!(c.behavior, Behavior::default());
+    assert_eq!(c.behavior.confirm, ConfirmMode::Always);
+    assert_eq!(c.behavior.residues, ResidueMode::Ask);
+    assert!(!c.behavior.purge);
+    assert!(!c.behavior.keep_old);
+}
+
+#[test]
+fn behavior_values_are_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(
+        &p,
+        "[behavior]\nconfirm = \"removals\"\npurge = true\nkeep_old = true\nresidues = \"high\"\n",
+    )
+    .unwrap();
+    let c = Config::load(&p).unwrap();
+    assert_eq!(c.behavior.confirm, ConfirmMode::Removals);
+    assert!(c.behavior.purge);
+    assert!(c.behavior.keep_old);
+    assert_eq!(c.behavior.residues, ResidueMode::High);
+}
+
+#[test]
+fn behavior_round_trips_through_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    let c = Config {
+        behavior: Behavior {
+            confirm: ConfirmMode::Never,
+            purge: true,
+            keep_old: false,
+            residues: ResidueMode::Keep,
+        },
+        ..Config::default()
+    };
+    c.save(&p).unwrap();
+    assert_eq!(Config::load(&p).unwrap(), c);
+}
+
+#[test]
+fn invalid_confirm_value_mentions_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "[behavior]\nconfirm = \"as vezes\"\n").unwrap();
+    let e = Config::load(&p).unwrap_err();
+    assert!(e.to_string().contains("config.toml"), "{e}");
+}
+
+#[test]
+fn update_file_keeps_changes_made_meanwhile() {
+    use wingetrs::config::BucketEntry;
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    let x = BucketEntry {
+        name: "x".into(),
+        repo: "a/x".into(),
+    };
+    let y = BucketEntry {
+        name: "y".into(),
+        repo: "a/y".into(),
+    };
+    let first = Config {
+        buckets: vec![x.clone()],
+        ..Config::default()
+    };
+    first.save(&p).unwrap();
+    let stale = Config::load(&p).unwrap();
+    let mut other = stale.clone();
+    other.buckets.push(y.clone());
+    other.save(&p).unwrap();
+    let written = update_file(&p, |c| c.behavior.purge = true).unwrap();
+    let on_disk = Config::load(&p).unwrap();
+    assert_eq!(written, on_disk);
+    assert_eq!(on_disk.buckets, vec![x, y]);
+    assert!(on_disk.behavior.purge);
 }
