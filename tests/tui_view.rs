@@ -297,3 +297,89 @@ fn selected_row_moves_on_screen_while_details_load() {
     assert!(selected.contains("powertoys"), "{selected}");
     assert!(screen.contains("carregando"), "{screen}");
 }
+
+#[test]
+fn list_window_keeps_selection_visible() {
+    use wingetrs::tui::view::list_window;
+    assert_eq!(list_window(0, 0, 1500, 10), 0..10);
+    assert_eq!(list_window(700, 0, 1500, 10), 691..701);
+    assert_eq!(list_window(1499, 1490, 1500, 10), 1490..1500);
+    assert_eq!(list_window(5, 3, 1500, 10), 3..13);
+    assert_eq!(list_window(0, 0, 3, 10), 0..3);
+    assert_eq!(list_window(0, 0, 0, 10), 0..0);
+}
+
+#[test]
+fn long_list_end_is_rendered() {
+    let es: Vec<PackageEntry> = (0..1500)
+        .map(|i| {
+            let n = format!("pkg{i:04}");
+            PackageEntry {
+                source: SourceKind::Winget,
+                source_name: "winget".into(),
+                id: n.clone(),
+                name: n,
+                moniker: None,
+                version: "1".into(),
+                publisher: None,
+                description: None,
+                tags: vec![],
+                commands: vec![],
+            }
+        })
+        .collect();
+    // The search keeps at most MAX_HITS (1000) hits, so the last row is pkg0999.
+    let mut a = App::new(es, GlyphSet::Ascii);
+    update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    let out = render(&a, 100, 20);
+    let line = out
+        .lines()
+        .map(|l| l.trim_start_matches('"'))
+        .find(|l| l.starts_with("│> "))
+        .unwrap();
+    assert!(line.contains("pkg0999"), "{line}");
+    assert!(!out.contains("pkg0000"));
+}
+
+#[test]
+fn installed_details_show_the_catalog_publisher() {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    use wingetrs::tui::app::Tab;
+    let mut a = App::new(vec![], GlyphSet::Ascii);
+    let mut e = entries().remove(0);
+    e.id = "Acme.Tool".into();
+    e.name = "Tool".into();
+    e.publisher = Some("Acme Corp".into());
+    update(&mut a, Msg::CatalogLoaded(vec![e]));
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![ListRow {
+            name: "Tool".into(),
+            origin: "arp".into(),
+            installed_version: Some("1".into()),
+            correlation: Correlation::Matched {
+                source: "winget".into(),
+                package_id: "Acme.Tool".into(),
+                rule: Rule::ScoopManifest,
+            },
+            latest: None,
+            state: UpdateState::UpToDate,
+            tiebreak: None,
+        }]),
+    );
+    update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    assert_eq!(a.tab, Tab::Installed);
+    assert!(render(&a, 120, 30).contains("Acme Corp"));
+}

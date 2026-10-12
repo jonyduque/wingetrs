@@ -235,7 +235,36 @@ fn row_source_glyph<'a>(theme: &Theme, g: &Glyphs, row: &ListRow) -> Span<'a> {
     }
 }
 
-fn list_lines<'a>(app: &'a App, theme: &Theme, g: &Glyphs, width: usize) -> Vec<Line<'a>> {
+/// Rows `[start, end)` of a list of `len` rows that fit in `height` lines while keeping
+/// `selected` visible, scrolling as little as possible from `scroll`.
+pub fn list_window(
+    selected: usize,
+    scroll: usize,
+    len: usize,
+    height: usize,
+) -> std::ops::Range<usize> {
+    if len == 0 {
+        return 0..0;
+    }
+    let start = if selected < scroll {
+        selected
+    } else if selected >= scroll + height {
+        selected + 1 - height
+    } else {
+        scroll
+    }
+    .min(len - 1);
+    start..(start + height).min(len)
+}
+
+/// Builds only the lines in `window` (indices into the full row list).
+fn list_lines<'a>(
+    app: &'a App,
+    theme: &Theme,
+    g: &Glyphs,
+    width: usize,
+    window: std::ops::Range<usize>,
+) -> Vec<Line<'a>> {
     let marker = |sel: bool| {
         if sel {
             Span::styled(format!("{} ", g.selected), theme.accent())
@@ -248,6 +277,8 @@ fn list_lines<'a>(app: &'a App, theme: &Theme, g: &Glyphs, width: usize) -> Vec<
             .hits
             .iter()
             .enumerate()
+            .skip(window.start)
+            .take(window.len())
             .filter_map(|(i, h)| {
                 let e: &PackageEntry = app.search.entries().get(h.index)?;
                 let mut left = vec![
@@ -264,6 +295,8 @@ fn list_lines<'a>(app: &'a App, theme: &Theme, g: &Glyphs, width: usize) -> Vec<
             .installed_view()
             .into_iter()
             .enumerate()
+            .skip(window.start)
+            .take(window.len())
             .map(|(i, r)| {
                 let mut left = vec![
                     marker(i == app.selected),
@@ -289,7 +322,11 @@ fn list_lines<'a>(app: &'a App, theme: &Theme, g: &Glyphs, width: usize) -> Vec<
             .collect(),
     };
     // The selected row gets the background token across the whole line.
-    if let Some(l) = lines.get_mut(app.selected) {
+    if let Some(l) = app
+        .selected
+        .checked_sub(window.start)
+        .and_then(|i| lines.get_mut(i))
+    {
         l.style = theme.bg_selected();
     }
     lines
@@ -315,7 +352,11 @@ fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect
         frame.render_widget(Paragraph::new(msg), inner);
         return;
     }
-    let lines = list_lines(app, theme, g, usize::from(inner.width));
+    let len = app.visible_len();
+    let h = usize::from(inner.height);
+    let sel = app.selected.min(len.saturating_sub(1));
+    let window = list_window(sel, app.scroll, len, h);
+    let lines = list_lines(app, theme, g, usize::from(inner.width), window);
     if lines.is_empty() {
         let text = match app.tab {
             Tab::Search => "nenhum resultado",
@@ -328,18 +369,7 @@ fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect
         );
         return;
     }
-    let h = usize::from(inner.height);
-    let sel = app.selected.min(lines.len() - 1);
-    let start = if sel < app.scroll {
-        sel
-    } else if sel >= app.scroll + h {
-        sel + 1 - h
-    } else {
-        app.scroll
-    }
-    .min(lines.len() - 1);
-    let visible: Vec<Line> = lines.into_iter().skip(start).take(h).collect();
-    frame.render_widget(Paragraph::new(visible), inner);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Fields of the selected row, shown before `PackageDetails` arrives.
