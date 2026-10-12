@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use wingetrs::config::{Behavior, Config, ConfirmMode, ResidueMode, update_file};
+use wingetrs::config::{Behavior, Config, ConfigError, ConfirmMode, ResidueMode, update_file};
 
 #[test]
 fn missing_file_gives_defaults() {
@@ -112,4 +112,38 @@ fn update_file_keeps_changes_made_meanwhile() {
     assert_eq!(written, on_disk);
     assert_eq!(on_disk.buckets, vec![x, y]);
     assert!(on_disk.behavior.purge);
+}
+
+#[test]
+fn update_file_refuses_invalid_file_and_leaves_it_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    let original = "[behavior]\nconfirm = \"as vezes\"\n";
+    std::fs::write(&p, original).unwrap();
+    let r = update_file(&p, |c| c.behavior.purge = true);
+    assert!(matches!(r, Err(ConfigError::Parse { .. })), "{r:?}");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+}
+
+#[test]
+fn partial_behavior_section_fills_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "[behavior]\npurge = true\n").unwrap();
+    let c = Config::load(&p).unwrap();
+    assert!(c.behavior.purge);
+    assert_eq!(c.behavior.confirm, ConfirmMode::Always);
+    assert_eq!(c.behavior.residues, ResidueMode::Ask);
+    assert!(!c.behavior.keep_old);
+}
+
+#[test]
+fn update_file_creates_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    update_file(&p, |c| c.behavior.purge = true).unwrap();
+    assert!(p.exists());
+    let c = Config::load(&p).unwrap();
+    assert!(c.behavior.purge);
+    assert_eq!(c.scoop_buckets, Config::default().scoop_buckets);
 }
