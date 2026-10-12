@@ -492,21 +492,19 @@ impl Catalog {
     }
 
     pub fn get(&self, source: &str, id: &str) -> Result<Option<StoredPackage>, CatalogError> {
+        let sql = format!("SELECT {PKG_COLS} FROM packages WHERE source = ?1 AND id = ?2");
         Ok(self
             .conn
-            .query_row(
-                &format!("SELECT {PKG_COLS} FROM packages WHERE source = ?1 AND id = ?2"),
-                params![source, id],
-                stored_from_row,
-            )
+            .prepare_cached(&sql)?
+            .query_row(params![source, id], stored_from_row)
             .optional()?)
     }
 
     /// Finds by id across sources (case-insensitive); used by `show <id>` without --source.
     pub fn find_by_id(&self, id: &str) -> Result<Vec<StoredPackage>, CatalogError> {
-        let mut st = self.conn.prepare(&format!(
-            "SELECT {PKG_COLS} FROM packages WHERE lower(id) = lower(?1) ORDER BY rowid"
-        ))?;
+        let sql =
+            format!("SELECT {PKG_COLS} FROM packages WHERE lower(id) = lower(?1) ORDER BY rowid");
+        let mut st = self.conn.prepare_cached(&sql)?;
         let rows = st.query_map(params![id], stored_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -518,10 +516,11 @@ impl Catalog {
         } else {
             key.to_owned()
         };
-        let mut st = self.conn.prepare(&format!(
+        let sql = format!(
             "SELECT p.id FROM {} m JOIN packages p ON p.rowid = m.package WHERE m.key = ?1 ORDER BY p.rowid",
             table.table()
-        ))?;
+        );
+        let mut st = self.conn.prepare_cached(&sql)?;
         let rows = st.query_map(params![key], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }

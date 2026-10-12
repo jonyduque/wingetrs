@@ -483,3 +483,67 @@ fn replace_waits_for_a_concurrent_writer_instead_of_failing() {
     let r = Catalog::open(&path).unwrap();
     assert_eq!(r.lookup(MapTable::Pfn, "pfn_a2").unwrap(), ["A.A"]);
 }
+
+fn cached_fixture() -> Catalog {
+    let mut c = Catalog::open_in_memory().unwrap();
+    replace_cached(&mut c, "A.App");
+    c
+}
+
+fn replace_cached(c: &mut Catalog, pc_a_target: &str) {
+    let maps = WingetMaps {
+        productcodes: vec![
+            ("{PC-A}".into(), pc_a_target.into()),
+            ("{PC-B}".into(), "B.App".into()),
+        ],
+        norm_names: vec![("aapp".into(), "A.App".into())],
+        ..Default::default()
+    };
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "v",
+        1,
+        &[pkg("A.App", "A", "1"), pkg("B.App", "B", "1")],
+        &maps,
+    )
+    .unwrap();
+}
+
+fn run_cached_queries(c: &Catalog) {
+    assert_eq!(
+        c.lookup(MapTable::ProductCode, "{pc-a}").unwrap(),
+        ["A.App"]
+    );
+    assert_eq!(
+        c.lookup(MapTable::ProductCode, "{PC-B}").unwrap(),
+        ["B.App"]
+    );
+    assert_eq!(c.get("winget", "B.App").unwrap().unwrap().entry.id, "B.App");
+    assert_eq!(c.lookup(MapTable::NormName, "aapp").unwrap(), ["A.App"]);
+    assert_eq!(
+        c.lookup(MapTable::ProductCode, "{PC-A}").unwrap(),
+        ["A.App"]
+    );
+    let found = c.find_by_id("a.app").unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].entry.id, "A.App");
+    assert_eq!(c.get("winget", "A.App").unwrap().unwrap().entry.id, "A.App");
+}
+
+#[test]
+fn cached_statements_return_fresh_rows_for_each_key() {
+    run_cached_queries(&cached_fixture());
+}
+
+#[test]
+fn cached_statements_see_a_replaced_source() {
+    let mut c = cached_fixture();
+    run_cached_queries(&c);
+    replace_cached(&mut c, "B.App");
+    assert_eq!(
+        c.lookup(MapTable::ProductCode, "{PC-A}").unwrap(),
+        ["B.App"]
+    );
+    assert!(c.get("winget", "A.App").unwrap().is_some());
+}
