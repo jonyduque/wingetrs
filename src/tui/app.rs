@@ -197,8 +197,11 @@ pub struct App {
     pub scroll: usize,
     pub search: Arc<SearchIndex>,
     pub hits: Vec<SearchHit>,
-    /// Generation of the newest `Cmd::Search`; results of any other generation are stale.
+    /// Generation of the newest `Cmd::Search`.
     pub search_generation: u64,
+    /// The one search running off the UI thread: generation, query and filter it was asked for.
+    /// Keystrokes meanwhile only change `query`; the latest is searched when this one ends.
+    search_in_flight: Option<(u64, String, Option<SourceKind>)>,
     pub installed: Vec<ListRow>,
     pub details: HashMap<String, Result<PackageDetails, String>>,
     /// `"{source}/{id}"` of the selected package while its details are being loaded.
@@ -238,6 +241,7 @@ impl App {
             search: Arc::new(SearchIndex::new(entries)),
             hits: Vec::new(),
             search_generation: 0,
+            search_in_flight: None,
             installed: Vec::new(),
             details: HashMap::new(),
             details_pending: None,
@@ -314,8 +318,8 @@ impl App {
 
     /// Synchronous search, used only when the index itself is (re)built.
     fn research(&mut self) {
-        // Results still in flight refer to the previous index.
-        self.search_generation += 1;
+        // A search still in flight refers to the previous index: its result is dropped.
+        self.search_in_flight = None;
         self.hits = run_search(&self.search, &self.query, self.search_kind());
     }
 
@@ -324,15 +328,39 @@ impl App {
     fn refresh_view(&mut self) -> Vec<Cmd> {
         self.selected = 0;
         self.scroll = 0;
+        if self.tab != Tab::Search || self.search_in_flight.is_some() {
+            return Vec::new();
+        }
+        self.start_search()
+    }
+
+    fn start_search(&mut self) -> Vec<Cmd> {
+        self.search_generation += 1;
+        let (query, kind) = (self.query.clone(), self.search_kind());
+        self.search_in_flight = Some((self.search_generation, query.clone(), kind));
+        vec![Cmd::Search {
+            generation: self.search_generation,
+            query,
+            kind,
+        }]
+    }
+
+    /// Result of the search in flight: dropped if stale or off the Search tab; if the query
+    /// changed meanwhile, the current one is searched instead of showing the old result.
+    fn search_done(&mut self, generation: u64, hits: Vec<SearchHit>) -> Vec<Cmd> {
+        let Some((_, query, kind)) = self.search_in_flight.take_if(|f| f.0 == generation) else {
+            return Vec::new();
+        };
         if self.tab != Tab::Search {
             return Vec::new();
         }
-        self.search_generation += 1;
-        vec![Cmd::Search {
-            generation: self.search_generation,
-            query: self.query.clone(),
-            kind: self.search_kind(),
-        }]
+        if query != self.query || kind != self.search_kind() {
+            return self.start_search();
+        }
+        self.hits = hits;
+        self.selected = 0;
+        self.scroll = 0;
+        self.details_cmd()
     }
 
     /// `refresh_view` plus the detail request; on the Search tab that waits for the hits.
@@ -481,15 +509,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.status = Some("Aguardando: outra atualização em andamento".to_string());
             Vec::new()
         }
-        Msg::SearchDone { generation, hits } => {
-            if generation != app.search_generation {
-                return Vec::new();
-            }
-            app.hits = hits;
-            app.selected = 0;
-            app.scroll = 0;
-            app.details_cmd()
-        }
+        Msg::SearchDone { generation, hits } => app.search_done(generation, hits),
         Msg::Planned(result) => on_planned(app, result),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {

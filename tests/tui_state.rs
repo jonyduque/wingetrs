@@ -983,22 +983,37 @@ fn cached_installed_view_matches_a_fresh_filter() {
 use wingetrs::tui::app::run_search;
 
 /// Runs every `Cmd::Search` in `cmds` like the event loop does and delivers the results.
+/// Searches it starts in turn (a coalesced query) are run too.
 fn deliver_searches(a: &mut App, cmds: Vec<Cmd>) -> Vec<Cmd> {
     let mut rest = Vec::new();
-    for c in cmds {
+    let mut queue = std::collections::VecDeque::from(cmds);
+    while let Some(c) = queue.pop_front() {
         match c {
-            Cmd::Search {
-                generation,
-                query,
-                kind,
-            } => {
-                let hits = run_search(&a.search, &query, kind);
-                rest.extend(update(a, Msg::SearchDone { generation, hits }));
-            }
+            Cmd::Search { .. } => queue.extend(answer(a, &c)),
             other => rest.push(other),
         }
     }
     rest
+}
+
+/// Runs one `Cmd::Search` on the current index and delivers its result.
+fn answer(a: &mut App, cmd: &Cmd) -> Vec<Cmd> {
+    let Cmd::Search {
+        generation,
+        query,
+        kind,
+    } = cmd
+    else {
+        panic!("not a search: {cmd:?}");
+    };
+    let hits = run_search(&a.search, query, *kind);
+    update(
+        a,
+        Msg::SearchDone {
+            generation: *generation,
+            hits,
+        },
+    )
 }
 
 /// `update` followed by the searches it asked for.
@@ -1036,12 +1051,84 @@ fn async_search_equals_sync_search() {
 #[test]
 fn stale_search_results_are_dropped() {
     let mut a = app();
+    // "p" starts generation 1; "o" waits for it and then starts generation 2 ("po").
     let first = update(&mut a, key(KeyCode::Char('p')));
-    let second = update(&mut a, key(KeyCode::Char('o')));
+    assert!(update(&mut a, key(KeyCode::Char('o'))).is_empty());
+    let second = answer(&mut a, &first[0]);
+    assert!(matches!(&second[..], [Cmd::Search { query, .. }] if query == "po"));
     let expected = a.search.search("po", None, 1000);
     deliver_searches(&mut a, second);
-    deliver_searches(&mut a, first);
+    // The generation-1 result arriving again (late) is dropped.
+    assert!(answer(&mut a, &first[0]).is_empty());
     assert_eq!(a.hits, expected);
+}
+
+#[test]
+fn stale_search_after_catalog_reload_is_dropped() {
+    let mut a = app();
+    let cmds = update(&mut a, key(KeyCode::Char('p')));
+    let Cmd::Search { generation, .. } = &cmds[0] else {
+        panic!("{cmds:?}");
+    };
+    // Computed by the worker on the old index.
+    let old_hits = run_search(&a.search, "p", None);
+    update(
+        &mut a,
+        Msg::CatalogLoaded(vec![
+            entry(SourceKind::Winget, "Zed.Zed", "Zed"),
+            entry(SourceKind::Scoop, "git", "git"),
+            entry(SourceKind::Scoop, "pnpm", "pnpm"),
+        ]),
+    );
+    let fresh = run_search(&a.search, "p", None);
+    assert_ne!(old_hits, fresh);
+    let cmds = update(
+        &mut a,
+        Msg::SearchDone {
+            generation: *generation,
+            hits: old_hits,
+        },
+    );
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert_eq!(a.hits, fresh);
+}
+
+#[test]
+fn search_result_off_the_search_tab_is_dropped() {
+    let mut a = app();
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![
+            irow("pa", "wingetrs", "scoop:main", false),
+            irow("pb", "wingetrs", "scoop:main", false),
+        ]),
+    );
+    let cmds = update(&mut a, key(KeyCode::Char('p')));
+    update(&mut a, key(KeyCode::Tab));
+    assert_eq!(a.tab, Tab::Installed);
+    update(&mut a, key(KeyCode::Down));
+    assert_eq!(a.selected, 1);
+    assert!(answer(&mut a, &cmds[0]).is_empty());
+    assert_eq!(a.selected, 1);
+}
+
+#[test]
+fn typing_during_a_search_queues_only_the_latest() {
+    let mut a = app();
+    let before = a.hits.clone();
+    let c = update(&mut a, key(KeyCode::Char('c')));
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert!(matches!(&c[0], Cmd::Search { query, .. } if query == "c"));
+    assert!(update(&mut a, key(KeyCode::Char('o'))).is_empty());
+    assert!(update(&mut a, key(KeyCode::Char('d'))).is_empty());
+    let next = answer(&mut a, &c[0]);
+    assert!(
+        matches!(&next[..], [Cmd::Search { query, .. }] if query == "cod"),
+        "{next:?}"
+    );
+    assert_eq!(a.hits, before, "the 'c' result is not shown");
+    answer(&mut a, &next[0]);
+    assert_eq!(a.hits, a.search.search("cod", None, 1000));
 }
 
 #[test]

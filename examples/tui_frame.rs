@@ -4,9 +4,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wingetrs::cache::DataDir;
 use wingetrs::catalog::Catalog;
+use wingetrs::catalog::search::SearchIndex;
 use wingetrs::core::PackageEntry;
 use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
 use wingetrs::tui::app::{App, Cmd, Msg, run_search, update};
@@ -105,6 +107,94 @@ fn keystroke_scenario(app: &mut App) -> (u128, u128) {
     (times[SEARCH_RUNS / 2], times[SEARCH_RUNS * 95 / 100])
 }
 
+const BURST: &str = "code";
+const KEY_GAP: Duration = Duration::from_millis(30);
+const BURST_RUNS: usize = 15;
+
+/// Before Task 60: every key searched on the UI thread, one after the other, as keys arrived
+/// every `KEY_GAP`. Returns last key -> final hits.
+fn burst_sync(app: &App) -> Duration {
+    let mut end = Duration::ZERO;
+    for (i, n) in (1..=BURST.len()).enumerate() {
+        let arrival = KEY_GAP * u32::try_from(i).unwrap();
+        let start = end.max(arrival);
+        let t = Instant::now();
+        std::hint::black_box(run_search(&app.search, &BURST[..n], None));
+        end = start + t.elapsed();
+    }
+    end.saturating_sub(KEY_GAP * u32::try_from(BURST.len() - 1).unwrap())
+}
+
+/// Now: real keys every `KEY_GAP`, searches on a worker thread, as the event loop runs them.
+fn burst_async(entries: &[PackageEntry]) -> Duration {
+    let mut app = App::new(entries.to_vec(), GlyphSet::Nerd);
+    let (to_worker, jobs) = std::sync::mpsc::channel::<(Arc<SearchIndex>, Cmd)>();
+    let (to_ui, done) = std::sync::mpsc::channel::<Msg>();
+    let worker = std::thread::spawn(move || {
+        for (index, cmd) in jobs {
+            if let Cmd::Search {
+                generation,
+                query,
+                kind,
+            } = cmd
+            {
+                let hits = run_search(&index, &query, kind);
+                let _ = to_ui.send(Msg::SearchDone { generation, hits });
+            }
+        }
+    });
+    let send = |app: &App, cmds: Vec<Cmd>| {
+        for c in cmds {
+            if matches!(c, Cmd::Search { .. }) {
+                to_worker.send((Arc::clone(&app.search), c)).unwrap();
+            }
+        }
+    };
+    let t0 = Instant::now();
+    let mut sent = 0;
+    let mut last_key = t0;
+    let latency = loop {
+        if sent < BURST.len() {
+            let due = t0 + KEY_GAP * u32::try_from(sent).unwrap();
+            match done.recv_timeout(due.saturating_duration_since(Instant::now())) {
+                Ok(m) => {
+                    let cmds = update(&mut app, m);
+                    send(&app, cmds);
+                }
+                Err(_) => {
+                    let c = BURST[sent..].chars().next().unwrap();
+                    let cmds = update(&mut app, key(KeyCode::Char(c)));
+                    send(&app, cmds);
+                    sent += 1;
+                    last_key = Instant::now();
+                }
+            }
+        } else {
+            let cmds = update(&mut app, done.recv().unwrap());
+            let more = cmds.iter().any(|c| matches!(c, Cmd::Search { .. }));
+            send(&app, cmds);
+            if !more && app.query == BURST {
+                break last_key.elapsed();
+            }
+        }
+    };
+    drop(to_worker);
+    worker
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p));
+    assert_eq!(app.hits, run_search(&app.search, BURST, None));
+    latency
+}
+
+fn report_burst(name: &str, mut times: Vec<u128>) {
+    times.sort_unstable();
+    println!(
+        "{name:<14} median {:>6} us   max {:>6} us",
+        times[times.len() / 2],
+        times[times.len() - 1]
+    );
+}
+
 fn main() {
     let data = DataDir::from_env().expect("data dir");
     let entries = Catalog::open_read_only(&data.catalog_path())
@@ -128,4 +218,13 @@ fn main() {
     }
     let (med, p95) = keystroke_scenario(&mut app);
     println!("tecla 'c'      median {med:>6} us   p95 {p95:>6} us");
+    let sync: Vec<u128> = (0..BURST_RUNS)
+        .map(|_| burst_sync(&app).as_micros())
+        .collect();
+    report_burst("rajada sync", sync);
+    let entries = app.search.entries().to_vec();
+    let asy: Vec<u128> = (0..BURST_RUNS)
+        .map(|_| burst_async(&entries).as_micros())
+        .collect();
+    report_burst("rajada async", asy);
 }
