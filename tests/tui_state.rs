@@ -1216,7 +1216,7 @@ fn end_scrolls_by_two_row_items() {
     let mut a = App::new(es, GlyphSet::Ascii);
     update(&mut a, Msg::Resize(100, 20));
     update(&mut a, key(KeyCode::End));
-    // (20 - CHROME_ROWS 7) / ITEM_ROWS 2 = 6 items per page: the window is 44..50.
+    // (20 - chrome_rows(20) = 8) / ITEM_ROWS 2 = 6 items per page: the window is 44..50.
     assert_eq!(a.selected, 49);
     assert_eq!(a.scroll, 44);
 }

@@ -1,7 +1,10 @@
 Status: DONE_WITH_CONCERNS
 
 Commits:
-(ver abaixo, preenchido apos o commit do relatorio)
+bfa580e feat(tui): status pills and contextual help bar
+15e6d7b chore(tasks): report for task 65
+7e2d09d test(tui): full help key column and accent keys
+(+ commit de correcao da revisao: ver git log)
 
 Gate:
 [OK]   rules 3s
@@ -34,3 +37,7 @@ Adendo (ajuda completa): o dialogo ja atendia o brief (borda accent, inset DIALO
 Mutacao: [OK] mutação PEGA: 'theme.accent().add_modifier(Modifier::BOLD),...' -> 'theme.fg(),...' fez o teste falhar.
 Gate: [OK]   test (564 passed, 16 ignored) / [OK]   gate verde
 Concern anterior sobre "colunas" resolvido: coluna de teclas de 12 celulas verificada.
+
+Revisao (minors): status longo agora e cortado por celulas com `clip` para caber em largura - rw - 2 (pepitas da direita tem prioridade); teste long_status_keeps_right_pills_visible.
+Mutacao: [OK] mutação PEGA: 'clip(s, room.saturating_sub(2))' -> 's.clone()' fez o teste falhar (exit 101).
+Comentarios CHROME_ROWS trocados por chrome_rows. Gate: [OK]   test (565 passed, 16 ignored) / [OK]   gate verde

@@ -654,17 +654,6 @@ fn bar_area(area: Rect) -> Rect {
 }
 
 fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
-    let left = match &app.status {
-        Some(s) => vec![Span::styled(format!(" {s} "), theme.pill_msg())],
-        None => {
-            let len = app.visible_len();
-            let mut text = format!("{} de {len}", if len == 0 { 0 } else { app.selected + 1 });
-            if app.tab == Tab::Search {
-                text.push_str(&format!(" · {} no catálogo", app.search.entries().len()));
-            }
-            vec![Span::styled(text, theme.fg_dim())]
-        }
-    };
     let mut right: Vec<Span> = Vec::new();
     let mut push = |span: Span<'static>| {
         if !right.is_empty() {
@@ -691,6 +680,23 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
         ));
     }
     let bar = bar_area(area);
+    // The right pills win: the left text is cut to what is left, minus a 2-cell gap.
+    let rw: usize = right.iter().map(Span::width).sum();
+    let room = usize::from(bar.width).saturating_sub(rw + 2);
+    let left = match &app.status {
+        Some(s) => vec![Span::styled(
+            format!(" {} ", clip(s, room.saturating_sub(2))),
+            theme.pill_msg(),
+        )],
+        None => {
+            let len = app.visible_len();
+            let mut text = format!("{} de {len}", if len == 0 { 0 } else { app.selected + 1 });
+            if app.tab == Tab::Search {
+                text.push_str(&format!(" · {} no catálogo", app.search.entries().len()));
+            }
+            vec![Span::styled(clip(&text, room), theme.fg_dim())]
+        }
+    };
     frame.render_widget(
         Paragraph::new(compose(left, right, usize::from(bar.width))),
         bar,

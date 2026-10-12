@@ -887,7 +887,7 @@ fn end_of_list_is_visible_with_two_row_items() {
 
 #[test]
 fn end_and_page_keep_selection_on_screen_at_other_heights() {
-    // Page in items = (height - CHROME_ROWS) / 2.
+    // Page in items = (height - chrome_rows(height)) / 2.
     for h in [12u16, 40] {
         let mut a = App::new(long_entries(300), GlyphSet::Ascii);
         update(&mut a, Msg::Resize(100, h));
@@ -1120,4 +1120,27 @@ fn full_help_has_key_column_and_accent_keys() {
     let (_, title_y) = find(" Ajuda ");
     let (tx, _) = find(" Ajuda ");
     assert_eq!(buf[(tx - 1, title_y)].fg, theme.accent().fg.unwrap());
+}
+
+#[test]
+fn long_status_keeps_right_pills_visible() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    for status in ["x".repeat(300), "日本語のメッセージ".repeat(30)] {
+        let mut a = App::new(entries(), GlyphSet::Ascii);
+        a.offline = true;
+        a.status = Some(status);
+        let buf = screen_cells(&a, 80, 24, &theme);
+        let y = (0..24)
+            .find(|&y| row_text(&buf, y).contains("offline"))
+            .expect("offline pill");
+        let text = row_text(&buf, y);
+        assert!(text.contains('…'), "{text}");
+        assert!(text.contains("… ") || text.contains("…"), "{text}");
+        let left = text.split("offline").next().unwrap().trim_end();
+        assert!(left.ends_with('…') || left.ends_with("… "), "{text}");
+        assert!(
+            text.trim_end().ends_with("offline") || text.ends_with(' '),
+            "{text}"
+        );
+    }
 }
