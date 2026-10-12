@@ -135,3 +135,31 @@ pwsh -File scripts/mutate.ps1 -Path src/catalog/index_file.rs -Anchor '         
 - `t` do scanner medido uma única vez (16 ms); a escada (1,27 s) foi dimensionada pelo maior `t` medido no total (228 ms, que é de um lock do próprio teste). Erro de permissão genuíno agora custa ~1,27 s antes de falhar com a mesma mensagem (aceito pelo brief).
 - `scripts/leftovers.ps1` aponta PID 7900 (`bash.exe` de 11/10, `bun run check:q` de outro projeto): não é meu, não encerrei.
 - Limpeza feita: `<S>\t78`, `<S>\t78d`, `<S>\probe78`, `<S>\eacces-*`, `%TEMP%\wingetrs-diag-*.txt`, worktree `wt-78-diag` removido (`git worktree list` só mostra o principal); nenhum `install_executor-*`/`install_ops-*`/`index_file-*` vivo (contagem 0).
+
+## Review fixes (7c6d70a)
+
+`CARGO_TARGET_DIR=target/t78`, sem laços de carga.
+
+1. As 3 renomeações de `merge_into` passam por `rename_retrying(from, to)`. Novo unitário `install::extract::tests::merge_into_a_missing_dest_waits_for_a_held_child_to_be_released`: `dest` ausente, `src/f.txt` aberto com share 1|2|4 e solto no evento "transient fs error, retrying". A camada de teste foi para `fs_retry::release_on_retry` (`#[cfg(test)]`, subscriber global instalado uma vez + `thread_local`).
+```
+pwsh -File scripts/mutate.ps1 -Path src/install/extract.rs -Anchor 'fs_retry::retry("renomear", from, || fs::rename(from, to))' -Replacement 'fs::rename(from, to)' -TestCommand 'cargo test --quiet --lib merge_into_a_missing_dest_waits_for_a_held_child_to_be_released'
+[OK] mutação PEGA: 'fs_retry::retry("renomear", from, || fs::rename(from, to))' -> 'fs::rename(from, to)' fez o teste falhar (exit 101).
+  install::extract::tests::merge_into_a_missing_dest_waits_for_a_held_child_to_be_released --- FAILED
+```
+2. `search` = `search_with(.., std::thread::sleep)`, que lê por `read_retrying_with(path, sleep)`. `read_retrying` sumiu porque ficou sem uso, e a doc dele foi para `read_retrying_with`. Novo unitário `search_reads_through_the_retry`: índice válido vazio (`assemble(0, ..)`), lock exclusivo solto pelo `sleep`, resultado `Ok(Some([]))`. A âncora da mutação é a leitura dentro de `search_with`, porque `search` não chama mais `read_retrying(path)`:
+```
+pwsh -File scripts/mutate.ps1 -Path src/catalog/index_file.rs -Anchor 'match read_retrying_with(path, sleep) {' -Replacement 'match std::fs::read(path) {' -TestCommand 'cargo test --quiet --lib search_reads_through_the_retry'
+[OK] mutação PEGA: 'match read_retrying_with(path, sleep) {' -> 'match std::fs::read(path) {' fez o teste falhar (exit 101).
+  catalog::index_file::tests::search_reads_through_the_retry --- FAILED
+```
+3. `download_one`: o rename do blob roda em `tokio::task::spawn_blocking`. O handle é aguardado, um pânico volta com `resume_unwind` e um cancelamento vira `DownloadError::Io` (mesmo molde de `ops::lock_async`). Sem teste novo.
+
+Gate:
+```
+[OK]   rules 3s
+[OK]   rules-selftest 9s
+[OK]   fmt 1s
+[OK]   clippy 99s
+[OK]   test (621 passed, 16 ignored) 152s
+[OK]   gate verde
+```
