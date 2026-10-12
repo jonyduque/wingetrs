@@ -50,4 +50,5 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 - **`core.autocrlf=true`** converteria fixtures de texto e quebraria comparações de hash: `.gitattributes` marca `tests/fixtures/** -text`.
 - **`find /` no Git Bash varre o disco inteiro** (inclusive `C:\Program Files\Git`); proibido no CLAUDE.md.
 - **O modo automático bloqueia encerrar processos** sem pedido explícito do usuário: liste com `leftovers.ps1` e pergunte.
+- **SHA relatado que existe mas é de outro agente.** Task 58: com agentes em paralelo, o `git commit` falhou em silêncio (erro suprimido, arquivo untracked na lista) e o implementador relatou o SHA do commit de outro agente; `git cat-file -t` dizia `commit`. Audite com `git show --stat <sha>` (os arquivos são os da tarefa?) e `git status --short` (nada da tarefa sobrando na árvore).
 - **Revisor também erra.** Um achado de "fixture sem CRLF" era falso (180 `\r`, SHA conferido): recuse com a evidência, não implemente por segurança.
