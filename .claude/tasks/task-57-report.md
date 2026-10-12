@@ -22,3 +22,6 @@ Decisions:
 - `cargo fmt` ran on the whole tree, which may have touched other agents' files; nothing of theirs was added to my commit.
 
 Concerns: none
+
+Addendum (review Minor): added `arrows_are_ignored_while_help_is_open` in tests/tui_state.rs.
+[OK] mutação PEGA: 'if app.show_help {' -> 'if app.show_help && !matches!(key.code, KeyCode::Right) {' fez o teste falhar (exit 101).

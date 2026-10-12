@@ -925,3 +925,15 @@ fn arrows_belong_to_an_open_dialog() {
     assert_eq!(a.tab, tab);
     assert!(confirm_open(&a));
 }
+
+#[test]
+fn arrows_are_ignored_while_help_is_open() {
+    let mut a = app();
+    update(&mut a, key(KeyCode::Char('?')));
+    assert!(a.show_help);
+    let tab = a.tab;
+    update(&mut a, key(KeyCode::Right));
+    update(&mut a, key(KeyCode::Left));
+    assert_eq!(a.tab, tab);
+    assert!(a.show_help);
+}
