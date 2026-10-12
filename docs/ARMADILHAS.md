@@ -50,6 +50,7 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 
 ## Ambiente e repositório
 
+- **Apagar por caminho interpolado.** Task 72: script gerado com `Remove-Item "$root\$Name\*"` e `$Name` vazio apagou o scratchpad inteiro da sessão. Antes de apagar, confira que cada parte do caminho é não vazia (`if (-not $Name) { throw }`) e que o alvo fica dentro de uma pasta criada pelo próprio script.
 - **`core.autocrlf=true`** converteria fixtures de texto e quebraria comparações de hash: `.gitattributes` marca `tests/fixtures/** -text`.
 - **`find /` no Git Bash varre o disco inteiro** (inclusive `C:\Program Files\Git`); proibido no CLAUDE.md.
 - **O modo automático bloqueia encerrar processos** sem pedido explícito do usuário: liste com `leftovers.ps1` e pergunte.
