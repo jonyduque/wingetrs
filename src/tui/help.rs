@@ -8,6 +8,14 @@ const ELLIPSIS: &str = " …";
 
 /// Key hints for the current tab and focus, most useful first, `?` last.
 pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.tab == Tab::Settings {
+        return vec![
+            ("↑/↓", "escolher"),
+            ("enter", "mudar"),
+            ("←/→", "aba"),
+            ("?", "ajuda"),
+        ];
+    }
     let mut out = Vec::new();
     if app.focus == Focus::Details {
         out.push(("esc", "voltar"));
@@ -19,6 +27,7 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Search => out.push(("i", "instalar")),
         Tab::Installed => out.push(("u", "remover")),
         Tab::Updates => out.push(("U", "atualizar")),
+        Tab::Settings => {}
     }
     out.push(("ctrl+s", "fonte"));
     if app.toasts.iter().any(|t| t.kind == ToastKind::Error) {

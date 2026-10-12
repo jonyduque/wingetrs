@@ -12,7 +12,8 @@ use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
 use crate::tui::app::{Action, App, Cmd, InstallFail, Msg, Planned, run_search, update};
 use crate::tui::jobs;
-use crate::tui::theme::{GlyphSet, Theme, detect_depth};
+use crate::tui::settings::SettingsState;
+use crate::tui::theme::{ColorDepth, GlyphSet, Theme, detect_depth};
 use crate::tui::view::view;
 use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update};
 use anyhow::Context;
@@ -101,19 +102,27 @@ struct Ctx {
 
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
 /// The first frame is drawn before the catalog is read; loading happens in the background.
-pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
+pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     let start = Instant::now();
     let data = DataDir::from_env()?;
     data.ensure()?;
     let cfg = Config::load(&data.config_path())?;
-    let theme = Theme::new(
-        cfg.theme != "light",
-        detect_depth(
-            std::env::var("COLORTERM").ok().as_deref(),
-            std::env::var("NO_COLOR").ok().as_deref(),
-        ),
+    let depth = detect_depth(
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("NO_COLOR").ok().as_deref(),
     );
+    let dark = cfg.theme != "light";
+    let theme = Theme::new(dark, depth);
     let mut app = App::new(Vec::new(), glyphs);
+    app.dark = dark;
+    app.settings = SettingsState::new(cfg.behavior, glyphs, dark, glyphs_forced);
+    app.buckets_summary = cfg
+        .scoop_buckets
+        .iter()
+        .chain(cfg.buckets.iter().map(|b| &b.name))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
     app.status = Some("carregando catálogo…".into());
     // `ratatui::init` also installs a panic hook that restores the terminal before the message.
     let mut terminal = ratatui::init();
@@ -129,7 +138,9 @@ pub fn run(glyphs: GlyphSet) -> anyhow::Result<()> {
     // A worker panic is re-raised by the loop; restore the terminal on that path too.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match (drawn, tokio::runtime::Runtime::new()) {
-            (Ok(()), Ok(rt)) => rt.block_on(event_loop(&mut terminal, app, &theme, data, cfg)),
+            (Ok(()), Ok(rt)) => {
+                rt.block_on(event_loop(&mut terminal, app, theme, depth, data, cfg))
+            }
             (Err(e), _) => Err(e.into()),
             (_, Err(e)) => Err(e.into()),
         }
@@ -147,7 +158,8 @@ fn index_age(data: &DataDir) -> Option<i64> {
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     mut app: App,
-    theme: &Theme,
+    mut theme: Theme,
+    depth: ColorDepth,
     data: DataDir,
     cfg: Config,
 ) -> anyhow::Result<()> {
@@ -163,6 +175,7 @@ async fn event_loop(
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
     let mut stats = LoopStats::new();
+    let mut dark_now = app.dark;
 
     loop {
         let wake = app.next_toast_deadline();
@@ -225,6 +238,20 @@ async fn event_loop(
                 }
                 Cmd::PlanRemove { app } => spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app)),
                 Cmd::PlanUpgradeAll => spawn_plan(&ctx, jobs::plan_upgrade_all),
+                Cmd::SaveSettings {
+                    behavior,
+                    glyphs,
+                    theme,
+                } => {
+                    spawn_job(&ctx, move |c, _| {
+                        Msg::SettingsSaved(jobs::save_settings(
+                            &c.data.config_path(),
+                            behavior,
+                            &glyphs,
+                            &theme,
+                        ))
+                    });
+                }
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
                 Cmd::Search {
@@ -244,8 +271,12 @@ async fn event_loop(
             }
         }
         if draw {
+            if app.dark != dark_now {
+                dark_now = app.dark;
+                theme = Theme::new(dark_now, depth);
+            }
             stats.draw(batch_len, || {
-                terminal.draw(|f| view(&app, theme, f)).map(|_| ())
+                terminal.draw(|f| view(&app, &theme, f)).map(|_| ())
             })?;
         }
     }

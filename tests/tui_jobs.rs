@@ -394,3 +394,32 @@ async fn plan_remove_text_uses_the_plan_lines() {
     assert!(text.contains("Desfazer entrada no PATH: "), "{text}");
     assert!(!text.contains("Path ") && !text.contains("Shim "), "{text}");
 }
+
+#[test]
+fn save_settings_keeps_buckets() {
+    let dir = TempDir::new().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(
+        &p,
+        "[[buckets]]
+name = \"x\"
+repo = \"o/x\"
+",
+    )
+    .unwrap();
+    jobs::save_settings(
+        &p,
+        wingetrs::config::Behavior {
+            purge: true,
+            ..Default::default()
+        },
+        "ascii",
+        "light",
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(text.contains("name = \"x\""), "{text}");
+    assert!(text.contains("purge = true"), "{text}");
+    assert!(text.contains("glyphs = \"ascii\""), "{text}");
+    assert!(text.contains("theme = \"light\""), "{text}");
+}

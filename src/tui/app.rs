@@ -1,5 +1,6 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
 use crate::catalog::search::{SearchHit, SearchIndex};
+use crate::config::{Behavior, Config};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
@@ -7,6 +8,7 @@ use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::layout::{FILTER_GAP, ITEM_GAP};
 use crate::tui::picker::{PickOutcome, Picker, PickerItem};
+use crate::tui::settings::{SettingsState, glyphs_name};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -19,6 +21,7 @@ pub enum Tab {
     Search,
     Installed,
     Updates,
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +65,8 @@ pub enum Msg {
     RefreshFinished(Vec<SourceReport>),
     /// Another process holds the update lock; not a failure and not offline.
     RefreshBusy,
+    /// Result of writing the settings to `config.toml`.
+    SettingsSaved(Result<(), String>),
     /// Result of planning an install, upgrade or removal.
     Planned(Result<Planned, String>),
     /// Download/extract progress of the running operation.
@@ -188,6 +193,12 @@ pub enum Cmd {
         app: String,
         residues: Vec<Residue>,
     },
+    /// Write the settings to `config.toml` (`glyphs`: nerd|unicode|ascii, `theme`: dark|light).
+    SaveSettings {
+        behavior: Behavior,
+        glyphs: String,
+        theme: String,
+    },
     /// Run `run_search` off the UI thread and answer with `Msg::SearchDone`.
     Search {
         generation: u64,
@@ -264,6 +275,12 @@ pub struct App {
     pub toasts: Vec<Toast>,
     /// The refresh in flight was asked for with Ctrl+R (its success is announced).
     pub refresh_forced: bool,
+    /// State of the Settings tab.
+    pub settings: SettingsState,
+    /// Dark palette in use (the loop rebuilds the theme when it changes).
+    pub dark: bool,
+    /// Bucket names for the read-only sources section.
+    pub buckets_summary: String,
 }
 
 const MAX_HITS: usize = 1000;
@@ -313,6 +330,9 @@ impl App {
             now: Instant::now(),
             toasts: Vec::new(),
             refresh_forced: false,
+            settings: SettingsState::new(Config::default().behavior, glyphs, true, false),
+            dark: true,
+            buckets_summary: String::new(),
         };
         app.research();
         app
@@ -389,6 +409,7 @@ impl App {
         match self.tab {
             Tab::Search => self.hits.len(),
             Tab::Installed | Tab::Updates => self.installed_view().len(),
+            Tab::Settings => 0,
         }
     }
 
@@ -409,6 +430,7 @@ impl App {
                     _ => None,
                 }
             }
+            Tab::Settings => None,
         }
     }
 
@@ -530,7 +552,7 @@ impl App {
         self.focus = Focus::List;
         let mut cmds = self.refresh_view();
         if tab != Tab::Search {
-            if self.installed.is_empty() {
+            if self.installed.is_empty() && tab != Tab::Settings {
                 cmds.push(Cmd::ScanInstalled);
             }
             cmds.extend(self.details_cmd());
@@ -629,6 +651,29 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.search_in_flight.take_if(|f| f.0 == generation);
             Vec::new()
         }
+        Msg::SettingsSaved(result) => {
+            app.status = None;
+            match result {
+                Ok(()) => {
+                    app.settings.saved = (
+                        app.settings.behavior,
+                        app.settings.glyphs,
+                        app.settings.dark,
+                    );
+                    app.push_toast(ToastKind::Success, "ajustes salvos");
+                }
+                Err(e) => {
+                    let (behavior, glyphs, dark) = app.settings.saved;
+                    app.settings.behavior = behavior;
+                    app.settings.glyphs = glyphs;
+                    app.settings.dark = dark;
+                    app.glyphs = glyphs;
+                    app.dark = dark;
+                    app.push_toast(ToastKind::Error, format!("falha ao salvar: {e}"));
+                }
+            }
+            Vec::new()
+        }
         Msg::Planned(result) => on_planned(app, result),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
@@ -716,6 +761,11 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         }
         return Vec::new();
     }
+    if app.tab == Tab::Settings
+        && let Some(cmds) = settings_key(app, key)
+    {
+        return cmds;
+    }
     let last = app.visible_len().saturating_sub(1);
     let empty = app.query.is_empty();
     match key.code {
@@ -770,6 +820,47 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Keys of the Settings tab; `None` leaves the key to the common handling (tabs, Esc).
+fn settings_key(app: &mut App, key: KeyEvent) -> Option<Vec<Cmd>> {
+    let last = crate::tui::settings::ORDER.len() - 1;
+    Some(match key.code {
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.settings.selected = (app.settings.selected + 1).min(last);
+            Vec::new()
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.settings.selected = app.settings.selected.saturating_sub(1);
+            Vec::new()
+        }
+        KeyCode::Enter | KeyCode::Char(' ' | 'l') => change_setting(app, true),
+        KeyCode::Char('h') => change_setting(app, false),
+        KeyCode::Char('q') => vec![Cmd::Quit],
+        KeyCode::Char('?') => {
+            app.show_help = true;
+            Vec::new()
+        }
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right | KeyCode::Esc => {
+            return None;
+        }
+        _ => Vec::new(),
+    })
+}
+
+/// Cycles the selected setting, applies it at once and asks for it to be saved.
+fn change_setting(app: &mut App, forward: bool) -> Vec<Cmd> {
+    if !app.settings.cycle(forward) {
+        return Vec::new();
+    }
+    app.glyphs = app.settings.glyphs;
+    app.dark = app.settings.dark;
+    app.status = Some("salvando…".to_string());
+    vec![Cmd::SaveSettings {
+        behavior: app.settings.behavior,
+        glyphs: glyphs_name(app.settings.glyphs).to_string(),
+        theme: if app.settings.dark { "dark" } else { "light" }.to_string(),
+    }]
 }
 
 const NOT_OURS: &str = "só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui";
@@ -1012,15 +1103,17 @@ pub fn next_tab(tab: Tab) -> Tab {
     match tab {
         Tab::Search => Tab::Installed,
         Tab::Installed => Tab::Updates,
-        Tab::Updates => Tab::Search,
+        Tab::Updates => Tab::Settings,
+        Tab::Settings => Tab::Search,
     }
 }
 
 /// Previous tab in the cycle.
 pub fn prev_tab(tab: Tab) -> Tab {
     match tab {
-        Tab::Search => Tab::Updates,
+        Tab::Search => Tab::Settings,
         Tab::Installed => Tab::Search,
         Tab::Updates => Tab::Installed,
+        Tab::Settings => Tab::Updates,
     }
 }

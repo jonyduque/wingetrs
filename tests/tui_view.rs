@@ -1240,3 +1240,11 @@ fn repeated_toast_shows_its_count_in_the_title() {
     let out = render(&a, 100, 24);
     assert!(out.contains("+ Sucesso ×2"), "{out}");
 }
+
+#[test]
+fn settings_screen_snapshot() {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.tab = wingetrs::tui::app::Tab::Settings;
+    a.buckets_summary = "main, extras".into();
+    insta::assert_snapshot!(render(&a, 100, 24));
+}

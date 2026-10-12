@@ -9,6 +9,7 @@ use crate::tui::layout::{
     PICKER_FOOTER_SLACK, inset, split_with_gutter,
 };
 use crate::tui::picker::{Picker, window};
+use crate::tui::settings::{ORDER, SettingId};
 use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{Glyphs, Theme};
 use crate::tui::toast::draw_toasts;
@@ -58,7 +59,11 @@ const TOAST_MIN_HEIGHT: u16 = 12;
 fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Option<Rect> {
     let g = Glyphs::for_set(app.glyphs);
     if area.height < MIN_HEIGHT_FOR_CHROME {
-        draw_list(app, theme, g, frame, area);
+        if app.tab == Tab::Settings {
+            draw_settings(app, theme, g, frame, area);
+        } else {
+            draw_list(app, theme, g, frame, area);
+        }
         return None;
     }
     let help_rows = u16::from(area.height >= HELP_BAR_MIN_HEIGHT);
@@ -88,11 +93,14 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Optio
         Constraint::Min(0),
     ])
     .split(inner);
-    draw_search_line(app, theme, g, frame, parts[0]);
     let body = parts[2];
-    if area.width < MIN_WIDTH_FOR_DETAILS {
+    if app.tab == Tab::Settings {
+        draw_settings(app, theme, g, frame, inner);
+    } else if area.width < MIN_WIDTH_FOR_DETAILS {
+        draw_search_line(app, theme, g, frame, parts[0]);
         draw_list(app, theme, g, frame, body);
     } else {
+        draw_search_line(app, theme, g, frame, parts[0]);
         let (left, divider, right) = split_with_gutter(body, 55);
         draw_list(app, theme, g, frame, left);
         let divider_style = if app.focus == Focus::Details {
@@ -124,6 +132,7 @@ fn tab_index(tab: Tab) -> usize {
         Tab::Search => 0,
         Tab::Installed => 1,
         Tab::Updates => 2,
+        Tab::Settings => 3,
     }
 }
 
@@ -171,7 +180,90 @@ fn tab_labels(app: &App, g: &Glyphs) -> Vec<TabLabel> {
             },
             warn: count > 0,
         },
+        plain(with_glyph(g.tab_settings, "Ajustes")),
     ]
+}
+
+/// Settings tab: sections, one row per setting and the selected one's description last.
+fn draw_settings(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let st = &app.settings;
+    let label_w = ORDER
+        .iter()
+        .map(|id| Span::raw(id.label()).width())
+        .max()
+        .unwrap_or(0);
+    let heading = |text: &str| Line::from(Span::styled(text.to_string(), theme.accent()));
+    let row = |i: usize, id: SettingId| {
+        let sel = i == st.selected;
+        let (bar, label_style) = if sel {
+            (
+                Span::styled(format!("{} ", g.bar), theme.sel_bar()),
+                theme.sel_title().add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (Span::raw("  "), theme.fg())
+        };
+        let label = id.label();
+        let pad = " ".repeat(label_w + 2 - Span::raw(label).width());
+        let mut spans = vec![
+            bar,
+            Span::styled(label.to_string(), label_style),
+            Span::raw(pad),
+        ];
+        let current = st.value_index(id);
+        for (n, opt) in id.options().iter().enumerate() {
+            if n > 0 {
+                spans.push(Span::raw("  "));
+            }
+            if n == current {
+                spans.push(Span::styled(
+                    format!("‹ {opt} ›"),
+                    theme.accent().add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled((*opt).to_string(), theme.fg_dim()));
+            }
+        }
+        if id == SettingId::Glyphs && st.glyphs_forced {
+            spans.push(Span::styled(
+                "  (substituído por --glyphs nesta sessão)",
+                theme.fg_dim(),
+            ));
+        }
+        Line::from(spans)
+    };
+    let mut lines = vec![heading("Operações")];
+    for (i, id) in ORDER.iter().enumerate().take(4) {
+        lines.push(row(i, *id));
+    }
+    lines.push(Line::raw(""));
+    lines.push(heading("Aparência"));
+    for (i, id) in ORDER.iter().enumerate().skip(4) {
+        lines.push(row(i, *id));
+    }
+    lines.push(Line::raw(""));
+    lines.push(heading("Fontes (somente leitura)"));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Buckets do scoop  ", theme.fg()),
+        Span::styled(app.buckets_summary.clone(), theme.fg_dim()),
+    ]));
+    let body_h = area.height.saturating_sub(2);
+    let body = Rect::new(area.x, area.y, area.width, body_h.min(area.height));
+    frame.render_widget(Paragraph::new(lines), body);
+    if area.height >= 2 {
+        let desc = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                st.current_id().description(),
+                theme.fg_dim().add_modifier(Modifier::ITALIC),
+            )),
+            desc,
+        );
+    }
 }
 
 fn format_age(secs: i64) -> String {
@@ -439,6 +531,7 @@ fn list_lines<'a>(
                 items.push([compose(left, right, width), second(sel, detail)]);
             }
         }
+        Tab::Settings => {}
     }
     let mut lines = Vec::new();
     for (n, item) in items.into_iter().enumerate() {
@@ -474,6 +567,7 @@ fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect
             Tab::Search => "nenhum resultado",
             Tab::Installed => "nenhum pacote instalado encontrado",
             Tab::Updates => "tudo atualizado",
+            Tab::Settings => "",
         };
         frame.render_widget(
             Paragraph::new(Span::styled(text, italic_muted(theme))),
@@ -527,6 +621,7 @@ fn install_status(theme: &Theme, g: &Glyphs, r: &ListRow) -> Line<'static> {
 
 fn basics(app: &App, theme: &Theme, g: &Glyphs) -> Option<Basics> {
     match app.tab {
+        Tab::Settings => None,
         Tab::Search => {
             let h = app.hits.get(app.selected)?;
             let e = app.search.entries().get(h.index)?;

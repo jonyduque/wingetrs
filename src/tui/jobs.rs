@@ -211,3 +211,19 @@ pub fn clean(o: &OpsCtx<'_>, app: &str, residues: &[Residue]) -> Vec<String> {
     .filter_map(Result::err)
     .collect()
 }
+
+/// Writes the Settings tab's values into `config.toml`, keeping everything else in the file.
+pub fn save_settings(
+    path: &Path,
+    behavior: crate::config::Behavior,
+    glyphs: &str,
+    theme: &str,
+) -> Result<(), String> {
+    crate::config::update_file(path, |c| {
+        c.behavior = behavior;
+        c.glyphs = glyphs.to_string();
+        c.theme = theme.to_string();
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}

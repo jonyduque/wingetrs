@@ -86,9 +86,11 @@ fn tabs_cycle_and_filter_toggles() {
     update(&mut a, key(KeyCode::Tab));
     assert_eq!(a.tab, Tab::Updates);
     update(&mut a, key(KeyCode::Tab));
+    assert_eq!(a.tab, Tab::Settings);
+    update(&mut a, key(KeyCode::Tab));
     assert_eq!(a.tab, Tab::Search);
     update(&mut a, key(KeyCode::BackTab));
-    assert_eq!(a.tab, Tab::Updates);
+    assert_eq!(a.tab, Tab::Settings);
     let mut b = app();
     step(&mut b, ctrl('s'));
     assert_eq!(b.filter, SourceFilter::Winget);
@@ -872,19 +874,19 @@ fn stale_details_keep_the_spinner_for_the_current_item() {
 #[test]
 fn right_and_left_arrows_cycle_tabs() {
     let mut a = app();
-    for want in [Tab::Installed, Tab::Updates, Tab::Search] {
+    for want in [Tab::Installed, Tab::Updates, Tab::Settings, Tab::Search] {
         update(&mut a, key(KeyCode::Right));
         assert_eq!(a.tab, want);
     }
     update(&mut a, key(KeyCode::Left));
-    assert_eq!(a.tab, Tab::Updates);
+    assert_eq!(a.tab, Tab::Settings);
     update(&mut a, key(KeyCode::Left));
-    assert_eq!(a.tab, Tab::Installed);
+    assert_eq!(a.tab, Tab::Updates);
 }
 
 #[test]
 fn arrows_match_tab_and_backtab() {
-    for start in [Tab::Search, Tab::Installed, Tab::Updates] {
+    for start in [Tab::Search, Tab::Installed, Tab::Updates, Tab::Settings] {
         for (arrow, other) in [
             (KeyCode::Right, KeyCode::Tab),
             (KeyCode::Left, KeyCode::BackTab),
@@ -1379,4 +1381,130 @@ fn error_toast_adds_the_esc_hint() {
     let h = hints(&a);
     let esc = h.iter().position(|x| *x == ("esc", "fecha erro")).unwrap();
     assert_eq!(esc + 1, h.iter().position(|x| x.0 == "?").unwrap());
+}
+
+// ---- Settings tab (Task 68) ----
+use wingetrs::config::ConfirmMode;
+
+fn on_settings() -> App {
+    let mut a = app();
+    a.tab = Tab::Settings;
+    a
+}
+
+#[test]
+fn settings_tab_is_in_the_tab_cycle() {
+    let mut a = app();
+    for want in [Tab::Installed, Tab::Updates, Tab::Settings, Tab::Search] {
+        update(&mut a, key(KeyCode::Tab));
+        assert_eq!(a.tab, want);
+    }
+    update(&mut a, key(KeyCode::BackTab));
+    assert_eq!(a.tab, Tab::Settings);
+    let mut b = app();
+    b.tab = Tab::Updates;
+    update(&mut b, key(KeyCode::Right));
+    assert_eq!(b.tab, Tab::Settings);
+    let mut c = app();
+    update(&mut c, key(KeyCode::Left));
+    assert_eq!(c.tab, Tab::Settings);
+}
+
+#[test]
+fn enter_changes_confirm_and_requests_save() {
+    let mut a = on_settings();
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(a.settings.behavior.confirm, ConfirmMode::Removals);
+    assert_eq!(
+        cmds,
+        vec![Cmd::SaveSettings {
+            behavior: wingetrs::config::Behavior {
+                confirm: ConfirmMode::Removals,
+                ..Default::default()
+            },
+            glyphs: "nerd".into(),
+            theme: "dark".into(),
+        }]
+    );
+    assert_eq!(a.status.as_deref(), Some("salvando…"));
+}
+
+#[test]
+fn failed_save_restores_the_last_saved_value() {
+    let mut a = on_settings();
+    update(&mut a, key(KeyCode::Enter));
+    update(&mut a, Msg::SettingsSaved(Err("disco cheio".into())));
+    assert_eq!(a.settings.behavior.confirm, ConfirmMode::Always);
+    assert_eq!(a.toasts[0].kind, ToastKind::Error);
+    assert!(a.toasts[0].text.contains("disco cheio"));
+    assert_eq!(a.status, None);
+}
+
+#[test]
+fn successful_save_is_remembered_and_announced() {
+    let mut a = on_settings();
+    update(&mut a, key(KeyCode::Enter));
+    update(&mut a, Msg::SettingsSaved(Ok(())));
+    update(&mut a, Msg::SettingsSaved(Err("x".into())));
+    assert_eq!(a.settings.behavior.confirm, ConfirmMode::Removals);
+    update(&mut a, Msg::SettingsSaved(Ok(())));
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.text == "ajustes salvos" && t.kind == ToastKind::Success)
+    );
+}
+
+#[test]
+fn forced_glyphs_cannot_be_changed() {
+    let mut a = on_settings();
+    a.settings.glyphs_forced = true;
+    for _ in 0..4 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(cmds.is_empty());
+    assert_eq!(a.glyphs, GlyphSet::Nerd);
+}
+
+#[test]
+fn letters_do_not_type_in_settings() {
+    let mut a = on_settings();
+    update(&mut a, key(KeyCode::Char('x')));
+    assert!(a.query.is_empty());
+}
+
+#[test]
+fn theme_setting_flips_dark() {
+    let mut a = on_settings();
+    for _ in 0..5 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    update(&mut a, key(KeyCode::Enter));
+    assert!(!a.dark);
+}
+
+#[test]
+fn h_cycles_backwards_and_arrows_leave_settings() {
+    let mut a = on_settings();
+    update(&mut a, key(KeyCode::Char('h')));
+    assert_eq!(a.settings.behavior.confirm, ConfirmMode::Never);
+    update(&mut a, key(KeyCode::Right));
+    assert_eq!(a.tab, Tab::Search);
+    assert_eq!(a.settings.behavior.confirm, ConfirmMode::Never);
+}
+
+#[test]
+fn list_keys_do_not_break_the_settings_tab() {
+    let mut a = on_settings();
+    for c in [
+        KeyCode::End,
+        KeyCode::PageDown,
+        KeyCode::Home,
+        KeyCode::Backspace,
+    ] {
+        assert!(update(&mut a, key(c)).is_empty());
+    }
+    assert_eq!(a.selected, 0);
+    assert_eq!(a.settings.selected, 0);
 }

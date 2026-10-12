@@ -905,7 +905,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 _ => GlyphSet::Nerd,
             },
         };
-        return crate::tui::run::run(glyphs);
+        return crate::tui::run::run(glyphs, cli.glyphs.is_some());
     }
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_async(cli, data, cfg, early))
