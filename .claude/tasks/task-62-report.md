@@ -39,3 +39,9 @@ Decisions:
 Concerns:
 - At 100 columns the picker/residues dialog is clamped to the screen, so its inner text lost 4 columns; the long residues line is now cut (")" of "(pode ser de outra instalação)" disappears). Picker lines do not wrap.
 - Used CARGO_TARGET_DIR=target/t62 (removed at the end).
+
+Revisão (CHANGES_REQUESTED) tratada:
+- draw_picker agora mostra a nota logo após a caixa de marcação: "[ ] (outra instalação?) label  detail"; OTHER_INSTALL_NOTE é abreviada só no desenho da TUI (a constante e a CLI não mudaram). Teste residue_conflict_warning_survives_narrow_terminals (100/80/60 colunas) verde.
+- Mutation: "[OK] mutação PEGA: 'format!("{cursor} {mark}{note}{}  {}", it.label, it.detail)' -> 'format!("{cursor} {mark}{}  {}{note}", it.label, it.detail)' fez o teste falhar (exit 101)."
+- Nova constante layout::PICKER_FOOTER_SLACK (=2) no lugar do "+2". Snapshot dos resíduos atualizado.
+- Gate: [OK] test (538 passed, 16 ignored) / [OK] gate verde. Concern anterior (corte do aviso) resolvido.

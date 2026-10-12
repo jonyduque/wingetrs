@@ -54,3 +54,5 @@ pub fn split_with_gutter(area: Rect, left_percent: u16) -> (Rect, u16, Rect) {
     let right = Rect::new(right_x, area.y, area.right() - right_x, area.height);
     (left, divider, right)
 }
+/// Lines a picker dialog reserves beyond border and padding: the footer line plus one spare.
+pub const PICKER_FOOTER_SLACK: u16 = 2;

@@ -530,3 +530,33 @@ fn layout_constants_are_the_documented_scale() {
         [1, 1, 1, 0, 2, 1, 1, 2, 1, 1, 1]
     );
 }
+
+#[test]
+fn residue_conflict_warning_survives_narrow_terminals() {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    let long = "C:/Users/someone/AppData/Local/vendor/product/very/long/path/powertoys";
+    assert!(long.len() >= 70);
+    update(
+        &mut a,
+        Msg::InstallFinished(Ok(Done {
+            summary: "powertoys removido".into(),
+            residues: Some((
+                "powertoys".into(),
+                vec![Residue {
+                    kind: ResidueKind::Folder { path: long.into() },
+                    confidence: Confidence::Low,
+                    preselected: false,
+                    note: Some("pode ser de outra instalação".to_string()),
+                }],
+            )),
+        })),
+    );
+    for w in [100, 80, 60] {
+        let out = render(&a, w, 16);
+        let line = out
+            .lines()
+            .find(|l| l.contains("[ ]"))
+            .unwrap_or_else(|| panic!("no residue row at {w}: {out}"));
+        assert!(line.contains("(outra instalação?)"), "{w}: {line}");
+    }
+}

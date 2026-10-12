@@ -1,8 +1,11 @@
 //! Pure rendering of `App` (spec §7.1). Colors come only from `Theme` tokens.
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
+use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{App, Focus, Modal, RunProgress, Tab};
-use crate::tui::layout::{BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, PAD_X, inset};
+use crate::tui::layout::{
+    BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, PAD_X, PICKER_FOOTER_SLACK, inset,
+};
 use crate::tui::picker::{Picker, window};
 use crate::tui::theme::{Glyphs, Theme};
 use ratatui::Frame;
@@ -740,7 +743,7 @@ fn draw_picker(
 ) {
     let items = picker.items();
     // Rows left after borders, vertical padding, the footer line and one spare line.
-    let spare = 2 * (BORDER + DIALOG_PAD_Y) + 2;
+    let spare = 2 * (BORDER + DIALOG_PAD_Y) + PICKER_FOOTER_SLACK;
     let rows = usize::from(area.height.saturating_sub(spare)).clamp(1, 12);
     let range = window(picker.selected(), items.len(), rows);
     let mut lines: Vec<Line> = Vec::new();
@@ -754,10 +757,18 @@ fn draw_picker(
         } else {
             "[ ] "
         };
+        // The warning goes before the label/path: long paths get cut at the end.
         let note = it
             .note
             .as_deref()
-            .map(|n| format!(" ({n})"))
+            .map(|n| {
+                let n = if n == OTHER_INSTALL_NOTE {
+                    "outra instalação?"
+                } else {
+                    n
+                };
+                format!("({n}) ")
+            })
             .unwrap_or_default();
         let style = if !it.selectable {
             theme.muted()
@@ -767,7 +778,7 @@ fn draw_picker(
             theme.fg()
         };
         lines.push(Line::from(Span::styled(
-            format!("{cursor} {mark}{}  {}{note}", it.label, it.detail),
+            format!("{cursor} {mark}{note}{}  {}", it.label, it.detail),
             style,
         )));
     }
