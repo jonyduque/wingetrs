@@ -22,3 +22,8 @@ Decisions:
 - Existing tests adapted: narrow_terminal probe "versão" (description now appears in the list), list_and_details test (description rows), selected-row prefix "│ | ".
 
 Concerns: none (full test build used CARGO_TARGET_DIR=target/t64 because target/debug/wingetrs.exe was locked; remove it).
+
+Follow-up (review fixes):
+- clip now cuts by terminal cell width and maps \r/\n/\t to space; tests cjk_description_is_clipped_by_cell_width, newlines_in_description_become_spaces, installed_second_line_explains_missing_correlation; CHROME_ROWS doc moved back above it.
+- [OK] mutação PEGA: 'text.chars().map(cell_width).sum::<usize>() <= max' -> 'text.chars().count() <= max' fez o teste falhar (exit 101).
+- Gate: [OK]   gate verde (557 passed, 16 ignored)

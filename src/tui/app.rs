@@ -231,9 +231,9 @@ pub fn run_search(index: &SearchIndex, query: &str, kind: Option<SourceKind>) ->
     index.search(query, kind, MAX_HITS)
 }
 const PAGE: usize = 10;
-/// Rows of screen taken by tabs (3), search line, filter gap, bottom border and status bar.
 /// Screen lines per list item: title and description.
 pub const ITEM_ROWS: usize = 2;
+/// Rows of screen taken by tabs (3), search line, filter gap, bottom border and status bar.
 const CHROME_ROWS: usize = 3 + 1 + FILTER_GAP as usize + 1 + 1;
 
 impl App {

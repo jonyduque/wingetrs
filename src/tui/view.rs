@@ -297,13 +297,34 @@ pub fn list_window(
     start..(start + height).min(len)
 }
 
-/// Cuts `text` to at most `max` columns, ending in an ellipsis when it was cut.
+/// Cuts `text` to at most `max` terminal cells (wide chars count 2), ending in an
+/// ellipsis when it was cut. Control whitespace becomes a plain space first.
 fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
+    let cell_width = |c: char| Span::raw(c.encode_utf8(&mut [0; 4]).to_string()).width();
+    let text: String = text
+        .chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if text.chars().map(cell_width).sum::<usize>() <= max {
+        return text;
     }
-    let keep = max.saturating_sub(1);
-    let mut out: String = text.chars().take(keep).collect();
+    let budget = max.saturating_sub(1);
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = cell_width(c);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
     out.push('…');
     out
 }

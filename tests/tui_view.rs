@@ -903,3 +903,66 @@ fn end_and_page_keep_selection_on_screen_at_other_heights() {
         assert!(line.contains(&name), "h={h}: {line}");
     }
 }
+
+fn one_entry_with_description(d: &str) -> App {
+    let mut e = entries().remove(0);
+    e.description = Some(d.into());
+    App::new(vec![e], GlyphSet::Ascii)
+}
+
+#[test]
+fn cjk_description_is_clipped_by_cell_width() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let a = one_entry_with_description("日本語のとても長い説明文日本語のと");
+    let buf = screen_cells(&a, 100, 20, &theme);
+    let y = (0..20)
+        .find(|&y| row_text(&buf, y).contains("Microsoft.PowerToys ·"))
+        .expect("second line");
+    let div = (3..100u16)
+        .find(|&x| buf[(x, y)].symbol() == "│")
+        .expect("divider");
+    assert_eq!(buf[(div - 1, y)].symbol(), " ", "gutter");
+    let before: String = (0..div - 1)
+        .map(|x| buf[(x, y)].symbol().to_string())
+        .collect();
+    assert!(before.trim_end().ends_with('…'), "{before}");
+}
+
+#[test]
+fn newlines_in_description_become_spaces() {
+    let a = one_entry_with_description("linha1\nlinha2");
+    assert!(render(&a, 120, 20).contains("linha1 linha2"));
+}
+
+#[test]
+fn installed_second_line_explains_missing_correlation() {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    let row = |name: &str, c: Correlation| ListRow {
+        name: name.into(),
+        origin: "arp".into(),
+        installed_version: Some("1".into()),
+        correlation: c,
+        latest: None,
+        state: UpdateState::UpToDate,
+        tiebreak: None,
+    };
+    let _ = Rule::ScoopManifest;
+    let mut a = App::new(vec![], GlyphSet::Ascii);
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![
+            row("Orfao", Correlation::Unmatched),
+            row(
+                "Duplo",
+                Correlation::Ambiguous {
+                    candidates: vec!["a".into(), "b".into()],
+                    rule: Rule::ScoopManifest,
+                },
+            ),
+        ]),
+    );
+    key(&mut a, crossterm::event::KeyCode::Tab);
+    let out = render(&a, 120, 20);
+    assert!(out.contains("sem correspondência no catálogo"), "{out}");
+    assert!(out.contains("correspondência ambígua"), "{out}");
+}
