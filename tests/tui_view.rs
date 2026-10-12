@@ -3,7 +3,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use wingetrs::core::{PackageEntry, SourceKind};
-use wingetrs::tui::app::{App, Msg, update};
+use wingetrs::tui::app::{App, Cmd, Msg, run_search, update};
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
 use wingetrs::tui::view::view;
 
@@ -51,13 +51,25 @@ fn render(app: &App, w: u16, h: u16) -> String {
 fn typed(q: &str) -> App {
     let mut a = App::new(entries(), GlyphSet::Ascii);
     for c in q.chars() {
-        update(
+        let cmds = update(
             &mut a,
             Msg::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char(c),
                 crossterm::event::KeyModifiers::NONE,
             )),
         );
+        // Run the searches the keystroke asked for, as the event loop does.
+        for cmd in cmds {
+            if let Cmd::Search {
+                generation,
+                query,
+                kind,
+            } = cmd
+            {
+                let hits = run_search(&a.search, &query, kind);
+                update(&mut a, Msg::SearchDone { generation, hits });
+            }
+        }
     }
     a
 }

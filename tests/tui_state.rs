@@ -45,7 +45,7 @@ fn typing_filters_and_resets_selection() {
     update(&mut a, key(KeyCode::Down));
     assert_eq!(a.selected, 1);
     for c in "zeal".chars() {
-        update(&mut a, key(KeyCode::Char(c)));
+        step(&mut a, key(KeyCode::Char(c)));
     }
     assert_eq!(a.query, "zeal");
     assert_eq!(a.selected, 0);
@@ -70,9 +70,9 @@ fn escape_ladder_and_quit() {
     assert_eq!(a.focus, Focus::Details);
     assert!(update(&mut a, key(KeyCode::Esc)).is_empty());
     assert_eq!(a.focus, Focus::List);
-    update(&mut a, key(KeyCode::Char('x')));
+    step(&mut a, key(KeyCode::Char('x')));
     // Clearing the query changes the selection, so it asks for the new row's details.
-    assert_eq!(update(&mut a, key(KeyCode::Esc)), vec![details_for(&a)]);
+    assert_eq!(step(&mut a, key(KeyCode::Esc)), vec![details_for(&a)]);
     assert_eq!(a.query, "");
     assert_eq!(update(&mut a, key(KeyCode::Esc)), vec![Cmd::Quit]);
     assert_eq!(update(&mut app(), ctrl('c')), vec![Cmd::Quit]);
@@ -90,7 +90,7 @@ fn tabs_cycle_and_filter_toggles() {
     update(&mut a, key(KeyCode::BackTab));
     assert_eq!(a.tab, Tab::Updates);
     let mut b = app();
-    update(&mut b, ctrl('s'));
+    step(&mut b, ctrl('s'));
     assert_eq!(b.filter, SourceFilter::Winget);
     assert_eq!(b.visible_len(), 2);
 }
@@ -838,8 +838,8 @@ fn every_view_change_requests_details_for_the_new_selection() {
     );
     // (d) Esc clears the query.
     let mut a = app();
-    update(&mut a, key(KeyCode::Char('z')));
-    let cmds = update(&mut a, key(KeyCode::Esc));
+    step(&mut a, key(KeyCode::Char('z')));
+    let cmds = step(&mut a, key(KeyCode::Esc));
     assert!(a.query.is_empty());
     assert!(cmds.contains(&details_for(&a)), "{cmds:?}");
 }
@@ -978,4 +978,80 @@ fn cached_installed_view_matches_a_fresh_filter() {
             }
         }
     }
+}
+
+use wingetrs::tui::app::run_search;
+
+/// Runs every `Cmd::Search` in `cmds` like the event loop does and delivers the results.
+fn deliver_searches(a: &mut App, cmds: Vec<Cmd>) -> Vec<Cmd> {
+    let mut rest = Vec::new();
+    for c in cmds {
+        match c {
+            Cmd::Search {
+                generation,
+                query,
+                kind,
+            } => {
+                let hits = run_search(&a.search, &query, kind);
+                rest.extend(update(a, Msg::SearchDone { generation, hits }));
+            }
+            other => rest.push(other),
+        }
+    }
+    rest
+}
+
+/// `update` followed by the searches it asked for.
+fn step(a: &mut App, msg: Msg) -> Vec<Cmd> {
+    let cmds = update(a, msg);
+    deliver_searches(a, cmds)
+}
+
+/// More entries than `MAX_HITS`, so a changed result limit shows up.
+fn big_entries() -> Vec<PackageEntry> {
+    let mut es = app_entries();
+    es.extend((0..1500).map(|i| entry(SourceKind::Winget, &format!("pkg{i:04}"), "Pkg")));
+    es
+}
+
+#[test]
+fn async_search_equals_sync_search() {
+    for entries in [app_entries(), big_entries()] {
+        for (toggles, kind) in [(0, None), (1, Some(SourceKind::Winget))] {
+            for q in ["", "p", "po", "zeal", "xyz"] {
+                let mut a = App::new(entries.clone(), GlyphSet::Nerd);
+                for _ in 0..toggles {
+                    step(&mut a, ctrl('s'));
+                }
+                for c in q.chars() {
+                    step(&mut a, key(KeyCode::Char(c)));
+                }
+                let expected = a.search.search(q, kind, 1000);
+                assert_eq!(a.hits, expected, "query {q:?} filter {kind:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn stale_search_results_are_dropped() {
+    let mut a = app();
+    let first = update(&mut a, key(KeyCode::Char('p')));
+    let second = update(&mut a, key(KeyCode::Char('o')));
+    let expected = a.search.search("po", None, 1000);
+    deliver_searches(&mut a, second);
+    deliver_searches(&mut a, first);
+    assert_eq!(a.hits, expected);
+}
+
+#[test]
+fn typing_does_not_search_on_the_ui_thread() {
+    let mut a = app();
+    let before = a.hits.clone();
+    let cmds = update(&mut a, key(KeyCode::Char('p')));
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::Search { query, .. } if query == "p"))
+    );
+    assert_eq!(a.hits, before);
 }

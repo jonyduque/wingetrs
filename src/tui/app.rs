@@ -10,6 +10,7 @@ use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -69,6 +70,11 @@ pub enum Msg {
     InstallFinished(Result<Done, InstallFail>),
     /// Residue cleanup ended; one message per item that failed.
     ResiduesCleaned(Vec<String>),
+    /// Hits of the `Cmd::Search` with this generation; stale generations are dropped.
+    SearchDone {
+        generation: u64,
+        hits: Vec<SearchHit>,
+    },
     /// A worker thread panicked; the event loop re-raises it before `update` sees it.
     Panicked(Box<dyn std::any::Any + Send>),
 }
@@ -174,6 +180,12 @@ pub enum Cmd {
         app: String,
         residues: Vec<Residue>,
     },
+    /// Run `run_search` off the UI thread and answer with `Msg::SearchDone`.
+    Search {
+        generation: u64,
+        query: String,
+        kind: Option<SourceKind>,
+    },
 }
 
 pub struct App {
@@ -183,8 +195,10 @@ pub struct App {
     pub query: String,
     pub selected: usize,
     pub scroll: usize,
-    pub search: SearchIndex,
+    pub search: Arc<SearchIndex>,
     pub hits: Vec<SearchHit>,
+    /// Generation of the newest `Cmd::Search`; results of any other generation are stale.
+    pub search_generation: u64,
     pub installed: Vec<ListRow>,
     pub details: HashMap<String, Result<PackageDetails, String>>,
     /// `"{source}/{id}"` of the selected package while its details are being loaded.
@@ -203,6 +217,11 @@ pub struct App {
 }
 
 const MAX_HITS: usize = 1000;
+
+/// The one search the TUI runs, on the UI thread at load and on a worker per keystroke.
+pub fn run_search(index: &SearchIndex, query: &str, kind: Option<SourceKind>) -> Vec<SearchHit> {
+    index.search(query, kind, MAX_HITS)
+}
 const PAGE: usize = 10;
 /// Rows of screen taken by tabs, search box, status bar and borders.
 const CHROME_ROWS: usize = 6;
@@ -216,8 +235,9 @@ impl App {
             query: String::new(),
             selected: 0,
             scroll: 0,
-            search: SearchIndex::new(entries),
+            search: Arc::new(SearchIndex::new(entries)),
             hits: Vec::new(),
+            search_generation: 0,
             installed: Vec::new(),
             details: HashMap::new(),
             details_pending: None,
@@ -284,22 +304,44 @@ impl App {
         }
     }
 
-    fn research(&mut self) {
-        let kind = match self.filter {
+    fn search_kind(&self) -> Option<SourceKind> {
+        match self.filter {
             SourceFilter::All => None,
             SourceFilter::Winget => Some(SourceKind::Winget),
             SourceFilter::Scoop => Some(SourceKind::Scoop),
-        };
-        self.hits = self.search.search(&self.query, kind, MAX_HITS);
+        }
+    }
+
+    /// Synchronous search, used only when the index itself is (re)built.
+    fn research(&mut self) {
+        // Results still in flight refer to the previous index.
+        self.search_generation += 1;
+        self.hits = run_search(&self.search, &self.query, self.search_kind());
     }
 
     /// Recomputes the row set after query/filter/tab changes and resets the selection.
-    fn refresh_view(&mut self) {
-        if self.tab == Tab::Search {
-            self.research();
-        }
+    /// On the Search tab the hits come later through `Msg::SearchDone`.
+    fn refresh_view(&mut self) -> Vec<Cmd> {
         self.selected = 0;
         self.scroll = 0;
+        if self.tab != Tab::Search {
+            return Vec::new();
+        }
+        self.search_generation += 1;
+        vec![Cmd::Search {
+            generation: self.search_generation,
+            query: self.query.clone(),
+            kind: self.search_kind(),
+        }]
+    }
+
+    /// `refresh_view` plus the detail request; on the Search tab that waits for the hits.
+    fn view_changed(&mut self) -> Vec<Cmd> {
+        let mut cmds = self.refresh_view();
+        if self.tab != Tab::Search {
+            cmds.extend(self.details_cmd());
+        }
+        cmds
     }
 
     fn clamp(&mut self) {
@@ -352,13 +394,13 @@ impl App {
     fn set_tab(&mut self, tab: Tab) -> Vec<Cmd> {
         self.tab = tab;
         self.focus = Focus::List;
-        self.refresh_view();
-        let mut cmds = if tab != Tab::Search && self.installed.is_empty() {
-            vec![Cmd::ScanInstalled]
-        } else {
-            Vec::new()
-        };
-        cmds.extend(self.details_cmd());
+        let mut cmds = self.refresh_view();
+        if tab != Tab::Search {
+            if self.installed.is_empty() {
+                cmds.push(Cmd::ScanInstalled);
+            }
+            cmds.extend(self.details_cmd());
+        }
         cmds
     }
 }
@@ -378,7 +420,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::CatalogLoaded(entries) => {
-            app.search = SearchIndex::new(entries);
+            app.search = Arc::new(SearchIndex::new(entries));
             app.research();
             app.clamp();
             app.details_cmd()
@@ -398,7 +440,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             let refresh = match catalog {
                 Ok(entries) => {
                     let empty = entries.is_empty();
-                    app.search = SearchIndex::new(entries);
+                    app.search = Arc::new(SearchIndex::new(entries));
                     app.research();
                     app.clamp();
                     cmds.extend(app.details_cmd());
@@ -438,6 +480,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.refreshing = false;
             app.status = Some("Aguardando: outra atualização em andamento".to_string());
             Vec::new()
+        }
+        Msg::SearchDone { generation, hits } => {
+            if generation != app.search_generation {
+                return Vec::new();
+            }
+            app.hits = hits;
+            app.selected = 0;
+            app.scroll = 0;
+            app.details_cmd()
         }
         Msg::Planned(result) => on_planned(app, result),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
@@ -496,8 +547,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     SourceFilter::Winget => SourceFilter::Scoop,
                     SourceFilter::Scoop => SourceFilter::All,
                 };
-                app.refresh_view();
-                app.details_cmd()
+                app.view_changed()
             }
             _ => Vec::new(),
         };
@@ -537,8 +587,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 Vec::new()
             } else if !empty {
                 app.query.clear();
-                app.refresh_view();
-                app.details_cmd()
+                app.view_changed()
             } else {
                 vec![Cmd::Quit]
             }
@@ -553,14 +602,12 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Backspace => {
             app.query.pop();
-            app.refresh_view();
-            app.details_cmd()
+            app.view_changed()
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
             app.query.push(c);
             app.focus = Focus::List;
-            app.refresh_view();
-            app.details_cmd()
+            app.view_changed()
         }
         _ => Vec::new(),
     }

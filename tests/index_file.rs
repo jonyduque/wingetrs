@@ -75,7 +75,7 @@ fn index_search_matches_in_memory_and_sqlite_exactly() {
     let idx = d.path().join("search.idx");
     let cat = Catalog::open(&db).unwrap();
     index_file::write(&cat, &idx).unwrap();
-    let mut mem = SearchIndex::new(cat.load_entries().unwrap());
+    let mem = SearchIndex::new(cat.load_entries().unwrap());
     for (q, f, limit) in [
         ("powertoys", None, 20),
         ("power", None, 50),

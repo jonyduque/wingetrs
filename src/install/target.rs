@@ -89,7 +89,7 @@ pub fn resolve(
     if !by_name.is_empty() {
         return Ok(by_name);
     }
-    let mut index = SearchIndex::new(entries);
+    let index = SearchIndex::new(entries);
     // The matcher is subsequence-based, so a typo ("ripgrop") finds nothing: retry with shorter prefixes.
     let chars: Vec<char> = text.chars().collect();
     let mut hits = Vec::new();

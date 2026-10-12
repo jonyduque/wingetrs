@@ -44,7 +44,7 @@ fn idx() -> SearchIndex {
 
 #[test]
 fn exact_moniker_or_id_wins() {
-    let mut i = idx();
+    let i = idx();
     let hits = i.search("powertoys", None, 10);
     let top: Vec<&str> = hits
         .iter()
@@ -60,7 +60,7 @@ fn exact_moniker_or_id_wins() {
 
 #[test]
 fn source_filter() {
-    let mut i = idx();
+    let i = idx();
     let hits = i.search("powertoys", Some(SourceKind::Scoop), 10);
     assert_eq!(hits.len(), 1);
     assert_eq!(i.entries()[hits[0].index].source, SourceKind::Scoop);
@@ -68,7 +68,7 @@ fn source_filter() {
 
 #[test]
 fn empty_query_lists_by_name_case_insensitive() {
-    let mut i = idx();
+    let i = idx();
     let names: Vec<String> = i
         .search("", None, 3)
         .iter()
@@ -79,7 +79,7 @@ fn empty_query_lists_by_name_case_insensitive() {
 
 #[test]
 fn non_ascii_names_are_searchable() {
-    let mut i = idx();
+    let i = idx();
     let hits = i.search("360", None, 10);
     assert_eq!(i.entries()[hits[0].index].id, "Qihoo.360TotalSecurity");
     let hits = i.search("安全", None, 10);
@@ -88,7 +88,7 @@ fn non_ascii_names_are_searchable() {
 
 #[test]
 fn fuzzy_name_indices_point_at_matched_chars() {
-    let mut i = idx();
+    let i = idx();
     let hits = i.search("zel", None, 10);
     let h = &hits[0];
     assert_eq!(i.entries()[h.index].name, "Zeal");
@@ -97,13 +97,13 @@ fn fuzzy_name_indices_point_at_matched_chars() {
 
 #[test]
 fn limit_is_respected() {
-    let mut i = idx();
+    let i = idx();
     assert_eq!(i.search("", None, 2).len(), 2);
 }
 
 #[test]
 fn exact_id_beats_equal_scoring_name_match() {
-    let mut i = SearchIndex::new(vec![
+    let i = SearchIndex::new(vec![
         e(SourceKind::Winget, "B.B", "foo", None),
         e(SourceKind::Winget, "foo", "Zzz", None),
     ]);
@@ -113,7 +113,7 @@ fn exact_id_beats_equal_scoring_name_match() {
 
 #[test]
 fn non_ascii_name_indices_are_char_positions() {
-    let mut i = idx();
+    let i = idx();
     let hits = i.search("安全", None, 10);
     assert_eq!(hits[0].name_indices, [3, 4]);
 }
@@ -145,7 +145,7 @@ fn parallel_search_equals_sequential() {
             p
         })
         .collect();
-    let mut index = SearchIndex::new(entries);
+    let index = SearchIndex::new(entries);
     for q in ["powertoys", "pwr", "安全", "tööl", "", "tool"] {
         for filter in [None, Some(SourceKind::Scoop)] {
             let seq = index.search_with_threads(q, filter, 100_000, 1);
@@ -209,7 +209,7 @@ fn search_on_disk_matches_in_memory_search_exactly() {
     use wingetrs::catalog::Catalog;
     use wingetrs::catalog::search::{SearchIndex, search_on_disk};
     let (_d, path) = disk_catalog_with_many(6000);
-    let mut idx = SearchIndex::new(Catalog::open(&path).unwrap().load_entries().unwrap());
+    let idx = SearchIndex::new(Catalog::open(&path).unwrap().load_entries().unwrap());
     for (q, f, limit) in [
         ("powertoys", None, 20),
         ("power", None, 50),
@@ -256,7 +256,7 @@ fn tag_and_command_matches_score_half_of_the_same_text_in_the_name() {
     let mut cmd = e(SourceKind::Winget, "A.Two", "Yyy", None);
     cmd.commands = vec!["firefox".into()];
     let named = e(SourceKind::Winget, "B.Three", "firefox", None);
-    let mut idx = SearchIndex::new(vec![tagged, cmd, named]);
+    let idx = SearchIndex::new(vec![tagged, cmd, named]);
     let hits = idx.search("firefox", None, 10);
     let score_of = |i: usize| hits.iter().find(|h| h.index == i).unwrap().score;
     assert!(score_of(2) > 0);

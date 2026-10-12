@@ -4,7 +4,8 @@ use futures_util::StreamExt;
 use tokio::time::MissedTickBehavior;
 use wingetrs::tui::app::{Cmd, Msg};
 use wingetrs::tui::run::{
-    drain_ready, join_details, join_refresh, last_details_only, needs_draw, spinner_ticker,
+    drain_ready, join_details, join_refresh, join_search, last_details_only, needs_draw,
+    spinner_ticker,
 };
 
 fn key(c: KeyCode) -> Msg {
@@ -104,4 +105,23 @@ async fn refresh_worker_panic_reaches_the_loop() {
     h.abort();
     let msg = join_refresh(h).await;
     assert!(matches!(msg, Msg::RefreshFinished(r) if r.len() == 1));
+}
+
+#[tokio::test]
+async fn search_worker_panic_reaches_the_loop() {
+    let msg = join_search(tokio::spawn(async { panic!("x") })).await;
+    assert!(matches!(msg, Some(Msg::Panicked(_))));
+    let h = tokio::spawn(std::future::pending::<Msg>());
+    h.abort();
+    assert!(join_search(h).await.is_none());
+    let ok = tokio::spawn(async {
+        Msg::SearchDone {
+            generation: 7,
+            hits: vec![],
+        }
+    });
+    assert!(matches!(
+        join_search(ok).await,
+        Some(Msg::SearchDone { generation: 7, .. })
+    ));
 }

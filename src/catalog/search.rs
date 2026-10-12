@@ -15,7 +15,6 @@ pub struct SearchHit {
 
 pub struct SearchIndex {
     entries: Vec<PackageEntry>,
-    matcher: Matcher,
 }
 
 /// Bonus that puts an exact id/moniker match before any fuzzy score.
@@ -174,22 +173,14 @@ fn scan(
 
 impl SearchIndex {
     pub fn new(entries: Vec<PackageEntry>) -> SearchIndex {
-        SearchIndex {
-            entries,
-            matcher: Matcher::new(Config::DEFAULT),
-        }
+        SearchIndex { entries }
     }
 
     pub fn entries(&self) -> &[PackageEntry] {
         &self.entries
     }
 
-    pub fn search(
-        &mut self,
-        query: &str,
-        filter: Option<SourceKind>,
-        limit: usize,
-    ) -> Vec<SearchHit> {
+    pub fn search(&self, query: &str, filter: Option<SourceKind>, limit: usize) -> Vec<SearchHit> {
         let workers = std::thread::available_parallelism()
             .map_or(1, |n| n.get())
             .clamp(1, 8);
@@ -198,7 +189,7 @@ impl SearchIndex {
 
     /// Same as `search` with an explicit worker count (1 = sequential); exposed for equivalence tests.
     pub fn search_with_threads(
-        &mut self,
+        &self,
         query: &str,
         filter: Option<SourceKind>,
         limit: usize,
@@ -206,7 +197,14 @@ impl SearchIndex {
     ) -> Vec<SearchHit> {
         let q = Query::new(query);
         let mut hits: Vec<SearchHit> = if self.entries.len() < PARALLEL_MIN || workers <= 1 {
-            scan(&self.entries, 0, &q, filter, &mut self.matcher)
+            // Shared `&self` lets the TUI search off the UI thread; a matcher per call is cheap.
+            scan(
+                &self.entries,
+                0,
+                &q,
+                filter,
+                &mut Matcher::new(Config::DEFAULT),
+            )
         } else {
             // Chunks are contiguous and joined in order, so hits keep entry order.
             let chunk = self.entries.len().div_ceil(workers);

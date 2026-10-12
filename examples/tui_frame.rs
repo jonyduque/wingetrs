@@ -9,11 +9,12 @@ use wingetrs::cache::DataDir;
 use wingetrs::catalog::Catalog;
 use wingetrs::core::PackageEntry;
 use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
-use wingetrs::tui::app::{App, Msg, update};
+use wingetrs::tui::app::{App, Cmd, Msg, run_search, update};
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
 use wingetrs::tui::view::view;
 
 const FRAMES: usize = 200;
+const SEARCH_RUNS: usize = 50;
 
 fn rows(entries: &[PackageEntry]) -> Vec<ListRow> {
     entries
@@ -51,7 +52,18 @@ fn scenario(entries: &[PackageEntry], tabs: usize, query: &str) -> (u128, u128) 
         update(&mut app, key(KeyCode::Tab));
     }
     for c in query.chars() {
-        update(&mut app, key(KeyCode::Char(c)));
+        for cmd in update(&mut app, key(KeyCode::Char(c))) {
+            // The event loop runs this off the UI thread; here it is delivered inline.
+            if let Cmd::Search {
+                generation,
+                query,
+                kind,
+            } = cmd
+            {
+                let hits = run_search(&app.search, &query, kind);
+                update(&mut app, Msg::SearchDone { generation, hits });
+            }
+        }
     }
     let theme = Theme::new(true, ColorDepth::TrueColor);
     let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
@@ -64,6 +76,33 @@ fn scenario(entries: &[PackageEntry], tabs: usize, query: &str) -> (u128, u128) 
     }
     times.sort_unstable();
     (times[FRAMES / 2], times[FRAMES * 95 / 100])
+}
+
+/// Task 60 step 0: cost of one `SearchIndex::search` call as run per keystroke.
+fn search_scenario(app: &App, query: &str) -> (u128, u128) {
+    let mut times = Vec::with_capacity(SEARCH_RUNS);
+    for _ in 0..SEARCH_RUNS {
+        let t = Instant::now();
+        let hits = app.search.search(query, None, 1000);
+        times.push(t.elapsed().as_micros());
+        std::hint::black_box(hits);
+    }
+    times.sort_unstable();
+    (times[SEARCH_RUNS / 2], times[SEARCH_RUNS * 95 / 100])
+}
+
+/// UI-thread cost of typing `c` and erasing it (Task 60: the search itself runs elsewhere).
+fn keystroke_scenario(app: &mut App) -> (u128, u128) {
+    let mut times = Vec::with_capacity(SEARCH_RUNS);
+    for _ in 0..SEARCH_RUNS {
+        let t = Instant::now();
+        let cmds = update(app, key(KeyCode::Char('c')));
+        times.push(t.elapsed().as_micros());
+        std::hint::black_box(cmds);
+        update(app, key(KeyCode::Backspace));
+    }
+    times.sort_unstable();
+    (times[SEARCH_RUNS / 2], times[SEARCH_RUNS * 95 / 100])
 }
 
 fn main() {
@@ -82,4 +121,11 @@ fn main() {
         let (med, p95) = scenario(&entries, tabs, q);
         println!("{name:<14} median {med:>6} us   p95 {p95:>6} us");
     }
+    let mut app = App::new(entries, GlyphSet::Nerd);
+    for q in ["c", "co", "cod", "code", "vscode"] {
+        let (med, p95) = search_scenario(&app, q);
+        println!("busca {q:<8} median {med:>6} us   p95 {p95:>6} us");
+    }
+    let (med, p95) = keystroke_scenario(&mut app);
+    println!("tecla 'c'      median {med:>6} us   p95 {p95:>6} us");
 }

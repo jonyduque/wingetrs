@@ -1,6 +1,7 @@
 //! TUI event loop: terminal setup, input stream, command execution.
 use crate::cache::{BlobStore, DataDir, HttpState, now_unix};
 use crate::catalog::Catalog;
+use crate::catalog::search::SearchIndex;
 use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
@@ -9,7 +10,7 @@ use crate::install::residue::Residue;
 use crate::installed::correlate::correlate;
 use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
-use crate::tui::app::{Action, App, Cmd, InstallFail, Msg, Planned, update};
+use crate::tui::app::{Action, App, Cmd, InstallFail, Msg, Planned, run_search, update};
 use crate::tui::jobs;
 use crate::tui::theme::{GlyphSet, Theme, detect_depth};
 use crate::tui::view::view;
@@ -220,6 +221,11 @@ async fn event_loop(
                 Cmd::PlanUpgradeAll => spawn_plan(&ctx, jobs::plan_upgrade_all),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
+                Cmd::Search {
+                    generation,
+                    query,
+                    kind,
+                } => spawn_search(&ctx, Arc::clone(&app.search), generation, query, kind),
             }
         }
         if refresh_msg {
@@ -302,6 +308,36 @@ pub async fn join_details(key: String, h: tokio::task::JoinHandle<Msg>) -> Msg {
             result: Err(format!("tarefa cancelada: {e}")),
         },
     }
+}
+
+/// Awaits a search worker: a panic travels to the loop as `Msg::Panicked`; a cancelled search
+/// sends nothing (the list keeps its current hits).
+pub async fn join_search(h: tokio::task::JoinHandle<Msg>) -> Option<Msg> {
+    match h.await {
+        Ok(msg) => Some(msg),
+        Err(e) if e.is_panic() => Some(Msg::Panicked(e.into_panic())),
+        Err(_) => None,
+    }
+}
+
+/// Runs one keystroke's search on a blocking thread; the handle is always awaited.
+fn spawn_search(
+    ctx: &Arc<Ctx>,
+    index: Arc<SearchIndex>,
+    generation: u64,
+    query: String,
+    kind: Option<SourceKind>,
+) {
+    let tx = ctx.tx.clone();
+    tokio::spawn(async move {
+        let work = tokio::task::spawn_blocking(move || Msg::SearchDone {
+            generation,
+            hits: run_search(&index, &query, kind),
+        });
+        if let Some(msg) = join_search(work).await {
+            let _ = tx.send(msg);
+        }
+    });
 }
 
 /// Loads the catalog off the UI path, then reports what the startup refresh should do.
