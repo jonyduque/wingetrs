@@ -160,5 +160,33 @@ async fn version_data_with_another_hash_is_shown_but_not_cached() {
             .unwrap();
         assert_eq!(d.version, "0.101.2362.0");
     }
-    assert!(blobs.get(&hex::encode(&hash)).is_none());
+    assert!(!dir.path().join(hex::encode(&hash)).exists());
+}
+
+#[tokio::test]
+async fn version_data_cache_write_failure_does_not_fail_show() {
+    let s = server_expecting(2).await;
+    let dir = tempfile::tempdir().unwrap();
+    let ok_blobs = BlobStore::new(dir.path().join("ok"));
+    // A directory named like the versionData tmp file makes only that cache write fail.
+    let broken_dir = dir.path().join("broken");
+    std::fs::create_dir_all(broken_dir.join(format!("{HASH_HEX}.tmp"))).unwrap();
+    let broken_blobs = BlobStore::new(broken_dir.clone());
+    let http = Http::new().unwrap();
+    let base = format!("{}/", s.uri());
+    let hash = hex::decode(HASH_HEX).unwrap();
+    let expected = details(&http, &ok_blobs, &base, "Microsoft.PowerToys", &hash, None)
+        .await
+        .unwrap();
+    let got = details(
+        &http,
+        &broken_blobs,
+        &base,
+        "Microsoft.PowerToys",
+        &hash,
+        None,
+    )
+    .await;
+    assert_eq!(got.unwrap(), expected);
+    assert!(!broken_dir.join(HASH_HEX).exists(), "write really failed");
 }

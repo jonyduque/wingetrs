@@ -29,7 +29,11 @@ pub async fn details(
                     Err(crate::cache::CacheError::HashMismatch { expected, actual }) => {
                         tracing::warn!(%expected, %actual, url = %vd_url, "versionData does not match the catalog hash; not cached");
                     }
-                    Err(other) => return Err(WingetError::Cache(other)),
+                    // The bytes are already downloaded; a failed cache write (e.g. two first
+                    // `show`s racing on the same tmp file) must not fail the command.
+                    Err(other) => {
+                        tracing::warn!(error = %other, url = %vd_url, "could not cache versionData");
+                    }
                 }
                 b
             }
