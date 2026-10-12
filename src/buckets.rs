@@ -193,15 +193,18 @@ pub fn remove_and_cleanup(
     let catalog_path = data.catalog_path();
     if catalog_path.exists() {
         let mut catalog = crate::catalog::Catalog::open(&catalog_path).map_err(cat_err)?;
-        catalog
+        let removed = catalog
             .remove_source(&crate::sources::scoop::source_name(name))
             .map_err(cat_err)?;
         let idx = data.search_index_path();
-        let written = tracing::debug_span!("bucket.rm.index_write")
-            .in_scope(|| crate::catalog::index_file::write(&catalog, &idx));
-        if let Err(e) = written {
-            tracing::warn!("falha ao regravar o índice de busca: {e}");
-            let _ = std::fs::remove_file(&idx);
+        // A bucket that was never downloaded has no rows: the index is still correct.
+        if removed > 0 || !idx.exists() {
+            let written = tracing::debug_span!("bucket.rm.index_write")
+                .in_scope(|| crate::catalog::index_file::write(&catalog, &idx));
+            if let Err(e) = written {
+                tracing::warn!("falha ao regravar o índice de busca: {e}");
+                let _ = std::fs::remove_file(&idx);
+            }
         }
     }
     if let Some(repo) = repo {

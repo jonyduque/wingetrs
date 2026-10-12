@@ -270,3 +270,39 @@ fn remove_and_cleanup_purges_catalog_index_and_http_state() {
     assert!(st.get(&url_main).is_some());
     assert!(cfg.buckets.is_empty());
 }
+
+#[test]
+fn rm_of_a_never_updated_bucket_keeps_search_idx() {
+    use wingetrs::cache::DataDir;
+    let d = tempfile::tempdir().unwrap();
+    let data = DataDir::new(d.path());
+    let mut cfg = Config::default();
+    {
+        let mut c = wingetrs::catalog::Catalog::open(&data.catalog_path()).unwrap();
+        let no = wingetrs::catalog::WingetMaps::default();
+        c.replace_source(
+            "scoop:main",
+            wingetrs::core::SourceKind::Scoop,
+            "v",
+            1,
+            &[pkg("zebramain")],
+            &no,
+        )
+        .unwrap();
+        wingetrs::catalog::index_file::write(&c, &data.search_index_path()).unwrap();
+    }
+    let idx = data.search_index_path();
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&idx)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let before = std::fs::read(&idx).unwrap();
+    add(&mut cfg, "perfx", "me/scoop-perfx", true).unwrap();
+    let db = d.path().join("state.db");
+    remove_and_cleanup(&data, &mut cfg, "perfx", &db).unwrap();
+    assert_eq!(std::fs::metadata(&idx).unwrap().modified().unwrap(), old);
+    assert_eq!(std::fs::read(&idx).unwrap(), before);
+}
