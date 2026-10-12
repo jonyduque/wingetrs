@@ -197,7 +197,9 @@ pub fn remove_and_cleanup(
             .remove_source(&crate::sources::scoop::source_name(name))
             .map_err(cat_err)?;
         let idx = data.search_index_path();
-        if let Err(e) = crate::catalog::index_file::write(&catalog, &idx) {
+        let written = tracing::debug_span!("bucket.rm.index_write")
+            .in_scope(|| crate::catalog::index_file::write(&catalog, &idx));
+        if let Err(e) = written {
             tracing::warn!("falha ao regravar o índice de busca: {e}");
             let _ = std::fs::remove_file(&idx);
         }

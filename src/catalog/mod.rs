@@ -178,6 +178,14 @@ fn delete_source_rows(
     tx: &rusqlite::Transaction<'_>,
     source: &str,
 ) -> Result<DeletedRows, CatalogError> {
+    tracing::debug_span!("catalog.delete_source_rows")
+        .in_scope(|| delete_source_rows_inner(tx, source))
+}
+
+fn delete_source_rows_inner(
+    tx: &rusqlite::Transaction<'_>,
+    source: &str,
+) -> Result<DeletedRows, CatalogError> {
     let mut truncated_maps = 0;
     for t in MAP_TABLES {
         let foreign: bool = tx.query_row(
