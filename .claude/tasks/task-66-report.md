@@ -72,6 +72,25 @@ Correção pedida pelo orquestrador (toast nunca cobre diálogo):
 [OK]   gate verde
 ```
 
+Pendências da revisão (opus), resolvidas:
+1. `run.rs`: nova `pub fn clock_turn(app, now, msgs) -> Vec<Cmd>`, que atribui `app.now = now` e aplica o lote. O laço agora faz `propagate`, contagem e detecção de `RefreshFinished` num `map`/`inspect` e chama `clock_turn(&mut app, Instant::now(), batch)`. A atribuição existe só dentro da função (`grep -c "app.now = " src/tui/run.rs` = 1). Diferença: o `propagate` do lote inteiro agora roda antes de qualquer `update`, então um pânico de worker é relançado antes de aplicar o resto do lote. Teste `clock_turn_sets_the_clock_so_toasts_expire` (tests/tui_loop.rs).
+   `pwsh -File scripts/mutate.ps1 -Path src/tui/run.rs -Anchor '    app.now = now;' -Replacement '' -TestCommand 'cargo test --quiet --test tui_loop clock_turn_sets_the_clock_so_toasts_expire'`
+   `[OK] mutação PEGA: '    app.now = now;' -> '' fez o teste falhar (exit 101).`
+2. `offline_refresh_failure_is_a_warning` ganhou o caso misto (uma falha offline + uma não ⇒ `Error`).
+   `pwsh -File scripts/mutate.ps1 -Path src/tui/app.rs -Anchor 'let kind = if all_offline {' -Replacement 'let kind = if any_offline {' -TestCommand 'cargo test --quiet --test tui_state offline_refresh_failure_is_a_warning'`
+   `[OK] mutação PEGA: 'let kind = if all_offline {' -> 'let kind = if any_offline {' fez o teste falhar (exit 101).`
+3. `esc_in_a_dialog_closes_the_dialog_and_keeps_the_error_toast` (tests/tui_state.rs): diálogo de confirmação + toast Error; `Esc` fecha o diálogo e o toast continua.
+4. `error_toast_adds_the_esc_hint` (tests/tui_state.rs): sem erro não há a dica; com erro, `("esc", "fecha erro")` vem logo antes de `?`. `repeated_toast_shows_its_count_in_the_title` (tests/tui_view.rs): `count == 2` ⇒ `+ Sucesso ×2`.
+Gate depois das pendências:
+```
+[OK]   rules 2s
+[OK]   rules-selftest 9s
+[OK]   fmt 1s
+[OK]   clippy 96s
+[OK]   test (584 passed, 16 ignored) 132s
+[OK]   gate verde
+```
+
 Concerns:
 - Em terminal pequeno, a pepita mostra o toast mais novo enquanto ele não vence; um `Error` fica lá até `Esc`.
 - Não medido: custo de desenho dos toasts e acordadas do laço (nenhum benchmark pedido).

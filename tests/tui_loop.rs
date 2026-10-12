@@ -4,8 +4,8 @@ use futures_util::StreamExt;
 use tokio::time::MissedTickBehavior;
 use wingetrs::tui::app::{Cmd, Msg};
 use wingetrs::tui::run::{
-    drain_ready, join_details, join_refresh, join_search, last_details_only, needs_draw,
-    spinner_ticker,
+    clock_turn, drain_ready, join_details, join_refresh, join_search, last_details_only,
+    needs_draw, spinner_ticker,
 };
 
 fn key(c: KeyCode) -> Msg {
@@ -132,4 +132,18 @@ async fn search_worker_panic_reaches_the_loop() {
 #[test]
 fn clock_message_draws() {
     assert!(needs_draw(&[Msg::Clock], false));
+}
+
+#[test]
+fn clock_turn_sets_the_clock_so_toasts_expire() {
+    use std::time::Duration;
+    use wingetrs::tui::app::{App, ToastKind};
+    use wingetrs::tui::theme::GlyphSet;
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    let t0 = a.now;
+    a.push_toast(ToastKind::Success, "ok");
+    clock_turn(&mut a, t0 + Duration::from_millis(2999), vec![Msg::Clock]);
+    assert_eq!(a.toasts.len(), 1);
+    clock_turn(&mut a, t0 + Duration::from_millis(3001), vec![Msg::Clock]);
+    assert!(a.toasts.is_empty());
 }

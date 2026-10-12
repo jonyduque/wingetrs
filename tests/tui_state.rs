@@ -1333,6 +1333,11 @@ fn offline_refresh_failure_is_a_warning() {
     let mut b = app();
     update(&mut b, Msg::RefreshFinished(failed_report(false)));
     assert_eq!(b.toasts[0].kind, ToastKind::Error);
+    let mut mixed = failed_report(true);
+    mixed.extend(failed_report(false));
+    let mut c = app();
+    update(&mut c, Msg::RefreshFinished(mixed));
+    assert_eq!(c.toasts[0].kind, ToastKind::Error);
 }
 
 #[test]
@@ -1352,4 +1357,26 @@ fn expired_toast_disappears_on_any_message() {
     a.now = t0 + Duration::from_secs(4);
     update(&mut a, Msg::Resize(100, 24));
     assert!(a.toasts.is_empty());
+}
+
+#[test]
+fn esc_in_a_dialog_closes_the_dialog_and_keeps_the_error_toast() {
+    let mut a = app();
+    a.push_toast(ToastKind::Error, "falhou");
+    update(&mut a, ready("ripgrep"));
+    assert!(confirm_open(&a));
+    update(&mut a, key(KeyCode::Esc));
+    assert!(a.modal.is_none());
+    assert_eq!(toast_texts(&a), vec!["falhou"]);
+}
+
+#[test]
+fn error_toast_adds_the_esc_hint() {
+    use wingetrs::tui::help::hints;
+    let mut a = app();
+    assert!(!hints(&a).contains(&("esc", "fecha erro")));
+    a.push_toast(ToastKind::Error, "falhou");
+    let h = hints(&a);
+    let esc = h.iter().position(|x| *x == ("esc", "fecha erro")).unwrap();
+    assert_eq!(esc + 1, h.iter().position(|x| x.0 == "?").unwrap());
 }

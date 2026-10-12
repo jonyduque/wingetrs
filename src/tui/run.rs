@@ -202,15 +202,16 @@ async fn event_loop(
         }
         let draw = needs_draw(&batch, app.animating());
         let batch_len = batch.len();
-        let mut cmds = Vec::new();
         let mut refresh_msg = false;
-        app.now = Instant::now();
-        for msg in batch {
-            let msg = jobs::propagate(msg);
-            stats.count(&msg);
-            refresh_msg |= matches!(msg, Msg::RefreshFinished(_));
-            cmds.extend(update(&mut app, msg));
-        }
+        let batch: Vec<Msg> = batch
+            .into_iter()
+            .map(jobs::propagate)
+            .inspect(|msg| {
+                stats.count(msg);
+                refresh_msg |= matches!(msg, Msg::RefreshFinished(_));
+            })
+            .collect();
+        let cmds = clock_turn(&mut app, Instant::now(), batch);
         for cmd in last_details_only(cmds) {
             match cmd {
                 Cmd::Quit => return Ok(()),
@@ -248,6 +249,16 @@ async fn event_loop(
             })?;
         }
     }
+}
+
+/// One loop turn: sets the toast clock to `now`, then applies the batch in order.
+pub fn clock_turn(app: &mut App, now: Instant, msgs: Vec<Msg>) -> Vec<Cmd> {
+    app.now = now;
+    let mut cmds = Vec::new();
+    for msg in msgs {
+        cmds.extend(update(app, msg));
+    }
+    cmds
 }
 
 /// Terminal events the app reacts to; the rest are dropped.

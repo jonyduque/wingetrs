@@ -1230,3 +1230,13 @@ fn toasts_never_cover_a_dialog() {
     let out = render(&a, 100, 24);
     assert!(out.contains("+ Sucesso"), "{out}");
 }
+
+#[test]
+fn repeated_toast_shows_its_count_in_the_title() {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.push_toast(wingetrs::tui::app::ToastKind::Success, "Instalado: rg");
+    a.push_toast(wingetrs::tui::app::ToastKind::Success, "Instalado: rg");
+    assert_eq!(a.toasts[0].count, 2);
+    let out = render(&a, 100, 24);
+    assert!(out.contains("+ Sucesso ×2"), "{out}");
+}
