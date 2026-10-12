@@ -619,6 +619,7 @@ async fn run_async(
     data: DataDir,
     cfg: Config,
     mut early: Option<EarlySearch>,
+    after_log: std::time::Instant,
 ) -> anyhow::Result<()> {
     let http = tracing::debug_span!("startup.http").in_scope(Http::new)?;
     let Some(cmd) = cli.command else {
@@ -738,6 +739,10 @@ async fn run_async(
             source,
             json,
         } => {
+            tracing::debug!(
+                ms = after_log.elapsed().as_secs_f64() * 1000.0,
+                "list.setup"
+            );
             // Scan, tracking and normalizer start now so they overlap with the catalog open.
             let scan_job = std::thread::spawn(|| {
                 crate::installed::timed("scan_all", crate::installed::scan_all)
@@ -893,6 +898,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     };
     data.ensure()?;
     let _guard = init_logging(&data, if stderr_logging(&cli) { cli.verbose } else { 0 });
+    let after_log = std::time::Instant::now();
     let cfg = Config::load(&data.config_path())?;
     if cli.command.is_none() {
         // The TUI builds its own runtime; glyphs: flag > config.toml > nerd.
@@ -909,7 +915,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         return crate::tui::run::run(glyphs, cli.glyphs.is_some());
     }
     let rt = tracing::debug_span!("startup.runtime").in_scope(tokio::runtime::Runtime::new)?;
-    let result = rt.block_on(run_async(cli, data, cfg, early));
+    let result = rt.block_on(run_async(cli, data, cfg, early, after_log));
     tracing::debug_span!("startup.runtime_drop").in_scope(|| drop(rt));
     result
 }
