@@ -39,17 +39,16 @@ CREATE TABLE IF NOT EXISTS map_norm_name      (key TEXT NOT NULL, package INTEGE
 CREATE TABLE IF NOT EXISTS map_norm_publisher (key TEXT NOT NULL, package INTEGER NOT NULL);
 ";
 
-/// Indexes on the map tables and `lower(id)`; dropped and rebuilt once by a winget import (see `replace_source_impl`).
-const REBUILT_INDEXES: &str = "
+/// Indexes on the map tables; dropped and rebuilt once by a winget import (see `replace_source_impl`).
+const MAP_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS ix_pc  ON map_productcode(key);
 CREATE INDEX IF NOT EXISTS ix_uc  ON map_upgradecode(key);
 CREATE INDEX IF NOT EXISTS ix_pfn ON map_pfn(key);
 CREATE INDEX IF NOT EXISTS ix_nn  ON map_norm_name(key);
 CREATE INDEX IF NOT EXISTS ix_np  ON map_norm_publisher(key);
-CREATE INDEX IF NOT EXISTS ix_pkg_id_lower ON packages(lower(id));
 ";
 
-const DROP_REBUILT_INDEXES: &str = "DROP INDEX IF EXISTS ix_pc; DROP INDEX IF EXISTS ix_uc; DROP INDEX IF EXISTS ix_pfn; DROP INDEX IF EXISTS ix_nn; DROP INDEX IF EXISTS ix_np; DROP INDEX IF EXISTS ix_pkg_id_lower;";
+const DROP_MAP_INDEXES: &str = "DROP INDEX IF EXISTS ix_pc; DROP INDEX IF EXISTS ix_uc; DROP INDEX IF EXISTS ix_pfn; DROP INDEX IF EXISTS ix_nn; DROP INDEX IF EXISTS ix_np;";
 
 /// An import that carries maps rebuilds the map indexes once instead of row by row.
 pub(crate) fn rebuilds_map_indexes(maps: &WingetMaps) -> bool {
@@ -58,11 +57,6 @@ pub(crate) fn rebuilds_map_indexes(maps: &WingetMaps) -> bool {
         && maps.pfns.is_empty()
         && maps.norm_names.is_empty()
         && maps.norm_publishers.is_empty())
-}
-
-/// The WHERE must repeat the indexed expression of `ix_pkg_id_lower` for SQLite to use the index.
-fn find_by_id_sql() -> String {
-    format!("SELECT {PKG_COLS} FROM packages WHERE lower(id) = lower(?1) ORDER BY rowid")
 }
 
 type MapPair = (String, String);
@@ -301,7 +295,7 @@ impl Catalog {
         // Reads through the OS mapping instead of pread copies (best effort).
         let _ = conn.pragma_update(None, "mmap_size", 268_435_456i64);
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(REBUILT_INDEXES)?;
+        conn.execute_batch(MAP_INDEXES)?;
         Ok(Catalog {
             conn,
             path: Some(path.to_path_buf()),
@@ -355,7 +349,7 @@ impl Catalog {
     pub fn open_in_memory() -> Result<Catalog, CatalogError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(REBUILT_INDEXES)?;
+        conn.execute_batch(MAP_INDEXES)?;
         Ok(Catalog { conn, path: None })
     }
 
@@ -449,7 +443,7 @@ impl Catalog {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if rebuild {
             // DDL is transactional: an error before the commit brings the indexes back.
-            tx.execute_batch(DROP_REBUILT_INDEXES)?;
+            tx.execute_batch(DROP_MAP_INDEXES)?;
         }
         let deleted = delete_source_rows(&tx, source, kind)?;
         tracing::debug!(
@@ -513,7 +507,7 @@ impl Catalog {
             params![source, kind.as_str(), source_version, fetched_at],
         )?;
         if rebuild {
-            tx.execute_batch(REBUILT_INDEXES)?;
+            tx.execute_batch(MAP_INDEXES)?;
         }
         tx.commit()?;
         Ok(ImportStats {
@@ -614,7 +608,8 @@ impl Catalog {
 
     /// Finds by id across sources (case-insensitive); used by `show <id>` without --source.
     pub fn find_by_id(&self, id: &str) -> Result<Vec<StoredPackage>, CatalogError> {
-        let sql = find_by_id_sql();
+        let sql =
+            format!("SELECT {PKG_COLS} FROM packages WHERE lower(id) = lower(?1) ORDER BY rowid");
         let mut st = self.conn.prepare_cached(&sql)?;
         let rows = st.query_map(params![id], stored_from_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -872,22 +867,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CatalogError::DanglingMap(_)));
         assert_eq!(cache(&c), before, "after DanglingMap");
-    }
-
-    #[test]
-    fn find_by_id_where_uses_the_lower_id_index() {
-        let c = Catalog::open_in_memory().unwrap();
-        let sql = format!("EXPLAIN QUERY PLAN {}", find_by_id_sql());
-        let mut st = c.conn.prepare(&sql).unwrap();
-        let details: Vec<String> = st
-            .query_map(["x"], |r| r.get::<_, String>("detail"))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert!(
-            details.iter().any(|d| d.contains("ix_pkg_id_lower")),
-            "plan: {details:?}"
-        );
     }
 
     fn map_counts(c: &Catalog) -> Vec<i64> {

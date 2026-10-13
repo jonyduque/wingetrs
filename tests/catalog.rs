@@ -737,14 +737,7 @@ fn dangling_map_rollback_keeps_the_map_indexes() {
     let raw = rusqlite::Connection::open(&p).unwrap();
     assert_eq!(
         index_names(&raw),
-        [
-            "ix_nn",
-            "ix_np",
-            "ix_pc",
-            "ix_pfn",
-            "ix_pkg_id_lower",
-            "ix_uc"
-        ]
+        ["ix_nn", "ix_np", "ix_pc", "ix_pfn", "ix_uc"]
     );
     assert_eq!(w.lookup(MapTable::Pfn, "pfn_a").unwrap(), ["A.A"]);
 }
@@ -776,104 +769,4 @@ fn reader_sees_new_rows_after_an_index_rebuild() {
     .unwrap();
     assert_eq!(r.lookup(MapTable::Pfn, "pfn_b").unwrap(), ["A.A"]);
     assert!(r.lookup(MapTable::Pfn, "pfn_a").unwrap().is_empty());
-}
-
-fn find_ids(c: &Catalog, q: &str) -> Vec<(String, String)> {
-    c.find_by_id(q)
-        .unwrap()
-        .into_iter()
-        .map(|p| (p.entry.source_name, p.entry.id))
-        .collect()
-}
-
-#[test]
-fn find_by_id_is_the_same_with_and_without_the_index() {
-    let queries = ["GIT.GIT", "git", "Git", "ünïcode", "ÜNÏCODE", "Ünïcode"];
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("c.db");
-    let mut w = Catalog::open(&p).unwrap();
-    w.replace_source(
-        "winget",
-        SourceKind::Winget,
-        "v",
-        1,
-        &[pkg("Git.Git", "Git", "1")],
-        &WingetMaps::default(),
-    )
-    .unwrap();
-    w.replace_source(
-        "scoop:main",
-        SourceKind::Scoop,
-        "e",
-        1,
-        &[pkg("git", "git", "2"), pkg("Ünïcode", "u", "1")],
-        &WingetMaps::default(),
-    )
-    .unwrap();
-    let with_index: Vec<_> = queries.iter().map(|q| find_ids(&w, q)).collect();
-    drop(w);
-
-    let raw = rusqlite::Connection::open(&p).unwrap();
-    raw.execute_batch("DROP INDEX ix_pkg_id_lower").unwrap();
-    drop(raw);
-    let r = Catalog::open_read_only(&p).unwrap();
-    let without_index: Vec<_> = queries.iter().map(|q| find_ids(&r, q)).collect();
-
-    assert_eq!(with_index, without_index);
-    for lists in [&with_index, &without_index] {
-        assert_eq!(
-            lists[0],
-            [("winget".to_string(), "Git.Git".to_string())],
-            "GIT.GIT"
-        );
-        assert_eq!(
-            lists[2],
-            [("scoop:main".to_string(), "git".to_string())],
-            "Git"
-        );
-        // SQLite lower() is ASCII-only: the non-ASCII capital does not fold.
-        assert!(lists[3].is_empty(), "ünïcode must not match Ünïcode");
-        assert_eq!(lists[5].len(), 1);
-    }
-}
-
-#[test]
-fn rebuilt_import_keeps_the_lower_id_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("c.db");
-    let mut w = Catalog::open(&p).unwrap();
-    let plan_uses_index = |raw: &rusqlite::Connection| -> bool {
-        let mut st = raw
-            .prepare("EXPLAIN QUERY PLAN SELECT rowid FROM packages WHERE lower(id) = lower('x')")
-            .unwrap();
-        let details: Vec<String> = st
-            .query_map([], |r| r.get::<_, String>("detail"))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        details.iter().any(|d| d.contains("ix_pkg_id_lower"))
-    };
-    w.replace_source(
-        "winget",
-        SourceKind::Winget,
-        "v",
-        1,
-        &[pkg("A.A", "Alpha", "1")],
-        &all_maps(),
-    )
-    .unwrap();
-    let raw = rusqlite::Connection::open(&p).unwrap();
-    assert!(index_names(&raw).contains(&"ix_pkg_id_lower".to_string()));
-    assert!(plan_uses_index(&raw), "after the rebuild path");
-    w.replace_source(
-        "scoop:main",
-        SourceKind::Scoop,
-        "e",
-        1,
-        &[pkg("s", "s", "1")],
-        &WingetMaps::default(),
-    )
-    .unwrap();
-    assert!(index_names(&raw).contains(&"ix_pkg_id_lower".to_string()));
-    assert!(plan_uses_index(&raw), "after the scoop path");
 }
