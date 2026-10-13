@@ -1805,3 +1805,129 @@ fn details_icon_failure_never_fails_details() {
     assert_eq!(a.icon_bytes.get("other/x"), Some(&vec![9]));
     assert!(matches!(a.details.get(&key), Some(Ok(_))));
 }
+
+fn selected_icon_key(a: &App) -> String {
+    let (s, id) = a.selected_key().unwrap();
+    format!("{s}/{id}")
+}
+
+fn encode_requests(cmds: &[Cmd]) -> usize {
+    cmds.iter()
+        .filter(|c| matches!(c, Cmd::EncodeIcon { .. }))
+        .count()
+}
+
+/// A tiny valid protocol for cache tests.
+fn tiny_icon() -> ratatui_image::protocol::Protocol {
+    ratatui_image::picker::Picker::halfblocks()
+        .new_protocol(
+            image::DynamicImage::new_rgba8(10, 20),
+            ratatui::layout::Size::new(1, 1),
+            ratatui_image::Resize::Fit(None),
+        )
+        .unwrap()
+}
+
+#[test]
+fn undecodable_icon_is_remembered_as_none() {
+    use wingetrs::tui::icons::{IconProtocol, encode, picker};
+    let mut a = app();
+    a.icon_protocol = IconProtocol::Sixel;
+    let k0 = selected_icon_key(&a);
+    let cmds = update(
+        &mut a,
+        Msg::IconLoaded {
+            key: k0.clone(),
+            bytes: b"lixo".to_vec(),
+        },
+    );
+    let Some(Cmd::EncodeIcon {
+        key: k,
+        bytes,
+        size,
+    }) = cmds
+        .into_iter()
+        .find(|c| matches!(c, Cmd::EncodeIcon { .. }))
+    else {
+        panic!("no encode request");
+    };
+    assert_eq!((k.as_str(), size), (k0.as_str(), (8, 4)));
+    let proto = encode(&picker(IconProtocol::Sixel).unwrap(), &bytes, size);
+    assert!(proto.is_err());
+    update(
+        &mut a,
+        Msg::IconReady {
+            key: k0.clone(),
+            size,
+            proto,
+        },
+    );
+    assert!(a.icon_none.contains(&k0));
+    // Never asked again: same bytes again, or leaving the package and coming back.
+    let mut again = encode_requests(&update(
+        &mut a,
+        Msg::IconLoaded {
+            key: k0.clone(),
+            bytes: b"lixo".to_vec(),
+        },
+    ));
+    update(&mut a, key(KeyCode::Down));
+    again += encode_requests(&update(&mut a, key(KeyCode::Up)));
+    assert_eq!(selected_icon_key(&a), k0);
+    assert_eq!(again, 0);
+}
+
+#[test]
+fn icon_encoding_is_requested_once_for_the_selected_package() {
+    use wingetrs::tui::icons::IconProtocol;
+    let loaded = |k: &str| Msg::IconLoaded {
+        key: k.into(),
+        bytes: vec![1],
+    };
+    // Off: nothing is decoded.
+    let mut off = app();
+    let k = selected_icon_key(&off);
+    assert_eq!(encode_requests(&update(&mut off, loaded(&k))), 0);
+    assert!(off.icon_bytes.contains_key(&k));
+
+    let mut a = app();
+    a.icon_protocol = IconProtocol::Sixel;
+    let first = selected_icon_key(&a);
+    update(&mut a, key(KeyCode::Down));
+    let second = selected_icon_key(&a);
+    update(&mut a, key(KeyCode::Up));
+    // A package that is not selected waits until it is.
+    assert_eq!(encode_requests(&update(&mut a, loaded(&second))), 0);
+    assert_eq!(encode_requests(&update(&mut a, key(KeyCode::Down))), 1);
+    // In flight: not asked twice.
+    assert_eq!(encode_requests(&update(&mut a, loaded(&second))), 0);
+    update(
+        &mut a,
+        Msg::IconReady {
+            key: second.clone(),
+            size: (8, 4),
+            proto: Ok(tiny_icon()),
+        },
+    );
+    assert!(a.icons.get(&second, (8, 4)).is_some());
+    assert_eq!(encode_requests(&update(&mut a, loaded(&first))), 0);
+    // Encoded: coming back does not ask again; the first package does when selected.
+    assert_eq!(encode_requests(&update(&mut a, key(KeyCode::Up))), 1);
+    assert_eq!(encode_requests(&update(&mut a, key(KeyCode::Down))), 0);
+}
+
+#[test]
+fn icon_cache_keeps_the_newest_64() {
+    use wingetrs::tui::icons::{ICON_CACHE_MAX, IconCache};
+    let mut c = IconCache::default();
+    for i in 0..=ICON_CACHE_MAX {
+        c.insert(format!("k{i}"), (8, 4), tiny_icon());
+    }
+    assert_eq!(ICON_CACHE_MAX, 64);
+    assert_eq!(c.len(), 64);
+    assert!(c.get("k0", (8, 4)).is_none(), "the oldest goes");
+    assert!(c.get("k1", (8, 4)).is_some());
+    assert!(c.get("k64", (8, 4)).is_some());
+    // Keyed by size too.
+    assert!(c.get("k64", (4, 2)).is_none());
+}

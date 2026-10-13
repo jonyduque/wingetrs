@@ -4,9 +4,11 @@ use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{App, Focus, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, RunProgress, Tab};
 use crate::tui::help::{help_line, hints};
+use crate::tui::icons::IconProtocol;
 use crate::tui::layout::{
-    BAR_PAD_X, BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X,
-    PICKER_FOOTER_SLACK, inset, split_with_gutter,
+    BAR_PAD_X, BORDER, DETAIL_ICON_COLS, DETAIL_ICON_GAP, DETAIL_ICON_ROWS, DIALOG_PAD_X,
+    DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X, PICKER_FOOTER_SLACK, inset, split_icon,
+    split_with_gutter,
 };
 use crate::tui::picker::{Picker, window};
 use crate::tui::settings::{ORDER, SettingId};
@@ -18,6 +20,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui_image::protocol::Protocol;
 
 /// Below this width the details panel is hidden.
 const MIN_WIDTH_FOR_DETAILS: u16 = 60;
@@ -31,18 +34,42 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let window = draw_screen(app, theme, frame, area);
+    let (window, icon) = draw_screen(app, theme, frame, area);
     if let Some(modal) = &app.modal {
         draw_modal(modal, theme, frame, area);
     }
     // Toast boxes never cover a dialog (the residue picker decides what gets deleted);
     // with a dialog open, or on a small terminal, the newest toast goes to the status bar.
+    let mut toasts = Vec::new();
     if let Some(window) = window
         && !toasts_in_status_bar(app, area)
     {
         let g = Glyphs::for_set(app.glyphs);
-        draw_toasts(frame, window, &app.toasts, theme, g);
+        toasts = draw_toasts(frame, window, &app.toasts, theme, g);
     }
+    // Drawn last: a terminal image paints its whole area, so one crossing a toast is skipped.
+    if let Some((rect, proto)) = icon
+        && !toasts.iter().any(|t| t.intersects(rect))
+    {
+        frame.render_widget(ratatui_image::Image::new(proto), rect);
+    }
+}
+
+/// Whether the package icon may be shown: never under a dialog or the help, nor when off.
+pub fn icon_visible(app: &App) -> bool {
+    app.modal.is_none() && !app.show_help && app.icon_protocol != IconProtocol::Off
+}
+
+/// The encoded icon of the selected package, when one may be shown.
+fn selected_icon(app: &App) -> Option<&Protocol> {
+    if !icon_visible(app) {
+        return None;
+    }
+    let (source, id) = app.selected_key()?;
+    app.icons.get(
+        &format!("{source}/{id}"),
+        (DETAIL_ICON_COLS, DETAIL_ICON_ROWS),
+    )
 }
 
 /// On a small terminal or with a dialog open toasts are not boxes: the newest shows in the
@@ -55,8 +82,17 @@ fn toasts_in_status_bar(app: &App, area: Rect) -> bool {
 const TOAST_MIN_WIDTH: u16 = 40;
 const TOAST_MIN_HEIGHT: u16 = 12;
 
-/// Draws the screen; returns the main window's rectangle when there is one.
-fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Option<Rect> {
+/// Where the icon goes and what it is; drawn by `view` after the toasts.
+type IconPlace<'a> = Option<(Rect, &'a Protocol)>;
+
+/// Draws the screen; returns the main window's rectangle when there is one, and the
+/// icon still to be drawn.
+fn draw_screen<'a>(
+    app: &'a App,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) -> (Option<Rect>, IconPlace<'a>) {
     let g = Glyphs::for_set(app.glyphs);
     if area.height < MIN_HEIGHT_FOR_CHROME {
         if app.tab == Tab::Settings {
@@ -64,7 +100,7 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Optio
         } else {
             draw_list(app, theme, g, frame, area);
         }
-        return None;
+        return (None, None);
     }
     let help_rows = u16::from(area.height >= HELP_BAR_MIN_HEIGHT);
     let rows = Layout::vertical([
@@ -94,6 +130,7 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Optio
     ])
     .split(inner);
     let body = parts[2];
+    let mut icon = None;
     if app.tab == Tab::Settings {
         draw_settings(app, theme, g, frame, inner);
     } else if area.width < MIN_WIDTH_FOR_DETAILS {
@@ -113,7 +150,7 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Optio
                 .buffer_mut()
                 .set_string(divider, y, "│", divider_style);
         }
-        draw_details(app, theme, g, frame, right);
+        icon = draw_details(app, theme, g, frame, right);
     }
     draw_status(app, theme, g, frame, rows[2]);
     if help_rows > 0 {
@@ -124,7 +161,7 @@ fn draw_screen(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Optio
     if app.show_help {
         draw_help(theme, frame, area);
     }
-    Some(rows[1])
+    (Some(rows[1]), icon)
 }
 
 fn tab_index(tab: Tab) -> usize {
@@ -759,9 +796,35 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
     out
 }
 
-fn draw_details(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
-    let p = Paragraph::new(details_lines(app, theme, g)).wrap(Wrap { trim: true });
-    frame.render_widget(p, area);
+/// Draws the details; with an icon, its first lines sit beside it and the rest below.
+/// Returns where the icon goes (drawn by `view`, after the toasts).
+fn draw_details<'a>(
+    app: &'a App,
+    theme: &Theme,
+    g: &Glyphs,
+    frame: &mut Frame,
+    area: Rect,
+) -> IconPlace<'a> {
+    let mut lines = details_lines(app, theme, g);
+    let icon = selected_icon(app).filter(|_| {
+        area.width >= DETAIL_ICON_COLS + DETAIL_ICON_GAP + 10 && area.height >= DETAIL_ICON_ROWS
+    });
+    let Some(proto) = icon else {
+        let p = Paragraph::new(lines).wrap(Wrap { trim: true });
+        frame.render_widget(p, area);
+        return None;
+    };
+    let (icon_rect, text) = split_icon(area, DETAIL_ICON_ROWS, DETAIL_ICON_COLS, DETAIL_ICON_GAP);
+    let rest = lines.split_off(lines.len().min(usize::from(DETAIL_ICON_ROWS)));
+    frame.render_widget(Paragraph::new(lines), text);
+    let below = Rect::new(
+        area.x,
+        area.y + DETAIL_ICON_ROWS,
+        area.width,
+        area.height - DETAIL_ICON_ROWS,
+    );
+    frame.render_widget(Paragraph::new(rest).wrap(Wrap { trim: true }), below);
+    Some((icon_rect, proto))
 }
 
 /// A bar row with `BAR_PAD_X` of margin on both sides.

@@ -54,5 +54,26 @@ pub fn split_with_gutter(area: Rect, left_percent: u16) -> (Rect, u16, Rect) {
     let right = Rect::new(right_x, area.y, area.right() - right_x, area.height);
     (left, divider, right)
 }
+/// Lines of the details pane beside the package icon.
+pub const DETAIL_ICON_ROWS: u16 = 4;
+/// Columns of the package icon.
+pub const DETAIL_ICON_COLS: u16 = 8;
+/// Blank columns between the icon and the text beside it.
+pub const DETAIL_ICON_GAP: u16 = 2;
+
+/// Splits the top `rows` lines of `area` into `(icon, text)`: the icon takes `cols` columns
+/// at the left and the text starts `gap` columns after it; too-narrow areas saturate to 0.
+pub fn split_icon(area: Rect, rows: u16, cols: u16, gap: u16) -> (Rect, Rect) {
+    let h = rows.min(area.height);
+    let icon = Rect::new(area.x, area.y, cols.min(area.width), h);
+    let text_x = area
+        .x
+        .saturating_add(cols)
+        .saturating_add(gap)
+        .min(area.right());
+    let text = Rect::new(text_x, area.y, area.right() - text_x, h);
+    (icon, text)
+}
+
 /// Lines a picker dialog reserves beyond border and padding: the footer line plus one spare.
 pub const PICKER_FOOTER_SLACK: u16 = 2;

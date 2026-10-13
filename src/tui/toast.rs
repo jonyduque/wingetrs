@@ -106,18 +106,19 @@ fn toast_lines(toast: &Toast, width: usize, theme: &Theme, g: &Glyphs) -> Vec<Li
 }
 
 /// Draws `toasts` (newest first) down from the top right of `window`; what does not fit
-/// in the window's height is left out.
+/// in the window's height is left out. Returns the rectangles drawn.
 pub fn draw_toasts(
     frame: &mut Frame,
     window: Rect,
     toasts: &[Toast],
     theme: &Theme,
     glyphs: &Glyphs,
-) {
+) -> Vec<Rect> {
+    let mut drawn = Vec::new();
     let w = TOAST_MAX_WIDTH.min(window.width.saturating_sub(2 * TOAST_MARGIN_X));
     let text_w = w.saturating_sub(2 * (BORDER + TOAST_PAD_X));
     if text_w == 0 {
-        return;
+        return drawn;
     }
     let x = window.right().saturating_sub(TOAST_MARGIN_X + w);
     let bottom = window.bottom().saturating_sub(BORDER);
@@ -138,8 +139,10 @@ pub fn draw_toasts(
         frame.render_widget(Clear, rect);
         frame.render_widget(blk, rect);
         frame.render_widget(Paragraph::new(lines), inner);
+        drawn.push(rect);
         y = y.saturating_add(h);
     }
+    drawn
 }
 
 #[cfg(test)]

@@ -6,13 +6,14 @@ use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::layout::{FILTER_GAP, ITEM_GAP};
+use crate::tui::icons::{IconCache, IconProtocol};
+use crate::tui::layout::{DETAIL_ICON_COLS, DETAIL_ICON_ROWS, FILTER_GAP, ITEM_GAP};
 use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::settings::{SettingsState, glyphs_name};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,6 +66,12 @@ pub enum Msg {
     IconLoaded {
         key: String,
         bytes: Vec<u8>,
+    },
+    /// The icon of `key` encoded for `size` cells (columns, rows), or why it could not be.
+    IconReady {
+        key: String,
+        size: (u16, u16),
+        proto: Result<ratatui_image::protocol::Protocol, String>,
     },
     RefreshStarted,
     RefreshFinished(Vec<SourceReport>),
@@ -213,6 +220,12 @@ pub enum Cmd {
         glyphs: Option<String>,
         theme: String,
     },
+    /// Decode and encode an icon off the UI thread and answer with `Msg::IconReady`.
+    EncodeIcon {
+        key: String,
+        bytes: Vec<u8>,
+        size: (u16, u16),
+    },
     /// Run `run_search` off the UI thread and answer with `Msg::SearchDone`.
     Search {
         generation: u64,
@@ -272,6 +285,14 @@ pub struct App {
     pub details: HashMap<String, Result<PackageDetails, String>>,
     /// Raw icon bytes, keyed like `details`.
     pub icon_bytes: HashMap<String, Vec<u8>>,
+    /// Protocol icons are drawn with; `Off` decodes and draws nothing.
+    pub icon_protocol: IconProtocol,
+    /// Encoded icons ready to draw.
+    pub icons: IconCache,
+    /// Keys whose icon could not be decoded; never retried in this session.
+    pub icon_none: HashSet<String>,
+    /// Keys whose icon is being encoded.
+    icon_in_flight: HashSet<String>,
     /// `"{source}/{id}"` of the selected package while its details are being loaded.
     pub details_pending: Option<String>,
     pub refreshing: bool,
@@ -341,6 +362,10 @@ impl App {
             installed: Vec::new(),
             details: HashMap::new(),
             icon_bytes: HashMap::new(),
+            icon_protocol: IconProtocol::Off,
+            icons: IconCache::default(),
+            icon_none: HashSet::new(),
+            icon_in_flight: HashSet::new(),
             details_pending: None,
             refreshing: false,
             offline: false,
@@ -544,8 +569,40 @@ impl App {
         self.refreshing || self.details_pending.is_some()
     }
 
-    /// Requests the selected package's details unless cached; records what is pending.
+    /// Requests encoding the selected package's icon when its bytes are here and it is
+    /// neither encoded, being encoded, nor known to be undecodable.
+    fn icon_cmd(&mut self) -> Vec<Cmd> {
+        if self.icon_protocol == IconProtocol::Off {
+            return Vec::new();
+        }
+        let Some((source, id)) = self.selected_key() else {
+            return Vec::new();
+        };
+        let key = format!("{source}/{id}");
+        let size = (DETAIL_ICON_COLS, DETAIL_ICON_ROWS);
+        if self.icon_none.contains(&key)
+            || self.icon_in_flight.contains(&key)
+            || self.icons.get(&key, size).is_some()
+        {
+            return Vec::new();
+        }
+        let Some(bytes) = self.icon_bytes.get(&key) else {
+            return Vec::new();
+        };
+        let bytes = bytes.clone();
+        self.icon_in_flight.insert(key.clone());
+        vec![Cmd::EncodeIcon { key, bytes, size }]
+    }
+
+    /// Requests the selected package's details unless cached (and its icon's encoding);
+    /// records what is pending.
     fn details_cmd(&mut self) -> Vec<Cmd> {
+        let mut cmds = self.details_only_cmd();
+        cmds.extend(self.icon_cmd());
+        cmds
+    }
+
+    fn details_only_cmd(&mut self) -> Vec<Cmd> {
         match self.selected_key() {
             Some((source, id)) => {
                 let key = format!("{source}/{id}");
@@ -657,6 +714,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::IconLoaded { key, bytes } => {
             // Stored even if the selection moved on: the bytes are keyed and the cache is bounded.
             app.icon_bytes.insert(key, bytes);
+            app.icon_cmd()
+        }
+        Msg::IconReady { key, size, proto } => {
+            app.icon_in_flight.remove(&key);
+            match proto {
+                Ok(p) => app.icons.insert(key, size, p),
+                Err(_) => {
+                    app.icon_none.insert(key);
+                }
+            }
             Vec::new()
         }
         Msg::DetailsLoaded { key, result } => {

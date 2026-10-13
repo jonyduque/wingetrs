@@ -98,6 +98,8 @@ struct Ctx {
     tx: UnboundedSender<Msg>,
     /// Generation of the newest detail request; older ones are dropped after the debounce.
     details_gen: AtomicU64,
+    /// Encoder for package icons; `None` when icons are off.
+    icon_picker: Option<ratatui_image::picker::Picker>,
 }
 
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
@@ -123,6 +125,7 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
+    app.icon_protocol = crate::tui::icons::choose_from_env(&cfg.icons);
     app.status = Some("carregando catálogo…".into());
     // `ratatui::init` also installs a panic hook that restores the terminal before the message.
     let mut terminal = ratatui::init();
@@ -170,6 +173,8 @@ async fn event_loop(
         http: Http::new()?,
         tx,
         details_gen: AtomicU64::new(0),
+        // After `ratatui::init`, so the pixel size is that of the terminal in use.
+        icon_picker: crate::tui::icons::picker(app.icon_protocol),
     });
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
@@ -262,6 +267,7 @@ async fn event_loop(
                         ))
                     });
                 }
+                Cmd::EncodeIcon { key, bytes, size } => spawn_icon(&ctx, key, bytes, size),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
                 Cmd::Search {
@@ -376,6 +382,42 @@ pub async fn join_search(generation: u64, h: tokio::task::JoinHandle<Msg>) -> Ms
         Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
         Err(_) => Msg::SearchCancelled { generation },
     }
+}
+
+/// Awaits an icon encoder: a panic travels to the loop as `Msg::Panicked`, a cancellation
+/// becomes a failed encoding for `key`.
+pub async fn join_icon(key: String, size: (u16, u16), h: tokio::task::JoinHandle<Msg>) -> Msg {
+    match h.await {
+        Ok(msg) => msg,
+        Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
+        Err(e) => Msg::IconReady {
+            key,
+            size,
+            proto: Err(format!("tarefa cancelada: {e}")),
+        },
+    }
+}
+
+/// Decodes and encodes one icon on a blocking thread; the handle is always awaited.
+fn spawn_icon(ctx: &Arc<Ctx>, key: String, bytes: Vec<u8>, size: (u16, u16)) {
+    let picker = ctx.icon_picker.clone();
+    let tx = ctx.tx.clone();
+    tokio::spawn(async move {
+        let work = tokio::task::spawn_blocking({
+            let key = key.clone();
+            move || {
+                let proto = match &picker {
+                    Some(p) => crate::tui::icons::encode(p, &bytes, size),
+                    None => Err("ícones desligados".into()),
+                };
+                if let Err(e) = &proto {
+                    tracing::debug!(%key, error = %e, "icon not decoded");
+                }
+                Msg::IconReady { key, size, proto }
+            }
+        });
+        let _ = tx.send(join_icon(key, size, work).await);
+    });
 }
 
 /// Runs one keystroke's search on a blocking thread; the handle is always awaited.

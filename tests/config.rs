@@ -147,3 +147,24 @@ fn update_file_creates_missing_file() {
     assert!(c.behavior.purge);
     assert_eq!(c.scoop_buckets, Config::default().scoop_buckets);
 }
+
+#[test]
+fn config_icons_default_and_unknown() {
+    use wingetrs::tui::icons::{IconProtocol, choose};
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "glyphs = \"ascii\"\n").unwrap();
+    let c = Config::load(&p).unwrap();
+    assert_eq!(c.icons, "auto");
+    std::fs::write(&p, "icons = \"bogus\"\n").unwrap();
+    let c = Config::load(&p).unwrap();
+    assert_eq!(
+        choose(&c.icons, Some("WezTerm"), false),
+        IconProtocol::Iterm2
+    );
+    assert_eq!(choose(&c.icons, None, true), IconProtocol::Sixel);
+    assert_eq!(choose(&c.icons, None, false), IconProtocol::Off);
+    std::fs::write(&p, "icons = \"off\"\n").unwrap();
+    let c = Config::load(&p).unwrap();
+    assert_eq!(choose(&c.icons, Some("WezTerm"), true), IconProtocol::Off);
+}

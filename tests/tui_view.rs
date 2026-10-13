@@ -1248,3 +1248,138 @@ fn settings_screen_snapshot() {
     a.buckets_summary = "main, extras".into();
     insta::assert_snapshot!(render(&a, 100, 24));
 }
+
+#[test]
+fn split_icon_leaves_a_gap() {
+    use ratatui::layout::Rect;
+    use wingetrs::tui::layout::split_icon;
+    let (icon, text) = split_icon(Rect::new(0, 0, 40, 10), 4, 8, 2);
+    assert_eq!(icon, Rect::new(0, 0, 8, 4));
+    assert_eq!(text, Rect::new(10, 0, 30, 4));
+    let (icon, text) = split_icon(Rect::new(3, 2, 15, 10), 4, 8, 2);
+    assert_eq!(icon, Rect::new(3, 2, 8, 4));
+    assert_eq!(text, Rect::new(13, 2, 5, 4));
+    // Narrower than icon + gap: saturates instead of panicking.
+    let (_, text) = split_icon(Rect::new(0, 0, 9, 2), 4, 8, 2);
+    assert_eq!((text.x, text.width, text.height), (9, 0, 2));
+}
+
+/// An opaque red 8x4-cell halfblocks icon: its cells get a red background in the buffer.
+fn test_icon() -> ratatui_image::protocol::Protocol {
+    use wingetrs::tui::layout::{DETAIL_ICON_COLS, DETAIL_ICON_ROWS};
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    let fs = picker.font_size();
+    let img = image::RgbaImage::from_pixel(
+        u32::from(DETAIL_ICON_COLS * fs.width),
+        u32::from(DETAIL_ICON_ROWS * fs.height),
+        image::Rgba([255, 0, 0, 255]),
+    );
+    picker
+        .new_protocol(
+            image::DynamicImage::ImageRgba8(img),
+            ratatui::layout::Size::new(DETAIL_ICON_COLS, DETAIL_ICON_ROWS),
+            ratatui_image::Resize::Fit(None),
+        )
+        .unwrap()
+}
+
+fn selected_key(a: &App) -> String {
+    let (s, id) = a.selected_key().unwrap();
+    format!("{s}/{id}")
+}
+
+/// `typed("powert")` with the selected package's icon encoded and the protocol on.
+fn with_icon() -> App {
+    use wingetrs::tui::layout::{DETAIL_ICON_COLS, DETAIL_ICON_ROWS};
+    let mut a = typed("powert");
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let key = selected_key(&a);
+    a.icons
+        .insert(key, (DETAIL_ICON_COLS, DETAIL_ICON_ROWS), test_icon());
+    a
+}
+
+fn is_icon(c: &ratatui::buffer::Cell) -> bool {
+    c.bg == ratatui::style::Color::Rgb(255, 0, 0)
+}
+
+fn icon_cells(buf: &ratatui::buffer::Buffer) -> usize {
+    buf.content().iter().filter(|c| is_icon(c)).count()
+}
+
+#[test]
+fn details_text_starts_after_the_icon_gap() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let buf = screen_cells(&with_icon(), 100, 16, &theme);
+    // Details pane: text column 57, first line 5 (see list_and_details_text_start_one_column_after_the_border).
+    let (x, y) = (57u16, 5u16);
+    let mut drawn = 0;
+    for row in y..y + 4 {
+        for col in x..x + 8 {
+            let s = buf[(col, row)].symbol();
+            assert!(
+                !s.chars().any(char::is_alphanumeric),
+                "text inside the icon at ({col},{row}): {s:?}"
+            );
+            drawn += usize::from(is_icon(&buf[(col, row)]));
+        }
+        assert_eq!(buf[(x + 8, row)].symbol(), " ", "row {row}");
+        assert_eq!(buf[(x + 9, row)].symbol(), " ", "row {row}");
+    }
+    assert_eq!(drawn, 32, "the icon fills its 8x4 cells");
+    let line = row_text(&buf, y);
+    let name_at: String = line.chars().skip(usize::from(x) + 10).take(9).collect();
+    assert_eq!(name_at, "PowerToys", "{line}");
+    // Lines past the first four (a blank one, then the spinner) use the full width again.
+    let below: String = row_text(&buf, y + 5).chars().skip(usize::from(x)).collect();
+    assert!(below.starts_with("| carregando"), "{below}");
+}
+
+#[test]
+fn details_without_icon_keep_the_old_layout() {
+    use wingetrs::tui::icons::IconProtocol;
+    let base = render(&typed("powert"), 100, 16);
+    // Bytes but the protocol off.
+    let mut a = typed("powert");
+    let key = selected_key(&a);
+    a.icon_bytes.insert(key.clone(), vec![1, 2, 3]);
+    assert_eq!(render(&a, 100, 16), base);
+    // Protocol on, still encoding (nothing in the cache).
+    a.icon_protocol = IconProtocol::Sixel;
+    assert_eq!(render(&a, 100, 16), base);
+    // An encoded icon with the protocol off is not drawn either.
+    let mut b = with_icon();
+    b.icon_protocol = IconProtocol::Off;
+    assert_eq!(render(&b, 100, 16), base);
+    // Control: with the icon the screen does change.
+    assert_ne!(render(&with_icon(), 100, 16), base);
+}
+
+#[test]
+fn no_icon_over_a_dialog() {
+    use wingetrs::tui::view::icon_visible;
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let a = with_icon();
+    assert!(icon_visible(&a));
+    assert!(icon_cells(&screen_cells(&a, 100, 16, &theme)) > 0);
+    let mut m = with_confirm();
+    m.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let key = selected_key(&m);
+    m.icons.insert(key, (8, 4), test_icon());
+    assert!(!icon_visible(&m));
+    assert_eq!(icon_cells(&screen_cells(&m, 100, 16, &theme)), 0);
+    let mut h = with_icon();
+    h.show_help = true;
+    assert!(!icon_visible(&h));
+    assert_eq!(icon_cells(&screen_cells(&h, 100, 16, &theme)), 0);
+}
+
+#[test]
+fn icon_crossing_a_toast_is_not_drawn() {
+    use wingetrs::tui::app::ToastKind;
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let mut a = with_icon();
+    a.push_toast(ToastKind::Error, "falhou");
+    let buf = screen_cells(&a, 100, 16, &theme);
+    assert_eq!(icon_cells(&buf), 0);
+}

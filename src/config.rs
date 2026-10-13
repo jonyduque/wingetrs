@@ -48,6 +48,8 @@ pub struct Config {
     pub buckets: Vec<BucketEntry>,
     pub glyphs: String,
     pub theme: String,
+    /// Icon protocol in the details pane: `auto`, `iterm2`, `sixel` or `off`.
+    pub icons: String,
     pub behavior: Behavior,
 }
 
@@ -58,6 +60,7 @@ impl Default for Config {
             buckets: Vec::new(),
             glyphs: "nerd".into(),
             theme: "dark".into(),
+            icons: crate::tui::icons::DEFAULT_SETTING.into(),
             behavior: Behavior::default(),
         }
     }
@@ -86,10 +89,15 @@ impl Config {
                 });
             }
         };
-        toml::from_str(&text).map_err(|e| ConfigError::Parse {
+        let mut cfg: Config = toml::from_str(&text).map_err(|e| ConfigError::Parse {
             path: path.display().to_string(),
             msg: e.to_string(),
-        })
+        })?;
+        if !crate::tui::icons::SETTINGS.contains(&cfg.icons.as_str()) {
+            tracing::warn!(icons = %cfg.icons, "unknown icons setting, using auto");
+            cfg.icons = crate::tui::icons::DEFAULT_SETTING.into();
+        }
+        Ok(cfg)
     }
 
     /// Writes the config (temp file + rename).

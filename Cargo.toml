@@ -23,9 +23,11 @@ fancy-regex = "0.19.2"
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 futures-util = "0.3.34"
 hex = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "ico", "jpeg", "gif"] }
 md-5 = "0.11.0"
 nucleo = "0.5.0"
 ratatui = "0.30.2"
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "stream"] }
 roxmltree = "0.21.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
