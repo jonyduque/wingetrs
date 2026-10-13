@@ -735,6 +735,8 @@ mod tests {
     #[test]
     fn import_restores_cache_size() {
         let mut c = Catalog::open_in_memory().unwrap();
+        // Non-default, so restoring SQLite's default would not pass.
+        c.conn.pragma_update(None, "cache_size", -1234i64).unwrap();
         let cache = |c: &Catalog| -> i64 {
             c.conn
                 .query_row("PRAGMA cache_size", [], |r| r.get(0))
