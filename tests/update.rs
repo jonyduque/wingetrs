@@ -411,3 +411,111 @@ async fn a_failed_source_does_not_respawn_on_every_command() {
         );
     }
 }
+
+fn all_urls(ep: &Endpoints) -> Vec<String> {
+    let mut v = vec![ep.winget_index.clone()];
+    v.extend(ep.scoop.iter().map(|(_, u)| u.clone()));
+    v
+}
+
+async fn endpoints_all_answering(s: &MockServer, status: u16, expect0: bool) -> Endpoints {
+    for p in ["/source2.msix", "/main.tgz", "/extras.tgz"] {
+        let m = Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(status));
+        if expect0 {
+            m.expect(0).mount(s).await;
+        } else {
+            m.mount(s).await;
+        }
+    }
+    Endpoints {
+        winget_index: format!("{}/source2.msix", s.uri()),
+        scoop: vec![
+            ("main".into(), format!("{}/main.tgz", s.uri())),
+            ("extras".into(), format!("{}/extras.tgz", s.uri())),
+        ],
+    }
+}
+
+fn seed_state_and_index(data: &DataDir, ep: &Endpoints, checked_at: i64) {
+    data.ensure().unwrap();
+    let mut st = HttpState::default();
+    for u in all_urls(ep) {
+        st.set(
+            &u,
+            HttpEntry {
+                etag: Some("\"e\"".into()),
+                checked_at,
+                ..HttpEntry::default()
+            },
+        );
+    }
+    st.save(&data.http_state_path()).unwrap();
+    wingetrs::catalog::index_file::write(
+        &Catalog::open_in_memory().unwrap(),
+        &data.search_index_path(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn fresh_update_touches_neither_http_json_nor_the_catalog() {
+    let s = MockServer::start().await;
+    let ep = endpoints_all_answering(&s, 500, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    seed_state_and_index(&data, &ep, wingetrs::cache::now_unix());
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(data.http_state_path())
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let rep = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        false,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rep.len(), 3);
+    assert!(rep.iter().all(|r| r.outcome == Outcome::Fresh), "{rep:?}");
+    assert_eq!(
+        std::fs::metadata(data.http_state_path())
+            .unwrap()
+            .modified()
+            .unwrap(),
+        old
+    );
+    assert!(!data.catalog_path().exists());
+}
+
+#[tokio::test]
+async fn not_modified_update_still_refreshes_checked_at() {
+    let s = MockServer::start().await;
+    let ep = endpoints_all_answering(&s, 304, false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    seed_state_and_index(&data, &ep, 1);
+    let rep = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        false,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rep.iter().all(|r| r.outcome == Outcome::Unchanged),
+        "{rep:?}"
+    );
+    let back = HttpState::load(&data.http_state_path());
+    for u in all_urls(&ep) {
+        assert!(back.get(&u).unwrap().checked_at > 1, "{u}");
+    }
+}

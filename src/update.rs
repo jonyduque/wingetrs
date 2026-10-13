@@ -228,8 +228,15 @@ pub async fn run_update(
     });
     let results = futures_util::future::join_all(fetches).await;
 
-    let mut catalog = tracing::debug_span!("update.catalog_open")
-        .in_scope(|| Catalog::open(&data.catalog_path()))?;
+    let index_path = data.search_index_path();
+    let mut catalog = if needs_catalog(&results, index_path.exists()) {
+        Some(
+            tracing::debug_span!("update.catalog_open")
+                .in_scope(|| Catalog::open(&data.catalog_path()))?,
+        )
+    } else {
+        None
+    };
     let mut reports = Vec::new();
     for (job, res) in jobs.iter().zip(results) {
         let outcome = match res {
@@ -241,44 +248,65 @@ pub async fn run_update(
                 state.set(job.url, e);
                 Outcome::Unchanged
             }
-            Some(Ok(Fetched::Winget(imp, entry))) => apply(
-                &mut catalog,
-                &mut state,
-                job,
-                entry,
-                now,
-                &imp.packages,
-                &imp.maps,
-                0,
-            ),
-            Some(Ok(Fetched::Scoop(imp, entry))) => apply(
-                &mut catalog,
-                &mut state,
-                job,
-                entry,
-                now,
-                &imp.packages,
-                &WingetMaps::default(),
-                imp.skipped.len(),
-            ),
+            Some(Ok(Fetched::Winget(imp, entry))) => match catalog.as_mut() {
+                Some(c) => apply(c, &mut state, job, entry, now, &imp.packages, &imp.maps, 0),
+                None => no_catalog(),
+            },
+            Some(Ok(Fetched::Scoop(imp, entry))) => match catalog.as_mut() {
+                Some(c) => apply(
+                    c,
+                    &mut state,
+                    job,
+                    entry,
+                    now,
+                    &imp.packages,
+                    &WingetMaps::default(),
+                    imp.skipped.len(),
+                ),
+                None => no_catalog(),
+            },
         };
         reports.push(SourceReport {
             source: job.source.clone(),
             outcome,
         });
     }
-    let saved =
-        tracing::debug_span!("update.state_save").in_scope(|| state.save(&data.http_state_path()));
-    let index_path = data.search_index_path();
+    // Only Unchanged/Updated change an HttpEntry; all Fresh/Failed leaves http.json as is.
+    let state_changed = reports
+        .iter()
+        .any(|r| matches!(r.outcome, Outcome::Unchanged | Outcome::Updated { .. }));
+    let saved = if state_changed {
+        tracing::debug_span!("update.state_save").in_scope(|| state.save(&data.http_state_path()))
+    } else {
+        Ok(())
+    };
     let updated = reports
         .iter()
         .any(|r| matches!(r.outcome, Outcome::Updated { .. }));
-    if updated || !index_path.exists() {
-        tracing::debug_span!("update.search_idx")
-            .in_scope(|| write_search_index(&catalog, &index_path));
+    if let Some(c) = &catalog
+        && (updated || !index_path.exists())
+    {
+        tracing::debug_span!("update.search_idx").in_scope(|| write_search_index(c, &index_path));
     }
     saved?;
     Ok(reports)
+}
+
+/// True when the catalog must be opened: some source has an import to apply, or the
+/// search index is missing and must be rebuilt from the catalog.
+fn needs_catalog(results: &[Option<Result<Fetched, (String, bool)>>], index_exists: bool) -> bool {
+    !index_exists
+        || results
+            .iter()
+            .any(|r| matches!(r, Some(Ok(Fetched::Winget(..) | Fetched::Scoop(..)))))
+}
+
+/// Unreachable by construction: `needs_catalog` is true whenever an import exists.
+fn no_catalog() -> Outcome {
+    Outcome::Failed {
+        message: "erro interno: catálogo não aberto para importar".to_string(),
+        offline: false,
+    }
 }
 
 /// Rewrites `search.idx`; on failure removes a possibly stale file so `search` falls back to
@@ -320,5 +348,39 @@ fn apply(
             message: e.to_string(),
             offline: false,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_catalog_only_for_imports_or_missing_index() {
+        let idle = || {
+            vec![
+                None,
+                Some(Ok(Fetched::NotModified)),
+                Some(Err(("x".to_string(), true))),
+            ]
+        };
+        assert!(!needs_catalog(&idle(), true));
+        assert!(needs_catalog(&idle(), false));
+        let scoop = vec![Some(Ok(Fetched::Scoop(
+            BucketImport {
+                packages: vec![],
+                skipped: vec![],
+            },
+            HttpEntry::default(),
+        )))];
+        assert!(needs_catalog(&scoop, true));
+        let winget = vec![Some(Ok(Fetched::Winget(
+            WingetImport {
+                packages: vec![],
+                maps: WingetMaps::default(),
+            },
+            HttpEntry::default(),
+        )))];
+        assert!(needs_catalog(&winget, true));
     }
 }
