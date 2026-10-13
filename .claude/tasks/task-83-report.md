@@ -25,3 +25,9 @@ Decisions:
 - Cargo target: target/t83.
 
 Concerns: none (leftovers.ps1 lista um bash.exe anterior a esta tarefa, nao meu).
+
+## Review fixes
+Gate: [OK]   test (659 passed, 16 ignored) / [OK]   gate verde
+1. `Msg::DetailsLoaded` voltou a ter so `key,result`; novo `Msg::IconLoaded { key, bytes }`. `spawn_details` envia os detalhes, depois busca o icone na mesma tarefa e envia `IconLoaded` so em sucesso (falha => debug, nada enviado). Decisao: `IconLoaded` de chave nao mais selecionada e ARMAZENADO (chaveado, inofensivo). Teste de estado em tests/tui_state.rs (`details_icon_failure_never_fails_details`). Teste deterministico da ordem detalhes->icone: nao feito, a ordem esta dentro de `spawn_details` (tokio::spawn com Ctx real, sem costura de teste).
+2. `Http::get_limited` + `HttpError::TooLarge`; `icons::fetch` mapeia para `IconError::TooLarge`. Testes (servidor TCP cru, pois wiremock sempre poe Content-Length): fluxo sem Content-Length > max, e Content-Length declarado > max com corpo curto (so passa se recusar antes de ler).
+Mutacoes: `if body.len() > max {` -> `if false {` => [OK] mutação PEGA; `is_some_and(|n| n > max as u64)` -> `false && ...` => [OK] mutação PEGA.

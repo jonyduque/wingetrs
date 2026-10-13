@@ -60,8 +60,11 @@ pub enum Msg {
     DetailsLoaded {
         key: String,
         result: Result<PackageDetails, String>,
-        /// Raw bytes of the package icon; `None` when absent or its download failed.
-        icon: Option<Vec<u8>>,
+    },
+    /// Raw icon bytes of `key`, sent after its details and only when the icon was obtained.
+    IconLoaded {
+        key: String,
+        bytes: Vec<u8>,
     },
     RefreshStarted,
     RefreshFinished(Vec<SourceReport>),
@@ -651,12 +654,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             );
             Vec::new()
         }
-        Msg::DetailsLoaded { key, result, icon } => {
+        Msg::IconLoaded { key, bytes } => {
+            // Stored even if the selection moved on: the bytes are keyed and the cache is bounded.
+            app.icon_bytes.insert(key, bytes);
+            Vec::new()
+        }
+        Msg::DetailsLoaded { key, result } => {
             if app.details_pending.as_deref() == Some(key.as_str()) {
                 app.details_pending = None;
-            }
-            if let Some(bytes) = icon {
-                app.icon_bytes.insert(key.clone(), bytes);
             }
             app.details.insert(key, result);
             Vec::new()

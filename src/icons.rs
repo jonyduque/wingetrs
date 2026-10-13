@@ -27,10 +27,11 @@ pub async fn fetch(http: &Http, blobs: &BlobStore, icon: &IconRef) -> Result<Vec
     if let Some(hit) = blobs.get(&icon.sha256) {
         return Ok(hit);
     }
-    let bytes = http.get(&icon.url).await?;
-    if bytes.len() > MAX_ICON_BYTES {
-        return Err(IconError::TooLarge);
-    }
+    let bytes = match http.get_limited(&icon.url, MAX_ICON_BYTES).await {
+        Ok(b) => b,
+        Err(HttpError::TooLarge(_)) => return Err(IconError::TooLarge),
+        Err(e) => return Err(e.into()),
+    };
     match blobs.put_verified(&icon.sha256, &bytes) {
         Ok(()) => Ok(bytes),
         Err(CacheError::HashMismatch { .. }) => Err(IconError::Integrity),

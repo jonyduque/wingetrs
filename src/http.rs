@@ -18,6 +18,8 @@ pub enum HttpError {
     Timeout,
     #[error("HTTP {0}")]
     Status(u16),
+    #[error("resposta maior que o limite de {0} bytes")]
+    TooLarge(usize),
 }
 
 impl HttpError {
@@ -118,6 +120,29 @@ impl Http {
             return Err(HttpError::Status(status.as_u16()));
         }
         Ok(resp.bytes().await.map_err(map_err)?.to_vec())
+    }
+
+    /// Like [`Http::get`], but refuses bodies over `max` bytes: at once when `Content-Length`
+    /// says so, otherwise as soon as the streamed total passes `max`.
+    pub async fn get_limited(&self, url: &str, max: usize) -> Result<Vec<u8>, HttpError> {
+        use futures_util::StreamExt;
+        let resp = self.client.get(url).send().await.map_err(map_err)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(HttpError::Status(status.as_u16()));
+        }
+        if resp.content_length().is_some_and(|n| n > max as u64) {
+            return Err(HttpError::TooLarge(max));
+        }
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.map_err(map_err)?);
+            if body.len() > max {
+                return Err(HttpError::TooLarge(max));
+            }
+        }
+        Ok(body)
     }
 
     /// Streams the body of `url` into `path` (created/truncated), reporting `(done, total)`.

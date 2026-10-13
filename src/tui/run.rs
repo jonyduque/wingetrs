@@ -364,7 +364,6 @@ pub async fn join_details(key: String, h: tokio::task::JoinHandle<Msg>) -> Msg {
         Err(e) => Msg::DetailsLoaded {
             key,
             result: Err(format!("tarefa cancelada: {e}")),
-            icon: None,
         },
     }
 }
@@ -510,18 +509,24 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
         let key = format!("{source}/{id}");
         let work = tokio::spawn({
             let (ctx, key) = (Arc::clone(&ctx), key.clone());
+            let (source, id) = (source.clone(), id.clone());
             async move {
                 let result = load_details(&ctx, &source, &id)
                     .await
                     .map_err(|e| format!("{e:#}"));
-                let icon = match &result {
-                    Ok(d) => load_icon(&ctx, &source, &id, d.icon.as_ref()).await,
-                    Err(_) => None,
-                };
-                Msg::DetailsLoaded { key, result, icon }
+                Msg::DetailsLoaded { key, result }
             }
         });
-        let _ = ctx.tx.send(join_details(key, work).await);
+        let msg = join_details(key.clone(), work).await;
+        let icon = match &msg {
+            Msg::DetailsLoaded { result: Ok(d), .. } => d.icon.clone(),
+            _ => None,
+        };
+        // Details first; the icon is fetched afterwards so a slow host never delays them.
+        let _ = ctx.tx.send(msg);
+        if let Some(bytes) = load_icon(&ctx, &source, &id, icon.as_ref()).await {
+            let _ = ctx.tx.send(Msg::IconLoaded { key, bytes });
+        }
     });
 }
 

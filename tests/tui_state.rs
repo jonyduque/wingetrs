@@ -111,7 +111,6 @@ fn selection_change_requests_details_once() {
         Msg::DetailsLoaded {
             key: format!("{source}/{id}"),
             result: Err("x".into()),
-            icon: None,
         },
     );
     update(&mut a, key(KeyCode::Up));
@@ -773,7 +772,6 @@ fn loaded(key: &str) -> Msg {
     Msg::DetailsLoaded {
         key: key.into(),
         result: Err("x".into()),
-        icon: None,
     }
 }
 
@@ -1782,9 +1780,28 @@ fn details_icon_failure_never_fails_details() {
         Msg::DetailsLoaded {
             key: key.clone(),
             result: Ok(details),
-            icon: None,
         },
     );
     assert!(matches!(a.details.get(&key), Some(Ok(_))));
     assert!(!a.icon_bytes.contains_key(&key));
+
+    // The icon arrives later, as its own message; bytes for a key that is no longer
+    // selected are still stored (keyed, so harmless).
+    update(
+        &mut a,
+        Msg::IconLoaded {
+            key: key.clone(),
+            bytes: vec![1, 2, 3],
+        },
+    );
+    assert_eq!(a.icon_bytes.get(&key), Some(&vec![1, 2, 3]));
+    update(
+        &mut a,
+        Msg::IconLoaded {
+            key: "other/x".into(),
+            bytes: vec![9],
+        },
+    );
+    assert_eq!(a.icon_bytes.get("other/x"), Some(&vec![9]));
+    assert!(matches!(a.details.get(&key), Some(Ok(_))));
 }

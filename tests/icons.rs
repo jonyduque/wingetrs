@@ -94,3 +94,66 @@ fn icon_map_round_trips_and_survives_corruption() {
     icons::remember(&data, "winget", "A.B", &sha);
     assert_eq!(icons::load_map(&data).get("winget/A.B"), Some(&sha));
 }
+
+/// Raw HTTP server that sends `body_len` bytes with no Content-Length (close-delimited).
+async fn serve_unsized(body_len: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = s.write_all(&vec![7u8; body_len]).await;
+            let _ = s.shutdown().await;
+        }
+    });
+    format!("http://{addr}/i.ico")
+}
+
+#[tokio::test]
+async fn get_limited_stops_a_stream_without_content_length() {
+    let http = Http::new().unwrap();
+    let url = serve_unsized(MAX_ICON_BYTES + 1).await;
+    let err = http.get_limited(&url, MAX_ICON_BYTES).await.unwrap_err();
+    assert!(
+        matches!(err, wingetrs::http::HttpError::TooLarge(_)),
+        "{err:?}"
+    );
+    let url = serve_unsized(MAX_ICON_BYTES).await;
+    assert_eq!(
+        http.get_limited(&url, MAX_ICON_BYTES).await.unwrap().len(),
+        MAX_ICON_BYTES
+    );
+}
+
+#[tokio::test]
+async fn get_limited_refuses_on_content_length_before_reading() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\nshort",
+                MAX_ICON_BYTES + 1
+            );
+            let _ = s.write_all(head.as_bytes()).await;
+            let _ = s.shutdown().await;
+        }
+    });
+    let http = Http::new().unwrap();
+    let err = http
+        .get_limited(&format!("http://{addr}/i.ico"), MAX_ICON_BYTES)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, wingetrs::http::HttpError::TooLarge(_)),
+        "{err:?}"
+    );
+}
