@@ -519,3 +519,51 @@ async fn not_modified_update_still_refreshes_checked_at() {
         assert!(back.get(&u).unwrap().checked_at > 1, "{u}");
     }
 }
+
+#[tokio::test]
+async fn not_modified_update_rebuilds_a_missing_search_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    {
+        let (_s, ep) = setup().await;
+        run_update(
+            data_ensured(&data),
+            &ep,
+            &Http::new().unwrap(),
+            true,
+            LockWait::from_env(),
+        )
+        .await
+        .unwrap();
+    }
+    let s = MockServer::start().await;
+    let ep = endpoints_all_answering(&s, 304, false).await;
+    seed_state_and_index(&data, &ep, 1);
+    std::fs::remove_file(data.search_index_path()).unwrap();
+    let rep = run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        false,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rep.iter().all(|r| r.outcome == Outcome::Unchanged),
+        "{rep:?}"
+    );
+    assert!(data.catalog_path().exists());
+    let bytes = std::fs::read(data.search_index_path()).unwrap();
+    assert_eq!(
+        wingetrs::catalog::index_file::IndexView::parse(&bytes)
+            .unwrap()
+            .len(),
+        28
+    );
+}
+
+fn data_ensured(data: &DataDir) -> &DataDir {
+    data.ensure().unwrap();
+    data
+}
