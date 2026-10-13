@@ -7,6 +7,7 @@ pub mod config;
 pub mod core;
 pub mod fs_retry;
 pub mod http;
+pub mod icons;
 pub mod install;
 pub mod installed;
 pub mod sources;

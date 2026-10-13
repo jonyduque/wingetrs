@@ -364,6 +364,7 @@ pub async fn join_details(key: String, h: tokio::task::JoinHandle<Msg>) -> Msg {
         Err(e) => Msg::DetailsLoaded {
             key,
             result: Err(format!("tarefa cancelada: {e}")),
+            icon: None,
         },
     }
 }
@@ -513,11 +514,36 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
                 let result = load_details(&ctx, &source, &id)
                     .await
                     .map_err(|e| format!("{e:#}"));
-                Msg::DetailsLoaded { key, result }
+                let icon = match &result {
+                    Ok(d) => load_icon(&ctx, &source, &id, d.icon.as_ref()).await,
+                    Err(_) => None,
+                };
+                Msg::DetailsLoaded { key, result, icon }
             }
         });
         let _ = ctx.tx.send(join_details(key, work).await);
     });
+}
+
+/// Icon bytes for the details; any failure is only logged, never an error of the details.
+async fn load_icon(
+    ctx: &Ctx,
+    source: &str,
+    id: &str,
+    icon: Option<&crate::core::IconRef>,
+) -> Option<Vec<u8>> {
+    let icon = icon?;
+    let blobs = BlobStore::new(ctx.data.blobs_dir());
+    match crate::icons::fetch(&ctx.http, &blobs, icon).await {
+        Ok(bytes) => {
+            crate::icons::remember(&ctx.data, source, id, &icon.sha256);
+            Some(bytes)
+        }
+        Err(e) => {
+            tracing::debug!(%source, %id, error = %e, "icon not loaded");
+            None
+        }
+    }
 }
 
 async fn load_details(

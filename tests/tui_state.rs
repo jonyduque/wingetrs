@@ -111,6 +111,7 @@ fn selection_change_requests_details_once() {
         Msg::DetailsLoaded {
             key: format!("{source}/{id}"),
             result: Err("x".into()),
+            icon: None,
         },
     );
     update(&mut a, key(KeyCode::Up));
@@ -772,6 +773,7 @@ fn loaded(key: &str) -> Msg {
     Msg::DetailsLoaded {
         key: key.into(),
         result: Err("x".into()),
+        icon: None,
     }
 }
 
@@ -1754,4 +1756,35 @@ fn second_upgrade_while_running_does_nothing() {
     assert!(matches!(a.modal, Some(Modal::Running { .. })));
     assert!(update(&mut a, key(KeyCode::Char('U'))).is_empty());
     assert!(matches!(a.modal, Some(Modal::Running { .. })));
+}
+
+#[test]
+fn details_icon_failure_never_fails_details() {
+    let mut a = app();
+    let (source, id) = a.selected_key().unwrap();
+    let key = format!("{source}/{id}");
+    let details = wingetrs::core::PackageDetails {
+        source: wingetrs::core::SourceKind::Winget,
+        id: id.clone(),
+        name: id,
+        version: "1".into(),
+        publisher: None,
+        description: None,
+        homepage: None,
+        license: None,
+        tags: Vec::new(),
+        installers: Vec::new(),
+        available_versions: Vec::new(),
+        icon: None,
+    };
+    update(
+        &mut a,
+        Msg::DetailsLoaded {
+            key: key.clone(),
+            result: Ok(details),
+            icon: None,
+        },
+    );
+    assert!(matches!(a.details.get(&key), Some(Ok(_))));
+    assert!(!a.icon_bytes.contains_key(&key));
 }

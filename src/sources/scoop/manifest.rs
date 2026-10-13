@@ -154,5 +154,6 @@ pub fn details_from_raw(app: &str, raw: &str) -> Result<PackageDetails, ScoopErr
         tags: Vec::new(),
         installers,
         available_versions: vec![version],
+        icon: None,
     })
 }

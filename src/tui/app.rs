@@ -60,6 +60,8 @@ pub enum Msg {
     DetailsLoaded {
         key: String,
         result: Result<PackageDetails, String>,
+        /// Raw bytes of the package icon; `None` when absent or its download failed.
+        icon: Option<Vec<u8>>,
     },
     RefreshStarted,
     RefreshFinished(Vec<SourceReport>),
@@ -265,6 +267,8 @@ pub struct App {
     search_in_flight: Option<(u64, String, Option<SourceKind>)>,
     pub installed: Vec<ListRow>,
     pub details: HashMap<String, Result<PackageDetails, String>>,
+    /// Raw icon bytes, keyed like `details`.
+    pub icon_bytes: HashMap<String, Vec<u8>>,
     /// `"{source}/{id}"` of the selected package while its details are being loaded.
     pub details_pending: Option<String>,
     pub refreshing: bool,
@@ -333,6 +337,7 @@ impl App {
             search_in_flight: None,
             installed: Vec::new(),
             details: HashMap::new(),
+            icon_bytes: HashMap::new(),
             details_pending: None,
             refreshing: false,
             offline: false,
@@ -646,9 +651,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             );
             Vec::new()
         }
-        Msg::DetailsLoaded { key, result } => {
+        Msg::DetailsLoaded { key, result, icon } => {
             if app.details_pending.as_deref() == Some(key.as_str()) {
                 app.details_pending = None;
+            }
+            if let Some(bytes) = icon {
+                app.icon_bytes.insert(key.clone(), bytes);
             }
             app.details.insert(key, result);
             Vec::new()

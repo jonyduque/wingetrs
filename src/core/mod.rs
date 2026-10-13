@@ -77,4 +77,14 @@ pub struct PackageDetails {
     pub installers: Vec<InstallerSummary>,
     /// Newest first.
     pub available_versions: Vec<String>,
+    /// Package icon (winget only); never serialized, the CLI output is unchanged.
+    #[serde(skip)]
+    pub icon: Option<IconRef>,
+}
+
+/// Where to fetch a package icon and the SHA-256 its bytes must have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IconRef {
+    pub url: String,
+    pub sha256: String,
 }

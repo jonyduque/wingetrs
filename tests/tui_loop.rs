@@ -71,7 +71,7 @@ async fn details_worker_panic_reaches_the_loop() {
     let h = tokio::spawn(std::future::pending::<Msg>());
     h.abort();
     let msg = join_details("k".into(), h).await;
-    assert!(matches!(&msg, Msg::DetailsLoaded { key, result: Err(_) } if key == "k"));
+    assert!(matches!(&msg, Msg::DetailsLoaded { key, result: Err(_), .. } if key == "k"));
 }
 
 /// Always pending; remembers the waker of its last poll, like crossterm's `EventStream`.
