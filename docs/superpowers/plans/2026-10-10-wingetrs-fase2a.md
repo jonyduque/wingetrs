@@ -5834,3 +5834,72 @@ Testes:
 2. Aplicar na hora: não esvaziar o cache ⇒ PEGA (teste 2).
 
 **Commit:** `feat(tui): icons setting`
+
+## Redirecionamento https→http (Task 87)
+
+Emenda da spec da fase 2a (§10, 2026-10-13). Hoje os dois clientes de `src/http.rs` usam a política padrão do reqwest: seguem até 10 redirecionamentos, em qualquer esquema. O SHA-256 já confere o conteúdo; o rebaixamento só deixa a rede ver e estragar o download.
+
+### Task 87: Recusar redirecionamento de https para http, com ajuste para aceitar
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `Http` (`src/http.rs`, ~:40) é `Clone` e tem dois clientes (`client` e `dl_client`), os dois criados em `with_timeouts` (~:52). `HttpError` (~:14) tem `Network`, `Timeout`, `Status` e `TooLarge`; `is_offline` é `Network | Timeout`. `map_err` (~:31) converte o `reqwest::Error`.
+- `Behavior` (`src/config.rs`, ~:35) é a seção `[behavior]` do `config.toml` (`#[serde(default)]`, `Copy`). A aba Ajustes já grava o `Behavior` inteiro pelo `Cmd::SaveSettings` (`src/tui/app.rs`, ~:1170; `src/tui/run.rs`, ~:278; `jobs::save_settings`).
+- `src/tui/settings.rs`: `SettingId`, `ORDER`, `label`, `options`, `description`, `value_index` e `cycle`. `Purge` e `KeepOld` são o modelo de ajuste booleano dentro de `Behavior`.
+- O `Http` é criado em `src/cli/mod.rs` (~:624, depois de `Config::load`) e em `src/tui/run.rs` (~:175, `Ctx`).
+
+#### What binds this task
+
+- **Regra pura, pública em `src/http.rs`:**
+  `pub fn redirect_allowed(prev: &reqwest::Url, next: &reqwest::Url, allow_http: bool) -> bool`
+  - Devolve `false` só quando `prev` é `https`, `next` é `http` e `allow_http` é `false`. Todo o resto é `true`.
+  - Esquema conferido com `Url::scheme()`, que já vem em minúsculas.
+- **Política dos dois clientes:** `reqwest::redirect::Policy::custom`, com um `Arc<AtomicBool>` guardado no `Http` e compartilhado pelos clones.
+  - Mais de 10 redirecionamentos ⇒ `attempt.error(..)`. É o mesmo limite do padrão do reqwest.
+  - Senão, com `prev` = `attempt.previous().last()`: se `redirect_allowed` dá `false`, `attempt.error(..)` com um erro próprio (`InsecureRedirect`, que guarda a URL de destino). Se dá `true`, `attempt.follow()`.
+  - A closure chama `redirect_allowed`. Não reescreva a regra dentro dela.
+- **Erro:** a variante nova `HttpError::InsecureRedirect(String)` tem a mensagem `"redirecionamento de https para http recusado: {0} (permita em Ajustes)"`.
+  - `map_err` percorre `std::error::Error::source()` do `reqwest::Error` e, se achar o erro próprio, devolve essa variante.
+  - `is_offline` continua `Network | Timeout`: a recusa **não** é "sem conexão".
+- **Ajuste:**
+  - `pub fn set_allow_http_redirect(&self, allow: bool)` grava no `AtomicBool` com `Ordering::Relaxed`. `Http::new()` começa com `false`.
+  - `Behavior.allow_http_redirect: bool` tem padrão `false`. Um `config.toml` antigo, sem o campo, carrega com `false`.
+- **Aplicar o ajuste:**
+  - CLI: depois de criar o `Http` em `cli/mod.rs`, chame `set_allow_http_redirect(cfg.behavior.allow_http_redirect)`.
+  - TUI: o mesmo depois de criar o `Ctx`.
+  - TUI, na hora: no `Cmd::SaveSettings` de `run.rs`, antes do `spawn_job`, chame `ctx.http.set_allow_http_redirect(behavior.allow_http_redirect)`.
+- **Linha nova na aba Ajustes**, `SettingId::HttpRedirect`, depois de `Residues` e antes de `Glyphs` em `ORDER`:
+  - rótulo `"Redirecionar https para http"`;
+  - opções `&["recusar", "aceitar"]`;
+  - descrição `"Aceita downloads que trocam https por http no caminho. O hash ainda confere o arquivo, mas a rede vê o que é baixado."`.
+- **Fora do escopo:**
+  - nenhuma flag nova na CLI;
+  - nenhuma outra mudança nos clientes (timeouts, user agent);
+  - não use `https_only`.
+
+**Files:**
+- Modify: `src/http.rs`, `src/config.rs`, `src/cli/mod.rs`, `src/tui/run.rs`, `src/tui/settings.rs`. Mexa em `src/tui/app.rs` ou `src/tui/view.rs` só se a linha nova exigir.
+- Test: `tests/http.rs`, `tests/config.rs`, `tests/tui_state.rs`, mais o snapshot da aba Ajustes onde ele estiver (`tests/tui_view.rs`).
+
+Testes:
+1. `redirect_allowed_refuses_only_https_to_http`: tabela com os quatro pares de esquema (`https→http`, `https→https`, `http→http`, `http→https`), cada um com `allow_http` `false` e `true`. Só `https→http` com `false` dá `false`.
+2. `http_redirect_is_still_followed`: wiremock responde `302` com `Location` para outro caminho do mesmo servidor (`http`→`http`), e o `get` devolve o corpo do destino.
+3. `redirect_loop_is_still_limited`: wiremock redireciona sempre para si mesmo. O `get` falha com erro, não trava, e o erro não é `InsecureRedirect`.
+4. `insecure_redirect_is_not_offline`: `HttpError::InsecureRedirect("http://x".into()).is_offline()` é `false`, e a mensagem contém `"permita em Ajustes"`.
+5. `behavior_allow_http_redirect_defaults_to_false`: um `config.toml` sem o campo carrega `false`; com `allow_http_redirect = true` carrega `true`; e o valor sobrevive a `save` + `load`.
+6. `http_redirect_setting_cycles_and_saves` (`tests/tui_state.rs`): `Enter` na linha nova alterna recusar ⇔ aceitar, e o `Cmd::SaveSettings` carrega `behavior.allow_http_redirect == true` depois do 1º `Enter`.
+7. O snapshot da aba Ajustes foi atualizado; confira no diff que só a linha nova mudou.
+
+Com wiremock só há `http`, então o caso `https→http` real não tem teste de ponta a ponta. A fiação fica coberta pelo item 2 de "Checks beyond the steps" e pela leitura do revisor.
+
+#### Checks beyond the steps
+
+1. Mutação: em `redirect_allowed`, trocar a condição para `false` (recusar tudo que vem de `https`) ⇒ PEGA (teste 1). Trocar para `true` (aceitar tudo) ⇒ PEGA (teste 1).
+2. Mutação: na closure da política, trocar `attempt.follow()` por `attempt.stop()` ⇒ PEGA (teste 2).
+3. Mutação: remover o limite de 10 na closure ⇒ PEGA (teste 3). Rode com timeout; se o teste travar em vez de falhar, o teste está errado (ver `docs/ARMADILHAS.md`, "Teste concorrente que trava em vez de falhar").
+4. Mutação: incluir `InsecureRedirect` em `is_offline` ⇒ PEGA (teste 4).
+5. Rode `target/release/wingetrs.exe show Notepad++.Notepad++ --source winget` com o `LOCALAPPDATA` real. Deve funcionar como antes; cole a 1ª linha da saída.
+
+**Commit:** `feat(http): refuse https to http redirects unless allowed in settings`
