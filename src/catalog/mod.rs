@@ -37,27 +37,12 @@ CREATE TABLE IF NOT EXISTS map_upgradecode    (key TEXT NOT NULL, package INTEGE
 CREATE TABLE IF NOT EXISTS map_pfn            (key TEXT NOT NULL, package INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS map_norm_name      (key TEXT NOT NULL, package INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS map_norm_publisher (key TEXT NOT NULL, package INTEGER NOT NULL);
-";
-
-/// Indexes on the map tables; dropped and rebuilt once by a winget import (see `replace_source_impl`).
-const MAP_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS ix_pc  ON map_productcode(key);
 CREATE INDEX IF NOT EXISTS ix_uc  ON map_upgradecode(key);
 CREATE INDEX IF NOT EXISTS ix_pfn ON map_pfn(key);
 CREATE INDEX IF NOT EXISTS ix_nn  ON map_norm_name(key);
 CREATE INDEX IF NOT EXISTS ix_np  ON map_norm_publisher(key);
 ";
-
-const DROP_MAP_INDEXES: &str = "DROP INDEX IF EXISTS ix_pc; DROP INDEX IF EXISTS ix_uc; DROP INDEX IF EXISTS ix_pfn; DROP INDEX IF EXISTS ix_nn; DROP INDEX IF EXISTS ix_np;";
-
-/// An import that carries maps rebuilds the map indexes once instead of row by row.
-pub(crate) fn rebuilds_map_indexes(maps: &WingetMaps) -> bool {
-    !(maps.productcodes.is_empty()
-        && maps.upgradecodes.is_empty()
-        && maps.pfns.is_empty()
-        && maps.norm_names.is_empty()
-        && maps.norm_publishers.is_empty())
-}
 
 type MapPair = (String, String);
 
@@ -295,7 +280,6 @@ impl Catalog {
         // Reads through the OS mapping instead of pread copies (best effort).
         let _ = conn.pragma_update(None, "mmap_size", 268_435_456i64);
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(MAP_INDEXES)?;
         Ok(Catalog {
             conn,
             path: Some(path.to_path_buf()),
@@ -349,7 +333,6 @@ impl Catalog {
     pub fn open_in_memory() -> Result<Catalog, CatalogError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(MAP_INDEXES)?;
         Ok(Catalog { conn, path: None })
     }
 
@@ -372,6 +355,8 @@ impl Catalog {
         Ok(n)
     }
 
+    /// Runs the import with a larger page cache (up to 64 MiB more memory) and restores the
+    /// previous `cache_size` on every path; the import error wins over a restore error.
     pub fn replace_source(
         &mut self,
         source: &str,
@@ -381,49 +366,15 @@ impl Catalog {
         packages: &[NewPackage],
         maps: &WingetMaps,
     ) -> Result<ImportStats, CatalogError> {
-        let rebuild = rebuilds_map_indexes(maps);
-        self.replace_source_impl(
-            source,
-            kind,
-            source_version,
-            fetched_at,
-            packages,
-            maps,
-            rebuild,
-        )
-    }
-
-    /// Runs the import with a larger page cache (up to 64 MiB more memory) and restores the
-    /// previous `cache_size` on every path; the import error wins over a restore error.
-    #[allow(clippy::too_many_arguments)]
-    fn replace_source_impl(
-        &mut self,
-        source: &str,
-        kind: SourceKind,
-        source_version: &str,
-        fetched_at: i64,
-        packages: &[NewPackage],
-        maps: &WingetMaps,
-        rebuild: bool,
-    ) -> Result<ImportStats, CatalogError> {
         let prev: i64 = self.conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
         self.conn.pragma_update(None, "cache_size", -65536i64)?;
-        let result = self.import_source(
-            source,
-            kind,
-            source_version,
-            fetched_at,
-            packages,
-            maps,
-            rebuild,
-        );
+        let result = self.import_source(source, kind, source_version, fetched_at, packages, maps);
         let restored = self.conn.pragma_update(None, "cache_size", prev);
         let stats = result?;
         restored?;
         Ok(stats)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn import_source(
         &mut self,
         source: &str,
@@ -432,19 +383,19 @@ impl Catalog {
         fetched_at: i64,
         packages: &[NewPackage],
         maps: &WingetMaps,
-        rebuild: bool,
     ) -> Result<ImportStats, CatalogError> {
-        if kind == SourceKind::Scoop && rebuilds_map_indexes(maps) {
+        let has_maps = !(maps.productcodes.is_empty()
+            && maps.upgradecodes.is_empty()
+            && maps.pfns.is_empty()
+            && maps.norm_names.is_empty()
+            && maps.norm_publishers.is_empty());
+        if kind == SourceKind::Scoop && has_maps {
             return Err(CatalogError::MapsForScoop(source.to_string()));
         }
         // Dropping `tx` on an early return rolls the whole import back.
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if rebuild {
-            // DDL is transactional: an error before the commit brings the indexes back.
-            tx.execute_batch(DROP_MAP_INDEXES)?;
-        }
         let deleted = delete_source_rows(&tx, source, kind)?;
         tracing::debug!(
             truncated_maps = deleted.truncated_maps,
@@ -506,9 +457,6 @@ impl Catalog {
                source_version=excluded.source_version, fetched_at=excluded.fetched_at",
             params![source, kind.as_str(), source_version, fetched_at],
         )?;
-        if rebuild {
-            tx.execute_batch(MAP_INDEXES)?;
-        }
         tx.commit()?;
         Ok(ImportStats {
             packages: packages.len(),
@@ -782,69 +730,6 @@ mod tests {
         check(two_owners, "other", SourceKind::Winget, 0);
         // An orphan row counts as foreign: map_pfn keeps it, the other four are truncated.
         check(orphan_pfn, "winget", SourceKind::Winget, 4);
-    }
-
-    #[test]
-    fn rebuilds_map_indexes_only_for_imports_with_maps() {
-        assert!(!rebuilds_map_indexes(&WingetMaps::default()));
-        let only_publisher = WingetMaps {
-            norm_publishers: vec![("p".into(), "A".into())],
-            ..Default::default()
-        };
-        assert!(rebuilds_map_indexes(&only_publisher));
-        let only_productcode = WingetMaps {
-            productcodes: vec![("c".into(), "A".into())],
-            ..Default::default()
-        };
-        assert!(rebuilds_map_indexes(&only_productcode));
-    }
-
-    fn schema(conn: &Connection) -> Vec<String> {
-        let mut st = conn
-            .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name")
-            .unwrap();
-        st.query_map([], |r| {
-            Ok(format!(
-                "{:?}|{:?}|{:?}|{:?}",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?
-            ))
-        })
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap()
-    }
-
-    #[test]
-    fn rebuilt_import_equals_the_import_that_keeps_indexes() {
-        for from_empty in [false, true] {
-            let mut a = Catalog::open_in_memory().unwrap();
-            let mut b = Catalog::open_in_memory().unwrap();
-            if !from_empty {
-                winget_only(&mut a);
-                winget_only(&mut b);
-            }
-            for (c, rebuild) in [(&mut a, true), (&mut b, false)] {
-                c.replace_source_impl(
-                    "winget",
-                    SourceKind::Winget,
-                    "v2",
-                    2,
-                    &[pkg("W.2"), pkg("W.4")],
-                    &maps(&["W.2", "W.4"]),
-                    rebuild,
-                )
-                .unwrap();
-            }
-            assert_eq!(
-                content(&a.conn),
-                content(&b.conn),
-                "from_empty={from_empty}"
-            );
-            assert_eq!(schema(&a.conn), schema(&b.conn), "from_empty={from_empty}");
-        }
     }
 
     #[test]
