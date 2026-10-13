@@ -1,5 +1,5 @@
 //! Catalog update orchestration.
-use crate::cache::{DataDir, HttpEntry, HttpState, UpdateLock, now_unix};
+use crate::cache::{BLOB_MAX_AGE, BlobStore, DataDir, HttpEntry, HttpState, UpdateLock, now_unix};
 use crate::catalog::{Catalog, NewPackage, WingetMaps, index_file};
 use crate::core::SourceKind;
 use crate::http::Http;
@@ -7,7 +7,7 @@ use crate::sources::scoop::bucket::{BucketImport, ScoopFetch, fetch_bucket, repo
 use crate::sources::scoop::source_name;
 use crate::sources::winget::index::WingetImport;
 use crate::sources::winget::{SOURCE_NAME, SOURCE2_URL, WingetFetch, fetch_index};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tracing::Instrument;
 
 pub const MAX_AGE_SECS: i64 = 900;
@@ -288,8 +288,45 @@ pub async fn run_update(
     {
         tracing::debug_span!("update.search_idx").in_scope(|| write_search_index(c, &index_path));
     }
+    tracing::debug_span!("update.blob_prune").in_scope(|| prune_blobs(data));
     saved?;
     Ok(reports)
+}
+
+/// Best-effort blob cleanup under the install lock; never fails the update.
+fn prune_blobs(data: &DataDir) {
+    let _lock = match UpdateLock::try_acquire(&data.install_layout().install_lock()) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            tracing::debug!("blob prune skipped: install lock busy");
+            return;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "blob prune skipped: install lock unavailable");
+            return;
+        }
+    };
+    let stats = match BlobStore::new(data.blobs_dir()).prune(SystemTime::now(), BLOB_MAX_AGE) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "blob prune failed");
+            return;
+        }
+    };
+    let index_removed = match crate::install::download::prune_index(data) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, "blob index prune failed");
+            0
+        }
+    };
+    tracing::info!(
+        removed = stats.removed,
+        bytes = stats.bytes,
+        kept = stats.kept,
+        index_removed,
+        "blob prune"
+    );
 }
 
 /// True when the catalog must be opened: some source has an import to apply, or the

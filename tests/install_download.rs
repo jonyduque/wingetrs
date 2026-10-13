@@ -381,3 +381,78 @@ async fn fetch_each_keeps_order_and_reports_each_failure() {
     assert_eq!(std::fs::read(p1).unwrap(), b"one");
     assert_eq!(std::fs::read(p2).unwrap(), b"two");
 }
+
+fn age_days(path: &std::path::Path, days: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 86400))
+        .unwrap();
+}
+
+#[test]
+fn prune_index_drops_entries_without_blob() {
+    use wingetrs::install::download::prune_index;
+    let td = tempfile::tempdir().unwrap();
+    let data = DataDir::new(td.path());
+    data.ensure().unwrap();
+    let blobs = data.blobs_dir();
+    std::fs::write(blobs.join("present"), b"x").unwrap();
+    let idx = blobs.join("index.json");
+    std::fs::write(&idx, br#"{"md5:aa":"present","md5:bb":"gone"}"#).unwrap();
+
+    assert_eq!(prune_index(&data).unwrap(), 1);
+    let now: std::collections::BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(&idx).unwrap()).unwrap();
+    assert_eq!(
+        now.into_iter().collect::<Vec<_>>(),
+        vec![("md5:aa".to_owned(), "present".to_owned())]
+    );
+
+    age_days(&idx, 1);
+    let content = std::fs::read(&idx).unwrap();
+    let mtime = std::fs::metadata(&idx).unwrap().modified().unwrap();
+    assert_eq!(prune_index(&data).unwrap(), 0);
+    assert_eq!(std::fs::read(&idx).unwrap(), content);
+    assert_eq!(std::fs::metadata(&idx).unwrap().modified().unwrap(), mtime);
+
+    // Corrupt or missing index: nothing to do, nothing written.
+    std::fs::write(&idx, b"not json").unwrap();
+    assert_eq!(prune_index(&data).unwrap(), 0);
+    assert_eq!(std::fs::read(&idx).unwrap(), b"not json");
+    std::fs::remove_file(&idx).unwrap();
+    assert_eq!(prune_index(&data).unwrap(), 0);
+    assert!(!idx.exists());
+}
+
+async fn pruned_scenario(age_it: bool) -> usize {
+    use wingetrs::cache::{BLOB_MAX_AGE, BlobStore};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/a"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"abc".to_vec()))
+        .mount(&server)
+        .await;
+    let td = tempfile::tempdir().unwrap();
+    let data = DataDir::new(td.path());
+    let http = Http::new().unwrap();
+    let sources = [src(&server, "/a", SHA_A)];
+    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let first = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    if age_it {
+        age_days(&first[0], 40);
+    }
+    BlobStore::new(data.blobs_dir())
+        .prune(std::time::SystemTime::now(), BLOB_MAX_AGE)
+        .unwrap();
+    wingetrs::install::download::prune_index(&data).unwrap();
+    let second = fetch_all(&http, &data, &sources, &progress).await.unwrap();
+    assert_eq!(second, first);
+    assert_eq!(std::fs::read(&second[0]).unwrap(), b"abc");
+    server.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+async fn pruned_download_is_fetched_again() {
+    assert_eq!(pruned_scenario(true).await, 2);
+    // Control: not aged, so the second request is served from the cache.
+    assert_eq!(pruned_scenario(false).await, 1);
+}

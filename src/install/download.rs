@@ -88,6 +88,24 @@ fn write_index(data: &DataDir, idx: &BTreeMap<String, String>) -> Result<(), Dow
     })
 }
 
+/// Drops index entries whose blob file is gone; rewrites the index only if any went.
+pub fn prune_index(data: &DataDir) -> Result<usize, DownloadError> {
+    let Ok(bytes) = std::fs::read(index_path(data)) else {
+        return Ok(0);
+    };
+    let Ok(mut idx) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) else {
+        return Ok(0);
+    };
+    let blobs = data.blobs_dir();
+    let before = idx.len();
+    idx.retain(|_, name| blobs.join(name).exists());
+    let removed = before - idx.len();
+    if removed > 0 {
+        write_index(data, &idx)?;
+    }
+    Ok(removed)
+}
+
 /// Path of a cached, content-verified blob for `spec`, if any.
 fn cached(data: &DataDir, idx: &BTreeMap<String, String>, spec: &HashSpec) -> Option<PathBuf> {
     let name = if spec.algo == HashAlgo::Sha256 {

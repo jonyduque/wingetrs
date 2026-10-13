@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -158,6 +158,21 @@ impl HttpState {
     }
 }
 
+/// Content blobs unused for this long are removed by `BlobStore::prune`.
+pub const BLOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+const TMP_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    pub removed: usize,
+    pub bytes: u64,
+    pub kept: usize,
+}
+
+fn is_blob_name(n: &str) -> bool {
+    n.len() == 64 && n.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 pub struct BlobStore {
     dir: PathBuf,
 }
@@ -169,8 +184,83 @@ impl BlobStore {
 
     /// None if missing or the content hash differs from the name.
     pub fn get(&self, sha256_hex_name: &str) -> Option<Vec<u8>> {
-        let bytes = std::fs::read(self.dir.join(sha256_hex_name)).ok()?;
-        (sha256_hex(&bytes).eq_ignore_ascii_case(sha256_hex_name)).then_some(bytes)
+        let path = self.dir.join(sha256_hex_name);
+        let bytes = std::fs::read(&path).ok()?;
+        if !sha256_hex(&bytes).eq_ignore_ascii_case(sha256_hex_name) {
+            return None;
+        }
+        // A hit counts as use: `prune` goes by mtime. A failed touch changes nothing else.
+        let touched = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(SystemTime::now()));
+        if let Err(e) = touched {
+            tracing::debug!(path = %path.display(), error = %e, "blob mtime not refreshed");
+        }
+        Some(bytes)
+    }
+
+    /// Removes content blobs unused for `max_age` and leftover temp files older than a day.
+    pub fn prune(&self, now: SystemTime, max_age: Duration) -> Result<PruneStats, CacheError> {
+        let rd = match std::fs::read_dir(&self.dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(PruneStats::default());
+            }
+            Err(e) => return Err(io_err(&self.dir, e)),
+        };
+        let stale = |meta: &std::fs::Metadata, limit: Duration| {
+            // A modification time in the future (fast clock) errors out: keep.
+            meta.modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age > limit)
+        };
+        let mut stats = PruneStats::default();
+        for entry in rd {
+            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
+            let is_file = entry.file_type().is_ok_and(|t| t.is_file());
+            let name = entry.file_name();
+            let limit = name.to_str().and_then(|n| {
+                if is_blob_name(n) {
+                    Some(max_age)
+                } else if n.ends_with(".tmp") {
+                    Some(TMP_MAX_AGE)
+                } else {
+                    None
+                }
+            });
+            let (true, Some(limit)) = (is_file, limit) else {
+                stats.kept += 1;
+                continue;
+            };
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                stats.kept += 1;
+                continue;
+            };
+            if !stale(&meta, limit) {
+                stats.kept += 1;
+                continue;
+            }
+            // Re-read right before deleting: someone may have used the file since the listing.
+            let fresh = std::fs::symlink_metadata(&path);
+            if fresh.as_ref().map(|m| !stale(m, limit)).unwrap_or(true) {
+                stats.kept += 1;
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    stats.removed += 1;
+                    stats.bytes += meta.len();
+                }
+                Err(e) => {
+                    tracing::debug!(path = %path.display(), error = %e, "blob not removed");
+                    stats.kept += 1;
+                }
+            }
+        }
+        Ok(stats)
     }
 
     pub fn put_verified(&self, expected_sha256_hex: &str, bytes: &[u8]) -> Result<(), CacheError> {

@@ -567,3 +567,105 @@ fn data_ensured(data: &DataDir) -> &DataDir {
     data.ensure().unwrap();
     data
 }
+
+fn blob_with_age(data: &DataDir, content: &[u8], days: u64) -> std::path::PathBuf {
+    let name = wingetrs::cache::sha256_hex(content);
+    let p = data.blobs_dir().join(name);
+    std::fs::create_dir_all(data.blobs_dir()).unwrap();
+    std::fs::write(&p, content).unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400))
+        .unwrap();
+    p
+}
+
+async fn outcomes_of_prune_run(data: &DataDir, ep: &Endpoints) -> Vec<(String, Outcome)> {
+    let rep = run_update(data, ep, &Http::new().unwrap(), true, LockWait::from_env())
+        .await
+        .unwrap();
+    let mut v: Vec<_> = rep.into_iter().map(|r| (r.source, r.outcome)).collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v.into_iter()
+        .map(|(s, o)| match o {
+            Outcome::Failed { offline, .. } => (
+                s,
+                Outcome::Failed {
+                    message: String::new(),
+                    offline,
+                },
+            ),
+            o => (s, o),
+        })
+        .collect()
+}
+
+fn expected_prune_outcomes() -> Vec<(String, Outcome)> {
+    vec![
+        (
+            "scoop:extras".to_owned(),
+            Outcome::Failed {
+                message: String::new(),
+                offline: false,
+            },
+        ),
+        (
+            "scoop:main".to_owned(),
+            Outcome::Updated {
+                packages: 8,
+                skipped: 1,
+            },
+        ),
+        (
+            "winget".to_owned(),
+            Outcome::Updated {
+                packages: 20,
+                skipped: 0,
+            },
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn update_prunes_old_blobs() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let old = blob_with_age(&data, b"old", 40);
+    let young = blob_with_age(&data, b"young", 1);
+    let out = outcomes_of_prune_run(&data, &ep).await;
+    assert_eq!(out, expected_prune_outcomes());
+    assert!(!old.exists());
+    assert!(young.exists());
+}
+
+#[tokio::test]
+async fn update_skips_prune_while_install_lock_is_held() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let old = blob_with_age(&data, b"old", 40);
+    let young = blob_with_age(&data, b"young", 1);
+    let held = wingetrs::cache::UpdateLock::try_acquire(&data.install_layout().install_lock())
+        .unwrap()
+        .unwrap();
+    let out = outcomes_of_prune_run(&data, &ep).await;
+    drop(held);
+    assert_eq!(out, expected_prune_outcomes());
+    assert!(old.exists());
+    assert!(young.exists());
+}
+
+#[tokio::test]
+async fn prune_failure_never_fails_update() {
+    let (_s, ep) = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    std::fs::remove_dir(data.blobs_dir()).unwrap();
+    // `blobs` is a file, not a directory.
+    std::fs::write(data.blobs_dir(), b"not a dir").unwrap();
+    let out = outcomes_of_prune_run(&data, &ep).await;
+    assert_eq!(out, expected_prune_outcomes());
+}
