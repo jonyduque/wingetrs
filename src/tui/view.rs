@@ -26,7 +26,7 @@ use ratatui_image::protocol::Protocol;
 /// Below this width the details panel is hidden.
 const MIN_WIDTH_FOR_DETAILS: u16 = 60;
 /// Below this height only the list is drawn.
-const MIN_HEIGHT_FOR_CHROME: u16 = 8;
+pub const MIN_HEIGHT_FOR_CHROME: u16 = 8;
 /// Lines taken by the tab header.
 const TABS_ROWS: u16 = 3;
 
@@ -604,7 +604,7 @@ fn draw_list<'a>(
     }
     let len = app.visible_len();
     let per_item = ITEM_ROWS + usize::from(ITEM_GAP);
-    let h = ((usize::from(inner.height) + usize::from(ITEM_GAP)) / per_item).max(1);
+    let h = crate::tui::app::items_in_rows(usize::from(inner.height));
     let sel = app.selected.min(len.saturating_sub(1));
     let window = list_window(sel, app.scroll, len, h);
     let indent = LIST_ICON_COLS + LIST_ICON_GAP;

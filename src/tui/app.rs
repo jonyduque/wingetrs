@@ -363,6 +363,22 @@ pub const ITEM_ROWS: usize = 2;
 pub const HELP_BAR_MIN_HEIGHT: u16 = 20;
 /// Rows of screen taken by tabs (3), search line, filter gap, bottom border, status bar and,
 /// on tall terminals, the help bar.
+/// Items that fit in `rows` list lines (at least one).
+pub fn items_in_rows(rows: usize) -> usize {
+    ((rows + usize::from(ITEM_GAP)) / (ITEM_ROWS + usize::from(ITEM_GAP))).max(1)
+}
+
+/// Items the list shows on a screen `screen_height` lines tall; the view sizes its window
+/// with `items_in_rows` on the area it really has, so both agree.
+pub fn list_page_rows(screen_height: u16) -> usize {
+    let rows = if screen_height < crate::tui::view::MIN_HEIGHT_FOR_CHROME {
+        usize::from(screen_height)
+    } else {
+        usize::from(screen_height).saturating_sub(chrome_rows(screen_height))
+    };
+    items_in_rows(rows)
+}
+
 pub fn chrome_rows(height: u16) -> usize {
     let help = usize::from(height >= HELP_BAR_MIN_HEIGHT);
     3 + 1 + FILTER_GAP as usize + 1 + 1 + help
@@ -576,9 +592,7 @@ impl App {
 
     /// Items that fit in the list at the current terminal height.
     fn page(&self) -> usize {
-        (usize::from(self.size.1).saturating_sub(chrome_rows(self.size.1))
-            / (ITEM_ROWS + usize::from(ITEM_GAP)))
-        .max(1)
+        list_page_rows(self.size.1)
     }
 
     fn clamp(&mut self) {

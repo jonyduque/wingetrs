@@ -1608,3 +1608,38 @@ fn list_indents_every_item_when_icons_are_on() {
         render(&typed("powert"), 100, 16)
     );
 }
+
+#[test]
+fn list_page_rows_matches_the_items_the_view_draws() {
+    let many: Vec<PackageEntry> = (0..80)
+        .map(|i| PackageEntry {
+            source: SourceKind::Winget,
+            source_name: "winget".into(),
+            id: format!("Pkg.N{i:02}"),
+            name: format!("pkg{i:02}"),
+            moniker: None,
+            version: "1".into(),
+            publisher: None,
+            description: None,
+            tags: vec![],
+            commands: vec![],
+        })
+        .collect();
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    // Heights below and above the help-bar threshold (20) and the chrome threshold (8).
+    for h in 1..=60u16 {
+        let mut a = App::new(many.clone(), GlyphSet::Ascii);
+        update(&mut a, Msg::Resize(100, h));
+        let buf = screen_cells(&a, 100, h, &theme);
+        let drawn = (0..h)
+            .filter(|y| {
+                row_text(&buf, *y)
+                    .chars()
+                    .take(50)
+                    .collect::<String>()
+                    .contains("pkg")
+            })
+            .count();
+        assert_eq!(wingetrs::tui::app::list_page_rows(h), drawn, "height {h}");
+    }
+}

@@ -34,3 +34,9 @@ Concerns:
 - Window in app (size-based) can differ by an item from view's measured one on odd layouts (narrow terminal where details are hidden still uses same height); an icon missed then appears once the selection moves.
 - Disk filled during work (C: 100%); I deleted my own target/t85/debug. Other agents' target/t79..t84, review, orch dirs are large and stale; not touched.
 - Stray python/bash processes from a bad heredoc of mine were killed.
+
+Review fix (page height, one formula):
+- app::items_in_rows + app::list_page_rows(screen_height) are the only page formulas; the view calls items_in_rows on its real area, App::page calls list_page_rows. MIN_HEIGHT_FOR_CHROME is now pub.
+- Test list_page_rows_matches_the_items_the_view_draws (heights 1..=60) compares list_page_rows with items drawn on a TestBackend.
+- Mutation: [OK] mutação PEGA: 'if screen_height < crate::tui::view::MIN_HEIGHT_FOR_CHROME {' -> 'if false {' fez o teste falhar (exit 101); failing: list_page_rows_matches_the_items_the_view_draws ("height 4").
+- Gate: [OK]   test (680 passed, 16 ignored) / [OK]   gate verde
