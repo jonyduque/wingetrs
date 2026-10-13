@@ -179,6 +179,11 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
+    if app.icon_protocol != crate::tui::icons::IconProtocol::Off {
+        spawn_job(&ctx, |c, _| {
+            Msg::IconMapLoaded(crate::icons::load_map(&c.data))
+        });
+    }
     let mut stats = LoopStats::new();
     let mut dark_now = app.dark;
 
@@ -268,6 +273,12 @@ async fn event_loop(
                     });
                 }
                 Cmd::EncodeIcon { key, bytes, size } => spawn_icon(&ctx, key, bytes, size),
+                Cmd::EncodeCachedIcon {
+                    source,
+                    id,
+                    sha,
+                    size,
+                } => spawn_cached_icon(&ctx, source, id, sha, size),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
                 Cmd::Search {
@@ -420,6 +431,35 @@ fn spawn_icon(ctx: &Arc<Ctx>, key: String, bytes: Vec<u8>, size: (u16, u16)) {
     });
 }
 
+/// Reads a cached icon from the blob store and encodes it on a blocking thread (no network);
+/// the handle is always awaited.
+fn spawn_cached_icon(ctx: &Arc<Ctx>, source: String, id: String, sha: String, size: (u16, u16)) {
+    let picker = ctx.icon_picker.clone();
+    let ctx = Arc::clone(ctx);
+    let key = format!("{source}/{id}");
+    tokio::spawn(async move {
+        let work = tokio::task::spawn_blocking({
+            let (ctx, key) = (Arc::clone(&ctx), key.clone());
+            move || {
+                let map = std::collections::BTreeMap::from([(key.clone(), sha)]);
+                let proto = match (
+                    &picker,
+                    crate::icons::cached_icon(&ctx.data, &map, &source, &id),
+                ) {
+                    (None, _) => Err("ícones desligados".to_string()),
+                    (_, None) => Err("ícone fora do cache".to_string()),
+                    (Some(p), Some(bytes)) => crate::tui::icons::encode(p, &bytes, size),
+                };
+                if let Err(e) = &proto {
+                    tracing::debug!(%key, error = %e, "cached icon not encoded");
+                }
+                Msg::IconReady { key, size, proto }
+            }
+        });
+        let _ = ctx.tx.send(join_icon(key, size, work).await);
+    });
+}
+
 /// Runs one keystroke's search on a blocking thread; the handle is always awaited.
 fn spawn_search(
     ctx: &Arc<Ctx>,
@@ -564,9 +604,14 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
             Msg::DetailsLoaded { result: Ok(d), .. } => d.icon.clone(),
             _ => None,
         };
+        let icon_sha = icon.as_ref().map(|i| i.sha256.clone()).unwrap_or_default();
         // Details first; the icon is fetched afterwards so a slow host never delays them.
         let _ = ctx.tx.send(msg);
         if let Some(bytes) = load_icon(&ctx, &source, &id, icon.as_ref()).await {
+            let _ = ctx.tx.send(Msg::IconMapped {
+                key: key.clone(),
+                sha: icon_sha,
+            });
             let _ = ctx.tx.send(Msg::IconLoaded { key, bytes });
         }
     });

@@ -77,3 +77,8 @@ pub fn split_icon(area: Rect, rows: u16, cols: u16, gap: u16) -> (Rect, Rect) {
 
 /// Lines a picker dialog reserves beyond border and padding: the footer line plus one spare.
 pub const PICKER_FOOTER_SLACK: u16 = 2;
+
+/// Columns of a package icon in the list (its height is `ITEM_ROWS`).
+pub const LIST_ICON_COLS: u16 = 4;
+/// Blank columns between a list icon and the item text.
+pub const LIST_ICON_GAP: u16 = 1;

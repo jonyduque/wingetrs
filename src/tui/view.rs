@@ -7,8 +7,8 @@ use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
 use crate::tui::layout::{
     BAR_PAD_X, BORDER, DETAIL_ICON_COLS, DETAIL_ICON_GAP, DETAIL_ICON_ROWS, DIALOG_PAD_X,
-    DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X, PICKER_FOOTER_SLACK, inset, split_icon,
-    split_with_gutter,
+    DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, LIST_ICON_COLS, LIST_ICON_GAP, PAD_X, PICKER_FOOTER_SLACK,
+    inset, split_icon, split_with_gutter,
 };
 use crate::tui::picker::{Picker, window};
 use crate::tui::settings::{ORDER, SettingId};
@@ -35,7 +35,7 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (window, icon) = draw_screen(app, theme, frame, area);
+    let (window, icons) = draw_screen(app, theme, frame, area);
     if let Some(modal) = &app.modal {
         draw_modal(modal, theme, frame, area);
     }
@@ -49,10 +49,10 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
         toasts = draw_toasts(frame, window, &app.toasts, theme, g);
     }
     // Drawn last: a terminal image paints its whole area, so one crossing a toast is skipped.
-    if let Some((rect, proto)) = icon
-        && !toasts.iter().any(|t| t.intersects(rect))
-    {
-        frame.render_widget(ratatui_image::Image::new(proto), rect);
+    for (rect, proto) in icons {
+        if !toasts.iter().any(|t| t.intersects(rect)) {
+            frame.render_widget(ratatui_image::Image::new(proto), rect);
+        }
     }
 }
 
@@ -83,8 +83,8 @@ fn toasts_in_status_bar(app: &App, area: Rect) -> bool {
 const TOAST_MIN_WIDTH: u16 = 40;
 const TOAST_MIN_HEIGHT: u16 = 12;
 
-/// Where the icon goes and what it is; drawn by `view` after the toasts.
-type IconPlace<'a> = Option<(Rect, &'a Protocol)>;
+/// Where each icon goes and what it is; drawn by `view` after the toasts.
+type IconPlaces<'a> = Vec<(Rect, &'a Protocol)>;
 
 /// Draws the screen; returns the main window's rectangle when there is one, and the
 /// icon still to be drawn.
@@ -93,15 +93,15 @@ fn draw_screen<'a>(
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
-) -> (Option<Rect>, IconPlace<'a>) {
+) -> (Option<Rect>, IconPlaces<'a>) {
     let g = Glyphs::for_set(app.glyphs);
     if area.height < MIN_HEIGHT_FOR_CHROME {
         if app.tab == Tab::Settings {
             draw_settings(app, theme, g, frame, area);
         } else {
-            draw_list(app, theme, g, frame, area);
+            return (None, draw_list(app, theme, g, frame, area));
         }
-        return (None, None);
+        return (None, Vec::new());
     }
     let help_rows = u16::from(area.height >= HELP_BAR_MIN_HEIGHT);
     let rows = Layout::vertical([
@@ -131,16 +131,16 @@ fn draw_screen<'a>(
     ])
     .split(inner);
     let body = parts[2];
-    let mut icon = None;
+    let mut icons = Vec::new();
     if app.tab == Tab::Settings {
         draw_settings(app, theme, g, frame, inner);
     } else if area.width < MIN_WIDTH_FOR_DETAILS {
         draw_search_line(app, theme, g, frame, parts[0]);
-        draw_list(app, theme, g, frame, body);
+        icons = draw_list(app, theme, g, frame, body);
     } else {
         draw_search_line(app, theme, g, frame, parts[0]);
         let (left, divider, right) = split_with_gutter(body, 55);
-        draw_list(app, theme, g, frame, left);
+        icons = draw_list(app, theme, g, frame, left);
         let divider_style = if app.focus == Focus::Details {
             theme.border_focus()
         } else {
@@ -151,7 +151,7 @@ fn draw_screen<'a>(
                 .buffer_mut()
                 .set_string(divider, y, "│", divider_style);
         }
-        icon = draw_details(app, theme, g, frame, right);
+        icons.extend(draw_details(app, theme, g, frame, right));
     }
     draw_status(app, theme, g, frame, rows[2]);
     if help_rows > 0 {
@@ -162,7 +162,7 @@ fn draw_screen<'a>(
     if app.show_help {
         draw_help(theme, frame, area);
     }
-    (Some(rows[1]), icon)
+    (Some(rows[1]), icons)
 }
 
 fn tab_index(tab: Tab) -> usize {
@@ -581,10 +581,18 @@ fn list_lines<'a>(
     lines
 }
 
-fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect) {
+/// Draws the list; returns the icons of its visible rows, drawn by `view` after the toasts.
+/// With icons on every item is indented, with or without an icon, so the text stays aligned.
+fn draw_list<'a>(
+    app: &'a App,
+    theme: &Theme,
+    g: &Glyphs,
+    frame: &mut Frame,
+    area: Rect,
+) -> IconPlaces<'a> {
     let inner = area;
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return Vec::new();
     }
     if app.tab == Tab::Search && app.search.entries().is_empty() {
         let msg = Line::from(vec![
@@ -592,14 +600,21 @@ fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect
             Span::styled("baixando catálogo…", italic_muted(theme)),
         ]);
         frame.render_widget(Paragraph::new(msg), inner);
-        return;
+        return Vec::new();
     }
     let len = app.visible_len();
     let per_item = ITEM_ROWS + usize::from(ITEM_GAP);
     let h = ((usize::from(inner.height) + usize::from(ITEM_GAP)) / per_item).max(1);
     let sel = app.selected.min(len.saturating_sub(1));
     let window = list_window(sel, app.scroll, len, h);
-    let lines = list_lines(app, theme, g, usize::from(inner.width), window);
+    let indent = LIST_ICON_COLS + LIST_ICON_GAP;
+    let icons_on = app.icon_protocol != IconProtocol::Off && inner.width >= indent + 20;
+    let text_area = if icons_on {
+        inset_left(inner, indent)
+    } else {
+        inner
+    };
+    let lines = list_lines(app, theme, g, usize::from(text_area.width), window.clone());
     if lines.is_empty() {
         let text = match app.tab {
             Tab::Search => "nenhum resultado",
@@ -611,9 +626,32 @@ fn draw_list(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Rect
             Paragraph::new(Span::styled(text, italic_muted(theme))),
             inner,
         );
-        return;
+        return Vec::new();
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), text_area);
+    if !icons_on || !icon_visible(app) {
+        return Vec::new();
+    }
+    let size = (LIST_ICON_COLS, ITEM_ROWS as u16);
+    let mut places = Vec::new();
+    for (n, key) in app.list_keys(window).into_iter().enumerate() {
+        let Some((source, id)) = key else { continue };
+        let Some(proto) = app.icons.get(&format!("{source}/{id}"), size) else {
+            continue;
+        };
+        let y = usize::from(inner.y) + n * per_item;
+        let rect = Rect::new(inner.x, y as u16, size.0, size.1);
+        if rect.bottom() <= inner.bottom() {
+            places.push((rect, proto));
+        }
+    }
+    places
+}
+
+/// `area` without its `cols` leftmost columns.
+fn inset_left(area: Rect, cols: u16) -> Rect {
+    let cols = cols.min(area.width);
+    Rect::new(area.x + cols, area.y, area.width - cols, area.height)
 }
 
 /// Fields of the selected row, shown before `PackageDetails` arrives.
@@ -828,7 +866,7 @@ fn draw_details<'a>(
     g: &Glyphs,
     frame: &mut Frame,
     area: Rect,
-) -> IconPlace<'a> {
+) -> Option<(Rect, &'a Protocol)> {
     let (mut lines, identity) = details_lines(app, theme, g);
     // Guard: the narrowest details pane drawn today (60-column terminal) is 23 columns.
     let icon = selected_icon(app).filter(|_| {

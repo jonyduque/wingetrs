@@ -1968,3 +1968,126 @@ fn icon_evicted_from_the_cache_is_encoded_again() {
     update(&mut a, key(KeyCode::Down));
     assert_eq!(encode_requests(&update(&mut a, key(KeyCode::Up))), 1);
 }
+
+fn many_entries(n: usize) -> Vec<PackageEntry> {
+    (0..n)
+        .map(|i| {
+            entry(
+                SourceKind::Winget,
+                &format!("Pkg.N{i:02}"),
+                &format!("pkg{i:02}"),
+            )
+        })
+        .collect()
+}
+
+/// An app with `n` packages on a terminal tall enough for exactly `page` list items.
+fn icon_app(n: usize, page: usize) -> App {
+    let mut a = App::new(many_entries(n), GlyphSet::Nerd);
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let h = (1..200u16)
+        .find(|h| usize::from(*h).saturating_sub(wingetrs::tui::app::chrome_rows(*h)) / 2 == page)
+        .unwrap();
+    update(&mut a, Msg::Resize(100, h));
+    a
+}
+
+fn map_of(a: &App, window: std::ops::Range<usize>, picks: &[usize]) -> Vec<(String, String)> {
+    let keys = a.list_keys(window.clone());
+    picks
+        .iter()
+        .map(|p| {
+            let (s, id) = keys[p - window.start].clone().unwrap();
+            (format!("{s}/{id}"), format!("sha{p}"))
+        })
+        .collect()
+}
+
+fn cached_requests(cmds: &[Cmd]) -> Vec<(String, String)> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            Cmd::EncodeCachedIcon { source, id, .. } => Some((source.clone(), id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn only_visible_cached_icons_are_requested() {
+    let mut a = icon_app(50, 10);
+    let visible = map_of(&a, 0..10, &[0, 4, 9]);
+    let hidden = map_of(&a, 10..50, &[10, 11, 20, 30, 49]);
+    let map: std::collections::BTreeMap<String, String> =
+        visible.iter().chain(&hidden).cloned().collect();
+    let cmds = update(&mut a, Msg::IconMapLoaded(map));
+    assert_eq!(cmds.len(), 3, "{cmds:?}");
+    let got: std::collections::BTreeSet<String> = cached_requests(&cmds)
+        .into_iter()
+        .map(|(s, id)| format!("{s}/{id}"))
+        .collect();
+    let want: std::collections::BTreeSet<String> = visible.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(got, want);
+    // Asking again while they are in flight asks for nothing.
+    assert!(update(&mut a, Msg::Tick).is_empty());
+}
+
+#[test]
+fn icon_requests_are_capped() {
+    let mut a = icon_app(50, 20);
+    let all = map_of(&a, 0..20, &(0..20).collect::<Vec<_>>());
+    let cmds = update(&mut a, Msg::IconMapLoaded(all.into_iter().collect()));
+    let first = cached_requests(&cmds);
+    assert_eq!(first.len(), 8, "capped per frame");
+    assert!(update(&mut a, Msg::Tick).is_empty(), "still 8 in flight");
+    let mut next = Vec::new();
+    for (source, id) in &first {
+        let cmds = update(
+            &mut a,
+            Msg::IconReady {
+                key: format!("{source}/{id}"),
+                size: (4, 2),
+                proto: Ok(tiny_icon()),
+            },
+        );
+        next.extend(cached_requests(&cmds));
+    }
+    assert_eq!(
+        next.len(),
+        8,
+        "the waiting ones are requested as slots free"
+    );
+    assert!(next.iter().all(|r| !first.contains(r)));
+}
+
+#[test]
+fn list_never_fetches_icons() {
+    // Visible rows without a cached icon produce no request of any kind.
+    let mut a = icon_app(50, 10);
+    let mut cmds = update(&mut a, Msg::IconMapLoaded(Default::default()));
+    cmds.extend(
+        update(&mut a, key(KeyCode::Down))
+            .into_iter()
+            .filter(|c| !matches!(c, Cmd::LoadDetails { .. })),
+    );
+    cmds.extend(update(&mut a, Msg::Resize(100, 60)));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    // With a cached one the only request is a read-and-encode of that blob.
+    let hit = map_of(&a, 0..3, &[1]);
+    let cmds = update(
+        &mut a,
+        Msg::IconMapped {
+            key: hit[0].0.clone(),
+            sha: "abc".into(),
+        },
+    );
+    assert!(
+        matches!(&cmds[..], [Cmd::EncodeCachedIcon { sha, .. }] if sha == "abc"),
+        "{cmds:?}"
+    );
+    // The worker that serves it never touches the network.
+    let src = include_str!("../src/tui/run.rs");
+    let from = src.find("fn spawn_cached_icon").unwrap();
+    let to = src[from..].find("/// Runs one keystroke").unwrap();
+    let body = &src[from..from + to];
+    assert!(!body.contains("fetch") && !body.contains("http"), "{body}");
+}

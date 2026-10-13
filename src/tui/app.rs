@@ -7,13 +7,15 @@ use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::icons::{IconCache, IconProtocol};
-use crate::tui::layout::{DETAIL_ICON_COLS, DETAIL_ICON_ROWS, FILTER_GAP, ITEM_GAP};
+use crate::tui::layout::{
+    DETAIL_ICON_COLS, DETAIL_ICON_ROWS, FILTER_GAP, ITEM_GAP, LIST_ICON_COLS,
+};
 use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::settings::{SettingsState, glyphs_name};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -66,6 +68,13 @@ pub enum Msg {
     IconLoaded {
         key: String,
         bytes: Vec<u8>,
+    },
+    /// The `icons.json` map (`<source>/<id>` -> SHA-256 of the cached icon), read at startup.
+    IconMapLoaded(BTreeMap<String, String>),
+    /// An icon was just cached: `key` now has its blob under `sha`.
+    IconMapped {
+        key: String,
+        sha: String,
     },
     /// The icon of `key` encoded for `size` cells (columns, rows), or why it could not be.
     IconReady {
@@ -226,6 +235,14 @@ pub enum Cmd {
         bytes: Vec<u8>,
         size: (u16, u16),
     },
+    /// Read a cached icon blob and encode it, off the UI thread; answers with `Msg::IconReady`.
+    /// Never touches the network.
+    EncodeCachedIcon {
+        source: String,
+        id: String,
+        sha: String,
+        size: (u16, u16),
+    },
     /// Run `run_search` off the UI thread and answer with `Msg::SearchDone`.
     Search {
         generation: u64,
@@ -264,6 +281,9 @@ pub struct Toast {
     pub count: u32,
 }
 
+/// Most icon encodings in flight at once.
+pub const MAX_ICON_JOBS: usize = 8;
+
 /// Most toasts on screen at once.
 pub const MAX_TOASTS: usize = 3;
 
@@ -291,8 +311,10 @@ pub struct App {
     pub icons: IconCache,
     /// Keys whose icon could not be decoded; never retried in this session.
     pub icon_none: HashSet<String>,
-    /// Keys whose icon is being encoded.
-    icon_in_flight: HashSet<String>,
+    /// `(key, size)` of the icons being encoded.
+    icon_in_flight: HashSet<(String, (u16, u16))>,
+    /// Cached icons known to the list: `<source>/<id>` -> SHA-256 of the blob.
+    pub icon_map: BTreeMap<String, String>,
     /// `"{source}/{id}"` of the selected package while its details are being loaded.
     pub details_pending: Option<String>,
     pub refreshing: bool,
@@ -366,6 +388,7 @@ impl App {
             icons: IconCache::default(),
             icon_none: HashSet::new(),
             icon_in_flight: HashSet::new(),
+            icon_map: BTreeMap::new(),
             details_pending: None,
             refreshing: false,
             offline: false,
@@ -551,12 +574,17 @@ impl App {
         cmds
     }
 
+    /// Items that fit in the list at the current terminal height.
+    fn page(&self) -> usize {
+        (usize::from(self.size.1).saturating_sub(chrome_rows(self.size.1))
+            / (ITEM_ROWS + usize::from(ITEM_GAP)))
+        .max(1)
+    }
+
     fn clamp(&mut self) {
         let len = self.visible_len();
         self.selected = self.selected.min(len.saturating_sub(1));
-        let page = (usize::from(self.size.1).saturating_sub(chrome_rows(self.size.1))
-            / (ITEM_ROWS + usize::from(ITEM_GAP)))
-        .max(1);
+        let page = self.page();
         if self.selected < self.scroll {
             self.scroll = self.selected;
         } else if self.selected >= self.scroll + page {
@@ -581,7 +609,7 @@ impl App {
         let key = format!("{source}/{id}");
         let size = (DETAIL_ICON_COLS, DETAIL_ICON_ROWS);
         if self.icon_none.contains(&key)
-            || self.icon_in_flight.contains(&key)
+            || self.icon_in_flight.contains(&(key.clone(), size))
             || self.icons.get(&key, size).is_some()
         {
             return Vec::new();
@@ -590,8 +618,83 @@ impl App {
             return Vec::new();
         };
         let bytes = bytes.clone();
-        self.icon_in_flight.insert(key.clone());
+        self.icon_in_flight.insert((key.clone(), size));
         vec![Cmd::EncodeIcon { key, bytes, size }]
+    }
+
+    /// `(source, id)` of each list row in `window`, in order; `None` for rows with no
+    /// catalog package.
+    pub fn list_keys(&self, window: std::ops::Range<usize>) -> Vec<Option<(String, String)>> {
+        let key = |source: &str, id: &str| Some((source.to_owned(), id.to_owned()));
+        match self.tab {
+            Tab::Search => self
+                .hits
+                .iter()
+                .skip(window.start)
+                .take(window.len())
+                .map(|h| {
+                    let e = self.search.entries().get(h.index)?;
+                    key(&e.source_name, &e.id)
+                })
+                .collect(),
+            Tab::Installed | Tab::Updates => self
+                .installed_view()
+                .into_iter()
+                .skip(window.start)
+                .take(window.len())
+                .map(|r| match &r.correlation {
+                    Correlation::Matched {
+                        source, package_id, ..
+                    } => key(source, package_id),
+                    _ => None,
+                })
+                .collect(),
+            Tab::Settings => Vec::new(),
+        }
+    }
+
+    /// Requests encoding of the visible rows' cached icons that are neither encoded, being
+    /// encoded, nor known to be undecodable; at most `MAX_ICON_JOBS` in flight. The bytes
+    /// come from the blob store (never the network) on a worker.
+    fn list_icon_cmds(&mut self) -> Vec<Cmd> {
+        if self.icon_map.is_empty()
+            || self.tab == Tab::Settings
+            || !crate::tui::view::icon_visible(self)
+        {
+            return Vec::new();
+        }
+        let size = (LIST_ICON_COLS, ITEM_ROWS as u16);
+        let window = crate::tui::view::list_window(
+            self.selected.min(self.visible_len().saturating_sub(1)),
+            self.scroll,
+            self.visible_len(),
+            self.page(),
+        );
+        let mut cmds = Vec::new();
+        for (source, id) in self.list_keys(window).into_iter().flatten() {
+            if self.icon_in_flight.len() >= MAX_ICON_JOBS {
+                break;
+            }
+            let key = format!("{source}/{id}");
+            let Some(sha) = self.icon_map.get(&key) else {
+                continue;
+            };
+            let flight = (key, size);
+            if self.icon_none.contains(&flight.0)
+                || self.icon_in_flight.contains(&flight)
+                || self.icons.get(&flight.0, size).is_some()
+            {
+                continue;
+            }
+            cmds.push(Cmd::EncodeCachedIcon {
+                source,
+                id,
+                sha: sha.clone(),
+                size,
+            });
+            self.icon_in_flight.insert(flight);
+        }
+        cmds
     }
 
     /// Requests the selected package's details unless cached (and its icon's encoding);
@@ -646,7 +749,14 @@ impl App {
     }
 }
 
+/// Applies `msg`; the result also asks for the visible list rows' cached icons.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
+    let mut cmds = apply(app, msg);
+    cmds.extend(app.list_icon_cmds());
+    cmds
+}
+
+fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
     app.prune_toasts();
     match msg {
         Msg::Key(k) => on_key(app, k),
@@ -716,8 +826,19 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.icon_bytes.insert(key, bytes);
             app.icon_cmd()
         }
+        Msg::IconMapLoaded(loaded) => {
+            // Entries written meanwhile are newer than the file read at startup.
+            for (k, sha) in loaded {
+                app.icon_map.entry(k).or_insert(sha);
+            }
+            Vec::new()
+        }
+        Msg::IconMapped { key, sha } => {
+            app.icon_map.insert(key, sha);
+            Vec::new()
+        }
         Msg::IconReady { key, size, proto } => {
-            app.icon_in_flight.remove(&key);
+            app.icon_in_flight.remove(&(key.clone(), size));
             match proto {
                 Ok(p) => app.icons.insert(key, size, p),
                 Err(_) => {

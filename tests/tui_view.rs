@@ -1346,8 +1346,11 @@ fn details_without_icon_keep_the_old_layout() {
     a.icon_bytes.insert(key.clone(), vec![1, 2, 3]);
     assert_eq!(render(&a, 100, 16), base);
     // Protocol on, still encoding (nothing in the cache).
+    // (The list indents for the icon column, so only the details pane is compared.)
     a.icon_protocol = IconProtocol::Sixel;
-    assert_eq!(render(&a, 100, 16), base);
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let pane = |a: &App| pane_cells(&screen_cells(a, 100, 16, &theme), PANE_X, 5..14);
+    assert_eq!(pane(&a), pane(&typed("powert")));
     // An encoded icon with the protocol off is not drawn either.
     let mut b = with_icon();
     b.icon_protocol = IconProtocol::Off;
@@ -1515,4 +1518,93 @@ fn icon_layout_draws_the_same_words() {
         );
         assert_eq!(pane_words(&with, 20), pane_words(&plain, 20), "{name}");
     }
+}
+
+/// An opaque red halfblocks icon of `cols` x `rows` cells.
+fn red_icon(cols: u16, rows: u16) -> ratatui_image::protocol::Protocol {
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    let fs = picker.font_size();
+    let img = image::RgbaImage::from_pixel(
+        u32::from(cols * fs.width),
+        u32::from(rows * fs.height),
+        image::Rgba([255, 0, 0, 255]),
+    );
+    picker
+        .new_protocol(
+            image::DynamicImage::ImageRgba8(img),
+            ratatui::layout::Size::new(cols, rows),
+            ratatui_image::Resize::Fit(None),
+        )
+        .unwrap()
+}
+
+/// `(column, row)` of the first occurrence of `needle` on screen (one cell per char).
+fn find_text(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+    (0..buf.area.height).find_map(|y| {
+        let row = row_text(buf, y);
+        let at = row.find(needle)?;
+        Some((u16::try_from(row[..at].chars().count()).unwrap(), y))
+    })
+}
+
+#[test]
+fn list_indents_every_item_when_icons_are_on() {
+    use wingetrs::tui::icons::IconProtocol;
+    use wingetrs::tui::layout::{LIST_ICON_COLS, LIST_ICON_GAP};
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let ids = [
+        "Microsoft.PowerToys ·",
+        "lin-ycv.EverythingPowerToys ·",
+        "powertoys · U",
+    ];
+    let off = typed("powert");
+    let off_buf = screen_cells(&off, 100, 16, &theme);
+    let off_pos: Vec<(u16, u16)> = ids
+        .iter()
+        .map(|i| find_text(&off_buf, i).unwrap())
+        .collect();
+
+    // One of the three has an icon in the cache; the protocol is on.
+    let mut on = typed("powert");
+    on.icon_protocol = IconProtocol::Sixel;
+    let (src, id) = on.list_keys(0..1).remove(0).unwrap();
+    on.icons.insert(
+        format!("{src}/{id}"),
+        (LIST_ICON_COLS, 2),
+        red_icon(LIST_ICON_COLS, 2),
+    );
+    let on_buf = screen_cells(&on, 100, 16, &theme);
+    let indent = LIST_ICON_COLS + LIST_ICON_GAP;
+    let list_x = off_pos[0].0 - 4;
+    let mut icon_rows = 0;
+    for (id, (x, y)) in ids.iter().zip(&off_pos) {
+        let (nx, ny) = find_text(&on_buf, id).unwrap();
+        assert_eq!((nx, ny), (x + indent, *y), "{id} text column");
+        // The 4 icon columns of both lines of the item hold no text.
+        for row in [y - 1, *y] {
+            for col in list_x..list_x + LIST_ICON_COLS {
+                let c = &on_buf[(col, row)];
+                if is_icon(c) {
+                    icon_rows += 1;
+                } else {
+                    assert_eq!(c.symbol(), " ", "text in the icon area at ({col},{row})");
+                }
+            }
+            assert_eq!(on_buf[(list_x + LIST_ICON_COLS, row)].symbol(), " ");
+        }
+    }
+    assert_eq!(icon_rows, 8, "the one cached icon fills its 4x2 cells");
+    assert_eq!(icon_cells(&on_buf), 8);
+
+    // Off: no indent and no icon even with one in the cache.
+    let mut still_off = typed("powert");
+    still_off.icons.insert(
+        format!("{src}/{id}"),
+        (LIST_ICON_COLS, 2),
+        red_icon(LIST_ICON_COLS, 2),
+    );
+    assert_eq!(
+        render(&still_off, 100, 16),
+        render(&typed("powert"), 100, 16)
+    );
 }

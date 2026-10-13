@@ -12,6 +12,8 @@ use wingetrs::catalog::search::SearchIndex;
 use wingetrs::core::PackageEntry;
 use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
 use wingetrs::tui::app::{App, Cmd, Msg, run_search, update};
+use wingetrs::tui::icons::IconProtocol;
+use wingetrs::tui::layout::LIST_ICON_COLS;
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
 use wingetrs::tui::view::view;
 
@@ -47,7 +49,27 @@ fn key(c: KeyCode) -> Msg {
     Msg::Key(KeyEvent::new(c, KeyModifiers::NONE))
 }
 
-fn scenario(entries: &[PackageEntry], tabs: usize, query: &str) -> (u128, u128) {
+/// A red icon that only reserves its cells: the real terminal is not measured here.
+fn reserve_icon() -> ratatui_image::protocol::Protocol {
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    let fs = picker.font_size();
+    let img = image::RgbaImage::from_pixel(
+        u32::from(LIST_ICON_COLS * fs.width),
+        u32::from(2 * fs.height),
+        image::Rgba([255, 0, 0, 255]),
+    );
+    picker
+        .new_protocol(
+            image::DynamicImage::ImageRgba8(img),
+            ratatui::layout::Size::new(LIST_ICON_COLS, 2),
+            ratatui_image::Resize::Fit(None),
+        )
+        .unwrap()
+}
+
+/// Median and p95 microseconds of `FRAMES` frames; with `icons` the protocol is on and
+/// every package of the first screens has a cached (pre-encoded) list icon.
+fn scenario(entries: &[PackageEntry], tabs: usize, query: &str, icons: bool) -> (u128, u128) {
     let mut app = App::new(entries.to_vec(), GlyphSet::Nerd);
     update(&mut app, Msg::InstalledLoaded(rows(entries)));
     for _ in 0..tabs {
@@ -65,6 +87,14 @@ fn scenario(entries: &[PackageEntry], tabs: usize, query: &str) -> (u128, u128) 
                 let hits = run_search(&app.search, &query, kind);
                 update(&mut app, Msg::SearchDone { generation, hits });
             }
+        }
+    }
+    if icons {
+        app.icon_protocol = IconProtocol::Sixel;
+        let size = (LIST_ICON_COLS, 2);
+        for (source, id) in app.list_keys(0..FRAMES + 40).into_iter().flatten() {
+            app.icons
+                .insert(format!("{source}/{id}"), size, reserve_icon());
         }
     }
     let theme = Theme::new(true, ColorDepth::TrueColor);
@@ -202,13 +232,26 @@ fn main() {
         .load_entries()
         .expect("load entries");
     println!("entries: {}", entries.len());
+    if std::env::args().any(|a| a == "frames") {
+        // Task 85: 3 series of FRAMES frames on the Search tab, icons off then on.
+        for icons in [false, true] {
+            for _ in 0..3 {
+                let (med, p95) = scenario(&entries, 0, "", icons);
+                println!(
+                    "pesquisar icones {:<4} median {med:>6} us   p95 {p95:>6} us",
+                    if icons { "on" } else { "off" }
+                );
+            }
+        }
+        return;
+    }
     for (name, tabs, q) in [
         ("search", 0, ""),
         ("search 'code'", 0, "code"),
         ("installed", 1, ""),
         ("updates", 2, ""),
     ] {
-        let (med, p95) = scenario(&entries, tabs, q);
+        let (med, p95) = scenario(&entries, tabs, q, false);
         println!("{name:<14} median {med:>6} us   p95 {p95:>6} us");
     }
     let mut app = App::new(entries, GlyphSet::Nerd);
