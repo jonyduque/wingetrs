@@ -5363,3 +5363,176 @@ Testes:
 6. Mutação "PEGA" só conta com o nome do teste na saída (target separado: `$env:CARGO_TARGET_DIR`), nunca por falha de build (ARMADILHAS).
 
 **Commit:** `fix(install): extraction io errors name the operation and path` e (conforme a evidência) `fix(install): retry renames and removals blocked by a transient external handle`
+
+## Manutenção (Tasks 80–81)
+
+Pedido do usuário (2026-10-13): limpar `blobs/` e fazer a TUI abrir o catálogo só para leitura. As duas tarefas tocam arquivos disjuntos e rodam em paralelo; nenhuma mede tempo.
+- **Task 80:** `src/tui/run.rs`, `src/tui/jobs.rs` e os testes da TUI.
+- **Task 81:** `src/cache/mod.rs`, `src/install/download.rs`, `src/update.rs` e os testes de cache, download e update.
+
+### Task 80: A TUI lê o catálogo só para leitura
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+A TUI chama `Catalog::open` em cinco lugares que só leem. Essa função abre o banco para leitura e escrita e roda o DDL de `SCHEMA` a cada chamada. Os cinco lugares:
+- `src/tui/run.rs` `index_age` (~:153): idade do catálogo na abertura.
+- `src/tui/run.rs`, carga dos instalados (~:488, `correlate`).
+- `src/tui/run.rs` `load_details` (~:529): roda **a cada seleção** de item.
+- `src/tui/jobs.rs` `read_catalog` (~:88): carga da lista de pacotes.
+- `src/tui/run.rs` `with_ops` (~:601): planejamento e execução de operações. `OpsCtx` só lê o catálogo.
+
+As únicas escritas no catálogo estão em `update.rs` `apply`, `buckets.rs` `remove_source` e no import de `cli/mod.rs`. Confira com `grep -rn "replace_source\|remove_source" src`.
+
+O DDL pega o lock de escrita do SQLite e compete com um `update` em andamento, ficando ocupado até 5 s. `Catalog::open_read_only` (`src/catalog/mod.rs:291`) não roda DDL. Ela usa `open_worker_connection`: `SQLITE_OPEN_READ_ONLY | NO_MUTEX`, `busy_timeout` de 5 s e `mmap_size`. A CLI já usa `open_read_only` no caminho barato (`src/cli/mod.rs` `ensure_catalog_ran`, ~:470). Armadilha em `docs/ARMADILHAS.md`: "`Catalog::open` roda DDL do schema; para leitura use `open_read_only`".
+
+#### What binds this task
+
+- Os cinco lugares acima passam a abrir o catálogo só para leitura, por um helper único em `src/tui/jobs.rs`:
+  ```rust
+  /// Opens the catalog for reading without DDL or a write lock; a missing file reads as empty.
+  pub fn open_catalog_for_reading(path: &Path) -> Result<Catalog, CatalogError> {
+      if path.exists() { Catalog::open_read_only(path) } else { Catalog::open_in_memory() }
+  }
+  ```
+  `run.rs` importa esse helper de `jobs.rs`.
+- **Catálogo ausente** (primeira execução, ou arquivo apagado): `Catalog::open` criava o arquivo vazio, e `open_read_only` falharia. O helper lê um catálogo vazio em memória e nunca cria o arquivo. O comportamento visível não muda:
+  - `index_age` devolve `None`;
+  - `read_catalog` devolve uma lista vazia;
+  - a carga dos instalados correlaciona contra um catálogo vazio;
+  - `load_details` devolve o mesmo erro de "pacote não encontrado" de hoje.
+- **Arquivo existente e ilegível** continua sendo erro, nunca lista vazia (o comentário de `read_catalog` já diz isso).
+- Nada mais muda: mesma ordem de chamadas, mesmos `spawn_blocking`, mesmos erros.
+
+**Files:**
+- Modify: `src/tui/run.rs`, `src/tui/jobs.rs`
+- Test: no arquivo onde já houver testes de `read_catalog` (procure com `grep -rn "read_catalog" tests src`). Se não houver, use `tests/tui_jobs.rs` (novo).
+
+Testes (catálogo em disco num `tempdir`):
+1. `reading_the_catalog_never_writes_it`:
+   - Crie o catálogo com `Catalog::open` e um `replace_source` de 2 pacotes, e feche.
+   - Marque `catalog.db` como só leitura: `let mut p = fs::metadata(&db)?.permissions(); p.set_readonly(true); fs::set_permissions(&db, p)?`.
+   - `read_catalog(&db)` devolve os 2 pacotes, e `open_catalog_for_reading(&db)?.get(source, id)` devolve o pacote.
+   - Restaure a permissão no fim, antes de qualquer `assert`, com um guard `Drop`, para o tempdir ser apagado.
+   - O caminho antigo (`Catalog::open`) falha com o arquivo só leitura; é isso que a mutação 1 prova.
+2. `reading_a_missing_catalog_is_empty`: caminho inexistente. `read_catalog` devolve `Ok(vec![])`, e o arquivo **continua** inexistente (hoje seria criado).
+3. `reading_a_corrupt_catalog_is_an_error`: `catalog.db` com 4096 bytes de lixo. `read_catalog` devolve `Err(_)`.
+
+#### Checks beyond the steps
+
+1. Helper voltando a `Catalog::open(path)` no ramo de arquivo existente ⇒ PEGA (teste 1).
+2. Helper sem o ramo `!path.exists()`, ou seja, `Catalog::open` para arquivo ausente ⇒ PEGA (teste 2: o arquivo passa a existir).
+3. `read_catalog` devolvendo vazio em qualquer erro ⇒ PEGA (teste 3).
+4. Um dos cinco lugares ainda com `Catalog::open`: `grep -n "Catalog::open(" src/tui` vazio. Cole a saída no relatório.
+
+**Commit:** `fix(tui): open the catalog read-only for reads`
+
+---
+
+### Task 81: Limpeza de `blobs/` por idade de uso
+
+**Modelo:** sonnet (revisor opus: apaga arquivos e concorre com a instalação).
+
+#### Where this fits
+
+`%LOCALAPPDATA%\wingetrs\blobs\` (`DataDir::blobs_dir`, `src/cache/mod.rs:80`) guarda arquivos endereçados pelo SHA-256 do conteúdo: 64 caracteres hex minúsculos, sem extensão. São três tipos:
+- **Manifestos e `versionData` do winget.** Gravados por `BlobStore::put_verified` (`src/cache/mod.rs:176`) e usados por `src/sources/winget/details.rs` (Task 70).
+- **Downloads de instalação do Scoop** (`src/install/download.rs` `download_one`, ~:117).
+  - Com hash SHA-256, o nome do arquivo é esse hash.
+  - Com outro algoritmo, o nome é o SHA-256 do conteúdo, e `blobs/index.json` mapeia `"<algo>:<hex>"` para o nome (`read_index`/`write_index`, ~:68-89).
+  - `cached` (~:92) lê via `BlobStore::get`.
+- **Temporários que sobram quando o processo morre:** `<hash>.tmp` (de `put_verified`) e `index.json.<pid>-<seq>.tmp` (de `write_index`).
+
+Nada apaga esses arquivos. Hoje são 44 arquivos e 10,4 MB:
+- 3 downloads de 1,8 a 5,5 MB;
+- o resto são manifestos de 5 a 19 KB.
+
+A pasta cresce cerca de 5 KB por pacote consultado a cada versão do catálogo, mais um arquivo por download.
+
+Decisões do orquestrador (2026-10-13; o usuário pode mudar o número):
+- **Política: idade desde o último uso, 30 dias.** Em `src/cache/mod.rs`: `pub const BLOB_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);`.
+  - O último uso é o `mtime`. Uma gravação nova já tem `mtime` atual, e um `BlobStore::get` com acerto (hash conferido) atualiza o `mtime` para agora.
+  - Consequência aceita: reinstalar offline um app cujo arquivo não é usado há 30 dias exige rede.
+- **Quando:** no fim de `run_update` (`src/update.rs`), depois do `search_idx` e antes de `saved?`, em toda execução. A CLI e a TUI usam a mesma função. A chamada fica dentro de `tracing::debug_span!("update.blob_prune")`. O custo é um `read_dir` de dezenas de arquivos.
+- **Concorrência:**
+  - A limpeza só roda segurando o `install.lock` (`Layout::install_lock()`, `src/install/layout.rs:46`), obtido com `UpdateLock::try_acquire`, sem esperar.
+  - Se estiver ocupado, pula com log `debug`; nunca espera nem faz o `update` falhar.
+  - Imediatamente antes de apagar cada arquivo, releia o `mtime`. Se ficou novo, porque alguém usou o arquivo entre a listagem e a remoção, não apague.
+- **A limpeza nunca faz o `update` falhar.** Qualquer erro dela vira `tracing::warn!`, e o `update` segue com o mesmo resultado.
+
+#### What binds this task
+
+- **`BlobStore::get`** (`src/cache/mod.rs:171`), no acerto: abre o arquivo com `OpenOptions::new().write(true)` e chama `File::set_modified(SystemTime::now())`.
+  - Erro nesse toque é ignorado (log `debug`) e **não** muda o retorno.
+  - Sem acerto (arquivo ausente ou hash errado), não toca.
+- **Função nova em `src/cache/mod.rs`:**
+  ```rust
+  #[derive(Debug, Default, PartialEq, Eq)]
+  pub struct PruneStats { pub removed: usize, pub bytes: u64, pub kept: usize }
+  impl BlobStore {
+      /// Removes content blobs unused for `max_age` and leftover temp files older than a day.
+      pub fn prune(&self, now: SystemTime, max_age: Duration) -> Result<PruneStats, CacheError>
+  }
+  ```
+  Regras:
+  - Considera só entradas diretamente em `dir`, sem recursão.
+  - Usa `DirEntry::file_type()`, que não segue symlink nem reparse point. Symlink ou diretório: ignora e conta em `kept`.
+  - Blob: nome com exatamente 64 caracteres `[0-9a-f]`. Apaga se `now - mtime > max_age`.
+  - Temporário: nome terminando em `.tmp`. Apaga se `now - mtime > 1 dia`.
+  - `index.json` e qualquer outro nome nunca são apagados; contam em `kept`.
+  - `mtime` no futuro (relógio adiantado): mantém.
+  - Remoção que falha: mantém e segue, com log `debug`.
+  - `dir` inexistente: `Ok(PruneStats::default())`.
+- **Função nova em `src/install/download.rs`:** `pub fn prune_index(data: &DataDir) -> Result<usize, DownloadError>`.
+  - Lê `index.json` com `read_index` e remove as entradas cujo arquivo `blobs/<nome>` não existe.
+  - Regrava com `write_index` **só se** removeu alguma, e devolve quantas removeu.
+  - `index.json` ausente ou corrompido: `Ok(0)`, sem gravar. Teste o corrompido lendo os bytes direto, sem o `unwrap_or_default` de `read_index`.
+- **Em `src/update.rs`:** `fn prune_blobs(data: &DataDir)`, síncrona e sem propagar erro com `?`.
+  - Chama `UpdateLock::try_acquire(&data.install_layout().install_lock())`. Se der `Ok(None)` ou `Err`, sai com log `debug`.
+  - Senão chama `BlobStore::new(data.blobs_dir()).prune(SystemTime::now(), BLOB_MAX_AGE)` e depois `prune_index(data)`.
+  - Registra `tracing::info!` com `removed`, `bytes`, `kept` e o número de entradas removidas do índice.
+  - É chamada no fim de `run_update`, conforme as decisões acima.
+- **Nada fora de `blobs_dir()` é tocado** (regra de escrita do CLAUDE.md). Os testes usam `tempdir` e `File::set_modified` para envelhecer arquivos, nunca o `%LOCALAPPDATA%` real.
+
+**Files:**
+- Modify: `src/cache/mod.rs`, `src/install/download.rs`, `src/update.rs`
+- Test: o arquivo de testes de cache existente (`grep -rln "BlobStore" tests`), o de download (`grep -rln "index.json\|download_all" tests`) e `tests/update.rs`
+
+Testes (helper `age(path, days)`, que abre com `write(true)` e faz `set_modified(now - days)`; `days` negativo = futuro):
+1. `get_hit_refreshes_mtime`:
+   - Blob válido envelhecido 40 dias: `get` devolve `Some`, e o `mtime` passa a ser ≥ o instante anterior à chamada.
+   - Blob com conteúdo trocado: `get` devolve `None`, e o `mtime` fica inalterado.
+2. `prune_removes_only_old_blobs_and_old_temps`. Em `dir`:
+   - sai: blob válido de 40 dias;
+   - fica: blob de 10 dias;
+   - sai: `<hash>.tmp` de 2 dias;
+   - fica: `<hash>.tmp` de 1 hora;
+   - ficam: `index.json`, `notes.txt`, um nome de 63 hex e um subdiretório, todos de 400 dias.
+
+   `prune(now, 30 dias)` deve dar `removed == 2`, `bytes` igual à soma dos dois e exatamente esse conjunto de nomes restantes.
+3. `prune_keeps_future_mtime_and_missing_dir`:
+   - um blob com `mtime` 1 dia no futuro fica;
+   - `dir` inexistente dá `Ok(default)`, e o diretório continua inexistente.
+4. `prune_index_drops_entries_without_blob`: `index.json` com duas entradas, uma com arquivo presente e outra ausente.
+   - `prune_index` dá `Ok(1)`, e o índice é regravado só com a entrada presente.
+   - Uma segunda chamada dá `Ok(0)`, e o conteúdo e o `mtime` do `index.json` não mudam. Antes da 2ª chamada, envelheça o `index.json` 1 dia para o `mtime` ser comparável.
+5. `pruned_download_is_fetched_again`, com wiremock e o mesmo padrão dos testes de download existentes:
+   - baixar um arquivo faz 1 GET;
+   - envelhecer o blob 40 dias e rodar `prune` + `prune_index`;
+   - pedir o mesmo arquivo de novo faz um 2º GET (`expect(2)`), e o arquivo volta para o lugar;
+   - no controle sem envelhecer, o 2º pedido não faz GET.
+6. `update_prunes_old_blobs` (`tests/update.rs`, mesmo arranjo dos testes de `run_update` com wiremock e raiz temporária): com um blob de 40 dias e outro de 1 dia em `blobs/`, depois do `run_update` só o de 1 dia existe.
+7. `update_skips_prune_while_install_lock_is_held`: o mesmo, mas segurando `UpdateLock::try_acquire(install_lock)` durante o `run_update`. Os dois blobs continuam, e o `run_update` devolve `Ok` com os mesmos outcomes do teste 6.
+8. `prune_failure_never_fails_update`: com `blobs` sendo um **arquivo**, não um diretório, `run_update` devolve `Ok` com os mesmos outcomes.
+
+#### Checks beyond the steps
+
+1. Idade: inverter a comparação de idade dos blobs ⇒ PEGA (teste 2).
+2. Só 64 hex: aceitar como blob qualquer nome sem `.` ⇒ PEGA (teste 2).
+3. Toque: remover o toque do acerto em `get` ⇒ PEGA (teste 1).
+4. Lock: chamar a limpeza sem o `try_acquire` ⇒ PEGA (teste 7).
+5. Índice: `prune_index` regravando sempre ⇒ PEGA (teste 4).
+6. Releitura do `mtime` antes de apagar: não há teste determinístico simples. Cite no relatório a linha do código que faz a releitura; o revisor confere.
+
+**Commit:** `feat(cache): prune blobs unused for 30 days after update`
