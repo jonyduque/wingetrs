@@ -393,8 +393,38 @@ impl Catalog {
         )
     }
 
+    /// Runs the import with a larger page cache (up to 64 MiB more memory) and restores the
+    /// previous `cache_size` on every path; the import error wins over a restore error.
     #[allow(clippy::too_many_arguments)]
     fn replace_source_impl(
+        &mut self,
+        source: &str,
+        kind: SourceKind,
+        source_version: &str,
+        fetched_at: i64,
+        packages: &[NewPackage],
+        maps: &WingetMaps,
+        rebuild: bool,
+    ) -> Result<ImportStats, CatalogError> {
+        let prev: i64 = self.conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
+        self.conn.pragma_update(None, "cache_size", -65536i64)?;
+        let result = self.import_source(
+            source,
+            kind,
+            source_version,
+            fetched_at,
+            packages,
+            maps,
+            rebuild,
+        );
+        let restored = self.conn.pragma_update(None, "cache_size", prev);
+        let stats = result?;
+        restored?;
+        Ok(stats)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn import_source(
         &mut self,
         source: &str,
         kind: SourceKind,
@@ -815,6 +845,28 @@ mod tests {
             );
             assert_eq!(schema(&a.conn), schema(&b.conn), "from_empty={from_empty}");
         }
+    }
+
+    #[test]
+    fn import_restores_cache_size() {
+        let mut c = Catalog::open_in_memory().unwrap();
+        let cache = |c: &Catalog| -> i64 {
+            c.conn
+                .query_row("PRAGMA cache_size", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = cache(&c);
+        winget_only(&mut c);
+        assert_eq!(cache(&c), before, "after success");
+        let bad = WingetMaps {
+            pfns: vec![("k".into(), "Missing".into())],
+            ..Default::default()
+        };
+        let err = c
+            .replace_source("winget", SourceKind::Winget, "v", 1, &[pkg("W.1")], &bad)
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::DanglingMap(_)));
+        assert_eq!(cache(&c), before, "after DanglingMap");
     }
 
     fn map_counts(c: &Catalog) -> Vec<i64> {
