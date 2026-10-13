@@ -51,6 +51,7 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 ## Ambiente e repositório
 
 - **Apagar por caminho interpolado.** Task 72: script gerado com `Remove-Item "$root\$Name\*"` e `$Name` vazio apagou o scratchpad inteiro da sessão. Antes de apagar, confira que cada parte do caminho é não vazia (`if (-not $Name) { throw }`) e que o alvo fica dentro de uma pasta criada pelo próprio script.
+- **`CARGO_TARGET_DIR` por tarefa enche o disco.** Cada `target/tNN` de debug com as dependências de imagem passa de 10 GB; em 2026-10-13 sete deles (~64 GB) deixaram o C: com 2 GB e um agente falhou no meio. O agente apaga o próprio `target/tNN` ao terminar (depois do gate e das mutações), e o orquestrador confere com `Get-ChildItem target -Directory`.
 - **`core.autocrlf=true`** converteria fixtures de texto e quebraria comparações de hash: `.gitattributes` marca `tests/fixtures/** -text`.
 - **`find /` no Git Bash varre o disco inteiro** (inclusive `C:\Program Files\Git`); proibido no CLAUDE.md.
 - **O modo automático bloqueia encerrar processos** sem pedido explícito do usuário: liste com `leftovers.ps1` e pergunte.
