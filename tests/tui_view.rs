@@ -1643,3 +1643,36 @@ fn list_page_rows_matches_the_items_the_view_draws() {
         assert_eq!(wingetrs::tui::app::list_page_rows(h), drawn, "height {h}");
     }
 }
+
+#[test]
+fn turning_icons_off_clears_the_cache_and_the_indent() {
+    use crossterm::event::KeyCode;
+    use wingetrs::tui::app::Tab;
+    use wingetrs::tui::icons::IconProtocol;
+    use wingetrs::tui::layout::LIST_ICON_COLS;
+    let mut a = typed("powert");
+    a.icon_protocol = IconProtocol::Sixel;
+    a.settings.icons = "sixel".into();
+    let (src, id) = a.list_keys(0..1).remove(0).unwrap();
+    a.icons.insert(
+        format!("{src}/{id}"),
+        (LIST_ICON_COLS, 2),
+        red_icon(LIST_ICON_COLS, 2),
+    );
+    assert!(!a.icons.is_empty());
+    a.tab = Tab::Settings;
+    for _ in 0..5 {
+        key(&mut a, KeyCode::Down);
+    }
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.settings.icons, "off");
+    assert_eq!(a.icon_protocol, IconProtocol::Off);
+    assert!(a.icons.is_empty(), "cache cleared");
+    a.tab = Tab::Search;
+    a.status = None; // "salvando…" is the only other difference
+    assert_eq!(
+        render(&a, 100, 16),
+        render(&typed("powert"), 100, 16),
+        "no icon, no indent"
+    );
+}

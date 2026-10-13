@@ -99,7 +99,7 @@ struct Ctx {
     /// Generation of the newest detail request; older ones are dropped after the debounce.
     details_gen: AtomicU64,
     /// Encoder for package icons; `None` when icons are off.
-    icon_picker: Option<ratatui_image::picker::Picker>,
+    icon_picker: std::sync::Mutex<Option<ratatui_image::picker::Picker>>,
 }
 
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
@@ -118,6 +118,8 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     let mut app = App::new(Vec::new(), glyphs);
     app.dark = dark;
     app.settings = SettingsState::new(cfg.behavior, glyphs, dark, glyphs_forced);
+    app.settings.icons.clone_from(&cfg.icons);
+    app.settings.saved_icons.clone_from(&cfg.icons);
     app.buckets_summary = cfg
         .scoop_buckets
         .iter()
@@ -174,7 +176,7 @@ async fn event_loop(
         tx,
         details_gen: AtomicU64::new(0),
         // After `ratatui::init`, so the pixel size is that of the terminal in use.
-        icon_picker: crate::tui::icons::picker(app.icon_protocol),
+        icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
     });
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
@@ -186,6 +188,7 @@ async fn event_loop(
     }
     let mut stats = LoopStats::new();
     let mut dark_now = app.dark;
+    let mut protocol_now = app.icon_protocol;
 
     loop {
         let wake = app.next_toast_deadline();
@@ -235,6 +238,20 @@ async fn event_loop(
             })
             .collect();
         let cmds = clock_turn(&mut app, Instant::now(), batch);
+        if app.icon_protocol != protocol_now {
+            // The Ícones setting changed: encode with the new protocol from here on.
+            protocol_now = app.icon_protocol;
+            let new_picker = crate::tui::icons::picker(protocol_now);
+            match ctx.icon_picker.lock() {
+                Ok(mut g) => *g = new_picker,
+                Err(poisoned) => *poisoned.into_inner() = new_picker,
+            }
+            if protocol_now != crate::tui::icons::IconProtocol::Off && app.icon_map.is_empty() {
+                spawn_job(&ctx, |c, _| {
+                    Msg::IconMapLoaded(crate::icons::load_map(&c.data))
+                });
+            }
+        }
         for cmd in last_details_only(cmds) {
             match cmd {
                 Cmd::Quit => return Ok(()),
@@ -261,6 +278,7 @@ async fn event_loop(
                 Cmd::SaveSettings {
                     behavior,
                     glyphs,
+                    icons,
                     theme,
                 } => {
                     spawn_job(&ctx, move |c, _| {
@@ -268,6 +286,7 @@ async fn event_loop(
                             &c.data.config_path(),
                             behavior,
                             glyphs.as_deref(),
+                            icons.as_deref(),
                             &theme,
                         ))
                     });
@@ -409,9 +428,17 @@ pub async fn join_icon(key: String, size: (u16, u16), h: tokio::task::JoinHandle
     }
 }
 
+/// The encoder for the protocol in force (changes when the Ícones setting does).
+fn current_picker(ctx: &Ctx) -> Option<ratatui_image::picker::Picker> {
+    match ctx.icon_picker.lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 /// Decodes and encodes one icon on a blocking thread; the handle is always awaited.
 fn spawn_icon(ctx: &Arc<Ctx>, key: String, bytes: Vec<u8>, size: (u16, u16)) {
-    let picker = ctx.icon_picker.clone();
+    let picker = current_picker(ctx);
     let tx = ctx.tx.clone();
     tokio::spawn(async move {
         let work = tokio::task::spawn_blocking({
@@ -434,7 +461,7 @@ fn spawn_icon(ctx: &Arc<Ctx>, key: String, bytes: Vec<u8>, size: (u16, u16)) {
 /// Reads a cached icon from the blob store and encodes it on a blocking thread (no network);
 /// the handle is always awaited.
 fn spawn_cached_icon(ctx: &Arc<Ctx>, source: String, id: String, sha: String, size: (u16, u16)) {
-    let picker = ctx.icon_picker.clone();
+    let picker = current_picker(ctx);
     let ctx = Arc::clone(ctx);
     let key = format!("{source}/{id}");
     tokio::spawn(async move {

@@ -238,12 +238,16 @@ pub fn save_settings(
     path: &Path,
     behavior: crate::config::Behavior,
     glyphs: Option<&str>,
+    icons: Option<&str>,
     theme: &str,
 ) -> Result<(), String> {
     crate::config::update_file(path, |c| {
         c.behavior = behavior;
         if let Some(g) = glyphs {
             c.glyphs = g.to_string();
+        }
+        if let Some(i) = icons {
+            c.icons = i.to_string();
         }
         c.theme = theme.to_string();
     })

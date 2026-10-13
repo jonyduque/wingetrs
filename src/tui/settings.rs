@@ -9,16 +9,18 @@ pub enum SettingId {
     KeepOld,
     Residues,
     Glyphs,
+    Icons,
     Theme,
 }
 
 /// Order of the settings on screen.
-pub const ORDER: [SettingId; 6] = [
+pub const ORDER: [SettingId; 7] = [
     SettingId::Confirm,
     SettingId::Purge,
     SettingId::KeepOld,
     SettingId::Residues,
     SettingId::Glyphs,
+    SettingId::Icons,
     SettingId::Theme,
 ];
 
@@ -30,6 +32,7 @@ impl SettingId {
             SettingId::KeepOld => "Ao atualizar, manter versão antiga",
             SettingId::Residues => "Resíduos após remover",
             SettingId::Glyphs => "Glifos",
+            SettingId::Icons => "Ícones",
             SettingId::Theme => "Tema",
         }
     }
@@ -40,6 +43,7 @@ impl SettingId {
             SettingId::Purge | SettingId::KeepOld => &["não", "sim"],
             SettingId::Residues => &["perguntar", "só alta confiança", "manter"],
             SettingId::Glyphs => &["nerd", "unicode", "ascii"],
+            SettingId::Icons => &["Automático", "iTerm2", "Sixel", "Desligado"],
             SettingId::Theme => &["escuro", "claro"],
         }
     }
@@ -55,6 +59,9 @@ impl SettingId {
             SettingId::KeepOld => "Mantém a versão anterior no disco depois de atualizar.",
             SettingId::Residues => "O que fazer com restos deixados no sistema após remover.",
             SettingId::Glyphs => "Conjunto de ícones da interface.",
+            SettingId::Icons => {
+                "Imagens dos pacotes: automático usa iTerm2 no WezTerm e sixel no Windows Terminal."
+            }
             SettingId::Theme => "Paleta de cores da interface.",
         }
     }
@@ -72,6 +79,12 @@ pub struct SettingsState {
     pub saved: (Behavior, GlyphSet, bool),
     /// The user changed Glifos this session; only then is `glyphs` written to the file.
     pub glyphs_touched: bool,
+    /// Value of `icons` in `config.toml` terms (`auto`, `iterm2`, `sixel`, `off`).
+    pub icons: String,
+    /// Last `icons` written successfully.
+    pub saved_icons: String,
+    /// The user changed Ícones this session; only then is `icons` written to the file.
+    pub icons_touched: bool,
 }
 
 fn step(i: usize, len: usize, forward: bool) -> usize {
@@ -92,6 +105,9 @@ impl SettingsState {
             glyphs_forced,
             saved: (behavior, glyphs, dark),
             glyphs_touched: false,
+            icons: crate::tui::icons::DEFAULT_SETTING.to_string(),
+            saved_icons: crate::tui::icons::DEFAULT_SETTING.to_string(),
+            icons_touched: false,
         }
     }
 
@@ -119,6 +135,10 @@ impl SettingsState {
                 GlyphSet::Unicode => 1,
                 GlyphSet::Ascii => 2,
             },
+            SettingId::Icons => crate::tui::icons::SETTINGS
+                .iter()
+                .position(|s| *s == self.icons)
+                .unwrap_or(0),
             SettingId::Theme => usize::from(!self.dark),
         }
     }
@@ -147,6 +167,7 @@ impl SettingsState {
             SettingId::Glyphs => {
                 self.glyphs = [GlyphSet::Nerd, GlyphSet::Unicode, GlyphSet::Ascii][next];
             }
+            SettingId::Icons => self.icons = crate::tui::icons::SETTINGS[next].to_string(),
             SettingId::Theme => self.dark = next == 0,
         }
         true

@@ -1429,6 +1429,7 @@ fn enter_changes_confirm_and_requests_save() {
                 ..Default::default()
             },
             glyphs: None,
+            icons: None,
             theme: "dark".into(),
         }]
     );
@@ -1483,7 +1484,7 @@ fn letters_do_not_type_in_settings() {
 #[test]
 fn theme_setting_flips_dark() {
     let mut a = on_settings();
-    for _ in 0..5 {
+    for _ in 0..6 {
         update(&mut a, key(KeyCode::Down));
     }
     update(&mut a, key(KeyCode::Enter));
@@ -2090,4 +2091,33 @@ fn list_never_fetches_icons() {
     let to = src[from..].find("/// Runs one keystroke").unwrap();
     let body = &src[from..from + to];
     assert!(!body.contains("fetch") && !body.contains("http"), "{body}");
+}
+
+#[test]
+fn icons_setting_cycles_and_saves() {
+    let mut a = on_settings();
+    for _ in 0..5 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let cmds = update(&mut a, key(KeyCode::Enter));
+        seen.push(a.settings.icons.clone());
+        if seen.len() == 1 {
+            assert!(matches!(
+                cmds.as_slice(),
+                [Cmd::SaveSettings { icons: Some(i), .. }] if i == "iterm2"
+            ));
+        }
+        update(&mut a, Msg::SettingsSaved(Ok(())));
+    }
+    assert_eq!(seen, ["iterm2", "sixel", "off", "auto"]);
+
+    // Another setting does not send `icons` while Ícones is untouched.
+    let mut b = on_settings();
+    let cmds = update(&mut b, key(KeyCode::Enter));
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::SaveSettings { icons: None, .. }]
+    ));
 }

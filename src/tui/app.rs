@@ -6,12 +6,12 @@ use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::icons::{IconCache, IconProtocol};
+use crate::tui::icons::{IconCache, IconProtocol, choose_from_env};
 use crate::tui::layout::{
     DETAIL_ICON_COLS, DETAIL_ICON_ROWS, FILTER_GAP, ITEM_GAP, LIST_ICON_COLS,
 };
 use crate::tui::picker::{PickOutcome, Picker, PickerItem};
-use crate::tui::settings::{SettingsState, glyphs_name};
+use crate::tui::settings::{SettingId, SettingsState, glyphs_name};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -227,6 +227,8 @@ pub enum Cmd {
         behavior: Behavior,
         /// `None` leaves `glyphs` in the file as it is (flag in force, or Glifos never changed).
         glyphs: Option<String>,
+        /// `None` leaves `icons` in the file as it is (Ícones never changed).
+        icons: Option<String>,
         theme: String,
     },
     /// Decode and encode an icon off the UI thread and answer with `Msg::IconReady`.
@@ -348,6 +350,8 @@ pub struct App {
     /// The values (behavior, glyphs, dark) of the one save in flight. Further changes only
     /// update the state; when the save ends, one more save carries the newest values.
     save_in_flight: Option<(Behavior, GlyphSet, bool)>,
+    /// The `icons` value of the save in flight (goes with `save_in_flight`).
+    icons_in_flight: Option<String>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -425,6 +429,7 @@ impl App {
             dark: true,
             buckets_summary: String::new(),
             save_in_flight: None,
+            icons_in_flight: None,
         };
         app.research();
         app
@@ -854,6 +859,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::IconReady { key, size, proto } => {
             app.icon_in_flight.remove(&(key.clone(), size));
             match proto {
+                _ if app.icon_protocol == IconProtocol::Off => {}
                 Ok(p) => app.icons.insert(key, size, p),
                 Err(_) => {
                     app.icon_none.insert(key);
@@ -896,9 +902,16 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             // A newer change was made while saving: it gets its own save and the outcome
             // (toast, and on failure the revert) is decided by that one. A failure with a
             // newer change pending therefore does not revert; the retry carries the newest.
-            let newer = sent.is_some_and(|s| s != current);
+            let sent_icons = app.icons_in_flight.take();
+            let newer = sent.is_some_and(|s| s != current)
+                || sent_icons
+                    .as_ref()
+                    .is_some_and(|i| *i != app.settings.icons);
             if let (Ok(()), Some(sent)) = (&result, sent) {
                 app.settings.saved = sent;
+                if let Some(i) = sent_icons {
+                    app.settings.saved_icons = i;
+                }
             }
             if newer {
                 return request_save(app);
@@ -915,6 +928,10 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                     app.settings.dark = dark;
                     app.glyphs = glyphs;
                     app.dark = dark;
+                    if app.settings.icons != app.settings.saved_icons {
+                        app.settings.icons = app.settings.saved_icons.clone();
+                        apply_icons(app);
+                    }
                     app.push_toast(ToastKind::Error, format!("falha ao salvar: {e}"));
                 }
             }
@@ -1101,13 +1118,29 @@ fn change_setting(app: &mut App, forward: bool) -> Vec<Cmd> {
     }
     app.glyphs = app.settings.glyphs;
     app.dark = app.settings.dark;
-    if app.settings.selected == SETTING_GLYPHS {
-        app.settings.glyphs_touched = true;
+    let mut cmds = Vec::new();
+    match app.settings.current_id() {
+        SettingId::Glyphs => app.settings.glyphs_touched = true,
+        SettingId::Icons => {
+            app.settings.icons_touched = true;
+            apply_icons(app);
+            // Under the new protocol the selected icon is encoded again.
+            cmds.extend(app.icon_cmd());
+        }
+        _ => {}
     }
-    request_save(app)
+    cmds.extend(request_save(app));
+    cmds
 }
 
-const SETTING_GLYPHS: usize = 4;
+/// Makes the protocol of `settings.icons` the live one and forgets everything encoded or
+/// decided under the old one, so icons are requested again.
+fn apply_icons(app: &mut App) {
+    app.icon_protocol = choose_from_env(&app.settings.icons);
+    app.icons = IconCache::default();
+    app.icon_in_flight.clear();
+    app.icon_none.clear();
+}
 
 /// Starts a save unless one is in flight (then its end sends the newest values).
 fn request_save(app: &mut App) -> Vec<Cmd> {
@@ -1116,10 +1149,12 @@ fn request_save(app: &mut App) -> Vec<Cmd> {
     }
     let s = &app.settings;
     app.save_in_flight = Some((s.behavior, s.glyphs, s.dark));
+    app.icons_in_flight = Some(s.icons.clone());
     app.status = Some("salvando…".to_string());
     vec![Cmd::SaveSettings {
         behavior: s.behavior,
         glyphs: (s.glyphs_touched && !s.glyphs_forced).then(|| glyphs_name(s.glyphs).to_string()),
+        icons: s.icons_touched.then(|| s.icons.clone()),
         theme: if s.dark { "dark" } else { "light" }.to_string(),
     }]
 }
