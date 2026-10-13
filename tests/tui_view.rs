@@ -1330,9 +1330,10 @@ fn details_text_starts_after_the_icon_gap() {
     let line = row_text(&buf, y);
     let name_at: String = line.chars().skip(usize::from(x) + 10).take(9).collect();
     assert_eq!(name_at, "PowerToys", "{line}");
-    // Lines past the first four (a blank one, then the spinner) use the full width again.
-    let below: String = row_text(&buf, y + 5).chars().skip(usize::from(x)).collect();
-    assert!(below.starts_with("| carregando"), "{below}");
+    // Only the identity lines (name, ID, version) sit beside the icon; the description
+    // starts below it, at the full width.
+    let below: String = row_text(&buf, y + 4).chars().skip(usize::from(x)).collect();
+    assert!(below.starts_with("Utilitários para power users"), "{below}");
 }
 
 #[test]
@@ -1382,4 +1383,136 @@ fn icon_crossing_a_toast_is_not_drawn() {
     a.push_toast(ToastKind::Error, "falhou");
     let buf = screen_cells(&a, 100, 16, &theme);
     assert_eq!(icon_cells(&buf), 0);
+}
+
+fn add_icon(a: &mut App) {
+    use wingetrs::tui::layout::{DETAIL_ICON_COLS, DETAIL_ICON_ROWS};
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let key = selected_key(a);
+    a.icons
+        .insert(key, (DETAIL_ICON_COLS, DETAIL_ICON_ROWS), test_icon());
+}
+
+/// Details text column at 100 columns: pane starts at 57 and ends before the border at 98.
+const PANE_X: u16 = 57;
+const PANE_END: u16 = 98;
+
+fn pane_cells(buf: &ratatui::buffer::Buffer, x0: u16, rows: std::ops::Range<u16>) -> String {
+    rows.map(|y| {
+        (x0..PANE_END)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect::<String>()
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn pane_words(a: &App, h: u16) -> Vec<String> {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let buf = screen_cells(a, 100, h, &theme);
+    let mut w: Vec<String> = pane_cells(&buf, PANE_X, 5..h - 2)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    w.sort();
+    w
+}
+
+fn long_id_app() -> App {
+    let mut a = App::new(vec![], GlyphSet::Ascii);
+    let mut e = entries().remove(0);
+    e.id = "Contoso.AnExtremelyLongPackageIdentifierThatWraps".into();
+    e.name = "Tool".into();
+    update(&mut a, Msg::CatalogLoaded(vec![e]));
+    a
+}
+
+/// Installed tab, catalog match without publisher and an installed row without version.
+fn bare_installed_app() -> App {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    let mut a = App::new(vec![], GlyphSet::Ascii);
+    let mut e = entries().remove(0);
+    e.id = "Acme.Tool".into();
+    e.name = "Tool".into();
+    e.publisher = None;
+    e.description = Some("Descricao completa do pacote".into());
+    update(&mut a, Msg::CatalogLoaded(vec![e]));
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![ListRow {
+            name: "Tool".into(),
+            origin: "arp".into(),
+            installed_version: None,
+            correlation: Correlation::Matched {
+                source: "winget".into(),
+                package_id: "Acme.Tool".into(),
+                rule: Rule::ScoopManifest,
+            },
+            latest: None,
+            state: UpdateState::UpToDate,
+            tiebreak: None,
+        }]),
+    );
+    press(&mut a, crossterm::event::KeyCode::Tab);
+    a
+}
+
+#[test]
+fn long_id_beside_the_icon_wraps_in_full() {
+    let mut a = long_id_app();
+    add_icon(&mut a);
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let buf = screen_cells(&a, 100, 16, &theme);
+    assert!(icon_cells(&buf) > 0);
+    let beside: String = pane_cells(&buf, PANE_X + 10, 5..9)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert!(
+        beside.contains("Contoso.AnExtremelyLongPackageIdentifierThatWraps"),
+        "{beside}"
+    );
+}
+
+#[test]
+fn description_without_publisher_and_version_goes_below_at_full_width() {
+    let mut a = bare_installed_app();
+    add_icon(&mut a);
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let buf = screen_cells(&a, 100, 16, &theme);
+    assert!(icon_cells(&buf) > 0);
+    let rows: Vec<String> = pane_cells(&buf, PANE_X, 5..14)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let at = rows
+        .iter()
+        .position(|r| r.starts_with("Descricao completa do pacote"))
+        .unwrap_or_else(|| panic!("{rows:#?}"));
+    assert!(at >= 4, "description beside the icon: {rows:#?}");
+    assert!(
+        !rows[..4].iter().any(|r| r.contains("instalado")),
+        "install line beside the icon: {rows:#?}"
+    );
+}
+
+#[test]
+fn icon_layout_draws_the_same_words() {
+    for (name, plain) in [
+        ("search", typed("powert")),
+        ("installed", bare_installed_app()),
+    ] {
+        let mut with = if name == "search" {
+            typed("powert")
+        } else {
+            bare_installed_app()
+        };
+        add_icon(&mut with);
+        let theme = Theme::new(true, ColorDepth::NoColor);
+        assert!(
+            icon_cells(&screen_cells(&with, 100, 20, &theme)) > 0,
+            "{name}"
+        );
+        assert_eq!(pane_words(&with, 20), pane_words(&plain, 20), "{name}");
+    }
 }

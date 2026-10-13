@@ -16,10 +16,11 @@ use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{Glyphs, Theme};
 use crate::tui::toast::draw_toasts;
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui_image::protocol::Protocol;
 
 /// Below this width the details panel is hidden.
@@ -712,12 +713,17 @@ fn heading<'a>(theme: &Theme, text: &'a str) -> Line<'a> {
     ))
 }
 
-fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
+/// The details text, and how many of its first lines identify the package (name, ID,
+/// publisher, version): those go beside the icon.
+fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, usize) {
     let Some(b) = basics(app, theme, g) else {
-        return vec![Line::from(Span::styled(
-            "nenhum pacote selecionado",
-            italic_muted(theme),
-        ))];
+        return (
+            vec![Line::from(Span::styled(
+                "nenhum pacote selecionado",
+                italic_muted(theme),
+            ))],
+            0,
+        );
     };
     let mut out = vec![Line::from(Span::styled(b.name.clone(), theme.name()))];
     if let Some(id) = &b.id {
@@ -729,6 +735,7 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
     if let Some(v) = &b.version {
         out.push(Line::from(Span::styled(format!("versão {v}"), theme.fg())));
     }
+    let identity = out.len();
     if let Some(i) = b.install.clone() {
         out.push(i);
     }
@@ -793,7 +800,24 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> Vec<Line<'static>> {
             }
         }
     }
-    out
+    (out, identity)
+}
+
+/// Rows `line` takes in `width` columns, wrapped exactly as the details text is drawn.
+fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
+    const MAX_ROWS: u16 = 64;
+    if width == 0 {
+        return u16::MAX;
+    }
+    let area = Rect::new(0, 0, width, MAX_ROWS);
+    let mut buf = Buffer::empty(area);
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: true })
+        .render(area, &mut buf);
+    (0..MAX_ROWS)
+        .rev()
+        .find(|&y| (0..width).any(|x| buf[(x, y)].symbol() != " "))
+        .map_or(1, |y| y + 1)
 }
 
 /// Draws the details; with an icon, its first lines sit beside it and the rest below.
@@ -805,7 +829,8 @@ fn draw_details<'a>(
     frame: &mut Frame,
     area: Rect,
 ) -> IconPlace<'a> {
-    let mut lines = details_lines(app, theme, g);
+    let (mut lines, identity) = details_lines(app, theme, g);
+    // Guard: the narrowest details pane drawn today (60-column terminal) is 23 columns.
     let icon = selected_icon(app).filter(|_| {
         area.width >= DETAIL_ICON_COLS + DETAIL_ICON_GAP + 10 && area.height >= DETAIL_ICON_ROWS
     });
@@ -815,8 +840,18 @@ fn draw_details<'a>(
         return None;
     };
     let (icon_rect, text) = split_icon(area, DETAIL_ICON_ROWS, DETAIL_ICON_COLS, DETAIL_ICON_GAP);
-    let rest = lines.split_off(lines.len().min(usize::from(DETAIL_ICON_ROWS)));
-    frame.render_widget(Paragraph::new(lines), text);
+    // Identity lines go beside the icon while they fit wrapped in its rows; from the first
+    // that does not, everything goes below at full width.
+    let mut used = 0u16;
+    let beside = lines[..identity]
+        .iter()
+        .take_while(|l| {
+            used = used.saturating_add(wrapped_rows(l, text.width));
+            used <= DETAIL_ICON_ROWS
+        })
+        .count();
+    let rest = lines.split_off(beside);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text);
     let below = Rect::new(
         area.x,
         area.y + DETAIL_ICON_ROWS,

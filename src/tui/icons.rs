@@ -75,10 +75,29 @@ pub fn picker(protocol: IconProtocol) -> Option<Picker> {
 /// Decodes `bytes` and encodes them for `picker`, fitted into `size` cells (columns, rows).
 /// Slow: runs off the UI thread.
 pub fn encode(picker: &Picker, bytes: &[u8], size: (u16, u16)) -> Result<Protocol, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let img = decode(bytes)?;
     picker
         .new_protocol(img, Size::new(size.0, size.1), Resize::Fit(None))
         .map_err(|e| e.to_string())
+}
+
+/// Largest icon side, in pixels, that is decoded.
+pub const MAX_ICON_SIDE: u32 = 1024;
+/// Most memory one icon decode may allocate.
+pub const MAX_ICON_ALLOC: u64 = 64 * 1024 * 1024;
+
+/// Decodes icon bytes with bounded size: a small file declaring a huge image (a decompression
+/// bomb) is refused before its pixels are allocated.
+pub fn decode(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_ICON_SIDE);
+    limits.max_image_height = Some(MAX_ICON_SIDE);
+    limits.max_alloc = Some(MAX_ICON_ALLOC);
+    reader.limits(limits);
+    reader.decode().map_err(|e| e.to_string())
 }
 
 /// Most encoded icons kept at once.
@@ -135,6 +154,47 @@ mod tests {
         for (setting, term, wt, want) in cases {
             assert_eq!(choose(setting, term, wt), want, "{setting} {term:?} {wt}");
         }
+    }
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        let img = image::DynamicImage::ImageLuma8(image::GrayImage::new(w, h));
+        let written = img.write_to(&mut out, image::ImageFormat::Png);
+        assert!(written.is_ok());
+        out.into_inner()
+    }
+
+    /// PNG signature and an IHDR declaring `w`x`h` RGBA, with no pixel data.
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut chunk = b"IHDR".to_vec();
+        chunk.extend_from_slice(&w.to_be_bytes());
+        chunk.extend_from_slice(&h.to_be_bytes());
+        chunk.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut crc = flate2::Crc::new();
+        crc.update(&chunk);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&crc.sum().to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn oversized_icons_are_refused() {
+        // Valid and decodable without limits (2 KB of pixels), but wider/taller than allowed.
+        assert!(decode(&png(MAX_ICON_SIDE + 1, 2)).is_err());
+        assert!(decode(&png(2, MAX_ICON_SIDE + 1)).is_err());
+        // A bomb header: 20000x20000 RGBA in a few bytes.
+        assert!(decode(&png_header(20_000, 20_000)).is_err());
+        // Normal icons decode.
+        let ok = decode(&png(256, 256));
+        assert!(ok.is_ok());
+        assert_eq!(ok.map(|i| (i.width(), i.height())), Ok((256, 256)));
+        assert!(decode(&png(MAX_ICON_SIDE, 2)).is_ok());
+        let mut ico = std::io::Cursor::new(Vec::new());
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(256, 256));
+        assert!(img.write_to(&mut ico, image::ImageFormat::Ico).is_ok());
+        assert!(decode(&ico.into_inner()).is_ok());
     }
 
     #[test]

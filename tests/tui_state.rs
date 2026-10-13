@@ -1931,3 +1931,40 @@ fn icon_cache_keeps_the_newest_64() {
     // Keyed by size too.
     assert!(c.get("k64", (4, 2)).is_none());
 }
+
+#[test]
+fn icon_evicted_from_the_cache_is_encoded_again() {
+    use wingetrs::tui::icons::{ICON_CACHE_MAX, IconProtocol};
+    let mut a = app();
+    a.icon_protocol = IconProtocol::Sixel;
+    let k = selected_icon_key(&a);
+    let cmds = update(
+        &mut a,
+        Msg::IconLoaded {
+            key: k.clone(),
+            bytes: vec![1],
+        },
+    );
+    assert_eq!(encode_requests(&cmds), 1);
+    update(
+        &mut a,
+        Msg::IconReady {
+            key: k.clone(),
+            size: (8, 4),
+            proto: Ok(tiny_icon()),
+        },
+    );
+    for i in 0..ICON_CACHE_MAX {
+        update(
+            &mut a,
+            Msg::IconReady {
+                key: format!("other/{i}"),
+                size: (8, 4),
+                proto: Ok(tiny_icon()),
+            },
+        );
+    }
+    assert!(a.icons.get(&k, (8, 4)).is_none(), "evicted");
+    update(&mut a, key(KeyCode::Down));
+    assert_eq!(encode_requests(&update(&mut a, key(KeyCode::Up))), 1);
+}
