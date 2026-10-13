@@ -5660,9 +5660,9 @@ O manifesto mesclado do winget (`src/sources/winget/manifest.rs`, `MergedManifes
 - A CLI (`show`) não muda, nem o texto nem os snapshots.
 
 **Files:**
-- Create: `src/icons.rs`, `tests/icons.rs`
+- Create: `src/icons.rs`, `tests/icons.rs` (novos)
 - Modify: `src/sources/winget/manifest.rs`, `src/core/mod.rs`, `src/lib.rs`, `src/tui/run.rs`, `src/tui/app.rs`, construtores de `PackageDetails` em `src/` e `tests/`
-- Test: `tests/icons.rs`, `mod tests` de `manifest.rs`
+- Test: `tests/icons.rs` (novo), `mod tests` de `manifest.rs`
 
 Testes:
 1. `pick_icon_prefers_default_then_dark`: com [dark, light, default], escolhe o default; com [light, dark], o dark; com [light], o light; tema ausente conta como default.
