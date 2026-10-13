@@ -150,7 +150,7 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
 }
 
 fn index_age(data: &DataDir) -> Option<i64> {
-    let catalog = Catalog::open(&data.catalog_path()).ok()?;
+    let catalog = jobs::open_catalog_for_reading(&data.catalog_path()).ok()?;
     let newest = catalog.sources().ok()?.iter().map(|s| s.fetched_at).max()?;
     Some((now_unix() - newest).max(0))
 }
@@ -485,7 +485,7 @@ fn spawn_scan(ctx: &Arc<Ctx>) {
         for e in &scan.errors {
             tracing::warn!("scan: {e}");
         }
-        match Catalog::open(&c.data.catalog_path())
+        match jobs::open_catalog_for_reading(&c.data.catalog_path())
             .and_then(|cat| correlate(&scan.apps, &cat, &NameNormalizer::new(), &tracking))
         {
             Ok(rows) => Msg::InstalledLoaded(rows),
@@ -526,7 +526,9 @@ async fn load_details(
     id: &str,
 ) -> anyhow::Result<crate::core::PackageDetails> {
     let (data_path, source, id) = (ctx.data.catalog_path(), source.to_owned(), id.to_owned());
-    let read = tokio::task::spawn_blocking(move || Catalog::open(&data_path)?.get(&source, &id));
+    let read = tokio::task::spawn_blocking(move || {
+        jobs::open_catalog_for_reading(&data_path)?.get(&source, &id)
+    });
     let pkg = match read.await {
         Ok(r) => r?,
         // A panic in the read re-panics this task, so `join_details` reports it.
@@ -598,7 +600,8 @@ fn with_ops<R>(
     progress: crate::install::download::Progress<'_>,
     f: impl FnOnce(&OpsCtx<'_>) -> R,
 ) -> Result<R, String> {
-    let catalog = Catalog::open(&ctx.data.catalog_path()).map_err(|e| e.to_string())?;
+    let catalog =
+        jobs::open_catalog_for_reading(&ctx.data.catalog_path()).map_err(|e| e.to_string())?;
     with_ctx(
         &ctx.data,
         &ctx.http,

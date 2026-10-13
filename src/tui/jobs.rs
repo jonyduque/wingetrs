@@ -1,6 +1,6 @@
 //! Install/remove/upgrade jobs of the TUI. Every function takes the `OpsCtx` as a parameter so
 //! tests drive them with fakes; `run.rs` builds the production context.
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
 use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
@@ -83,9 +83,18 @@ pub async fn join_job(handle: tokio::task::JoinHandle<Msg>) -> Msg {
     }
 }
 
+/// Opens the catalog for reading without DDL or a write lock; a missing file reads as empty.
+pub fn open_catalog_for_reading(path: &Path) -> Result<Catalog, CatalogError> {
+    if path.exists() {
+        Catalog::open_read_only(path)
+    } else {
+        Catalog::open_in_memory()
+    }
+}
+
 /// Reads every catalog entry; an unreadable catalog is an error, never an empty list.
 pub fn read_catalog(path: &Path) -> Result<Vec<PackageEntry>, String> {
-    Catalog::open(path)
+    open_catalog_for_reading(path)
         .and_then(|c| c.load_entries())
         .map_err(|e| e.to_string())
 }

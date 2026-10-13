@@ -382,6 +382,76 @@ fn read_catalog_of_a_good_catalog_lists_its_entries() {
     assert_eq!(jobs::read_catalog(&path).unwrap().len(), 1);
 }
 
+struct Writable(PathBuf);
+impl Drop for Writable {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::metadata(&self.0) {
+            let mut p = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            let _ = std::fs::set_permissions(&self.0, p);
+        }
+    }
+}
+
+#[test]
+fn reading_the_catalog_never_writes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog.db");
+    let mut c = Catalog::open(&db).unwrap();
+    let pkgs: Vec<NewPackage> = ["a", "b"]
+        .iter()
+        .map(|id| NewPackage {
+            id: (*id).into(),
+            name: (*id).into(),
+            version: "1".into(),
+            ..Default::default()
+        })
+        .collect();
+    c.replace_source(
+        "scoop:main",
+        SourceKind::Scoop,
+        "v",
+        1,
+        &pkgs,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    drop(c);
+    let mut p = std::fs::metadata(&db).unwrap().permissions();
+    p.set_readonly(true);
+    std::fs::set_permissions(&db, p).unwrap();
+    let _guard = Writable(db.clone());
+    let listed = jobs::read_catalog(&db);
+    let got = jobs::open_catalog_for_reading(&db)
+        .unwrap()
+        .get("scoop:main", "a");
+    assert_eq!(listed.unwrap().len(), 2);
+    assert!(got.unwrap().is_some());
+}
+
+#[test]
+fn reading_never_runs_the_schema_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE unrelated (x INTEGER);")
+        .unwrap();
+    drop(conn);
+    let before = std::fs::read(&db).unwrap();
+    // The write path would create the catalog tables and succeed with an empty list.
+    assert!(jobs::read_catalog(&db).is_err());
+    assert_eq!(before, std::fs::read(&db).unwrap());
+}
+
+#[test]
+fn reading_a_missing_catalog_is_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("catalog.db");
+    assert_eq!(jobs::read_catalog(&db), Ok(vec![]));
+    assert!(!db.exists());
+}
+
 #[tokio::test]
 async fn plan_remove_text_uses_the_plan_lines() {
     let mut w = World::new().await;
