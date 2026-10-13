@@ -168,9 +168,10 @@ async fn version_data_cache_write_failure_does_not_fail_show() {
     let s = server_expecting(2).await;
     let dir = tempfile::tempdir().unwrap();
     let ok_blobs = BlobStore::new(dir.path().join("ok"));
-    // A directory named like the versionData tmp file makes only that cache write fail.
+    // A non-empty directory where the blob should land makes only the cache rename fail.
     let broken_dir = dir.path().join("broken");
-    std::fs::create_dir_all(broken_dir.join(format!("{HASH_HEX}.tmp"))).unwrap();
+    std::fs::create_dir_all(broken_dir.join(HASH_HEX)).unwrap();
+    std::fs::write(broken_dir.join(HASH_HEX).join("keep"), b"x").unwrap();
     let broken_blobs = BlobStore::new(broken_dir.clone());
     let http = Http::new().unwrap();
     let base = format!("{}/", s.uri());
@@ -188,5 +189,5 @@ async fn version_data_cache_write_failure_does_not_fail_show() {
     )
     .await;
     assert_eq!(got.unwrap(), expected);
-    assert!(!broken_dir.join(HASH_HEX).exists(), "write really failed");
+    assert!(!broken_dir.join(HASH_HEX).is_file(), "write really failed");
 }

@@ -141,6 +141,30 @@ fn age_secs(path: &std::path::Path, secs: u64) {
         .unwrap();
 }
 
+fn age_dir(path: &std::path::Path, days: u64) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_BACKUP_SEMANTICS lets Windows open a directory handle.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0200_0000)
+        .open(path)
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 86400))
+        .unwrap();
+}
+
+fn age_link(path: &std::path::Path, days: u64) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_OPEN_REPARSE_POINT: touch the link itself, not its target.
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0020_0000)
+        .open(path)
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 86400))
+        .unwrap();
+}
+
 fn mtime(path: &std::path::Path) -> std::time::SystemTime {
     std::fs::metadata(path).unwrap().modified().unwrap()
 }
@@ -179,20 +203,29 @@ fn prune_removes_only_old_blobs_and_old_temps() {
     let young = put_blob(d, b"young blob");
     let h3 = sha256_hex(b"tmp old");
     let h4 = sha256_hex(b"tmp young");
-    std::fs::write(d.join(format!("{h3}.tmp")), b"tmp old").unwrap();
+    std::fs::write(d.join(format!("{h3}.4242-7.tmp")), b"tmp old").unwrap();
     std::fs::write(d.join(format!("{h4}.tmp")), b"tmp young").unwrap();
     std::fs::write(d.join("index.json"), b"{}").unwrap();
     std::fs::write(d.join("notes.txt"), b"x").unwrap();
     let short = &sha256_hex(b"short")[..63];
     std::fs::write(d.join(short), b"x").unwrap();
     std::fs::create_dir(d.join("subdir")).unwrap();
+    let hexdir = sha256_hex(b"a directory");
+    std::fs::create_dir(d.join(&hexdir)).unwrap();
 
     age(&d.join(&old), 40);
     age(&d.join(&young), 10);
-    age(&d.join(format!("{h3}.tmp")), 2);
+    age(&d.join(format!("{h3}.4242-7.tmp")), 2);
     age_secs(&d.join(format!("{h4}.tmp")), 3600);
     for n in ["index.json", "notes.txt", short] {
         age(&d.join(n), 400);
+    }
+    age_dir(&d.join(&hexdir), 400);
+    // A symlink named like a blob must not be followed or deleted (skipped if the OS refuses).
+    let linkname = sha256_hex(b"a symlink");
+    let linked = std::os::windows::fs::symlink_file(d.join("notes.txt"), d.join(&linkname)).is_ok();
+    if linked {
+        age_link(&d.join(&linkname), 400);
     }
 
     let expected_bytes = (b"old blob".len() + b"tmp old".len()) as u64;
@@ -204,7 +237,7 @@ fn prune_removes_only_old_blobs_and_old_temps() {
         .unwrap();
     assert_eq!(stats.removed, 2);
     assert_eq!(stats.bytes, expected_bytes);
-    assert_eq!(stats.kept, 6);
+    assert_eq!(stats.kept, 7 + usize::from(linked));
     let mut names: Vec<String> = std::fs::read_dir(d)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -217,7 +250,11 @@ fn prune_removes_only_old_blobs_and_old_temps() {
         "notes.txt".to_owned(),
         short.to_owned(),
         "subdir".to_owned(),
+        hexdir,
     ];
+    if linked {
+        want.push(linkname);
+    }
     want.sort();
     assert_eq!(names, want);
 }
@@ -240,4 +277,16 @@ fn prune_keeps_future_mtime_and_missing_dir() {
         .unwrap();
     assert_eq!(stats, wingetrs::cache::PruneStats::default());
     assert!(!missing.exists());
+}
+
+#[test]
+fn put_verified_twice_leaves_one_blob_and_no_tmp() {
+    let t = tempfile::tempdir().unwrap();
+    let name = put_blob(t.path(), b"same bytes");
+    put_blob(t.path(), b"same bytes");
+    let names: Vec<String> = std::fs::read_dir(t.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, vec![name]);
 }

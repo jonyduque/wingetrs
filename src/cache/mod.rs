@@ -169,6 +169,8 @@ pub struct PruneStats {
     pub kept: usize,
 }
 
+static BLOB_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn is_blob_name(n: &str) -> bool {
     n.len() == 64 && n.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -273,10 +275,18 @@ impl BlobStore {
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| io_err(&self.dir, e))?;
         let target = self.dir.join(&actual);
-        let tmp = self.dir.join(format!("{actual}.tmp"));
-        std::fs::write(&tmp, bytes).map_err(|e| io_err(&tmp, e))?;
-        crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &target))
-            .map_err(|e| io_err(&target, e))
+        let seq = BLOB_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self
+            .dir
+            .join(format!("{actual}.{}-{seq}.tmp", std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, bytes) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io_err(&tmp, e));
+        }
+        crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &target)).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            io_err(&target, e)
+        })
     }
 }
 
