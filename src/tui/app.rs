@@ -78,6 +78,8 @@ pub enum Msg {
     },
     /// The icon of `key` encoded for `size` cells (columns, rows), or why it could not be.
     IconReady {
+        /// `App::icon_gen` when the encode was requested; older results are dropped.
+        generation: u64,
         key: String,
         size: (u16, u16),
         proto: Result<ratatui_image::protocol::Protocol, String>,
@@ -233,6 +235,7 @@ pub enum Cmd {
     },
     /// Decode and encode an icon off the UI thread and answer with `Msg::IconReady`.
     EncodeIcon {
+        generation: u64,
         key: String,
         bytes: Vec<u8>,
         size: (u16, u16),
@@ -240,6 +243,7 @@ pub enum Cmd {
     /// Read a cached icon blob and encode it, off the UI thread; answers with `Msg::IconReady`.
     /// Never touches the network.
     EncodeCachedIcon {
+        generation: u64,
         source: String,
         id: String,
         sha: String,
@@ -313,6 +317,8 @@ pub struct App {
     pub icons: IconCache,
     /// Keys whose icon could not be decoded; never retried in this session.
     pub icon_none: HashSet<String>,
+    /// Bumped whenever the icon protocol changes; encodes of an older one are discarded.
+    pub icon_gen: u64,
     /// `(key, size)` of the icons being encoded.
     icon_in_flight: HashSet<(String, (u16, u16))>,
     /// Cached icons known to the list: `<source>/<id>` -> SHA-256 of the blob.
@@ -407,6 +413,7 @@ impl App {
             icon_protocol: IconProtocol::Off,
             icons: IconCache::default(),
             icon_none: HashSet::new(),
+            icon_gen: 0,
             icon_in_flight: HashSet::new(),
             icon_map: BTreeMap::new(),
             details_pending: None,
@@ -638,7 +645,12 @@ impl App {
         };
         let bytes = bytes.clone();
         self.icon_in_flight.insert((key.clone(), size));
-        vec![Cmd::EncodeIcon { key, bytes, size }]
+        vec![Cmd::EncodeIcon {
+            generation: self.icon_gen,
+            key,
+            bytes,
+            size,
+        }]
     }
 
     /// `(source, id)` of each list row in `window`, in order; `None` for rows with no
@@ -706,6 +718,7 @@ impl App {
                 continue;
             }
             cmds.push(Cmd::EncodeCachedIcon {
+                generation: self.icon_gen,
                 source,
                 id,
                 sha: sha.clone(),
@@ -856,7 +869,16 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.icon_map.insert(key, sha);
             Vec::new()
         }
-        Msg::IconReady { key, size, proto } => {
+        Msg::IconReady {
+            generation,
+            key,
+            size,
+            proto,
+        } => {
+            if generation != app.icon_gen {
+                // Encoded for a protocol no longer in use; its slot was already cleared.
+                return Vec::new();
+            }
             app.icon_in_flight.remove(&(key.clone(), size));
             match proto {
                 _ if app.icon_protocol == IconProtocol::Off => {}
@@ -1138,6 +1160,7 @@ fn change_setting(app: &mut App, forward: bool) -> Vec<Cmd> {
 fn apply_icons(app: &mut App) {
     app.icon_protocol = choose_from_env(&app.settings.icons);
     app.icons = IconCache::default();
+    app.icon_gen += 1;
     app.icon_in_flight.clear();
     app.icon_none.clear();
 }

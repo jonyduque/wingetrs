@@ -1846,6 +1846,7 @@ fn undecodable_icon_is_remembered_as_none() {
         key: k,
         bytes,
         size,
+        ..
     }) = cmds
         .into_iter()
         .find(|c| matches!(c, Cmd::EncodeIcon { .. }))
@@ -1858,6 +1859,7 @@ fn undecodable_icon_is_remembered_as_none() {
     update(
         &mut a,
         Msg::IconReady {
+            generation: 0,
             key: k0.clone(),
             size,
             proto,
@@ -1905,6 +1907,7 @@ fn icon_encoding_is_requested_once_for_the_selected_package() {
     update(
         &mut a,
         Msg::IconReady {
+            generation: 0,
             key: second.clone(),
             size: (8, 4),
             proto: Ok(tiny_icon()),
@@ -1950,6 +1953,7 @@ fn icon_evicted_from_the_cache_is_encoded_again() {
     update(
         &mut a,
         Msg::IconReady {
+            generation: 0,
             key: k.clone(),
             size: (8, 4),
             proto: Ok(tiny_icon()),
@@ -1959,6 +1963,7 @@ fn icon_evicted_from_the_cache_is_encoded_again() {
         update(
             &mut a,
             Msg::IconReady {
+                generation: 0,
                 key: format!("other/{i}"),
                 size: (8, 4),
                 proto: Ok(tiny_icon()),
@@ -2045,6 +2050,7 @@ fn icon_requests_are_capped() {
         let cmds = update(
             &mut a,
             Msg::IconReady {
+                generation: 0,
                 key: format!("{source}/{id}"),
                 size: (4, 2),
                 proto: Ok(tiny_icon()),
@@ -2120,4 +2126,72 @@ fn icons_setting_cycles_and_saves() {
         cmds.as_slice(),
         [Cmd::SaveSettings { icons: None, .. }]
     ));
+}
+
+#[test]
+fn icon_encoded_for_an_old_protocol_is_discarded() {
+    use wingetrs::tui::icons::IconProtocol;
+    let mut a = app();
+    a.icon_protocol = IconProtocol::Iterm2;
+    a.settings.icons = "iterm2".into();
+    let k = selected_icon_key(&a);
+    let cmds = update(
+        &mut a,
+        Msg::IconLoaded {
+            key: k.clone(),
+            bytes: b"x".to_vec(),
+        },
+    );
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::EncodeIcon { generation: 0, .. }]
+    ));
+    // Switch to Sixel (Ícones is the 6th row) while that encode is in flight.
+    a.tab = Tab::Settings;
+    for _ in 0..5 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(a.icon_protocol, IconProtocol::Sixel);
+    assert_eq!(a.icon_gen, 1);
+    assert_eq!(
+        encode_requests(&cmds),
+        0,
+        "no package is selected on this tab"
+    );
+    a.tab = Tab::Search;
+    let stale = update(
+        &mut a,
+        Msg::IconReady {
+            generation: 0,
+            key: k.clone(),
+            size: (8, 4),
+            proto: Ok(tiny_icon()),
+        },
+    );
+    assert!(stale.is_empty());
+    assert!(a.icons.get(&k, (8, 4)).is_none(), "old encoding not cached");
+    assert!(!a.icon_none.contains(&k));
+    // The icon is requested again under the new generation, and that result is kept.
+    let cmds = update(
+        &mut a,
+        Msg::IconLoaded {
+            key: k.clone(),
+            bytes: b"x".to_vec(),
+        },
+    );
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::EncodeIcon { generation: 1, .. }]
+    ));
+    update(
+        &mut a,
+        Msg::IconReady {
+            generation: 1,
+            key: k.clone(),
+            size: (8, 4),
+            proto: Ok(tiny_icon()),
+        },
+    );
+    assert!(a.icons.get(&k, (8, 4)).is_some());
 }

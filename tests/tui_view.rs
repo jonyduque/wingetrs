@@ -1659,6 +1659,15 @@ fn turning_icons_off_clears_the_cache_and_the_indent() {
         (LIST_ICON_COLS, 2),
         red_icon(LIST_ICON_COLS, 2),
     );
+    // The details pane has its icon too, so the switch must also undo that layout.
+    a.icons
+        .insert(format!("{src}/{id}"), (8, 4), red_icon(8, 4));
+    a.status = None;
+    assert_ne!(
+        render(&a, 100, 16),
+        render(&typed("powert"), 100, 16),
+        "icons change the frame while on"
+    );
     assert!(!a.icons.is_empty());
     a.tab = Tab::Settings;
     for _ in 0..5 {

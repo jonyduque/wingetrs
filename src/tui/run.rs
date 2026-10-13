@@ -291,13 +291,19 @@ async fn event_loop(
                         ))
                     });
                 }
-                Cmd::EncodeIcon { key, bytes, size } => spawn_icon(&ctx, key, bytes, size),
+                Cmd::EncodeIcon {
+                    generation,
+                    key,
+                    bytes,
+                    size,
+                } => spawn_icon(&ctx, generation, key, bytes, size),
                 Cmd::EncodeCachedIcon {
+                    generation,
                     source,
                     id,
                     sha,
                     size,
-                } => spawn_cached_icon(&ctx, source, id, sha, size),
+                } => spawn_cached_icon(&ctx, generation, source, id, sha, size),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
                 Cmd::Search {
@@ -416,11 +422,17 @@ pub async fn join_search(generation: u64, h: tokio::task::JoinHandle<Msg>) -> Ms
 
 /// Awaits an icon encoder: a panic travels to the loop as `Msg::Panicked`, a cancellation
 /// becomes a failed encoding for `key`.
-pub async fn join_icon(key: String, size: (u16, u16), h: tokio::task::JoinHandle<Msg>) -> Msg {
+pub async fn join_icon(
+    generation: u64,
+    key: String,
+    size: (u16, u16),
+    h: tokio::task::JoinHandle<Msg>,
+) -> Msg {
     match h.await {
         Ok(msg) => msg,
         Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
         Err(e) => Msg::IconReady {
+            generation,
             key,
             size,
             proto: Err(format!("tarefa cancelada: {e}")),
@@ -437,7 +449,7 @@ fn current_picker(ctx: &Ctx) -> Option<ratatui_image::picker::Picker> {
 }
 
 /// Decodes and encodes one icon on a blocking thread; the handle is always awaited.
-fn spawn_icon(ctx: &Arc<Ctx>, key: String, bytes: Vec<u8>, size: (u16, u16)) {
+fn spawn_icon(ctx: &Arc<Ctx>, generation: u64, key: String, bytes: Vec<u8>, size: (u16, u16)) {
     let picker = current_picker(ctx);
     let tx = ctx.tx.clone();
     tokio::spawn(async move {
@@ -451,16 +463,28 @@ fn spawn_icon(ctx: &Arc<Ctx>, key: String, bytes: Vec<u8>, size: (u16, u16)) {
                 if let Err(e) = &proto {
                     tracing::debug!(%key, error = %e, "icon not decoded");
                 }
-                Msg::IconReady { key, size, proto }
+                Msg::IconReady {
+                    generation,
+                    key,
+                    size,
+                    proto,
+                }
             }
         });
-        let _ = tx.send(join_icon(key, size, work).await);
+        let _ = tx.send(join_icon(generation, key, size, work).await);
     });
 }
 
 /// Reads a cached icon from the blob store and encodes it on a blocking thread (no network);
 /// the handle is always awaited.
-fn spawn_cached_icon(ctx: &Arc<Ctx>, source: String, id: String, sha: String, size: (u16, u16)) {
+fn spawn_cached_icon(
+    ctx: &Arc<Ctx>,
+    generation: u64,
+    source: String,
+    id: String,
+    sha: String,
+    size: (u16, u16),
+) {
     let picker = current_picker(ctx);
     let ctx = Arc::clone(ctx);
     let key = format!("{source}/{id}");
@@ -480,10 +504,15 @@ fn spawn_cached_icon(ctx: &Arc<Ctx>, source: String, id: String, sha: String, si
                 if let Err(e) = &proto {
                     tracing::debug!(%key, error = %e, "cached icon not encoded");
                 }
-                Msg::IconReady { key, size, proto }
+                Msg::IconReady {
+                    generation,
+                    key,
+                    size,
+                    proto,
+                }
             }
         });
-        let _ = ctx.tx.send(join_icon(key, size, work).await);
+        let _ = ctx.tx.send(join_icon(generation, key, size, work).await);
     });
 }
 
