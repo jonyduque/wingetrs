@@ -5606,3 +5606,231 @@ Antes de adicionar dependências ao `Cargo.toml`, a regra do projeto exige prova
 3. Os `IconSha256` dos ícones baixados foram conferidos: cole quantos conferiram e quantos divergiram.
 
 **Commit:** `chore(tasks): icon probe report for task 82` (só o relatório)
+
+## Ícones dos pacotes (Tasks 83–86)
+
+Decisões do usuário (2026-10-13): protocolo iTerm2 por padrão no WezTerm, que gastou menos recursos na sonda, com opção de troca nos Ajustes; dependências novas aprovadas; ícone nos detalhes e na lista (esta só a partir do cache); **nos detalhes, espaço entre o ícone e o texto**. A emenda está na spec da fase 1, §3.2 e §7.3 (2026-10-13), que é a fonte das regras. Sonda: relatório `.claude/tasks/task-82-report.md`; o código de exemplo da API do `ratatui-image` 11.1 está em `C:\Users\jonyd\AppData\Local\Temp\claude\C--Users-jonyd-Projetos-wingetrs\2e07e6fc-9d74-4bff-b5e7-d3b32963d7e7\scratchpad\icon-probe\src\main.rs` (somente leitura: copie o que servir, não dependa do arquivo).
+
+Números da sonda no terminal do usuário (WezTerm, fonte 10×23 px, ícone .ico 256×256 de 186 KB):
+
+| Medida | iTerm2 | sixel |
+|---|---|---|
+| Decodificar o ícone | 0,93 ms | 1,36 ms |
+| Codificar um ícone pequeno | 0,2–0,3 ms | 0,5–0,8 ms |
+| Primeiro desenho do ícone grande | 12 ms | 20 ms |
+| Mediana por quadro, rolando 10 ícones | 3,6–3,9 ms | 5,4–6,2 ms |
+| Bytes enviados por quadro | cerca de 44 KB | cerca de 56 KB |
+
+Ordem: 83 → 84 → 85 → 86, em série. A 84, a 85 e a 86 mexem em `src/tui/app.rs`/`view.rs`. A 85 mede o tempo de quadro e roda sozinha.
+
+### Task 83: Ícone no modelo de detalhes, baixado e guardado em cache
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+O manifesto mesclado do winget (`src/sources/winget/manifest.rs`, `MergedManifest`) ainda não lê `Icons`. Exemplo real (Notepad++): `Icons:` é uma lista de mapas com `IconUrl`, `IconFileType` (`ico`), `IconResolution` (`custom`), `IconTheme` (`default`) e `IconSha256` (64 hex). `details()` (`src/sources/winget/details.rs`) devolve `PackageDetails` (`src/core/mod.rs:67`). A TUI recebe os detalhes em `Msg::DetailsLoaded { key, result }` (`src/tui/app.rs`), e `load_details` fica em `src/tui/run.rs`. O `BlobStore` (`src/cache/mod.rs`) confere o SHA-256 na leitura e na gravação, e a Task 81 o limpa por idade.
+
+#### What binds this task
+
+- Em `manifest.rs`: `#[serde(default)] pub icons: Vec<Icon>` em `MergedManifest`, e `struct Icon { icon_url: String, icon_file_type: Option<String>, icon_resolution: Option<String>, icon_theme: Option<String>, icon_sha256: Option<String> }`, com `rename_all = "PascalCase"`.
+- Em `src/core/mod.rs`: `pub struct IconRef { pub url: String, pub sha256: String }` e o campo `pub icon: Option<IconRef>` em `PackageDetails`. Os pacotes do Scoop ficam com `None`. Todo construtor de `PackageDetails` (procure com `grep -rn "PackageDetails {" src tests`) ganha `icon: None`, exceto o do winget.
+- Função pura `pub fn pick_icon(icons: &[Icon]) -> Option<IconRef>`, em `manifest.rs`:
+  - ignora ícone sem `icon_sha256`, ou cujo `icon_sha256` não tenha exatamente 64 caracteres hex (devolve o hash em minúsculas);
+  - ignora URL que não comece com `https://`;
+  - ordem de preferência: tema `default` (sem diferenciar maiúsculas; tema ausente conta como `default`), depois `dark`, depois qualquer outro;
+  - empate: o primeiro na ordem do manifesto.
+- `into_details` preenche `icon` com `pick_icon(&self.icons)`.
+- Novo `src/icons.rs`, declarado em `lib.rs`:
+  - `pub const MAX_ICON_BYTES: usize = 1024 * 1024;`
+  - `pub async fn fetch(http: &Http, blobs: &BlobStore, icon: &IconRef) -> Result<Vec<u8>, IconError>`:
+    - acerto em `blobs.get(&icon.sha256)` ⇒ devolve sem rede;
+    - senão `http.get(&icon.url)`;
+    - mais de `MAX_ICON_BYTES` ⇒ `IconError::TooLarge`;
+    - grava com `blobs.put_verified(&icon.sha256, &b)`; `HashMismatch` ⇒ `IconError::Integrity`, sem gravar.
+  - Mapa `src/icons.rs` ⇒ arquivo `icons.json` em `DataDir::root()`, com o formato `{"<source>/<id>": "<sha256>"}`:
+    - `pub fn remember(data: &DataDir, source: &str, id: &str, sha: &str)`: lê, insere e grava com temporário único + `fs_retry` (mesmo padrão de `write_index` em `src/install/download.rs`). Erro vira `tracing::debug!`; a função não devolve erro.
+    - `pub fn cached_icon(data: &DataDir, map: &BTreeMap<String,String>, source: &str, id: &str) -> Option<Vec<u8>>`: `BlobStore::get` do sha mapeado.
+    - `pub fn load_map(data: &DataDir) -> BTreeMap<String,String>`: ausente ou corrompido devolve vazio.
+  - `IconError` com `thiserror`: `Http`, `TooLarge`, `Integrity`, `Cache`.
+- TUI (`src/tui/run.rs`, `load_details`): depois de obter os detalhes com `icon: Some(r)`, chama `icons::fetch`, junto e no mesmo `spawn`/tarefa dos detalhes, depois deles.
+  - Sucesso ⇒ `icons::remember(..)` e o resultado vai junto no `Msg::DetailsLoaded`, num campo novo `icon: Option<Vec<u8>>` com os bytes brutos.
+  - Falha ⇒ `None` e `tracing::debug!`. A falha nunca vira erro dos detalhes.
+- `App` guarda os bytes em `pub icon_bytes: HashMap<String, Vec<u8>>`, chaveado como `details`, para a Task 84 desenhar. Nada é desenhado nesta tarefa.
+- A CLI (`show`) não muda, nem o texto nem os snapshots.
+
+**Files:**
+- Create: `src/icons.rs`, `tests/icons.rs`
+- Modify: `src/sources/winget/manifest.rs`, `src/core/mod.rs`, `src/lib.rs`, `src/tui/run.rs`, `src/tui/app.rs`, construtores de `PackageDetails` em `src/` e `tests/`
+- Test: `tests/icons.rs`, `mod tests` de `manifest.rs`
+
+Testes:
+1. `pick_icon_prefers_default_then_dark`: com [dark, light, default], escolhe o default; com [light, dark], o dark; com [light], o light; tema ausente conta como default.
+2. `pick_icon_requires_https_and_a_valid_sha`: sem `IconSha256`, com sha de 63 hex, com sha não hex ou com `http://` ⇒ `None`; sha em maiúsculas ⇒ minúsculas.
+3. `manifest_with_icons_parses`: YAML mesclado mínimo com o bloco `Icons` do Notepad++ (5 campos) ⇒ `details.icon == Some(IconRef { url, sha })`; manifesto sem `Icons` ⇒ `None`.
+4. `fetch_caches_by_sha_and_rejects_mismatch`, com wiremock:
+   - 1º `fetch` faz 1 GET e grava em `blobs/<sha>`; o 2º `fetch` não faz GET (`expect(1)`);
+   - bytes com outro hash ⇒ `IconError::Integrity` e nada gravado;
+   - corpo de `MAX_ICON_BYTES + 1` ⇒ `TooLarge` e nada gravado.
+5. `icon_map_round_trips_and_survives_corruption`: `remember` + `load_map` + `cached_icon` devolve os bytes; `icons.json` com lixo ⇒ `load_map` vazio, e um `remember` posterior regrava válido; blob ausente ⇒ `cached_icon` = `None`.
+6. `details_icon_failure_never_fails_details`: no teste de estado da TUI (`tests/tui_state.rs`), `Msg::DetailsLoaded` com `result: Ok(..)` e `icon: None` ⇒ detalhes presentes e `icon_bytes` sem a chave.
+
+#### Checks beyond the steps
+
+1. Preferência: trocar a ordem `default`/`dark` em `pick_icon` ⇒ PEGA (teste 1).
+2. Integridade: gravar mesmo com `HashMismatch` ⇒ PEGA (teste 4).
+3. Limite: tirar a checagem de `MAX_ICON_BYTES` ⇒ PEGA (teste 4).
+4. Cache: buscar sempre na rede ⇒ PEGA (teste 4, `expect(1)`).
+
+**Commit:** `feat(icons): pick, fetch and cache winget package icons`
+
+---
+
+### Task 84: Desenhar o ícone nos detalhes (ratatui-image, protocolo pelo ajuste)
+
+**Modelo:** opus (revisor opus: dependência nova, thread/tarefa de codificação, sobreposição com diálogos).
+
+#### Where this fits
+
+Depois da Task 83: `App.icon_bytes` já tem os bytes brutos verificados. Os detalhes são desenhados por `draw_details` (`src/tui/view.rs`, ~:762), que hoje é um `Paragraph` de `details_lines` (~:678). Os espaçamentos vivem em `src/tui/layout.rs` ("no loose spacing numbers elsewhere"). A configuração fica em `src/config.rs`, `Config`, com `glyphs: String` como modelo de campo texto. A sonda achou: `Picker::from_query_stdio` cria thread que nunca é juntada e trava com stdin em EOF, por isso **é proibido usá-lo**.
+
+#### What binds this task
+
+- `Cargo.toml`: `ratatui-image = { version = "=11.1.0", default-features = false, features = [<as necessárias para crossterm, iterm2 e sixel; confira no Cargo.toml do crate 11.1.0>] }` e `image = { version = "<a que o ratatui-image 11.1.0 resolve>", default-features = false, features = ["png", "ico", "jpeg", "gif"] }`.
+  - Rode `cargo build` e confira no `Cargo.lock` que o ratatui continua `0.30.2` e o crossterm `0.29.0`, sem `cargo update`.
+  - Cole o diff do `Cargo.lock` resumido: crates novos e versões.
+- `src/config.rs`: `pub icons: String`, com padrão `"auto"` e valores válidos `auto`, `iterm2`, `sixel`, `off`. Valor desconhecido ⇒ `auto` e `tracing::warn!`.
+- Novo `src/tui/icons.rs`:
+  - `pub enum IconProtocol { Iterm2, Sixel, Off }`.
+  - `pub fn choose(setting: &str, term_program: Option<&str>, wt_session: bool) -> IconProtocol` (pura):
+    - `iterm2`/`sixel`/`off` explícitos valem como estão;
+    - `auto` ⇒ WezTerm (`TERM_PROGRAM` igual a `WezTerm`, sem diferenciar maiúsculas) dá `Iterm2`; `WT_SESSION` presente dá `Sixel`; qualquer outro caso dá `Off`.
+  - `pub fn font_size() -> (u16, u16)`: `crossterm::terminal::window_size()` com `width`/`height` em pixels > 0 ⇒ `(px_w / cols, px_h / rows)`; senão `(10, 20)`.
+  - Construção do `Picker` com `Picker::from_fontsize(font_size())` e o tipo de protocolo fixado (`set_protocol_type`), nunca por consulta.
+- Codificação **fora da thread da UI**:
+  - Os bytes são decodificados (`image::load_from_memory`) e convertidos no protocolo em `spawn_blocking`, com o handle aguardado (regra do projeto) e o pânico repassado com `resume_unwind`.
+  - O resultado volta por `Msg::IconReady { key, size: (u16,u16), proto }`.
+  - Falha de decodificação ⇒ `tracing::debug!` e a chave marcada como "sem ícone", sem tentar de novo nesta sessão.
+  - Cache do protocolo codificado em `App`, chaveado por `(key, cols, rows)`, com no máximo 64 entradas. Ao passar disso, sai a mais antiga.
+  - `Off` ⇒ nada é decodificado nem desenhado.
+- `src/tui/layout.rs`:
+  - `pub const DETAIL_ICON_ROWS: u16 = 4; pub const DETAIL_ICON_COLS: u16 = 8; pub const DETAIL_ICON_GAP: u16 = 2;` (pedido do usuário: espaço entre ícone e texto).
+  - Uma função `pub fn split_icon(area: Rect, rows: u16, cols: u16, gap: u16) -> (Rect, Rect)` que devolve (área do ícone, área do texto à direita), com a área do texto começando `gap` colunas depois do ícone.
+- `draw_details`, quando há ícone codificado para o pacote selecionado:
+  - as primeiras `DETAIL_ICON_ROWS` linhas são divididas por `split_icon`;
+  - à esquerda vai o ícone; à direita vão as primeiras linhas de `details_lines` (nome, versão, publisher; o que couber em 4 linhas);
+  - as linhas restantes vão abaixo, na largura toda.
+  - Sem ícone (pacote sem ícone, `Off`, ainda codificando ou área com menos de `DETAIL_ICON_COLS + DETAIL_ICON_GAP + 10` colunas): o layout fica exatamente como hoje, e os snapshots existentes não mudam.
+- Sobreposição: com `app.modal.is_some()` ou `app.show_help`, nenhum ícone é desenhado. Um ícone cuja área cruza a área de um toast visível também não é desenhado.
+- Desenho com o widget de imagem do `ratatui-image` (o `Image` com o protocolo já codificado, não o `StatefulImage` que codifica no desenho).
+- Os testes de view usam `TestBackend`: o ícone não sai no buffer de texto, mas a área reservada sai. Os testes verificam por células, nunca por bytes de protocolo.
+
+**Files:**
+- Create: `src/tui/icons.rs`
+- Modify: `Cargo.toml`, `Cargo.lock`, `src/config.rs`, `src/tui/mod.rs`, `src/tui/layout.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/view.rs`
+- Test: `mod tests` de `src/tui/icons.rs`, `tests/tui_view.rs`, `tests/tui_state.rs`, `tests/config.rs` (ou onde estão os testes de config: `grep -rln "glyphs" tests`)
+
+Testes:
+1. `choose_protocol`: tabela com `auto`+WezTerm ⇒ Iterm2; `auto`+`wezterm` ⇒ Iterm2; `auto`+WT_SESSION ⇒ Sixel; `auto`+ambos ⇒ Iterm2 (WezTerm vence); `auto`+nada ⇒ Off; `sixel` no WezTerm ⇒ Sixel; `off` no WT ⇒ Off; `iterm2` sem nada ⇒ Iterm2.
+2. `config_icons_default_and_unknown`: config sem `icons` ⇒ `"auto"`; `icons = "bogus"` ⇒ protocolo de `auto` (via `choose`).
+3. `split_icon_leaves_a_gap`: `split_icon(Rect(0,0,40,10), 4, 8, 2)` ⇒ ícone `(0,0,8,4)`, texto `(10,0,30,4)`; área de 15 colunas ⇒ texto com largura ≥ 0 (sem pânico).
+4. `details_text_starts_after_the_icon_gap` (`tests/tui_view.rs`, `TestBackend`):
+   - App com detalhes de um pacote e um protocolo de teste no cache (o que o ratatui-image oferecer para teste; se não houver, um `IconSlot` interno que só reserva a área);
+   - as colunas `x..x+8` das 4 primeiras linhas do painel ficam sem texto;
+   - as 2 colunas seguintes ficam em branco;
+   - o nome do pacote começa exatamente na coluna `x+10`.
+5. `details_without_icon_keep_the_old_layout`: snapshot existente dos detalhes inalterado com `icon_bytes` vazio e com `Off`.
+6. `no_icon_over_a_dialog`: com `Modal::Confirm` aberto, a área do ícone não é reservada nem desenhada (verifique pela função que decide, por exemplo `fn icon_visible(app) -> bool`).
+7. `undecodable_icon_is_remembered_as_none`: bytes lixo ⇒ `Msg::IconReady` com falha ⇒ a chave fica "sem ícone", e um 2º pedido não é enviado (contagem de `Cmd`).
+
+#### Checks beyond the steps
+
+1. Espaço: `DETAIL_ICON_GAP` ignorado em `split_icon` (texto começando em `x+8`) ⇒ PEGA (testes 3 e 4).
+2. Protocolo: em `choose`, `auto` sempre `Sixel` ⇒ PEGA (teste 1).
+3. Diálogo: desenhar ícone com modal aberto ⇒ PEGA (teste 6).
+4. Codificação fora da UI: `grep -n "load_from_memory\|new_protocol" src/tui/view.rs` vazio. Cole a saída.
+5. `grep -rn "from_query_stdio" src` vazio. Cole a saída.
+
+**Commit:** `feat(tui): package icon in the details pane`
+
+---
+
+### Task 85: Ícones na lista, só do cache
+
+**Modelo:** sonnet (revisor sonnet). **Roda sozinha (mede quadro).**
+
+#### Where this fits
+
+Depois da Task 84: protocolo, cache de codificação e `Msg::IconReady` já existem. Lista: `draw_list` (`src/tui/view.rs`, ~:546) e a montagem dos itens visíveis (~:426-476), com `ITEM_ROWS = 2`. O tempo de quadro é medido por `examples/tui_frame.rs` (Task 59: Pesquisar ~0,27–0,40 ms). O mapa `icons.json` (Task 83, `icons::load_map`, `icons::cached_icon`) diz quais pacotes têm ícone no cache.
+
+#### What binds this task
+
+- `src/tui/layout.rs`: `pub const LIST_ICON_COLS: u16 = 4; pub const LIST_ICON_GAP: u16 = 1;`. A altura é `ITEM_ROWS`.
+- Ícones ligados (protocolo ≠ `Off`): todo item da lista recua `LIST_ICON_COLS + LIST_ICON_GAP` colunas, tenha ícone ou não, para o texto ficar alinhado. Desligados: a lista fica exatamente como hoje (snapshots existentes inalterados).
+- O mapa é carregado uma vez ao abrir a TUI (`load_map` em `spawn_blocking`, handle aguardado) e atualizado em memória quando a Task 83 grava um ícone novo (`remember`).
+- A cada quadro, só os itens **visíveis** (a janela `list_window`) que têm entrada no mapa e ainda não têm protocolo codificado em `(key, LIST_ICON_COLS, ITEM_ROWS)` geram pedidos de codificação.
+  - Os bytes vêm de `cached_icon`, lido em `spawn_blocking`, nunca na UI.
+  - No máximo 8 pedidos em andamento ao mesmo tempo; os demais esperam o próximo quadro.
+  - **Nada de rede** para a lista.
+- Mesmas regras de sobreposição da Task 84: com modal ou ajuda abertos, não desenha; ícone que cruza um toast também não.
+- Medição (protocolo da Task 59):
+  - `examples/tui_frame.rs` com a aba Pesquisar, ícones desligados e ligados, usando um protocolo de teste que só reserva a área (o terminal real não é medido aqui);
+  - 3 séries de 200 quadros: mediana e p95;
+  - a regra é que, com ícones desligados, o quadro não piore mais de +0,05 ms contra a base;
+  - cole os números no relatório.
+  - Medida do terminal real: escreva no relatório o comando para o usuário rodar a TUI (`cargo run --release`) e fica "não medido".
+
+**Files:**
+- Modify: `src/tui/layout.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/view.rs`, `examples/tui_frame.rs`
+- Test: `tests/tui_view.rs`, `tests/tui_state.rs`
+
+Testes:
+1. `list_indents_every_item_when_icons_are_on` (`TestBackend`): 3 itens, um com ícone no cache; com ícones ligados, o texto dos 3 começa na mesma coluna (`x + 5`), e as 4 colunas do ícone ficam sem texto; com `Off`, o snapshot de antes não muda.
+2. `only_visible_cached_icons_are_requested`: lista de 50 itens, 10 visíveis, 3 dos visíveis e 5 dos invisíveis no mapa ⇒ exatamente 3 pedidos `Cmd` de codificação; nenhum `Cmd` de rede.
+3. `icon_requests_are_capped`: 20 visíveis no mapa ⇒ no máximo 8 pedidos por quadro; depois de 8 `Msg::IconReady`, os próximos são pedidos.
+4. `list_never_fetches_icons`: nenhum `Cmd` de download de ícone sai da lista. A rede só ocorre em `load_details`.
+
+#### Checks beyond the steps
+
+1. Alinhamento: recuar só os itens com ícone ⇒ PEGA (teste 1).
+2. Só visíveis: pedir para todos os itens do mapa ⇒ PEGA (teste 2).
+3. Limite: tirar o teto de 8 ⇒ PEGA (teste 3).
+
+**Commit:** `feat(tui): cached package icons in the list`
+
+---
+
+### Task 86: Ajuste "Ícones" na aba Ajustes
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+A aba Ajustes (`src/tui/settings.rs`: `SettingId`, `ORDER`, `label`, `values`, `help`) salva via `Cmd::SaveSettings` (`src/tui/app.rs`, ~:205 e ~:905; `run.rs` ~:251), com `save_in_flight` e coalescência (Task 68). `Glifos` é o modelo: um valor texto da config, que avança com `Enter`/Espaço/`l` e volta com `h`. Depois das Tasks 84 e 85, `Config.icons` e `IconProtocol` já existem.
+
+#### What binds this task
+
+- `SettingId::Icons`, depois de `Glyphs` em `ORDER`.
+  - Rótulo: `"Ícones"`.
+  - Valores mostrados: `Automático`, `iTerm2`, `Sixel` e `Desligado` (config: `auto`, `iterm2`, `sixel`, `off`).
+  - Ajuda: `"Imagens dos pacotes: automático usa iTerm2 no WezTerm e sixel no Windows Terminal."`.
+- Mudar o valor:
+  - aplica na hora: novo `IconProtocol` via `choose` e cache de protocolos codificados esvaziado (os ícones são recodificados no próximo quadro);
+  - salva em `config.toml` pelo mesmo `Cmd::SaveSettings` (campo novo `icons: Option<String>`, enviado só se o usuário mexeu, como `glyphs_touched`).
+- `Desligado` ⇒ nenhum ícone nem recuo na lista (Task 85) e layout antigo nos detalhes (Task 84), no mesmo quadro.
+
+**Files:**
+- Modify: `src/tui/settings.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/view.rs` (se a linha do ajuste precisar), `src/config.rs` (só se faltar algo)
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs` (snapshot da aba Ajustes)
+
+Testes:
+1. `icons_setting_cycles_and_saves`: `Enter` na linha Ícones ⇒ Automático → iTerm2 → Sixel → Desligado → Automático; o `Cmd::SaveSettings` carrega `icons: Some("iterm2")` depois do 1º `Enter`; mexer em outro ajuste não envia `icons`.
+2. `turning_icons_off_clears_the_cache_and_the_indent`: com protocolo codificado no cache, mudar para Desligado ⇒ cache vazio e lista sem recuo (`TestBackend`).
+3. Snapshot da aba Ajustes atualizado: só a linha nova muda (confira no diff).
+
+#### Checks beyond the steps
+
+1. Salvar sem mexer: enviar sempre `icons` ⇒ PEGA (teste 1).
+2. Aplicar na hora: não esvaziar o cache ⇒ PEGA (teste 2).
+
+**Commit:** `feat(tui): icons setting`

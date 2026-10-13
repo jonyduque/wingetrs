@@ -113,6 +113,8 @@ O overlay do GitHub (fase 1.5) entra como um `Source` adicional que sobrepõe `l
 
 O crate `winget-types` (projeto Komac) é referência de modelagem, não dependência.
 
+> **Emenda (2026-10-13, ícones; dependências aprovadas pelo usuário).** `ratatui-image` 11.1 (protocolos de imagem do terminal) e `image` (só as features `png`, `ico`, `jpeg`, `gif`). A compatibilidade com ratatui 0.30.2 e crossterm 0.29 foi provada na sonda da Task 82. O executável fica cerca de 1,14 MB maior, e o crate `windows` 0.58 entra duplicado ao lado da 0.62. A consulta automática ao terminal (`Picker::from_query_stdio`) não é usada: ela cria uma thread que nunca é juntada e trava com stdin em EOF.
+
 ## 4. Dados locais
 
 Diretório: `%LOCALAPPDATA%\wingetrs\`
@@ -304,6 +306,19 @@ Todos os estilos vêm de `tui/theme.rs`; views não usam cores literais.
   - `ascii`.
 
 > **Emenda (2026-10-11).** Paleta do Charm (Lip Gloss/Bubbles): `accent` roxo `#7D56F4` (escuro) / `#874BFD` (claro) no lugar de azul/ciano; tokens novos `sel_bar`, `sel_title`, `sel_desc` (seleção rosa), `badge`, `help_key`/`help_desc`/`help_sep` (texto de ajuda clareado para `#6C6C6C`), `pill_msg`/`pill_a`/`pill_b` (barra de status) e `spinner`; spinner `Dot` do Bubbles (`⣾⣽⣻⢿⡿⣟⣯⣷`) nos glifos `nerd`/`unicode`. A linha selecionada deixa de ter fundo e `▶` (barra `┃`; ver §7.1). `NO_COLOR`: pepitas e badge em vídeo reverso.
+
+> **Emenda (2026-10-13, ícones dos pacotes, aprovada pelo usuário).** Os pacotes do winget cujo manifesto traz `Icons` (com `IconSha256`) mostram o ícone na TUI.
+>
+> - **Detalhes:** o ícone fica no canto superior esquerdo do painel, com 4 linhas × 8 colunas. Nome, versão e publisher ficam à direita dele, separados por 2 colunas em branco; o ícone nunca encosta no texto. O resto do texto continua abaixo.
+> - **Lista:** só aparecem os ícones que já estão no cache. A lista nunca baixa nada para mostrar um ícone. Cada ícone ocupa 2 linhas × 4 colunas à esquerda do item, seguido de 1 coluna em branco. Quando os ícones estão ligados, itens sem ícone recebem o mesmo recuo, para o texto ficar alinhado.
+> - **Download e cache:** o ícone é baixado junto com os detalhes, com no máximo 1 MiB. Ele é conferido pelo `IconSha256` e guardado em `blobs/`, sujeito à mesma limpeza de 30 dias. Ícone sem `IconSha256`, com hash divergente ou que não decodifica fica sem ícone, nunca dá erro.
+> - **Qual ícone:** tema `default`, depois `dark`, depois qualquer outro.
+> - **Protocolo:** vem do ajuste "Ícones" (config `icons`), com os valores `auto` (padrão), `iterm2`, `sixel` e `off`.
+>   - `auto` escolhe iTerm2 no WezTerm (`TERM_PROGRAM=WezTerm`; foi o que gastou menos recursos na sonda) e sixel no Windows Terminal (`WT_SESSION`). Em qualquer outro terminal, `auto` desliga os ícones.
+>   - O protocolo nunca é descoberto consultando o terminal.
+>   - O tamanho da fonte em pixels vem de `crossterm::terminal::window_size()`; se ele não informar, usa-se 10×20.
+> - **Sobreposições:** com um diálogo ou a ajuda abertos, nenhum ícone é desenhado. Um ícone que cruzaria um toast também não é desenhado.
+> - **CLI:** o `show` não muda.
 
 ### 7.4 Modelo de eventos
 
