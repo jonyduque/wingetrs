@@ -5536,3 +5536,73 @@ Testes (helper `age(path, days)`, que abre com `write(true)` e faz `set_modified
 6. Releitura do `mtime` antes de apagar: não há teste determinístico simples. Cite no relatório a linha do código que faz a releitura; o revisor confere.
 
 **Commit:** `feat(cache): prune blobs unused for 30 days after update`
+
+## Ícones dos pacotes (Task 82: sonda)
+
+Pedido do usuário (2026-10-13): mostrar o logotipo dos programas, como o winget faz com sixel, no painel de detalhes, em outros lugares adequados e, se der, como ícone na lista. O usuário aprovou a fase 1: uma sonda, sem tocar no código do produto. As fases 2 (ícone nos detalhes), 3 (ícone na lista, só do cache) e 4 (ícones locais dos apps instalados) serão decididas com os números da sonda e exigem emenda na spec da fase 1 (§7).
+
+Fatos conhecidos:
+- Manifestos do winget (esquema ≥ 1.4, manifesto de locale) podem ter `Icons:`, uma lista de `IconUrl`, `IconFileType` (png, ico, jpeg, svg), `IconResolution`, `IconTheme` e `IconSha256`. No cache do usuário, 15 de 41 blobs pequenos têm `IconUrl`; um deles é `Notepad++.Notepad++` (ico, IconSha256 `7f00c181…`).
+- O projeto usa `ratatui = "0.30.2"` e `crossterm = "0.29.0"`. O terminal do usuário é o Windows Terminal 1.25.2733.0, que tem sixel desde a 1.22.
+- Os manifestos do Scoop não têm ícone.
+
+### Task 82: Sonda de ícones (sixel com ratatui-image)
+
+**Modelo:** opus (decisões de viabilidade; revisor: o orquestrador lê o relatório).
+
+#### Where this fits
+
+Antes de adicionar dependências ao `Cargo.toml`, a regra do projeto exige provar o conjunto num crate de sonda: as versões das dependências foram verificadas juntas. Esta tarefa responde, com números, a cinco perguntas:
+- (a) se `ratatui-image` compila com o ratatui 0.30.2 e o crossterm 0.29;
+- (b) se a detecção de protocolo acha sixel no terminal do usuário;
+- (c) quanto custa desenhar um ícone, por quadro e no primeiro desenho;
+- (d) que fração dos pacotes do winget tem ícone, e de que tipos;
+- (e) se `image` decodifica os tipos reais encontrados: ico, png, jpeg; svg provavelmente não.
+
+#### What binds this task
+
+- **Nada no repositório muda**, exceto o relatório `.claude/tasks/task-82-report.md`. Não toque em `Cargo.toml`, `Cargo.lock` nem `src/`.
+- **Crate de sonda** em `<S>\icon-probe` (`<S>` = o scratchpad do agente, nunca dentro do repositório). Ele é binário e depende de:
+  - `ratatui = "=0.30.2"` e `crossterm = "=0.29.0"`, as mesmas versões do projeto;
+  - a versão mais recente de `ratatui-image` que declare compatibilidade com ratatui 0.30; se nenhuma declarar, registre isso e pare em BLOCKED com as versões vistas;
+  - `image`, com só as features de png, ico, jpeg e gif.
+
+  Registre as versões resolvidas e o tamanho do binário release com e sem as dependências de imagem (um binário mínimo com ratatui+crossterm como base).
+- **Amostra de ícones (d):**
+  - Copie o catálogo real para uma raiz temporária, com o mesmo método de cópia `python -I … backup` do protocolo da Task 77.
+  - Escolha 200 ids do winget com semente fixa: os 50 primeiros por ordem alfabética entre os ids instalados (`wingetrs list` na cópia) e 150 sorteados com `random.seed(82)`.
+  - Rode `target/release/wingetrs.exe show <id> --source winget` com `LOCALAPPDATA` apontando para a raiz temporária. Os manifestos ficam no `blobs/` dela.
+  - Conte quantos têm `Icons:`, a distribuição de `IconFileType` e `IconResolution`, e quantos têm mais de um ícone (temas claro e escuro, resoluções).
+  - Baixe até 30 ícones, confira o `IconSha256` e registre tamanho em bytes, dimensões e se `image` decodificou. Falha de decodificação: registre o tipo e o motivo.
+  - Coloque um intervalo de ≥ 200 ms entre requisições, para não martelar o CDN nem os sites dos fabricantes.
+- **Binário de demonstração (b, c)** no crate de sonda, para **o usuário** rodar no terminal dele, porque o agente não tem terminal interativo:
+  - Detecta o protocolo com o `Picker` do `ratatui-image` (consulta ao terminal; fallback por variável de ambiente) e mostra o protocolo escolhido e o tamanho de fonte em pixels.
+  - Desenha numa tela ratatui:
+    - o ícone do Notepad++, que vem embutido no binário com `include_bytes!` de um ícone baixado e verificado;
+    - à direita, o mesmo ícone em 2 linhas de altura, como seria na lista;
+    - 10 linhas de lista fictícias com ícone de 2 linhas, rolando com ↑/↓.
+  - Mede com `Instant`: primeiro desenho; mediana e máximo do tempo de `terminal.draw` em 200 quadros de rolagem automática; tempo de codificação do protocolo, se a API expuser.
+  - Ao sair (`q`), imprime os números em texto. Também os grava em `<S>\icon-probe\last-run.txt` para o agente ler depois.
+  - Sem sixel detectado: imprime "protocolo: <nome>" e desenha o fallback (meio-bloco), para comparação visual.
+- **Entrega ao usuário:** o caminho do exe e um comando pronto para colar (`! & "<S>\icon-probe\target\release\icon-probe.exe"`). O agente **não** espera o usuário; o orquestrador cuida disso.
+- **Relatório:**
+  - versões e compatibilidade (a);
+  - números da amostra (d, e);
+  - tamanho do binário;
+  - riscos vistos: sixel dentro de uma lista que rola (ratatui-image redesenha? pisca?), imagem sobre um diálogo, redimensionamento, troca de tema;
+  - uma recomendação concreta para as fases 2 e 3, com a API do `ratatui-image` que seria usada: `StatefulImage`, `Resize` e onde guardar o protocolo codificado.
+- **Limpeza:**
+  - apague a raiz temporária e o catálogo copiado;
+  - o crate de sonda e o exe **ficam** no scratchpad para o usuário rodar;
+  - `leftovers.ps1` limpo.
+
+**Files:**
+- Create: `.claude/tasks/task-82-report.md`, que é o único arquivo do repositório tocado.
+
+#### Checks beyond the steps
+
+1. Nenhum arquivo do repositório além do relatório mudou: cole a saída de `git status --short`.
+2. Cada número do relatório tem a saída de origem colada; número não medido é escrito "não medido".
+3. Os `IconSha256` dos ícones baixados foram conferidos: cole quantos conferiram e quantos divergiram.
+
+**Commit:** `chore(tasks): icon probe report for task 82` (só o relatório)
