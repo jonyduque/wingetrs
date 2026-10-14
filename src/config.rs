@@ -30,7 +30,7 @@ pub enum ResidueMode {
 }
 
 /// `[behavior]` section of `config.toml`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Behavior {
     pub confirm: ConfirmMode,
@@ -39,6 +39,21 @@ pub struct Behavior {
     pub residues: ResidueMode,
     /// Follow redirects that downgrade https to http.
     pub allow_http_redirect: bool,
+    /// Capture the terminal mouse (click, wheel); off leaves text selection to the terminal.
+    pub mouse: bool,
+}
+
+impl Default for Behavior {
+    fn default() -> Self {
+        Behavior {
+            confirm: ConfirmMode::default(),
+            purge: false,
+            keep_old: false,
+            residues: ResidueMode::default(),
+            allow_http_redirect: false,
+            mouse: true,
+        }
+    }
 }
 
 /// Valid values of `Config::list_icons`; the first is the default.

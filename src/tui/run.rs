@@ -152,7 +152,10 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         previous_hook(info);
     }));
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    app.mouse_enabled = cfg.behavior.mouse;
+    if app.mouse_enabled {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    }
     app.size = terminal
         .size()
         .map(|s| (s.width, s.height))
@@ -283,6 +286,16 @@ async fn event_loop(
         for cmd in last_details_only(cmds) {
             match cmd {
                 Cmd::Quit => return Ok(()),
+                Cmd::SetMouseCapture(on) => {
+                    let _ = if on {
+                        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)
+                    } else {
+                        crossterm::execute!(
+                            std::io::stdout(),
+                            crossterm::event::DisableMouseCapture
+                        )
+                    };
+                }
                 Cmd::Refresh { force } => spawn_refresh(&ctx, force),
                 Cmd::ScanInstalled => spawn_scan(&ctx),
                 Cmd::LoadDetails { source, id } => {

@@ -12,11 +12,12 @@ pub enum SettingId {
     Glyphs,
     Icons,
     ListIcons,
+    Mouse,
     Theme,
 }
 
 /// Order of the settings on screen.
-pub const ORDER: [SettingId; 9] = [
+pub const ORDER: [SettingId; 10] = [
     SettingId::Confirm,
     SettingId::Purge,
     SettingId::KeepOld,
@@ -25,6 +26,7 @@ pub const ORDER: [SettingId; 9] = [
     SettingId::Glyphs,
     SettingId::Icons,
     SettingId::ListIcons,
+    SettingId::Mouse,
     SettingId::Theme,
 ];
 
@@ -39,6 +41,7 @@ impl SettingId {
             SettingId::Glyphs => "Glifos",
             SettingId::Icons => "Ícones",
             SettingId::ListIcons => "Ícones da lista",
+            SettingId::Mouse => "Mouse",
             SettingId::Theme => "Tema",
         }
     }
@@ -52,6 +55,7 @@ impl SettingId {
             SettingId::Glyphs => &["nerd", "unicode", "ascii"],
             SettingId::Icons => &["Automático", "iTerm2", "Sixel", "Desligado"],
             SettingId::ListIcons => &["visíveis", "só ao abrir"],
+            SettingId::Mouse => &["ligado", "desligado"],
             SettingId::Theme => &["escuro", "claro"],
         }
     }
@@ -75,6 +79,9 @@ impl SettingId {
             }
             SettingId::ListIcons => {
                 "Baixa os ícones dos pacotes que aparecem na lista. Só ao abrir: o ícone vem quando você abre os detalhes."
+            }
+            SettingId::Mouse => {
+                "Clique troca de aba e seleciona; clique duplo faz o mesmo que Enter. Desligado: o terminal volta a selecionar texto com o mouse."
             }
             SettingId::Theme => "Paleta de cores da interface.",
         }
@@ -167,6 +174,7 @@ impl SettingsState {
                 .iter()
                 .position(|s| *s == self.list_icons)
                 .unwrap_or(0),
+            SettingId::Mouse => usize::from(!self.behavior.mouse),
             SettingId::Theme => usize::from(!self.dark),
         }
     }
@@ -200,6 +208,7 @@ impl SettingsState {
             SettingId::ListIcons => {
                 self.list_icons = crate::config::LIST_ICONS[next].to_string();
             }
+            SettingId::Mouse => self.behavior.mouse = next == 0,
             SettingId::Theme => self.dark = next == 0,
         }
         true

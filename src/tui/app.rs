@@ -245,6 +245,8 @@ pub enum Cmd {
         list_icons: Option<String>,
         theme: String,
     },
+    /// Turn the terminal mouse capture on or off (`App.mouse_enabled` is already set).
+    SetMouseCapture(bool),
     /// Decode and encode an icon off the UI thread and answer with `Msg::IconReady`.
     EncodeIcon {
         generation: u64,
@@ -1114,6 +1116,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                     app.push_toast(ToastKind::Success, "ajustes salvos");
                 }
                 Err(e) => {
+                    let mouse_before = app.mouse_enabled;
                     let (behavior, glyphs, dark) = app.settings.saved;
                     app.settings.behavior = behavior;
                     app.settings.glyphs = glyphs;
@@ -1130,6 +1133,10 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                             app.settings.list_icons == crate::config::LIST_ICONS[0];
                     }
                     app.push_toast(ToastKind::Error, format!("falha ao salvar: {e}"));
+                    app.mouse_enabled = behavior.mouse;
+                    if app.mouse_enabled != mouse_before {
+                        return vec![Cmd::SetMouseCapture(app.mouse_enabled)];
+                    }
                 }
             }
             Vec::new()
@@ -1389,6 +1396,10 @@ fn change_setting(app: &mut App, forward: bool) -> Vec<Cmd> {
             app.settings.list_icons_touched = true;
             // `update` asks for the visible rows' icons right after this.
             app.list_icons_visible = app.settings.list_icons == crate::config::LIST_ICONS[0];
+        }
+        SettingId::Mouse => {
+            app.mouse_enabled = app.settings.behavior.mouse;
+            cmds.push(Cmd::SetMouseCapture(app.mouse_enabled));
         }
         SettingId::Icons => {
             app.settings.icons_touched = true;

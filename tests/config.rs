@@ -70,6 +70,7 @@ fn behavior_round_trips_through_save() {
             keep_old: false,
             residues: ResidueMode::Keep,
             allow_http_redirect: true,
+            mouse: false,
         },
         ..Config::default()
     };
@@ -208,4 +209,22 @@ fn config_list_icons_defaults_and_rejects_unknown() {
     };
     c.save(&p).unwrap();
     assert_eq!(Config::load(&p).unwrap().list_icons, "opened");
+}
+
+#[test]
+fn behavior_mouse_defaults_to_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "[behavior]\npurge = true\n").unwrap();
+    assert!(Config::load(&p).unwrap().behavior.mouse);
+    assert!(Behavior::default().mouse);
+    let c = Config {
+        behavior: Behavior {
+            mouse: false,
+            ..Behavior::default()
+        },
+        ..Config::default()
+    };
+    c.save(&p).unwrap();
+    assert!(!Config::load(&p).unwrap().behavior.mouse);
 }

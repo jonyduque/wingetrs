@@ -1481,7 +1481,7 @@ fn letters_do_not_type_in_settings() {
 #[test]
 fn theme_setting_flips_dark() {
     let mut a = on_settings();
-    for _ in 0..8 {
+    for _ in 0..9 {
         update(&mut a, key(KeyCode::Down));
     }
     update(&mut a, key(KeyCode::Enter));
@@ -2940,4 +2940,98 @@ fn motion_is_not_a_message() {
     assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Left))).is_some());
     assert!(mouse_msg(ev(MouseEventKind::ScrollDown)).is_some());
     assert!(mouse_msg(ev(MouseEventKind::ScrollUp)).is_some());
+}
+
+// ---- Task 95: mouse setting; every setting joins save coalescing ----
+
+fn select_setting(a: &mut App, id: wingetrs::tui::settings::SettingId) {
+    a.settings.selected = wingetrs::tui::settings::ORDER
+        .iter()
+        .position(|s| *s == id)
+        .unwrap();
+}
+
+fn saves(cmds: &[Cmd]) -> usize {
+    cmds.iter()
+        .filter(|c| matches!(c, Cmd::SaveSettings { .. }))
+        .count()
+}
+
+#[test]
+fn mouse_setting_toggles_capture() {
+    use wingetrs::tui::settings::SettingId;
+    let mut a = ten_hits();
+    a.tab = Tab::Settings;
+    select_setting(&mut a, SettingId::Mouse);
+    assert!(a.mouse_enabled);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(!a.mouse_enabled);
+    assert_eq!(
+        cmds.iter()
+            .filter(|c| matches!(c, Cmd::SetMouseCapture(false)))
+            .count(),
+        1,
+        "{cmds:?}"
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            Cmd::SaveSettings { behavior, .. } if !behavior.mouse
+        )),
+        "{cmds:?}"
+    );
+    // A click on a tab no longer switches it.
+    let (rect, _) = regions(&a, screen(&a)).tabs[0];
+    click_at(&mut a, Instant::now(), rect.x + rect.width / 2, rect.y + 1);
+    assert_eq!(a.tab, Tab::Settings);
+}
+
+#[test]
+fn mouse_setting_reverts_capture_on_save_failure() {
+    use wingetrs::tui::settings::SettingId;
+    let mut a = ten_hits();
+    a.tab = Tab::Settings;
+    select_setting(&mut a, SettingId::Mouse);
+    update(&mut a, key(KeyCode::Enter));
+    let cmds = update(&mut a, Msg::SettingsSaved(Err("x".into())));
+    assert!(a.mouse_enabled);
+    assert!(cmds.contains(&Cmd::SetMouseCapture(true)), "{cmds:?}");
+}
+
+#[test]
+fn every_setting_joins_save_coalescing() {
+    use wingetrs::tui::settings::ORDER;
+    for id in ORDER {
+        let fresh = || {
+            let mut a = on_settings();
+            select_setting(&mut a, id);
+            a
+        };
+        // `Glyphs` forced by a flag cannot change; `fresh` never forces it.
+        let original = fresh().settings.value_index(id);
+
+        // Ok: the change made during the save is saved next.
+        let mut a = fresh();
+        let first = update(&mut a, key(KeyCode::Enter));
+        assert_eq!(saves(&first), 1, "{id:?}: {first:?}");
+        let during = update(&mut a, key(KeyCode::Enter));
+        assert_eq!(saves(&during), 0, "{id:?}: {during:?}");
+        let newest = a.settings.value_index(id);
+        let next = update(&mut a, Msg::SettingsSaved(Ok(())));
+        assert_eq!(saves(&next), 1, "{id:?} lost its change: {next:?}");
+        assert_eq!(a.settings.value_index(id), newest, "{id:?}");
+
+        // Err: a newer change retries, and the failure of the retry reverts to the last saved.
+        let mut a = fresh();
+        update(&mut a, key(KeyCode::Enter));
+        update(&mut a, key(KeyCode::Enter));
+        let retry = update(&mut a, Msg::SettingsSaved(Err("x".into())));
+        assert_eq!(saves(&retry), 1, "{id:?}: {retry:?}");
+        update(&mut a, Msg::SettingsSaved(Err("x".into())));
+        assert_eq!(
+            a.settings.value_index(id),
+            original,
+            "{id:?} did not revert"
+        );
+    }
 }
