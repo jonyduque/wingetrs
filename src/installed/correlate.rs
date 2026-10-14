@@ -1,7 +1,10 @@
 //! Installed <-> catalog correlation and update state (spec §5.4).
+use std::collections::BTreeMap;
+
 use crate::catalog::{Catalog, CatalogError, MapTable};
 use crate::core::version::Version;
 use crate::installed::normalize::NameNormalizer;
+use crate::installed::overrides::{self, Choice};
 use crate::installed::tiebreak::{Candidate, Tiebreak, break_tie};
 use crate::installed::winget_tracking::Tracking;
 use crate::installed::{InstallSource, InstalledApp};
@@ -13,6 +16,8 @@ pub enum Rule {
     PackageFamilyName,
     NameAndPublisher,
     ScoopManifest,
+    /// Chosen by the user (`correlations.json`).
+    User,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -23,6 +28,8 @@ pub enum Correlation {
         rule: Rule,
     },
     Ambiguous {
+        /// Catalog source name of every candidate.
+        source: String,
         candidates: Vec<String>,
         rule: Rule,
     },
@@ -43,6 +50,10 @@ pub enum UpdateState {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ListRow {
     pub name: String,
+    /// Stable identity of the installed app (`overrides::app_key`).
+    pub app_key: String,
+    /// The user said this app is not in the catalog (`Choice::NotInCatalog`).
+    pub not_in_catalog: bool,
     /// Who installed it: `arp`, `msix`, `scoop` or `wingetrs`.
     pub origin: String,
     pub installed_version: Option<String>,
@@ -198,7 +209,7 @@ fn find(
     by_scoop(app, catalog)
 }
 
-fn origin(source: &InstallSource) -> &'static str {
+pub fn origin(source: &InstallSource) -> &'static str {
     match source {
         InstallSource::Arp(_) => "arp",
         InstallSource::Msix => "msix",
@@ -220,6 +231,8 @@ fn row(
     };
     ListRow {
         name: app.name.clone(),
+        app_key: overrides::app_key(app),
+        not_in_catalog: false,
         origin: origin(&app.source).to_string(),
         installed_version: app.version.clone(),
         correlation,
@@ -287,14 +300,43 @@ fn matched_row(
     })
 }
 
+/// The row the user's choice for `app` dictates; `None` when there is none, or when it points
+/// at a package no longer in the catalog (the automatic correlation then stands).
+fn user_choice(
+    app: &InstalledApp,
+    catalog: &Catalog,
+    overrides: &BTreeMap<String, Choice>,
+) -> Result<Option<ListRow>, CatalogError> {
+    let key = overrides::app_key(app);
+    match overrides.get(&key) {
+        None => Ok(None),
+        Some(Choice::NotInCatalog) => Ok(Some(ListRow {
+            not_in_catalog: true,
+            ..row(app, Correlation::Unmatched, None, UpdateState::Unknown)
+        })),
+        Some(Choice::Package { source, package_id }) => {
+            if catalog.get(source, package_id)?.is_none() {
+                tracing::warn!("escolha de {key} ignorada: {source}/{package_id} saiu do catálogo");
+                return Ok(None);
+            }
+            matched_row(app, catalog, source.clone(), package_id.clone(), Rule::User).map(Some)
+        }
+    }
+}
+
 pub fn correlate(
     apps: &[InstalledApp],
     catalog: &Catalog,
     normalizer: &NameNormalizer,
     tracking: &Tracking,
+    overrides: &BTreeMap<String, Choice>,
 ) -> Result<Vec<ListRow>, CatalogError> {
     let mut rows = Vec::with_capacity(apps.len());
     for app in apps {
+        if let Some(r) = user_choice(app, catalog, overrides)? {
+            rows.push(r);
+            continue;
+        }
         let r = match find(app, catalog, normalizer)? {
             None => row(app, Correlation::Unmatched, None, UpdateState::Unknown),
             Some((source, candidates, rule)) if candidates.len() > 1 => {
@@ -305,7 +347,11 @@ pub fn correlate(
                     },
                     None => row(
                         app,
-                        Correlation::Ambiguous { candidates, rule },
+                        Correlation::Ambiguous {
+                            source,
+                            candidates,
+                            rule,
+                        },
                         None,
                         UpdateState::Unknown,
                     ),

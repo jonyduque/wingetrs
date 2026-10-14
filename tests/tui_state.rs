@@ -179,6 +179,8 @@ fn row(
     use wingetrs::installed::correlate::{Correlation, ListRow, Rule};
     ListRow {
         name: name.into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: "arp".into(),
         installed_version: Some("1".into()),
         correlation: Correlation::Matched {
@@ -329,6 +331,8 @@ fn select_source(a: &mut App, kind: SourceKind) {
 fn irow(name: &str, origin: &str, source: &str, available: bool) -> ListRow {
     ListRow {
         name: name.into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: origin.into(),
         installed_version: Some("1".into()),
         correlation: Correlation::Matched {
@@ -2345,6 +2349,8 @@ fn actions_menu_never_defaults_to_remove() {
 fn srow(name: &str, origin: &str, source: Option<&str>, state: UpdateState) -> ListRow {
     ListRow {
         name: name.into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: origin.into(),
         installed_version: Some("1".into()),
         correlation: match source {
@@ -3763,4 +3769,126 @@ fn app_created_with_pins_blocks_the_first_upgrade() {
     );
     a.pins = [wingetrs::pins::key("wingetrs", "beta")].into();
     assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+}
+
+fn override_row(
+    correlation: wingetrs::installed::correlate::Correlation,
+) -> wingetrs::installed::correlate::ListRow {
+    use wingetrs::installed::correlate::UpdateState;
+    let mut r = irow("Tool", "arp", "winget", false);
+    r.app_key = "arp/{TOOL-GUID}".into();
+    r.correlation = correlation;
+    r.state = UpdateState::Unknown;
+    r
+}
+
+#[test]
+fn ambiguous_menu_offers_choice_and_saves() {
+    use wingetrs::installed::correlate::{Correlation, Rule};
+    use wingetrs::installed::overrides::Choice;
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![override_row(Correlation::Ambiguous {
+            source: "winget".into(),
+            candidates: vec!["A.A".into(), "B.B".into()],
+            rule: Rule::ProductCode,
+        })],
+    );
+    update(&mut a, key(KeyCode::Enter));
+    assert_eq!(menu_items(&a)[0].0, "Escolher correspondência");
+    update(&mut a, key(KeyCode::Enter));
+    match &a.modal {
+        Some(Modal::Choosing { picker, .. }) => {
+            let labels: Vec<&str> = picker.items().iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["A.A", "B.B", "Nenhum destes (não está no catálogo)"]
+            );
+        }
+        _ => panic!("picker not open"),
+    }
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::SetOverride {
+            app_key: "arp/{TOOL-GUID}".into(),
+            choice: Some(Choice::Package {
+                source: "winget".into(),
+                package_id: "A.A".into()
+            }),
+        }]
+    );
+}
+
+#[test]
+fn choosing_none_of_these_saves_not_in_catalog() {
+    use wingetrs::installed::correlate::{Correlation, Rule};
+    use wingetrs::installed::overrides::Choice;
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![override_row(Correlation::Ambiguous {
+            source: "winget".into(),
+            candidates: vec!["A.A".into(), "B.B".into()],
+            rule: Rule::ProductCode,
+        })],
+    );
+    update(&mut a, key(KeyCode::Enter));
+    update(&mut a, key(KeyCode::Enter));
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Down));
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::SetOverride {
+            app_key: "arp/{TOOL-GUID}".into(),
+            choice: Some(Choice::NotInCatalog),
+        }]
+    );
+}
+
+#[test]
+fn undo_choice_in_menu() {
+    use wingetrs::installed::correlate::{Correlation, Rule};
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![override_row(Correlation::Matched {
+            source: "winget".into(),
+            package_id: "A.A".into(),
+            rule: Rule::User,
+        })],
+    );
+    update(&mut a, key(KeyCode::Enter));
+    let items = menu_items(&a);
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[3].0, "Desfazer escolha de correspondência");
+    for _ in 0..3 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::SetOverride {
+            app_key: "arp/{TOOL-GUID}".into(),
+            choice: None,
+        }]
+    );
+}
+
+#[test]
+fn override_saved_toasts_and_rescans() {
+    use wingetrs::installed::overrides::Choice;
+    let mut a = app();
+    let cmds = update(
+        &mut a,
+        Msg::OverrideSaved {
+            choice: Some(Choice::Package {
+                source: "winget".into(),
+                package_id: "A.A".into(),
+            }),
+            result: Ok(()),
+        },
+    );
+    assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.text == "correspondência salva: A.A")
+    );
 }

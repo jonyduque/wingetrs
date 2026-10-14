@@ -289,6 +289,8 @@ fn actions_modal_snapshot() {
     let mut a = App::new(entries(), GlyphSet::Ascii);
     a.installed = vec![ListRow {
         name: "ripgrep".into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: "arp".into(),
         installed_version: Some("1".into()),
         correlation: Correlation::Matched {
@@ -459,6 +461,8 @@ fn installed_details_show_the_catalog_publisher() {
         &mut a,
         Msg::InstalledLoaded(vec![ListRow {
             name: "Tool".into(),
+            app_key: String::new(),
+            not_in_catalog: false,
             origin: "arp".into(),
             installed_version: Some("1".into()),
             correlation: Correlation::Matched {
@@ -1022,6 +1026,8 @@ fn installed_second_line_explains_missing_correlation() {
     use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
     let row = |name: &str, c: Correlation| ListRow {
         name: name.into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: "arp".into(),
         installed_version: Some("1".into()),
         correlation: c,
@@ -1038,6 +1044,7 @@ fn installed_second_line_explains_missing_correlation() {
             row(
                 "Duplo",
                 Correlation::Ambiguous {
+                    source: "winget".into(),
                     candidates: vec!["a".into(), "b".into()],
                     rule: Rule::ScoopManifest,
                 },
@@ -1526,6 +1533,8 @@ fn bare_installed_app() -> App {
         &mut a,
         Msg::InstalledLoaded(vec![ListRow {
             name: "Tool".into(),
+            app_key: String::new(),
+            not_in_catalog: false,
             origin: "arp".into(),
             installed_version: None,
             correlation: Correlation::Matched {
@@ -1949,6 +1958,8 @@ fn pinned_row_shows_the_pin_glyph() {
     a.size = (100, 24);
     a.installed = vec![ListRow {
         name: "beta".into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: "wingetrs".into(),
         installed_version: Some("1".into()),
         correlation: Correlation::Matched {

@@ -54,6 +54,7 @@ fn product_code_match_is_case_insensitive() {
         &catalog(),
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -88,6 +89,7 @@ fn package_family_name_match() {
         &catalog(),
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -115,6 +117,7 @@ fn name_and_publisher_with_arch_fallback() {
         &catalog(),
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -134,6 +137,7 @@ fn unknown_app_is_unmatched_and_never_upgradable() {
         &catalog(),
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(rows[0].correlation, Correlation::Unmatched);
@@ -215,10 +219,13 @@ fn ambiguous_is_never_resolved_silently() {
         &c,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     match &rows[0].correlation {
-        Correlation::Ambiguous { candidates, rule } => {
+        Correlation::Ambiguous {
+            candidates, rule, ..
+        } => {
             let mut c = candidates.clone();
             c.sort();
             assert_eq!(c, ["A.A", "B.B"]);
@@ -240,6 +247,7 @@ fn msix_is_never_matched_by_name_and_publisher() {
         &catalog(),
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(rows[0].correlation, Correlation::Unmatched);
@@ -259,6 +267,7 @@ fn live_list_runs_under_budget() {
         &cat,
         &NameNormalizer::new(),
         &wingetrs::installed::winget_tracking::load_default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     let matched = rows
@@ -327,6 +336,7 @@ fn tiebreak_tracking_picks_the_id_winget_installed() {
         &cat,
         &NameNormalizer::new(),
         &tracking,
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -352,11 +362,13 @@ fn tiebreak_tracking_outside_the_candidates_does_not_resolve() {
         &cat,
         &NameNormalizer::new(),
         &tracking,
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
         rows[0].correlation,
         Correlation::Ambiguous {
+            source: "winget".into(),
             candidates: vec!["Ruby.3.4".into(), "RubyDevKit.3.4".into()],
             rule: Rule::ProductCode
         }
@@ -375,6 +387,7 @@ fn tiebreak_arp_range_keeps_only_the_candidate_containing_the_version() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(rows[0].correlation, matched("Acme.New", Rule::ProductCode));
@@ -397,6 +410,7 @@ fn tiebreak_arp_range_never_drops_a_candidate_without_range() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     for r in &rows {
@@ -417,6 +431,7 @@ fn tiebreak_channel_ffmpeg_display_name_without_suffix_picks_base() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -438,6 +453,7 @@ fn tiebreak_channel_display_name_with_suffix_does_not_pick_base() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert!(matches!(rows[0].correlation, Correlation::Ambiguous { .. }));
@@ -460,6 +476,7 @@ fn tiebreak_channel_suffix_is_case_insensitive_and_needs_a_known_suffix() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -474,6 +491,7 @@ fn tiebreak_channel_suffix_is_case_insensitive_and_needs_a_known_suffix() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert!(matches!(rows[0].correlation, Correlation::Ambiguous { .. }));
@@ -487,11 +505,13 @@ fn tiebreak_without_objective_criterion_stays_ambiguous() {
         &cat,
         &NameNormalizer::new(),
         &Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
         rows[0].correlation,
         Correlation::Ambiguous {
+            source: "winget".into(),
             candidates: vec!["Acme.Tool".into(), "Other.Tool".into()],
             rule: Rule::ProductCode
         }
@@ -590,4 +610,106 @@ fn read_tracking_refuses_wal_catalogs_without_creating_files() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(before, after);
+}
+
+fn ambiguous_pair() -> (Catalog, InstalledApp) {
+    (
+        tied_catalog(&[("Acme.Tool", None, None), ("Other.Tool", None, None)]),
+        arp("dup", "Tool", "Acme", "1.0"),
+    )
+}
+
+fn run_with(
+    cat: &Catalog,
+    app: &InstalledApp,
+    choice: wingetrs::installed::overrides::Choice,
+) -> wingetrs::installed::correlate::ListRow {
+    let overrides =
+        std::collections::BTreeMap::from([(wingetrs::installed::overrides::app_key(app), choice)]);
+    correlate(
+        std::slice::from_ref(app),
+        cat,
+        &NameNormalizer::new(),
+        &Tracking::default(),
+        &overrides,
+    )
+    .unwrap()
+    .remove(0)
+}
+
+#[test]
+fn override_resolves_ambiguous() {
+    use wingetrs::installed::overrides::Choice;
+    let (cat, app) = ambiguous_pair();
+    let row = run_with(
+        &cat,
+        &app,
+        Choice::Package {
+            source: "winget".into(),
+            package_id: "Other.Tool".into(),
+        },
+    );
+    assert_eq!(row.correlation, matched("Other.Tool", Rule::User));
+    assert_eq!(row.latest.as_deref(), Some("9"));
+    assert_eq!(row.state, UpdateState::Available { latest: "9".into() });
+    assert_eq!(row.app_key, "arp/dup");
+}
+
+#[test]
+fn override_not_in_catalog_is_unmatched() {
+    let (cat, app) = ambiguous_pair();
+    let row = run_with(
+        &cat,
+        &app,
+        wingetrs::installed::overrides::Choice::NotInCatalog,
+    );
+    assert_eq!(row.correlation, Correlation::Unmatched);
+    assert!(row.not_in_catalog);
+    assert_eq!(row.state, UpdateState::Unknown);
+}
+
+#[test]
+fn override_to_missing_package_falls_back() {
+    let (cat, app) = ambiguous_pair();
+    let row = run_with(
+        &cat,
+        &app,
+        wingetrs::installed::overrides::Choice::Package {
+            source: "winget".into(),
+            package_id: "Gone.Pkg".into(),
+        },
+    );
+    assert!(matches!(row.correlation, Correlation::Ambiguous { .. }));
+}
+
+#[test]
+fn cli_list_uses_overrides() {
+    use wingetrs::installed::overrides::{self, Choice};
+    let (cat, app) = ambiguous_pair();
+    let dir = tempfile::tempdir().unwrap();
+    let data = wingetrs::cache::DataDir::new(dir.path());
+    let rows = |data: &wingetrs::cache::DataDir| {
+        correlate(
+            std::slice::from_ref(&app),
+            &cat,
+            &NameNormalizer::new(),
+            &Tracking::default(),
+            &overrides::load(data),
+        )
+        .unwrap()
+    };
+    let before = wingetrs::cli::output::list_text(&rows(&data), false);
+    assert!(before.contains("Ambíguos (1)"), "{before}");
+    overrides::set(
+        &data,
+        &overrides::app_key(&app),
+        Some(Choice::Package {
+            source: "winget".into(),
+            package_id: "Acme.Tool".into(),
+        }),
+    )
+    .unwrap();
+    let after = wingetrs::cli::output::list_text(&rows(&data), false);
+    assert!(!after.contains("Ambíguos"), "{after}");
+    assert!(after.contains("Acme.Tool"), "{after}");
 }

@@ -780,8 +780,9 @@ async fn run_async(
                 tracing::warn!("coleta de instalados: {e}");
             }
             let t = std::time::Instant::now();
+            let overrides = crate::installed::overrides::load(&data);
             let mut rows = crate::installed::timed("correlate", || {
-                correlate(&scan.apps, &catalog, &normalizer, &tracking)
+                correlate(&scan.apps, &catalog, &normalizer, &tracking, &overrides)
             })?;
             tracing::info!(
                 scan_ms = scan.elapsed_ms,

@@ -7,6 +7,7 @@ mod arp_win;
 pub mod correlate;
 pub mod guid;
 pub mod normalize;
+pub mod overrides;
 pub mod par;
 pub mod scoop;
 pub mod tiebreak;

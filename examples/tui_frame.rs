@@ -27,6 +27,8 @@ fn rows(entries: &[PackageEntry]) -> Vec<ListRow> {
         .enumerate()
         .map(|(i, e)| ListRow {
             name: e.name.clone(),
+            app_key: String::new(),
+            not_in_catalog: false,
             origin: "arp".into(),
             installed_version: Some("1".into()),
             correlation: Correlation::Matched {

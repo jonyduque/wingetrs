@@ -1092,6 +1092,16 @@ fn draw_modal(app: &App, modal: &Modal, theme: &Theme, frame: &mut Frame, area: 
                 area,
             );
         }
+        Modal::Choosing { picker, .. } => {
+            draw_picker(
+                picker,
+                "Escolha a correspondência",
+                "Enter escolhe · Esc cancela",
+                theme,
+                frame,
+                area,
+            );
+        }
         Modal::Residues { picker, app, .. } => {
             let title = format!("Resíduos de {app}");
             draw_picker(

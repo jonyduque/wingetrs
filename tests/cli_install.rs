@@ -473,6 +473,8 @@ async fn cli_and_tui_use_the_same_key() {
     a.tab = Tab::Installed;
     a.installed = vec![ListRow {
         name: "solo".into(),
+        app_key: String::new(),
+        not_in_catalog: false,
         origin: "wingetrs".into(),
         installed_version: Some("0.9".into()),
         correlation: Correlation::Matched {

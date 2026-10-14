@@ -307,6 +307,13 @@ async fn event_loop(
                         pinned,
                     });
                 }
+                Cmd::SetOverride { app_key, choice } => {
+                    spawn_job(&ctx, move |c, _| Msg::OverrideSaved {
+                        result: crate::installed::overrides::set(&c.data, &app_key, choice.clone())
+                            .map_err(|e| e.to_string()),
+                        choice,
+                    });
+                }
                 Cmd::LoadDetails { source, id } => {
                     spawn_details(&ctx, source, id);
                 }
@@ -701,9 +708,16 @@ fn spawn_scan(ctx: &Arc<Ctx>) {
         for e in &scan.errors {
             tracing::warn!("scan: {e}");
         }
-        match jobs::open_catalog_for_reading(&c.data.catalog_path())
-            .and_then(|cat| correlate(&scan.apps, &cat, &NameNormalizer::new(), &tracking))
-        {
+        let overrides = crate::installed::overrides::load(&c.data);
+        match jobs::open_catalog_for_reading(&c.data.catalog_path()).and_then(|cat| {
+            correlate(
+                &scan.apps,
+                &cat,
+                &NameNormalizer::new(),
+                &tracking,
+                &overrides,
+            )
+        }) {
             Ok(rows) => Msg::InstalledLoaded(rows),
             Err(e) => {
                 tracing::warn!("correlação falhou: {e}");

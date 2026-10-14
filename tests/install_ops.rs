@@ -757,6 +757,7 @@ async fn list_shows_wingetrs_origin_and_broken_apps() {
         &w.catalog,
         &wingetrs::installed::normalize::NameNormalizer::new(),
         &wingetrs::installed::winget_tracking::Tracking::default(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     let leaf = rows.iter().find(|r| r.name == "leaf").unwrap();

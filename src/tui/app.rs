@@ -5,7 +5,8 @@ use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
-use crate::installed::correlate::{Correlation, ListRow, UpdateState};
+use crate::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+use crate::installed::overrides::Choice;
 use crate::tui::icons::{IconCache, IconProtocol, choose_from_env};
 use crate::tui::layout::{
     DETAIL_ICON_COLS, DETAIL_ICON_ROWS, FILTER_GAP, ITEM_GAP, LIST_ICON_COLS,
@@ -68,6 +69,11 @@ pub enum Msg {
     },
     /// The `icons.json` map (`<source>/<id>` -> SHA-256 of the cached icon), read at startup.
     IconMapLoaded(BTreeMap<String, String>),
+    /// Result of writing the user's catalog match; a rescan follows on success.
+    OverrideSaved {
+        choice: Option<Choice>,
+        result: Result<(), String>,
+    },
     /// Result of writing `key` (un)pinned; the `App` already applied it and reverts on `Err`.
     PinSaved {
         key: String,
@@ -232,14 +238,37 @@ pub enum Modal {
         pin: Option<(String, bool)>,
         /// The tab has marked rows: the items act on them, not on `app`.
         marked: bool,
+        /// Correlation item of the row (first for `Choose`, last for `Undo`).
+        choice: Option<RowChoice>,
     },
     Residues {
         picker: Picker,
         app: String,
         residues: Vec<Residue>,
     },
+    /// Candidates of an ambiguous installed app, to pick its catalog match; the last item is
+    /// "none of these".
+    Choosing {
+        picker: Picker,
+        app_key: String,
+        source: String,
+        candidates: Vec<String>,
+    },
     /// The operation queue; `selected` is the id of the row under the cursor.
     Queue { selected: u64 },
+}
+
+/// Extra item of the actions menu that acts on the correlation of the selected installed row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RowChoice {
+    /// First item: choose among the candidates of an ambiguous row.
+    Choose {
+        app_key: String,
+        source: String,
+        candidates: Vec<String>,
+    },
+    /// Last item: drop the user's choice for this row.
+    Undo { app_key: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,6 +286,12 @@ pub enum Cmd {
     SetPin {
         key: String,
         pinned: bool,
+    },
+    /// Store (or, with `None`, drop) the user's catalog match of `app_key` in `correlations.json`;
+    /// answers with `Msg::OverrideSaved`.
+    SetOverride {
+        app_key: String,
+        choice: Option<Choice>,
     },
     /// Plan installing (or upgrading) one catalog package.
     /// `keep`: keep the old version when this is an upgrade (setting at key time).
@@ -1195,6 +1230,26 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             }
             Vec::new()
         }
+        Msg::OverrideSaved { choice, result } => match result {
+            Ok(()) => {
+                let text = match choice {
+                    Some(Choice::Package { package_id, .. }) => {
+                        format!("correspondência salva: {package_id}")
+                    }
+                    Some(Choice::NotInCatalog) => "marcado como fora do catálogo".to_string(),
+                    None => "escolha de correspondência desfeita".to_string(),
+                };
+                app.push_toast(ToastKind::Success, text);
+                vec![Cmd::ScanInstalled]
+            }
+            Err(e) => {
+                app.push_toast(
+                    ToastKind::Error,
+                    format!("falha ao gravar a correspondência: {e}"),
+                );
+                Vec::new()
+            }
+        },
         Msg::PinSaved {
             key,
             pinned,
@@ -1947,6 +2002,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             remove: None,
             pin: None,
             marked: true,
+            choice: None,
         });
         return Vec::new();
     }
@@ -1957,7 +2013,25 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     let pin_key = crate::pins::key(&r.origin, &r.name);
     let pinned = crate::pins::is_pinned(&app.pins, &r.origin, &r.name);
     let remove = (r.origin == "wingetrs").then(|| r.name.clone());
-    let items = vec![
+    let choice = match &r.correlation {
+        Correlation::Ambiguous {
+            source, candidates, ..
+        } => Some(RowChoice::Choose {
+            app_key: r.app_key.clone(),
+            source: source.clone(),
+            candidates: candidates.clone(),
+        }),
+        Correlation::Matched {
+            rule: Rule::User, ..
+        } => Some(RowChoice::Undo {
+            app_key: r.app_key.clone(),
+        }),
+        Correlation::Unmatched if r.not_in_catalog => Some(RowChoice::Undo {
+            app_key: r.app_key.clone(),
+        }),
+        _ => None,
+    };
+    let mut items = vec![
         PickerItem {
             label: "Atualizar".to_string(),
             detail: String::new(),
@@ -1977,6 +2051,19 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             note: None,
         },
     ];
+    let menu_item = |label: &str| PickerItem {
+        label: label.to_string(),
+        detail: String::new(),
+        selectable: true,
+        note: None,
+    };
+    match choice {
+        Some(RowChoice::Choose { .. }) => items.insert(0, menu_item("Escolher correspondência")),
+        Some(RowChoice::Undo { .. }) => {
+            items.push(menu_item("Desfazer escolha de correspondência"));
+        }
+        None => {}
+    }
     let name = r.name.clone();
     app.modal = Some(Modal::Actions {
         picker: Picker::single_at(items, 0),
@@ -1985,6 +2072,80 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
         remove,
         pin: Some((pin_key, !pinned)),
         marked: false,
+        choice,
+    });
+    Vec::new()
+}
+
+/// Runs the fixed item `at` (upgrade, remove, pin) of the actions menu of one installed app.
+fn pick_action(
+    app: &mut App,
+    at: Option<usize>,
+    upgrade: Option<(String, String)>,
+    remove: Option<String>,
+    pin: Option<(String, bool)>,
+) -> Vec<Cmd> {
+    match (at, upgrade, remove) {
+        (Some(0), Some((source_name, id)), _) => plan_upgrade(app, source_name, id),
+        (Some(1), _, Some(target)) => plan_remove(app, target),
+        (Some(2), _, _) => match pin {
+            Some((key, pinned)) => {
+                // Applied now; `Msg::PinSaved` reverts it if the write fails.
+                if pinned {
+                    app.pins.insert(key.clone());
+                } else {
+                    app.pins.remove(&key);
+                }
+                vec![Cmd::SetPin { key, pinned }]
+            }
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Opens the picker of the catalog candidates of an ambiguous installed row.
+fn open_choosing(app: &mut App, choice: Option<RowChoice>) -> Vec<Cmd> {
+    let Some(RowChoice::Choose {
+        app_key,
+        source,
+        candidates,
+    }) = choice
+    else {
+        return Vec::new();
+    };
+    let mut items: Vec<PickerItem> = candidates
+        .iter()
+        .map(|id| {
+            let detail = app
+                .search
+                .entries()
+                .iter()
+                .find(|e| e.source_name == source && e.id == *id)
+                .map(|e| match &e.publisher {
+                    Some(p) => format!("{} · {p}", e.name),
+                    None => e.name.clone(),
+                })
+                .unwrap_or_default();
+            PickerItem {
+                label: id.clone(),
+                detail,
+                selectable: true,
+                note: None,
+            }
+        })
+        .collect();
+    items.push(PickerItem {
+        label: "Nenhum destes (não está no catálogo)".to_string(),
+        detail: String::new(),
+        selectable: true,
+        note: None,
+    });
+    app.modal = Some(Modal::Choosing {
+        picker: Picker::single_at(items, 0),
+        app_key,
+        source,
+        candidates,
     });
     Vec::new()
 }
@@ -2465,6 +2626,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             remove,
             pin,
             marked,
+            choice,
         } => match picker.key(key) {
             PickOutcome::Pending => {
                 app.modal = Some(Modal::Actions {
@@ -2474,6 +2636,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     remove,
                     pin,
                     marked,
+                    choice,
                 });
                 Vec::new()
             }
@@ -2483,23 +2646,56 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 (Some(1), Some((rows, hidden))) => remove_marked(app, &rows, hidden),
                 _ => Vec::new(),
             },
-            PickOutcome::Picked(chosen) => match (chosen.first(), upgrade, remove) {
-                (Some(0), Some((source_name, id)), _) => plan_upgrade(app, source_name, id),
-                (Some(1), _, Some(target)) => plan_remove(app, target),
-                (Some(2), _, _) => match pin {
-                    Some((key, pinned)) => {
-                        // Applied now; `Msg::PinSaved` reverts it if the write fails.
-                        if pinned {
-                            app.pins.insert(key.clone());
-                        } else {
-                            app.pins.remove(&key);
+            PickOutcome::Picked(chosen) => {
+                let at = chosen.first().copied();
+                // `Choose` is the first item and shifts the fixed ones by one; `Undo` is last.
+                let fixed = match &choice {
+                    Some(RowChoice::Choose { .. }) => {
+                        if at == Some(0) {
+                            return open_choosing(app, choice);
                         }
-                        vec![Cmd::SetPin { key, pinned }]
+                        at.and_then(|i| i.checked_sub(1))
                     }
-                    None => Vec::new(),
-                },
-                _ => Vec::new(),
-            },
+                    Some(RowChoice::Undo { app_key }) if at == Some(3) => {
+                        return vec![Cmd::SetOverride {
+                            app_key: app_key.clone(),
+                            choice: None,
+                        }];
+                    }
+                    _ => at,
+                };
+                pick_action(app, fixed, upgrade, remove, pin)
+            }
+        },
+        Modal::Choosing {
+            mut picker,
+            app_key,
+            source,
+            candidates,
+        } => match picker.key(key) {
+            PickOutcome::Pending => {
+                app.modal = Some(Modal::Choosing {
+                    picker,
+                    app_key,
+                    source,
+                    candidates,
+                });
+                Vec::new()
+            }
+            PickOutcome::Cancelled => Vec::new(),
+            PickOutcome::Picked(chosen) => {
+                let choice = match chosen.first().and_then(|&i| candidates.get(i)) {
+                    Some(id) => Choice::Package {
+                        source,
+                        package_id: id.clone(),
+                    },
+                    None => Choice::NotInCatalog,
+                };
+                vec![Cmd::SetOverride {
+                    app_key,
+                    choice: Some(choice),
+                }]
+            }
         },
         Modal::Queue { selected } => queue_key(app, selected, key),
         Modal::Residues {
