@@ -2619,3 +2619,20 @@ fn icon_mapped_encodes_the_visible_row() {
         "{cmds:?}"
     );
 }
+
+#[test]
+fn dropped_keys_are_asked_again() {
+    let mut a = app();
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
+    let asked = got[0].1.clone();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    // The second was never started (a newer screen superseded it): it is asked again, alone.
+    let got = prefetches(&update(
+        &mut a,
+        Msg::PrefetchDropped(vec![asked[1].clone()]),
+    ));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, vec![asked[1].clone()]);
+    assert!(prefetches(&update(&mut a, Msg::Tick)).is_empty());
+}

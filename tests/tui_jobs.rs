@@ -658,6 +658,54 @@ mod prefetch {
     }
 
     #[tokio::test]
+    async fn prefetch_returns_the_keys_it_did_not_start() {
+        let counters: [Arc<AtomicUsize>; 3] = Default::default();
+        let [started, running, peak] = &counters;
+        let gate = Arc::new(Semaphore::new(0));
+        let generation = Arc::new(AtomicU64::new(0));
+        let fetch = gated(started, running, peak, &gate);
+        let run = tokio::spawn({
+            let generation = Arc::clone(&generation);
+            async move { prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await }
+        });
+        wait_for(started, MAX_LIST_FETCH).await;
+        generation.store(2, Ordering::SeqCst);
+        gate.add_permits(8);
+        assert_eq!(run.await.unwrap(), keys(8)[MAX_LIST_FETCH..].to_vec());
+        // Superseded during the debounce: nothing starts, every key comes back.
+        let fetch = gated(started, running, peak, &gate);
+        let dropped = prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(3), fetch).await;
+        assert_eq!(dropped, keys(3));
+        assert_eq!(started.load(Ordering::SeqCst), MAX_LIST_FETCH);
+    }
+
+    #[tokio::test]
+    async fn older_generation_never_wins() {
+        let generation = AtomicU64::new(0);
+        let slots = slots();
+        let (newer, older) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let counting = |n: &Arc<AtomicUsize>| {
+            let n = Arc::clone(n);
+            move |_: String, _: String| {
+                let n = Arc::clone(&n);
+                async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+        let debounce = Duration::from_millis(50);
+        // The tasks ran out of order: generation 6 marks itself before generation 5.
+        let (kept, dropped) = tokio::join!(
+            prefetch_list(&generation, 6, debounce, &slots, keys(3), counting(&newer)),
+            prefetch_list(&generation, 5, debounce, &slots, keys(2), counting(&older)),
+        );
+        assert_eq!(newer.load(Ordering::SeqCst), 3);
+        assert_eq!(older.load(Ordering::SeqCst), 0, "the older one fetched");
+        assert!(kept.is_empty());
+        assert_eq!(dropped, keys(2));
+    }
+
+    #[tokio::test]
     async fn prefetch_reraises_a_package_panic_after_the_others_end() {
         let done = Arc::new(AtomicUsize::new(0));
         let fetch = {

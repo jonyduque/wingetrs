@@ -708,11 +708,14 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) 
                     keys,
                     fetch,
                 )
-                .await;
+                .await
             }
         });
         match work.await {
-            Ok(()) => {}
+            Ok(dropped) if dropped.is_empty() => {}
+            Ok(dropped) => {
+                let _ = ctx.tx.send(Msg::PrefetchDropped(dropped));
+            }
             Err(e) if e.is_panic() => {
                 let _ = ctx.tx.send(Msg::Panicked(e.into_panic()));
             }
@@ -745,10 +748,11 @@ pub fn still_current(generation: &AtomicU64, mine: u64) -> bool {
     generation.load(Ordering::SeqCst) == mine
 }
 
-/// Marks `mine` as the newest prefetch, waits `debounce`, then runs `fetch` for each key in
-/// order, each on its own task holding one of `slots`. The generation is checked before
-/// each package starts; once superseded, the rest is skipped. Every task is awaited, and a
-/// panic in one is re-raised here after the others end.
+/// Marks `mine` as the newest prefetch (unless a newer one already ran), waits `debounce`,
+/// then runs `fetch` for each key in order, each on its own task holding one of `slots`.
+/// The generation is checked before each package starts; once superseded, the rest is
+/// skipped and returned. Every task is awaited, and a panic in one is re-raised here after
+/// the others end.
 pub async fn prefetch_list<F, Fut>(
     generation: &AtomicU64,
     mine: u64,
@@ -756,20 +760,26 @@ pub async fn prefetch_list<F, Fut>(
     slots: &Arc<tokio::sync::Semaphore>,
     keys: Vec<(String, String)>,
     fetch: F,
-) where
+) -> Vec<(String, String)>
+where
     F: Fn(String, String) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    generation.store(mine, Ordering::SeqCst);
+    // Tasks may run out of order: an older generation never takes the place of a newer one.
+    generation.fetch_max(mine, Ordering::SeqCst);
     tokio::time::sleep(debounce).await;
     let mut tasks = tokio::task::JoinSet::new();
-    for (source, id) in keys {
-        let Ok(slot) = Arc::clone(slots).acquire_owned().await else {
-            break;
+    let mut keys = keys.into_iter();
+    let mut dropped = Vec::new();
+    while let Some((source, id)) = keys.next() {
+        let slot = match Arc::clone(slots).acquire_owned().await {
+            Ok(slot) if still_current(generation, mine) => slot,
+            _ => {
+                dropped.push((source, id));
+                dropped.extend(keys);
+                break;
+            }
         };
-        if !still_current(generation, mine) {
-            break;
-        }
         let job = fetch(source, id);
         tasks.spawn(async move {
             job.await;
@@ -789,6 +799,7 @@ pub async fn prefetch_list<F, Fut>(
     if let Some(p) = panic {
         std::panic::resume_unwind(p);
     }
+    dropped
 }
 
 /// Icon bytes for the details; any failure is only logged, never an error of the details.

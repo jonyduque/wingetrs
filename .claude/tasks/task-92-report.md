@@ -42,3 +42,27 @@ Concerns:
 - Brief diz que `list_icon_cmds` roda só "pela mudança de tela e pelo IconReady"; no código (Task 85) `update()` já o chama após toda mensagem, então `IconMapped` já gerava `EncodeCachedIcon` e a mutação 3 é equivalente. Não dupliquei a chamada no braço `IconMapped`; o teste 4 existe e pega a remoção do caminho real.
 - Testes alterados (setup, não asserções): `list_never_fetches_icons` renomeado para `list_encodes_only_cached_icons` e passa a ignorar `PrefetchIcons` (a regra antiga "a lista nunca baixa" deixa de valer por design desta tarefa); `icon_encoded_for_an_old_protocol_is_discarded` desliga `list_icons_visible` (asserção de fatia exata).
 - Requisições reais (versionData/manifesto/ícone) no terminal real: não medido.
+
+## Correção da auditoria (fix commit)
+
+Commits: o commit `fix(tui): retry dropped list icons; generation never goes back` que contém esta seção (SHA na mensagem ao orquestrador).
+
+Gate:
+[OK]   rules 3s
+[OK]   rules-selftest 9s
+[OK]   fmt 1s
+[OK]   clippy 99s
+[OK]   test (714 passed, 18 ignored) 145s
+[OK]   gate verde
+
+Mutation proofs:
+- Não remover de `icon_tried` no `PrefetchDropped`: [OK] mutação PEGA: 'app.icon_tried.remove(&format!("{source}/{id}"));' -> 'let _ = (source, id);' fez o teste falhar (exit 101). (dropped_keys_are_asked_again)
+- Voltar a `store`: [OK] mutação PEGA: 'generation.fetch_max(mine, Ordering::SeqCst);' -> 'generation.store(mine, Ordering::SeqCst);' fez o teste falhar (exit 101). (older_generation_never_wins)
+- Não devolver o resto das chaves: [OK] mutação PEGA: '                dropped.extend(keys);' -> '' fez o teste falhar (exit 101). (prefetch_returns_the_keys_it_did_not_start)
+
+Decisions:
+- `prefetch_list` devolve as chaves não iniciadas (a que esbarrou na geração + o resto); `spawn_prefetch` manda `Msg::PrefetchDropped` só se a lista não for vazia; o App remove de `icon_tried` e o `list_fetch_cmds` de `update()` pede de novo as que ainda estão na tela.
+- Generation com `fetch_max` dentro de `prefetch_list` (a mesma função testada).
+
+Concerns:
+- O envio de `PrefetchDropped` dentro de `spawn_prefetch` não tem teste (precisa do `Ctx`); é um `match` de 3 linhas sobre o retorno testado.

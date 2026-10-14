@@ -70,6 +70,8 @@ pub enum Msg {
         key: String,
         sha: String,
     },
+    /// List rows a superseded `Cmd::PrefetchIcons` never started; they may be asked again.
+    PrefetchDropped(Vec<(String, String)>),
     /// The icon of `key` encoded for `size` cells (columns, rows), or why it could not be.
     IconReady {
         /// `App::icon_gen` when the encode was requested; older results are dropped.
@@ -1002,6 +1004,13 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::IconMapped { key, sha } => {
             app.icon_map.insert(key, sha);
+            Vec::new()
+        }
+        Msg::PrefetchDropped(keys) => {
+            // `update` asks again for those still on screen.
+            for (source, id) in keys {
+                app.icon_tried.remove(&format!("{source}/{id}"));
+            }
             Vec::new()
         }
         Msg::IconReady {
