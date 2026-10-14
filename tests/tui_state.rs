@@ -2146,7 +2146,7 @@ fn icon_encoded_for_an_old_protocol_is_discarded() {
         cmds.as_slice(),
         [Cmd::EncodeIcon { generation: 0, .. }]
     ));
-    // Switch to Sixel (Ícones is the 6th row) while that encode is in flight.
+    // Switch to Sixel (Ícones is the 7th row) while that encode is in flight.
     a.tab = Tab::Settings;
     for _ in 0..6 {
         update(&mut a, key(KeyCode::Down));

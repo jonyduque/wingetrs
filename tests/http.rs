@@ -164,3 +164,18 @@ fn insecure_redirect_is_not_offline() {
     assert!(!e.is_offline());
     assert!(e.to_string().contains("permita em Ajustes"));
 }
+
+#[tokio::test]
+#[ignore = "live: https to http redirect via httpbin"]
+async fn live_https_to_http_redirect_is_refused() {
+    let url = "https://httpbin.org/redirect-to?url=http://example.com";
+    let h = Http::new().unwrap();
+    match h.get(url).await {
+        Err(HttpError::InsecureRedirect(u)) => assert!(u.starts_with("http://example.com"), "{u}"),
+        other => panic!("expected InsecureRedirect, got {other:?}"),
+    }
+    h.set_allow_http_redirect(true);
+    if let Err(e) = h.get(url).await {
+        assert!(!matches!(e, HttpError::InsecureRedirect(_)), "{e}");
+    }
+}
