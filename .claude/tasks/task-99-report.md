@@ -3,7 +3,10 @@
 Status: DONE_WITH_CONCERNS
 
 Commits:
-(preenchido abaixo, após o commit; ver `git log --format='%h %s' 4a1471e..HEAD`)
+```
+9529f8f chore(tasks): scoop icon probe report for task 99
+```
+(+ o commit seguinte, que só preenche esta linha de SHA)
 
 Gate: não se aplica — tarefa de sonda, nenhum arquivo de código mudou (só este relatório). `verify.ps1` não foi rodado.
 
