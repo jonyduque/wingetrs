@@ -2345,6 +2345,9 @@ fn confirm_text_never_overflows() {
     let names: Vec<String> = (0..5).map(|i| format!("{i}{}", "n".repeat(79))).collect();
     let mut a = confirm_of(&names, GlyphSet::Unicode);
     a.size = (60, 15);
+    if let Some(wingetrs::tui::app::Modal::Confirm { notes, .. }) = &mut a.modal {
+        notes.push(format!("aviso {}", "x".repeat(100)));
+    }
     let theme = Theme::new(true, ColorDepth::NoColor);
     let with = screen_cells(&a, 60, 15, &theme);
     let dialog =
@@ -2381,7 +2384,17 @@ fn confirm_text_never_overflows() {
             cut += 1;
         }
     }
-    assert!(cut >= 2, "at least two items on screen");
+    assert!(cut >= 1, "an item on screen beside the notes");
+    // The long note is cut too.
+    let note = (dialog.y..dialog.bottom())
+        .map(|y| {
+            (dialog.x + 1..dialog.right() - 1)
+                .map(|x| with[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .find(|t| t.contains("xxx"))
+        .expect("note on screen");
+    assert!(note.trim_end().ends_with('…'), "{note:?}");
 }
 
 #[test]
@@ -2420,6 +2433,23 @@ fn confirm_scrolls_with_many_items() {
         out.contains("pacote03") && !out.contains("pacote02"),
         "{out}"
     );
+    // A click after the wheel toggles the item on that row, not the one scroll 0 had there.
+    update(
+        &mut w,
+        Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: list.x + 2,
+            row: list.y + 2,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    match &w.modal {
+        Some(Modal::Confirm { items, .. }) => {
+            let off: Vec<usize> = (0..items.len()).filter(|&i| !items[i].checked).collect();
+            assert_eq!(off, [4]);
+        }
+        _ => panic!("confirmation not open"),
+    }
 }
 
 #[test]

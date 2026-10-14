@@ -4686,3 +4686,107 @@ fn confirm_buttons_clickable() {
     assert_eq!(cmds, vec![Cmd::Execute(apply_action("a"))], "same as Enter");
     assert!(a.modal.is_none());
 }
+
+#[test]
+fn unchecking_an_apply_group() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            irow("alpha", "wingetrs", "scoop:main", true),
+            irow("beta", "wingetrs", "scoop:main", true),
+            irow("Git.Git", "arp", "winget", true),
+        ],
+    );
+    mark_all(&mut a);
+    update(&mut a, key(KeyCode::Char('U')));
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![ready_apply("alpha"), ready_apply("beta")]),
+    );
+    assert_eq!(checked(&a), [true, true, true]);
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Char(' ')));
+    assert_eq!(checked(&a), [true, false, true]);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(cmds, vec![Cmd::Execute(apply_action("alpha"))]);
+    let queued: Vec<Action> = a.queue.iter().map(|q| q.action.clone()).collect();
+    assert_eq!(
+        queued,
+        vec![Action::Bridge(BridgeJob {
+            tool: Tool::Winget,
+            target: "Git.Git".into(),
+            name: "Git.Git".into(),
+        })]
+    );
+}
+
+fn confirm_notes(a: &App) -> Vec<String> {
+    match &a.modal {
+        Some(Modal::Confirm { notes, .. }) => notes.clone(),
+        _ => panic!("confirmation not open"),
+    }
+}
+
+#[test]
+fn unchecked_dependency_is_noted() {
+    let mut a = app();
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: String::new(),
+            action: Action::Apply(vec![vec![plan("lib"), plan("tool")], vec![plan("lib")]]),
+        })),
+    );
+    assert!(confirm_notes(&a).is_empty());
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Char(' ')));
+    assert_eq!(
+        confirm_notes(&a),
+        ["lib será instalado mesmo assim: é dependência de tool"]
+    );
+    // Unchecking the one that needs it too: nothing installs lib any more.
+    update(&mut a, key(KeyCode::Up));
+    update(&mut a, key(KeyCode::Char(' ')));
+    assert!(confirm_notes(&a).is_empty(), "{:?}", confirm_notes(&a));
+    update(&mut a, key(KeyCode::Char(' ')));
+    assert_eq!(confirm_notes(&a).len(), 1);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(
+        cmds,
+        vec![Cmd::Execute(Action::Apply(vec![vec![
+            plan("lib"),
+            plan("tool")
+        ]]))]
+    );
+}
+
+#[test]
+fn bridge_item_takes_versions_from_its_own_row() {
+    let row = |origin: &str, source: &str, from: &str, to: &str| ListRow {
+        installed_version: Some(from.into()),
+        latest: Some(to.into()),
+        state: UpdateState::Available { latest: to.into() },
+        ..irow("Foo", origin, source, true)
+    };
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            row("arp", "winget", "3", "4"),
+            row("scoop", "scoop:main", "5", "6"),
+        ],
+    );
+    a.marks
+        .insert(Tab::Updates, [row_key("scoop", "Foo")].into());
+    update(&mut a, key(KeyCode::Char('U')));
+    match &a.modal {
+        Some(Modal::Confirm { items, .. }) => {
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].manager, "scoop");
+            assert_eq!(
+                (items[0].from.as_deref(), items[0].to.as_deref()),
+                (Some("5"), Some("6"))
+            );
+        }
+        _ => panic!("confirmation not open"),
+    }
+}

@@ -2091,10 +2091,23 @@ fn row_key(r: &ListRow) -> Option<(String, String)> {
 
 /// One item per package of `actions` (built once, when the dialog opens).
 fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
-    let row = |name: &str, ours: bool| {
+    let ours = |name: &str| {
         app.installed
             .iter()
-            .find(|r| r.name == name && (r.origin == "wingetrs") == ours)
+            .find(|r| r.name == name && r.origin == "wingetrs")
+    };
+    // The row `bridge_target` built the job from: same name, origin and target.
+    let bridged = |job: &BridgeJob| {
+        app.installed.iter().find(|r| {
+            r.name == job.name
+                && match job.tool {
+                    Tool::Scoop => r.origin == "scoop",
+                    Tool::Winget => {
+                        matches!(r.origin.as_str(), "arp" | "msix")
+                            && row_key(r).is_some_and(|(_, id)| id == job.target)
+                    }
+                }
+        })
     };
     let mut items = Vec::new();
     for action in actions {
@@ -2112,14 +2125,14 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
             }
             Action::Remove(p) => items.push(ConfirmItem {
                 name: p.app.clone(),
-                key: row(&p.app, true).and_then(row_key),
+                key: ours(&p.app).and_then(row_key),
                 from: Some(p.version.clone()),
                 to: None,
                 manager: "wingetrs",
                 checked: true,
             }),
             Action::Bridge(job) => {
-                let r = row(&job.name, false);
+                let r = bridged(job);
                 items.push(ConfirmItem {
                     name: job.name.clone(),
                     key: r.and_then(row_key),
@@ -2163,6 +2176,67 @@ fn confirm_modal(
         cursor: 0,
         actions,
         clear_marks,
+    }
+}
+
+/// Middle of the note of an unchecked package that a checked one still installs.
+const KEPT_DEP_NOTE: &str = " será instalado mesmo assim: é dependência de ";
+
+/// `(checked, group)` of each `Apply` group, aligned with `items` as `confirm_items` built it.
+fn apply_groups<'a>(
+    items: &[ConfirmItem],
+    actions: &'a [Action],
+) -> Vec<(bool, &'a [InstallPlan])> {
+    let mut checked = items.iter().map(|i| i.checked);
+    let mut out = Vec::new();
+    for action in actions {
+        match action {
+            Action::Apply(groups) => {
+                for g in groups.iter().filter(|g| !g.is_empty()) {
+                    out.push((checked.next().unwrap_or(false), g.as_slice()));
+                }
+            }
+            _ => {
+                checked.next();
+            }
+        }
+    }
+    out
+}
+
+/// Replaces the notes of unchecked packages that a checked group installs anyway (its
+/// dependency): called whenever an item is toggled.
+fn refresh_kept_deps(items: &[ConfirmItem], actions: &[Action], notes: &mut Vec<String>) {
+    notes.retain(|n| !n.contains(KEPT_DEP_NOTE));
+    let groups = apply_groups(items, actions);
+    for (_, g) in groups.iter().filter(|(checked, _)| !checked) {
+        let Some(target) = g.last() else { continue };
+        let owner = groups
+            .iter()
+            .filter(|(checked, _)| *checked)
+            .find_map(|(_, other)| {
+                let last = other.last()?;
+                other[..other.len() - 1]
+                    .iter()
+                    .any(|p| p.app.eq_ignore_ascii_case(&target.app))
+                    .then_some(last)
+            });
+        if let Some(owner) = owner {
+            notes.push(format!("{}{KEPT_DEP_NOTE}{}", target.app, owner.app));
+        }
+    }
+}
+
+/// Toggles item `index` of a confirmation and refreshes the dependency notes.
+fn toggle_confirm_item(
+    items: &mut [ConfirmItem],
+    actions: &[Action],
+    notes: &mut Vec<String>,
+    index: usize,
+) {
+    if let Some(item) = items.get_mut(index) {
+        item.checked = !item.checked;
+        refresh_kept_deps(items, actions, notes);
     }
 }
 
@@ -3320,8 +3394,10 @@ fn confirm_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     let rows = confirm_rows(app);
     let Some(Modal::Confirm {
         items,
+        notes,
         scroll,
         cursor,
+        actions,
         ..
     }) = &mut app.modal
     else {
@@ -3335,11 +3411,7 @@ fn confirm_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Up => *cursor = cursor.saturating_sub(1),
         KeyCode::Down => *cursor = (*cursor + 1).min(items.len().saturating_sub(1)),
-        KeyCode::Char(' ') => {
-            if let Some(item) = items.get_mut(*cursor) {
-                item.checked = !item.checked;
-            }
-        }
+        KeyCode::Char(' ') => toggle_confirm_item(items, actions, notes, *cursor),
         _ => {}
     }
     *scroll = crate::tui::view::list_window(*cursor, *scroll, items.len(), rows).start;
@@ -3392,8 +3464,10 @@ fn confirm_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
     let rows = usize::from(r.confirm_list.height) / ITEM_ROWS;
     let Some(Modal::Confirm {
         items,
+        notes,
         scroll,
         cursor,
+        actions,
         ..
     }) = &mut app.modal
     else {
@@ -3403,10 +3477,8 @@ fn confirm_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) if inside(r.confirm_list) => {
             let index = shown.start + usize::from(ev.row - r.confirm_list.y) / ITEM_ROWS;
-            if index < shown.end
-                && let Some(item) = items.get_mut(index)
-            {
-                item.checked = !item.checked;
+            if index < shown.end {
+                toggle_confirm_item(items, actions, notes, index);
                 *cursor = index;
             }
         }
