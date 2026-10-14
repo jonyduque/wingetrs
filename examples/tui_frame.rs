@@ -43,6 +43,7 @@ fn rows(entries: &[PackageEntry]) -> Vec<ListRow> {
                 UpdateState::UpToDate
             },
             tiebreak: None,
+            ..Default::default()
         })
         .collect()
 }

@@ -301,6 +301,7 @@ fn actions_modal_snapshot() {
         latest: Some("2".into()),
         state: UpdateState::Available { latest: "2".into() },
         tiebreak: None,
+        ..Default::default()
     }];
     a.tab = Tab::Installed;
     press(&mut a, crossterm::event::KeyCode::Enter);
@@ -473,6 +474,7 @@ fn installed_details_show_the_catalog_publisher() {
             latest: None,
             state: UpdateState::UpToDate,
             tiebreak: None,
+            ..Default::default()
         }]),
     );
     update(
@@ -1034,6 +1036,7 @@ fn installed_second_line_explains_missing_correlation() {
         latest: None,
         state: UpdateState::UpToDate,
         tiebreak: None,
+        ..Default::default()
     };
     let _ = Rule::ScoopManifest;
     let mut a = App::new(vec![], GlyphSet::Ascii);
@@ -1545,6 +1548,7 @@ fn bare_installed_app() -> App {
             latest: None,
             state: UpdateState::UpToDate,
             tiebreak: None,
+            ..Default::default()
         }]),
     );
     press(&mut a, crossterm::event::KeyCode::Tab);
@@ -1970,10 +1974,42 @@ fn pinned_row_shows_the_pin_glyph() {
         latest: None,
         state: UpdateState::UpToDate,
         tiebreak: None,
+        ..Default::default()
     }];
     let pin = wingetrs::tui::theme::Glyphs::for_set(GlyphSet::Unicode).pin;
     assert!(!render(&a, 100, 24).contains(pin));
     a.pins.insert(wingetrs::pins::key("wingetrs", "beta"));
     let out = render(&a, 100, 24);
     assert!(out.contains(pin), "{out}");
+}
+
+#[test]
+fn details_list_records_and_warning() {
+    use wingetrs::installed::correlate::{ListRow, OtherRecord, UpdateState};
+    use wingetrs::tui::app::Tab;
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.installed = vec![ListRow {
+        name: "Kindle".into(),
+        origin: "arp".into(),
+        location: "usuário".into(),
+        installed_version: Some("2.9.1".into()),
+        others: vec![OtherRecord {
+            app_key: "arp/hklm32/K".into(),
+            origin: "arp".into(),
+            location: "máquina 32-bit".into(),
+            installed_version: Some("2.8.3".into()),
+            state: UpdateState::Unknown,
+        }],
+        ..Default::default()
+    }];
+    a.tab = Tab::Installed;
+    let screen = render(&a, 140, 24);
+    assert!(screen.contains("Registros"), "{screen}");
+    assert!(screen.contains("usuário · 2.9.1 · arp"), "{screen}");
+    assert!(screen.contains("máquina 32-bit · 2.8.3 · arp"), "{screen}");
+    assert!(screen.contains("mais de um registro"), "{screen}");
+    assert!(screen.contains("+1"), "{screen}");
+    a.installed[0].others.clear();
+    let screen = render(&a, 140, 24);
+    assert!(!screen.contains("Registros"), "{screen}");
 }

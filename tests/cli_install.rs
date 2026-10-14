@@ -485,6 +485,7 @@ async fn cli_and_tui_use_the_same_key() {
         latest: None,
         state: UpdateState::UpToDate,
         tiebreak: None,
+        ..Default::default()
     }];
     let k = |c| Msg::Key(KeyEvent::new(c, KeyModifiers::NONE));
     update(&mut a, k(KeyCode::Enter));

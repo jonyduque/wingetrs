@@ -652,7 +652,7 @@ fn override_resolves_ambiguous() {
     assert_eq!(row.correlation, matched("Other.Tool", Rule::User));
     assert_eq!(row.latest.as_deref(), Some("9"));
     assert_eq!(row.state, UpdateState::Available { latest: "9".into() });
-    assert_eq!(row.app_key, "arp/dup");
+    assert_eq!(row.app_key, "arp/hklm64/dup");
 }
 
 #[test]
@@ -712,4 +712,84 @@ fn cli_list_uses_overrides() {
     let after = wingetrs::cli::output::list_text(&rows(&data), false);
     assert!(!after.contains("Ambíguos"), "{after}");
     assert!(after.contains("Acme.Tool"), "{after}");
+}
+
+fn kindle(hive: Hive, name: &str, version: &str) -> InstalledApp {
+    InstalledApp {
+        source: InstallSource::Arp(hive),
+        key: "Amazon Kindle".into(),
+        product_code: Some("{23170F69-40C1-2701-1900-000001000000}".into()),
+        ..arp("Amazon Kindle", name, "Amazon", version)
+    }
+}
+
+fn run(apps: &[InstalledApp]) -> Vec<wingetrs::installed::correlate::ListRow> {
+    correlate(
+        apps,
+        &catalog(),
+        &NameNormalizer::new(),
+        &Tracking::default(),
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn same_name_rows_become_one_with_newest_first() {
+    let rows = run(&[
+        kindle(Hive::MachineX86, "Amazon Kindle", "2.8.3.70995"),
+        kindle(Hive::User, "Amazon kindle", "2.9.1.71006"),
+    ]);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let r = &rows[0];
+    assert_eq!(r.installed_version.as_deref(), Some("2.9.1.71006"));
+    assert_eq!(r.location, "usuário");
+    assert_eq!(r.others.len(), 1);
+    let o = &r.others[0];
+    assert_eq!(o.location, "máquina 32-bit");
+    assert_eq!(o.installed_version.as_deref(), Some("2.8.3.70995"));
+    assert_eq!(o.app_key, "arp/hklm32/Amazon Kindle");
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(json.contains("\"others\""), "{json}");
+}
+
+#[test]
+fn tie_prefers_matched_then_first() {
+    let mut unmatched = kindle(Hive::MachineX64, "Tool", "1.0");
+    unmatched.product_code = None;
+    unmatched.key = "other".into();
+    let matched = kindle(Hive::User, "Tool", "1.0");
+    let rows = run(&[unmatched.clone(), matched.clone()]);
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].correlation, Correlation::Matched { .. }));
+    assert_eq!(rows[0].location, "usuário");
+    assert_eq!(rows[0].others[0].location, "máquina 64-bit");
+    // Two equal rows keep the first.
+    let rows = run(&[
+        kindle(Hive::MachineX64, "Tool", "1.0"),
+        kindle(Hive::User, "Tool", "1.0"),
+    ]);
+    assert_eq!(rows[0].location, "máquina 64-bit");
+}
+
+#[test]
+fn app_keys_differ_by_hive() {
+    use wingetrs::installed::overrides::app_key;
+    let x = |h| InstalledApp {
+        key: "X".into(),
+        ..kindle(h, "X", "1")
+    };
+    assert_eq!(app_key(&x(Hive::MachineX86)), "arp/hklm32/X");
+    assert_eq!(app_key(&x(Hive::User)), "arp/hkcu/X");
+    assert_eq!(app_key(&x(Hive::MachineX64)), "arp/hklm64/X");
+}
+
+#[test]
+fn cli_list_shows_extra_records() {
+    let rows = run(&[
+        kindle(Hive::MachineX86, "Amazon Kindle", "2.8.3.70995"),
+        kindle(Hive::User, "Amazon Kindle", "2.9.1.71006"),
+    ]);
+    let text = wingetrs::cli::output::list_text(&rows, false);
+    assert!(text.contains("+1 registro"), "{text}");
 }

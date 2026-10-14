@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 
 use crate::cache::DataDir;
-use crate::installed::InstalledApp;
 use crate::installed::correlate::origin;
+use crate::installed::{Hive, InstallSource, InstalledApp};
 
 static OVERRIDES_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Serializes the load-modify-rename of `correlations.json` within the process.
@@ -23,9 +23,30 @@ fn overrides_path(data: &DataDir) -> std::path::PathBuf {
     data.root().join("correlations.json")
 }
 
-/// Stable identity of an installed app: `<source>/<key>` (`arp/{GUID}`, `msix/<family>`, `scoop/<name>`).
+/// Stable identity of an installed app: `arp/<hklm64|hklm32|hkcu>/<subkey>`, `msix/<family>`,
+/// `scoop/<name>`. The hive is part of the ARP key: one subkey can exist in two hives.
 pub fn app_key(app: &InstalledApp) -> String {
-    format!("{}/{}", origin(&app.source), app.key)
+    match &app.source {
+        InstallSource::Arp(hive) => format!("arp/{}/{}", hive_tag(*hive), app.key),
+        _ => format!("{}/{}", origin(&app.source), app.key),
+    }
+}
+
+fn hive_tag(hive: Hive) -> &'static str {
+    match hive {
+        Hive::MachineX64 => "hklm64",
+        Hive::MachineX86 => "hklm32",
+        Hive::User => "hkcu",
+    }
+}
+
+/// The user's choice for `app`: its own key first, then the legacy ARP key `arp/<subkey>`
+/// (written before the hive joined the key), which applies to that subkey in any hive.
+pub fn lookup<'a>(map: &'a BTreeMap<String, Choice>, app: &InstalledApp) -> Option<&'a Choice> {
+    map.get(&app_key(app)).or_else(|| match app.source {
+        InstallSource::Arp(_) => map.get(&format!("arp/{}", app.key)),
+        _ => None,
+    })
 }
 
 /// Missing or corrupt file yields an empty map.

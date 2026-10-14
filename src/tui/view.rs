@@ -568,6 +568,9 @@ fn list_lines<'a>(
                         state_span(theme, g, r),
                     ],
                 };
+                if !r.others.is_empty() {
+                    right.push(Span::styled(format!(" +{}", r.others.len()), theme.muted()));
+                }
                 if crate::pins::is_pinned(&app.pins, &r.origin, &r.name) {
                     right.push(Span::raw(" "));
                     right.push(Span::styled(g.pin, theme.warn()));
@@ -802,6 +805,38 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
     };
     if let Some(d) = desc {
         out.push(Line::from(Span::styled(d, theme.description())));
+    }
+    if matches!(app.tab, Tab::Installed | Tab::Updates)
+        && let Some(r) = app.installed_view().get(app.selected)
+        && !r.others.is_empty()
+    {
+        out.push(Line::raw(""));
+        out.push(heading(theme, "Registros"));
+        let version = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".to_string());
+        out.push(Line::from(Span::styled(
+            format!(
+                "  {} · {} · {}",
+                r.location,
+                version(&r.installed_version),
+                r.origin
+            ),
+            theme.fg(),
+        )));
+        for o in &r.others {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "  {} · {} · {}",
+                    o.location,
+                    version(&o.installed_version),
+                    o.origin
+                ),
+                theme.fg(),
+            )));
+        }
+        out.push(Line::from(Span::styled(
+            "O Windows tem mais de um registro deste app. Pode ser uma instalação antiga esquecida ou o mesmo app instalado de dois jeitos.",
+            italic_muted(theme),
+        )));
     }
     match loaded {
         Some(Ok(d)) => {

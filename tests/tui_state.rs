@@ -191,6 +191,7 @@ fn row(
         latest: None,
         state,
         tiebreak: None,
+        ..Default::default()
     }
 }
 
@@ -347,6 +348,7 @@ fn irow(name: &str, origin: &str, source: &str, available: bool) -> ListRow {
             UpdateState::UpToDate
         },
         tiebreak: None,
+        ..Default::default()
     }
 }
 
@@ -2364,6 +2366,7 @@ fn srow(name: &str, origin: &str, source: Option<&str>, state: UpdateState) -> L
         latest: None,
         state,
         tiebreak: None,
+        ..Default::default()
     }
 }
 

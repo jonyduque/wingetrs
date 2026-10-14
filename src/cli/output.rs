@@ -111,6 +111,18 @@ fn aligned<const N: usize>(header: [&str; N], cells: &[[String; N]]) -> String {
     out
 }
 
+/// `, +N registros` for a row that folded other records, else empty.
+fn extra_suffix(r: &ListRow) -> String {
+    if r.others.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", {}",
+            crate::installed::correlate::extra_records_label(r.others.len())
+        )
+    }
+}
+
 /// `Nome  Id  Instalada  Disponível  Fonte  Origem` for correlated rows, followed by the
 /// ambiguous and unmatched sections unless `upgradable_only`. A broken wingetrs install
 /// shows "quebrado" instead of its version.
@@ -134,6 +146,14 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
                 if upgradable_only && available.is_empty() {
                     continue;
                 }
+                let installed = if r.others.is_empty() {
+                    installed
+                } else {
+                    format!(
+                        "{installed} {}",
+                        crate::installed::correlate::extra_records_label(r.others.len())
+                    )
+                };
                 cells.push([
                     r.name.clone(),
                     package_id.clone(),
@@ -145,14 +165,20 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
             }
             Correlation::Ambiguous { candidates, .. } => {
                 ambiguous.push(format!(
-                    "{} ({installed}, {}): {}",
+                    "{} ({installed}{}, {}): {}",
                     r.name,
+                    extra_suffix(r),
                     r.origin,
                     candidates.join(", ")
                 ));
             }
             Correlation::Unmatched => {
-                unmatched.push(format!("{} ({installed}, {})", r.name, r.origin));
+                unmatched.push(format!(
+                    "{} ({installed}{}, {})",
+                    r.name,
+                    extra_suffix(r),
+                    r.origin
+                ));
             }
         }
     }

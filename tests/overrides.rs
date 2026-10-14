@@ -27,3 +27,34 @@ fn overrides_round_trip_and_survive_corruption() {
     set(&data, "arp/{G}", Some(pkg.clone())).unwrap();
     assert_eq!(load(&data).get("arp/{G}"), Some(&pkg));
 }
+
+#[test]
+fn legacy_override_key_still_applies() {
+    use wingetrs::installed::overrides::lookup;
+    use wingetrs::installed::{Hive, InstallSource, InstalledApp};
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    let pkg = |id: &str| Choice::Package {
+        source: "winget".into(),
+        package_id: id.into(),
+    };
+    let app = InstalledApp {
+        source: InstallSource::Arp(Hive::User),
+        key: "X".into(),
+        name: "X".into(),
+        publisher: None,
+        version: None,
+        product_code: None,
+        upgrade_code: None,
+        family_name: None,
+        scoop_bucket: None,
+    };
+    std::fs::write(
+        dir.path().join("correlations.json"),
+        br#"{"arp/X":{"kind":"Package","source":"winget","package_id":"Old.Id"}}"#,
+    )
+    .unwrap();
+    assert_eq!(lookup(&load(&data), &app), Some(&pkg("Old.Id")));
+    set(&data, "arp/hkcu/X", Some(pkg("New.Id"))).unwrap();
+    assert_eq!(lookup(&load(&data), &app), Some(&pkg("New.Id")));
+}

@@ -7,7 +7,7 @@ use crate::installed::normalize::NameNormalizer;
 use crate::installed::overrides::{self, Choice};
 use crate::installed::tiebreak::{Candidate, Tiebreak, break_tie};
 use crate::installed::winget_tracking::Tracking;
-use crate::installed::{InstallSource, InstalledApp};
+use crate::installed::{Hive, InstallSource, InstalledApp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Rule {
@@ -20,7 +20,7 @@ pub enum Rule {
     User,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub enum Correlation {
     Matched {
         source: String,
@@ -33,21 +33,33 @@ pub enum Correlation {
         candidates: Vec<String>,
         rule: Rule,
     },
+    #[default]
     Unmatched,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub enum UpdateState {
     UpToDate,
     Available {
         latest: String,
     },
+    #[default]
     Unknown,
     /// Installed by wingetrs, but `current` or its `install.json` is missing (run `repair`).
     Broken,
 }
 
+/// Another registry record of the same app name, folded into the main row by `group_duplicates`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OtherRecord {
+    pub app_key: String,
+    pub origin: String,
+    pub location: String,
+    pub installed_version: Option<String>,
+    pub state: UpdateState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ListRow {
     pub name: String,
     /// Stable identity of the installed app (`overrides::app_key`).
@@ -62,6 +74,11 @@ pub struct ListRow {
     pub state: UpdateState,
     /// Tie-break that turned an ambiguous correlation into `Matched` (debugging aid).
     pub tiebreak: Option<Tiebreak>,
+    /// Where the record lives, readable (`location`).
+    pub location: String,
+    /// The other records of the same name, in scan order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub others: Vec<OtherRecord>,
 }
 
 const WINGET_SOURCE: &str = "winget";
@@ -209,6 +226,78 @@ fn find(
     by_scoop(app, catalog)
 }
 
+/// Readable place of an installed record.
+pub fn location(source: &InstallSource) -> &'static str {
+    match source {
+        InstallSource::Arp(Hive::MachineX64) => "máquina 64-bit",
+        InstallSource::Arp(Hive::MachineX86) => "máquina 32-bit",
+        InstallSource::Arp(Hive::User) => "usuário",
+        InstallSource::Msix => "msix",
+        InstallSource::Scoop => "scoop",
+        InstallSource::Wingetrs => "wingetrs",
+    }
+}
+
+/// `+1 registro` / `+N registros`: the hint that a row hides other records of its name.
+pub fn extra_records_label(n: usize) -> String {
+    if n == 1 {
+        "+1 registro".to_string()
+    } else {
+        format!("+{n} registros")
+    }
+}
+
+/// Folds rows with the same name (trimmed, case-insensitive) into one: the newest version is
+/// the main row (a tie goes to `Matched`, then to the first), the rest become `others`.
+/// Groups come out in the order of their first occurrence.
+pub fn group_duplicates(rows: Vec<ListRow>) -> Vec<ListRow> {
+    let mut groups: Vec<Vec<ListRow>> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for r in rows {
+        let key = r.name.trim().to_lowercase();
+        match index.get(&key) {
+            Some(&i) => groups[i].push(r),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(vec![r]);
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .map(|mut g| {
+            if g.len() == 1 {
+                return g.remove(0);
+            }
+            let rank = |r: &ListRow| {
+                (
+                    r.installed_version.as_deref().map(Version::parse),
+                    matches!(r.correlation, Correlation::Matched { .. }),
+                )
+            };
+            let mut best = 0;
+            for i in 1..g.len() {
+                // Strictly greater: an equal rank keeps the earlier row.
+                if rank(&g[i]) > rank(&g[best]) {
+                    best = i;
+                }
+            }
+            let mut main = g.remove(best);
+            main.others = g
+                .into_iter()
+                .map(|r| OtherRecord {
+                    app_key: r.app_key,
+                    origin: r.origin,
+                    location: r.location,
+                    installed_version: r.installed_version,
+                    state: r.state,
+                })
+                .collect();
+            main
+        })
+        .collect()
+}
+
 pub fn origin(source: &InstallSource) -> &'static str {
     match source {
         InstallSource::Arp(_) => "arp",
@@ -234,11 +323,13 @@ fn row(
         app_key: overrides::app_key(app),
         not_in_catalog: false,
         origin: origin(&app.source).to_string(),
+        location: location(&app.source).to_string(),
         installed_version: app.version.clone(),
         correlation,
         latest,
         state,
         tiebreak: None,
+        others: Vec::new(),
     }
 }
 
@@ -308,7 +399,7 @@ fn user_choice(
     overrides: &BTreeMap<String, Choice>,
 ) -> Result<Option<ListRow>, CatalogError> {
     let key = overrides::app_key(app);
-    match overrides.get(&key) {
+    match overrides::lookup(overrides, app) {
         None => Ok(None),
         Some(Choice::NotInCatalog) => Ok(Some(ListRow {
             not_in_catalog: true,
@@ -364,5 +455,5 @@ pub fn correlate(
         };
         rows.push(r);
     }
-    Ok(rows)
+    Ok(group_duplicates(rows))
 }
