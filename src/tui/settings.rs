@@ -8,17 +8,19 @@ pub enum SettingId {
     Purge,
     KeepOld,
     Residues,
+    HttpRedirect,
     Glyphs,
     Icons,
     Theme,
 }
 
 /// Order of the settings on screen.
-pub const ORDER: [SettingId; 7] = [
+pub const ORDER: [SettingId; 8] = [
     SettingId::Confirm,
     SettingId::Purge,
     SettingId::KeepOld,
     SettingId::Residues,
+    SettingId::HttpRedirect,
     SettingId::Glyphs,
     SettingId::Icons,
     SettingId::Theme,
@@ -31,6 +33,7 @@ impl SettingId {
             SettingId::Purge => "Ao remover, apagar dados (purge)",
             SettingId::KeepOld => "Ao atualizar, manter versão antiga",
             SettingId::Residues => "Resíduos após remover",
+            SettingId::HttpRedirect => "Redirecionar https para http",
             SettingId::Glyphs => "Glifos",
             SettingId::Icons => "Ícones",
             SettingId::Theme => "Tema",
@@ -42,6 +45,7 @@ impl SettingId {
             SettingId::Confirm => &["sempre", "só remoções", "nunca"],
             SettingId::Purge | SettingId::KeepOld => &["não", "sim"],
             SettingId::Residues => &["perguntar", "só alta confiança", "manter"],
+            SettingId::HttpRedirect => &["recusar", "aceitar"],
             SettingId::Glyphs => &["nerd", "unicode", "ascii"],
             SettingId::Icons => &["Automático", "iTerm2", "Sixel", "Desligado"],
             SettingId::Theme => &["escuro", "claro"],
@@ -58,6 +62,9 @@ impl SettingId {
             }
             SettingId::KeepOld => "Mantém a versão anterior no disco depois de atualizar.",
             SettingId::Residues => "O que fazer com restos deixados no sistema após remover.",
+            SettingId::HttpRedirect => {
+                "Aceita downloads que trocam https por http no caminho. O hash ainda confere o arquivo, mas a rede vê o que é baixado."
+            }
             SettingId::Glyphs => "Conjunto de ícones da interface.",
             SettingId::Icons => {
                 "Imagens dos pacotes: automático usa iTerm2 no WezTerm e sixel no Windows Terminal."
@@ -130,6 +137,7 @@ impl SettingsState {
                 ResidueMode::High => 1,
                 ResidueMode::Keep => 2,
             },
+            SettingId::HttpRedirect => usize::from(self.behavior.allow_http_redirect),
             SettingId::Glyphs => match self.glyphs {
                 GlyphSet::Nerd => 0,
                 GlyphSet::Unicode => 1,
@@ -164,6 +172,7 @@ impl SettingsState {
                 self.behavior.residues =
                     [ResidueMode::Ask, ResidueMode::High, ResidueMode::Keep][next];
             }
+            SettingId::HttpRedirect => self.behavior.allow_http_redirect = next == 1,
             SettingId::Glyphs => {
                 self.glyphs = [GlyphSet::Nerd, GlyphSet::Unicode, GlyphSet::Ascii][next];
             }

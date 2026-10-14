@@ -1,5 +1,7 @@
 //! HTTP client helpers: conditional GET with validators.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::cache::{HttpEntry, now_unix};
@@ -20,6 +22,8 @@ pub enum HttpError {
     Status(u16),
     #[error("resposta maior que o limite de {0} bytes")]
     TooLarge(usize),
+    #[error("redirecionamento de https para http recusado: {0} (permita em Ajustes)")]
+    InsecureRedirect(String),
 }
 
 impl HttpError {
@@ -28,7 +32,51 @@ impl HttpError {
     }
 }
 
+/// Only https -> http is refused, and only while `allow_http` is false.
+pub fn redirect_allowed(prev: &reqwest::Url, next: &reqwest::Url, allow_http: bool) -> bool {
+    allow_http || !(prev.scheme() == "https" && next.scheme() == "http")
+}
+
+/// Same hop limit as reqwest's default policy.
+const MAX_REDIRECTS: usize = 10;
+
+#[derive(Debug)]
+struct InsecureRedirectError(String);
+
+impl std::fmt::Display for InsecureRedirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "insecure redirect to {}", self.0)
+    }
+}
+
+impl std::error::Error for InsecureRedirectError {}
+
+fn redirect_policy(allow_http: Arc<AtomicBool>) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        let allowed = match attempt.previous().last() {
+            Some(prev) => redirect_allowed(prev, attempt.url(), allow_http.load(Ordering::Relaxed)),
+            None => true,
+        };
+        if allowed {
+            attempt.follow()
+        } else {
+            let to = attempt.url().to_string();
+            attempt.error(InsecureRedirectError(to))
+        }
+    })
+}
+
 fn map_err(e: reqwest::Error) -> HttpError {
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        if let Some(i) = s.downcast_ref::<InsecureRedirectError>() {
+            return HttpError::InsecureRedirect(i.0.clone());
+        }
+        src = s.source();
+    }
     if e.is_timeout() {
         HttpError::Timeout
     } else {
@@ -42,6 +90,7 @@ pub struct Http {
     /// No total timeout (big downloads); stalls are caught by `chunk_timeout`.
     dl_client: reqwest::Client,
     chunk_timeout: Duration,
+    allow_http_redirect: Arc<AtomicBool>,
 }
 
 impl Http {
@@ -50,13 +99,16 @@ impl Http {
     }
 
     pub fn with_timeouts(connect: Duration, total: Duration) -> Result<Http, HttpError> {
+        let allow_http_redirect = Arc::new(AtomicBool::new(false));
         let client = reqwest::Client::builder()
+            .redirect(redirect_policy(allow_http_redirect.clone()))
             .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(connect)
             .timeout(total)
             .build()
             .map_err(|e| HttpError::Network(e.to_string()))?;
         let dl_client = reqwest::Client::builder()
+            .redirect(redirect_policy(allow_http_redirect.clone()))
             .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(connect)
             .build()
@@ -65,7 +117,13 @@ impl Http {
             client,
             dl_client,
             chunk_timeout: Duration::from_secs(30),
+            allow_http_redirect,
         })
+    }
+
+    /// Whether redirects from https to http are followed (shared by all clones).
+    pub fn set_allow_http_redirect(&self, allow: bool) {
+        self.allow_http_redirect.store(allow, Ordering::Relaxed);
     }
 
     /// Max idle time waiting for headers or the next body chunk in `get_to_file`.

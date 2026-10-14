@@ -103,3 +103,64 @@ async fn unreachable_host_is_offline() {
     let e = h.get("http://127.0.0.1:9/").await.unwrap_err();
     assert!(e.is_offline(), "{e:?}");
 }
+
+#[test]
+fn redirect_allowed_refuses_only_https_to_http() {
+    use wingetrs::http::redirect_allowed;
+    let u = |s: &str| reqwest::Url::parse(s).unwrap();
+    for allow in [false, true] {
+        for (prev, next) in [
+            ("https://a/", "http://b/"),
+            ("https://a/", "https://b/"),
+            ("http://a/", "http://b/"),
+            ("http://a/", "https://b/"),
+        ] {
+            let expected = allow || !(prev.starts_with("https") && next.starts_with("http:"));
+            assert_eq!(
+                redirect_allowed(&u(prev), &u(next), allow),
+                expected,
+                "{prev} -> {next} allow={allow}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_redirect_is_still_followed() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/a"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/b"))
+        .mount(&s)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/b"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"dest".to_vec()))
+        .mount(&s)
+        .await;
+    let h = Http::new().unwrap();
+    assert_eq!(h.get(&format!("{}/a", s.uri())).await.unwrap(), b"dest");
+}
+
+#[tokio::test]
+async fn redirect_loop_is_still_limited() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/loop"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", "/loop"))
+        .mount(&s)
+        .await;
+    let h = Http::new().unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(20), h.get(&format!("{}/loop", s.uri())))
+        .await
+        .expect("redirect loop must fail, not hang");
+    let e = r.unwrap_err();
+    assert!(!matches!(e, HttpError::InsecureRedirect(_)), "{e}");
+}
+
+#[test]
+fn insecure_redirect_is_not_offline() {
+    let e = HttpError::InsecureRedirect("http://x".into());
+    assert!(!e.is_offline());
+    assert!(e.to_string().contains("permita em Ajustes"));
+}

@@ -178,6 +178,8 @@ async fn event_loop(
         // After `ratatui::init`, so the pixel size is that of the terminal in use.
         icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
     });
+    ctx.http
+        .set_allow_http_redirect(ctx.cfg.behavior.allow_http_redirect);
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
@@ -281,6 +283,8 @@ async fn event_loop(
                     icons,
                     theme,
                 } => {
+                    ctx.http
+                        .set_allow_http_redirect(behavior.allow_http_redirect);
                     spawn_job(&ctx, move |c, _| {
                         Msg::SettingsSaved(jobs::save_settings(
                             &c.data.config_path(),

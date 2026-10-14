@@ -622,6 +622,7 @@ async fn run_async(
     after_log: std::time::Instant,
 ) -> anyhow::Result<()> {
     let http = tracing::debug_span!("startup.http").in_scope(Http::new)?;
+    http.set_allow_http_redirect(cfg.behavior.allow_http_redirect);
     let Some(cmd) = cli.command else {
         anyhow::bail!("TUI ainda não implementada");
     };

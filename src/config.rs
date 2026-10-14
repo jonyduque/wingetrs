@@ -37,6 +37,8 @@ pub struct Behavior {
     pub purge: bool,
     pub keep_old: bool,
     pub residues: ResidueMode,
+    /// Follow redirects that downgrade https to http.
+    pub allow_http_redirect: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]

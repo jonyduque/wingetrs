@@ -1670,7 +1670,7 @@ fn turning_icons_off_clears_the_cache_and_the_indent() {
     );
     assert!(!a.icons.is_empty());
     a.tab = Tab::Settings;
-    for _ in 0..5 {
+    for _ in 0..6 {
         key(&mut a, KeyCode::Down);
     }
     key(&mut a, KeyCode::Enter);

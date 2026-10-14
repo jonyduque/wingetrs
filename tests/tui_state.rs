@@ -1466,7 +1466,7 @@ fn successful_save_is_remembered_and_announced() {
 fn forced_glyphs_cannot_be_changed() {
     let mut a = on_settings();
     a.settings.glyphs_forced = true;
-    for _ in 0..4 {
+    for _ in 0..5 {
         update(&mut a, key(KeyCode::Down));
     }
     let cmds = update(&mut a, key(KeyCode::Enter));
@@ -1484,7 +1484,7 @@ fn letters_do_not_type_in_settings() {
 #[test]
 fn theme_setting_flips_dark() {
     let mut a = on_settings();
-    for _ in 0..6 {
+    for _ in 0..7 {
         update(&mut a, key(KeyCode::Down));
     }
     update(&mut a, key(KeyCode::Enter));
@@ -1531,7 +1531,7 @@ fn forced_glyphs_are_not_written_when_another_setting_changes() {
 #[test]
 fn changed_glyphs_are_written() {
     let mut a = on_settings();
-    for _ in 0..4 {
+    for _ in 0..5 {
         update(&mut a, key(KeyCode::Down));
     }
     let cmds = update(&mut a, key(KeyCode::Enter));
@@ -2102,7 +2102,7 @@ fn list_never_fetches_icons() {
 #[test]
 fn icons_setting_cycles_and_saves() {
     let mut a = on_settings();
-    for _ in 0..5 {
+    for _ in 0..6 {
         update(&mut a, key(KeyCode::Down));
     }
     let mut seen = Vec::new();
@@ -2148,7 +2148,7 @@ fn icon_encoded_for_an_old_protocol_is_discarded() {
     ));
     // Switch to Sixel (Ícones is the 6th row) while that encode is in flight.
     a.tab = Tab::Settings;
-    for _ in 0..5 {
+    for _ in 0..6 {
         update(&mut a, key(KeyCode::Down));
     }
     let cmds = update(&mut a, key(KeyCode::Enter));
@@ -2194,4 +2194,24 @@ fn icon_encoded_for_an_old_protocol_is_discarded() {
         },
     );
     assert!(a.icons.get(&k, (8, 4)).is_some());
+}
+
+#[test]
+fn http_redirect_setting_cycles_and_saves() {
+    let mut a = on_settings();
+    for _ in 0..4 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    assert_eq!(
+        a.settings.current_id(),
+        wingetrs::tui::settings::SettingId::HttpRedirect
+    );
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(a.settings.behavior.allow_http_redirect);
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::SaveSettings { behavior, .. }] if behavior.allow_http_redirect
+    ));
+    update(&mut a, key(KeyCode::Enter));
+    assert!(!a.settings.behavior.allow_http_redirect);
 }

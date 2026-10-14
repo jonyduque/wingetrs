@@ -69,6 +69,7 @@ fn behavior_round_trips_through_save() {
             purge: true,
             keep_old: false,
             residues: ResidueMode::Keep,
+            allow_http_redirect: true,
         },
         ..Config::default()
     };
@@ -167,4 +168,18 @@ fn config_icons_default_and_unknown() {
     std::fs::write(&p, "icons = \"off\"\n").unwrap();
     let c = Config::load(&p).unwrap();
     assert_eq!(choose(&c.icons, Some("WezTerm"), true), IconProtocol::Off);
+}
+
+#[test]
+fn behavior_allow_http_redirect_defaults_to_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(&p, "[behavior]\npurge = true\n").unwrap();
+    assert!(!Config::load(&p).unwrap().behavior.allow_http_redirect);
+    std::fs::write(&p, "[behavior]\nallow_http_redirect = true\n").unwrap();
+    let c = Config::load(&p).unwrap();
+    assert!(c.behavior.allow_http_redirect);
+    let q = dir.path().join("saved.toml");
+    c.save(&q).unwrap();
+    assert!(Config::load(&q).unwrap().behavior.allow_http_redirect);
 }
