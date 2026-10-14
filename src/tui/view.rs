@@ -2,7 +2,9 @@
 use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, ITEM_ROWS, Modal, RunProgress, Tab, queue_rows};
+use crate::tui::app::{
+    App, ITEM_ROWS, Modal, RunProgress, ShowFilter, SourceFilter, Tab, queue_rows,
+};
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
 use crate::tui::layout::{
@@ -634,7 +636,10 @@ fn draw_list<'a>(
     };
     let lines = list_lines(app, theme, g, usize::from(text_area.width), window.clone());
     if lines.is_empty() {
+        let filtered = app.tab == Tab::Installed
+            && (app.show != ShowFilter::All || app.filter != SourceFilter::All);
         let text = match app.tab {
+            Tab::Installed if filtered => "nenhum pacote neste filtro",
             Tab::Search => "nenhum resultado",
             Tab::Installed => "nenhum pacote instalado encontrado",
             Tab::Updates => "tudo atualizado",
@@ -1072,7 +1077,7 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
 }
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 17 + 2 * DIALOG_PAD_Y);
+    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 18 + 2 * DIALOG_PAD_Y);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(
@@ -1094,6 +1099,7 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("U", "atualizar (aba Atualizações)"),
         key("f", "fila de operações"),
         key("Ctrl+S", "filtrar fonte"),
+        key("Ctrl+E", "mostrar (aba Instalados)"),
         key("Ctrl+R", "atualizar catálogo"),
         key("Esc", "voltar / limpar / sair"),
         key("q Ctrl+C", "sair"),

@@ -1070,20 +1070,14 @@ fn hints_change_with_the_tab() {
     use wingetrs::tui::help::hints;
     let mut a = App::new(entries(), GlyphSet::Ascii);
     a.tab = Tab::Search;
-    assert_eq!(
-        keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "espaço", "ctrl+s", "?"]
-    );
+    assert_eq!(keys_of(&hints(&a)), ["enter", "espaço", "ctrl+s", "?"]);
     a.tab = Tab::Installed;
     assert_eq!(
         keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "u", "o", "espaço", "ctrl+s", "?"]
+        ["enter", "u", "o", "espaço", "ctrl+s", "ctrl+e", "?"]
     );
     a.tab = Tab::Updates;
-    assert_eq!(
-        keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "o", "espaço", "ctrl+s", "?"]
-    );
+    assert_eq!(keys_of(&hints(&a)), ["enter", "o", "espaço", "ctrl+s", "?"]);
     assert!(!keys_of(&hints(&a)).contains(&"esc".to_string()));
 }
 
@@ -2139,4 +2133,12 @@ fn stale_shows_in_row_and_details() {
     a.installed[0].stale = None;
     let screen = render(&a, 160, 24);
     assert!(!screen.contains("sobra provável"), "{screen}");
+}
+
+#[test]
+fn help_key_is_bold() {
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    assert!(theme.help_key().add_modifier.contains(Modifier::BOLD));
+    let theme = Theme::new(true, ColorDepth::TrueColor);
+    assert!(theme.help_key().add_modifier.contains(Modifier::BOLD));
 }

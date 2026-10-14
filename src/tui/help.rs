@@ -1,5 +1,5 @@
 //! Contextual key hints for the bottom help bar.
-use crate::tui::app::{App, SortKey, Tab, ToastKind};
+use crate::tui::app::{App, ShowFilter, SortKey, SourceFilter, Tab, ToastKind};
 use crate::tui::theme::Theme;
 use ratatui::text::{Line, Span};
 
@@ -8,9 +8,25 @@ const ELLIPSIS: &str = " …";
 
 fn sort_hint(app: &App) -> &'static str {
     match app.sort_key() {
-        SortKey::Name => "ordem: nome",
-        SortKey::Source => "ordem: fonte",
-        SortKey::State => "ordem: estado",
+        SortKey::Name => "trocar ordem: nome",
+        SortKey::Source => "trocar ordem: fonte",
+        SortKey::State => "trocar ordem: estado",
+    }
+}
+
+fn source_hint(app: &App) -> &'static str {
+    match app.filter {
+        SourceFilter::All => "gerenciador: todos",
+        SourceFilter::Winget => "gerenciador: winget",
+        SourceFilter::Scoop => "gerenciador: scoop",
+    }
+}
+
+fn show_hint(app: &App) -> &'static str {
+    match app.show {
+        ShowFilter::All => "mostrar: todos",
+        ShowFilter::Unmatched => "mostrar: sem correspondência",
+        ShowFilter::Duplicates => "mostrar: duplicados",
     }
 }
 
@@ -18,7 +34,7 @@ fn sort_hint(app: &App) -> &'static str {
 pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let queue = app.running.is_some() || !app.queue.is_empty();
     if app.tab == Tab::Settings {
-        let mut out = vec![("↑/↓", "escolher"), ("enter", "mudar"), ("←/→", "aba")];
+        let mut out = vec![("enter", "mudar")];
         if queue {
             out.push(("f", "fila"));
         }
@@ -26,8 +42,6 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         return out;
     }
     let mut out = Vec::new();
-    out.push(("↑/↓", "mover"));
-    out.push(("←/→", "aba"));
     match app.tab {
         Tab::Search => {
             out.push(("enter", "instalar"));
@@ -48,7 +62,10 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
     } else {
         out.push(("ins", "marcar"));
     }
-    out.push(("ctrl+s", "fonte"));
+    out.push(("ctrl+s", source_hint(app)));
+    if app.tab == Tab::Installed {
+        out.push(("ctrl+e", show_hint(app)));
+    }
     if queue {
         out.push(("f", "fila"));
     }

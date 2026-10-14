@@ -39,6 +39,15 @@ pub enum SourceFilter {
     Scoop,
 }
 
+/// Which Installed rows to show by how well they matched the catalog (`ctrl+e`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShowFilter {
+    #[default]
+    All,
+    Unmatched,
+    Duplicates,
+}
+
 /// How one attempt to get a package's icon ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconOutcome {
@@ -461,6 +470,7 @@ pub struct App {
     pub sort_updates: SortKey,
     pub tab: Tab,
     pub filter: SourceFilter,
+    pub show: ShowFilter,
     pub query: String,
     pub selected: usize,
     pub scroll: usize,
@@ -619,6 +629,7 @@ impl App {
             sort_updates: SortKey::Name,
             tab: Tab::Search,
             filter: SourceFilter::All,
+            show: ShowFilter::All,
             query: String::new(),
             selected: 0,
             scroll: 0,
@@ -756,6 +767,14 @@ impl App {
                 }
                 _ => false,
             })
+            .filter(|r| match (self.tab, self.show) {
+                (Tab::Installed, ShowFilter::Unmatched) => matches!(
+                    r.correlation,
+                    Correlation::Unmatched | Correlation::Ambiguous { .. }
+                ),
+                (Tab::Installed, ShowFilter::Duplicates) => !r.others.is_empty(),
+                _ => true,
+            })
             .collect();
         // Stable sort: ties fall to the lowercase name, the final tie-break.
         match self.sort_key() {
@@ -794,6 +813,18 @@ impl App {
                 SortKey::State => SortKey::Name,
             };
         }
+        self.selected = self.position_of(kept).unwrap_or(0);
+        self.clamp();
+    }
+
+    /// Next show filter (`ctrl+e`, Installed only); the same item stays selected, or 0 if it vanished.
+    fn cycle_show(&mut self) {
+        let kept = self.selected_ident();
+        self.show = match self.show {
+            ShowFilter::All => ShowFilter::Unmatched,
+            ShowFilter::Unmatched => ShowFilter::Duplicates,
+            ShowFilter::Duplicates => ShowFilter::All,
+        };
         self.selected = self.position_of(kept).unwrap_or(0);
         self.clamp();
     }
@@ -1700,6 +1731,10 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     SourceFilter::Scoop => SourceFilter::All,
                 };
                 app.view_changed()
+            }
+            KeyCode::Char('e') if app.tab == Tab::Installed => {
+                app.cycle_show();
+                Vec::new()
             }
             _ => Vec::new(),
         };

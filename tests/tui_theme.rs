@@ -6,7 +6,7 @@ fn dark_truecolor_uses_the_charm_palette() {
     let t = Theme::new(true, ColorDepth::TrueColor);
     assert_eq!(t.accent().fg, Some(Color::Rgb(0x7D, 0x56, 0xF4)));
     assert_eq!(t.sel_title().fg, Some(Color::Rgb(0xEE, 0x6F, 0xF8)));
-    assert_eq!(t.help_key().fg, Some(Color::Rgb(0x62, 0x62, 0x62)));
+    assert_eq!(t.help_key().fg, Some(Color::Rgb(0x8A, 0x8A, 0x8A)));
     assert_eq!(t.badge().bg, Some(Color::Rgb(0x5F, 0x5F, 0xD7)));
 }
 
@@ -65,7 +65,7 @@ fn theme_table_matches_the_brief() {
             ("fg_dim", t.fg_dim().fg, p(0x777777, 0xA49FA5)),
             ("border", t.border().fg, p(0x383838, 0xD9DCCF)),
             ("ok", t.ok().fg, p(0x73F59F, 0x43BF6D)),
-            ("help_key", t.help_key().fg, p(0x626262, 0x909090)),
+            ("help_key", t.help_key().fg, p(0x8A8A8A, 0x707070)),
             ("help_desc", t.help_desc().fg, p(0x6C6C6C, 0xB2B2B2)),
             ("help_sep", t.help_sep().fg, p(0x3C3C3C, 0xDADADA)),
             ("badge.fg", t.badge().fg, rgb(0xFFFFD7)),

@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use wingetrs::core::{PackageEntry, SourceKind};
-use wingetrs::tui::app::{App, Cmd, Msg, SourceFilter, Tab, update};
+use wingetrs::tui::app::{App, Cmd, Msg, ShowFilter, SourceFilter, Tab, update};
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Glyphs, detect_depth};
 
 fn entry(source: SourceKind, id: &str, name: &str) -> PackageEntry {
@@ -2477,12 +2477,12 @@ fn sort_hint_shows_current_order() {
     use wingetrs::tui::help::hints;
     let mut a = on_tab(Tab::Installed, sort_rows());
     let desc = |a: &App| hints(a).iter().find(|h| h.0 == "o").unwrap().1;
-    assert_eq!(desc(&a), "ordem: nome");
+    assert_eq!(desc(&a), "trocar ordem: nome");
     update(&mut a, key(KeyCode::Char('o')));
-    assert_eq!(desc(&a), "ordem: fonte");
+    assert_eq!(desc(&a), "trocar ordem: fonte");
     let mut u = on_tab(Tab::Updates, sort_rows());
     for _ in 0..4 {
-        assert_ne!(desc(&u), "ordem: estado");
+        assert_ne!(desc(&u), "trocar ordem: estado");
         update(&mut u, key(KeyCode::Char('o')));
     }
 }
@@ -4260,4 +4260,87 @@ fn marked_bridges_are_not_lost_silently_while_a_plan_is_in_flight() {
         a.toasts
     );
     assert_eq!(a.marked_count(), 2, "marks stay for the retry");
+}
+
+fn other(origin: &str) -> wingetrs::installed::correlate::OtherRecord {
+    wingetrs::installed::correlate::OtherRecord {
+        app_key: String::new(),
+        origin: origin.into(),
+        location: String::new(),
+        installed_version: None,
+        state: UpdateState::UpToDate,
+        stale: None,
+    }
+}
+
+fn show_rows() -> Vec<ListRow> {
+    let mut dup = irow("dup", "winget", "winget", false);
+    dup.others = vec![other("scoop")];
+    vec![
+        irow("matched", "winget", "winget", false),
+        ListRow {
+            name: "unmatched".into(),
+            origin: "winget".into(),
+            ..Default::default()
+        },
+        ListRow {
+            name: "ambiguous".into(),
+            origin: "winget".into(),
+            correlation: Correlation::Ambiguous {
+                source: "winget".into(),
+                candidates: vec!["a".into(), "b".into()],
+                rule: Rule::ScoopManifest,
+            },
+            ..Default::default()
+        },
+        dup,
+    ]
+}
+
+#[test]
+fn ctrl_e_cycles_show_filter_in_installed() {
+    let mut a = on_tab(Tab::Installed, show_rows());
+    assert_eq!(a.visible_len(), 4);
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.show, ShowFilter::Unmatched);
+    assert_eq!(a.visible_len(), 2);
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.show, ShowFilter::Duplicates);
+    assert_eq!(a.visible_len(), 1);
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.show, ShowFilter::All);
+    assert_eq!(a.visible_len(), 4);
+    let mut s = on_tab(Tab::Search, show_rows());
+    update(&mut s, ctrl('e'));
+    assert_eq!(s.show, ShowFilter::All);
+}
+
+#[test]
+fn show_and_source_filters_combine() {
+    let mut dup_scoop = irow("dup2", "scoop", "scoop", false);
+    dup_scoop.others = vec![other("winget")];
+    let mut rows = show_rows();
+    rows.push(dup_scoop);
+    let mut a = on_tab(Tab::Installed, rows);
+    update(&mut a, ctrl('e'));
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.visible_len(), 2);
+    a.filter = SourceFilter::Winget;
+    let names: Vec<String> = a.installed_view().iter().map(|r| r.name.clone()).collect();
+    assert_eq!(names, vec!["dup".to_string()]);
+}
+
+#[test]
+fn help_bar_has_no_arrows_and_new_labels() {
+    use wingetrs::tui::help::hints;
+    let a = on_tab(Tab::Installed, show_rows());
+    let text: String = hints(&a)
+        .iter()
+        .map(|(k, d)| format!("{k} {d}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for want in ["trocar ordem: nome", "gerenciador: todos", "mostrar: todos"] {
+        assert!(text.contains(want), "{want} in {text}");
+    }
+    assert!(!text.contains("↑/↓") && !text.contains("←/→"), "{text}");
 }

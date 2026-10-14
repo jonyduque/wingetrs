@@ -230,7 +230,7 @@ impl Theme {
         let text = pick(((0xDD, 0xDD, 0xDD), 253), ((0x1A, 0x1A, 0x1A), 234));
         let dim = pick(((0x77, 0x77, 0x77), 243), ((0xA4, 0x9F, 0xA5), 247));
         let border = pick(((0x38, 0x38, 0x38), 237), ((0xD9, 0xDC, 0xCF), 253));
-        let help_key = pick(((0x62, 0x62, 0x62), 241), ((0x90, 0x90, 0x90), 246));
+        let help_key = pick(((0x8A, 0x8A, 0x8A), 245), ((0x70, 0x70, 0x70), 242));
         let help_desc = pick(((0x6C, 0x6C, 0x6C), 242), ((0xB2, 0xB2, 0xB2), 249));
         let help_sep = pick(((0x3C, 0x3C, 0x3C), 237), ((0xDA, 0xDA, 0xDA), 253));
         let spinner = pick(((0x74, 0x73, 0x73), 243), ((0x8E, 0x8E, 0x8E), 245));
@@ -265,7 +265,7 @@ impl Theme {
             sel_bar: fg(sel_bar),
             sel_desc: fg(sel_bar),
             sel_title: fg(sel_title),
-            help_key: fg(help_key),
+            help_key: fg(help_key).add_modifier(Modifier::BOLD),
             help_desc: fg(help_desc),
             help_sep: fg(help_sep),
             badge: both(
