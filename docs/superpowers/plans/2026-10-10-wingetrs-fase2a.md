@@ -6093,3 +6093,119 @@ Testes:
    - Se passar de 1 ms, avise no relatório. Não otimize sem esse número.
 
 **Commit:** `feat(tui): sort Installed and Updates with o`
+
+## Lote B da TUI: ícones dos itens visíveis (Tasks 92–93)
+
+Esta parte segue a emenda da spec da fase 1 de 2026-10-13, "lote B". Hoje a lista só mostra um ícone que já foi baixado quando os detalhes foram abertos. O usuário quer ver o ícone de todos os itens mostrados.
+
+### Task 92: Baixar os ícones dos itens visíveis
+
+**Modelo:** opus (concorrência, descarte e cancelamento; revisor opus).
+
+#### Where this fits
+
+- **`src/tui/app.rs`:**
+  - `list_icon_cmds` (~:771) percorre as linhas visíveis (`list_window` + `list_keys`). Para cada uma que tem entrada em `icon_map`, pede `Cmd::EncodeCachedIcon`, com teto `MAX_ICON_JOBS` (8) e os conjuntos `icon_in_flight` e `icon_none`.
+  - `Msg::IconMapped { key, sha }` (~:952) só insere no `icon_map`.
+  - O ícone é codificado no próximo `list_icon_cmds`. Confira em que mensagens ele é chamado: hoje é pela mudança de tela e pelo `IconReady`.
+- **`src/tui/run.rs`:**
+  - `spawn_details` (~:642) usa um contador `details_gen` (`AtomicU64` no `Ctx`) com espera de `DETAILS_DEBOUNCE` para descartar pedidos velhos.
+  - Em seguida roda `load_details` (~:701; catálogo → versionData/manifesto pelo `BlobStore`) e `load_icon` (~:681; `icons::fetch` + `icons::remember`).
+  - Por fim manda `DetailsLoaded`, `IconMapped` e `IconLoaded`.
+- **Custo** na primeira vez de um pacote: até 3 requisições (versionData, manifesto, ícone). Depois, tudo sai do cache de blobs. Os pacotes do Scoop não têm ícone (`icon: None`).
+
+#### What binds this task
+
+- **Lado puro (`App`).** `fn list_fetch_cmds(&mut self) -> Vec<Cmd>` devolve no máximo um `Cmd::PrefetchIcons { generation: u64, keys: Vec<(String, String)> }` com os pacotes visíveis que:
+  - são do winget (`source == "winget"`);
+  - não estão em `icon_map`;
+  - não estão em `icon_tried: HashSet<String>`, um campo novo com as chaves `source/id` já pedidas nesta sessão.
+
+  Regras:
+  - As chaves entram em `icon_tried` **no momento do pedido**, então a mesma tela não pede duas vezes.
+  - A ordem das chaves é a da tela, de cima para baixo.
+  - Nada é pedido com `icon_protocol == Off`, na aba Ajustes, ou quando `icon_visible` é falso (modal ou ajuda aberta).
+  - O campo `list_fetch_gen: u64` é incrementado a cada `PrefetchIcons` emitido.
+  - `list_fetch_cmds` roda nos mesmos lugares em que hoje roda `list_icon_cmds` por mudança de tela: rolar, trocar de aba, busca, filtro, ordenação e `InstalledLoaded`.
+- **Lado do trabalho (`run.rs`).** `spawn_prefetch(ctx, generation, keys)`:
+  1. Grava `generation` num `AtomicU64` novo do `Ctx` (`list_fetch_gen`) e dorme `LIST_FETCH_DEBOUNCE` = 300 ms.
+  2. Se a geração mudou nesse meio-tempo, abandona tudo.
+  3. Para cada chave, em ordem, com no máximo `MAX_LIST_FETCH` = 4 pacotes em andamento (`tokio::sync::Semaphore` no `Ctx`):
+     - confere a geração **antes de começar cada pacote**; se mudou, pula o resto;
+     - chama `load_details` e depois `load_icon` com o `icon` dos detalhes. É o mesmo caminho dos detalhes; não reescreva a busca.
+  4. Por pacote:
+     - deu ícone ⇒ `Msg::IconMapped`;
+     - sem ícone ou erro ⇒ nada (a chave já está em `icon_tried`), e o erro vai para `tracing::debug!`.
+  5. **Não** manda `DetailsLoaded`, para a lista não encher `app.details`.
+- **Tarefas e pânicos.**
+  - Cada pacote roda numa task, e as tasks são aguardadas, por exemplo com um `JoinSet` drenado até o fim.
+  - Pânico num pacote é propagado com `resume_unwind` na task de cima, como `join_details` faz.
+  - Nada fica solto: a regra do `CLAUDE.md` sobre threads e handles vale aqui.
+- **Mostrar o ícone que chegou.** Ao receber `IconMapped`, o `App` devolve `list_icon_cmds()`, para o ícone novo ser codificado sem esperar outra tecla. Hoje ele devolve `Vec::new()`.
+- **Fora do escopo:**
+  - o ajuste "Ícones da lista" (Task 93): nesta tarefa o comportamento é sempre `visíveis`, com um campo `list_icons_visible: bool` no `App` que começa `true`;
+  - ícones do Scoop (lote E);
+  - persistir "sem ícone" entre sessões.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/run.rs`
+- Test: `tests/tui_state.rs`, mais `tests/tui_jobs.rs` se o `Ctx` de teste permitir rodar `spawn_prefetch` com fixtures e wiremock
+
+Testes:
+1. `prefetch_asks_for_visible_winget_rows_once`: Pesquisar com 3 hits visíveis (2 winget sem ícone no mapa e 1 scoop) ⇒ um `PrefetchIcons` só com os 2 do winget, na ordem da tela. A mesma tela de novo ⇒ nenhum `PrefetchIcons`.
+2. `prefetch_skips_mapped_and_off`: um hit já em `icon_map` não entra. Com `icon_protocol = Off` ⇒ nenhum `PrefetchIcons`. Com um modal aberto ⇒ nenhum.
+3. `scrolling_bumps_the_generation`: rolar para outra página ⇒ outro `PrefetchIcons` com `generation` maior, só com as chaves novas.
+4. `icon_mapped_encodes_the_visible_row`: `Msg::IconMapped` de uma linha visível ⇒ `Cmd::EncodeCachedIcon` dela.
+5. Lado do trabalho, se o `Ctx` de teste permitir; senão, explique no relatório e teste a regra de geração como função pura `fn still_current(gen: &AtomicU64, mine: u64) -> bool` usada pelo laço.
+   - `prefetch_drops_superseded_generation`: duas chamadas seguidas ⇒ a primeira não baixa nada (conte as requisições no wiremock).
+   - `prefetch_runs_at_most_four_at_once`: 8 chaves com resposta lenta no wiremock ⇒ o máximo de requisições simultâneas observado é ≤ 4.
+
+#### Checks beyond the steps
+
+1. Mutação: não inserir em `icon_tried` ⇒ PEGA (teste 1).
+2. Mutação: não conferir a geração antes de cada pacote ⇒ PEGA (teste 5a, ou o teste da função pura).
+3. Mutação: `IconMapped` devolver `Vec::new()` ⇒ PEGA (teste 4).
+4. Medida (sem rede): rode o teste ignorado de quadro que já existe, o da Task 85, com e sem `PrefetchIcons` sendo emitido. Os dois números devem ser iguais dentro do ruído, porque o trabalho é todo fora do quadro. Cole os dois.
+
+**Commit:** `feat(tui): fetch icons of the visible list rows`
+
+### Task 93: Ajuste "Ícones da lista"
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- A aba Ajustes fica em `src/tui/settings.rs`: `SettingId`, `ORDER`, `label`, `options`, `description`, `value_index` e `cycle`.
+- `Icons` é o modelo de um valor texto gravado na raiz do `config.toml`. Ele usa os campos `icons`, `saved_icons` e `icons_touched` e sai no `Cmd::SaveSettings` como `icons: Option<String>`. A gravação passa por `jobs::save_settings` e a aplicação imediata por `change_setting` em `app.rs`.
+- Depois da Task 92, `App.list_icons_visible: bool` já existe e controla `list_fetch_cmds`.
+
+#### What binds this task
+
+- **Config:** `Config.list_icons: String`, com os valores `"visible"` (padrão) e `"opened"`. Valor desconhecido ⇒ `"visible"` com `tracing::warn!`, igual a `icons`.
+- **Linha `SettingId::ListIcons`:** fica logo depois de `Icons` em `ORDER`.
+  - Rótulo: `"Ícones da lista"`.
+  - Opções: `&["visíveis", "só ao abrir"]`.
+  - Descrição: `"Baixa os ícones dos pacotes que aparecem na lista. Só ao abrir: o ícone vem quando você abre os detalhes."`.
+- **Gravar:** pelo mesmo `Cmd::SaveSettings`, com o campo novo `list_icons: Option<String>`, mandado só se o usuário mexeu nesse ajuste (como `icons_touched`).
+- **Aplicar na hora:** `App.list_icons_visible` passa a refletir o valor. `só ao abrir` faz `list_fetch_cmds` não pedir nada.
+- **Início:** `run.rs` lê `cfg.list_icons` para o `App`, como faz com `icons`.
+
+**Files:**
+- Modify: `src/config.rs`, `src/tui/settings.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/jobs.rs`
+- Test: `tests/config.rs`, `tests/tui_state.rs`, mais o snapshot da aba Ajustes
+
+Testes:
+1. `list_icons_setting_cycles_saves_and_applies`:
+   - `Enter` na linha ⇒ `só ao abrir`;
+   - o `Cmd::SaveSettings` carrega `list_icons: Some("opened")`;
+   - em seguida, rolar a lista não emite `PrefetchIcons`;
+   - mexer em outro ajuste não manda `list_icons`.
+2. `config_list_icons_defaults_and_rejects_unknown`: sem o campo ⇒ `"visible"`; `"xyz"` ⇒ `"visible"`; `"opened"` sobrevive a `save` + `load`.
+3. Snapshot da aba Ajustes: só a linha nova muda.
+
+#### Checks beyond the steps
+
+1. Mutação: mandar `list_icons` sempre ⇒ PEGA (teste 1).
+2. Mutação: `list_fetch_cmds` ignorar `list_icons_visible` ⇒ PEGA (teste 1).
+
+**Commit:** `feat(tui): list icons setting`
