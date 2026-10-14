@@ -292,6 +292,35 @@ Abas:
 > - **Ícone ausente.** Quando a busca do ícone terminou sem ícone, a lista e os detalhes mostram um ícone neutro (placeholder). Isso vale quando o manifesto não tem `Icons`, quando o app do Scoop não tem par no winget, quando o download do ícone falhou de forma definitiva (HTTP 4xx ou SHA-256 errado), quando a imagem não decodifica e para linhas sem correspondência no catálogo. Enquanto o ícone ainda não foi procurado, está sendo baixado ou falhou por falta de conexão, nada é mostrado. A falha por falta de conexão não conta como tentativa e pode ser repetida quando a rede voltar. Com "Ícones" em `Desligado`, também não há placeholder.
 > - **Sobra provável (somente leitura).** Um registro ARP cujo `UninstallString` aponta para um executável que não existe (depois de expandir as variáveis de ambiente) ganha a marca "sobra provável" e o caminho que falta. Ficam de fora os comandos sem caminho de executável, como `winget uninstall`, `msiexec`, `powershell` e `cmd`. Nada é apagado: a limpeza de chaves em HKLM e a desinstalação de uma instalação antiga ficam para a fase 2d, que terá UAC. Medição de 2026-10-14 nesta máquina: 21 de 99 entradas não-MSI sem executável; 18 eram portáteis do winget (falso positivo, excluídos pela regra) e 3 são candidatas reais.
 
+> **Emenda (2026-10-14, lote H: filtros, barra de ajuda, mouse, botões e confirmação, aprovada pelo usuário).**
+> - **Filtros.**
+>   - `ctrl+s` alterna o gerenciador entre `todos`, `winget` e `scoop`, como hoje.
+>   - `ctrl+e`, só em Instalados, alterna o que é mostrado entre `todos`, `sem correspondência` e `duplicados`.
+>   - "Sem correspondência" mostra as linhas `Unmatched`, incluindo "não está no catálogo", e as `Ambiguous`.
+>   - "Duplicados" mostra as linhas com `others`.
+>   - Os dois filtros se combinam, e os valores atuais aparecem na barra de ajuda.
+> - **Barra de ajuda.**
+>   - A tecla fica em negrito, um tom mais clara que a descrição no tema escuro e um tom mais escura no tema claro.
+>   - As setas (`↑/↓`, `←/→`) saem da barra; continuam na ajuda completa (`?`).
+>   - O `o` mostra `trocar ordem: <atual>`.
+> - **Mouse na lista.**
+>   - O clique esquerdo seleciona e alterna a marca de lote do item.
+>   - O clique direito seleciona e abre o menu com todas as ações possíveis do item, em qualquer aba (Pesquisar: instalar e marcar; Instalados e Atualizações: atualizar, remover, fixar, escolher ou desfazer correspondência, marcar). As ações que não se aplicam ficam desabilitadas, com o motivo.
+>   - O clique duplo deixa de valer como `Enter`.
+> - **Botões abaixo dos detalhes**, clicáveis e com a tecla no rótulo:
+>   - Pesquisar: `Instalar (enter)`;
+>   - Atualizações: `Atualizar (enter)`;
+>   - Instalados: um botão por ação possível, com o rótulo de cada um mostrando a sua tecla.
+>
+>   Com itens marcados, cada botão age sobre os itens marcados em que a ação é possível. Os outros ficam de fora, e a confirmação diz quantos. Um botão só aparece se a ação vale para pelo menos um item.
+> - **Confirmação.** O modal não mostra mais o comando nem o texto do plano. Ele mostra uma lista com uma linha por pacote, nesta ordem: `✓`, ícone do pacote (ou o placeholder), nome, versão atual → versão nova (na remoção, só a versão atual) e gerenciador (`wingetrs`, `winget` ou `scoop`).
+>   - A lista rola (`↑/↓`, roda do mouse) dentro de uma área com borda.
+>   - `Espaço` ou o clique na linha alterna o `✓`; um item desmarcado fica de fora. Se todos ficarem desmarcados, `Continuar` é desabilitado.
+>   - Abaixo da lista ficam os botões `Continuar (enter)` e `Cancelar (esc)`, clicáveis.
+>   - Os avisos da ponte (UAC no winget, `git pull` dos buckets no scoop) aparecem uma vez, abaixo da lista, só se houver item daquele gerenciador.
+>   - Nenhum texto passa da borda do modal: o que não cabe na largura é cortado com `…`.
+>   - A confirmação de sair continua só com texto.
+
 > **Roteiro aprovado (2026-10-13).** Lotes, nesta ordem: A (esta emenda); B (ícones dos itens visíveis da lista, baixados com espera, teto de concorrência e ajuste "Ícones da lista"); C (mouse: abas, seleção, roda, clique duplo = `Enter`; ajuste "Mouse"); D (marcação com Espaço, fila de operações visível, fixar versão no estado do wingetrs); E (escolher o candidato de um pacote ambíguo, gravado em `correlations.json`; ícone de pacote do Scoop: primeiro pelo pacote do winget com mesmo domínio de homepage e nome normalizado, só com candidato único; reserva pela homepage do app — `apple-touch-icon`, depois `link rel=icon` ≥ 64 px, por último `og:image` só se quase quadrada; github.com fica de fora; limites de 1 MiB e 1024 px; reserva atrás de ajuste, ligado por padrão. O lote E começa com uma sonda nos buckets `main` e `extras` (amostra fixa) que mede cobertura e tempo mediano de cada caminho; se a homepage ganhar com folga, a ordem se inverte); F (Microsoft Store com instalação direta, precedido de sonda e spec própria). Popularidade/downloads mensais: descartado (nenhuma fonte tem esse dado).
 
 ### 7.3 Estilo visual

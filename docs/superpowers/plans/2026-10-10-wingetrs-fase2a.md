@@ -7115,3 +7115,241 @@ Testes:
 5. **Nada ao vivo.** Não rode um upgrade real. Cole `git grep -n "Command::new" src/bridge`: só o `spawn_win.rs` cria processo.
 
 **Commit:** `feat: upgrade apps installed by winget or scoop through their own CLI`
+
+## Lote H da TUI: filtros, barra de ajuda, mouse, botões e confirmação (Tasks 107–110)
+
+A emenda da spec da fase 1 (2026-10-14, lote H) define estas tarefas. Elas rodam **uma de cada vez**, porque todas mexem em `src/tui/app.rs` e `src/tui/view.rs` (ARMADILHAS: arquivo compartilhado entre agentes em paralelo).
+
+### Task 107: Filtro de Instalados e barra de ajuda
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `src/tui/app.rs`:
+  - `SourceFilter` (~:36) e `App.filter`; `ctrl+s` alterna o filtro (~:1696);
+  - `installed_view` (~:742) aplica a busca, a fonte e a ordem;
+  - `ListRow` tem `correlation` (`Unmatched` / `Ambiguous` / `Matched`), `not_in_catalog` e `others` (Task 102).
+- `src/tui/help.rs`:
+  - `hints(app)` monta os pares `(tecla, descrição)`; hoje inclui `("↑/↓", "mover")`, `("←/→", "aba")` e `("o", "ordem: …")`;
+  - `help_line` desenha a barra.
+- `src/tui/theme.rs` (~:233): `help_key` é `#626262`/241 no escuro e `#909090`/246 no claro; `help_desc` é `#6C6C6C`/242 no escuro e `#B2B2B2`/249 no claro.
+
+#### What binds this task
+
+- **`pub enum ShowFilter { All, Unmatched, Duplicates }`** em `App.show`, com padrão `All`.
+  - `ctrl+e` alterna nesta ordem, **só** na aba Instalados; nas outras não faz nada.
+  - Ao alternar, a seleção fica no mesmo item se ele continuar visível; senão, vai para 0 (use `position_of`, como `cycle_sort`).
+- **`installed_view`**, só em Instalados:
+  - `Unmatched` mostra as linhas `Correlation::Unmatched` (com ou sem `not_in_catalog`) e as `Ambiguous`;
+  - `Duplicates` mostra as linhas com `!others.is_empty()`.
+
+  O filtro de fonte continua valendo junto. `visible_len`, `list_keys` e as marcas usam o mesmo `installed_view`, então nada mais muda.
+- **Barra de ajuda:**
+  - tira `↑/↓` e `←/→` de todas as abas, inclusive Ajustes, onde fica `enter mudar`;
+  - `o` passa a `trocar ordem: nome`, `trocar ordem: fonte` ou `trocar ordem: estado`;
+  - `ctrl+s` passa a `gerenciador: todos`, `gerenciador: winget` ou `gerenciador: scoop`;
+  - em Instalados entra `ctrl+e`, com `mostrar: todos`, `mostrar: sem correspondência` ou `mostrar: duplicados`.
+
+  A ajuda completa (`?`) continua listando as setas e passa a listar `ctrl+e`.
+- **Tema:** `help_key` fica `#8A8A8A`/245 no escuro e `#707070`/242 no claro, com `Modifier::BOLD`. `NO_COLOR` mantém o negrito. Atualize os snapshots afetados e confira que só a barra mudou.
+- Mensagem da lista vazia com o filtro ativo: `"nenhum pacote neste filtro"`.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/help.rs`, `src/tui/theme.rs`, `src/tui/view.rs` (mensagem da lista vazia e ajuda completa)
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs` e os snapshots
+
+Testes:
+1. **`ctrl_e_cycles_show_filter_in_installed`:** 4 linhas: Matched, Unmatched, Ambiguous e Matched com `others`.
+   - `Unmatched` ⇒ 2 linhas;
+   - `Duplicates` ⇒ 1;
+   - `All` ⇒ 4;
+   - em Pesquisar, `ctrl+e` não muda nada.
+2. **`show_and_source_filters_combine`:** `Duplicates` + `Winget` ⇒ só as duplicadas casadas no winget.
+3. **`help_bar_has_no_arrows_and_new_labels`:** a barra de Instalados contém `trocar ordem: nome`, `gerenciador: todos` e `mostrar: todos`, e não contém `↑/↓` nem `←/→`.
+4. **`help_key_is_bold`:** o estilo da tecla tem `BOLD`.
+
+#### Checks beyond the steps
+
+1. Mutação: `Unmatched` ignorar `Ambiguous` ⇒ PEGA (teste 1).
+2. Mutação: `ctrl+e` funcionar fora de Instalados ⇒ PEGA (teste 1).
+
+**Commit:** `feat(tui): show filter for unmatched and duplicate apps; lighter bold help keys`
+
+### Task 108: Clique esquerdo marca, clique direito abre o menu completo
+
+**Modelo:** sonnet (revisor opus: regra única de ações por aba e geometria).
+
+#### Where this fits
+
+- `src/tui/run.rs`: `mouse_msg` (~:432) só deixa passar `Down(Left)`, `ScrollUp` e `ScrollDown`.
+- `src/tui/app.rs`:
+  - `on_mouse` (~:1615) trata o clique esquerdo: na aba, em item e em linha de ajuste; o clique duplo dentro de `DOUBLE_CLICK` vira `Enter`;
+  - `last_click` guarda o último clique.
+- A marcação de lote é a Task 97: Espaço, `Insert` e `ctrl+Espaço` alternam pela identidade da linha (`marks`, `RowKey`). Leia a função que o Espaço chama e reuse-a.
+- `Modal::Actions` (~:276) existe só em Instalados (`open_actions`, ~:2236), com estes itens:
+  - atualizar (`Target` `Ours` ou `Bridge`, Task 106);
+  - remover;
+  - fixar;
+  - `RowChoice` (escolher ou desfazer a correspondência).
+
+  Os itens desabilitados levam o motivo. O menu abre com o cursor no 1º item (`Picker::single_at`, Task 90).
+
+#### What binds this task
+
+- **`mouse_msg`** também deixa passar `Down(Right)`.
+- **Clique esquerdo** num item da lista, nas abas Pesquisar, Instalados e Atualizações:
+  1. `move_to(índice)`;
+  2. alterna a marca do item pela **mesma função** do Espaço.
+
+  O clique duplo **deixa de existir**: tire `DOUBLE_CLICK`, `last_click` e o ramo `double`. Em Ajustes, o clique na linha só seleciona, como hoje. O clique na aba troca de aba, como hoje.
+- **Clique direito** num item: `move_to(índice)` e depois abre o menu de ações do item, **sem mexer na marca**. O clique direito fora de um item não faz nada.
+- **Menu completo em todas as abas.** O menu passa a ser montado por **uma** função, `fn actions_for(app, row) -> Vec<(label, Option<reason>, ActionId)>`, usada pelo clique direito, pelo `Enter` em Instalados e pela Task 109.
+  - **Pesquisar:** `Instalar`, `Marcar`/`Desmarcar`.
+  - **Instalados e Atualizações:**
+    - `Atualizar` (com `(via winget)`/`(via scoop)` quando for ponte);
+    - `Remover`;
+    - `Fixar versão`/`Desafixar`;
+    - `Escolher correspondência` (só ambígua) ou `Desfazer escolha de correspondência` (só escolha do usuário);
+    - `Marcar`/`Desmarcar`.
+  - Os itens que não se aplicam continuam visíveis e desabilitados, com o motivo. O menu abre no 1º item **habilitado que não é destrutivo**: nunca em `Remover` (regra da Task 90).
+  - `Enter` em Pesquisar continua instalando direto, e em Atualizações continua atualizando direto (spec, emenda da ação principal). Só o clique direito abre o menu nessas abas.
+- Com um modal aberto, o mouse continua ignorado (a Task 110 trata os cliques da confirmação).
+
+**Files:**
+- Modify: `src/tui/run.rs`, `src/tui/app.rs`
+- Test: `tests/tui_state.rs`
+
+Testes:
+1. **`left_click_selects_and_toggles_mark`:** um clique no 2º item visível ⇒ `selected` e marcado; um 2º clique ⇒ desmarcado. Funciona em Pesquisar e em Instalados.
+2. **`double_click_no_longer_runs_enter`:** dois cliques em 100 ms ⇒ nenhum `Cmd` de instalar e nenhum modal.
+3. **`right_click_opens_full_menu`:**
+   - Instalados, linha wingetrs com atualização ⇒ menu com Atualizar, Remover, Fixar versão e Marcar, nessa ordem, e o cursor em Atualizar;
+   - Pesquisar ⇒ Instalar e Marcar;
+   - a marca não muda.
+4. **`menu_never_opens_on_remove`:** uma linha em que só `Remover` está habilitado (sem atualização, nossa) ⇒ o cursor fica em `Marcar` ou em outro item que não seja `Remover`.
+5. **`menu_mark_item_toggles_mark`.**
+
+#### Checks beyond the steps
+
+1. Mutação: o clique esquerdo não alternar a marca ⇒ PEGA (teste 1).
+2. Mutação: o menu abrir no índice de `Remover` ⇒ PEGA (teste 4).
+3. Cole `grep -n "DOUBLE_CLICK\|last_click" src tests -r`; a saída deve ser vazia.
+
+**Commit:** `feat(tui): left click marks, right click opens the item's full action menu`
+
+### Task 109: Botões de ação abaixo dos detalhes
+
+**Modelo:** sonnet (revisor opus: geometria única e subconjunto de itens marcados).
+
+#### Where this fits
+
+- `src/tui/regions.rs` (Task 94) é a geometria única: `regions(app, area) -> Regions` (abas, lista, linhas de ajuste e detalhes). O desenho e o mouse usam essa mesma geometria.
+- `src/tui/view.rs`: `draw_details` (~:873) desenha os detalhes.
+- `actions_for(app, row)` vem da Task 108. As marcas e o lote vêm da Task 97: `marked_rows`, `PlanBatch`, e `start_batch` com os itens da ponte (Task 106).
+
+#### What binds this task
+
+- **`Regions` ganha `buttons: Vec<(Rect, ActionId)>`.** Os botões ficam numa linha no rodapé da área de detalhes e só aparecem quando há linha selecionada.
+- **Quais botões:**
+  - Pesquisar: `Instalar (enter)`;
+  - Atualizações: `Atualizar (enter)`;
+  - Instalados: um botão por ação de `actions_for` que vale para **pelo menos um** item do alvo, com a tecla no rótulo (`Atualizar (U)`, `Remover (u)`, `Fixar (p)`, `Correspondência (enter)`, etc.).
+
+  Use as teclas que já existem; ação sem tecla não leva parênteses.
+- **O alvo** são as linhas marcadas da aba; sem nenhuma marcada, é a linha selecionada.
+- **O clique num botão**, ou a tecla dele, executa a ação **só sobre os itens do alvo em que ela é possível**, usando a mesma regra de `actions_for`. Os outros ficam de fora. Se algum ficou de fora, a confirmação (Task 110) mostra a nota `"N itens ficaram de fora (ação não se aplica)"`. Sem confirmação, um toast `Info` diz o mesmo.
+- **Desenho:**
+  - estilo de botão do tema (`accent` em vídeo reverso, ou o que o `theme.rs` já tiver para destaque); desabilitado nunca aparece;
+  - os botões quebram linha se não couberem;
+  - os detalhes perdem as linhas que os botões ocupam, e a área de texto dos detalhes nunca fica embaixo deles.
+- Teste de equivalência obrigatório: o texto de cada botão no `TestBackend` está dentro do `Rect` que `regions` devolve para ele, nos tamanhos 80×24, 100×30 e 60×15.
+
+**Files:**
+- Modify: `src/tui/regions.rs`, `src/tui/view.rs`, `src/tui/app.rs`
+- Test: `tests/tui_view.rs`, `tests/tui_state.rs`
+
+Testes:
+1. **`buttons_match_regions`:** o teste de equivalência descrito acima.
+2. **`click_install_button`:** em Pesquisar, um clique no botão gera o mesmo `Cmd` que `Enter`.
+3. **`installed_buttons_apply_to_possible_subset`:** 3 linhas marcadas, 2 com atualização ⇒ o botão `Atualizar` aparece; o clique planeja só as 2, e a confirmação ou o toast diz `1 itens ficaram de fora` (escolha o singular ou o plural certo e teste).
+4. **`no_button_when_action_applies_to_none`:** nenhuma linha atualizável ⇒ sem o botão `Atualizar`.
+
+#### Checks beyond the steps
+
+1. Mutação: o desenho dos botões deslocado 1 coluna em `regions` ⇒ PEGA (teste 1 ou 2).
+2. Mutação: aplicar a todos os marcados sem filtrar ⇒ PEGA (teste 3).
+
+**Commit:** `feat(tui): action buttons under the details pane`
+
+### Task 110: Confirmação com lista rolável, ícones e botões
+
+**Modelo:** opus (revisor opus: modal novo com rolagem, ícones e mouse).
+
+#### Where this fits
+
+- `src/tui/app.rs`:
+  - `Modal::Confirm { plan_text, action, then, clear_marks }` (~:261); `plan_text` é montado em ~:1993, ~:2145 e ~:2643;
+  - `Action` tem as variantes `Apply(Vec<Vec<InstallPlan>>) | Remove(UninstallPlan) | Bridge(BridgeJob)`;
+  - o lote vem da Task 97 e da Task 106.
+- `src/tui/view.rs` desenha a confirmação. Hoje o texto do plano passa da borda (medido pelo usuário).
+- O ícone da lista vem de `IconPlaces` em `draw_list`, com `icons.get(key, (LIST_ICON_COLS, ITEM_ROWS))`. Os ícones são desenhados depois dos widgets. `icon_visible` é falso com modal; esse é o único lugar que precisa de exceção.
+- O placeholder `Glyphs.no_icon` e o `icon_absent` vêm da Task 103.
+- A versão instalada e a nova vêm do `ListRow` (`installed_version`, `latest`) e do plano (`InstallPlan` traz a versão a instalar).
+
+#### What binds this task
+
+- **`pub struct ConfirmItem`:**
+  - `name`;
+  - `key: Option<(String, String)>`, a chave do ícone;
+  - `from: Option<String>`;
+  - `to: Option<String>`;
+  - `manager: &'static str` (`"wingetrs"`, `"winget"` ou `"scoop"`);
+  - `checked: bool`.
+
+  `Modal::Confirm` troca `plan_text` por:
+  - `items: Vec<ConfirmItem>`;
+  - `notes: Vec<String>`, com os avisos da ponte e o "N itens ficaram de fora";
+  - `scroll: usize` e `cursor: usize`.
+
+  A confirmação de sair continua com texto: use uma variante separada, `Modal::ConfirmQuit`, ou `items` vazio + `notes`. A escolha é sua; o teste 5 cobra.
+- **Uma linha por item**, cortada com `…` na largura:
+  - `✓` (ou `☐` desmarcado; ascii `[x]`/`[ ]`);
+  - o ícone;
+  - o nome;
+  - `from → to` (remover: só `from`; instalar: só `to`);
+  - o gerenciador.
+
+  Os itens têm `ITEM_ROWS` de altura, como na lista, para caber o ícone. O ícone sai de `icons.get` no tamanho da lista; se não houver, aparece o placeholder quando a chave estiver em `icon_absent`/`icon_none`, e senão nada.
+- **Rolagem:**
+  - `↑/↓` move o cursor, e a área rola para mantê-lo visível;
+  - a roda do mouse rola;
+  - `Espaço` ou o clique na linha alterna `checked`.
+- **Botões** `Continuar (enter)` e `Cancelar (esc)` abaixo da lista. Os dois são clicáveis, com geometria em `regions` (`confirm_buttons`, `confirm_list`).
+  - Com todos desmarcados, `Continuar` fica desabilitado (estilo `muted`), e `Enter` não faz nada.
+- **Ao continuar**, só os marcados viram ações:
+  - no `Apply` do lote, os grupos dos desmarcados saem; se o plano de um marcado depende de um desmarcado, mantenha a dependência (ela vem dos `merge_groups`);
+  - `Remove` e `Bridge` desmarcados saem.
+- **Tamanho:** o modal ocupa até 80% da largura e 80% da altura. A lista recebe a altura que sobra depois das notas e dos botões. Nenhuma linha passa da borda: há um teste para isso.
+- **Mouse em modais:** só a confirmação aceita mouse (clique na linha, na roda e nos botões); os outros modais continuam ignorando o mouse.
+- O ajuste "Confirmar antes de aplicar" continua decidindo se o modal aparece.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/view.rs`, `src/tui/regions.rs`, `src/tui/run.rs` (se o ícone precisar sair do modal)
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`
+
+Testes:
+1. **`confirm_lists_items_with_versions_and_manager`:** um lote com 1 nosso (1.0 → 2.0) e 1 ponte (winget 3 → 4) ⇒ 2 linhas com `✓`, os nomes, `1.0 → 2.0`, `wingetrs`, `winget` e a nota do UAC. Nenhum comando aparece (sem `winget upgrade`).
+2. **`confirm_text_never_overflows`:** 60×15 com nomes de 80 caracteres ⇒ nenhuma célula fora do retângulo do modal tem texto do modal, e as linhas terminam em `…`.
+3. **`confirm_scrolls_with_many_items`:** 30 itens em 80×24 ⇒ `↓` 29 vezes leva o último item para a tela; a roda rola 3.
+4. **`unchecking_drops_the_item`:** desmarcar a ponte ⇒ `Enter` enfileira só o `Apply`; desmarcar todos ⇒ `Enter` não faz nada.
+5. **`quit_confirmation_still_text`.**
+6. **`confirm_buttons_clickable`:** um clique em `Cancelar` fecha; um clique em `Continuar` equivale a `Enter`. A geometria vem de `regions`.
+
+#### Checks beyond the steps
+
+1. Mutação: `Continuar` ignorar `checked` ⇒ PEGA (teste 4).
+2. Mutação: não cortar com `…` ⇒ PEGA (teste 2).
+3. Mutação: a rolagem não seguir o cursor ⇒ PEGA (teste 3).
+
+**Commit:** `feat(tui): confirmation lists packages with icons, versions and manager; scrollable with buttons`
