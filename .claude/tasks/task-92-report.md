@@ -66,3 +66,31 @@ Decisions:
 
 Concerns:
 - O envio de `PrefetchDropped` dentro de `spawn_prefetch` não tem teste (precisa do `Ctx`); é um `match` de 3 linhas sobre o retorno testado.
+
+## Convergência do prefetch (fix commit 2, substitui PrefetchDropped)
+
+Commits: o commit `fix(tui): list icon prefetch converges` que contém esta seção (SHA na mensagem ao orquestrador).
+
+Gate:
+[OK]   rules 7s
+[OK]   rules-selftest 9s
+[OK]   fmt 1s
+[OK]   clippy 98s
+[OK]   test (715 passed, 18 ignored) 174s
+[OK]   gate verde
+
+Mutation proofs:
+- Emitir também ao encolher: [OK] mutação PEGA: 'if names.iter().all(|k| self.last_prefetch.contains(k)) {' -> 'if names.is_empty() || names == self.last_prefetch {' fez o teste falhar (exit 101). (shrinking_never_reemits)
+- Não pular chave em andamento: [OK] mutação PEGA: 'if !lock_running(running).insert(key.clone()) {' -> 'if { lock_running(running).insert(key.clone()); false } {' fez o teste falhar (exit 101). (running_key_is_not_started_twice)
+- `PrefetchDone` não marcar `icon_tried`: [OK] mutação PEGA: 'app.icon_tried.insert(key);' -> 'let _ = key;' fez o teste falhar (exit 101). (alternating_screens_converge)
+- Guard não tirar a chave da set (pânico): [OK] mutação PEGA: 'lock_running(&self.running).remove(&self.key);' -> 'let _ = &self.key;' fez o teste falhar (exit 101). (prefetch_reraises_a_package_panic_after_the_others_end)
+- `fetch_max` -> `store` (refeita): [OK] mutação PEGA ... (older_generation_never_wins)
+
+Decisions:
+- `icon_tried` = tentativa concluída (`Msg::PrefetchDone { key }`, enviado pelo `fetch` de `spawn_prefetch` depois de `prefetch_one`, com ou sem ícone). `last_prefetch` guarda as chaves do último pedido; novo `PrefetchIcons` (com todas as candidatas visíveis) só quando alguma candidata não está nele.
+- `Msg::PrefetchDropped` e o retorno de chaves de `prefetch_list` removidos (com o teste `prefetch_returns_the_keys_it_did_not_start` e `dropped_keys_are_asked_again`).
+- `Ctx.list_fetch_running: Arc<Mutex<HashSet>>` injetado em `prefetch_list`; chave em andamento é pulada sem `Done`; `RunningKey` (Drop) a remove ao fim da task, inclusive em pânico; mutex envenenado ⇒ `into_inner` (nada que pode entrar em pânico roda sob o lock).
+- `scrolling_bumps_the_generation`: asserção do 1º passo mudou de "só a linha nova" (10..11) para "todas as visíveis ainda não concluídas" (1..11), pelo redesenho.
+
+Concerns:
+- O envio de `PrefetchDone` dentro de `spawn_prefetch` não tem teste (precisa do `Ctx`).

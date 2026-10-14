@@ -70,8 +70,10 @@ pub enum Msg {
         key: String,
         sha: String,
     },
-    /// List rows a superseded `Cmd::PrefetchIcons` never started; they may be asked again.
-    PrefetchDropped(Vec<(String, String)>),
+    /// The list's icon fetch of `key` ended (with or without an icon); it is not asked again.
+    PrefetchDone {
+        key: String,
+    },
     /// The icon of `key` encoded for `size` cells (columns, rows), or why it could not be.
     IconReady {
         /// `App::icon_gen` when the encode was requested; older results are dropped.
@@ -343,8 +345,10 @@ pub struct App {
     icon_in_flight: HashSet<(String, (u16, u16))>,
     /// Cached icons known to the list: `<source>/<id>` -> SHA-256 of the blob.
     pub icon_map: BTreeMap<String, String>,
-    /// `<source>/<id>` of the list rows whose icon was already asked for in this session.
+    /// `<source>/<id>` of the list rows whose icon fetch ended in this session.
     icon_tried: HashSet<String>,
+    /// Keys of the newest `Cmd::PrefetchIcons`.
+    last_prefetch: HashSet<String>,
     /// Generation of the newest `Cmd::PrefetchIcons`.
     pub list_fetch_gen: u64,
     /// Fetch the icons of the visible list rows.
@@ -444,6 +448,7 @@ impl App {
             icon_in_flight: HashSet::new(),
             icon_map: BTreeMap::new(),
             icon_tried: HashSet::new(),
+            last_prefetch: HashSet::new(),
             list_fetch_gen: 0,
             list_icons_visible: true,
             details_pending: None,
@@ -793,7 +798,9 @@ impl App {
     }
 
     /// Requests fetching the icons of the visible winget rows that are neither cached nor
-    /// already asked for in this session, in screen order; at most one command.
+    /// done, in screen order; at most one command. Only when some row is not in the previous
+    /// request: the new one covers every visible row, so superseding the old loses nothing,
+    /// and rows ending never ask again.
     fn list_fetch_cmds(&mut self) -> Vec<Cmd> {
         if !self.list_icons_visible
             || self.tab == Tab::Settings
@@ -801,20 +808,21 @@ impl App {
         {
             return Vec::new();
         }
-        let keys: Vec<(String, String)> = self
+        let (keys, names): (Vec<(String, String)>, HashSet<String>) = self
             .list_keys(self.list_window())
             .into_iter()
             .flatten()
-            .filter(|(source, id)| {
+            .filter(|(source, _)| source == "winget")
+            .map(|(source, id)| {
                 let key = format!("{source}/{id}");
-                source == "winget"
-                    && !self.icon_map.contains_key(&key)
-                    && self.icon_tried.insert(key)
+                ((source, id), key)
             })
-            .collect();
-        if keys.is_empty() {
+            .filter(|(_, key)| !self.icon_map.contains_key(key) && !self.icon_tried.contains(key))
+            .unzip();
+        if names.iter().all(|k| self.last_prefetch.contains(k)) {
             return Vec::new();
         }
+        self.last_prefetch = names;
         self.list_fetch_gen += 1;
         vec![Cmd::PrefetchIcons {
             generation: self.list_fetch_gen,
@@ -1006,11 +1014,8 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.icon_map.insert(key, sha);
             Vec::new()
         }
-        Msg::PrefetchDropped(keys) => {
-            // `update` asks again for those still on screen.
-            for (source, id) in keys {
-                app.icon_tried.remove(&format!("{source}/{id}"));
-            }
+        Msg::PrefetchDone { key } => {
+            app.icon_tried.insert(key);
             Vec::new()
         }
         Msg::IconReady {

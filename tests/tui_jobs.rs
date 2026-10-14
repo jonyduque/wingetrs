@@ -540,8 +540,9 @@ async fn purge_plan_says_data_will_be_deleted() {
 }
 
 mod prefetch {
-    use std::sync::Arc;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::Semaphore;
     use wingetrs::tui::run::{MAX_LIST_FETCH, prefetch_list};
@@ -552,6 +553,10 @@ mod prefetch {
 
     fn slots() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(MAX_LIST_FETCH))
+    }
+
+    fn running_set() -> Arc<Mutex<HashSet<String>>> {
+        Arc::default()
     }
 
     /// Waits (hang detector: 10 s) until `n` reaches `want`.
@@ -580,9 +585,26 @@ mod prefetch {
             }
         };
         let debounce = Duration::from_millis(50);
+        let running = running_set();
         tokio::join!(
-            prefetch_list(&generation, 1, debounce, &slots, keys(3), counting(&old)),
-            prefetch_list(&generation, 2, debounce, &slots, keys(3), counting(&new)),
+            prefetch_list(
+                &generation,
+                1,
+                debounce,
+                &slots,
+                &running,
+                keys(3),
+                counting(&old)
+            ),
+            prefetch_list(
+                &generation,
+                2,
+                debounce,
+                &slots,
+                &running,
+                keys(3),
+                counting(&new)
+            ),
         );
         assert_eq!(old.load(Ordering::SeqCst), 0, "the superseded one fetched");
         assert_eq!(new.load(Ordering::SeqCst), 3);
@@ -627,7 +649,18 @@ mod prefetch {
         let fetch = gated(started, running, peak, &gate);
         let run = tokio::spawn({
             let generation = Arc::clone(&generation);
-            async move { prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await }
+            async move {
+                prefetch_list(
+                    &generation,
+                    1,
+                    Duration::ZERO,
+                    &slots(),
+                    &running_set(),
+                    keys(8),
+                    fetch,
+                )
+                .await
+            }
         });
         wait_for(started, MAX_LIST_FETCH).await;
         // Room for a fifth to start if the limit were missing.
@@ -647,35 +680,24 @@ mod prefetch {
         let fetch = gated(started, running, peak, &gate);
         let run = tokio::spawn({
             let generation = Arc::clone(&generation);
-            async move { prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await }
+            async move {
+                prefetch_list(
+                    &generation,
+                    1,
+                    Duration::ZERO,
+                    &slots(),
+                    &running_set(),
+                    keys(8),
+                    fetch,
+                )
+                .await
+            }
         });
         wait_for(started, MAX_LIST_FETCH).await;
         // A newer screen while the first four run: the other four never start.
         generation.store(2, Ordering::SeqCst);
         gate.add_permits(8);
         run.await.unwrap();
-        assert_eq!(started.load(Ordering::SeqCst), MAX_LIST_FETCH);
-    }
-
-    #[tokio::test]
-    async fn prefetch_returns_the_keys_it_did_not_start() {
-        let counters: [Arc<AtomicUsize>; 3] = Default::default();
-        let [started, running, peak] = &counters;
-        let gate = Arc::new(Semaphore::new(0));
-        let generation = Arc::new(AtomicU64::new(0));
-        let fetch = gated(started, running, peak, &gate);
-        let run = tokio::spawn({
-            let generation = Arc::clone(&generation);
-            async move { prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await }
-        });
-        wait_for(started, MAX_LIST_FETCH).await;
-        generation.store(2, Ordering::SeqCst);
-        gate.add_permits(8);
-        assert_eq!(run.await.unwrap(), keys(8)[MAX_LIST_FETCH..].to_vec());
-        // Superseded during the debounce: nothing starts, every key comes back.
-        let fetch = gated(started, running, peak, &gate);
-        let dropped = prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(3), fetch).await;
-        assert_eq!(dropped, keys(3));
         assert_eq!(started.load(Ordering::SeqCst), MAX_LIST_FETCH);
     }
 
@@ -694,15 +716,30 @@ mod prefetch {
             }
         };
         let debounce = Duration::from_millis(50);
+        let running = running_set();
         // The tasks ran out of order: generation 6 marks itself before generation 5.
-        let (kept, dropped) = tokio::join!(
-            prefetch_list(&generation, 6, debounce, &slots, keys(3), counting(&newer)),
-            prefetch_list(&generation, 5, debounce, &slots, keys(2), counting(&older)),
+        tokio::join!(
+            prefetch_list(
+                &generation,
+                6,
+                debounce,
+                &slots,
+                &running,
+                keys(3),
+                counting(&newer)
+            ),
+            prefetch_list(
+                &generation,
+                5,
+                debounce,
+                &slots,
+                &running,
+                keys(2),
+                counting(&older)
+            ),
         );
         assert_eq!(newer.load(Ordering::SeqCst), 3);
         assert_eq!(older.load(Ordering::SeqCst), 0, "the older one fetched");
-        assert!(kept.is_empty());
-        assert_eq!(dropped, keys(2));
     }
 
     #[tokio::test]
@@ -719,12 +756,63 @@ mod prefetch {
                 }
             }
         };
-        let run = tokio::spawn(async move {
-            let generation = AtomicU64::new(0);
-            prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await
+        let set = running_set();
+        let run = tokio::spawn({
+            let set = Arc::clone(&set);
+            async move {
+                let generation = AtomicU64::new(0);
+                prefetch_list(
+                    &generation,
+                    1,
+                    Duration::ZERO,
+                    &slots(),
+                    &set,
+                    keys(8),
+                    fetch,
+                )
+                .await
+            }
         });
         let err = run.await.unwrap_err();
         assert!(err.is_panic());
         assert_eq!(done.load(Ordering::SeqCst), 7);
+        assert!(
+            set.lock().unwrap().is_empty(),
+            "the panicked key is no longer running"
+        );
+    }
+
+    #[tokio::test]
+    async fn running_key_is_not_started_twice() {
+        let set = running_set();
+        // An older generation is still fetching k1; it will report it when done.
+        set.lock().unwrap().insert("winget/k1".into());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let fetch = {
+            let (seen, set) = (Arc::clone(&seen), Arc::clone(&set));
+            move |_: String, id: String| {
+                let (seen, set) = (Arc::clone(&seen), Arc::clone(&set));
+                async move {
+                    assert!(set.lock().unwrap().contains(&format!("winget/{id}")));
+                    seen.lock().unwrap().push(id);
+                }
+            }
+        };
+        let generation = AtomicU64::new(0);
+        prefetch_list(
+            &generation,
+            1,
+            Duration::ZERO,
+            &slots(),
+            &set,
+            keys(3),
+            fetch,
+        )
+        .await;
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec!["k0".to_string(), "k2".to_string()]);
+        let left: Vec<String> = set.lock().unwrap().iter().cloned().collect();
+        assert_eq!(left, vec!["winget/k1".to_string()]);
     }
 }

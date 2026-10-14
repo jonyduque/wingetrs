@@ -19,6 +19,7 @@ use crate::update::{Endpoints, LockWait, UpdateError, needs_refresh, run_update}
 use anyhow::Context;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
@@ -106,6 +107,8 @@ struct Ctx {
     list_fetch_gen: AtomicU64,
     /// Slots for list packages being fetched, shared by every generation.
     list_fetch_slots: Arc<tokio::sync::Semaphore>,
+    /// `<source>/<id>` of the list packages being fetched, by any generation.
+    list_fetch_running: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Encoder for package icons; `None` when icons are off.
     icon_picker: std::sync::Mutex<Option<ratatui_image::picker::Picker>>,
 }
@@ -185,6 +188,7 @@ async fn event_loop(
         details_gen: AtomicU64::new(0),
         list_fetch_gen: AtomicU64::new(0),
         list_fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_LIST_FETCH)),
+        list_fetch_running: Arc::default(),
         // After `ratatui::init`, so the pixel size is that of the terminal in use.
         icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
     });
@@ -689,7 +693,8 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
 }
 
 /// Debounced fetch of the visible list rows' icons through the details path; dropped when
-/// a newer screen supersedes it. Sends only `Msg::IconMapped`, never the details.
+/// a newer screen supersedes it. Sends `Msg::IconMapped` and `Msg::PrefetchDone`, never the
+/// details.
 fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) {
     let ctx = Arc::clone(ctx);
     tokio::spawn(async move {
@@ -698,24 +703,26 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) 
             async move {
                 let fetch = |source: String, id: String| {
                     let ctx = Arc::clone(&ctx);
-                    async move { prefetch_one(&ctx, &source, &id).await }
+                    async move {
+                        prefetch_one(&ctx, &source, &id).await;
+                        let key = format!("{source}/{id}");
+                        let _ = ctx.tx.send(Msg::PrefetchDone { key });
+                    }
                 };
                 prefetch_list(
                     &ctx.list_fetch_gen,
                     generation,
                     LIST_FETCH_DEBOUNCE,
                     &ctx.list_fetch_slots,
+                    &ctx.list_fetch_running,
                     keys,
                     fetch,
                 )
-                .await
+                .await;
             }
         });
         match work.await {
-            Ok(dropped) if dropped.is_empty() => {}
-            Ok(dropped) => {
-                let _ = ctx.tx.send(Msg::PrefetchDropped(dropped));
-            }
+            Ok(()) => {}
             Err(e) if e.is_panic() => {
                 let _ = ctx.tx.send(Msg::Panicked(e.into_panic()));
             }
@@ -751,17 +758,18 @@ pub fn still_current(generation: &AtomicU64, mine: u64) -> bool {
 /// Marks `mine` as the newest prefetch (unless a newer one already ran), waits `debounce`,
 /// then runs `fetch` for each key in order, each on its own task holding one of `slots`.
 /// The generation is checked before each package starts; once superseded, the rest is
-/// skipped and returned. Every task is awaited, and a panic in one is re-raised here after
-/// the others end.
+/// skipped. A key in `running` (an older generation is fetching it and will report it) is
+/// skipped too. Every task is awaited, and a panic in one is re-raised here after the
+/// others end.
 pub async fn prefetch_list<F, Fut>(
     generation: &AtomicU64,
     mine: u64,
     debounce: Duration,
     slots: &Arc<tokio::sync::Semaphore>,
+    running: &Arc<std::sync::Mutex<HashSet<String>>>,
     keys: Vec<(String, String)>,
     fetch: F,
-) -> Vec<(String, String)>
-where
+) where
     F: Fn(String, String) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -769,21 +777,25 @@ where
     generation.fetch_max(mine, Ordering::SeqCst);
     tokio::time::sleep(debounce).await;
     let mut tasks = tokio::task::JoinSet::new();
-    let mut keys = keys.into_iter();
-    let mut dropped = Vec::new();
-    while let Some((source, id)) = keys.next() {
-        let slot = match Arc::clone(slots).acquire_owned().await {
-            Ok(slot) if still_current(generation, mine) => slot,
-            _ => {
-                dropped.push((source, id));
-                dropped.extend(keys);
-                break;
-            }
+    for (source, id) in keys {
+        let Ok(slot) = Arc::clone(slots).acquire_owned().await else {
+            break;
+        };
+        if !still_current(generation, mine) {
+            break;
+        }
+        let key = format!("{source}/{id}");
+        if !lock_running(running).insert(key.clone()) {
+            continue;
+        }
+        let mark = RunningKey {
+            running: Arc::clone(running),
+            key,
         };
         let job = fetch(source, id);
         tasks.spawn(async move {
             job.await;
-            drop(slot);
+            drop((mark, slot));
         });
     }
     let mut panic = None;
@@ -799,7 +811,26 @@ where
     if let Some(p) = panic {
         std::panic::resume_unwind(p);
     }
-    dropped
+}
+
+fn lock_running(
+    running: &std::sync::Mutex<HashSet<String>>,
+) -> std::sync::MutexGuard<'_, HashSet<String>> {
+    // Poisoned only by a panic while the lock is held, and no code that can panic runs under
+    // it (insert/remove of a String): the set is still consistent.
+    running.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Takes `key` off the running list packages when its task ends, also on panic.
+struct RunningKey {
+    running: Arc<std::sync::Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for RunningKey {
+    fn drop(&mut self) {
+        lock_running(&self.running).remove(&self.key);
+    }
 }
 
 /// Icon bytes for the details; any failure is only logged, never an error of the details.

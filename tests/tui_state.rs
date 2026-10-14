@@ -2590,10 +2590,11 @@ fn scrolling_bumps_the_generation() {
     for _ in 0..10 {
         got.extend(prefetches(&update(&mut a, key(KeyCode::Down))));
     }
-    // One row scrolled in: only it is asked for.
+    // One row scrolled in: the new request covers every visible row not done yet, so
+    // superseding the first one loses nothing still on screen.
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].0 > first);
-    assert_eq!(got[0].1, winget_keys(&a, 10..11));
+    assert_eq!(got[0].1, winget_keys(&a, 1..11));
     let second = got[0].0;
     let got = prefetches(&update(&mut a, key(KeyCode::End)));
     assert_eq!(got.len(), 1, "{got:?}");
@@ -2620,19 +2621,70 @@ fn icon_mapped_encodes_the_visible_row() {
     );
 }
 
+fn done(a: &mut App, (s, id): &(String, String)) -> Vec<Cmd> {
+    update(
+        a,
+        Msg::PrefetchDone {
+            key: format!("{s}/{id}"),
+        },
+    )
+}
+
 #[test]
-fn dropped_keys_are_asked_again() {
-    let mut a = app();
-    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
-    let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
-    let asked = got[0].1.clone();
-    assert_eq!(asked.len(), 2, "{asked:?}");
-    // The second was never started (a newer screen superseded it): it is asked again, alone.
-    let got = prefetches(&update(
-        &mut a,
-        Msg::PrefetchDropped(vec![asked[1].clone()]),
-    ));
+fn alternating_screens_converge() {
+    let mut a = icon_app(50, 10);
+    let first = winget_keys(&a, 0..10);
+    // Nothing changes on screen: nothing more is asked.
+    let size = a.size;
+    for _ in 0..5 {
+        assert!(prefetches(&update(&mut a, Msg::Tick)).is_empty());
+        assert!(prefetches(&update(&mut a, Msg::Resize(size.0, size.1))).is_empty());
+    }
+    let scroll = |a: &mut App, k: KeyCode| {
+        (0..10)
+            .flat_map(|_| prefetches(&update(a, key(k))))
+            .collect::<Vec<_>>()
+    };
+    let got = scroll(&mut a, KeyCode::Down);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].1, vec![asked[1].clone()]);
-    assert!(prefetches(&update(&mut a, Msg::Tick)).is_empty());
+    assert_eq!(got[0].1, winget_keys(&a, 1..11));
+    let got = scroll(&mut a, KeyCode::Up);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, first);
+    // Once every attempt is done, going back and forth asks for nothing.
+    for k in winget_keys(&a, 0..11) {
+        assert!(prefetches(&done(&mut a, &k)).is_empty());
+    }
+    for _ in 0..3 {
+        assert!(scroll(&mut a, KeyCode::Down).is_empty());
+        assert!(scroll(&mut a, KeyCode::Up).is_empty());
+    }
+}
+
+#[test]
+fn shrinking_never_reemits() {
+    let mut a = icon_app(50, 10);
+    let keys = winget_keys(&a, 0..10);
+    assert!(prefetches(&done(&mut a, &keys[0])).is_empty());
+    let (s, id) = &keys[1];
+    let mapped = update(
+        &mut a,
+        Msg::IconMapped {
+            key: format!("{s}/{id}"),
+            sha: "x".into(),
+        },
+    );
+    assert!(prefetches(&mapped).is_empty(), "{mapped:?}");
+    // A done row scrolled out and back in is not asked again.
+    let mut got = Vec::new();
+    for _ in 0..10 {
+        got.extend(prefetches(&update(&mut a, key(KeyCode::Down))));
+    }
+    for _ in 0..10 {
+        got.extend(prefetches(&update(&mut a, key(KeyCode::Up))));
+    }
+    let mut want = keys[2..].to_vec();
+    want.extend(winget_keys(&a, 10..11));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, want);
 }
