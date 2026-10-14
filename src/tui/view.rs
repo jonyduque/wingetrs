@@ -668,18 +668,18 @@ fn install_status(theme: &Theme, g: &Glyphs, r: &ListRow) -> Line<'static> {
     let installed = r.installed_version.as_deref().unwrap_or("?");
     match &r.state {
         UpdateState::Available { latest } => Line::from(vec![
-            Span::styled(format!("{} ", g.upgrade), theme.warn()),
+            Span::styled(format!("{}{}", g.upgrade, g.gap), theme.warn()),
             Span::styled(
                 format!("atualização disponível: {installed} → {latest}"),
                 theme.warn(),
             ),
         ]),
         UpdateState::UpToDate => Line::from(vec![
-            Span::styled(format!("{} ", g.ok), theme.ok()),
+            Span::styled(format!("{}{}", g.ok, g.gap), theme.ok()),
             Span::styled(format!("instalado {installed} (atualizado)"), theme.ok()),
         ]),
         UpdateState::Broken => Line::from(vec![
-            Span::styled(format!("{} ", g.unknown), theme.alert()),
+            Span::styled(format!("{}{}", g.unknown, g.gap), theme.alert()),
             Span::styled("instalação quebrada (rode repair)", theme.alert()),
         ]),
         UpdateState::Unknown => {
@@ -688,7 +688,7 @@ fn install_status(theme: &Theme, g: &Glyphs, r: &ListRow) -> Line<'static> {
                 _ => "sem correspondência no catálogo",
             };
             Line::from(vec![
-                Span::styled(format!("{} ", g.unknown), theme.muted()),
+                Span::styled(format!("{}{}", g.unknown, g.gap), theme.muted()),
                 Span::styled(text, theme.muted()),
             ])
         }
@@ -737,9 +737,9 @@ fn basics(app: &App, theme: &Theme, g: &Glyphs) -> Option<Basics> {
     }
 }
 
-fn labeled<'a>(theme: &Theme, glyph: &str, text: String) -> Line<'a> {
+fn labeled<'a>(theme: &Theme, glyph: &str, gap: &str, text: String) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{glyph} "), theme.accent()),
+        Span::styled(format!("{glyph}{gap}"), theme.accent()),
         Span::styled(text, theme.fg_dim()),
     ])
 }
@@ -765,10 +765,10 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
     };
     let mut out = vec![Line::from(Span::styled(b.name.clone(), theme.name()))];
     if let Some(id) = &b.id {
-        out.push(labeled(theme, g.id, id.clone()));
+        out.push(labeled(theme, g.id, g.gap, id.clone()));
     }
     if let Some(p) = &b.publisher {
-        out.push(labeled(theme, g.publisher, p.clone()));
+        out.push(labeled(theme, g.publisher, g.gap, p.clone()));
     }
     if let Some(v) = &b.version {
         out.push(Line::from(Span::styled(format!("versão {v}"), theme.fg())));
@@ -784,7 +784,7 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
     if let Some(Ok(d)) = loaded
         && let Some(l) = &d.license
     {
-        out.push(labeled(theme, g.license, l.clone()));
+        out.push(labeled(theme, g.license, g.gap, l.clone()));
     }
     let desc = match loaded {
         Some(Ok(d)) => d.description.clone().or(b.description.clone()),
@@ -824,7 +824,7 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
         Some(Err(e)) => {
             out.push(Line::raw(""));
             out.push(Line::from(Span::styled(
-                format!("{} {e}", g.ambiguous),
+                format!("{}{}{e}", g.ambiguous, g.gap),
                 theme.err(),
             )));
         }
@@ -832,7 +832,7 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
             if key.is_some() {
                 out.push(Line::raw(""));
                 out.push(Line::from(vec![
-                    Span::styled(format!("{} ", spinner(app, g)), theme.accent()),
+                    Span::styled(format!("{}{}", spinner(app, g), g.gap), theme.accent()),
                     Span::styled("carregando…", italic_muted(theme)),
                 ]));
             }

@@ -1685,3 +1685,36 @@ fn turning_icons_off_clears_the_cache_and_the_indent() {
         "no icon, no indent"
     );
 }
+
+fn licensed_row(set: GlyphSet) -> String {
+    let mut a = App::new(entries(), set);
+    let (source, id) = a.selected_key().unwrap();
+    let details = wingetrs::core::PackageDetails {
+        source: wingetrs::core::SourceKind::Winget,
+        id: id.clone(),
+        name: id.clone(),
+        version: "1".into(),
+        publisher: None,
+        description: None,
+        homepage: None,
+        license: Some("Zlicense-text".into()),
+        tags: Vec::new(),
+        installers: Vec::new(),
+        available_versions: Vec::new(),
+        icon: None,
+    };
+    a.details.insert(format!("{source}/{id}"), Ok(details));
+    render(&a, 120, 24)
+        .lines()
+        .find(|l| l.contains("Zlicense-text"))
+        .expect("license row")
+        .to_string()
+}
+
+#[test]
+fn nerd_detail_glyphs_have_two_spaces() {
+    assert!(licensed_row(GlyphSet::Nerd).contains("\u{f24e}  Zlicense-text"));
+    let u = licensed_row(GlyphSet::Unicode);
+    assert!(u.contains("§ Zlicense-text"));
+    assert!(!u.contains("§  Zlicense-text"));
+}
