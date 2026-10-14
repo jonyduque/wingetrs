@@ -5945,3 +5945,151 @@ Testes:
 2. O teste roda em menos de 2 s em debug; cole o tempo.
 
 **Commit:** `fix(icons): serialize icons.json updates within the process`
+
+## Lote A da TUI: glifos, ação principal, ordenação (Tasks 89–91)
+
+Emenda da spec da fase 1 (§7.2/§7.3, 2026-10-13, "ação principal e ordenação"). A emenda seguinte da mesma spec traz o roteiro dos lotes B–F. As três tarefas rodam em sequência, porque 90 e 91 mexem nos mesmos trechos de `app.rs` e `help.rs`.
+
+### Task 89: Dois espaços depois dos glifos Nerd nos detalhes
+
+**Modelo:** sonnet (revisor: orquestrador, porque o diff é pequeno).
+
+#### Where this fits
+
+`labeled` (`src/tui/view.rs`, ~:740) monta `format!("{glyph} ")` + texto para o ID, o publisher e a licença. Os glifos ficam em `src/tui/theme.rs`: `Glyphs`, `NERD` (~:47), `UNICODE` e `ASCII`. O glifo nerd da licença (`\u{f24e}`) é desenhado com 2 colunas no WezTerm e cobre o espaço, então o usuário vê o glifo colado no texto.
+
+#### What binds this task
+
+- Campo novo `pub gap: &'static str` em `Glyphs`: `"  "` (2 espaços) em `NERD` e `" "` em `UNICODE` e `ASCII`.
+- `labeled` usa `g.gap` em vez do espaço fixo. A assinatura passa a receber `&Glyphs` ou o `gap`, à escolha.
+- Confira em `view.rs` as outras linhas dos detalhes que juntam um glifo de `Glyphs` a um texto com `" "` fixo, como a linha de instalação e os instaladores. Todas passam a usar `g.gap`. Liste-as no relatório.
+- A lista (coluna de fonte/estado) fica fora: ela tem largura fixa e snapshot próprio.
+
+**Files:**
+- Modify: `src/tui/theme.rs`, `src/tui/view.rs`
+- Test: `tests/tui_view.rs`
+
+Testes:
+1. `nerd_detail_glyphs_have_two_spaces`: com `GlyphSet::Nerd` e um pacote com licença, a linha da licença no `TestBackend` contém `"\u{f24e}  "` seguido do texto. Com `Unicode`, contém `"§ "` seguido do texto, sem o segundo espaço.
+2. Os snapshots afetados foram atualizados; confira no diff que só mudou o espaçamento.
+
+#### Checks beyond the steps
+
+1. Mutação: `gap` do `NERD` igual a `" "` ⇒ PEGA (teste 1).
+
+**Commit:** `fix(tui): two spaces after nerd glyphs in the details`
+
+### Task 90: `Enter` faz a ação principal; menu de ações em Instalados
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `on_key` (`src/tui/app.rs`, ~:1054): hoje `Enter` só faz `app.focus = Focus::Details` e `details_cmd()`.
+- As ações existentes:
+  - `install_selected` (`i`, ~:1203, Pesquisar);
+  - `remove_selected` (`u`, ~:1224, Instalados, só para `origin == "wingetrs"`; senão mostra o toast `NOT_OURS`);
+  - `upgrade_selected` (`U`, ~:1238, Atualizações; com a lista vazia ele dispara `PlanUpgradeAll`).
+- Modais (`Modal`, ~:173): `Confirm`, `Picking` (picker single de candidatos), `Running`, `Residues`. O `Picker` (`src/tui/picker.rs`) tem `PickerItem { label, detail, selectable, note }` e `Picker::single`.
+- `Focus` aparece em 12 lugares de `src/tui/`: estilo do divisor em `view.rs` (~:144), dicas em `help.rs` e `Esc` em `app.rs`.
+
+#### What binds this task
+
+- **`Enter` em Pesquisar** chama `install_selected`.
+- **`Enter` em Atualizações** chama `upgrade_selected`.
+- **Lista vazia:** em todas as abas de lista, `Enter` não faz nada e nunca dispara `PlanUpgradeAll`. Mantenha a guarda `visible_len() == 0` antes de tudo.
+- **`Enter` em Instalados** abre `Modal::Actions`, um modal novo com um picker single e o que for preciso para achar o item escolhido. O título é o nome do app. Os itens, nesta ordem:
+  1. `Atualizar`
+     - Pode ser escolhido só quando `origin == "wingetrs"`, a correlação é `Matched` e o estado é `UpdateState::Available`.
+     - Fora disso, mostra a `note` `"instalado fora do wingetrs"` (origem ≠ wingetrs) ou `"sem atualização"`.
+     - Escolhido, faz o mesmo que `upgrade_selected` faria com esse item.
+  2. `Remover`
+     - Pode ser escolhido só quando `origin == "wingetrs"`. Fora disso, mostra a `note` com `NOT_OURS`.
+     - Escolhido, faz o mesmo que `remove_selected`.
+- **Item desabilitado e `Esc`:** escolher um item desabilitado não faz nada, como no `Picking`; `Esc` fecha o menu.
+- **Uma regra só:** a escolha de "Atualizar" no menu e o `U` passam pela mesma função. Não duplique a regra de quem pode ser atualizado.
+- **O foco nos detalhes deixa de existir.**
+  - Remova `Focus::Details` e o que só servia a ele: o estilo do divisor, a dica `esc voltar` e o ramo de `Esc`. Se `Focus` ficar com uma variante só, remova o tipo.
+  - A dica `enter detalhes` vira `enter instalar` em Pesquisar, `enter ações` em Instalados e `enter atualizar` em Atualizações.
+  - As teclas `i`, `u` e `U` continuam como estão.
+- **Desenho do modal:** reaproveite o desenho do `Picking` (mesmo componente e estilo), com o nome do app no título.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/view.rs`, `src/tui/help.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`
+
+Testes:
+1. `enter_in_search_plans_install`: em Pesquisar, um hit do Scoop + `Enter` ⇒ `Cmd::PlanInstall` igual ao de `i`.
+2. `enter_in_updates_plans_upgrade_and_empty_list_does_nothing`:
+   - com um item wingetrs `Available`, `Enter` ⇒ `Cmd::PlanInstall` com o `keep` do ajuste;
+   - com a lista vazia (um filtro que esvazia), `Enter` ⇒ nenhum `Cmd`, nunca `PlanUpgradeAll`.
+3. `enter_in_installed_opens_actions_menu`:
+   - item wingetrs `Available`: as duas opções podem ser escolhidas, e "Atualizar" ⇒ `PlanInstall`;
+   - item `arp`: as duas desabilitadas, com as notas, e `Enter` nelas ⇒ nenhum `Cmd`;
+   - `Esc` fecha sem `Cmd`.
+4. `actions_menu_remove_plans_remove`: "Remover" num item wingetrs ⇒ `Cmd::PlanRemove` com o `purge` do ajuste.
+5. Snapshot do menu aberto (`TestBackend`) e snapshots das dicas atualizados.
+
+#### Checks beyond the steps
+
+1. Mutação: tirar a guarda de lista vazia do `Enter` em Atualizações ⇒ PEGA (teste 2).
+2. Mutação: "Atualizar" do menu selecionável para um item `arp` ⇒ PEGA (teste 3).
+3. `grep -rn "Focus::Details" src tests` volta vazio; cole a saída.
+
+**Commit:** `feat(tui): enter runs the tab's main action, actions menu in Installed`
+
+### Task 91: Ordenar Instalados e Atualizações com `o`
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `installed_view` (`src/tui/app.rs`, ~:491) filtra `app.installed` por aba, busca e fonte, mas não ordena. A ordem é a de chegada dos coletores (arp, msix, scoop, wingetrs).
+- `ListRow` (`src/installed/correlate.rs`, ~:44) tem:
+  - `name`;
+  - `origin`;
+  - `correlation`: `Matched { source, package_id, .. }`, `Ambiguous`, ...;
+  - `state`: `UpToDate`, `Available { latest }`, `Unknown`, `Broken`.
+- `selected` é um índice da visão. As dicas ficam em `src/tui/help.rs`.
+
+#### What binds this task
+
+- `pub enum SortKey { Name, Source, State }`, com um campo por aba no `App`: `sort_installed` e `sort_updates`, os dois começando em `Name`. Valem só durante a sessão; nada vai para o `config.toml`.
+- `o` alterna a ordem, com a busca vazia (como `i`/`u`/`U`):
+  - Instalados: Name → Source → State → Name;
+  - Atualizações: Name → Source → Name. State não se aplica ali, porque todos os itens estão pendentes.
+  - Em Pesquisar e Ajustes, `o` não faz nada.
+- Critérios. Empate passa ao próximo critério; o desempate final é o nome.
+  - **Name:** `name`, sem diferenciar maiúsculas.
+  - **Source:** fonte da correlação `Matched` (`winget`, `scoop:<bucket>`) em ordem alfabética; os sem correlação ficam por último.
+  - **State:** `Available`, `Broken`, `Unknown`, `UpToDate`.
+- Use `sort_by_cached_key` (ou equivalente que não aloque por comparação) e ordenação estável.
+- Ao trocar a ordem, o mesmo item continua selecionado: ache-o na nova ordem por `name` + `origin`. Se ele sumiu, `selected = 0`.
+- A dica da barra mostra `o ordem: nome|fonte|estado` em Instalados e em Atualizações.
+- Toda leitura por índice usa a mesma visão ordenada: `selected_key`, `remove_selected`, `upgrade_selected`, o menu da Task 90 e o desenho. A ordenação fica dentro de `installed_view`, num lugar só.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/help.rs`
+- Test: `tests/tui_state.rs`
+
+Testes:
+1. `installed_sorts_by_name_source_state`:
+   - 4 linhas sintéticas: nomes fora de ordem, fontes `winget`/`scoop:main`/nenhuma, estados variados;
+   - `installed_view` sai em ordem de nome;
+   - depois de `o`, em ordem de fonte, com o sem fonte por último;
+   - depois de outro `o`, em ordem de estado, com `Available` primeiro;
+   - outro `o` volta a nome.
+2. `updates_sort_cycles_name_source`: em Atualizações, `o` alterna só entre nome e fonte.
+3. `sort_keeps_the_selected_item`: com o item "B" selecionado, `o` ⇒ "B" continua selecionado e `selected_key` devolve o mesmo pacote.
+4. `remove_acts_on_the_sorted_row`: depois de ordenar, `u` age sobre o item que aparece selecionado na visão ordenada, não sobre o da ordem de chegada.
+
+#### Checks beyond the steps
+
+1. Mutação: ordem de State com `UpToDate` primeiro ⇒ PEGA (teste 1).
+2. Mutação: não reposicionar `selected` ao trocar a ordem ⇒ PEGA (teste 3).
+3. Medida: `installed_view` é chamada a cada tecla e a cada quadro.
+   - Escreva um teste `#[ignore]` que monte 2 000 linhas sintéticas e meça a mediana de 200 chamadas ordenadas por State.
+   - Rode-o com `cargo test --release` e cole o número.
+   - Se passar de 1 ms, avise no relatório. Não otimize sem esse número.
+
+**Commit:** `feat(tui): sort Installed and Updates with o`

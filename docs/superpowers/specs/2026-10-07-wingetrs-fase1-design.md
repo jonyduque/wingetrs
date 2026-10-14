@@ -275,6 +275,10 @@ Abas:
 
 > **Emenda (2026-10-11).** `←` / `→` também trocam de aba (anterior/próxima, circular, incluindo Ajustes), em qualquer aba e com foco na lista ou nos detalhes; com um diálogo aberto as setas são do diálogo. Na aba Ajustes, `Enter`/Espaço avançam o valor do ajuste selecionado (as setas laterais continuam trocando de aba).
 
+> **Emenda (2026-10-13, ação principal e ordenação, aprovada pelo usuário).** `Enter` num item faz a ação principal da aba: em Pesquisar, instala (como `i`); em Atualizações, atualiza (como `U`); em Instalados, abre um menu de ações do item (Atualizar, Remover; as opções que não se aplicam ficam desabilitadas, com o motivo). A confirmação segue o ajuste "Confirmar antes de aplicar". `Enter` não muda mais o foco para os detalhes; o foco nos detalhes deixa de existir. Lista vazia: `Enter` não faz nada (nunca dispara "atualizar tudo"). `o` alterna a ordem da lista em Instalados (nome / fonte / estado) e em Atualizações (nome / fonte); a ordem padrão é nome, vale por aba durante a sessão e aparece na barra de ajuda. Atualizações continua mostrando só os itens com atualização pendente. Pesquisar mantém a ordem por pontuação. Nos detalhes, com glifos `nerd`, o glifo e o texto ficam separados por 2 espaços (os glifos Nerd Font podem ocupar 2 colunas).
+
+> **Roteiro aprovado (2026-10-13).** Lotes, nesta ordem: A (esta emenda); B (ícones dos itens visíveis da lista, baixados com espera, teto de concorrência e ajuste "Ícones da lista"); C (mouse: abas, seleção, roda, clique duplo = `Enter`; ajuste "Mouse"); D (marcação com Espaço, fila de operações visível, fixar versão no estado do wingetrs); E (escolher o candidato de um pacote ambíguo, gravado em `correlations.json`; ícone de pacote do Scoop pelo pacote do winget com mesmo domínio de homepage e nome normalizado, só com candidato único); F (Microsoft Store com instalação direta, precedido de sonda e spec própria). Popularidade/downloads mensais: descartado (nenhuma fonte tem esse dado).
+
 ### 7.3 Estilo visual
 
 Todos os estilos vêm de `tui/theme.rs`; views não usam cores literais.
