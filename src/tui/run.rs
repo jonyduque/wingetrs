@@ -131,6 +131,8 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     app.settings = SettingsState::new(cfg.behavior, glyphs, dark, glyphs_forced);
     app.settings.icons.clone_from(&cfg.icons);
     app.settings.saved_icons.clone_from(&cfg.icons);
+    app.settings.list_icons.clone_from(&cfg.list_icons);
+    app.list_icons_visible = cfg.list_icons == crate::config::LIST_ICONS[0];
     app.buckets_summary = cfg
         .scoop_buckets
         .iter()
@@ -295,6 +297,7 @@ async fn event_loop(
                     behavior,
                     glyphs,
                     icons,
+                    list_icons,
                     theme,
                 } => {
                     ctx.http
@@ -305,6 +308,7 @@ async fn event_loop(
                             behavior,
                             glyphs.as_deref(),
                             icons.as_deref(),
+                            list_icons.as_deref(),
                             &theme,
                         ))
                     });

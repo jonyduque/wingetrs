@@ -41,6 +41,9 @@ pub struct Behavior {
     pub allow_http_redirect: bool,
 }
 
+/// Valid values of `Config::list_icons`; the first is the default.
+pub const LIST_ICONS: [&str; 2] = ["visible", "opened"];
+
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -52,6 +55,8 @@ pub struct Config {
     pub theme: String,
     /// Icon protocol in the details pane: `auto`, `iterm2`, `sixel` or `off`.
     pub icons: String,
+    /// Icons in the list rows: `visible` (fetched for the rows on screen) or `opened`.
+    pub list_icons: String,
     pub behavior: Behavior,
 }
 
@@ -63,6 +68,7 @@ impl Default for Config {
             glyphs: "nerd".into(),
             theme: "dark".into(),
             icons: crate::tui::icons::DEFAULT_SETTING.into(),
+            list_icons: LIST_ICONS[0].into(),
             behavior: Behavior::default(),
         }
     }
@@ -98,6 +104,10 @@ impl Config {
         if !crate::tui::icons::SETTINGS.contains(&cfg.icons.as_str()) {
             tracing::warn!(icons = %cfg.icons, "unknown icons setting, using auto");
             cfg.icons = crate::tui::icons::DEFAULT_SETTING.into();
+        }
+        if !LIST_ICONS.contains(&cfg.list_icons.as_str()) {
+            tracing::warn!(list_icons = %cfg.list_icons, "unknown list_icons setting, using visible");
+            cfg.list_icons = LIST_ICONS[0].into();
         }
         Ok(cfg)
     }

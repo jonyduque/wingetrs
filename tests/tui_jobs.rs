@@ -489,6 +489,7 @@ repo = \"o/x\"
         },
         Some("ascii"),
         None,
+        None,
         "light",
     )
     .unwrap();
@@ -504,7 +505,7 @@ fn save_settings_without_glyphs_keeps_the_file_value() {
     let dir = TempDir::new().unwrap();
     let p = dir.path().join("config.toml");
     std::fs::write(&p, "glyphs = \"unicode\"\n").unwrap();
-    jobs::save_settings(&p, Default::default(), None, None, "dark").unwrap();
+    jobs::save_settings(&p, Default::default(), None, None, None, "dark").unwrap();
     let text = std::fs::read_to_string(&p).unwrap();
     assert!(text.contains("glyphs = \"unicode\""), "{text}");
 }

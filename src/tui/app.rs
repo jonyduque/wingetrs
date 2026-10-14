@@ -238,6 +238,8 @@ pub enum Cmd {
         glyphs: Option<String>,
         /// `None` leaves `icons` in the file as it is (Ícones never changed).
         icons: Option<String>,
+        /// `None` leaves `list_icons` in the file as it is (Ícones da lista never changed).
+        list_icons: Option<String>,
         theme: String,
     },
     /// Decode and encode an icon off the UI thread and answer with `Msg::IconReady`.
@@ -1296,6 +1298,11 @@ fn change_setting(app: &mut App, forward: bool) -> Vec<Cmd> {
     let mut cmds = Vec::new();
     match app.settings.current_id() {
         SettingId::Glyphs => app.settings.glyphs_touched = true,
+        SettingId::ListIcons => {
+            app.settings.list_icons_touched = true;
+            // `update` asks for the visible rows' icons right after this.
+            app.list_icons_visible = app.settings.list_icons == crate::config::LIST_ICONS[0];
+        }
         SettingId::Icons => {
             app.settings.icons_touched = true;
             apply_icons(app);
@@ -1331,6 +1338,7 @@ fn request_save(app: &mut App) -> Vec<Cmd> {
         behavior: s.behavior,
         glyphs: (s.glyphs_touched && !s.glyphs_forced).then(|| glyphs_name(s.glyphs).to_string()),
         icons: s.icons_touched.then(|| s.icons.clone()),
+        list_icons: s.list_icons_touched.then(|| s.list_icons.clone()),
         theme: if s.dark { "dark" } else { "light" }.to_string(),
     }]
 }

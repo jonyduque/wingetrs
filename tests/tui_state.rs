@@ -1426,6 +1426,7 @@ fn enter_changes_confirm_and_requests_save() {
             },
             glyphs: None,
             icons: None,
+            list_icons: None,
             theme: "dark".into(),
         }]
     );
@@ -1480,7 +1481,7 @@ fn letters_do_not_type_in_settings() {
 #[test]
 fn theme_setting_flips_dark() {
     let mut a = on_settings();
-    for _ in 0..7 {
+    for _ in 0..8 {
         update(&mut a, key(KeyCode::Down));
     }
     update(&mut a, key(KeyCode::Enter));
@@ -2687,4 +2688,42 @@ fn shrinking_never_reemits() {
     want.extend(winget_keys(&a, 10..11));
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].1, want);
+}
+
+#[test]
+fn list_icons_setting_cycles_saves_and_applies() {
+    let mut a = icon_app(50, 10);
+    a.tab = Tab::Settings;
+    for _ in 0..7 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    assert_eq!(a.settings.current_id().label(), "Ícones da lista");
+    assert!(a.list_icons_visible);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(a.settings.list_icons, "opened");
+    assert!(!a.list_icons_visible);
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Cmd::SaveSettings { list_icons: Some(l), icons: None, .. }] if l == "opened"
+        ),
+        "{cmds:?}"
+    );
+    update(&mut a, Msg::SettingsSaved(Ok(())));
+    // Scrolling the list asks for no fetch now.
+    a.tab = Tab::Search;
+    for _ in 0..10 {
+        assert!(prefetches(&update(&mut a, key(KeyCode::Down))).is_empty());
+    }
+
+    // Another setting does not send `list_icons` while it is untouched.
+    let mut b = on_settings();
+    let cmds = update(&mut b, key(KeyCode::Enter));
+    assert!(matches!(
+        cmds.as_slice(),
+        [Cmd::SaveSettings {
+            list_icons: None,
+            ..
+        }]
+    ));
 }

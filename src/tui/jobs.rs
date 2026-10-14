@@ -239,6 +239,7 @@ pub fn save_settings(
     behavior: crate::config::Behavior,
     glyphs: Option<&str>,
     icons: Option<&str>,
+    list_icons: Option<&str>,
     theme: &str,
 ) -> Result<(), String> {
     crate::config::update_file(path, |c| {
@@ -248,6 +249,9 @@ pub fn save_settings(
         }
         if let Some(i) = icons {
             c.icons = i.to_string();
+        }
+        if let Some(l) = list_icons {
+            c.list_icons = l.to_string();
         }
         c.theme = theme.to_string();
     })

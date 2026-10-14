@@ -183,3 +183,29 @@ fn behavior_allow_http_redirect_defaults_to_false() {
     c.save(&q).unwrap();
     assert!(Config::load(&q).unwrap().behavior.allow_http_redirect);
 }
+
+#[test]
+fn config_list_icons_defaults_and_rejects_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("config.toml");
+    std::fs::write(
+        &p,
+        "glyphs = \"ascii\"
+",
+    )
+    .unwrap();
+    assert_eq!(Config::load(&p).unwrap().list_icons, "visible");
+    std::fs::write(
+        &p,
+        "list_icons = \"xyz\"
+",
+    )
+    .unwrap();
+    assert_eq!(Config::load(&p).unwrap().list_icons, "visible");
+    let c = Config {
+        list_icons: "opened".into(),
+        ..Config::default()
+    };
+    c.save(&p).unwrap();
+    assert_eq!(Config::load(&p).unwrap().list_icons, "opened");
+}

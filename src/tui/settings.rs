@@ -11,11 +11,12 @@ pub enum SettingId {
     HttpRedirect,
     Glyphs,
     Icons,
+    ListIcons,
     Theme,
 }
 
 /// Order of the settings on screen.
-pub const ORDER: [SettingId; 8] = [
+pub const ORDER: [SettingId; 9] = [
     SettingId::Confirm,
     SettingId::Purge,
     SettingId::KeepOld,
@@ -23,6 +24,7 @@ pub const ORDER: [SettingId; 8] = [
     SettingId::HttpRedirect,
     SettingId::Glyphs,
     SettingId::Icons,
+    SettingId::ListIcons,
     SettingId::Theme,
 ];
 
@@ -36,6 +38,7 @@ impl SettingId {
             SettingId::HttpRedirect => "Redirecionar https para http",
             SettingId::Glyphs => "Glifos",
             SettingId::Icons => "Ícones",
+            SettingId::ListIcons => "Ícones da lista",
             SettingId::Theme => "Tema",
         }
     }
@@ -48,6 +51,7 @@ impl SettingId {
             SettingId::HttpRedirect => &["recusar", "aceitar"],
             SettingId::Glyphs => &["nerd", "unicode", "ascii"],
             SettingId::Icons => &["Automático", "iTerm2", "Sixel", "Desligado"],
+            SettingId::ListIcons => &["visíveis", "só ao abrir"],
             SettingId::Theme => &["escuro", "claro"],
         }
     }
@@ -68,6 +72,9 @@ impl SettingId {
             SettingId::Glyphs => "Conjunto de ícones da interface.",
             SettingId::Icons => {
                 "Imagens dos pacotes: automático usa iTerm2 no WezTerm e sixel no Windows Terminal."
+            }
+            SettingId::ListIcons => {
+                "Baixa os ícones dos pacotes que aparecem na lista. Só ao abrir: o ícone vem quando você abre os detalhes."
             }
             SettingId::Theme => "Paleta de cores da interface.",
         }
@@ -92,6 +99,10 @@ pub struct SettingsState {
     pub saved_icons: String,
     /// The user changed Ícones this session; only then is `icons` written to the file.
     pub icons_touched: bool,
+    /// Value of `list_icons` in `config.toml` terms (`visible`, `opened`).
+    pub list_icons: String,
+    /// The user changed Ícones da lista this session; only then is it written to the file.
+    pub list_icons_touched: bool,
 }
 
 fn step(i: usize, len: usize, forward: bool) -> usize {
@@ -115,6 +126,8 @@ impl SettingsState {
             icons: crate::tui::icons::DEFAULT_SETTING.to_string(),
             saved_icons: crate::tui::icons::DEFAULT_SETTING.to_string(),
             icons_touched: false,
+            list_icons: crate::config::LIST_ICONS[0].to_string(),
+            list_icons_touched: false,
         }
     }
 
@@ -147,6 +160,10 @@ impl SettingsState {
                 .iter()
                 .position(|s| *s == self.icons)
                 .unwrap_or(0),
+            SettingId::ListIcons => crate::config::LIST_ICONS
+                .iter()
+                .position(|s| *s == self.list_icons)
+                .unwrap_or(0),
             SettingId::Theme => usize::from(!self.dark),
         }
     }
@@ -177,6 +194,9 @@ impl SettingsState {
                 self.glyphs = [GlyphSet::Nerd, GlyphSet::Unicode, GlyphSet::Ascii][next];
             }
             SettingId::Icons => self.icons = crate::tui::icons::SETTINGS[next].to_string(),
+            SettingId::ListIcons => {
+                self.list_icons = crate::config::LIST_ICONS[next].to_string();
+            }
             SettingId::Theme => self.dark = next == 0,
         }
         true
