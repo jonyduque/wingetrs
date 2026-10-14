@@ -6209,3 +6209,123 @@ Testes:
 2. Mutação: `list_fetch_cmds` ignorar `list_icons_visible` ⇒ PEGA (teste 1).
 
 **Commit:** `feat(tui): list icons setting`
+
+## Lote C da TUI: mouse (Tasks 94–95)
+
+Esta parte segue o roteiro aprovado na emenda da spec da fase 1 (2026-10-13), lote C. O mouse passa a servir para três coisas: trocar de aba com clique, selecionar item com clique e rolar com a roda. Clique duplo num item faz o mesmo que `Enter`. Um ajuste "Mouse" liga e desliga tudo isso.
+
+### Task 94: Mouse na TUI (abas, seleção, roda, clique duplo)
+
+**Modelo:** sonnet (revisor opus: geometria, que precisa bater com o desenho).
+
+#### Where this fits
+
+- `src/tui/run.rs`:
+  - `ratatui::init()` (~:147) instala um panic hook que restaura o terminal;
+  - `ratatui::restore()` (~:167) roda na saída normal;
+  - `input_msg` (~:352) aceita só `Event::Key` e `Event::Resize` e descarta o resto.
+- `src/tui/app.rs`:
+  - `Msg` (~:40) tem `Key` e `Resize(u16, u16)`, e `App.size` guarda o tamanho do terminal;
+  - `set_tab`, `next_tab` e `move_to` (seleção com rolagem) já existem;
+  - a página e a altura dos itens vêm de `ITEM_ROWS`, `ITEM_GAP`, `items_in_rows` e `list_page_rows`;
+  - `Enter` faz a ação principal da aba (Task 90).
+- `src/tui/view.rs`:
+  - `draw_screen` (~:91) divide a tela;
+  - `draw_tabs` (`src/tui/tabs.rs`) desenha os títulos das abas;
+  - `draw_list` (~:582) desenha os itens a partir de `scroll` (`list_window`);
+  - `draw_settings` (~:222) desenha as linhas de ajuste.
+- `src/tui/layout.rs` tem as funções de divisão da tela.
+
+#### What binds this task
+
+- **Uma geometria só.** O desenho e o mouse usam a mesma função pura, `pub fn regions(app: &App, area: Rect) -> Regions`, em `layout.rs` ou num módulo novo.
+  - `Regions` devolve os retângulos dos títulos de cada aba (`Vec<(Rect, Tab)>`), a área da lista, a área das linhas de ajuste e a dos detalhes.
+  - `draw_screen`, `draw_tabs`, `draw_list` e `draw_settings` passam a tirar suas áreas de `regions`. Não pode existir uma segunda conta da posição.
+  - Teste de equivalência obrigatório (regra do `CLAUDE.md`): para cada aba e para os tamanhos 80×24, 100×30 e 60×15, o texto de cada título de aba no `TestBackend` está dentro do retângulo que `regions` devolve para ele.
+- **Captura do mouse.**
+  - `run.rs` executa `EnableMouseCapture` depois do `ratatui::init()` e `DisableMouseCapture` antes do `ratatui::restore()`.
+  - O panic hook também desliga a captura. Encadeie um hook que faça `DisableMouseCapture` e chame o hook anterior, para o terminal não ficar em modo mouse depois de um pânico.
+  - Por enquanto a captura fica sempre ligada; o ajuste vem na Task 95. Deixe um campo `App.mouse_enabled: bool`, que começa `true`.
+- **Eventos.** `input_msg` converte `Event::Mouse` em `Msg::Mouse(MouseEvent)`, com o tipo do crossterm. O `App` trata:
+  - **Clique esquerdo** (`MouseEventKind::Down(MouseButton::Left)`):
+    - num título de aba ⇒ `set_tab`;
+    - na área da lista, sobre um item ⇒ `move_to(índice)`, com o índice calculado pelo `scroll` atual e por `ITEM_ROWS` + `ITEM_GAP`;
+    - no espaço entre itens ou abaixo do último ⇒ nada;
+    - na aba Ajustes, sobre uma linha de ajuste ⇒ seleciona a linha, sem mudar o valor.
+  - **Clique duplo:** um segundo `Down(Left)` no **mesmo item** em até `DOUBLE_CLICK` = 400 ms ⇒ o mesmo que `Enter` (`on_key` com `KeyCode::Enter`). Em Ajustes, clique duplo numa linha ⇒ avança o valor, como `Enter`.
+    - Guarde `last_click: Option<(Instant, Tab, usize)>`.
+    - O tempo vem de um `now: Instant` passado a `update`, ou de um campo injetável nos testes. Não use `Instant::now()` dentro da lógica pura, senão o teste do clique duplo fica dependente de relógio.
+  - **Roda** (`ScrollDown`/`ScrollUp`) na área da lista ⇒ `move_to(selected ± 3)`.
+  - **Com um modal ou a ajuda aberta**, todo evento de mouse é ignorado. Os modais continuam só no teclado.
+  - Com `mouse_enabled == false`, nada disso acontece.
+- **Fora do escopo:**
+  - clique nos modais e nos detalhes;
+  - arrastar;
+  - botão direito.
+
+**Files:**
+- Modify: `src/tui/run.rs`, `src/tui/app.rs`, `src/tui/view.rs`, `src/tui/layout.rs`, `src/tui/tabs.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`
+
+Testes:
+1. `tab_titles_match_regions`: o teste de equivalência descrito acima.
+2. `click_on_tab_switches_tab`: um clique no centro do retângulo da aba Instalados ⇒ `app.tab == Installed`.
+3. `click_on_item_selects_it`: Pesquisar com 10 hits, `scroll` = 3; um clique na 1ª linha do 2º item visível ⇒ `selected == 4`. Um clique na linha de espaço entre itens ⇒ `selected` não muda.
+4. `double_click_runs_enter`: dois cliques no mesmo item com 100 ms de diferença ⇒ os mesmos `Cmd` que `Enter`. Com 500 ms de diferença ⇒ só seleção. Dois cliques em itens diferentes ⇒ só seleção.
+5. `wheel_scrolls_the_list`: `ScrollDown` ⇒ `selected` sobe 3, limitado ao fim da lista.
+6. `mouse_ignored_under_modal_and_when_disabled`: com um modal aberto ⇒ nada muda. Com `mouse_enabled = false` ⇒ nada muda.
+7. `settings_click_selects_row`: um clique sobre a 3ª linha de ajuste ⇒ `settings.selected == 2`, e o valor não muda.
+
+#### Checks beyond the steps
+
+1. Mutação: o índice do item ignorar `scroll` ⇒ PEGA (teste 3).
+2. Mutação: `DOUBLE_CLICK` igual a 0 ⇒ PEGA (teste 4).
+3. Mutação: tirar o filtro de modal ⇒ PEGA (teste 6).
+4. Mutação: o desenho dos títulos deslocado 1 coluna, sem mexer em `regions` ⇒ PEGA (teste 1). Essa mutação só existe se o desenho não ler de `regions`. Se ele lê (o esperado), rode no lugar a mutação de `regions` deslocar 1 coluna, que deve fazer o teste 2 ou o 1 falhar.
+5. Cole a linha do panic hook encadeado e explique em 1 linha a ordem `DisableMouseCapture` → hook anterior.
+
+**Commit:** `feat(tui): mouse for tabs, selection, wheel and double click`
+
+### Task 95: Ajuste "Mouse" e teste genérico da gravação dos ajustes
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- A aba Ajustes fica em `src/tui/settings.rs`: `SettingId`, `ORDER`, `label`, `options`, `description`, `value_index` e `cycle`.
+- A gravação passa pelo `Cmd::SaveSettings`, com coalescência em `Msg::SettingsSaved` (`src/tui/app.rs`, `request_save` e o handler). Ela usa `newer`, `saved_*`, `*_in_flight` e a reversão no Err.
+- **Duas vezes** um ajuste novo entrou sem fazer parte da coalescência. A Task 93 achou isso na auditoria: `list_icons`.
+- Depois da Task 94, `App.mouse_enabled` existe e controla o tratamento de `Msg::Mouse`.
+
+#### What binds this task
+
+- **O ajuste Mouse:**
+  - **Config:** `[behavior] mouse: bool`, padrão `true`. Fica em `Behavior`, para entrar na coalescência pelo `behavior`.
+  - **Linha `SettingId::Mouse`:** depois de `ListIcons`, com o rótulo `"Mouse"`, as opções `&["ligado", "desligado"]` e a descrição `"Clique troca de aba e seleciona; clique duplo faz o mesmo que Enter. Desligado: o terminal volta a selecionar texto com o mouse."`.
+  - **Aplicar na hora:** `App.mouse_enabled` muda, e `Cmd::SetMouseCapture(bool)` executa `EnableMouseCapture`/`DisableMouseCapture` em `run.rs`.
+  - **Início:** `run.rs` só liga a captura se `cfg.behavior.mouse`. O `DisableMouseCapture` da saída e do panic hook pode rodar sempre, porque é inofensivo.
+  - **Reversão no Err:** como o valor está em `behavior`, ele já volta. Garanta que `mouse_enabled` e a captura acompanhem a reversão.
+- **Teste genérico** `every_setting_joins_save_coalescing` em `tests/tui_state.rs`. Para **cada** `SettingId` de `ORDER`:
+  1. selecione a linha e dê `Enter`; deve sair um `SaveSettings`;
+  2. dê `Enter` de novo antes de responder;
+  3. responda `SettingsSaved(Ok)`; deve sair um novo `SaveSettings` com o valor mais novo;
+  4. repita com `SettingsSaved(Err)` e confira que o valor visível volta ao último salvo.
+
+  `Glyphs` com `glyphs_forced` fica de fora. O teste percorre `ORDER`, então um ajuste novo sem coalescência falha sem que alguém precise lembrar de escrever outro teste.
+
+**Files:**
+- Modify: `src/config.rs`, `src/tui/settings.rs`, `src/tui/app.rs`, `src/tui/run.rs`
+- Test: `tests/tui_state.rs`, `tests/config.rs`, e o snapshot da aba Ajustes
+
+Testes:
+1. `mouse_setting_toggles_capture`: `Enter` na linha ⇒ `mouse_enabled == false`, um `Cmd::SetMouseCapture(false)` e um `SaveSettings` com `behavior.mouse == false`. Depois disso, um clique numa aba não troca de aba.
+2. `every_setting_joins_save_coalescing`: o teste genérico acima.
+3. `behavior_mouse_defaults_to_true`: sem o campo ⇒ `true`; o valor sobrevive a `save` + `load`.
+4. Snapshot da aba Ajustes: só a linha nova muda.
+
+#### Checks beyond the steps
+
+1. Mutação: tirar `list_icons` de `newer` (o defeito da Task 93) ⇒ PEGA (teste 2). Esta é a prova de que o teste genérico pega a classe de defeito.
+2. Mutação: não emitir `SetMouseCapture` ⇒ PEGA (teste 1).
+
+**Commit:** `feat(tui): mouse setting; every setting joins save coalescing`
