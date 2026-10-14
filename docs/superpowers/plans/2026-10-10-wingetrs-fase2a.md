@@ -6526,3 +6526,121 @@ Testes:
 4. Os testes não tocam o `%LOCALAPPDATA%` real: o `DataDir` vem de `tempfile`. Cole a linha que mostra isso.
 
 **Commit:** `feat: pin an app's version (TUI menu; upgrade skips pinned)`
+
+## Lote E da TUI: ícones do Scoop e escolha de ambíguos (Tasks 99–100)
+
+O roteiro aprovado está na emenda da spec da fase 1 (2026-10-13), no lote E. Para os ícones do Scoop, a ordem decidida é: primeiro o winget (mesmo domínio de homepage + nome normalizado, só com candidato único), depois a homepage como reserva (`apple-touch-icon`, depois `link rel=icon` ≥ 64 px, por último `og:image` quase quadrada; github.com fica de fora). O lote começa com uma sonda que mede cobertura e tempo de cada caminho. As tarefas de implementação dos ícones do Scoop são escritas depois, com os números da sonda.
+
+### Task 99: Sonda de ícones para apps do Scoop
+
+**Modelo:** opus. O revisor é o orquestrador, que lê o relatório. **Roda sozinha**, porque mede tempo de rede.
+
+#### Where this fits
+
+- Os manifestos do Scoop não têm ícone. `details_from_raw` (`src/sources/scoop/manifest.rs`, ~:101) lê `homepage`, `description` e `license`.
+- O catálogo (`catalog.db`, tabela `packages`: `id`, `name`, `moniker`, `publisher`, `tags`...) **não tem homepage**. A homepage do winget só aparece no manifesto, buscado por `wingetrs show <id> --source winget`. A busca usa versionData + manifesto e guarda o resultado no cache de blobs.
+- Os ícones do winget vêm de `Icons` no manifesto, com `IconSha256` (Task 83).
+- Os buckets `main` e `extras` ficam no diretório de dados do wingetrs. Ache o caminho em `src/sources/scoop/` e `src/cache/`, sem varrer o disco.
+
+#### What binds this task
+
+- **Nada no repositório muda**, a não ser `.claude/tasks/task-99-report.md`. Os scripts ficam em `<S>\scoop-icon-probe`, onde `<S>` é o scratchpad do agente. Python roda com `-I`, conforme o `CLAUDE.md`.
+- **Amostra:** 150 apps com `random.seed(99)`, 75 do bucket `main` e 75 do `extras`, tirados dos manifestos locais. Grave a lista no relatório.
+- **Catálogo:** copie o catálogo para uma raiz temporária pelo mesmo método `python -I … backup` da Task 77. Os `show` rodam com `LOCALAPPDATA` apontando para essa raiz, para não mexer no cache real.
+- **Caminho W (winget).** Para cada app:
+  1. Normalize o nome: minúsculas, só alfanuméricos.
+  2. Junte candidatos do catálogo cujo `moniker`, `name` normalizado ou última parte do `id` normalizada seja igual.
+  3. Para cada candidato, até 5, rode `show` e extraia a homepage e se o manifesto tem `Icons`.
+  4. O par vale quando o **domínio registrável** (sem `www.`) da homepage do winget é igual ao do Scoop **e** só um candidato passa nesse critério.
+
+  Registre:
+  - candidatos por app;
+  - quantos têm par único;
+  - quantos desses têm ícone;
+  - tempo por app: mediana, p90 e máximo, contando só a rede, sem as leituras do catálogo.
+- **Caminho H (homepage).** Pule as homepages em `github.com` e conte quantas são. Para as outras:
+  1. GET da homepage com timeout de 10 s, limite de 1 MiB e o user agent `wingetrs-probe`.
+  2. Parse do `<head>` em busca de `apple-touch-icon`, `link rel=icon` com `sizes` ≥ 64 (ou sem `sizes` mas `.png`/`.svg`) e `og:image`.
+  3. Baixe o primeiro candidato pela ordem de preferência e confira se o `image` do Python (Pillow, se houver; senão só o cabeçalho PNG/ICO/JPEG) dá dimensões ≥ 64 e proporção entre 0,8 e 1,25.
+
+  Registre:
+  - cobertura por tipo de fonte;
+  - SVG encontrado (o `image` do Rust não decodifica SVG);
+  - falhas por tipo: timeout, 403, sem `<head>` útil;
+  - tempo: mediana, p90 e máximo;
+  - bytes baixados.
+
+  Espere ≥ 200 ms entre requisições ao mesmo host.
+- **Comparação:** apresente quatro coberturas — W sozinho, H sozinho, W então H, H então W — e o tempo esperado de cada ordem. Conte também os falsos positivos visíveis: confira à mão 15 pares do W e 15 ícones do H, olhando o nome do arquivo e as dimensões, e diga quantos parecem errados.
+- **Recomendação:** a ordem e os limites, com os números. Dê uma estimativa grosseira do custo de rede de uma página de 15 itens do Scoop na lista: requisições e tempo.
+- **Limpeza:** apague a raiz temporária e o catálogo copiado. `leftovers.ps1` deve sair limpo.
+
+**Files:**
+- Create: `.claude/tasks/task-99-report.md`, o único arquivo do repositório
+
+#### Checks beyond the steps
+
+1. `git status --short` mostra só o relatório; cole a saída.
+2. Todo número tem a saída de origem colada. O que não foi medido aparece como "não medido".
+
+**Commit:** `chore(tasks): scoop icon probe report for task 99`
+
+### Task 100: Escolher a correspondência de um pacote ambíguo
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `src/installed/correlate.rs`:
+  - `Correlation` (~:19) é `Matched { source, package_id, rule } | Ambiguous { candidates, rule } | Unmatched`;
+  - `Rule` (~:10) é `ProductCode | UpgradeCode | PackageFamilyName | NameAndPublisher | ScoopManifest`;
+  - `correlate(apps, catalog, normalizer, tracking)` (~:290) devolve `Vec<ListRow>`.
+- `InstalledApp` (`src/installed/mod.rs`, ~:35) tem `source` (`InstallSource`) e `key`. Para ARP, `key` é a subchave do registro; para MSIX, o family name; para o Scoop, o nome do app. É a identidade estável do app instalado.
+- Quem chama `correlate`: o scan da TUI (`src/tui/run.rs`, `spawn_scan`) e a CLI `list` (`src/cli/`). Confira com `grep -rn "correlate(" src`.
+- Na TUI, uma linha `Ambiguous` mostra ⚠, e `selected_key` dá `None`, então ela fica sem detalhes. O menu de ações de Instalados é o `Modal::Actions` (Tasks 90 e 97).
+- Mapas JSON pequenos: use `fs_retry::write_json_atomic` (Task 98), com leitura tolerante, como em `src/pins.rs`.
+
+#### What binds this task
+
+- **Módulo `src/installed/overrides.rs`:**
+  - `pub fn load(data: &DataDir) -> BTreeMap<String, Choice>`;
+  - `pub fn set(data: &DataDir, app_key: &str, choice: Option<Choice>)`, onde `None` remove a escolha;
+  - `pub enum Choice { Package { source: String, package_id: String }, NotInCatalog }`, serializado em JSON com tag;
+  - `pub fn app_key(app: &InstalledApp) -> String`, no formato `"<source>/<key>"` (ex.: `arp/{GUID}`, `msix/<family>`, `scoop/<name>`).
+
+  O arquivo é `correlations.json`.
+- **`correlate` recebe `overrides: &BTreeMap<String, Choice>`.** Para cada app com escolha:
+  - **`Package` que existe no catálogo** ⇒ `Matched { source, package_id, rule: Rule::User }` (variante nova), com `latest` e estado calculados como para qualquer `Matched`. Use a mesma função que já calcula esses dois; não duplique a conta.
+  - **`Package` que sumiu do catálogo** ⇒ a escolha é ignorada e a correlação automática vale, com `tracing::warn!`.
+  - **`NotInCatalog`** ⇒ `Unmatched`.
+  - A escolha vale para qualquer app, não só para os ambíguos. A UI desta tarefa só a oferece para ambíguos e para desfazer.
+- **TUI:**
+  - Numa linha `Ambiguous`, o menu de ações ganha "Escolher correspondência" como 1º item. Ele abre um picker com os candidatos (rótulo = id, detalhe = nome + publisher do catálogo, se houver) e a última opção "Nenhum destes (não está no catálogo)".
+  - Escolher ⇒ `Cmd::SetOverride { app_key, choice }` ⇒ job grava e emite `ScanInstalled`. A linha se corrige no novo scan e o toast é "correspondência salva: <id>".
+  - Numa linha com escolha do usuário (`rule == User`, ou `Unmatched` vindo de `NotInCatalog`), o menu ganha "Desfazer escolha de correspondência" ⇒ `set(.., None)` + scan.
+  - Para isso a linha precisa carregar o `app_key`. Acrescente `pub app_key: String` em `ListRow`, preenchido por `correlate`.
+- **CLI `list`:** respeita as escolhas, porque passa `overrides::load` a `correlate`. O "Ambíguos" da saída da CLI some para os resolvidos.
+- **Uma regra só:** a TUI e a CLI passam pelo mesmo `correlate` com o mesmo mapa.
+
+**Files:**
+- Create: `src/installed/overrides.rs`
+- Modify: `src/installed/mod.rs`, `src/installed/correlate.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/jobs.rs`, `src/cli/` (onde `correlate` é chamado)
+- Test: `tests/correlate.rs` (ou o arquivo de testes de correlação que existir), `tests/tui_state.rs`, `tests/overrides.rs` (novo)
+
+Testes:
+1. `override_resolves_ambiguous`: um app sintético que dá `Ambiguous` com candidatos A e B; com override `Package A` ⇒ `Matched { package_id: A, rule: User }`, com o `latest` de A.
+2. `override_not_in_catalog_is_unmatched`.
+3. `override_to_missing_package_falls_back`: override para um id que não está no catálogo ⇒ a correlação automática de antes (`Ambiguous`).
+4. `overrides_round_trip_and_survive_corruption` (`tests/overrides.rs`).
+5. `ambiguous_menu_offers_choice_and_saves`: na TUI, `Enter` numa linha ambígua ⇒ o menu tem "Escolher correspondência" ⇒ picker com os 2 candidatos + "Nenhum destes" ⇒ escolher A ⇒ `Cmd::SetOverride` com o `app_key` da linha e `Package A`.
+6. `undo_choice_in_menu`: uma linha `rule == User` ⇒ o menu tem "Desfazer…" ⇒ `SetOverride` com `None`.
+7. `cli_list_uses_overrides`: com override gravado, `list` não mostra o app em "Ambíguos".
+
+#### Checks beyond the steps
+
+1. Mutação: `correlate` ignorar overrides ⇒ PEGA (teste 1).
+2. Mutação: override para id inexistente virar `Matched` mesmo assim ⇒ PEGA (teste 3).
+3. Mutação: o `app_key` da linha usar `name` em vez de `key` ⇒ PEGA (teste 5 ou 1).
+4. Os testes usam `DataDir` em tempdir; cole a linha que mostra isso.
+
+**Commit:** `feat: choose the catalog match of an ambiguous installed app`
