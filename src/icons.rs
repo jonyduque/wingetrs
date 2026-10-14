@@ -56,7 +56,7 @@ pub fn load_map(data: &DataDir) -> BTreeMap<String, String> {
 }
 
 /// Records that `<source>/<id>` has its icon cached under `sha`. Failures are only logged.
-/// Entre processos, a última gravação vence; o pior caso é baixar o ícone de novo.
+/// Across processes the last write wins; the worst case is downloading the icon again.
 pub fn remember(data: &DataDir, source: &str, id: &str, sha: &str) {
     if let Err(e) = try_remember(data, source, id, sha) {
         tracing::debug!(error = %e, "icons.json not updated");
