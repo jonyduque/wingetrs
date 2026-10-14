@@ -40,6 +40,8 @@ pub async fn fetch(http: &Http, blobs: &BlobStore, icon: &IconRef) -> Result<Vec
 }
 
 static MAP_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Serializes the load-modify-rename of `icons.json` within the process.
+static MAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn map_path(data: &DataDir) -> std::path::PathBuf {
     data.root().join("icons.json")
@@ -54,6 +56,7 @@ pub fn load_map(data: &DataDir) -> BTreeMap<String, String> {
 }
 
 /// Records that `<source>/<id>` has its icon cached under `sha`. Failures are only logged.
+/// Entre processos, a última gravação vence; o pior caso é baixar o ícone de novo.
 pub fn remember(data: &DataDir, source: &str, id: &str, sha: &str) {
     if let Err(e) = try_remember(data, source, id, sha) {
         tracing::debug!(error = %e, "icons.json not updated");
@@ -61,6 +64,10 @@ pub fn remember(data: &DataDir, source: &str, id: &str, sha: &str) {
 }
 
 fn try_remember(data: &DataDir, source: &str, id: &str, sha: &str) -> std::io::Result<()> {
+    // Poison is harmless: the guarded data is `()` and the file is always rewritten whole by rename.
+    let _guard = MAP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut map = load_map(data);
     map.insert(format!("{source}/{id}"), sha.to_owned());
     let json = serde_json::to_vec(&map).map_err(std::io::Error::other)?;

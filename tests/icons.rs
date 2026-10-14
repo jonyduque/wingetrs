@@ -95,6 +95,46 @@ fn icon_map_round_trips_and_survives_corruption() {
     assert_eq!(icons::load_map(&data).get("winget/A.B"), Some(&sha));
 }
 
+#[test]
+fn concurrent_remember_keeps_every_entry() {
+    const THREADS: usize = 16;
+    const CALLS: usize = 4;
+    let sha_of = |i: usize, c: usize| format!("{:032x}{:032x}", i, c);
+    for _round in 0..2 {
+        let t = tempfile::tempdir().unwrap();
+        let data = DataDir::new(t.path().join("w"));
+        data.ensure().unwrap();
+        let barrier = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    let (data, barrier) = (&data, &barrier);
+                    s.spawn(move || {
+                        barrier.wait();
+                        for c in 0..CALLS {
+                            icons::remember(data, "winget", &format!("P.{i}"), &sha_of(i, c));
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Err(p) = h.join() {
+                    std::panic::resume_unwind(p);
+                }
+            }
+        });
+        let map = icons::load_map(&data);
+        assert_eq!(map.len(), THREADS);
+        for i in 0..THREADS {
+            assert_eq!(
+                map.get(&format!("winget/P.{i}")),
+                Some(&sha_of(i, CALLS - 1)),
+                "entry {i}"
+            );
+        }
+    }
+}
+
 /// Raw HTTP server that sends `body_len` bytes with no Content-Length (close-delimited).
 async fn serve_unsized(body_len: usize) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
