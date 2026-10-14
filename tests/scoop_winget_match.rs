@@ -97,3 +97,103 @@ fn live_winget_candidates_timing_and_twins() {
         );
     }
 }
+
+fn stored(id: &str) -> wingetrs::catalog::StoredPackage {
+    wingetrs::catalog::StoredPackage {
+        entry: wingetrs::core::PackageEntry {
+            source: wingetrs::core::SourceKind::Winget,
+            source_name: "winget".into(),
+            id: id.into(),
+            name: id.into(),
+            moniker: None,
+            version: "1".into(),
+            publisher: None,
+            description: None,
+            tags: Vec::new(),
+            commands: Vec::new(),
+        },
+        arp_min_version: None,
+        arp_max_version: None,
+        winget_hash: None,
+        raw: None,
+    }
+}
+
+/// Winget details with a homepage and, when `icon` is set, an icon whose sha is the id.
+fn details(id: &str, home: Option<&str>, icon: bool) -> wingetrs::core::PackageDetails {
+    wingetrs::core::PackageDetails {
+        source: wingetrs::core::SourceKind::Winget,
+        id: id.into(),
+        name: id.into(),
+        version: "1".into(),
+        publisher: None,
+        description: None,
+        homepage: home.map(str::to_string),
+        license: None,
+        tags: Vec::new(),
+        installers: Vec::new(),
+        available_versions: Vec::new(),
+        icon: icon.then(|| wingetrs::core::IconRef {
+            url: format!("https://x/{id}.png"),
+            sha256: id.into(),
+        }),
+    }
+}
+
+fn twin(pkgs: &[(&str, Option<&str>)], home: &str) -> Option<wingetrs::core::IconRef> {
+    let stored: Vec<_> = pkgs.iter().map(|(id, _)| stored(id)).collect();
+    let homes: std::collections::HashMap<_, _> = pkgs.iter().copied().collect();
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(wingetrs::sources::scoop::winget_match::twin_from(
+            &stored,
+            home,
+            |p| {
+                let d = details(&p.entry.id, homes[p.entry.id.as_str()], true);
+                async move { Some(d) }
+            },
+        ))
+}
+
+#[test]
+fn twin_icon_is_the_unique_same_site_candidates() {
+    let home = "https://www.7-zip.org/";
+    let icon = twin(
+        &[
+            ("A.One", Some("https://7-zip.org/x")),
+            ("B.Two", Some("https://o.org")),
+        ],
+        home,
+    );
+    assert_eq!(icon.map(|i| i.sha256).as_deref(), Some("A.One"));
+    assert_eq!(
+        twin(
+            &[
+                ("A.One", Some("https://7-zip.org")),
+                ("B.Two", Some("https://7-zip.org/a"))
+            ],
+            home
+        ),
+        None
+    );
+    let icon = twin(
+        &[("A.One", None), ("B.Two", Some("https://7-zip.org"))],
+        home,
+    );
+    assert_eq!(icon.map(|i| i.sha256).as_deref(), Some("B.Two"));
+    assert_eq!(twin(&[("A.One", None)], home), None);
+}
+
+#[test]
+fn details_are_sent_before_the_twin_search() {
+    let src = include_str!("../src/tui/run.rs");
+    let from = src.find("fn spawn_details").unwrap();
+    let body = &src[from..from + src[from..].find("/// Debounced fetch").unwrap()];
+    let sent = body.find("ctx.tx.send(msg)").unwrap();
+    let twin = body.find("icon_ref(").unwrap();
+    assert!(sent < twin, "{body}");
+    let load = src.find("async fn load_details").unwrap();
+    let load_body = &src[load..load + src[load..].find("async fn winget_details").unwrap()];
+    assert!(!load_body.contains("twin_icon"), "{load_body}");
+}

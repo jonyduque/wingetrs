@@ -46,3 +46,27 @@ pub fn pick(scoop_homepage: &str, candidates: &[(String, Option<String>)]) -> Op
     }
     Some(first.0.clone())
 }
+
+/// Icon of the twin of a Scoop app among the winget `pkgs` named alike: `load` yields each
+/// one's details (`None` when they cannot be had), `pick` demands exactly one on the same
+/// site, and the twin's icon is the result.
+pub async fn twin_from<'a, F, Fut>(
+    pkgs: &'a [crate::catalog::StoredPackage],
+    homepage: &str,
+    load: F,
+) -> Option<crate::core::IconRef>
+where
+    F: Fn(&'a crate::catalog::StoredPackage) -> Fut,
+    Fut: std::future::Future<Output = Option<crate::core::PackageDetails>>,
+{
+    let mut details = Vec::new();
+    for pkg in pkgs {
+        details.extend(load(pkg).await);
+    }
+    let cands: Vec<(String, Option<String>)> = details
+        .iter()
+        .map(|d| (d.id.clone(), d.homepage.clone()))
+        .collect();
+    let id = pick(homepage, &cands)?;
+    details.into_iter().find(|d| d.id == id)?.icon
+}

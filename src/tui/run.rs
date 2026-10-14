@@ -748,13 +748,18 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
             }
         });
         let msg = join_details(key.clone(), work).await;
-        let icon = match &msg {
-            Msg::DetailsLoaded { result: Ok(d), .. } => d.icon.clone(),
+        let details = match &msg {
+            Msg::DetailsLoaded { result: Ok(d), .. } => Some(d.clone()),
             _ => None,
         };
-        let icon_sha = icon.as_ref().map(|i| i.sha256.clone()).unwrap_or_default();
-        // Details first; the icon is fetched afterwards so a slow host never delays them.
+        // Details first; the icon (and the Scoop twin search) comes afterwards so a slow
+        // host never delays them.
         let _ = ctx.tx.send(msg);
+        let icon = match &details {
+            Some(d) => icon_ref(&ctx, &source, &id, d).await,
+            None => None,
+        };
+        let icon_sha = icon.as_ref().map(|i| i.sha256.clone()).unwrap_or_default();
         if let Some(bytes) = load_icon(&ctx, &source, &id, icon.as_ref()).await {
             let _ = ctx.tx.send(Msg::IconMapped {
                 key: key.clone(),
@@ -807,7 +812,7 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) 
 /// Details, then icon, of one list package; announces the icon when it was obtained.
 async fn prefetch_one(ctx: &Ctx, source: &str, id: &str) {
     let icon = match load_details(ctx, source, id).await {
-        Ok(d) => d.icon,
+        Ok(d) => icon_ref(ctx, source, id, &d).await,
         Err(e) => {
             tracing::debug!(%source, %id, error = %e, "list details not loaded");
             return;
@@ -949,11 +954,10 @@ async fn load_details(
         SourceKind::Winget => winget_details(ctx, &pkg).await,
         SourceKind::Scoop => {
             let raw = pkg.raw.as_deref().context("pacote scoop sem manifesto")?;
-            let mut d = crate::sources::scoop::manifest::details_from_raw(&pkg.entry.id, raw)?;
-            if let Some(home) = d.homepage.clone() {
-                d.icon = twin_icon(ctx, &pkg.entry.id, &home).await;
-            }
-            Ok(d)
+            Ok(crate::sources::scoop::manifest::details_from_raw(
+                &pkg.entry.id,
+                raw,
+            )?)
         }
     }
 }
@@ -976,6 +980,21 @@ async fn winget_details(
         None,
     )
     .await?)
+}
+
+/// The icon to show for a package: its own (winget) or its winget twin's (Scoop). Only ever
+/// called after the details were sent, since the twin search may take long.
+async fn icon_ref(
+    ctx: &Ctx,
+    source: &str,
+    id: &str,
+    d: &crate::core::PackageDetails,
+) -> Option<crate::core::IconRef> {
+    if source == "winget" {
+        return d.icon.clone();
+    }
+    let home = d.homepage.as_deref()?;
+    twin_icon(ctx, id, home).await
 }
 
 /// Icon of the winget package that is the same app as a Scoop one: named alike and with the
@@ -1006,19 +1025,16 @@ async fn twin_icon(ctx: &Ctx, scoop_app: &str, homepage: &str) -> Option<crate::
             }
         },
     };
-    let mut details = Vec::new();
-    for pkg in &pkgs {
+    crate::sources::scoop::winget_match::twin_from(&pkgs, homepage, |pkg| async move {
         match winget_details(ctx, pkg).await {
-            Ok(d) => details.push(d),
-            Err(e) => tracing::debug!(id = %pkg.entry.id, error = %e, "twin details not loaded"),
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::debug!(id = %pkg.entry.id, error = %e, "twin details not loaded");
+                None
+            }
         }
-    }
-    let cands: Vec<(String, Option<String>)> = details
-        .iter()
-        .map(|d| (d.id.clone(), d.homepage.clone()))
-        .collect();
-    let id = crate::sources::scoop::winget_match::pick(homepage, &cands)?;
-    details.into_iter().find(|d| d.id == id)?.icon
+    })
+    .await
 }
 
 #[cfg(windows)]

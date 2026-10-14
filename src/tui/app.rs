@@ -350,7 +350,7 @@ pub enum Cmd {
         sha: String,
         size: (u16, u16),
     },
-    /// Fetch the icons of these visible winget rows (details, then icon) off the UI thread;
+    /// Fetch the icons of these visible winget and scoop rows (details, then icon) off the UI thread;
     /// each one obtained answers with `Msg::IconMapped`. A newer generation supersedes it.
     PrefetchIcons {
         generation: u64,

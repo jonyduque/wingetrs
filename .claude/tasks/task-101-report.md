@@ -33,3 +33,10 @@ Decisions:
 Concerns:
 - winget_candidates 19-28 ms per call (over the 5 ms limit); runs on spawn_blocking per visible Scoop row (max 4 at once). Could be indexed in memory if it shows in use; not measured in the TUI.
 - Every Scoop details/prefetch now fetches the manifests of up to 5 candidates (cached in blobs after first time).
+
+## Fix round (review)
+- Commit: SHA real do primeiro commit 6e3f6da; fix in the commit `fix(tui): scoop details never wait for the twin icon`.
+- load_details back to local-only for Scoop; icon_ref (winget: d.icon, Scoop: twin_icon) runs after ctx.tx.send(msg) in spawn_details and inside prefetch_one. Testable core: winget_match::twin_from (pkgs, homepage, load fn).
+- Gate: [OK]   test (784 passed, 19 ignored) / [OK]   gate verde
+- [OK] mutação PEGA: 'details.into_iter().find(|d| d.id == id)?.icon' -> 'None' fez o teste falhar (exit 101). (twin_from always None)
+- Order test details_are_sent_before_the_twin_search is a source-order check (spawn_details needs a Ctx): [OK] mutação PEGA: 'let _ = ctx.tx.send(msg);' -> 'let _ = &msg;' fez o teste falhar (exit 101).
