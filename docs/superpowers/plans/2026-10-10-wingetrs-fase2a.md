@@ -6329,3 +6329,200 @@ Testes:
 2. Mutação: não emitir `SetMouseCapture` ⇒ PEGA (teste 1).
 
 **Commit:** `feat(tui): mouse setting; every setting joins save coalescing`
+
+## Lote D da TUI: fila, marcação, fixar versão (Tasks 96–98)
+
+Este lote implementa a emenda da spec da fase 1 de 2026-10-14 ("lote D"). As tarefas rodam em sequência, nesta ordem: 96, depois 97, depois 98. A 97 e a 98 dependem da fila da 96.
+
+### Task 96: Fila de operações sem diálogo que trava
+
+**Modelo:** opus (estado concorrente na TUI; revisor opus).
+
+#### Where this fits
+
+- `src/tui/app.rs`:
+  - `start_planning` (~:1449) liga `app.planning`; enquanto ele estiver ligado, nenhum outro plano começa.
+  - `on_planned` produz `Modal::Confirm { plan_text, action }`, ou chama `execute` direto (`needs_confirm` ~:1613).
+  - `execute` (~:1619) abre `Modal::Running { label, progress }` e emite `Cmd::Execute(action)`.
+  - `Msg::InstallProgress` atualiza o progresso do `Running`. `Msg::InstallFinished` chama `on_finished` (~:1657), que fecha o modal, emite `ScanInstalled`, mostra o toast e talvez abre `Modal::Residues` (`handle_residues`).
+  - `Action` (~:132) é `Apply(Vec<Vec<InstallPlan>>) | Remove(UninstallPlan)`, e `label()` devolve o texto da operação.
+- `src/tui/run.rs`: `spawn_execute` (~:1017) roda `jobs::run_action` sob o lock de instalação. `Busy` vira `InstallFail::Busy`.
+- `src/tui/view.rs`: `Modal::Running` é desenhado como diálogo (~:1061). A barra de status fica em `draw_status` (~:884).
+
+#### What binds this task
+
+- **Estado novo no `App`:**
+  - `running: Option<Running>` com `{ id: u64, label: String, progress: Option<RunProgress> }`, que substitui `Modal::Running`;
+  - `queue: VecDeque<Queued>` com `{ id: u64, label: String, action: Action }`;
+  - `next_op_id: u64`.
+- **Confirmar ou executar sem confirmação ⇒ `enqueue(action)`.** Se não há `running` e nenhum `Modal::Residues` está aberto, a ação começa na hora (`Cmd::Execute`). Senão, vai para o fim de `queue`. O toast "na fila: <label> (posição N)" aparece só quando a ação fica esperando.
+- **Ao chegar `InstallFinished`:**
+  - o resultado é tratado como hoje: `ScanInstalled`, toast e resíduos;
+  - `running = None`;
+  - em seguida, se nenhum `Modal::Residues` ficou aberto, a próxima da fila começa;
+  - ao fechar o diálogo de resíduos (escolha ou `Esc`), a fila continua;
+  - um `Busy` (outro processo segura o lock) mostra o toast de hoje e devolve a ação para a **frente** da fila, para ser tentada de novo no próximo `InstallFinished`. Como esse evento não virá, tente de novo depois de `BUSY_RETRY` = 2 s por um `Cmd::RetryQueue` com espera (`tokio::time::sleep` em `run.rs`). Isso pode se repetir sem limite enquanto o lock estiver ocupado, e a barra mostra "aguardando outra instalação".
+- **Sem diálogo de execução.**
+  - `Modal::Running` sai. A TUI continua navegável durante a operação: teclas, abas e mouse.
+  - Planejar outra ação durante uma execução é permitido; `app.planning` continua limitando a **um plano por vez**.
+  - `Msg::InstallProgress` atualiza `running.progress`.
+- **Barra de status** com `running`: spinner + label + progresso (o mesmo texto que o diálogo mostrava) + `· fila: N` quando N > 0. Isso tem prioridade sobre as outras mensagens da barra, como o status de atualização do catálogo, se houver conflito. Não invente uma segunda barra.
+- **`f` abre `Modal::Queue`.**
+  - A 1ª linha é a operação em andamento, com o rótulo "em andamento: …", e não pode ser escolhida.
+  - Depois vêm os pendentes, na ordem.
+  - `Delete` ou `x` num pendente tira-o da fila, com o toast "removido da fila: <label>".
+  - `Esc` ou `f` fecha.
+  - Fila vazia e nada rodando ⇒ toast "fila vazia", sem modal.
+  - `f` só funciona com a busca vazia, como `i`, `u` e `U`.
+- **Sair (`q`/`Esc` na raiz) com `running` ou fila não vazia ⇒ `Modal::Confirm` de saída.**
+  - O texto é "Há N operações na fila e uma em andamento. Sair cancela as pendentes; a em andamento termina antes de fechar."
+  - `Enter` esvazia a fila e espera `InstallFinished` antes do `Cmd::Quit` (barra: "saindo após terminar…").
+  - Use um campo `quit_after_running: bool`, e não um `Cmd::Quit` imediato: o job em andamento não pode ser abandonado.
+- **Dica na barra de ajuda:** `f fila` aparece só quando há `running` ou fila.
+- **Fora do escopo:** cancelar a operação em andamento; reordenar a fila.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/view.rs`, `src/tui/help.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`
+
+Testes:
+1. `second_action_waits_in_queue`:
+   - executar A ⇒ `Cmd::Execute(A)` e `running` = A;
+   - confirmar B durante A ⇒ nenhum `Execute`, `queue` = [B] e o toast da posição;
+   - `InstallFinished(Ok)` de A ⇒ `Execute(B)`, `ScanInstalled` e o toast de A.
+2. `navigation_works_while_running`: com `running`, `↓`, a troca de aba e a busca funcionam, e `modal` é `None`.
+3. `residues_dialog_pauses_the_queue`: A é uma remoção cujo `InstallFinished` traz resíduos (modo perguntar) e B está na fila ⇒ abre `Modal::Residues`, e não há `Execute(B)`. Fechar o diálogo ⇒ `Execute(B)`.
+4. `busy_requeues_at_front_and_retries`: `InstallFinished(Err(Busy))` de A, com B na fila ⇒ `queue` = [A, B] e `Cmd::RetryQueue`. `Msg::RetryQueue` ⇒ `Execute(A)`.
+5. `queue_modal_removes_pending`: com A rodando e B, C na fila, `f` ⇒ modal com 3 linhas. `↓` + `x` sobre B ⇒ `queue` = [C]. A linha de A não pode ser removida.
+6. `quit_waits_for_running`: com A rodando e B na fila, `q` ⇒ diálogo de saída. `Enter` ⇒ `queue` vazio e nenhum `Quit`. `InstallFinished` de A ⇒ `Cmd::Quit`.
+7. `status_bar_shows_running_and_queue` (`TestBackend`): a barra contém o label de A e `fila: 1`.
+8. Snapshots atualizados. O snapshot do diálogo `Running` some, porque não existe mais.
+
+#### Checks beyond the steps
+
+1. Mutação: executar a segunda ação na hora, ignorando `running` ⇒ PEGA (teste 1).
+2. Mutação: não pausar com `Residues` aberto ⇒ PEGA (teste 3).
+3. Mutação: `Busy` pôr a ação no fim da fila ⇒ PEGA (teste 4).
+4. Mutação: `q` sair na hora com `running` ⇒ PEGA (teste 6).
+5. O `Cmd::RetryQueue` com espera em `run.rs` segue a regra de handles: cole a linha que mostra o handle aguardado, ou o padrão `spawn_job` usado.
+
+**Commit:** `feat(tui): operation queue; running no longer blocks the screen`
+
+### Task 97: Marcar vários itens com Espaço
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- Depois da Task 96, uma ação confirmada vai para `enqueue(action)`.
+- As ações por item ficam em `src/tui/app.rs`:
+  - `install_selected` (`i`/`Enter` em Pesquisar);
+  - `remove_selected` (`u`);
+  - `upgrade_selected` (`U`/`Enter` em Atualizações), via `upgrade_target`;
+  - o menu de ações (`Modal::Actions`).
+- O planejamento é um `Cmd` por item: `PlanInstall { source_name, id, keep }` e `PlanRemove { app, purge }`. O resultado chega em `on_planned` como `Planned::Ready { text, action }` ou `Planned::Choose(candidates)`.
+- `Action::Apply(Vec<Vec<InstallPlan>>)` já aceita vários apps.
+- A identidade de uma linha de Instalados é `name` + `origin` (Task 91, `position_of`). Em Pesquisar, é `source_name` + `id`.
+
+#### What binds this task
+
+- **Marcas:**
+  - `marks: HashMap<Tab, HashSet<RowKey>>`, onde `RowKey` = `(origin, name)` em Instalados e Atualizações e `(source_name, id)` em Pesquisar.
+  - `Espaço` (com a busca vazia ou não, porque espaço não entra na busca) alterna a marca da linha selecionada.
+  - A linha marcada mostra `g.mark` antes do nome: campo novo em `Glyphs`, `"\u{f00c}"` em nerd, `"✓"` em unicode, `"*"` em ascii.
+  - O contador "N marcados" aparece na barra de ajuda.
+- **A ação principal com marcas vale para os marcados.**
+  - **Pesquisar, `Enter`/`i`:** planeja a instalação de cada marcado do Scoop. Os do winget são pulados e citados no toast "pulados: …".
+  - **Atualizações, `Enter`/`U`:** os marcados que `upgrade_target` aceita.
+  - **Instalados:** `u` remove os marcados `origin == "wingetrs"`. O menu de ações, com marcas, mostra "Atualizar marcados (N)" e "Remover marcados (N)" no lugar das opções do item.
+  - **Como planejar:** um `Cmd::PlanBatch { items: Vec<Cmd> }` com os `Plan*` individuais. `run.rs` planeja em sequência num job só e devolve `Msg::BatchPlanned(Vec<Result<Planned, String>>)`. O `App` junta:
+    - todos os `Ready` de instalação ⇒ uma `Action::Apply` com os grupos concatenados;
+    - remoções ⇒ uma `Action::Remove` por app, enfileiradas em sequência, porque `Remove` é de um app só e cada uma vira uma entrada na fila;
+    - `Choose` (ambíguo) ⇒ pulado e citado no toast "ambíguo, escolha individualmente: …";
+    - `Err` ⇒ citado no toast.
+  - **Uma confirmação só** (se o ajuste pedir) com o texto de todos os planos juntos. Depois, tudo vai para a fila.
+  - **Sem marcas**, nada muda.
+- **As marcas seguem por identidade.** Um novo scan ou uma nova ordenação mantém as marcas das linhas que ainda existem e descarta as que sumiram. Busca e filtro não apagam marcas, mas a ação só vale para marcados **visíveis**. Diga isso no toast quando houver marcados ocultos: "N marcados fora da vista não incluídos".
+- **`Esc`:** a ordem fica (1) fechar o toast de erro, (2) limpar as marcas da aba, (3) limpar a busca, (4) sair.
+- **Depois de enfileirar**, as marcas da aba são limpas.
+
+**Files:**
+- Modify: `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/jobs.rs` (se o plano em lote precisar), `src/tui/view.rs`, `src/tui/theme.rs`, `src/tui/help.rs`
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`
+
+Testes:
+1. `space_toggles_mark_and_glyph`: `Espaço` marca a linha e o glifo aparece no `TestBackend`; outro `Espaço` desmarca.
+2. `upgrade_marked_plans_batch_and_one_confirm`:
+   - em Atualizações, com 3 marcados (2 do wingetrs e 1 ARP), `Enter` ⇒ `Cmd::PlanBatch` com 2 itens;
+   - `BatchPlanned` com 2 `Ready` ⇒ um `Modal::Confirm` cujo texto contém os 2 apps e o toast "pulados" com o ARP;
+   - `Enter` ⇒ uma entrada na fila (ou `Execute`) e as marcas limpas.
+3. `remove_marked_enqueues_one_per_app`: em Instalados, `u` com 2 marcados do wingetrs ⇒ depois da confirmação, `running` = 1º app e `queue` = [2º].
+4. `marks_survive_rescan_and_sort_by_identity`: marcar B, chegar `InstalledLoaded` com B em outra posição ⇒ B continua marcado. Se B sumiu, a marca sai.
+5. `hidden_marks_are_not_acted_on`: marcar A e B, buscar algo que esconde B, `Enter` ⇒ só A no plano e o toast "1 marcados fora da vista".
+6. `esc_clears_marks_before_query`.
+
+#### Checks beyond the steps
+
+1. Mutação: o lote incluir itens que `upgrade_target` recusa ⇒ PEGA (teste 2).
+2. Mutação: marcar por índice em vez de identidade ⇒ PEGA (teste 4).
+3. Mutação: agir sobre marcados ocultos ⇒ PEGA (teste 5).
+
+**Commit:** `feat(tui): mark several items with space and act on all of them`
+
+### Task 98: Fixar versão
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- Menu de ações (`Modal::Actions`, `src/tui/app.rs`): "Atualizar" e "Remover", com a regra de atualização centralizada em `upgrade_target`.
+- `jobs::plan_upgrade_all` (`src/tui/jobs.rs` ~:163) e `install::ops::upgradable` (`src/install/ops.rs` ~:872) listam o que pode ser atualizado. A CLI `upgrade` fica em `src/cli/install_cmd.rs`.
+- O diretório de dados fica em `DataDir` (`src/cache`). Os mapas JSON pequenos seguem o modelo de `icons.json` (`src/icons.rs`):
+  - leitura tolerante (arquivo corrompido ⇒ vazio);
+  - gravação por temporário único + `fs_retry::retry` com rename;
+  - `Mutex` de processo (Task 88).
+
+#### What binds this task
+
+- **Módulo `src/pins.rs`:**
+  - `pub fn load(data: &DataDir) -> BTreeSet<String>`;
+  - `pub fn set(data: &DataDir, key: &str, pinned: bool) -> std::io::Result<()>`;
+  - `pub fn key(origin: &str, name: &str) -> String`, com o formato `"<origin>/<name>"`.
+  - O arquivo é `pins.json`, gravado por temporário + rename com retry e um `Mutex` de processo, como `icons.json`. Reaproveite o padrão; não copie a lógica de rename se já houver uma função comum para usar.
+- **TUI:**
+  - `App.pins: BTreeSet<String>`, carregado no início junto com o mapa de ícones (job).
+  - O menu de ações ganha "Fixar versão" ou "Desafixar", sempre selecionável, como 3º item.
+  - Escolher o item ⇒ `Cmd::SetPin { key, pinned }` ⇒ job `pins::set` ⇒ `Msg::PinSaved(Result)`.
+    - O `App` aplica a mudança na hora e reverte se der erro, com toast.
+    - Toast de sucesso: "versão fixada: X" ou "desafixado: X".
+  - **Glifo:** a linha fixada mostra `g.pin` (campo novo em `Glyphs`: `"\u{f08d}"` nerd, `"⚲"` unicode, `"!"` ascii) ao lado do estado.
+  - **`upgrade_target` recusa fixado** com o motivo "versão fixada". Por isso "Atualizar", `U`, `Enter` em Atualizações e marcados (Task 97) passam a pular fixados. O toast é "versão fixada (desafixe no menu)".
+  - **Atualizar tudo (`PlanUpgradeAll`) pula fixados.** Passe as chaves fixadas para `plan_upgrade_all`, ou filtre lá lendo `pins::load`. Escolha uma das duas formas e use a mesma na CLI.
+- **CLI** (`src/cli/install_cmd.rs`):
+  - `upgrade --all` pula os fixados e imprime `fixado, pulado: <app>` para cada um;
+  - `upgrade <app>` de um app fixado sai com erro `"<app> está com a versão fixada; desafixe na TUI (menu de ações)"`;
+  - `upgrade` sem argumento (que lista) marca fixados com `(fixado)`.
+  - A chave usada pela CLI é `pins::key("wingetrs", app)`, a mesma que a TUI grava para apps `origin == "wingetrs"`. Teste isso.
+- **Uma regra só:** "este app está fixado?" é `pins::key` + `contains` num lugar. A TUI e a CLI chamam a mesma função.
+
+**Files:**
+- Create: `src/pins.rs`
+- Modify: `src/lib.rs`, `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/jobs.rs`, `src/tui/view.rs`, `src/tui/theme.rs`, `src/cli/install_cmd.rs` (e `src/install/ops.rs` só se o filtro ficar lá)
+- Test: `tests/pins.rs` (novo), `tests/tui_state.rs`, `tests/tui_view.rs`, `tests/cli_install.rs` (ou o arquivo de testes da CLI `upgrade` que existir)
+
+Testes:
+1. `pins_round_trip_and_survive_corruption`: `set` + `load`; um arquivo corrompido ⇒ conjunto vazio, e o próximo `set` regrava válido.
+2. `pinned_app_is_not_upgraded`: um app wingetrs `Available` fixado ⇒ `Enter` em Atualizações não emite `PlanInstall` e mostra o toast; no menu, "Atualizar" aparece desabilitado com a nota "versão fixada".
+3. `pin_from_menu_applies_and_reverts_on_error`: "Fixar versão" ⇒ `pins` contém a chave e sai `Cmd::SetPin`; `PinSaved(Err)` ⇒ a chave sai, com toast de erro.
+4. `upgrade_all_skips_pinned` (CLI ou o nível de `plan_upgrade_all`): 2 apps atualizáveis, 1 fixado ⇒ o plano contém só o outro, e a saída da CLI tem `fixado, pulado: <app>`.
+5. `cli_upgrade_pinned_app_refuses`: `upgrade <app>` fixado ⇒ erro com a mensagem e nada instalado.
+6. `cli_and_tui_use_the_same_key`: a chave gravada pela TUI para um app wingetrs é a que a CLI consulta.
+
+#### Checks beyond the steps
+
+1. Mutação: `upgrade_target` ignorar o pin ⇒ PEGA (teste 2).
+2. Mutação: o filtro de atualizar tudo ignorar o pin ⇒ PEGA (teste 4).
+3. Mutação: a chave da CLI ser `"<app>"` sem a origem ⇒ PEGA (teste 6).
+4. Os testes não tocam o `%LOCALAPPDATA%` real: o `DataDir` vem de `tempfile`. Cole a linha que mostra isso.
+
+**Commit:** `feat: pin an app's version (TUI menu; upgrade skips pinned)`
