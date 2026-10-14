@@ -3602,7 +3602,7 @@ fn upgrade_marked_plans_batch_and_one_confirm() {
     assert!(
         a.toasts
             .iter()
-            .any(|t| t.text.contains("pulados") && t.text.contains("gamma")),
+            .any(|t| t.text.contains("1 itens ficaram de fora")),
         "{:?}",
         a.toasts
     );
@@ -3738,8 +3738,7 @@ fn marked_winget_hits_are_skipped_and_named() {
         "{cmds:?}"
     );
     update(&mut a, Msg::BatchPlanned(vec![ready_apply("ripgrep")]));
-    assert!(has_toast(&a, "pulados: "), "{:?}", a.toasts);
-    assert!(has_toast(&a, "PowerToys"), "{:?}", a.toasts);
+    assert!(has_toast(&a, "2 itens ficaram de fora"), "{:?}", a.toasts);
 }
 
 #[test]
@@ -4173,7 +4172,7 @@ fn marked_batch_mixes_ours_and_bridge() {
     assert!(text.contains("--id Git.Git"), "{text}");
     assert!(text.contains("update 7zip"), "{text}");
     assert!(!text.contains("Zed"), "{text}");
-    assert!(a.toasts.iter().any(|t| t.text.contains("Zed")), "skipped");
+    assert!(has_toast(&a, "itens ficaram de fora"), "skipped");
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert_eq!(cmds, vec![Cmd::Execute(apply_action("beta"))]);
     assert!(a.modal.is_none());
@@ -4515,7 +4514,7 @@ fn installed_buttons_apply_to_possible_subset() {
     };
     assert_eq!(items.len(), 2);
     assert!(
-        toasts(&a).contains(&"1 item ficou de fora (ação não se aplica)".to_string()),
+        toasts(&a).contains(&"1 itens ficaram de fora (ação não se aplica)".to_string()),
         "{:?}",
         toasts(&a)
     );
@@ -4541,4 +4540,24 @@ fn no_button_when_action_applies_to_none() {
             .iter()
             .all(|(_, id)| *id != ActionId::Upgrade)
     );
+}
+
+#[test]
+#[ignore = "live: bench"]
+fn bench_regions_with_many_marks() {
+    let rows: Vec<_> = (0..300)
+        .map(|i| irow(&format!("app{i:03}"), "wingetrs", "scoop:main", i % 2 == 0))
+        .collect();
+    let mut a = on_tab(Tab::Installed, rows);
+    a.size = (100, 30);
+    for i in 0..300 {
+        a.selected = i;
+        press_space(&mut a);
+    }
+    a.selected = 0;
+    let t = Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(regions(&a, screen(&a)));
+    }
+    eprintln!("regions(): {:?} per call", t.elapsed() / 100);
 }

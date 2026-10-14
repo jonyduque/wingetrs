@@ -2173,9 +2173,9 @@ fn buttons_match_regions() {
             ..Default::default()
         });
     }
-    let mut shown = 0;
     for (w, h) in [(80u16, 24u16), (100, 30), (60, 15)] {
         for tab in [Tab::Search, Tab::Installed] {
+            let mut shown = 0;
             let mut a = typed("");
             a.installed = installed.clone();
             a.tab = tab;
@@ -2203,7 +2203,46 @@ fn buttons_match_regions() {
             if let Some((first, _)) = r.buttons.first() {
                 assert_eq!(first.x, r.details.x, "{w}x{h} {tab:?}");
             }
+            assert!(
+                shown > 0 || tab == Tab::Search,
+                "no button at {w}x{h} {tab:?}"
+            );
         }
     }
-    assert!(shown > 0, "no button was ever shown");
+}
+
+#[test]
+fn buttons_wrap_without_overlap() {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    use wingetrs::tui::app::Tab;
+    use wingetrs::tui::regions::regions;
+    let mut a = typed("");
+    a.installed = vec![ListRow {
+        name: "ripgrep".into(),
+        origin: "wingetrs".into(),
+        installed_version: Some("1".into()),
+        correlation: Correlation::Matched {
+            source: "scoop:main".into(),
+            package_id: "ripgrep".into(),
+            rule: Rule::User,
+        },
+        latest: Some("2".into()),
+        state: UpdateState::Available { latest: "2".into() },
+        ..Default::default()
+    }];
+    a.tab = Tab::Installed;
+    a.size = (100, 30);
+    let r = regions(&a, ratatui::layout::Rect::new(0, 0, 100, 30));
+    let rows: std::collections::BTreeSet<u16> = r.buttons.iter().map(|(b, _)| b.y).collect();
+    assert!(rows.len() >= 2, "expected wrapping: {:?}", r.buttons);
+    for (i, (b, _)) in r.buttons.iter().enumerate() {
+        assert!(b.y >= r.details.bottom(), "text above the buttons");
+        assert!(
+            b.x >= r.details.x && b.right() <= r.details.right(),
+            "{b:?}"
+        );
+        for (c, _) in &r.buttons[i + 1..] {
+            assert!(!b.intersects(*c), "{b:?} overlaps {c:?}");
+        }
+    }
 }
