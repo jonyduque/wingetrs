@@ -68,8 +68,6 @@ pub enum Msg {
     },
     /// The `icons.json` map (`<source>/<id>` -> SHA-256 of the cached icon), read at startup.
     IconMapLoaded(BTreeMap<String, String>),
-    /// The pinned apps (`pins.json`), read at startup.
-    PinsLoaded(std::collections::BTreeSet<String>),
     /// Result of writing `key` (un)pinned; the `App` already applied it and reverts on `Err`.
     PinSaved {
         key: String,
@@ -1197,10 +1195,6 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             }
             Vec::new()
         }
-        Msg::PinsLoaded(loaded) => {
-            app.pins.extend(loaded);
-            Vec::new()
-        }
         Msg::PinSaved {
             key,
             pinned,
@@ -1961,7 +1955,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     };
     let upgrade = upgrade_target(r, &app.pins);
     let pin_key = crate::pins::key(&r.origin, &r.name);
-    let pinned = app.pins.contains(&pin_key);
+    let pinned = crate::pins::is_pinned(&app.pins, &r.origin, &r.name);
     let remove = (r.origin == "wingetrs").then(|| r.name.clone());
     let items = vec![
         PickerItem {

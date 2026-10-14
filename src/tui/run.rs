@@ -194,6 +194,8 @@ async fn event_loop(
     data: DataDir,
     cfg: Config,
 ) -> anyhow::Result<()> {
+    // Small file, read before the first event so an early Enter already sees the pins.
+    app.pins = crate::pins::load(&data);
     let (tx, mut rx) = unbounded_channel::<Msg>();
     let ctx = Arc::new(Ctx {
         data,
@@ -212,7 +214,6 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
-    spawn_job(&ctx, |c, _| Msg::PinsLoaded(crate::pins::load(&c.data)));
     if app.icon_protocol != crate::tui::icons::IconProtocol::Off {
         spawn_job(&ctx, |c, _| {
             Msg::IconMapLoaded(crate::icons::load_map(&c.data))

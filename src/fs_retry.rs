@@ -236,3 +236,25 @@ pub(crate) mod release_on_retry {
         }
     }
 }
+
+/// Writes `value` as JSON to `path` whole: a unique temporary (`seq` makes the name unique within
+/// the process) renamed over it with `retry`, so readers never see a half-written file.
+pub fn write_json_atomic<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    seq: &std::sync::atomic::AtomicU64,
+) -> io::Result<()> {
+    let json = serde_json::to_vec(value).map_err(io::Error::other)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!(
+        "json.{}-{}.tmp",
+        std::process::id(),
+        seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, json)?;
+    retry("renomear", &tmp, || std::fs::rename(&tmp, path)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}

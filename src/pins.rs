@@ -1,7 +1,7 @@
 //! Pinned apps: `pins.json` holds the set of `<origin>/<name>` keys whose version is frozen.
 //! The only place that decides "is this app pinned?" is [`is_pinned`].
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use crate::cache::DataDir;
 
@@ -43,16 +43,5 @@ pub fn set(data: &DataDir, key: &str, pinned: bool) -> std::io::Result<()> {
     } else {
         pins.remove(key);
     }
-    let json = serde_json::to_vec(&pins).map_err(std::io::Error::other)?;
-    let p = pins_path(data);
-    std::fs::create_dir_all(data.root())?;
-    let tmp = p.with_extension(format!(
-        "json.{}-{}.tmp",
-        std::process::id(),
-        PINS_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, json)?;
-    crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &p)).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::fs_retry::write_json_atomic(&pins_path(data), &pins, &PINS_TMP_SEQ)
 }

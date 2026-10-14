@@ -23,3 +23,5 @@ Decisions:
 - `Msg::PinsLoaded` carrega pins no boot (job); `app.pins.extend`.
 
 Concerns: CLI `upgrade <app>` compara a chave com `t` exato (maiúsculas/minúsculas). `pinned` na CLI sem argumento imprime `<app> (fixado)`.
+
+Follow-up (fix commit): pins carregados de forma síncrona antes do laço (PinsLoaded removido); open_actions usa is_pinned; `fs_retry::write_json_atomic` compartilhado por icons.rs e pins.rs. Gate: test (769 passed, 18 ignored), gate verde. Nota: `upgrade Ripgrep` (caixa diferente) dá NotInstalled; mantido, nada é instalado.

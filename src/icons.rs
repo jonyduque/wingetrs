@@ -1,7 +1,7 @@
 //! Package icons: download by content hash into the blob store, and the
 //! `icons.json` map from `<source>/<id>` to the cached icon's SHA-256.
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use crate::cache::{BlobStore, CacheError, DataDir};
 use crate::core::IconRef;
@@ -70,18 +70,7 @@ fn try_remember(data: &DataDir, source: &str, id: &str, sha: &str) -> std::io::R
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut map = load_map(data);
     map.insert(format!("{source}/{id}"), sha.to_owned());
-    let json = serde_json::to_vec(&map).map_err(std::io::Error::other)?;
-    let p = map_path(data);
-    std::fs::create_dir_all(data.root())?;
-    let tmp = p.with_extension(format!(
-        "json.{}-{}.tmp",
-        std::process::id(),
-        MAP_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&tmp, json)?;
-    crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &p)).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    crate::fs_retry::write_json_atomic(&map_path(data), &map, &MAP_TMP_SEQ)
 }
 
 /// The cached icon of `<source>/<id>`, if the map names a blob that is still valid.

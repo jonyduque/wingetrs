@@ -3754,3 +3754,13 @@ fn pin_from_menu_applies_and_reverts_on_error() {
     );
     assert!(a.toasts.iter().any(|t| t.text == "versão fixada: beta"));
 }
+
+#[test]
+fn app_created_with_pins_blocks_the_first_upgrade() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    a.pins = [wingetrs::pins::key("wingetrs", "beta")].into();
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+}
