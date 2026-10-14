@@ -2,7 +2,7 @@
 use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, Focus, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, RunProgress, Tab};
+use crate::tui::app::{App, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, RunProgress, Tab};
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
 use crate::tui::layout::{
@@ -141,11 +141,7 @@ fn draw_screen<'a>(
         draw_search_line(app, theme, g, frame, parts[0]);
         let (left, divider, right) = split_with_gutter(body, 55);
         icons = draw_list(app, theme, g, frame, left);
-        let divider_style = if app.focus == Focus::Details {
-            theme.border_focus()
-        } else {
-            theme.border()
-        };
+        let divider_style = theme.border();
         for y in body.y..body.bottom() {
             frame
                 .buffer_mut()
@@ -1055,6 +1051,16 @@ fn draw_modal(modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
             draw_picker(
                 picker,
                 "Escolha o pacote",
+                "Enter escolhe · Esc cancela",
+                theme,
+                frame,
+                area,
+            );
+        }
+        Modal::Actions { picker, app, .. } => {
+            draw_picker(
+                picker,
+                app,
                 "Enter escolhe · Esc cancela",
                 theme,
                 frame,

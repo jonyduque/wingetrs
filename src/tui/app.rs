@@ -28,12 +28,6 @@ pub enum Tab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    List,
-    Details,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceFilter {
     All,
     Winget,
@@ -181,6 +175,15 @@ pub enum Modal {
         /// `keep` of the plan that asked (install: false; upgrade: setting at key time).
         keep: bool,
     },
+    /// Actions of an installed app: [upgrade, remove].
+    Actions {
+        picker: Picker,
+        app: String,
+        /// `(source_name, id)` when the app can be upgraded.
+        upgrade: Option<(String, String)>,
+        /// Name to remove when wingetrs installed the app.
+        remove: Option<String>,
+    },
     Running {
         label: String,
         progress: Option<RunProgress>,
@@ -295,7 +298,6 @@ pub const MAX_TOASTS: usize = 3;
 
 pub struct App {
     pub tab: Tab,
-    pub focus: Focus,
     pub filter: SourceFilter,
     pub query: String,
     pub selected: usize,
@@ -398,7 +400,6 @@ impl App {
     pub fn new(entries: Vec<PackageEntry>, glyphs: GlyphSet) -> App {
         let mut app = App {
             tab: Tab::Search,
-            focus: Focus::List,
             filter: SourceFilter::All,
             query: String::new(),
             selected: 0,
@@ -769,7 +770,6 @@ impl App {
 
     fn set_tab(&mut self, tab: Tab) -> Vec<Cmd> {
         self.tab = tab;
-        self.focus = Focus::List;
         let mut cmds = self.refresh_view();
         if tab != Tab::Search {
             if self.installed.is_empty() && tab != Tab::Settings {
@@ -1068,16 +1068,17 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             if app.visible_len() == 0 {
                 return Vec::new();
             }
-            app.focus = Focus::Details;
-            app.details_cmd()
+            match app.tab {
+                Tab::Search => install_selected(app),
+                Tab::Updates => upgrade_selected(app),
+                Tab::Installed => open_actions(app),
+                Tab::Settings => Vec::new(),
+            }
         }
         KeyCode::Esc => {
             // An error toast stays until dismissed: Esc closes the newest and does nothing else.
             if let Some(i) = app.toasts.iter().position(|t| t.kind == ToastKind::Error) {
                 app.toasts.remove(i);
-                Vec::new()
-            } else if app.focus == Focus::Details {
-                app.focus = Focus::List;
                 Vec::new()
             } else if !empty {
                 app.query.clear();
@@ -1100,7 +1101,6 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
             app.query.push(c);
-            app.focus = Focus::List;
             app.view_changed()
         }
         _ => Vec::new(),
@@ -1182,6 +1182,7 @@ fn request_save(app: &mut App) -> Vec<Cmd> {
     }]
 }
 
+const NOT_OURS_NOTE: &str = "instalado fora do wingetrs";
 const NOT_OURS: &str = "só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui";
 
 /// Marks a plan as in flight; `None` when one already is.
@@ -1230,6 +1231,39 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
             return Vec::new();
         }
     };
+    plan_remove(app, name)
+}
+
+/// The one rule for who can be upgraded: ours, matched to a catalog package, with a newer version.
+/// `Err` carries the reason, as the note of a disabled menu item.
+fn upgrade_target(r: &ListRow) -> Result<(String, String), &'static str> {
+    if r.origin != "wingetrs" {
+        return Err(NOT_OURS_NOTE);
+    }
+    match (&r.correlation, &r.state) {
+        (
+            Correlation::Matched {
+                source, package_id, ..
+            },
+            UpdateState::Available { .. },
+        ) => Ok((source.clone(), package_id.clone())),
+        _ => Err("sem atualização"),
+    }
+}
+
+fn plan_upgrade(app: &mut App, source_name: String, id: String) -> Vec<Cmd> {
+    let keep = app.settings.behavior.keep_old;
+    start_planning(
+        app,
+        Cmd::PlanInstall {
+            source_name,
+            id,
+            keep,
+        },
+    )
+}
+
+fn plan_remove(app: &mut App, name: String) -> Vec<Cmd> {
     let purge = app.settings.behavior.purge;
     start_planning(app, Cmd::PlanRemove { app: name, purge })
 }
@@ -1237,32 +1271,48 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
 /// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.
 fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
     let keep = app.settings.behavior.keep_old;
-    let (ours, source) = match app.installed_view().get(app.selected) {
+    let target = match app.installed_view().get(app.selected) {
         None => return start_planning(app, Cmd::PlanUpgradeAll { keep }),
-        Some(r) => (
-            r.origin == "wingetrs",
-            match &r.correlation {
-                Correlation::Matched {
-                    source, package_id, ..
-                } => Some((source.clone(), package_id.clone())),
-                _ => None,
-            },
-        ),
+        Some(r) => upgrade_target(r),
     };
-    match source {
-        Some((source_name, id)) if ours => start_planning(
-            app,
-            Cmd::PlanInstall {
-                source_name,
-                id,
-                keep,
-            },
-        ),
-        _ => {
+    match target {
+        Ok((source_name, id)) => plan_upgrade(app, source_name, id),
+        Err(_) => {
             app.push_toast(ToastKind::Warning, NOT_OURS);
             Vec::new()
         }
     }
+}
+
+/// `Enter` in Installed: the actions menu of the selected app.
+fn open_actions(app: &mut App) -> Vec<Cmd> {
+    let Some(r) = app.installed_view().get(app.selected).copied() else {
+        return Vec::new();
+    };
+    let upgrade = upgrade_target(r);
+    let remove = (r.origin == "wingetrs").then(|| r.name.clone());
+    let items = vec![
+        PickerItem {
+            label: "Atualizar".to_string(),
+            detail: String::new(),
+            selectable: upgrade.is_ok(),
+            note: upgrade.as_ref().err().map(|n| (*n).to_string()),
+        },
+        PickerItem {
+            label: "Remover".to_string(),
+            detail: String::new(),
+            selectable: remove.is_some(),
+            note: remove.is_none().then(|| NOT_OURS.to_string()),
+        },
+    ];
+    let name = r.name.clone();
+    app.modal = Some(Modal::Actions {
+        picker: Picker::single(items),
+        app: name,
+        upgrade: upgrade.ok(),
+        remove,
+    });
+    Vec::new()
 }
 
 fn candidate_item(c: &Candidate) -> PickerItem {
@@ -1434,6 +1484,28 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     };
                     start_planning(app, cmd)
                 }
+                _ => Vec::new(),
+            },
+        },
+        Modal::Actions {
+            mut picker,
+            app: name,
+            upgrade,
+            remove,
+        } => match picker.key(key) {
+            PickOutcome::Pending => {
+                app.modal = Some(Modal::Actions {
+                    picker,
+                    app: name,
+                    upgrade,
+                    remove,
+                });
+                Vec::new()
+            }
+            PickOutcome::Cancelled => Vec::new(),
+            PickOutcome::Picked(chosen) => match (chosen.first(), upgrade, remove) {
+                (Some(0), Some((source_name, id)), _) => plan_upgrade(app, source_name, id),
+                (Some(1), _, Some(target)) => plan_remove(app, target),
                 _ => Vec::new(),
             },
         },

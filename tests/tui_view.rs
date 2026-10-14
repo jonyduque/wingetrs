@@ -260,6 +260,29 @@ fn picking_modal_snapshot() {
 }
 
 #[test]
+fn actions_modal_snapshot() {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    use wingetrs::tui::app::Tab;
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.installed = vec![ListRow {
+        name: "ripgrep".into(),
+        origin: "arp".into(),
+        installed_version: Some("1".into()),
+        correlation: Correlation::Matched {
+            source: "scoop:main".into(),
+            package_id: "ripgrep".into(),
+            rule: Rule::ScoopManifest,
+        },
+        latest: Some("2".into()),
+        state: UpdateState::Available { latest: "2".into() },
+        tiebreak: None,
+    }];
+    a.tab = Tab::Installed;
+    press(&mut a, crossterm::event::KeyCode::Enter);
+    insta::assert_snapshot!(render(&a, 100, 16));
+}
+
+#[test]
 fn running_modal_snapshot() {
     insta::assert_snapshot!(render(&with_running(), 100, 16));
 }
@@ -801,21 +824,18 @@ fn warn_label_is_warn_when_inactive_and_accent_when_active() {
 }
 
 #[test]
-fn divider_is_focus_colored_only_when_details_has_focus() {
+fn divider_uses_the_border_color() {
     let theme = Theme::new(true, ColorDepth::TrueColor);
     let paint = |a: &App| {
         let mut t = Terminal::new(TestBackend::new(100, 16)).unwrap();
         t.draw(|f| view(a, &theme, f)).unwrap();
         t.backend().buffer().clone()
     };
-    let mut a = typed("powert");
+    let a = typed("powert");
     // Divider at column 55, first list row is screen row 5.
     let b = paint(&a);
     assert_eq!(b[(55, 5)].symbol(), "│");
     assert_eq!(b[(55, 5)].fg, theme.border().fg.unwrap());
-    key(&mut a, crossterm::event::KeyCode::Enter);
-    let b = paint(&a);
-    assert_eq!(b[(55, 5)].fg, theme.border_focus().fg.unwrap());
 }
 
 fn screen_cells(a: &App, w: u16, h: u16, theme: &Theme) -> ratatui::buffer::Buffer {
@@ -973,7 +993,7 @@ fn keys_of(h: &[(&str, &str)]) -> Vec<String> {
 
 #[test]
 fn hints_change_with_the_tab() {
-    use wingetrs::tui::app::{Focus, Tab};
+    use wingetrs::tui::app::Tab;
     use wingetrs::tui::help::hints;
     let mut a = App::new(entries(), GlyphSet::Ascii);
     a.tab = Tab::Search;
@@ -991,8 +1011,7 @@ fn hints_change_with_the_tab() {
         keys_of(&hints(&a)),
         ["↑/↓", "←/→", "enter", "U", "ctrl+s", "?"]
     );
-    a.focus = Focus::Details;
-    assert_eq!(keys_of(&hints(&a))[0], "esc");
+    assert!(!keys_of(&hints(&a)).contains(&"esc".to_string()));
 }
 
 fn line_text(l: &ratatui::text::Line) -> String {

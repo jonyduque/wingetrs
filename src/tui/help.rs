@@ -1,5 +1,5 @@
 //! Contextual key hints for the bottom help bar.
-use crate::tui::app::{App, Focus, Tab, ToastKind};
+use crate::tui::app::{App, Tab, ToastKind};
 use crate::tui::theme::Theme;
 use ratatui::text::{Line, Span};
 
@@ -17,16 +17,21 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         ];
     }
     let mut out = Vec::new();
-    if app.focus == Focus::Details {
-        out.push(("esc", "voltar"));
-    }
     out.push(("↑/↓", "mover"));
     out.push(("←/→", "aba"));
-    out.push(("enter", "detalhes"));
     match app.tab {
-        Tab::Search => out.push(("i", "instalar")),
-        Tab::Installed => out.push(("u", "remover")),
-        Tab::Updates => out.push(("U", "atualizar")),
+        Tab::Search => {
+            out.push(("enter", "instalar"));
+            out.push(("i", "instalar"));
+        }
+        Tab::Installed => {
+            out.push(("enter", "ações"));
+            out.push(("u", "remover"));
+        }
+        Tab::Updates => {
+            out.push(("enter", "atualizar"));
+            out.push(("U", "atualizar"));
+        }
         Tab::Settings => {}
     }
     out.push(("ctrl+s", "fonte"));

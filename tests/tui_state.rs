@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use wingetrs::core::{PackageEntry, SourceKind};
-use wingetrs::tui::app::{App, Cmd, Focus, Msg, SourceFilter, Tab, update};
+use wingetrs::tui::app::{App, Cmd, Msg, SourceFilter, Tab, update};
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Glyphs, detect_depth};
 
 fn entry(source: SourceKind, id: &str, name: &str) -> PackageEntry {
@@ -66,10 +66,6 @@ fn j_k_are_text_when_query_is_not_empty() {
 #[test]
 fn escape_ladder_and_quit() {
     let mut a = app();
-    update(&mut a, key(KeyCode::Enter));
-    assert_eq!(a.focus, Focus::Details);
-    assert!(update(&mut a, key(KeyCode::Esc)).is_empty());
-    assert_eq!(a.focus, Focus::List);
     step(&mut a, key(KeyCode::Char('x')));
     // Clearing the query changes the selection, so it asks for the new row's details.
     assert_eq!(step(&mut a, key(KeyCode::Esc)), vec![details_for(&a)]);
@@ -907,7 +903,7 @@ fn arrows_match_tab_and_backtab() {
 }
 
 #[test]
-fn arrows_switch_tabs_with_text_and_from_details() {
+fn arrows_switch_tabs_with_text() {
     let mut a = app();
     update(&mut a, key(KeyCode::Char('p')));
     update(&mut a, key(KeyCode::Char('o')));
@@ -915,8 +911,6 @@ fn arrows_switch_tabs_with_text_and_from_details() {
     assert_eq!(a.tab, Tab::Installed);
     assert_eq!(a.query, "po");
     let mut b = app();
-    update(&mut b, key(KeyCode::Enter));
-    assert_eq!(b.focus, Focus::Details);
     update(&mut b, key(KeyCode::Right));
     assert_eq!(b.tab, Tab::Installed);
 }
@@ -2214,4 +2208,133 @@ fn http_redirect_setting_cycles_and_saves() {
     ));
     update(&mut a, key(KeyCode::Enter));
     assert!(!a.settings.behavior.allow_http_redirect);
+}
+
+fn menu_items(a: &App) -> Vec<(String, bool, Option<String>)> {
+    match &a.modal {
+        Some(Modal::Actions { picker, .. }) => picker
+            .items()
+            .iter()
+            .map(|i| (i.label.clone(), i.selectable, i.note.clone()))
+            .collect(),
+        _ => panic!("actions menu not open"),
+    }
+}
+
+#[test]
+fn enter_in_search_plans_install() {
+    let mut a = app();
+    select_source(&mut a, SourceKind::Scoop);
+    let by_enter = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(by_enter.len(), 1);
+    assert!(matches!(by_enter[0], Cmd::PlanInstall { keep: false, .. }));
+    let mut b = app();
+    select_source(&mut b, SourceKind::Scoop);
+    assert_eq!(by_enter, update(&mut b, key(KeyCode::Char('i'))));
+}
+
+#[test]
+fn enter_in_updates_plans_upgrade_and_empty_list_does_nothing() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    a.settings.behavior.keep_old = true;
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::PlanInstall {
+            source_name: "scoop:main".into(),
+            id: "beta".into(),
+            keep: true
+        }]
+    );
+    let mut empty = on_tab(
+        Tab::Updates,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    empty.query = "zzz".into();
+    empty.selected = 0;
+    assert_eq!(empty.visible_len(), 0);
+    assert!(update(&mut empty, key(KeyCode::Enter)).is_empty());
+    let mut none = on_tab(Tab::Updates, vec![]);
+    assert!(update(&mut none, key(KeyCode::Enter)).is_empty());
+}
+
+#[test]
+fn enter_in_installed_opens_actions_menu() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert_eq!(
+        menu_items(&a),
+        vec![
+            ("Atualizar".to_string(), true, None),
+            ("Remover".to_string(), true, None)
+        ]
+    );
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::PlanInstall {
+            source_name: "scoop:main".into(),
+            id: "beta".into(),
+            keep: false
+        }]
+    );
+
+    let mut foreign = on_tab(Tab::Installed, vec![irow("gamma", "arp", "winget", true)]);
+    update(&mut foreign, key(KeyCode::Enter));
+    let items = menu_items(&foreign);
+    assert!(!items[0].1);
+    assert_eq!(items[0].2.as_deref(), Some("instalado fora do wingetrs"));
+    assert!(!items[1].1);
+    assert!(
+        items[1]
+            .2
+            .as_deref()
+            .is_some_and(|n| n.contains("wingetrs"))
+    );
+    assert!(update(&mut foreign, key(KeyCode::Enter)).is_empty());
+    update(&mut foreign, key(KeyCode::Down));
+    assert!(update(&mut foreign, key(KeyCode::Enter)).is_empty());
+    assert!(
+        foreign.modal.is_some(),
+        "a disabled item keeps the menu open"
+    );
+    assert!(update(&mut foreign, key(KeyCode::Esc)).is_empty());
+    assert!(foreign.modal.is_none());
+
+    let mut current = on_tab(
+        Tab::Installed,
+        vec![irow("delta", "wingetrs", "scoop:main", false)],
+    );
+    update(&mut current, key(KeyCode::Enter));
+    assert_eq!(
+        menu_items(&current)[0].2.as_deref(),
+        Some("sem atualização")
+    );
+    // The picker starts on the first item that can be chosen.
+    assert!(matches!(
+        update(&mut current, key(KeyCode::Enter)).as_slice(),
+        [Cmd::PlanRemove { .. }]
+    ));
+}
+
+#[test]
+fn actions_menu_remove_plans_remove() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", false)],
+    );
+    a.settings.behavior.purge = true;
+    update(&mut a, key(KeyCode::Enter));
+    update(&mut a, key(KeyCode::Down));
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::PlanRemove {
+            app: "beta".into(),
+            purge: true
+        }]
+    );
 }
