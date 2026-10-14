@@ -6719,3 +6719,294 @@ Testes:
 4. Ao vivo, se der: rode o binário release com um `LOCALAPPDATA` temporário que tenha a cópia do catálogo (método da Task 77) e abra os detalhes de um app do Scoop que a sonda achou com par (ex.: `7zip` no main). Como não há terminal interativo, chame `load_details` + o caminho novo num teste `#[ignore]`, e cole se o ícone veio e de qual id do winget.
 
 **Commit:** `feat: scoop app icon from its winget twin`
+
+## Lote G: registros duplicados, ícone ausente, sobras e sonda da ponte (Tasks 102–105)
+
+A emenda da spec da fase 1 (2026-10-14, lote G) define as Tasks 102 a 104. A emenda da spec da fase 2a (2026-10-14, ponte de atualização) define a Task 105. Medição da máquina do usuário em 2026-10-14 (`wingetrs list --json`, 282 linhas), com 5 nomes repetidos:
+
+| Nome | Registros |
+|---|---|
+| Amazon Kindle | `arp/Amazon Kindle` duas vezes: HKLM 32-bit 2.8.3.70995 e HKCU 2.9.1.71006 |
+| Microsoft Edge | ARP e MSIX, ambos 155.0.4283.45 |
+| Python Launcher | dois GUIDs ARP: 3.13.12150.0 e 3.14.7150.0 |
+| Zed | ARP 1.23.3 e MSIX 1.0.0.0 |
+| Adobe Acrobat Reader | dois family names MSIX, ambos 26.0.0.1 |
+
+### Task 102: Uma linha por nome, com a chave do registro incluindo o local
+
+**Modelo:** sonnet (revisor opus: a identidade muda em marcas, fixação e escolhas).
+
+#### Where this fits
+
+- `src/installed/mod.rs`:
+  - `Hive` (~:21) tem as variantes `MachineX64 | MachineX86 | User`;
+  - `InstallSource` (~:28) tem as variantes `Arp(Hive) | Msix | Scoop | Wingetrs`;
+  - `InstalledApp` (~:36) traz `key`, que é a subchave ARP, o family name MSIX ou o nome do app no Scoop.
+- `src/installed/overrides.rs:27`: `app_key(app)` monta `"{origin}/{key}"` e não diferencia o local do ARP. Por isso os dois Kindle colidem.
+- `src/installed/correlate.rs`:
+  - `ListRow` (~:51), que deriva `Serialize`;
+  - `row()` (~:221) monta as linhas;
+  - `correlate()` (~:327) é chamado pela TUI (`src/tui/run.rs`, `spawn_scan`, ~:713) e pela CLI (`src/cli/mod.rs`, ~:785).
+- `src/cli/output.rs:117`: `list_text` monta a tabela da CLI.
+- TUI (`src/tui/app.rs`):
+  - `installed_view` (~:678) filtra e ordena;
+  - a identidade das linhas é `(name, origin)` em `selected_ident`/`position_of` e `(origin, name)` em `view_keys` (marcas);
+  - as fixações usam `origin/name`.
+
+  Com uma linha por nome, essa identidade passa a ser única.
+- Há 19 literais `ListRow { .. }` em `src/` e `tests/`: 7 em `tests/tui_state.rs`, 5 em `tests/tui_view.rs`, 1 em `tests/correlate.rs`, 1 em `tests/cli_install.rs` e 5 em `correlate.rs`.
+
+#### What binds this task
+
+- **Chave do registro.** `app_key` de um app ARP passa a ser `arp/<hklm64|hklm32|hkcu>/<subchave>`; os outros formatos não mudam.
+  - `overrides::load` aceita entradas antigas no formato `arp/<subchave>`.
+  - Uma escolha antiga vale para todo registro ARP com essa subchave, em qualquer local, quando não existe escolha no formato novo.
+  - `set` sempre grava no formato novo.
+- **Local legível:** `pub fn location(source: &InstallSource) -> &'static str` em `correlate.rs` devolve:
+  - `"máquina 64-bit"`;
+  - `"máquina 32-bit"`;
+  - `"usuário"`;
+  - `"msix"`;
+  - `"scoop"`;
+  - `"wingetrs"`.
+
+  `ListRow` ganha `pub location: String`.
+- **Agrupamento:** feito **no fim de `correlate`**, com `pub fn group_duplicates(rows: Vec<ListRow>) -> Vec<ListRow>`. Assim a TUI e a CLI passam pelo mesmo caminho e não existe uma segunda regra.
+  - O grupo é o `name` com `trim` e em minúsculas.
+  - A linha principal é a de maior `Version::parse(installed_version)`; `None` vale como a menor versão.
+  - No empate, vence a linha com `Correlation::Matched`. Se o empate continuar, vence a que veio primeiro.
+  - A ordem de saída é a da primeira ocorrência de cada grupo.
+  - `ListRow` ganha `pub others: Vec<OtherRecord>` (`#[serde(skip_serializing_if = "Vec::is_empty")]`), com `pub struct OtherRecord { app_key, origin, location, installed_version: Option<String>, state: UpdateState }` (`Serialize`, `Clone`, `Debug`, `PartialEq`), na ordem em que os registros vieram.
+  - Os estados `state`, `latest` e `correlation` do grupo são os da linha principal.
+- **Literais nos testes.** Para não repetir campos novos em 19 literais, `ListRow` deriva `Default`, com `Correlation::Unmatched` e `UpdateState::Unknown` como `#[default]`. Os literais existentes podem usar `..Default::default()`.
+- **TUI:**
+  - Uma linha com `others` não vazio mostra, depois da versão, um aviso discreto no estilo `muted`: `+N`, ou `+N registros` quando couber.
+  - Os detalhes de Instalados e Atualizações ganham a seção **"Registros"**, com uma linha por registro (o principal primeiro) no formato `<local> · <versão> · <origem>`. Depois vem o aviso em itálico: `"O Windows tem mais de um registro deste app. Pode ser uma instalação antiga esquecida ou o mesmo app instalado de dois jeitos."`
+  - A seção só aparece com `others` não vazio. As ações (Atualizar, Remover, fixar) valem para a linha principal.
+- **CLI:**
+  - A tabela mostra `+N registros` na linha principal.
+  - O JSON leva `others`.
+  - `--source` e `--upgradable` filtram as linhas agrupadas.
+
+**Files:**
+- Modify: `src/installed/correlate.rs`, `src/installed/overrides.rs`, `src/cli/output.rs`, `src/tui/view.rs`, `src/tui/app.rs` (só se precisar)
+- Test: `tests/correlate.rs`, `tests/overrides.rs`, `tests/tui_view.rs`, `tests/correlate.rs` (onde `list_text` já é testado)
+
+Testes:
+1. **`same_name_rows_become_one_with_newest_first`:** os dois Kindle (HKLM32 2.8.3 e HKCU 2.9.1, a mesma subchave, ambos `Matched` no mesmo id) ⇒ 1 linha.
+   - `installed_version` é `2.9.1.71006`.
+   - `location` é `"usuário"`.
+   - `others` tem 1 registro: `"máquina 32-bit"`, versão `2.8.3.70995` e `app_key == "arp/hklm32/Amazon Kindle"`.
+2. **`tie_prefers_matched_then_first`:** mesma versão, uma linha `Unmatched` e outra `Matched` ⇒ a principal é a `Matched`.
+3. **`app_keys_differ_by_hive`:** a mesma subchave em `MachineX86` e em `User` ⇒ as chaves `arp/hklm32/X` e `arp/hkcu/X`.
+4. **`legacy_override_key_still_applies`:** `correlations.json` com `arp/X` ⇒ a escolha vale para o registro `arp/hkcu/X`. Uma escolha nova `arp/hkcu/X` vence a antiga.
+5. **`details_list_records_and_warning`** (snapshot ou busca no buffer): a seção "Registros" com 2 linhas e o aviso. Uma linha sem `others` não mostra a seção.
+6. **`cli_list_shows_extra_records`:** o texto contém `+1 registros` ou `+1 registro` (escolha um e use o mesmo na TUI). O JSON tem `others`.
+
+#### Checks beyond the steps
+
+1. Mutação: o agrupamento comparar o nome sem minúsculas ⇒ PEGA (dê ao teste 1 caixas diferentes, como `Amazon Kindle` e `Amazon kindle`).
+2. Mutação: a principal ser a primeira em vez da mais nova ⇒ PEGA (teste 1).
+3. Mutação: `app_key` sem o local ⇒ PEGA (teste 3).
+4. Rode `target/release/wingetrs.exe list --json` na máquina real (é só leitura). Cole quantas linhas saíram e os 5 nomes da tabela de medição, cada um com o seu `others`.
+
+**Commit:** `feat: one row per installed app name, records listed with location`
+
+### Task 103: Ícone placeholder quando o ícone não existe
+
+**Modelo:** opus (revisor opus: o estado do ícone tem quatro casos, e o offline não pode virar "sem ícone").
+
+#### Where this fits
+
+- `src/tui/run.rs`:
+  - `prefetch_one` (~:813) faz detalhes ⇒ `icon_ref` ⇒ `load_icon` e manda `Msg::IconMapped` quando acha o ícone;
+  - o chamador manda `Msg::PrefetchDone { key }` sempre que a tentativa termina;
+  - `load_details` devolve `anyhow::Result`;
+  - `load_icon` (~:915) engole o `IconError`;
+  - `twin_icon` (~:1002) é o caminho do Scoop.
+- `src/http.rs`: `HttpError::is_offline()` (~:30) é `Network | Timeout`.
+- `src/icons.rs`: `IconError` (~:13) tem as variantes `Http(HttpError) | TooLarge | Integrity | Cache`.
+- `src/tui/app.rs`:
+  - `icon_tried` (~:445) só recebe `PrefetchDone`, e hoje uma falha offline também marca;
+  - `icon_none` guarda as chaves que não decodificaram;
+  - `list_fetch_cmds` (~:1022) pula as chaves que estão em `icon_map` ou em `icon_tried`.
+- `src/tui/view.rs`:
+  - `icon_visible` (~:58);
+  - `draw_list` (~:599), cujo laço final (~:645) põe o ícone codificado de cada `list_keys`;
+  - `list_keys` dá `None` para linhas sem correspondência;
+  - `selected_icon` (~:63) e `draw_details` (~:873) cuidam do ícone dos detalhes.
+- `Glyphs` (`src/tui/theme.rs:18`) tem os conjuntos nerd, unicode e ascii.
+
+#### What binds this task
+
+- **Resultado da tentativa:** `pub enum IconOutcome { Found, Absent, Retry }`. `PrefetchDone` passa a ser `PrefetchDone { key, outcome }`.
+  - `Absent`:
+    - os detalhes carregaram e não há `IconRef` (no Scoop, sem par);
+    - `IconError::Integrity` ou `TooLarge`;
+    - HTTP com status 4xx;
+    - os detalhes falharam por erro que não é de rede.
+  - `Retry`:
+    - qualquer `HttpError` com `is_offline()` em qualquer ponto da tentativa: detalhes, ícone ou detalhes do par do Scoop. Procure pela cadeia `source()`, como o `map_err` da Task 87 já faz;
+    - status 5xx;
+    - `IconError::Cache`.
+  - **Para o Scoop**, o par que falhou por rede vira `Retry` e não `Absent`. Hoje `twin_from` só recebe `Option`; leve a informação de "houve falha de rede" até o resultado. A forma é sua; o teste 3 cobra.
+- **Estado no `App`:** `icon_absent: HashSet<String>` (chave `source/id`).
+  - `PrefetchDone { Absent }` ⇒ entra em `icon_absent` e em `icon_tried`.
+  - `Found` ⇒ entra em `icon_tried`.
+  - `Retry` ⇒ não entra em nenhum dos dois, para que um pedido novo depois da rede voltar tente de novo. **Não** crie novo pedido sozinho por causa disso: o próximo movimento da tela já cria, como hoje.
+  - Os detalhes do item selecionado alimentam o mesmo `icon_absent` quando carregam sem `IconRef` ou quando o ícone falha com `Absent`.
+  - Chave em `icon_none` (não decodifica) também conta como ausente para desenhar.
+- **Desenho:**
+  - Em Pesquisar, Instalados e Atualizações, quando `icon_visible(app)` e os ícones da lista estão ligados (o mesmo `icons_on` de `draw_list`), o retângulo do ícone de uma linha mostra o placeholder se:
+    - a chave estiver em `icon_absent` ou em `icon_none`; ou
+    - a linha for `Correlation::Unmatched`, inclusive com `not_in_catalog`.
+  - Linha `Ambiguous`, chave sem resultado ainda ou ícone já codificado ⇒ não mostra o placeholder.
+  - Nos detalhes, a mesma regra vale para o item selecionado.
+  - **O placeholder:**
+    - é `Glyphs.no_icon`: nerd `"\u{f03d7}"` (nf-md-package_variant_closed), unicode `"▢"`, ascii `"[ ]"`;
+    - é desenhado centralizado no retângulo do ícone, em `theme.muted()`;
+    - é texto, não imagem, e não passa pelo codificador de ícones.
+  - Com `IconProtocol::Off` nada aparece.
+
+**Files:**
+- Modify: `src/tui/run.rs`, `src/tui/app.rs`, `src/tui/view.rs`, `src/tui/theme.rs`, `src/sources/scoop/winget_match.rs` (se `twin_from` mudar)
+- Test: `tests/tui_state.rs`, `tests/tui_view.rs`, os testes de `run.rs` que existirem para `prefetch_one` (ou novos com `wiremock`)
+
+Testes:
+1. **`outcome_absent_marks_absent_and_tried`:** `PrefetchDone { Absent }` ⇒ a chave entra em `icon_absent` e não entra em um novo `PrefetchIcons`.
+2. **`outcome_retry_is_asked_again`:** `PrefetchDone { Retry }` ⇒ a chave não está em `icon_absent`. Depois de mudar a tela e voltar, ela aparece de novo num `PrefetchIcons`.
+3. **`offline_is_retry_not_absent`** (com `wiremock` ou servidor fechado):
+   - detalhes ok, ícone com conexão recusada ⇒ `Retry`;
+   - ícone com 404 ⇒ `Absent`;
+   - manifesto sem `Icons` ⇒ `Absent`;
+   - Scoop com candidato do par que falha por conexão ⇒ `Retry`.
+4. **`placeholder_drawn_only_when_absent`** (`TestBackend`): 4 linhas visíveis.
+   - Linha absent ⇒ glifo no retângulo do ícone.
+   - Linha sem resultado ⇒ vazio.
+   - Linha `Unmatched` ⇒ glifo.
+   - Linha `Ambiguous` ⇒ vazio.
+   - Com `IconProtocol::Off` ⇒ nenhum glifo.
+5. **`details_placeholder_for_absent_selected`.**
+
+#### Checks beyond the steps
+
+1. Mutação: `Retry` tratado como `Absent` ⇒ PEGA (teste 2 ou 3).
+2. Mutação: o desenho ignorar `icon_absent` ⇒ PEGA (teste 4).
+3. Mutação: placeholder também para chave sem resultado ⇒ PEGA (teste 4).
+4. Cole a linha que decide `Retry` para erro de rede no par do Scoop.
+
+**Commit:** `feat(tui): placeholder icon when a package has none`
+
+### Task 104: Marca "sobra provável" em registros ARP sem desinstalador
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `src/installed/arp_win.rs`: `read_keys` (~:63) monta `RawArpEntry` a partir do registro (só leitura), e `filter_arp` (`src/installed/arp.rs`) transforma em `InstalledApp`.
+- `RawArpEntry` e `InstalledApp`: `src/installed/mod.rs` (~:36 e ~:50).
+- `ListRow` e `OtherRecord` vêm da Task 102. `row()` em `correlate.rs` monta as linhas.
+- Medição de 2026-10-14 nesta máquina, com 99 entradas ARP não-MSI. São 21 sem executável:
+  - 18 são portáteis do winget com `UninstallString` = `winget uninstall --product-code …`, mais um `powershell …`, todos sem caminho de executável;
+  - 3 são candidatas reais:
+    - `USB-Driver-Installer`: `C:\Users\…\AppData\Local\Temp\USBDriverInstaller\uninst.exe`;
+    - `Cities: Skylines`: `C:\Program Files (x86)\Steam\steam.exe steam://uninstall/255710`, sem aspas;
+    - `Counter-Strike: Global Offensive`: mesmo formato do Steam.
+
+#### What binds this task
+
+- **Função pura em `arp.rs`:** `pub fn missing_uninstaller(cmd: &str, expand: impl Fn(&str) -> Option<String>, exists: impl Fn(&Path) -> bool) -> Option<PathBuf>`.
+  1. `trim`. Se começa com `"`, o caminho é o que fica até o próximo `"`. Senão, é o prefixo até o primeiro `.exe` inclusive, sem diferenciar maiúsculas. Sem `.exe` ⇒ `None`.
+  2. Expande `%VAR%` com `expand`. Variável que não existe ⇒ `None`, porque não dá para afirmar nada.
+  3. Só caminho absoluto com unidade (`X:\`) conta; o resto ⇒ `None`.
+  4. Nome de arquivo (sem diferenciar maiúsculas) em `msiexec.exe`, `rundll32.exe`, `cmd.exe`, `powershell.exe`, `pwsh.exe` ou `winget.exe` ⇒ `None`.
+  5. `exists(path)` é falso ⇒ `Some(path)`; senão, `None`.
+- **Coleta:**
+  - `RawArpEntry` ganha `uninstall_string: Option<String>`, lido em `read_keys`;
+  - `InstalledApp` ganha `stale: Option<String>`, o caminho que falta.
+
+  A função pura roda em `arp_win.rs`, com `std::env::var` e `Path::exists`. Só lê do disco; nada é escrito.
+- **`ListRow` e `OtherRecord`** ganham `stale: Option<String>`.
+- **TUI:**
+  - A linha com `stale` mostra `sobra provável` na 2ª linha (subtítulo), em `theme.alert()`, antes do texto atual.
+  - Nos detalhes, aparece `"Sobra provável: o desinstalador <caminho> não existe. A limpeza fica para a fase 2d."`.
+  - Na seção "Registros" (Task 102), o registro sobrando leva `· sobra provável`.
+- **CLI:** a tabela de `list` acrescenta `(sobra provável)` ao nome, e o JSON traz `stale`.
+- **Nada apaga nem oferece apagar.**
+
+**Files:**
+- Modify: `src/installed/mod.rs`, `src/installed/arp.rs`, `src/installed/arp_win.rs`, `src/installed/correlate.rs`, `src/tui/view.rs`, `src/cli/output.rs`
+- Test: `tests/installed.rs` (onde `filter_arp` já é testado), `tests/correlate.rs`, `tests/tui_view.rs`
+
+Testes:
+1. **`missing_uninstaller_cases`**, com `exists` falso para todos:
+   - `"C:\\X\\u.exe" /S` ⇒ `Some("C:\\X\\u.exe")`;
+   - `C:\Program Files (x86)\Steam\steam.exe steam://uninstall/255710` ⇒ `Some(…\steam.exe)`;
+   - `%LOCALAPPDATA%\A\u.exe` com expand = `C:\L` ⇒ `Some("C:\\L\\A\\u.exe")`;
+   - `%NOPE%\u.exe` ⇒ `None`;
+   - `winget uninstall --product-code x` ⇒ `None`;
+   - `MsiExec.exe /X{…}` ⇒ `None`;
+   - `powershell -c …` ⇒ `None`;
+   - `u.exe` (relativo) ⇒ `None`.
+2. **`existing_uninstaller_is_not_stale`:** o mesmo caminho com `exists` verdadeiro ⇒ `None`.
+3. **`stale_shows_in_row_and_details`** (`TestBackend`).
+4. Teste `#[ignore = "live: registro real"]` que roda a coleta ARP real, imprime os nomes com `stale` e a contagem. Cole a saída: o esperado nesta máquina são 3 (USB-Driver-Installer e os dois do Steam). Se der outro número, explique.
+
+#### Checks beyond the steps
+
+1. Mutação: tirar `winget.exe`/`powershell.exe` da lista de exclusão ⇒ PEGA (teste 1). Os comandos `winget uninstall` não têm `.exe`, mas `powershell.exe -c` tem.
+2. Mutação: não expandir `%VAR%` ⇒ PEGA (teste 1).
+3. `git grep -n "delete_subkey\|remove_dir\|remove_file" src/installed`: cole a saída, que não deve trazer nada novo.
+
+**Commit:** `feat: flag ARP records whose uninstaller is missing`
+
+### Task 105: Sonda da ponte de atualização (winget e scoop por linha de comando)
+
+**Modelo:** opus. O revisor é o orquestrador, que lê o relatório. **Roda sozinha.**
+
+#### Where this fits
+
+- A emenda da fase 2a (2026-10-14, ponte) diz que um app com correspondência no winget, instalado por ARP ou MSIX, é atualizado por `winget upgrade --id <id> --exact`, e que um app instalado pelo Scoop é atualizado por `scoop update <app>`. A implementação (Task 106) vai ser escrita com os números desta sonda.
+- Nesta máquina, em 2026-10-14:
+  - `winget --version` = `v1.29.380`;
+  - `where winget` = `C:\Users\<u>\AppData\Local\Microsoft\WindowsApps\winget.exe` (alias de execução de app);
+  - `where scoop` = `~\scoop\shims\scoop` e `~\scoop\shims\scoop.cmd`.
+- A fila e os jobs da TUI ficam em `src/tui/jobs.rs` e em `Modal::Queue`. Os jobs de instalação existentes reportam progresso por mensagens.
+
+#### What binds this task
+
+- **Nada é instalado, atualizado nem escrito** nos arquivos do winget ou em `~/scoop`. Comandos permitidos:
+  - `winget --version`, `winget --info`, `winget upgrade --help`, `winget upgrade` (só a listagem) e `winget pin list`;
+  - `scoop --version`, `scoop help update` e `scoop status`.
+
+  Se `scoop status` fizer `git fetch` nos buckets, **não rode**; leia o código-fonte. O código do Scoop pode ser lido em `~/scoop/apps/scoop/current/` (só leitura).
+- **Medir e registrar:**
+  1. **winget:**
+     - as flags de `upgrade` que tiram a interatividade (`--silent`, `--disable-interactivity`, `--accept-package-agreements`, `--accept-source-agreements`) e o que cada uma faz;
+     - a saída com stdout redirecionado para arquivo: codificação, sequências de progresso (`\r`, ANSI) e linhas úteis para mostrar ao usuário. Cole um trecho da listagem de `winget upgrade` redirecionada, com os bytes de controle visíveis (ex.: `Format-Hex` nas primeiras linhas);
+     - os códigos de saída documentados para: sucesso, nenhuma atualização aplicável, pacote não encontrado, instalador falhou, reinício necessário e pacote fixado no winget. Use a documentação oficial (`returnCodes` do winget-cli no GitHub; cite a URL e o commit ou a data) e confira os que der com comando só de leitura (ex.: `winget upgrade --id Nao.Existe --exact` ⇒ código de "não encontrado"; esse comando não instala nada);
+     - o tempo de `winget upgrade` (listagem), com mediana de 3 execuções.
+  2. **scoop:**
+     - como `scoop.cmd` e o shim chamam o `scoop.ps1`, e qual é o jeito certo de executar a partir de um processo (`cmd /c scoop …`, `pwsh -File …`);
+     - o código de saída de `scoop update <app>` com sucesso, com o app já atualizado e com o app inexistente, lido no código de `update.ps1`. Cite os arquivos e as linhas;
+     - se `scoop update <app>` faz `git pull` dos buckets antes, e se isso tem flag para desligar;
+     - a codificação e o progresso da saída redirecionada.
+  3. **Elevação:** o que acontece quando o instalador do winget pede UAC num processo filho sem console (leia a documentação). Diga se o wingetrs precisa de algo além de esperar o processo.
+  4. **Recomendação para a Task 106:**
+     - a linha de comando exata de cada ferramenta;
+     - como detectar se a ferramenta existe;
+     - como mostrar o progresso;
+     - a tabela de códigos de saída ⇒ mensagem em português;
+     - o tempo-limite;
+     - o que testar com um executável falso.
+- **Relatório:** `.claude/tasks/task-105-report.md`. Todo número tem a saída de origem colada; o que não foi medido aparece como "não medido".
+
+**Files:**
+- Create: `.claude/tasks/task-105-report.md` (único arquivo)
+
+#### Checks beyond the steps
+
+1. `git status --short` mostra só o relatório; cole a saída.
+2. `leftovers.ps1` limpo.
+
+**Commit:** `chore(tasks): upgrade bridge probe report for task 105`
