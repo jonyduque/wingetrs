@@ -359,8 +359,12 @@ fn on_tab(tab: Tab, rows: Vec<ListRow>) -> App {
     a
 }
 
+/// A confirmation (of actions, or of quitting) is open.
 fn confirm_open(a: &App) -> bool {
-    matches!(a.modal, Some(Modal::Confirm { .. }))
+    matches!(
+        a.modal,
+        Some(Modal::Confirm { .. } | Modal::ConfirmQuit { .. })
+    )
 }
 
 #[test]
@@ -3377,7 +3381,7 @@ fn quit_waits_for_running() {
     update(&mut a, ready("a"));
     update(&mut a, ready("b"));
     assert!(update(&mut a, key(KeyCode::Char('q'))).is_empty());
-    let Some(Modal::Confirm { plan_text, .. }) = &a.modal else {
+    let Some(Modal::ConfirmQuit { text: plan_text }) = &a.modal else {
         panic!("no quit dialog");
     };
     assert_eq!(
@@ -3453,7 +3457,7 @@ fn nothing_is_queued_once_quitting() {
 fn quit_text(a: &mut App) -> String {
     update(a, key(KeyCode::Char('q')));
     match &a.modal {
-        Some(Modal::Confirm { plan_text, .. }) => plan_text.clone(),
+        Some(Modal::ConfirmQuit { text }) => text.clone(),
         _ => panic!("no quit dialog"),
     }
 }
@@ -3592,20 +3596,11 @@ fn upgrade_marked_plans_batch_and_one_confirm() {
         &mut a,
         Msg::BatchPlanned(vec![ready_apply("alpha"), ready_apply("beta")]),
     );
-    let Some(Modal::Confirm { plan_text, .. }) = &a.modal else {
-        panic!("no confirm");
-    };
-    assert!(
-        plan_text.contains("alpha") && plan_text.contains("beta"),
-        "{plan_text}"
-    );
-    assert!(
-        a.toasts
-            .iter()
-            .any(|t| t.text.contains("1 itens ficaram de fora")),
-        "{:?}",
-        a.toasts
-    );
+    let text = confirm_text(&a);
+    assert!(text.contains("alpha") && text.contains("beta"), "{text}");
+    // Shown by the confirmation, not by a toast.
+    assert!(text.contains("1 itens ficaram de fora"), "{text}");
+    assert!(!has_toast(&a, "itens ficaram de fora"), "{:?}", a.toasts);
     assert_eq!(a.marked_count(), 3, "marks stay until queued");
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert_eq!(
@@ -3738,7 +3733,14 @@ fn marked_winget_hits_are_skipped_and_named() {
         "{cmds:?}"
     );
     update(&mut a, Msg::BatchPlanned(vec![ready_apply("ripgrep")]));
-    assert!(has_toast(&a, "2 itens ficaram de fora"), "{:?}", a.toasts);
+    // Said by the confirmation; a toast only when there is none.
+    assert!(confirm_text(&a).contains("2 itens ficaram de fora"));
+    let mut b = app();
+    b.settings.behavior.confirm = ConfirmMode::Never;
+    mark_all(&mut b);
+    update(&mut b, key(KeyCode::Enter));
+    update(&mut b, Msg::BatchPlanned(vec![ready_apply("ripgrep")]));
+    assert!(has_toast(&b, "2 itens ficaram de fora"), "{:?}", b.toasts);
 }
 
 #[test]
@@ -4050,9 +4052,18 @@ fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
     }
 }
 
+/// Items (`name manager`) and notes of the open confirmation, one per line.
 fn confirm_text(a: &App) -> String {
     match &a.modal {
-        Some(Modal::Confirm { plan_text, .. }) => plan_text.clone(),
+        Some(Modal::Confirm { items, notes, .. }) => items
+            .iter()
+            .map(|i| format!("{} {}", i.name, i.manager))
+            .chain(notes.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            ),
         _ => panic!("confirmation not open"),
     }
 }
@@ -4067,12 +4078,9 @@ fn bridge_upgrade_from_menu() {
     );
     assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
     let text = confirm_text(&a);
-    assert!(
-        text.contains(
-            "winget upgrade --id Git.Git --exact --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements"
-        ),
-        "{text}"
-    );
+    // The package and its manager, not the command line.
+    assert!(text.contains("Git.Git winget"), "{text}");
+    assert!(!text.contains("winget upgrade"), "{text}");
     assert!(
         text.contains("Pode aparecer um pedido do UAC, às vezes só piscando na barra de tarefas."),
         "{text}"
@@ -4103,11 +4111,8 @@ fn bridge_upgrade_from_menu() {
     assert_eq!(menu_items(&s)[0].0, "Atualizar (via scoop)");
     update(&mut s, key(KeyCode::Enter));
     let text = confirm_text(&s);
-    assert!(
-        text.contains(r"& 'C:\s\apps\scoop\current\bin\scoop.ps1' update 7zip;"),
-        "{text}"
-    );
-    assert!(text.contains("pwsh -NoProfile"), "{text}");
+    assert!(text.contains("7zip scoop"), "{text}");
+    assert!(!text.contains("pwsh -NoProfile"), "{text}");
     assert!(
         text.contains("O scoop pode atualizar os buckets (git pull) antes."),
         "{text}"
@@ -4124,7 +4129,7 @@ fn bridge_upgrade_from_menu() {
     for k in [KeyCode::Char('U'), KeyCode::Enter] {
         let mut u = on_tab(Tab::Updates, vec![irow("Git.Git", "msix", "winget", true)]);
         assert!(update(&mut u, key(k)).is_empty());
-        assert!(confirm_text(&u).contains("--id Git.Git"));
+        assert!(confirm_text(&u).contains("Git.Git winget"));
     }
 }
 
@@ -4168,11 +4173,11 @@ fn marked_batch_mixes_ours_and_bridge() {
         })]),
     );
     let text = confirm_text(&a);
-    assert!(text.contains("Instalar beta"), "{text}");
-    assert!(text.contains("--id Git.Git"), "{text}");
-    assert!(text.contains("update 7zip"), "{text}");
+    assert!(text.contains("beta wingetrs"), "{text}");
+    assert!(text.contains("Git.Git winget"), "{text}");
+    assert!(text.contains("7zip scoop"), "{text}");
     assert!(!text.contains("Zed"), "{text}");
-    assert!(has_toast(&a, "itens ficaram de fora"), "skipped");
+    assert!(text.contains("itens ficaram de fora"), "skipped");
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert_eq!(cmds, vec![Cmd::Execute(apply_action("beta"))]);
     assert!(a.modal.is_none());
@@ -4205,10 +4210,9 @@ fn marked_batch_mixes_ours_and_bridge() {
     );
     assert!(update(&mut b, key(KeyCode::Char('U'))).is_empty());
     match &b.modal {
-        Some(Modal::Confirm { action, then, .. }) => {
-            assert!(matches!(action, Some(Action::Bridge(_))));
-            assert_eq!(then.len(), 1);
-            assert!(matches!(then[0], Action::Bridge(_)));
+        Some(Modal::Confirm { actions, .. }) => {
+            assert_eq!(actions.len(), 2);
+            assert!(actions.iter().all(|a| matches!(a, Action::Bridge(_))));
         }
         _ => panic!("confirmation not open"),
     }
@@ -4513,8 +4517,12 @@ fn installed_buttons_apply_to_possible_subset() {
         panic!("expected one batch, got {cmds:?}");
     };
     assert_eq!(items.len(), 2);
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![ready_apply("one"), ready_apply("two")]),
+    );
     assert!(
-        toasts(&a).contains(&"1 itens ficaram de fora (ação não se aplica)".to_string()),
+        confirm_text(&a).contains("1 itens ficaram de fora (ação não se aplica)"),
         "{:?}",
         toasts(&a)
     );
@@ -4560,4 +4568,121 @@ fn bench_regions_with_many_marks() {
         std::hint::black_box(regions(&a, screen(&a)));
     }
     eprintln!("regions(): {:?} per call", t.elapsed() / 100);
+}
+
+// ---- Task 110: confirmation list ----
+
+use wingetrs::tui::app::ConfirmButton;
+
+/// Updates tab with one row of ours and one bridge row (winget), both marked, after `U` and
+/// the batch plan: the confirmation is open.
+fn confirm_ours_and_bridge() -> App {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            irow("beta", "wingetrs", "scoop:main", true),
+            irow("Git.Git", "arp", "winget", true),
+        ],
+    );
+    a.marks.insert(
+        Tab::Updates,
+        [row_key("wingetrs", "beta"), row_key("arp", "Git.Git")].into(),
+    );
+    update(&mut a, key(KeyCode::Char('U')));
+    update(&mut a, Msg::BatchPlanned(vec![ready_apply("beta")]));
+    assert!(confirm_open(&a));
+    a
+}
+
+fn checked(a: &App) -> Vec<bool> {
+    match &a.modal {
+        Some(Modal::Confirm { items, .. }) => items.iter().map(|i| i.checked).collect(),
+        _ => panic!("confirmation not open"),
+    }
+}
+
+#[test]
+fn unchecking_drops_the_item() {
+    let mut a = confirm_ours_and_bridge();
+    assert_eq!(checked(&a), [true, true]);
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Char(' ')));
+    assert_eq!(checked(&a), [true, false]);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(cmds, vec![Cmd::Execute(apply_action("beta"))]);
+    assert!(a.queue.is_empty(), "the bridge was unchecked");
+    assert!(a.modal.is_none());
+
+    let mut b = confirm_ours_and_bridge();
+    update(&mut b, key(KeyCode::Char(' ')));
+    update(&mut b, key(KeyCode::Down));
+    update(&mut b, key(KeyCode::Char(' ')));
+    assert_eq!(checked(&b), [false, false]);
+    assert!(update(&mut b, key(KeyCode::Enter)).is_empty());
+    assert!(
+        confirm_open(&b),
+        "Enter does nothing with every item unchecked"
+    );
+    assert!(b.running.is_none() && b.queue.is_empty());
+}
+
+#[test]
+fn quit_confirmation_still_text() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    update(&mut a, key(KeyCode::Char('q')));
+    match &a.modal {
+        Some(Modal::ConfirmQuit { text }) => assert_eq!(
+            text,
+            "Há uma operação em andamento; ela termina antes de fechar."
+        ),
+        _ => panic!("no quit dialog"),
+    }
+    a.size = (100, 30);
+    let out = {
+        let theme = wingetrs::tui::theme::Theme::new(true, ColorDepth::NoColor);
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| wingetrs::tui::view::view(&a, &theme, f))
+            .unwrap();
+        format!("{}", t.backend())
+    };
+    assert!(out.contains("ela termina antes de fechar"), "{out}");
+    assert!(regions(&a, screen(&a)).confirm_buttons.is_empty());
+    update(&mut a, key(KeyCode::Enter));
+    assert!(a.quit_after_running);
+    assert!(a.modal.is_none());
+}
+
+#[test]
+fn confirm_buttons_clickable() {
+    let mut a = app();
+    a.size = (100, 30);
+    update(&mut a, ready("a"));
+    assert!(confirm_open(&a));
+    let button = |a: &App, which: ConfirmButton| {
+        regions(a, screen(a))
+            .confirm_buttons
+            .iter()
+            .find(|(_, b)| *b == which)
+            .map(|(r, _)| *r)
+            .expect("button placed")
+    };
+    let cancel = button(&a, ConfirmButton::Cancel);
+    assert!(click_at(&mut a, Instant::now(), cancel.x + 1, cancel.y).is_empty());
+    assert!(a.modal.is_none(), "Cancelar closes");
+    assert!(a.running.is_none() && a.queue.is_empty());
+
+    update(&mut a, ready("a"));
+    // A click on the row toggles it; with nothing checked Continuar does nothing.
+    let list = regions(&a, screen(&a)).confirm_list;
+    click_at(&mut a, Instant::now(), list.x + 1, list.y);
+    assert_eq!(checked(&a), [false]);
+    let go = button(&a, ConfirmButton::Continue);
+    assert!(click_at(&mut a, Instant::now(), go.x + 1, go.y).is_empty());
+    assert!(confirm_open(&a));
+    click_at(&mut a, Instant::now(), list.x + 1, list.y);
+    assert_eq!(checked(&a), [true]);
+    let cmds = click_at(&mut a, Instant::now(), go.x + 1, go.y);
+    assert_eq!(cmds, vec![Cmd::Execute(apply_action("a"))], "same as Enter");
+    assert!(a.modal.is_none());
 }

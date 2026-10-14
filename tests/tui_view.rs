@@ -610,7 +610,7 @@ fn confirm_dialog_has_inner_padding() {
     let inner = |y: usize| -> String { rows[y][left + 1..right].iter().collect() };
     assert!(inner(top + 1).chars().all(|c| c == ' '), "{out}");
     let first_text = inner(top + 2);
-    assert!(first_text.starts_with("  Instalar"), "{first_text:?}");
+    assert!(first_text.starts_with("  [x] powertoys"), "{first_text:?}");
     assert!(inner(top + 3).starts_with("  "), "{out}");
 }
 
@@ -2245,4 +2245,196 @@ fn buttons_wrap_without_overlap() {
             assert!(!b.intersects(*c), "{b:?} overlaps {c:?}");
         }
     }
+}
+
+// ---- Task 110: confirmation list ----
+
+fn upd_row(
+    name: &str,
+    origin: &str,
+    source: &str,
+    from: &str,
+    to: &str,
+) -> wingetrs::installed::correlate::ListRow {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    ListRow {
+        name: name.into(),
+        origin: origin.into(),
+        installed_version: Some(from.into()),
+        correlation: Correlation::Matched {
+            source: source.into(),
+            package_id: name.into(),
+            rule: Rule::ScoopManifest,
+        },
+        latest: Some(to.into()),
+        state: UpdateState::Available { latest: to.into() },
+        ..Default::default()
+    }
+}
+
+/// A confirmation of an `Apply` with one group per name, opened by a single plan.
+fn confirm_of(names: &[String], glyphs: GlyphSet) -> App {
+    let mut a = App::new(entries(), glyphs);
+    let groups = names
+        .iter()
+        .map(|n| {
+            vec![InstallPlan {
+                app: n.clone(),
+                ..plan()
+            }]
+        })
+        .collect();
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Instalar".into(),
+            action: Action::Apply(groups),
+        })),
+    );
+    a
+}
+
+#[test]
+fn confirm_lists_items_with_versions_and_manager() {
+    use wingetrs::tui::app::Tab;
+    let mut a = App::new(entries(), GlyphSet::Nerd);
+    a.tab = Tab::Updates;
+    a.installed = vec![
+        upd_row("beta", "wingetrs", "scoop:main", "1.0", "2.0"),
+        upd_row("Git.Git", "arp", "winget", "3", "4"),
+    ];
+    a.marks.insert(
+        Tab::Updates,
+        [
+            ("wingetrs".to_string(), "beta".to_string()),
+            ("arp".to_string(), "Git.Git".to_string()),
+        ]
+        .into(),
+    );
+    key(&mut a, crossterm::event::KeyCode::Char('U'));
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![Ok(Planned::Ready {
+            text: "Instalar beta 2.0".into(),
+            action: Action::Apply(vec![vec![InstallPlan {
+                app: "beta".into(),
+                version: "2.0".into(),
+                upgrade_from: Some("1.0".into()),
+                ..plan()
+            }]]),
+        })]),
+    );
+    let out = render(&a, 120, 30);
+    let rows: Vec<&str> = out.lines().filter(|l| l.contains('✓')).collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    assert!(
+        rows[0].contains("beta") && rows[0].contains("1.0 → 2.0") && rows[0].contains("wingetrs"),
+        "{out}"
+    );
+    assert!(
+        rows[1].contains("Git.Git") && rows[1].contains("3 → 4") && rows[1].contains("winget"),
+        "{out}"
+    );
+    assert!(out.contains("Pode aparecer um pedido do UAC"), "{out}");
+    assert!(!out.contains("winget upgrade"), "{out}");
+    assert!(!out.contains("--id"), "{out}");
+}
+
+#[test]
+fn confirm_text_never_overflows() {
+    let names: Vec<String> = (0..5).map(|i| format!("{i}{}", "n".repeat(79))).collect();
+    let mut a = confirm_of(&names, GlyphSet::Unicode);
+    a.size = (60, 15);
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let with = screen_cells(&a, 60, 15, &theme);
+    let dialog =
+        wingetrs::tui::regions::regions(&a, ratatui::layout::Rect::new(0, 0, 60, 15)).confirm;
+    assert!(
+        dialog.width > 0 && dialog.width <= 48 && dialog.height <= 12,
+        "{dialog:?}"
+    );
+    let list =
+        wingetrs::tui::regions::regions(&a, ratatui::layout::Rect::new(0, 0, 60, 15)).confirm_list;
+    let modal = a.modal.take();
+    let without = screen_cells(&a, 60, 15, &theme);
+    a.modal = modal;
+    for y in 0..15 {
+        for x in 0..60 {
+            if dialog.contains((x, y).into()) {
+                continue;
+            }
+            assert_eq!(
+                with[(x, y)].symbol(),
+                without[(x, y)].symbol(),
+                "cell ({x}, {y}) outside the dialog changed"
+            );
+        }
+    }
+    let mut cut = 0;
+    for y in list.y..list.bottom() {
+        let text: String = (list.x..list.right())
+            .map(|x| with[(x, y)].symbol().to_string())
+            .collect();
+        let text = text.trim_end();
+        if text.contains("nnn") {
+            assert!(text.ends_with('…'), "{text:?}");
+            cut += 1;
+        }
+    }
+    assert!(cut >= 2, "at least two items on screen");
+}
+
+#[test]
+fn confirm_scrolls_with_many_items() {
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    use wingetrs::tui::app::Modal;
+    let names: Vec<String> = (0..30).map(|i| format!("pacote{i:02}")).collect();
+    let mut a = confirm_of(&names, GlyphSet::Unicode);
+    assert!(render(&a, 80, 24).contains("pacote00"));
+    assert!(!render(&a, 80, 24).contains("pacote29"));
+    for _ in 0..29 {
+        key(&mut a, crossterm::event::KeyCode::Down);
+    }
+    let out = render(&a, 80, 24);
+    assert!(out.contains("pacote29"), "{out}");
+    assert!(!out.contains("pacote00"), "{out}");
+
+    let mut w = confirm_of(&names, GlyphSet::Unicode);
+    let list =
+        wingetrs::tui::regions::regions(&w, ratatui::layout::Rect::new(0, 0, 80, 24)).confirm_list;
+    update(
+        &mut w,
+        Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: list.x + 2,
+            row: list.y + 1,
+            modifiers: KeyModifiers::NONE,
+        }),
+    );
+    match &w.modal {
+        Some(Modal::Confirm { scroll, .. }) => assert_eq!(*scroll, 3),
+        _ => panic!("confirmation not open"),
+    }
+    let out = render(&w, 80, 24);
+    assert!(
+        out.contains("pacote03") && !out.contains("pacote02"),
+        "{out}"
+    );
+}
+
+#[test]
+#[ignore = "live: bench"]
+fn bench_confirm_with_many_items() {
+    let names: Vec<String> = (0..300).map(|i| format!("app{i:03}")).collect();
+    let mut a = confirm_of(&names, GlyphSet::Unicode);
+    a.size = (100, 30);
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let t = std::time::Instant::now();
+    for _ in 0..100 {
+        std::hint::black_box(screen_cells(&a, 100, 30, &theme));
+    }
+    eprintln!(
+        "frame with a 300-item confirmation: {:?}",
+        t.elapsed() / 100
+    );
 }

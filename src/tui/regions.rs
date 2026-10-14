@@ -1,6 +1,11 @@
 //! The one screen geometry: drawing and mouse hit-testing both read it from here.
-use crate::tui::app::{ActionId, App, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Tab, buttons, items_in_rows};
-use crate::tui::layout::{FILTER_GAP, ITEM_GAP, PAD_X, inset, split_with_gutter};
+use crate::tui::app::{
+    ActionId, App, CONFIRM_BUTTONS, ConfirmButton, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, Tab,
+    buttons, items_in_rows,
+};
+use crate::tui::layout::{
+    BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X, inset, split_with_gutter,
+};
 use crate::tui::settings::ORDER;
 use crate::tui::tabs::tab_rects;
 use crate::tui::view::{MIN_HEIGHT_FOR_CHROME, MIN_WIDTH_FOR_DETAILS, list_window, tab_labels};
@@ -33,6 +38,10 @@ pub struct Regions {
     pub setting_rows: Vec<Rect>,
     pub status: Rect,
     pub help: Rect,
+    /// The confirmation dialog, its item list and its buttons (when it is open).
+    pub confirm: Rect,
+    pub confirm_list: Rect,
+    pub confirm_buttons: Vec<(Rect, ConfirmButton)>,
 }
 
 const TAB_ORDER: [Tab; 4] = [Tab::Search, Tab::Installed, Tab::Updates, Tab::Settings];
@@ -114,7 +123,111 @@ pub fn regions(app: &App, area: Rect) -> Regions {
             })
             .collect();
     }
+    if let Some(Modal::Confirm { items, notes, .. }) = &app.modal {
+        let g = confirm_geom(items.len(), notes, area);
+        r.confirm = g.dialog;
+        r.confirm_list = g.list;
+        r.confirm_buttons = g.buttons;
+    }
     r
+}
+
+/// Share of the screen the confirmation may take, per side.
+const CONFIRM_SCREEN_PERCENT: u16 = 80;
+
+/// Where the confirmation draws its parts.
+#[derive(Debug, Default, Clone)]
+pub struct ConfirmGeom {
+    pub dialog: Rect,
+    /// The notes, wrapped to the dialog width; only the lines that fit.
+    pub notes: Vec<String>,
+    pub notes_area: Rect,
+    pub list: Rect,
+    pub buttons: Vec<(Rect, ConfirmButton)>,
+}
+
+/// Lays out a confirmation of `items` packages and `notes`: at most 80% of `area` per side;
+/// buttons at the foot, the notes on top, the list gets the rows in between.
+pub fn confirm_geom(items: usize, notes: &[String], area: Rect) -> ConfirmGeom {
+    let mut g = ConfirmGeom::default();
+    let chrome_w = 2 * (BORDER + DIALOG_PAD_X);
+    let chrome_h = 2 * (BORDER + DIALOG_PAD_Y);
+    let pct = |n: u16| u16::try_from(u32::from(n) * u32::from(CONFIRM_SCREEN_PERCENT) / 100);
+    let w = pct(area.width).unwrap_or(area.width);
+    let text_w = usize::from(w.saturating_sub(chrome_w));
+    let wrapped: Vec<String> = notes.iter().flat_map(|n| wrap(n, text_w)).collect();
+    let list_rows = items.saturating_mul(ITEM_ROWS);
+    let note_rows = if wrapped.is_empty() {
+        0
+    } else {
+        wrapped.len() + 1
+    };
+    // Notes (and a gap), the list, a gap and the button row.
+    let wanted = chrome_h as usize + note_rows + list_rows + 2;
+    let h = u16::try_from(wanted)
+        .unwrap_or(u16::MAX)
+        .min(pct(area.height).unwrap_or(area.height));
+    g.dialog = Rect::new(
+        area.x + (area.width - w.min(area.width)) / 2,
+        area.y + (area.height - h.min(area.height)) / 2,
+        w.min(area.width),
+        h.min(area.height),
+    );
+    let inner = inset(g.dialog, BORDER + DIALOG_PAD_X, BORDER + DIALOG_PAD_Y);
+    if inner.width == 0 || inner.height == 0 {
+        return g;
+    }
+    let body = inner.height.saturating_sub(2);
+    // The notes yield to at least one item.
+    let room = usize::from(body).saturating_sub(ITEM_ROWS + 1);
+    g.notes = wrapped.into_iter().take(room).collect();
+    let notes_h = u16::try_from(g.notes.len()).unwrap_or(0);
+    g.notes_area = Rect::new(inner.x, inner.y, inner.width, notes_h);
+    let gap = u16::from(notes_h > 0);
+    g.list = Rect::new(
+        inner.x,
+        inner.y + notes_h + gap,
+        inner.width,
+        body.saturating_sub(notes_h + gap),
+    );
+    let y = inner.bottom() - 1;
+    let mut x = inner.x;
+    for (label, button) in CONFIRM_BUTTONS {
+        let bw = u16::try_from(label.chars().count() + 2).unwrap_or(u16::MAX);
+        let bw = bw.min(inner.right().saturating_sub(x));
+        if bw == 0 {
+            break;
+        }
+        g.buttons.push((Rect::new(x, y, bw, 1), button));
+        x = x.saturating_add(bw + 2);
+    }
+    g
+}
+
+/// Items `[start, end)` of a confirmation of `len` items shown from `scroll` in `rows` items.
+pub fn confirm_window(scroll: usize, len: usize, rows: usize) -> std::ops::Range<usize> {
+    let start = scroll.min(len.saturating_sub(rows));
+    start..(start + rows).min(len)
+}
+
+/// Greedy word wrap of `text` to `width` cells; a word longer than a line is cut when drawn.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let cells = |s: &str| ratatui::text::Span::raw(s).width();
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && cells(&line) + 1 + cells(word) > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Details text rows kept above the buttons; with less room the buttons are not shown.

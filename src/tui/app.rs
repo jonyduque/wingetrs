@@ -265,18 +265,50 @@ pub struct Tools {
     pub scoop: Option<bool>,
 }
 
+/// One package of a confirmation: a group of an `Apply`, a removal or a bridge upgrade.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmItem {
+    pub name: String,
+    /// `(source, id)` of its icon.
+    pub key: Option<(String, String)>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// `"wingetrs"`, `"winget"` or `"scoop"`.
+    pub manager: &'static str,
+    pub checked: bool,
+}
+
+/// The two buttons under the confirmation list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmButton {
+    Continue,
+    Cancel,
+}
+
+/// Labels of the confirmation buttons, in drawing order.
+pub const CONFIRM_BUTTONS: [(&str, ConfirmButton); 2] = [
+    ("Continuar (enter)", ConfirmButton::Continue),
+    ("Cancelar (esc)", ConfirmButton::Cancel),
+];
+
 /// The dialog on top of the screen; it takes every key until it closes.
 pub enum Modal {
     Confirm {
-        plan_text: String,
-        /// `None`: the quit confirmation (Enter drops the queue and quits once the
-        /// operation in progress ends).
-        action: Option<Action>,
-        /// Further actions confirmed together with `action` (a batch of removals).
-        then: Vec<Action>,
+        /// One per package, in the order of `actions` (an `Apply` has one per group).
+        items: Vec<ConfirmItem>,
+        /// Bridge warnings and what the batch left out.
+        notes: Vec<String>,
+        /// First item on screen.
+        scroll: usize,
+        cursor: usize,
+        /// Queued in order on Enter, without the unchecked items.
+        actions: Vec<Action>,
         /// Tab whose marks are cleared once the actions are queued.
         clear_marks: Option<Tab>,
     },
+    /// Quitting with work in progress or queued: Enter drops the queue and quits once the
+    /// operation in progress ends.
+    ConfirmQuit { text: String },
     Picking {
         picker: Picker,
         candidates: Vec<Candidate>,
@@ -598,6 +630,8 @@ struct Batch {
     hidden: usize,
     /// Bridge upgrades of the marked rows, queued after the planned actions.
     bridges: Vec<BridgeJob>,
+    /// Marked rows the action does not apply to.
+    left_out: usize,
 }
 
 const MAX_HITS: usize = 1000;
@@ -1651,10 +1685,20 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
 const WHEEL_ITEMS: usize = 3;
 
 /// Mouse: left click on a tab, list item (selects and toggles its mark) or setting row; right
-/// click on an item opens its actions menu; the wheel moves the list. Ignored under a modal or
-/// the help, and when `mouse_enabled` is off.
+/// click on an item opens its actions menu; the wheel moves the list. Of the dialogs only the
+/// confirmation takes the mouse; ignored under the help, and when `mouse_enabled` is off.
 fn on_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
-    if !app.mouse_enabled || app.modal.is_some() || app.show_help {
+    if !app.mouse_enabled {
+        return Vec::new();
+    }
+    if matches!(app.modal, Some(Modal::Confirm { .. })) {
+        let cmds = confirm_mouse(app, ev);
+        if app.modal.is_none() {
+            app.modal = app.pending_modals.pop_front();
+        }
+        return cmds;
+    }
+    if app.modal.is_some() || app.show_help {
         return Vec::new();
     }
     let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
@@ -1710,7 +1754,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     // A second Ctrl+C once quitting was asked for (dialog open or confirmed) quits at once:
     // the way out if the job in progress hangs.
     let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
-    let quit_asked = matches!(app.modal, Some(Modal::Confirm { action: None, .. }));
+    let quit_asked = matches!(app.modal, Some(Modal::ConfirmQuit { .. }));
     if ctrl_c && (quit_asked || app.quit_after_running) {
         return vec![Cmd::Quit];
     }
@@ -2014,37 +2058,148 @@ fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, &'static str> {
     }
 }
 
-/// Confirmation text of a bridge upgrade: the exact command and what may happen meanwhile.
-fn bridge_text(app: &App, job: &BridgeJob) -> String {
-    let (program, args) = bridge::command(job, &app.scoop_root, &app.pwsh);
-    let note = match job.tool {
+/// What may happen meanwhile when `tool` runs an upgrade.
+fn bridge_note(tool: Tool) -> &'static str {
+    match tool {
         Tool::Winget => "Pode aparecer um pedido do UAC, às vezes só piscando na barra de tarefas.",
         Tool::Scoop => "O scoop pode atualizar os buckets (git pull) antes.",
+    }
+}
+
+/// The note of a batch whose action does not apply to every marked row.
+fn left_out_note(left_out: usize) -> String {
+    // One message for the buttons and the keys; the count is not inflected on purpose.
+    format!("{left_out} itens ficaram de fora (ação não se aplica)")
+}
+
+/// Toasts what `left_out_note` says when no confirmation shows it.
+fn toast_left_out(app: &mut App, left_out: usize) {
+    if left_out > 0 {
+        app.push_toast(ToastKind::Info, left_out_note(left_out));
+    }
+}
+
+/// `(source, id)` of the catalog package of a row.
+fn row_key(r: &ListRow) -> Option<(String, String)> {
+    match &r.correlation {
+        Correlation::Matched {
+            source, package_id, ..
+        } => Some((source.clone(), package_id.clone())),
+        _ => None,
+    }
+}
+
+/// One item per package of `actions` (built once, when the dialog opens).
+fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
+    let row = |name: &str, ours: bool| {
+        app.installed
+            .iter()
+            .find(|r| r.name == name && (r.origin == "wingetrs") == ours)
     };
-    format!(
-        "Atualizar {} via {}:\n  {}\n{note}\n",
-        job.name,
-        job.tool.name(),
-        bridge::command_text(&program, &args)
-    )
+    let mut items = Vec::new();
+    for action in actions {
+        match action {
+            Action::Apply(groups) => {
+                // The target of a group is its last plan; the others are its dependencies.
+                items.extend(groups.iter().filter_map(|g| g.last()).map(|p| ConfirmItem {
+                    name: p.app.clone(),
+                    key: Some((format!("scoop:{}", p.bucket), p.app.clone())),
+                    from: p.upgrade_from.clone(),
+                    to: Some(p.version.clone()),
+                    manager: "wingetrs",
+                    checked: true,
+                }));
+            }
+            Action::Remove(p) => items.push(ConfirmItem {
+                name: p.app.clone(),
+                key: row(&p.app, true).and_then(row_key),
+                from: Some(p.version.clone()),
+                to: None,
+                manager: "wingetrs",
+                checked: true,
+            }),
+            Action::Bridge(job) => {
+                let r = row(&job.name, false);
+                items.push(ConfirmItem {
+                    name: job.name.clone(),
+                    key: r.and_then(row_key),
+                    from: r.and_then(|r| r.installed_version.clone()),
+                    to: r.and_then(|r| r.latest.clone()),
+                    manager: job.tool.name(),
+                    checked: true,
+                });
+            }
+        }
+    }
+    items
+}
+
+/// The confirmation of `actions`: one item per package, the bridge and purge warnings, then
+/// `notes`.
+fn confirm_modal(
+    app: &App,
+    actions: Vec<Action>,
+    notes: Vec<String>,
+    clear_marks: Option<Tab>,
+) -> Modal {
+    let mut all: Vec<String> = Vec::new();
+    for action in &actions {
+        let note = match action {
+            Action::Bridge(job) => bridge_note(job.tool).to_string(),
+            Action::Remove(p) if p.purge => {
+                format!("Os dados persistentes de {} serão APAGADOS (purge).", p.app)
+            }
+            _ => continue,
+        };
+        if !all.contains(&note) {
+            all.push(note);
+        }
+    }
+    all.extend(notes);
+    Modal::Confirm {
+        items: confirm_items(app, &actions),
+        notes: all,
+        scroll: 0,
+        cursor: 0,
+        actions,
+        clear_marks,
+    }
+}
+
+/// `actions` without the unchecked items; `items` is aligned as `confirm_items` built it.
+fn checked_actions(items: &[ConfirmItem], actions: Vec<Action>) -> Vec<Action> {
+    let mut checked = items.iter().map(|i| i.checked);
+    let mut out = Vec::new();
+    for action in actions {
+        match action {
+            Action::Apply(groups) => {
+                // A kept group keeps its own dependencies (merged at execution).
+                let kept: Vec<Vec<InstallPlan>> = groups
+                    .into_iter()
+                    .filter(|g| !g.is_empty() && checked.next().unwrap_or(false))
+                    .collect();
+                if !kept.is_empty() {
+                    out.push(Action::Apply(kept));
+                }
+            }
+            other => {
+                if checked.next().unwrap_or(false) {
+                    out.push(other);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Upgrades one app through its own tool: confirmed per the `confirm` setting, then queued.
 fn start_bridge(app: &mut App, job: BridgeJob) -> Vec<Cmd> {
-    let text = bridge_text(app, &job);
     let action = Action::Bridge(job);
     if !needs_confirm(app.settings.behavior.confirm, &action) {
         return enqueue(app, action);
     }
-    open_modal(
-        app,
-        Modal::Confirm {
-            plan_text: text,
-            action: Some(action),
-            then: Vec::new(),
-            clear_marks: None,
-        },
-    );
+    let modal = confirm_modal(app, vec![action], Vec::new(), None);
+    open_modal(app, modal);
     Vec::new()
 }
 
@@ -2145,20 +2300,21 @@ fn report_left_out(app: &mut App, skipped: &[String], hidden: usize) {
 }
 
 /// Plans `items` (label, command) as one batch, or only reports what was left out when there
-/// is nothing to plan.
+/// is nothing to plan. `left_out` marked rows do not take the action.
 fn start_batch(
     app: &mut App,
     items: Vec<(String, Cmd)>,
     bridges: Vec<BridgeJob>,
     skipped: Vec<String>,
     hidden: usize,
+    left_out: usize,
 ) -> Vec<Cmd> {
     if items.is_empty() {
         report_left_out(app, &skipped, hidden);
         // Bridge upgrades need no plan: straight to the one confirmation.
         let tab = app.tab;
         let confirm = app.settings.behavior.confirm;
-        return confirm_batch(app, Vec::new(), Vec::new(), bridges, confirm, tab);
+        return confirm_batch(app, Vec::new(), bridges, confirm, tab, left_out);
     }
     if app.planning {
         if !bridges.is_empty() {
@@ -2167,6 +2323,7 @@ fn start_batch(
                 "outro plano em andamento: lote não iniciado, tente de novo",
             );
         }
+        toast_left_out(app, left_out);
         return Vec::new();
     }
     let (labels, items): (Vec<String>, Vec<Cmd>) = items.into_iter().unzip();
@@ -2176,38 +2333,31 @@ fn start_batch(
         skipped,
         hidden,
         bridges,
+        left_out,
     });
     start_planning(app, Cmd::PlanBatch { items })
 }
 
 /// The actions of a marked batch, then one bridge upgrade per job: one confirmation covers
 /// them all (when any needs it), else they are queued; the tab's marks are cleared either way.
+/// The `left_out` count goes into the confirmation, or a toast without one.
 fn confirm_batch(
     app: &mut App,
-    mut texts: Vec<String>,
     mut actions: Vec<Action>,
     bridges: Vec<BridgeJob>,
     confirm: ConfirmMode,
     tab: Tab,
+    left_out: usize,
 ) -> Vec<Cmd> {
-    for job in bridges {
-        texts.push(bridge_text(app, &job));
-        actions.push(Action::Bridge(job));
-    }
+    actions.extend(bridges.into_iter().map(Action::Bridge));
     if actions.is_empty() {
+        toast_left_out(app, left_out);
         return Vec::new();
     }
     if actions.iter().any(|a| needs_confirm(confirm, a)) {
-        let mut rest = actions.into_iter();
-        open_modal(
-            app,
-            Modal::Confirm {
-                plan_text: texts.join("\n\n"),
-                action: rest.next(),
-                then: rest.collect(),
-                clear_marks: Some(tab),
-            },
-        );
+        let notes = (left_out > 0).then(|| left_out_note(left_out));
+        let modal = confirm_modal(app, actions, notes.into_iter().collect(), Some(tab));
+        open_modal(app, modal);
         return Vec::new();
     }
     let mut cmds = Vec::new();
@@ -2215,11 +2365,12 @@ fn confirm_batch(
         cmds.extend(enqueue(app, action));
     }
     app.marks.remove(&tab);
+    toast_left_out(app, left_out);
     cmds
 }
 
 /// Marked rows of Search: plan installing each Scoop one; winget ones are skipped.
-fn install_marked(app: &mut App, rows: Vec<usize>, hidden: usize) -> Vec<Cmd> {
+fn install_marked(app: &mut App, rows: Vec<usize>, hidden: usize, left_out: usize) -> Vec<Cmd> {
     let mut items = Vec::new();
     let mut skipped = Vec::new();
     for i in rows {
@@ -2243,11 +2394,11 @@ fn install_marked(app: &mut App, rows: Vec<usize>, hidden: usize) -> Vec<Cmd> {
             skipped.push(e.name.clone());
         }
     }
-    start_batch(app, items, Vec::new(), skipped, hidden)
+    start_batch(app, items, Vec::new(), skipped, hidden, left_out)
 }
 
 /// Marked rows of Installed/Updates: plan upgrading those `upgrade_target` accepts.
-fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
+fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize, left_out: usize) -> Vec<Cmd> {
     let keep = app.settings.behavior.keep_old;
     let mut items = Vec::new();
     let mut bridges = Vec::new();
@@ -2267,11 +2418,11 @@ fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
             Err(_) => skipped.push(r.name.clone()),
         }
     }
-    start_batch(app, items, bridges, skipped, hidden)
+    start_batch(app, items, bridges, skipped, hidden, left_out)
 }
 
 /// Marked rows of Installed: plan removing those wingetrs installed.
-fn remove_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
+fn remove_marked(app: &mut App, rows: &[usize], hidden: usize, left_out: usize) -> Vec<Cmd> {
     let purge = app.settings.behavior.purge;
     let mut items = Vec::new();
     let mut skipped = Vec::new();
@@ -2289,7 +2440,7 @@ fn remove_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
             skipped.push(r.name.clone());
         }
     }
-    start_batch(app, items, Vec::new(), skipped, hidden)
+    start_batch(app, items, Vec::new(), skipped, hidden, left_out)
 }
 
 /// `Enter` in Installed: the actions menu of the selected app, or of the marked ones.
@@ -2595,6 +2746,8 @@ fn run_button(app: &mut App, id: ActionId) -> Vec<Cmd> {
     if possible.is_empty() && !marked {
         return Vec::new();
     }
+    // A marked batch plan says it in its confirmation (or toasts it without one).
+    let batch = marked && matches!(job, ButtonJob::Plan);
     let cmds = match job {
         ButtonJob::Pin { keys, pinned } => keys
             .into_iter()
@@ -2611,21 +2764,17 @@ fn run_button(app: &mut App, id: ActionId) -> Vec<Cmd> {
         ButtonJob::Choose(choice) => open_choosing(app, choice),
         ButtonJob::Undo(cmds) => cmds,
         ButtonJob::Plan => match (id, marked) {
-            (ActionId::Install, true) => install_marked(app, possible, hidden),
+            (ActionId::Install, true) => install_marked(app, possible, hidden, left_out),
             (ActionId::Install, false) => install_one(app),
-            (ActionId::Upgrade, true) => upgrade_marked(app, &possible, hidden),
+            (ActionId::Upgrade, true) => upgrade_marked(app, &possible, hidden, left_out),
             (ActionId::Upgrade, false) => upgrade_one(app),
-            (ActionId::Remove, true) => remove_marked(app, &possible, hidden),
+            (ActionId::Remove, true) => remove_marked(app, &possible, hidden, left_out),
             (ActionId::Remove, false) => remove_one(app),
             _ => Vec::new(),
         },
     };
-    if left_out > 0 {
-        // One message for the buttons and the keys; the count is not inflected on purpose.
-        app.push_toast(
-            ToastKind::Info,
-            format!("{left_out} itens ficaram de fora (ação não se aplica)"),
-        );
+    if !batch {
+        toast_left_out(app, left_out);
     }
     cmds
 }
@@ -2910,7 +3059,7 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
         return vec![Cmd::Quit];
     }
     let n = app.queue.len();
-    let mut plan_text = match (&app.running, n) {
+    let mut text = match (&app.running, n) {
         (Some(_), 0) => "Há uma operação em andamento; ela termina antes de fechar.".to_string(),
         (Some(_), _) => format!(
             "Há {n} operações na fila e uma em andamento. Sair cancela as pendentes; a em andamento termina antes de fechar."
@@ -2926,14 +3075,9 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
         })
     );
     if removing && app.settings.behavior.residues == ResidueMode::Ask {
-        plan_text.push_str(" Resíduos dela não serão limpos.");
+        text.push_str(" Resíduos dela não serão limpos.");
     }
-    app.modal = Some(Modal::Confirm {
-        plan_text,
-        action: None,
-        then: Vec::new(),
-        clear_marks: None,
-    });
+    app.modal = Some(Modal::ConfirmQuit { text });
     Vec::new()
 }
 
@@ -3012,19 +3156,12 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
         .take()
         .unwrap_or(app.settings.behavior.confirm);
     match result {
-        Ok(Planned::Ready { text, action }) => {
+        Ok(Planned::Ready { action, .. }) => {
             if !needs_confirm(confirm, &action) {
                 return enqueue(app, action);
             }
-            open_modal(
-                app,
-                Modal::Confirm {
-                    plan_text: text,
-                    action: Some(action),
-                    then: Vec::new(),
-                    clear_marks: None,
-                },
-            );
+            let modal = confirm_modal(app, vec![action], Vec::new(), None);
+            open_modal(app, modal);
         }
         Ok(Planned::Choose(candidates)) => {
             let items = candidates.iter().map(candidate_item).collect();
@@ -3057,18 +3194,14 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
     report_left_out(app, &batch.skipped, batch.hidden);
     let mut groups = Vec::new();
     let mut removals = Vec::new();
-    let mut texts = Vec::new();
     let mut ambiguous = Vec::new();
     for (i, result) in results.into_iter().enumerate() {
         let label = batch.labels.get(i).cloned().unwrap_or_default();
         match result {
-            Ok(Planned::Ready { text, action }) => {
-                texts.push(text);
-                match action {
-                    Action::Apply(g) => groups.extend(g),
-                    other => removals.push(other),
-                }
-            }
+            Ok(Planned::Ready { action, .. }) => match action {
+                Action::Apply(g) => groups.extend(g),
+                other => removals.push(other),
+            },
             Ok(Planned::Choose(_)) => ambiguous.push(label),
             Err(message) => app.push_toast(ToastKind::Error, format!("{label}: {message}")),
         }
@@ -3084,7 +3217,14 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
         actions.push(Action::Apply(groups));
     }
     actions.extend(removals);
-    confirm_batch(app, texts, actions, batch.bridges, confirm, batch.tab)
+    confirm_batch(
+        app,
+        actions,
+        batch.bridges,
+        confirm,
+        batch.tab,
+        batch.left_out,
+    )
 }
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
@@ -3164,6 +3304,128 @@ fn handle_residues(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<C
     start_cleanup(app, name, chosen)
 }
 
+/// Items of the open confirmation that fit on screen (at least one).
+fn confirm_rows(app: &App) -> usize {
+    let Some(Modal::Confirm { items, notes, .. }) = &app.modal else {
+        return 1;
+    };
+    let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
+    let list = crate::tui::regions::confirm_geom(items.len(), notes, area).list;
+    (usize::from(list.height) / ITEM_ROWS).max(1)
+}
+
+/// Keys of the confirmation: arrows move the cursor (the list scrolls to keep it on screen),
+/// `Espaço` toggles the item, `Enter` continues, `Esc` cancels.
+fn confirm_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
+    let rows = confirm_rows(app);
+    let Some(Modal::Confirm {
+        items,
+        scroll,
+        cursor,
+        ..
+    }) = &mut app.modal
+    else {
+        return Vec::new();
+    };
+    match key.code {
+        KeyCode::Enter => return continue_confirm(app),
+        KeyCode::Esc => {
+            app.modal = None;
+            return Vec::new();
+        }
+        KeyCode::Up => *cursor = cursor.saturating_sub(1),
+        KeyCode::Down => *cursor = (*cursor + 1).min(items.len().saturating_sub(1)),
+        KeyCode::Char(' ') => {
+            if let Some(item) = items.get_mut(*cursor) {
+                item.checked = !item.checked;
+            }
+        }
+        _ => {}
+    }
+    *scroll = crate::tui::view::list_window(*cursor, *scroll, items.len(), rows).start;
+    Vec::new()
+}
+
+/// `Continuar`: queues the checked items of the confirmation; with none checked it stays.
+fn continue_confirm(app: &mut App) -> Vec<Cmd> {
+    let any =
+        matches!(&app.modal, Some(Modal::Confirm { items, .. }) if items.iter().any(|i| i.checked));
+    if !any {
+        return Vec::new();
+    }
+    let Some(Modal::Confirm {
+        items,
+        actions,
+        clear_marks,
+        ..
+    }) = app.modal.take()
+    else {
+        return Vec::new();
+    };
+    let mut cmds = Vec::new();
+    for action in checked_actions(&items, actions) {
+        cmds.extend(enqueue(app, action));
+    }
+    if let Some(tab) = clear_marks {
+        app.marks.remove(&tab);
+    }
+    cmds
+}
+
+/// Mouse on the confirmation: a click on a row toggles it, on a button presses it; the wheel
+/// scrolls the list.
+fn confirm_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
+    let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
+    let r = crate::tui::regions::regions(app, area);
+    let inside = |rect: ratatui::layout::Rect| rect.contains((ev.column, ev.row).into());
+    if let MouseEventKind::Down(MouseButton::Left) = ev.kind
+        && let Some((_, button)) = r.confirm_buttons.iter().find(|(rect, _)| inside(*rect))
+    {
+        return match button {
+            ConfirmButton::Continue => continue_confirm(app),
+            ConfirmButton::Cancel => {
+                app.modal = None;
+                Vec::new()
+            }
+        };
+    }
+    let rows = usize::from(r.confirm_list.height) / ITEM_ROWS;
+    let Some(Modal::Confirm {
+        items,
+        scroll,
+        cursor,
+        ..
+    }) = &mut app.modal
+    else {
+        return Vec::new();
+    };
+    let shown = crate::tui::regions::confirm_window(*scroll, items.len(), rows);
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) if inside(r.confirm_list) => {
+            let index = shown.start + usize::from(ev.row - r.confirm_list.y) / ITEM_ROWS;
+            if index < shown.end
+                && let Some(item) = items.get_mut(index)
+            {
+                item.checked = !item.checked;
+                *cursor = index;
+            }
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if inside(r.confirm) => {
+            let start = if ev.kind == MouseEventKind::ScrollDown {
+                (shown.start + WHEEL_ITEMS).min(items.len().saturating_sub(rows))
+            } else {
+                shown.start.saturating_sub(WHEEL_ITEMS)
+            };
+            *scroll = start;
+            // The cursor stays on screen.
+            let last = (start + rows.max(1)).min(items.len()).saturating_sub(1);
+            *cursor = (*cursor).clamp(start.min(last), last);
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
 fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     let cmds = modal_key(app, key);
     if app.modal.is_none() {
@@ -3177,38 +3439,20 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         return Vec::new();
     };
     match modal {
-        Modal::Confirm {
-            plan_text,
-            action,
-            then,
-            clear_marks,
-        } => match key.code {
-            KeyCode::Enter => match action {
-                Some(action) => {
-                    let mut cmds = enqueue(app, action);
-                    for next in then {
-                        cmds.extend(enqueue(app, next));
-                    }
-                    if let Some(tab) = clear_marks {
-                        app.marks.remove(&tab);
-                    }
-                    cmds
-                }
-                None => {
-                    // Quit: the pending ones are dropped, the one in progress is waited for.
-                    app.queue.clear();
-                    app.quit_after_running = true;
-                    pump(app)
-                }
-            },
+        modal @ Modal::Confirm { .. } => {
+            app.modal = Some(modal);
+            confirm_key(app, key)
+        }
+        Modal::ConfirmQuit { text } => match key.code {
+            KeyCode::Enter => {
+                // Quit: the pending ones are dropped, the one in progress is waited for.
+                app.queue.clear();
+                app.quit_after_running = true;
+                pump(app)
+            }
             KeyCode::Esc => Vec::new(),
             _ => {
-                app.modal = Some(Modal::Confirm {
-                    plan_text,
-                    action,
-                    then,
-                    clear_marks,
-                });
+                app.modal = Some(Modal::ConfirmQuit { text });
                 Vec::new()
             }
         },
@@ -3263,8 +3507,8 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             }
             PickOutcome::Cancelled => Vec::new(),
             PickOutcome::Picked(chosen) if marked => match (chosen.first(), marked_rows(app)) {
-                (Some(0), Some((rows, hidden))) => upgrade_marked(app, &rows, hidden),
-                (Some(1), Some((rows, hidden))) => remove_marked(app, &rows, hidden),
+                (Some(0), Some((rows, hidden))) => upgrade_marked(app, &rows, hidden, 0),
+                (Some(1), Some((rows, hidden))) => remove_marked(app, &rows, hidden, 0),
                 _ => Vec::new(),
             },
             PickOutcome::Picked(chosen) => {

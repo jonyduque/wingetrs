@@ -3,8 +3,8 @@ use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{
-    ActionId, App, ITEM_ROWS, Modal, RunProgress, ShowFilter, SourceFilter, Tab, buttons,
-    queue_rows,
+    ActionId, App, CONFIRM_BUTTONS, ConfirmButton, ConfirmItem, ITEM_ROWS, Modal, RunProgress,
+    ShowFilter, SourceFilter, Tab, buttons, queue_rows,
 };
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
@@ -13,10 +13,10 @@ use crate::tui::layout::{
     DIALOG_PAD_Y, ITEM_GAP, LIST_ICON_COLS, LIST_ICON_GAP, PICKER_FOOTER_SLACK, inset, split_icon,
 };
 use crate::tui::picker::{Picker, window};
-use crate::tui::regions::{list_visible, regions};
+use crate::tui::regions::{confirm_geom, confirm_window, list_visible, regions};
 use crate::tui::settings::{ORDER, SettingId};
 use crate::tui::tabs::{TabLabel, draw_tabs};
-use crate::tui::theme::{Glyphs, Theme};
+use crate::tui::theme::{GlyphSet, Glyphs, Theme};
 use crate::tui::toast::draw_toasts;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -36,9 +36,9 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (window, icons) = draw_screen(app, theme, frame, area);
+    let (window, mut icons) = draw_screen(app, theme, frame, area);
     if let Some(modal) = &app.modal {
-        draw_modal(app, modal, theme, frame, area);
+        icons.extend(draw_modal(app, modal, theme, frame, area));
     }
     // Toast boxes never cover a dialog (the residue picker decides what gets deleted);
     // with a dialog open, or on a small terminal, the newest toast goes to the status bar.
@@ -58,6 +58,7 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
 }
 
 /// Whether the package icon may be shown: never under a dialog or the help, nor when off.
+/// (The confirmation draws the icons of its own items.)
 pub fn icon_visible(app: &App) -> bool {
     app.modal.is_none() && !app.show_help && app.icon_protocol != IconProtocol::Off
 }
@@ -1160,10 +1161,24 @@ fn modal_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
     ))
 }
 
-fn draw_modal(app: &App, modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
+/// Draws the dialog; returns the icons of the confirmation items, drawn by `view` last.
+fn draw_modal<'a>(
+    app: &'a App,
+    modal: &Modal,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) -> IconPlaces<'a> {
     match modal {
-        Modal::Confirm { plan_text, .. } => {
-            let mut lines: Vec<Line> = plan_text
+        Modal::Confirm {
+            items,
+            notes,
+            scroll,
+            cursor,
+            ..
+        } => return draw_confirm(app, items, notes, (*scroll, *cursor), theme, frame, area),
+        Modal::ConfirmQuit { text } => {
+            let mut lines: Vec<Line> = text
                 .lines()
                 .map(|l| Line::from(Span::styled(l.to_string(), theme.fg())))
                 .collect();
@@ -1234,6 +1249,125 @@ fn draw_modal(app: &App, modal: &Modal, theme: &Theme, frame: &mut Frame, area: 
             );
         }
     }
+    Vec::new()
+}
+
+/// Check box of a confirmation item.
+fn check_box(app: &App, checked: bool) -> &'static str {
+    match (app.glyphs, checked) {
+        (GlyphSet::Ascii, true) => "[x]",
+        (GlyphSet::Ascii, false) => "[ ]",
+        (_, true) => "✓",
+        (_, false) => "☐",
+    }
+}
+
+/// One line of a confirmation item: name, versions (`from → to`; a removal only `from`, an
+/// install only `to`) and the manager.
+fn confirm_text(app: &App, item: &ConfirmItem) -> String {
+    let arrow = if app.glyphs == GlyphSet::Ascii {
+        "->"
+    } else {
+        "→"
+    };
+    let versions = match (&item.from, &item.to) {
+        (Some(from), Some(to)) => format!("{from} {arrow} {to}"),
+        (Some(v), None) | (None, Some(v)) => v.clone(),
+        (None, None) => String::new(),
+    };
+    [item.name.as_str(), versions.as_str(), item.manager]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// The confirmation: notes, one row per item (check box, icon, text cut with `…`) and the
+/// buttons, all inside the box `confirm_geom` lays out.
+fn draw_confirm<'a>(
+    app: &'a App,
+    items: &[ConfirmItem],
+    notes: &[String],
+    (scroll, cursor): (usize, usize),
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) -> IconPlaces<'a> {
+    let geom = confirm_geom(items.len(), notes, area);
+    frame.render_widget(Clear, geom.dialog);
+    frame.render_widget(modal_block(theme, "Confirmar"), geom.dialog);
+    let line = |frame: &mut Frame, rect: Rect, text: &str, style| {
+        let text = clip(text, usize::from(rect.width));
+        frame.render_widget(Paragraph::new(Span::styled(text, style)), rect);
+    };
+    for (n, note) in geom.notes.iter().enumerate() {
+        let y = geom.notes_area.y + u16::try_from(n).unwrap_or(0);
+        line(
+            frame,
+            Rect::new(geom.notes_area.x, y, geom.notes_area.width, 1),
+            note,
+            theme.warn(),
+        );
+    }
+    let g = Glyphs::for_set(app.glyphs);
+    let list = geom.list;
+    let rows = usize::from(list.height) / ITEM_ROWS;
+    let mark_w = Span::raw(check_box(app, true)).width() as u16 + 1;
+    let indent = LIST_ICON_COLS + LIST_ICON_GAP;
+    let icons_on = app.icon_protocol != IconProtocol::Off && list.width >= mark_w + indent + 20;
+    let text_x = mark_w + if icons_on { indent } else { 0 };
+    let size = (LIST_ICON_COLS, ITEM_ROWS as u16);
+    let mut places = Vec::new();
+    for (n, i) in confirm_window(scroll, items.len(), rows).enumerate() {
+        let item = &items[i];
+        let y = list.y + u16::try_from(n * ITEM_ROWS).unwrap_or(0);
+        let row = Rect::new(list.x, y, list.width, size.1);
+        let style = if i == cursor {
+            theme.bg_selected()
+        } else {
+            theme.fg()
+        };
+        frame.render_widget(Paragraph::new("").style(style), row);
+        let mark_style = if item.checked {
+            theme.ok()
+        } else {
+            theme.muted()
+        };
+        line(
+            frame,
+            Rect::new(list.x, y, mark_w.min(list.width), 1),
+            check_box(app, item.checked),
+            style.patch(mark_style),
+        );
+        let text_rect = inset_left(Rect::new(list.x, y, list.width, 1), text_x);
+        line(frame, text_rect, &confirm_text(app, item), style);
+        if !icons_on {
+            continue;
+        }
+        let rect = Rect::new(list.x + mark_w, y, size.0, size.1);
+        let key = item
+            .key
+            .as_ref()
+            .map(|(source, id)| format!("{source}/{id}"));
+        match key.as_deref().and_then(|k| app.icons.get(k, size)) {
+            Some(proto) => places.push((rect, proto)),
+            None if key.as_deref().is_some_and(|k| app.icon_known_absent(k)) => {
+                draw_no_icon(theme, g, frame, rect);
+            }
+            None => {}
+        }
+    }
+    let ready = items.iter().any(|i| i.checked);
+    for ((rect, button), (label, _)) in geom.buttons.iter().zip(CONFIRM_BUTTONS) {
+        let style = if *button == ConfirmButton::Continue && !ready {
+            theme.muted()
+        } else {
+            theme.accent().add_modifier(Modifier::REVERSED)
+        };
+        line(frame, *rect, &format!(" {label} "), style);
+    }
+    places
 }
 
 /// Status bar text of the operation in progress (or of the queue waiting for the lock).
