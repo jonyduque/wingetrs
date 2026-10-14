@@ -351,6 +351,7 @@ async fn event_loop(
                 } => spawn_cached_icon(&ctx, generation, source, id, sha, size),
                 Cmd::PrefetchIcons { generation, keys } => spawn_prefetch(&ctx, generation, keys),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
+                Cmd::RetryQueue => spawn_retry(&ctx),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
                 Cmd::Search {
                     generation,
@@ -1029,6 +1030,16 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
         .map_err(InstallFail::Other)
         .and_then(|r| r);
         Msg::InstallFinished(result)
+    });
+}
+
+/// Wakes the queue after `BUSY_RETRY`, like the details debounce: the sleep is awaited in
+/// the task itself, which starts no worker, so no handle is left to await.
+fn spawn_retry(ctx: &Arc<Ctx>) {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        tokio::time::sleep(crate::tui::app::BUSY_RETRY).await;
+        let _ = ctx.tx.send(Msg::RetryQueue);
     });
 }
 

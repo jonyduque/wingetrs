@@ -2,7 +2,7 @@
 use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, ITEM_ROWS, Modal, RunProgress, Tab};
+use crate::tui::app::{App, ITEM_ROWS, Modal, RunProgress, Tab, queue_rows};
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
 use crate::tui::layout::{
@@ -35,7 +35,7 @@ pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     }
     let (window, icons) = draw_screen(app, theme, frame, area);
     if let Some(modal) = &app.modal {
-        draw_modal(modal, theme, frame, area);
+        draw_modal(app, modal, theme, frame, area);
     }
     // Toast boxes never cover a dialog (the residue picker decides what gets deleted);
     // with a dialog open, or on a small terminal, the newest toast goes to the status bar.
@@ -908,11 +908,19 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
         ));
     }
     let bar = bar_area(area);
-    // The right pills win: the left text is cut to what is left, minus a 2-cell gap.
+    let running = running_text(app, g);
+    // The operation in progress wins over the right pills when both do not fit.
+    if let Some(t) = &running {
+        let rw: usize = right.iter().map(Span::width).sum();
+        if Span::raw(t.as_str()).width() + 2 + rw + 2 > usize::from(bar.width) {
+            right.clear();
+        }
+    }
+    // Otherwise the right pills win: the left text is cut to what is left, minus a 2-cell gap.
     let rw: usize = right.iter().map(Span::width).sum();
     let room = usize::from(bar.width).saturating_sub(rw + 2);
     // Without toast boxes the newest toast takes the message pill when there is no status.
-    let message = app.status.as_deref().or_else(|| {
+    let message = running.as_deref().or(app.status.as_deref()).or_else(|| {
         toasts_in_status_bar(app, frame.area())
             .then(|| app.toasts.first().map(|t| t.text.as_str()))
             .flatten()
@@ -956,6 +964,7 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("i", "instalar (aba Busca, scoop)"),
         key("u", "remover (aba Instalados)"),
         key("U", "atualizar (aba Atualizações)"),
+        key("f", "fila de operações"),
         key("Ctrl+S", "filtrar fonte"),
         key("Ctrl+R", "atualizar catálogo"),
         key("Esc", "voltar / limpar / sair"),
@@ -1007,7 +1016,7 @@ fn modal_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
     ))
 }
 
-fn draw_modal(modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn draw_modal(app: &App, modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
     match modal {
         Modal::Confirm { plan_text, .. } => {
             let mut lines: Vec<Line> = plan_text
@@ -1058,24 +1067,48 @@ fn draw_modal(modal: &Modal, theme: &Theme, frame: &mut Frame, area: Rect) {
                 area,
             );
         }
-        Modal::Running { label, progress } => {
-            let mut lines = vec![Line::from(Span::styled(label.clone(), theme.fg()))];
-            if let Some(p) = progress {
-                lines.push(progress_line(p, theme));
-            }
-            let rect = dialog_size(area, 68, if progress.is_some() { 2 } else { 1 });
-            render_dialog(
+        Modal::Queue { selected } => {
+            let (ids, items): (Vec<u64>, Vec<_>) = queue_rows(app).into_iter().unzip();
+            let at = ids.iter().position(|id| id == selected).unwrap_or(0);
+            draw_picker(
+                &Picker::single_at(items, at),
+                "Fila",
+                "x/Delete tira da fila · Esc fecha",
+                theme,
                 frame,
-                rect,
-                modal_block(theme, "Em andamento"),
-                Paragraph::new(lines).wrap(Wrap { trim: true }),
+                area,
             );
         }
     }
 }
 
-fn progress_line<'a>(p: &RunProgress, theme: &Theme) -> Line<'a> {
-    let text = match p.total.filter(|t| *t > 0) {
+/// Status bar text of the operation in progress (or of the queue waiting for the lock).
+fn running_text(app: &App, g: &Glyphs) -> Option<String> {
+    let mut text = match &app.running {
+        Some(r) => {
+            let mut t = format!("{} {}", spinner(app, g), r.label);
+            if let Some(p) = &r.progress {
+                t.push(' ');
+                t.push_str(&progress_text(p));
+            }
+            t
+        }
+        None if app.waiting_lock && !app.queue.is_empty() => {
+            "aguardando outra instalação".to_string()
+        }
+        None => return None,
+    };
+    if !app.queue.is_empty() {
+        text.push_str(&format!(" · fila: {}", app.queue.len()));
+    }
+    if app.quit_after_running {
+        text.push_str(" · saindo após terminar…");
+    }
+    Some(text)
+}
+
+fn progress_text(p: &RunProgress) -> String {
+    match p.total.filter(|t| *t > 0) {
         Some(total) => {
             let pct = (p.done.saturating_mul(100) / total).min(100);
             let filled = usize::try_from(pct / 5).unwrap_or(20);
@@ -1087,8 +1120,7 @@ fn progress_line<'a>(p: &RunProgress, theme: &Theme) -> Line<'a> {
             )
         }
         None => format!("{} {} bytes", p.label, p.done),
-    };
-    Line::from(Span::styled(text, theme.muted()))
+    }
 }
 
 fn draw_picker(

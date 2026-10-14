@@ -16,13 +16,14 @@ fn sort_hint(app: &App) -> &'static str {
 
 /// Key hints for the current tab and focus, most useful first, `?` last.
 pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let queue = app.running.is_some() || !app.queue.is_empty();
     if app.tab == Tab::Settings {
-        return vec![
-            ("↑/↓", "escolher"),
-            ("enter", "mudar"),
-            ("←/→", "aba"),
-            ("?", "ajuda"),
-        ];
+        let mut out = vec![("↑/↓", "escolher"), ("enter", "mudar"), ("←/→", "aba")];
+        if queue {
+            out.push(("f", "fila"));
+        }
+        out.push(("?", "ajuda"));
+        return out;
     }
     let mut out = Vec::new();
     out.push(("↑/↓", "mover"));
@@ -43,6 +44,9 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Settings => {}
     }
     out.push(("ctrl+s", "fonte"));
+    if queue {
+        out.push(("f", "fila"));
+    }
     if app.toasts.iter().any(|t| t.kind == ToastKind::Error) {
         out.push(("esc", "fecha erro"));
     }

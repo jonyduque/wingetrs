@@ -221,6 +221,29 @@ fn with_running() -> App {
     a
 }
 
+/// powertoys running with one more operation waiting behind it.
+fn with_queue() -> App {
+    let mut a = with_running();
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Instalar ripgrep".into(),
+            action: Action::Apply(vec![vec![InstallPlan {
+                app: "ripgrep".into(),
+                ..plan()
+            }]]),
+        })),
+    );
+    press(&mut a, crossterm::event::KeyCode::Enter);
+    a
+}
+
+fn with_queue_modal() -> App {
+    let mut a = with_queue();
+    press(&mut a, crossterm::event::KeyCode::Char('f'));
+    a
+}
+
 fn with_residues() -> App {
     let mut a = App::new(entries(), GlyphSet::Ascii);
     let r = |p: &str, pre: bool| Residue {
@@ -283,8 +306,48 @@ fn actions_modal_snapshot() {
 }
 
 #[test]
-fn running_modal_snapshot() {
-    insta::assert_snapshot!(render(&with_running(), 100, 16));
+fn queue_modal_snapshot() {
+    insta::assert_snapshot!(render(&with_queue_modal(), 100, 16));
+}
+
+#[test]
+fn status_bar_shows_running_and_queue() {
+    let a = with_queue();
+    assert_eq!(a.queue.len(), 1);
+    let screen = render(&a, 100, 16);
+    let bar = screen.lines().last().unwrap();
+    assert!(bar.contains("Instalando powertoys"), "{bar}");
+    assert!(bar.contains("powertoys.zip"), "{bar}");
+    assert!(bar.contains("50%"), "{bar}");
+    assert!(bar.contains("fila: 1"), "{bar}");
+    // The running operation wins over a status message.
+    let mut busy = with_queue();
+    busy.status = Some("planejando…".into());
+    let screen = render(&busy, 100, 16);
+    assert!(screen.lines().last().unwrap().contains("fila: 1"));
+    // Nothing queued: no queue count.
+    let screen = render(&with_running(), 100, 16);
+    let bar = screen.lines().last().unwrap();
+    assert!(bar.contains("Instalando powertoys"), "{bar}");
+    assert!(!bar.contains("fila"), "{bar}");
+}
+
+#[test]
+fn status_bar_says_when_waiting_for_the_lock() {
+    use wingetrs::tui::app::InstallFail;
+    let mut a = with_queue();
+    update(&mut a, Msg::InstallFinished(Err(InstallFail::Busy)));
+    let screen = render(&a, 100, 16);
+    let bar = screen.lines().last().unwrap();
+    assert!(bar.contains("aguardando outra instalação"), "{bar}");
+}
+
+#[test]
+fn queue_hint_shows_only_with_work() {
+    use wingetrs::tui::help::hints;
+    let idle = App::new(entries(), GlyphSet::Ascii);
+    assert!(!hints(&idle).contains(&("f", "fila")));
+    assert!(hints(&with_running()).contains(&("f", "fila")));
 }
 
 #[test]
@@ -294,7 +357,7 @@ fn residues_modal_snapshot() {
 
 #[test]
 fn modals_never_panic_on_tiny_terminals() {
-    for build in [with_confirm, with_picking, with_running, with_residues] {
+    for build in [with_confirm, with_picking, with_queue_modal, with_residues] {
         let a = build();
         assert!(a.modal.is_some());
         for (w, h) in [(1, 1), (20, 5), (10, 3), (59, 7), (60, 8), (200, 60)] {

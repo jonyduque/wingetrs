@@ -409,7 +409,8 @@ fn enter_on_confirm_runs_the_action() {
     update(&mut a, ready("ripgrep"));
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert_eq!(cmds, vec![Cmd::Execute(apply_action("ripgrep"))]);
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+    assert!(a.modal.is_none());
+    assert!(a.running.is_some());
 }
 
 #[test]
@@ -422,35 +423,12 @@ fn confirm_ignores_other_keys_and_ctrl_r() {
 }
 
 #[test]
-fn running_swallows_keys_and_shows_progress() {
-    let mut a = app();
-    update(&mut a, ready("ripgrep"));
-    update(&mut a, key(KeyCode::Enter));
-    assert!(update(&mut a, key(KeyCode::Esc)).is_empty());
-    assert!(update(&mut a, key(KeyCode::Char('q'))).is_empty());
-    assert!(update(&mut a, ctrl('c')).is_empty(), "no quit mid-install");
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
-    update(
-        &mut a,
-        Msg::InstallProgress {
-            label: "ripgrep.zip".into(),
-            done: 5,
-            total: Some(10),
-        },
-    );
-    let Some(Modal::Running { progress, .. }) = &a.modal else {
-        panic!("not running");
-    };
-    assert_eq!(progress.as_ref().unwrap().done, 5);
-}
-
-#[test]
 fn busy_shows_status_and_rescans() {
     let mut a = app();
     update(&mut a, ready("ripgrep"));
     update(&mut a, key(KeyCode::Enter));
     let cmds = update(&mut a, Msg::InstallFinished(Err(InstallFail::Busy)));
-    assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+    assert_eq!(cmds, vec![Cmd::ScanInstalled, Cmd::RetryQueue]);
     assert!(a.modal.is_none());
     assert_eq!(a.toasts[0].text, "outra instalação em andamento");
 }
@@ -499,9 +477,10 @@ fn residues_modal_cleans_only_the_checked_items() {
             residues: vec![residue("C:/a", true)]
         }]
     );
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
-    update(&mut a, Msg::ResiduesCleaned(vec![]));
     assert!(a.modal.is_none());
+    assert!(a.running.is_some());
+    update(&mut a, Msg::ResiduesCleaned(vec![]));
+    assert!(a.running.is_none());
 }
 
 #[test]
@@ -1573,7 +1552,7 @@ fn never_confirm_executes_directly() {
     let mut a = app();
     a.settings.behavior.confirm = ConfirmMode::Never;
     let cmds = update(&mut a, ready("a"));
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+    assert!(a.running.is_some());
     assert_eq!(cmds, vec![Cmd::Execute(apply_action("a"))]);
 }
 
@@ -1667,7 +1646,10 @@ fn high_residue_mode_cleans_only_preselected() {
         }),
         "{cmds:?}"
     );
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+    assert_eq!(
+        a.running.as_ref().map(|r| r.label.as_str()),
+        Some("Limpando resíduos de a")
+    );
 }
 
 #[test]
@@ -1741,7 +1723,7 @@ fn confirm_setting_is_taken_at_key_time() {
 }
 
 #[test]
-fn second_upgrade_while_running_does_nothing() {
+fn second_upgrade_while_running_plans_again() {
     let mut a = on_tab(
         Tab::Updates,
         vec![irow("a", "wingetrs", "scoop:main", true)],
@@ -1749,9 +1731,10 @@ fn second_upgrade_while_running_does_nothing() {
     a.settings.behavior.confirm = ConfirmMode::Never;
     assert_eq!(update(&mut a, key(KeyCode::Char('U'))).len(), 1);
     update(&mut a, ready("a"));
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
-    assert!(update(&mut a, key(KeyCode::Char('U'))).is_empty());
-    assert!(matches!(a.modal, Some(Modal::Running { .. })));
+    assert!(a.running.is_some());
+    // Running no longer blocks the screen: another plan may start.
+    assert_eq!(update(&mut a, key(KeyCode::Char('U'))).len(), 1);
+    assert!(a.modal.is_none());
 }
 
 #[test]
@@ -2562,10 +2545,7 @@ fn prefetch_skips_mapped_and_off() {
 
     let mut modal = app();
     modal.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
-    modal.modal = Some(Modal::Running {
-        label: "x".into(),
-        progress: None,
-    });
+    modal.modal = Some(Modal::Queue { selected: 0 });
     assert!(prefetches(&update(&mut modal, Msg::Resize(100, 40))).is_empty());
     // Closing it asks for the rows now in view.
     modal.modal = None;
@@ -3034,4 +3014,283 @@ fn every_setting_joins_save_coalescing() {
             "{id:?} did not revert"
         );
     }
+}
+
+// ---- operation queue (Task 96) ----
+
+fn finished(summary: &str) -> Msg {
+    Msg::InstallFinished(Ok(Done {
+        summary: summary.into(),
+        residues: None,
+    }))
+}
+
+fn queued_labels(a: &App) -> Vec<&str> {
+    a.queue.iter().map(|q| q.label.as_str()).collect()
+}
+
+fn running_label(a: &App) -> Option<&str> {
+    a.running.as_ref().map(|r| r.label.as_str())
+}
+
+fn executes(cmds: &[Cmd]) -> Vec<&Cmd> {
+    cmds.iter()
+        .filter(|c| matches!(c, Cmd::Execute(_)))
+        .collect()
+}
+
+/// Confirmation off: every ready plan goes straight to the queue.
+fn unconfirmed() -> App {
+    let mut a = app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    a
+}
+
+#[test]
+fn second_action_waits_in_queue() {
+    let mut a = app();
+    update(&mut a, ready("a"));
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::Execute(apply_action("a"))]
+    );
+    assert_eq!(running_label(&a), Some("Instalando a"));
+    assert!(a.modal.is_none());
+
+    update(&mut a, ready("b"));
+    assert!(confirm_open(&a));
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(executes(&cmds).is_empty(), "{cmds:?}");
+    assert_eq!(queued_labels(&a), ["Instalando b"]);
+    assert_eq!(a.toasts[0].text, "na fila: Instalando b (posição 1)");
+    assert_eq!(running_label(&a), Some("Instalando a"));
+
+    let cmds = update(&mut a, finished("Instalado: a"));
+    assert_eq!(executes(&cmds), [&Cmd::Execute(apply_action("b"))]);
+    assert!(cmds.contains(&Cmd::ScanInstalled), "{cmds:?}");
+    assert!(a.toasts.iter().any(|t| t.text == "Instalado: a"));
+    assert_eq!(running_label(&a), Some("Instalando b"));
+    assert!(a.queue.is_empty());
+}
+
+#[test]
+fn starting_at_once_shows_no_queue_toast() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    assert!(a.toasts.iter().all(|t| !t.text.starts_with("na fila")));
+}
+
+#[test]
+fn navigation_works_while_running() {
+    let mut a = unconfirmed();
+    a.size = (100, 30);
+    update(&mut a, ready("a"));
+    assert!(a.running.is_some());
+    assert!(a.modal.is_none());
+    let before = a.selected;
+    update(&mut a, key(KeyCode::Down));
+    assert_eq!(a.selected, before + 1);
+    update(&mut a, key(KeyCode::Tab));
+    assert_eq!(a.tab, Tab::Installed);
+    let r = regions(&a, screen(&a));
+    let (rect, tab) = r.tabs[0];
+    assert_eq!(tab, Tab::Search);
+    click_at(&mut a, Instant::now(), rect.x + rect.width / 2, rect.y + 1);
+    assert_eq!(a.tab, Tab::Search, "the mouse works while running");
+    update(&mut a, key(KeyCode::Char('z')));
+    assert_eq!(a.query, "z");
+    assert!(a.modal.is_none());
+    assert_eq!(running_label(&a), Some("Instalando a"));
+    update(
+        &mut a,
+        Msg::InstallProgress {
+            label: "a.zip".into(),
+            done: 5,
+            total: Some(10),
+        },
+    );
+    let progress = a.running.as_ref().and_then(|r| r.progress.as_ref());
+    assert_eq!(progress.map(|p| p.done), Some(5));
+}
+
+#[test]
+fn residues_dialog_pauses_the_queue() {
+    for close in [KeyCode::Esc, KeyCode::Enter] {
+        let mut a = unconfirmed();
+        a.settings.behavior.residues = ResidueMode::Ask;
+        update(
+            &mut a,
+            Msg::Planned(Ok(Planned::Ready {
+                text: "Remover a".into(),
+                action: removal("a"),
+            })),
+        );
+        assert_eq!(running_label(&a), Some("Removendo a"));
+        update(&mut a, ready("b"));
+        assert_eq!(queued_labels(&a), ["Instalando b"]);
+
+        let cmds = update(&mut a, removed_with_residues());
+        assert!(matches!(a.modal, Some(Modal::Residues { .. })));
+        assert!(executes(&cmds).is_empty(), "{cmds:?}");
+        assert!(a.running.is_none());
+        // Moving inside the dialog does not let the queue go on.
+        let cmds = update(&mut a, key(KeyCode::Down));
+        assert!(executes(&cmds).is_empty(), "{cmds:?}");
+        assert!(matches!(a.modal, Some(Modal::Residues { .. })));
+
+        let cmds = update(&mut a, key(close));
+        if close == KeyCode::Esc {
+            assert_eq!(cmds, vec![Cmd::Execute(apply_action("b"))]);
+        } else {
+            // The chosen cleanup runs first; the queue continues when it ends.
+            assert_eq!(
+                cmds,
+                vec![Cmd::CleanResidues {
+                    app: "a".into(),
+                    residues: vec![residue("p1", true)]
+                }]
+            );
+            assert_eq!(running_label(&a), Some("Limpando resíduos de a"));
+            let cmds = update(&mut a, Msg::ResiduesCleaned(vec![]));
+            assert_eq!(cmds, vec![Cmd::Execute(apply_action("b"))]);
+        }
+        assert!(a.modal.is_none());
+        assert_eq!(running_label(&a), Some("Instalando b"));
+    }
+}
+
+#[test]
+fn busy_requeues_at_front_and_retries() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    update(&mut a, ready("b"));
+    let cmds = update(&mut a, Msg::InstallFinished(Err(InstallFail::Busy)));
+    assert!(cmds.contains(&Cmd::RetryQueue), "{cmds:?}");
+    assert!(executes(&cmds).is_empty(), "{cmds:?}");
+    assert_eq!(queued_labels(&a), ["Instalando a", "Instalando b"]);
+    assert!(a.running.is_none());
+    assert_eq!(a.toasts[0].text, "outra instalação em andamento");
+    // Waiting for the lock: a new action does not jump ahead.
+    let cmds = update(&mut a, ready("c"));
+    assert!(executes(&cmds).is_empty(), "{cmds:?}");
+    assert_eq!(
+        update(&mut a, Msg::RetryQueue),
+        vec![Cmd::Execute(apply_action("a"))]
+    );
+    assert_eq!(queued_labels(&a), ["Instalando b", "Instalando c"]);
+}
+
+#[test]
+fn queue_modal_removes_pending() {
+    use wingetrs::tui::app::queue_rows;
+    let mut a = unconfirmed();
+    a.size = (100, 30);
+    for name in ["a", "b", "c"] {
+        update(&mut a, ready(name));
+    }
+    assert!(update(&mut a, key(KeyCode::Char('f'))).is_empty());
+    assert!(matches!(a.modal, Some(Modal::Queue { .. })));
+    let rows = queue_rows(&a);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].1.label, "em andamento: Instalando a");
+    assert!(!rows[0].1.selectable);
+    assert_eq!(rows[1].1.label, "Instalando b");
+    // The mouse is ignored under the queue dialog.
+    let r = regions(&a, screen(&a));
+    let (rect, _) = r.tabs[1];
+    click_at(&mut a, Instant::now(), rect.x + rect.width / 2, rect.y + 1);
+    assert_eq!(a.tab, Tab::Search);
+    // The cursor starts on the running line, which cannot be removed.
+    update(&mut a, key(KeyCode::Char('x')));
+    assert_eq!(queued_labels(&a), ["Instalando b", "Instalando c"]);
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Char('x')));
+    assert_eq!(queued_labels(&a), ["Instalando c"]);
+    assert_eq!(a.toasts[0].text, "removido da fila: Instalando b");
+    assert_eq!(running_label(&a), Some("Instalando a"));
+    update(&mut a, key(KeyCode::Delete));
+    assert!(a.queue.is_empty());
+    update(&mut a, key(KeyCode::Char('f')));
+    assert!(a.modal.is_none());
+}
+
+#[test]
+fn f_with_nothing_queued_says_so() {
+    let mut a = app();
+    update(&mut a, key(KeyCode::Char('f')));
+    assert!(a.modal.is_none());
+    assert_eq!(a.toasts[0].text, "fila vazia");
+    // With a query, `f` is text.
+    let mut t = unconfirmed();
+    update(&mut t, ready("a"));
+    update(&mut t, key(KeyCode::Char('r')));
+    update(&mut t, key(KeyCode::Char('f')));
+    assert_eq!(t.query, "rf");
+    assert!(t.modal.is_none());
+}
+
+#[test]
+fn quit_waits_for_running() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    update(&mut a, ready("b"));
+    assert!(update(&mut a, key(KeyCode::Char('q'))).is_empty());
+    let Some(Modal::Confirm { plan_text, .. }) = &a.modal else {
+        panic!("no quit dialog");
+    };
+    assert_eq!(
+        plan_text,
+        "Há 1 operações na fila e uma em andamento. Sair cancela as pendentes; a em andamento termina antes de fechar."
+    );
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(!cmds.contains(&Cmd::Quit), "{cmds:?}");
+    assert!(a.queue.is_empty());
+    assert!(a.modal.is_none());
+    let cmds = update(&mut a, finished("Instalado: a"));
+    assert!(cmds.contains(&Cmd::Quit), "{cmds:?}");
+    assert!(executes(&cmds).is_empty(), "{cmds:?}");
+}
+
+#[test]
+fn a_dialog_arriving_meanwhile_waits_for_the_open_one() {
+    let mut a = app();
+    a.settings.behavior.residues = ResidueMode::Ask;
+    update(&mut a, ready("a"));
+    update(&mut a, key(KeyCode::Enter));
+    // B's confirmation is on screen when A ends with residues.
+    update(&mut a, ready("b"));
+    assert!(confirm_open(&a));
+    let cmds = update(&mut a, removed_with_residues());
+    assert!(confirm_open(&a), "the residues dialog must not replace it");
+    assert!(executes(&cmds).is_empty(), "{cmds:?}");
+    // Confirming B queues it: the residues dialog still has to be answered first.
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(executes(&cmds).is_empty(), "{cmds:?}");
+    assert!(matches!(a.modal, Some(Modal::Residues { .. })));
+    assert_eq!(queued_labels(&a), ["Instalando b"]);
+    assert_eq!(
+        update(&mut a, key(KeyCode::Esc)),
+        vec![Cmd::Execute(apply_action("b"))]
+    );
+}
+
+#[test]
+fn esc_and_ctrl_c_also_ask_while_running() {
+    for quit in [KeyCode::Esc, KeyCode::Char('c')] {
+        let mut a = unconfirmed();
+        update(&mut a, ready("a"));
+        let msg = if quit == KeyCode::Esc {
+            key(quit)
+        } else {
+            ctrl('c')
+        };
+        assert!(update(&mut a, msg).is_empty());
+        assert!(confirm_open(&a));
+        // Esc on the dialog keeps everything running.
+        update(&mut a, key(KeyCode::Esc));
+        assert!(a.modal.is_none());
+        assert_eq!(running_label(&a), Some("Instalando a"));
+    }
+    let mut idle = app();
+    assert_eq!(update(&mut idle, key(KeyCode::Char('q'))), vec![Cmd::Quit]);
 }

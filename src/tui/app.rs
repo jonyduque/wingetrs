@@ -17,7 +17,7 @@ use crate::update::{Outcome, SourceReport};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,8 @@ pub enum Msg {
     },
     /// The operation ended (also on failure, so the installed list is rescanned).
     InstallFinished(Result<Done, InstallFail>),
+    /// `BUSY_RETRY` passed since another process held the lock: try the queue again.
+    RetryQueue,
     /// Residue cleanup ended; one message per item that failed.
     ResiduesCleaned(Vec<String>),
     /// Hits of the `Cmd::Search` with this generation; stale generations are dropped.
@@ -170,11 +172,35 @@ pub struct RunProgress {
     pub total: Option<u64>,
 }
 
+/// The operation in progress (an action, or the cleanup of residues).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Running {
+    pub id: u64,
+    pub label: String,
+    pub progress: Option<RunProgress>,
+    /// The action itself, put back in line when another process holds the lock;
+    /// `None` for a residue cleanup.
+    pub action: Option<Action>,
+}
+
+/// A confirmed action waiting for the one in progress.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Queued {
+    pub id: u64,
+    pub label: String,
+    pub action: Action,
+}
+
+/// Wait before trying the queue again after another process held `install.lock`.
+pub const BUSY_RETRY: Duration = Duration::from_secs(2);
+
 /// The dialog on top of the screen; it takes every key until it closes.
 pub enum Modal {
     Confirm {
         plan_text: String,
-        action: Action,
+        /// `None`: the quit confirmation (Enter drops the queue and quits once the
+        /// operation in progress ends).
+        action: Option<Action>,
     },
     Picking {
         picker: Picker,
@@ -191,15 +217,13 @@ pub enum Modal {
         /// Name to remove when wingetrs installed the app.
         remove: Option<String>,
     },
-    Running {
-        label: String,
-        progress: Option<RunProgress>,
-    },
     Residues {
         picker: Picker,
         app: String,
         residues: Vec<Residue>,
     },
+    /// The operation queue; `selected` is the id of the row under the cursor.
+    Queue { selected: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,6 +254,8 @@ pub enum Cmd {
         keep: bool,
     },
     Execute(Action),
+    /// Answer with `Msg::RetryQueue` after `BUSY_RETRY`.
+    RetryQueue,
     CleanResidues {
         app: String,
         residues: Vec<Residue>,
@@ -400,6 +426,17 @@ pub struct App {
     pub mouse_enabled: bool,
     /// Time, tab and index of the last left click, for the double click.
     last_click: Option<(Instant, Tab, usize)>,
+    /// The operation in progress; the screen stays usable meanwhile.
+    pub running: Option<Running>,
+    /// Confirmed actions waiting for `running`, in order.
+    pub queue: VecDeque<Queued>,
+    pub next_op_id: u64,
+    /// Another process held the lock: the queue waits for `Msg::RetryQueue`.
+    pub waiting_lock: bool,
+    /// Quit was confirmed with an operation in progress: quit when it ends.
+    pub quit_after_running: bool,
+    /// Dialogs that arrived while another was open; shown, in order, as it closes.
+    pending_modals: VecDeque<Modal>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -487,6 +524,12 @@ impl App {
             list_icons_in_flight: None,
             mouse_enabled: true,
             last_click: None,
+            running: None,
+            queue: VecDeque::new(),
+            next_op_id: 0,
+            waiting_lock: false,
+            quit_after_running: false,
+            pending_modals: VecDeque::new(),
         };
         app.research();
         app
@@ -738,7 +781,7 @@ impl App {
 
     /// True while something on screen animates the spinner.
     pub fn animating(&self) -> bool {
-        self.refreshing || self.details_pending.is_some()
+        self.refreshing || self.details_pending.is_some() || self.running.is_some()
     }
 
     /// Requests encoding the selected package's icon when its bytes are here and it is
@@ -1144,14 +1187,18 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::Planned(result) => on_planned(app, result),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
-            if let Some(Modal::Running { progress, .. }) = &mut app.modal {
-                *progress = Some(RunProgress { label, done, total });
+            if let Some(r) = &mut app.running {
+                r.progress = Some(RunProgress { label, done, total });
             }
             Vec::new()
         }
         Msg::InstallFinished(result) => on_finished(app, result),
+        Msg::RetryQueue => {
+            app.waiting_lock = false;
+            pump(app)
+        }
         Msg::ResiduesCleaned(errors) => {
-            app.modal = None;
+            app.running = None;
             if errors.is_empty() {
                 app.push_toast(ToastKind::Success, "Resíduos removidos");
             } else {
@@ -1160,7 +1207,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                     format!("Falha ao limpar resíduos: {}", errors.join("; ")),
                 );
             }
-            Vec::new()
+            pump(app)
         }
         Msg::RefreshFinished(reports) => {
             app.refreshing = false;
@@ -1266,7 +1313,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
-            KeyCode::Char('c') => vec![Cmd::Quit],
+            KeyCode::Char('c') => request_quit(app),
             KeyCode::Char('r') => {
                 app.refresh_forced = true;
                 vec![Cmd::Refresh { force: true }]
@@ -1329,7 +1376,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 app.query.clear();
                 app.view_changed()
             } else {
-                vec![Cmd::Quit]
+                request_quit(app)
             }
         }
         KeyCode::Char('i') if empty && app.tab == Tab::Search => install_selected(app),
@@ -1339,7 +1386,8 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             app.cycle_sort();
             app.details_cmd()
         }
-        KeyCode::Char('q') if empty => vec![Cmd::Quit],
+        KeyCode::Char('q') if empty => request_quit(app),
+        KeyCode::Char('f') if empty => open_queue(app),
         KeyCode::Char('?') if empty => {
             app.show_help = true;
             Vec::new()
@@ -1370,7 +1418,8 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Vec<Cmd>> {
         }
         KeyCode::Enter | KeyCode::Char(' ' | 'l') => change_setting(app, true),
         KeyCode::Char('h') => change_setting(app, false),
-        KeyCode::Char('q') => vec![Cmd::Quit],
+        KeyCode::Char('q') => request_quit(app),
+        KeyCode::Char('f') => open_queue(app),
         KeyCode::Char('?') => {
             app.show_help = true;
             Vec::new()
@@ -1615,13 +1664,162 @@ pub fn needs_confirm(mode: ConfirmMode, action: &Action) -> bool {
     }
 }
 
-/// Same path as Enter on the confirmation dialog.
-fn execute(app: &mut App, action: Action) -> Vec<Cmd> {
-    app.modal = Some(Modal::Running {
-        label: action.label(),
+impl App {
+    fn next_id(&mut self) -> u64 {
+        self.next_op_id += 1;
+        self.next_op_id
+    }
+}
+
+/// Shows `modal`, or keeps it for when the dialog on screen closes.
+fn open_modal(app: &mut App, modal: Modal) {
+    if app.modal.is_some() {
+        app.pending_modals.push_back(modal);
+    } else {
+        app.modal = Some(modal);
+    }
+}
+
+/// A residues dialog is open or waiting to be: the queue does not go on until it closes.
+fn residues_pending(app: &App) -> bool {
+    matches!(app.modal, Some(Modal::Residues { .. }))
+        || app
+            .pending_modals
+            .iter()
+            .any(|m| matches!(m, Modal::Residues { .. }))
+}
+
+fn can_start(app: &App) -> bool {
+    app.running.is_none() && !app.waiting_lock && !residues_pending(app)
+}
+
+fn start(app: &mut App, q: Queued) -> Vec<Cmd> {
+    app.running = Some(Running {
+        id: q.id,
+        label: q.label,
         progress: None,
+        action: Some(q.action.clone()),
     });
-    vec![Cmd::Execute(action)]
+    vec![Cmd::Execute(q.action)]
+}
+
+/// A confirmed action (Enter on the dialog, or no confirmation needed): starts now when
+/// nothing is in the way, else waits at the end of the queue.
+fn enqueue(app: &mut App, action: Action) -> Vec<Cmd> {
+    let q = Queued {
+        id: app.next_id(),
+        label: action.label(),
+        action,
+    };
+    if can_start(app) && app.queue.is_empty() {
+        return start(app, q);
+    }
+    let label = q.label.clone();
+    app.queue.push_back(q);
+    let n = app.queue.len();
+    app.push_toast(ToastKind::Info, format!("na fila: {label} (posição {n})"));
+    Vec::new()
+}
+
+/// Next step once the way may be clear: quit if asked to, else start the next in line.
+fn pump(app: &mut App) -> Vec<Cmd> {
+    if app.quit_after_running && app.running.is_none() {
+        return vec![Cmd::Quit];
+    }
+    if !can_start(app) {
+        return Vec::new();
+    }
+    match app.queue.pop_front() {
+        Some(q) => start(app, q),
+        None => Vec::new(),
+    }
+}
+
+/// `q`, `Esc` at the root or Ctrl+C: quit now, or ask first when work is in progress or queued.
+fn request_quit(app: &mut App) -> Vec<Cmd> {
+    if app.running.is_none() && app.queue.is_empty() {
+        return vec![Cmd::Quit];
+    }
+    let n = app.queue.len();
+    let plan_text = if app.running.is_some() {
+        format!(
+            "Há {n} operações na fila e uma em andamento. Sair cancela as pendentes; a em andamento termina antes de fechar."
+        )
+    } else {
+        format!("Há {n} operações na fila. Sair cancela as pendentes.")
+    };
+    app.modal = Some(Modal::Confirm {
+        plan_text,
+        action: None,
+    });
+    Vec::new()
+}
+
+/// Rows of the queue dialog with their op ids: the operation in progress (not selectable),
+/// then the queue in order.
+pub fn queue_rows(app: &App) -> Vec<(u64, PickerItem)> {
+    let row = |id: u64, label: String, selectable: bool| {
+        let item = PickerItem {
+            label,
+            detail: String::new(),
+            selectable,
+            note: None,
+        };
+        (id, item)
+    };
+    let running = app
+        .running
+        .iter()
+        .map(|r| row(r.id, format!("em andamento: {}", r.label), false));
+    let queued = app.queue.iter().map(|q| row(q.id, q.label.clone(), true));
+    running.chain(queued).collect()
+}
+
+/// `f`: the queue dialog, cursor on the first row.
+fn open_queue(app: &mut App) -> Vec<Cmd> {
+    match queue_rows(app).first() {
+        Some((id, _)) => app.modal = Some(Modal::Queue { selected: *id }),
+        None => app.push_toast(ToastKind::Info, "fila vazia"),
+    }
+    Vec::new()
+}
+
+/// Keys of the queue dialog; it stays open until `Esc` or `f`.
+fn queue_key(app: &mut App, selected: u64, key: KeyEvent) -> Vec<Cmd> {
+    let rows = queue_rows(app);
+    let at = rows.iter().position(|(id, _)| *id == selected).unwrap_or(0);
+    let (ids, items): (Vec<u64>, Vec<PickerItem>) = rows.into_iter().unzip();
+    let selected = match key.code {
+        KeyCode::Char('f') => return Vec::new(),
+        KeyCode::Delete | KeyCode::Char('x') => {
+            // Only pending rows are in the queue: the one in progress is never removed.
+            let Some(q) = app
+                .queue
+                .iter()
+                .position(|q| q.id == selected)
+                .and_then(|i| app.queue.remove(i))
+            else {
+                app.modal = Some(Modal::Queue { selected });
+                return Vec::new();
+            };
+            app.push_toast(ToastKind::Info, format!("removido da fila: {}", q.label));
+            // The cursor stays on the same line, now the next row.
+            let ids: Vec<u64> = queue_rows(app).into_iter().map(|(id, _)| id).collect();
+            match ids.get(at.min(ids.len().saturating_sub(1))) {
+                Some(&id) => id,
+                None => return Vec::new(),
+            }
+        }
+        _ => {
+            let mut picker = Picker::single_at(items, at);
+            if picker.key(key) == PickOutcome::Cancelled {
+                return Vec::new();
+            }
+            ids.get(picker.selected()).copied().unwrap_or(selected)
+        }
+    };
+    app.modal = Some(Modal::Queue { selected });
+    Vec::new()
 }
 
 fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
@@ -1634,20 +1832,27 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
     match result {
         Ok(Planned::Ready { text, action }) => {
             if !needs_confirm(confirm, &action) {
-                return execute(app, action);
+                return enqueue(app, action);
             }
-            app.modal = Some(Modal::Confirm {
-                plan_text: text,
-                action,
-            });
+            open_modal(
+                app,
+                Modal::Confirm {
+                    plan_text: text,
+                    action: Some(action),
+                },
+            );
         }
         Ok(Planned::Choose(candidates)) => {
             let items = candidates.iter().map(candidate_item).collect();
-            app.modal = Some(Modal::Picking {
-                picker: Picker::single(items),
-                candidates,
-                keep: app.planning_keep,
-            });
+            let keep = app.planning_keep;
+            open_modal(
+                app,
+                Modal::Picking {
+                    picker: Picker::single(items),
+                    candidates,
+                    keep,
+                },
+            );
         }
         Err(message) => app.push_toast(ToastKind::Error, message),
     }
@@ -1655,7 +1860,7 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
 }
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
-    app.modal = None;
+    let finished = app.running.take();
     // Success or not, the disk may have changed.
     let mut cmds = vec![Cmd::ScanInstalled];
     match result {
@@ -1669,10 +1874,37 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
         }
         Err(InstallFail::Busy) => {
             app.push_toast(ToastKind::Warning, "outra instalação em andamento");
+            // It never ran: first in line again, tried once the other process may be done.
+            if let Some(Running {
+                id,
+                label,
+                action: Some(action),
+                ..
+            }) = finished
+            {
+                app.queue.push_front(Queued { id, label, action });
+            }
+            app.waiting_lock = true;
+            cmds.push(Cmd::RetryQueue);
         }
         Err(InstallFail::Other(message)) => app.push_toast(ToastKind::Error, message),
     }
+    cmds.extend(pump(app));
     cmds
+}
+
+/// Runs the cleanup of `residues` as the operation in progress.
+fn start_cleanup(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<Cmd> {
+    app.running = Some(Running {
+        id: app.next_id(),
+        label: format!("Limpando resíduos de {name}"),
+        progress: None,
+        action: None,
+    });
+    vec![Cmd::CleanResidues {
+        app: name,
+        residues,
+    }]
 }
 
 /// Leftovers after a removal, per the `residues` setting.
@@ -1681,11 +1913,14 @@ fn handle_residues(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<C
     if mode == ResidueMode::Ask {
         let items: Vec<PickerItem> = residues.iter().map(residue_item).collect();
         let initial: Vec<bool> = residues.iter().map(|r| r.preselected).collect();
-        app.modal = Some(Modal::Residues {
-            picker: Picker::multi(items, &initial),
-            app: name,
-            residues,
-        });
+        open_modal(
+            app,
+            Modal::Residues {
+                picker: Picker::multi(items, &initial),
+                app: name,
+                residues,
+            },
+        );
         return Vec::new();
     }
     let n = residues.len();
@@ -1697,24 +1932,32 @@ fn handle_residues(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<C
         app.push_toast(ToastKind::Info, format!("resíduos mantidos: {n} itens"));
         return Vec::new();
     }
-    app.modal = Some(Modal::Running {
-        label: format!("Limpando resíduos de {name}"),
-        progress: None,
-    });
-    vec![Cmd::CleanResidues {
-        app: name,
-        residues: chosen,
-    }]
+    start_cleanup(app, name, chosen)
 }
 
 fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
-    let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+    let cmds = modal_key(app, key);
+    if app.modal.is_none() {
+        app.modal = app.pending_modals.pop_front();
+    }
+    cmds
+}
+
+fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     let Some(modal) = app.modal.take() else {
         return Vec::new();
     };
     match modal {
         Modal::Confirm { plan_text, action } => match key.code {
-            KeyCode::Enter => execute(app, action),
+            KeyCode::Enter => match action {
+                Some(action) => enqueue(app, action),
+                None => {
+                    // Quit: the pending ones are dropped, the one in progress is waited for.
+                    app.queue.clear();
+                    app.quit_after_running = true;
+                    pump(app)
+                }
+            },
             KeyCode::Esc => Vec::new(),
             _ => {
                 app.modal = Some(Modal::Confirm { plan_text, action });
@@ -1769,14 +2012,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 _ => Vec::new(),
             },
         },
-        Modal::Running { label, progress } => {
-            // The operation cannot be abandoned half-way: keys wait for it.
-            if ctrl_c {
-                app.push_toast(ToastKind::Info, "aguarde: operação em andamento");
-            }
-            app.modal = Some(Modal::Running { label, progress });
-            Vec::new()
-        }
+        Modal::Queue { selected } => queue_key(app, selected, key),
         Modal::Residues {
             mut picker,
             app: name,
@@ -1792,7 +2028,7 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             }
             PickOutcome::Cancelled => {
                 app.push_toast(ToastKind::Info, "resíduos mantidos");
-                Vec::new()
+                pump(app)
             }
             PickOutcome::Picked(chosen) => {
                 let selected: Vec<Residue> = chosen
@@ -1801,16 +2037,9 @@ fn on_modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     .collect();
                 if selected.is_empty() {
                     app.push_toast(ToastKind::Info, "resíduos mantidos");
-                    return Vec::new();
+                    return pump(app);
                 }
-                app.modal = Some(Modal::Running {
-                    label: format!("Limpando resíduos de {name}"),
-                    progress: None,
-                });
-                vec![Cmd::CleanResidues {
-                    app: name,
-                    residues: selected,
-                }]
+                start_cleanup(app, name, selected)
             }
         },
     }
