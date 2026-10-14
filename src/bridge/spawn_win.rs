@@ -89,8 +89,15 @@ pub fn run(
         on_line(&line);
         tail.add(line);
     }
-    let out_rest = join(&mut readers.out)?;
-    let err_rest = join(&mut readers.err)?;
+    let rests = join(&mut readers.out).and_then(|o| Ok((o, join(&mut readers.err)?)));
+    let (out_rest, err_rest) = match rests {
+        Ok(r) => r,
+        Err(e) => {
+            // Reap the tool before reporting; its own exit status is moot after a read error.
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     for line in [out_rest, err_rest].into_iter().flatten() {
         on_line(&line);
         tail.add(line);

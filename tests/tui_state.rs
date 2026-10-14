@@ -4230,3 +4230,34 @@ fn bridge_progress_shows_lines_then_waiting_after_ten_minutes() {
             .any(|t| t.kind == ToastKind::Error && t.text == "Git.Git: O instalador falhou.")
     );
 }
+
+#[test]
+fn marked_bridges_are_not_lost_silently_while_a_plan_is_in_flight() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            irow("beta", "wingetrs", "scoop:main", true),
+            irow("Git.Git", "arp", "winget", true),
+        ],
+    );
+    a.marks.insert(
+        Tab::Updates,
+        [
+            ("wingetrs".to_string(), "beta".to_string()),
+            ("arp".to_string(), "Git.Git".to_string()),
+        ]
+        .into(),
+    );
+    a.planning = true;
+    assert!(update(&mut a, key(KeyCode::Char('U'))).is_empty());
+    assert!(a.modal.is_none());
+    assert!(a.queue.is_empty());
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.text == "outro plano em andamento: lote não iniciado, tente de novo"),
+        "{:?}",
+        a.toasts
+    );
+    assert_eq!(a.marked_count(), 2, "marks stay for the retry");
+}

@@ -982,7 +982,7 @@ fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
         on_line("Baixando");
         Ok((0, vec!["Baixando".to_string()]))
     };
-    let done = jobs::run_bridge(&job, root, "pwsh", &mut exec, &mut |l: &str| {
+    let done = jobs::run_bridge(&job, Some(root), "pwsh", &mut exec, &mut |l: &str| {
         seen.push(l.to_string())
     })
     .unwrap();
@@ -1002,7 +1002,7 @@ fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
         Ok((-1978335212, vec!["Nenhum pacote".to_string()]))
     };
     assert_eq!(
-        jobs::run_bridge(&job, root, "pwsh", &mut not_found, &mut |_: &str| {}),
+        jobs::run_bridge(&job, Some(root), "pwsh", &mut not_found, &mut |_: &str| {}),
         Err(InstallFail::Other(
             "App Git.Git: O winget não encontrou este pacote instalado.".into()
         ))
@@ -1012,14 +1012,14 @@ fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
         Err(std::io::Error::from(std::io::ErrorKind::NotFound))
     };
     assert_eq!(
-        jobs::run_bridge(&job, root, "pwsh", &mut missing, &mut |_: &str| {}),
+        jobs::run_bridge(&job, Some(root), "pwsh", &mut missing, &mut |_: &str| {}),
         Err(InstallFail::Other(
             "App Git.Git: winget não encontrado".into()
         ))
     );
     let scoop = bridge_job(Tool::Scoop, "7zip");
     assert_eq!(
-        jobs::run_bridge(&scoop, root, "pwsh", &mut missing, &mut |_: &str| {}),
+        jobs::run_bridge(&scoop, Some(root), "pwsh", &mut missing, &mut |_: &str| {}),
         Err(InstallFail::Other("App 7zip: scoop não encontrado".into()))
     );
 }
@@ -1034,7 +1034,7 @@ fn run_bridge_refuses_an_invalid_target_before_running() {
     for target in ["-x", "a&b", r"..\x"] {
         let r = jobs::run_bridge(
             &bridge_job(Tool::Scoop, target),
-            Path::new("C:/s"),
+            Some(Path::new("C:/s")),
             "pwsh",
             &mut exec,
             &mut |_: &str| {},
@@ -1058,7 +1058,8 @@ fn run_bridge_scoop_compares_versions_read_around_the_run() {
         scoop_manifest(&root, "7zip", "2.0");
         Ok((0, Vec::new()))
     };
-    let done = jobs::run_bridge(&job, &root, "pwsh", &mut upgrades, &mut |_: &str| {}).unwrap();
+    let done =
+        jobs::run_bridge(&job, Some(&root), "pwsh", &mut upgrades, &mut |_: &str| {}).unwrap();
     assert_eq!(done.summary, "App 7zip: Atualizado para a versão 2.0.");
 
     // Exit 0, same version: not an upgrade, whatever the code says.
@@ -1066,7 +1067,7 @@ fn run_bridge_scoop_compares_versions_read_around_the_run() {
         Ok((0, vec!["7zip: 2.0 (latest version)".to_string()]))
     };
     assert_eq!(
-        jobs::run_bridge(&job, &root, "pwsh", &mut stays, &mut |_: &str| {}),
+        jobs::run_bridge(&job, Some(&root), "pwsh", &mut stays, &mut |_: &str| {}),
         Err(InstallFail::Other(
             "App 7zip: Já está na versão mais recente.".into()
         ))
@@ -1074,9 +1075,41 @@ fn run_bridge_scoop_compares_versions_read_around_the_run() {
 
     let mut fails = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| Ok((1, Vec::new()));
     assert_eq!(
-        jobs::run_bridge(&job, &root, "pwsh", &mut fails, &mut |_: &str| {}),
+        jobs::run_bridge(&job, Some(&root), "pwsh", &mut fails, &mut |_: &str| {}),
         Err(InstallFail::Other(
             "App 7zip: O scoop falhou (código 1).".into()
         ))
+    );
+}
+
+#[test]
+fn run_bridge_scoop_without_a_root_fails_before_running() {
+    let mut ran = false;
+    let mut exec = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        ran = true;
+        Ok((0, Vec::new()))
+    };
+    assert_eq!(
+        jobs::run_bridge(
+            &bridge_job(Tool::Scoop, "7zip"),
+            None,
+            "pwsh",
+            &mut exec,
+            &mut |_: &str| {}
+        ),
+        Err(InstallFail::Other("App 7zip: scoop não encontrado".into()))
+    );
+    assert!(!ran);
+    // winget needs no scoop root.
+    let mut ok = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| Ok((0, Vec::new()));
+    assert!(
+        jobs::run_bridge(
+            &bridge_job(Tool::Winget, "Git.Git"),
+            None,
+            "pwsh",
+            &mut ok,
+            &mut |_: &str| {}
+        )
+        .is_ok()
     );
 }

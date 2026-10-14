@@ -114,10 +114,7 @@ pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<S
             )
         }
         Tool::Scoop => {
-            let ps1 = scoop_ps1(scoop_root)
-                .display()
-                .to_string()
-                .replace('\'', "''");
+            let ps1 = ps_single_quoted(&scoop_ps1(scoop_root).display().to_string());
             let script = format!(
                 "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & '{ps1}' update {}; exit $LASTEXITCODE",
                 job.target
@@ -128,6 +125,19 @@ pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<S
             (pwsh.to_string(), args)
         }
     }
+}
+
+/// `s` escaped for a PowerShell single-quoted string: every quote PowerShell reads as `'`
+/// (ASCII and the typographic U+2018..U+201B) is doubled.
+fn ps_single_quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The command as the user reads it in the confirmation (arguments with spaces in quotes).

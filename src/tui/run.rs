@@ -1257,10 +1257,9 @@ fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
         let mut on_line = |line: &str| {
             let _ = tx.send(Msg::BridgeLine(line.to_string()));
         };
-        let root = c.scoop_root.clone().unwrap_or_default();
         Msg::InstallFinished(jobs::run_bridge(
             &job,
-            &root,
+            c.scoop_root.as_deref(),
             &c.pwsh,
             &mut run_tool,
             &mut on_line,

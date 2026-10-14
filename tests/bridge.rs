@@ -99,6 +99,15 @@ fn command_lines_match_the_probe() {
         "{script}"
     );
     assert!(script.ends_with("; exit $LASTEXITCODE"));
+    let typographic = Path::new("C:\\Users\\D\u{2019}Angelo \u{2018}x\u{201A}\u{201B}\\scoop");
+    let (_, args) = bridge::command(&job(Tool::Scoop, "7zip"), typographic, "pwsh");
+    assert!(
+        args[4].contains(
+            "& 'C:\\Users\\D\u{2019}\u{2019}Angelo \u{2018}\u{2018}x\u{201A}\u{201A}\u{201B}\u{201B}\\scoop\\apps"
+        ),
+        "{}",
+        args[4]
+    );
 }
 
 #[test]

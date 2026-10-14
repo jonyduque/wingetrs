@@ -2101,6 +2101,12 @@ fn start_batch(
         return confirm_batch(app, Vec::new(), Vec::new(), bridges, confirm, tab);
     }
     if app.planning {
+        if !bridges.is_empty() {
+            app.push_toast(
+                ToastKind::Warning,
+                "outro plano em andamento: lote não iniciado, tente de novo",
+            );
+        }
         return Vec::new();
     }
     let (labels, items): (Vec<String>, Vec<Cmd>) = items.into_iter().unzip();
