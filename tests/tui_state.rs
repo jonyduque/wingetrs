@@ -2471,3 +2471,37 @@ fn installed_view_sorted_by_state_timing() {
     t.sort();
     eprintln!("median installed_view(2000, State) = {:?}", t[100]);
 }
+
+#[test]
+fn sort_hint_shows_current_order() {
+    use wingetrs::tui::help::hints;
+    let mut a = on_tab(Tab::Installed, sort_rows());
+    let desc = |a: &App| hints(a).iter().find(|h| h.0 == "o").unwrap().1;
+    assert_eq!(desc(&a), "ordem: nome");
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(desc(&a), "ordem: fonte");
+    let mut u = on_tab(Tab::Updates, sort_rows());
+    for _ in 0..4 {
+        assert_ne!(desc(&u), "ordem: estado");
+        update(&mut u, key(KeyCode::Char('o')));
+    }
+}
+
+#[test]
+fn rescan_keeps_the_selected_item() {
+    let mut a = on_tab(Tab::Installed, sort_rows());
+    update(&mut a, key(KeyCode::Char('o')));
+    // By source: Bravo, charlie, alpha, delta.
+    a.selected = 1;
+    assert_eq!(a.selected_key().unwrap().1, "charlie");
+    let mut rows = sort_rows();
+    rows.push(srow(
+        "aaa",
+        "scoop",
+        Some("scoop:aaa"),
+        UpdateState::UpToDate,
+    ));
+    update(&mut a, Msg::InstalledLoaded(rows));
+    assert_eq!(a.selected_key().unwrap().1, "charlie");
+    assert_eq!(a.selected, 2);
+}

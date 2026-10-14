@@ -1,10 +1,18 @@
 //! Contextual key hints for the bottom help bar.
-use crate::tui::app::{App, Tab, ToastKind};
+use crate::tui::app::{App, SortKey, Tab, ToastKind};
 use crate::tui::theme::Theme;
 use ratatui::text::{Line, Span};
 
 const SEP: &str = " • ";
 const ELLIPSIS: &str = " …";
+
+fn sort_hint(app: &App) -> &'static str {
+    match app.sort_key() {
+        SortKey::Name => "ordem: nome",
+        SortKey::Source => "ordem: fonte",
+        SortKey::State => "ordem: estado",
+    }
+}
 
 /// Key hints for the current tab and focus, most useful first, `?` last.
 pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
@@ -26,11 +34,11 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Installed => {
             out.push(("enter", "ações"));
             out.push(("u", "remover"));
-            out.push(("o", "ordem: nome|fonte|estado"));
+            out.push(("o", sort_hint(app)));
         }
         Tab::Updates => {
             out.push(("enter", "atualizar"));
-            out.push(("o", "ordem: nome|fonte|estado"));
+            out.push(("o", sort_hint(app)));
         }
         Tab::Settings => {}
     }

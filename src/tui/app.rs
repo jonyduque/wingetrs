@@ -554,10 +554,7 @@ impl App {
 
     /// Next order in the cycle (`o`); the same item stays selected, or 0 if it vanished.
     fn cycle_sort(&mut self) {
-        let kept = self
-            .installed_view()
-            .get(self.selected)
-            .map(|r| (r.name.clone(), r.origin.clone()));
+        let kept = self.selected_ident();
         if self.tab == Tab::Updates {
             self.sort_updates = match self.sort_updates {
                 SortKey::Name => SortKey::Source,
@@ -570,14 +567,26 @@ impl App {
                 SortKey::State => SortKey::Name,
             };
         }
-        self.selected = kept
-            .and_then(|(n, o)| {
-                self.installed_view()
-                    .iter()
-                    .position(|r| r.name == n && r.origin == o)
-            })
-            .unwrap_or(0);
+        self.selected = self.position_of(kept).unwrap_or(0);
         self.clamp();
+    }
+
+    /// `name` + `origin` of the selected Installed/Updates row.
+    fn selected_ident(&self) -> Option<(String, String)> {
+        if !matches!(self.tab, Tab::Installed | Tab::Updates) {
+            return None;
+        }
+        self.installed_view()
+            .get(self.selected)
+            .map(|r| (r.name.clone(), r.origin.clone()))
+    }
+
+    /// Where the row identified by `ident` sits in the current view.
+    fn position_of(&self, ident: Option<(String, String)>) -> Option<usize> {
+        let (n, o) = ident?;
+        self.installed_view()
+            .iter()
+            .position(|r| r.name == n && r.origin == o)
     }
 
     /// Rows visible in the current tab after filters.
@@ -913,7 +922,11 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             cmds
         }
         Msg::InstalledLoaded(rows) => {
+            let kept = app.selected_ident();
             app.installed = rows;
+            if let Some(i) = app.position_of(kept) {
+                app.selected = i;
+            }
             app.clamp();
             app.details_cmd()
         }
