@@ -495,16 +495,19 @@ fn list_lines<'a>(
         }
         spans
     };
+    // With a visible mark in the tab every row gets the column (on both lines), so the
+    // names stay aligned.
+    let mark_col = app.has_visible_mark();
+    let mark_w = Span::raw(g.mark).width() + 1;
     let second = |sel: bool, text: String| -> Line<'a> {
-        let room = width.saturating_sub(4);
+        let indent = if mark_col { mark_w } else { 0 };
+        let room = width.saturating_sub(4 + indent);
         Line::from(vec![
             bar(sel),
-            Span::raw("  "),
+            Span::raw(" ".repeat(2 + indent)),
             Span::styled(clip(&text, room), desc_style(sel)),
         ])
     };
-    // With any mark in the tab every row gets the column, so the names stay aligned.
-    let mark_col = app.marked_count() > 0;
     let mark = |key: (String, String)| -> Option<Span<'a>> {
         if !mark_col {
             return None;
@@ -512,7 +515,7 @@ fn list_lines<'a>(
         Some(if app.is_marked(&key) {
             Span::styled(format!("{} ", g.mark), theme.ok())
         } else {
-            Span::raw(" ".repeat(Span::raw(g.mark).width() + 1))
+            Span::raw(" ".repeat(mark_w))
         })
     };
     let mut items: Vec<[Line<'a>; ITEM_ROWS]> = Vec::new();

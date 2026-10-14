@@ -1882,3 +1882,60 @@ fn space_toggles_mark_and_glyph() {
     assert!(!cleared.contains(glyph), "{cleared}");
     assert!(!cleared.contains("marcados"), "{cleared}");
 }
+
+#[test]
+fn mark_column_aligns_both_lines() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut a = App::new(entries(), GlyphSet::Unicode);
+    let col = |s: &str, needle: &str| {
+        s.lines()
+            .find(|l| l.contains(needle))
+            .and_then(|l| l.find(needle))
+            .map(|i| l_chars(s, needle, i))
+    };
+    fn l_chars(s: &str, needle: &str, byte: usize) -> usize {
+        let line = s.lines().find(|l| l.contains(needle)).unwrap();
+        line[..byte].chars().count()
+    }
+    let before = render(&a, 100, 24);
+    let (n0, d0) = (
+        col(&before, "PowerToys").unwrap(),
+        col(&before, "Utilit").unwrap(),
+    );
+    update(
+        &mut a,
+        Msg::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+    );
+    let after = render(&a, 100, 24);
+    let (n1, d1) = (
+        col(&after, "PowerToys").unwrap(),
+        col(&after, "Utilit").unwrap(),
+    );
+    assert_eq!(
+        n1 - n0,
+        d1 - d0,
+        "both lines shift together:
+{after}"
+    );
+    assert!(n1 > n0, "{after}");
+    // A mark hidden by the query leaves no column.
+    for c in "zzz".chars() {
+        let cmds = update(
+            &mut a,
+            Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        );
+        for cmd in cmds {
+            if let Cmd::Search {
+                generation,
+                query,
+                kind,
+            } = cmd
+            {
+                let hits = run_search(&a.search, &query, kind);
+                update(&mut a, Msg::SearchDone { generation, hits });
+            }
+        }
+    }
+    assert_eq!(a.marked_count(), 1);
+    assert!(!a.has_visible_mark());
+}

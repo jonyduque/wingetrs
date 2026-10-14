@@ -754,6 +754,12 @@ impl App {
         self.marks.get(&self.tab).map_or(0, HashSet::len)
     }
 
+    /// A marked row is among the rows the tab shows now (marks hidden by the query or the
+    /// filter do not count).
+    pub fn has_visible_mark(&self) -> bool {
+        self.marked_count() > 0 && self.view_keys().iter().any(|k| self.is_marked(k))
+    }
+
     /// Whether the row `key` of the current tab is marked.
     pub fn is_marked(&self, key: &RowKey) -> bool {
         self.marks.get(&self.tab).is_some_and(|m| m.contains(key))
