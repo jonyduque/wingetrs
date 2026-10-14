@@ -4,13 +4,15 @@ use crate::catalog::Catalog;
 use crate::catalog::search::SearchIndex;
 use crate::config::Config;
 use crate::core::SourceKind;
-use crate::http::Http;
+use crate::http::{Http, HttpError};
 use crate::install::ops::OpsCtx;
 use crate::install::residue::Residue;
 use crate::installed::correlate::correlate;
 use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
-use crate::tui::app::{Action, App, Cmd, InstallFail, Msg, Planned, run_search, update};
+use crate::tui::app::{
+    Action, App, Cmd, IconOutcome, InstallFail, Msg, Planned, run_search, update,
+};
 use crate::tui::jobs;
 use crate::tui::settings::SettingsState;
 use crate::tui::theme::{ColorDepth, GlyphSet, Theme, detect_depth};
@@ -21,7 +23,7 @@ use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -741,9 +743,15 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
             let (ctx, key) = (Arc::clone(&ctx), key.clone());
             let (source, id) = (source.clone(), id.clone());
             async move {
-                let result = load_details(&ctx, &source, &id)
-                    .await
-                    .map_err(|e| format!("{e:#}"));
+                let result = load_details(&ctx, &source, &id).await;
+                if let Err(e) = &result {
+                    let outcome = details_outcome(e);
+                    let _ = ctx.tx.send(Msg::PrefetchDone {
+                        key: key.clone(),
+                        outcome,
+                    });
+                }
+                let result = result.map_err(|e| format!("{e:#}"));
                 Msg::DetailsLoaded { key, result }
             }
         });
@@ -755,18 +763,22 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
         // Details first; the icon (and the Scoop twin search) comes afterwards so a slow
         // host never delays them.
         let _ = ctx.tx.send(msg);
-        let icon = match &details {
-            Some(d) => icon_ref(&ctx, &source, &id, d).await,
-            None => None,
+        let Some(details) = details else { return };
+        let outcome = match details_icon(&ctx, &source, &id, &details).await {
+            Ok((icon, bytes)) => {
+                let _ = ctx.tx.send(Msg::IconMapped {
+                    key: key.clone(),
+                    sha: icon.sha256,
+                });
+                let _ = ctx.tx.send(Msg::IconLoaded {
+                    key: key.clone(),
+                    bytes,
+                });
+                IconOutcome::Found
+            }
+            Err(outcome) => outcome,
         };
-        let icon_sha = icon.as_ref().map(|i| i.sha256.clone()).unwrap_or_default();
-        if let Some(bytes) = load_icon(&ctx, &source, &id, icon.as_ref()).await {
-            let _ = ctx.tx.send(Msg::IconMapped {
-                key: key.clone(),
-                sha: icon_sha,
-            });
-            let _ = ctx.tx.send(Msg::IconLoaded { key, bytes });
-        }
+        let _ = ctx.tx.send(Msg::PrefetchDone { key, outcome });
     });
 }
 
@@ -782,9 +794,9 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) 
                 let fetch = |source: String, id: String| {
                     let ctx = Arc::clone(&ctx);
                     async move {
-                        prefetch_one(&ctx, &source, &id).await;
+                        let outcome = prefetch_one(&ctx, &source, &id).await;
                         let key = format!("{source}/{id}");
-                        let _ = ctx.tx.send(Msg::PrefetchDone { key });
+                        let _ = ctx.tx.send(Msg::PrefetchDone { key, outcome });
                     }
                 };
                 prefetch_list(
@@ -810,22 +822,67 @@ fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) 
 }
 
 /// Details, then icon, of one list package; announces the icon when it was obtained.
-async fn prefetch_one(ctx: &Ctx, source: &str, id: &str) {
-    let icon = match load_details(ctx, source, id).await {
-        Ok(d) => icon_ref(ctx, source, id, &d).await,
+async fn prefetch_one(ctx: &Ctx, source: &str, id: &str) -> IconOutcome {
+    let details = match load_details(ctx, source, id).await {
+        Ok(d) => d,
         Err(e) => {
             tracing::debug!(%source, %id, error = %e, "list details not loaded");
-            return;
+            return details_outcome(&e);
         }
     };
-    if load_icon(ctx, source, id, icon.as_ref()).await.is_some()
-        && let Some(icon) = icon
-    {
-        let _ = ctx.tx.send(Msg::IconMapped {
-            key: format!("{source}/{id}"),
-            sha: icon.sha256,
-        });
+    match details_icon(ctx, source, id, &details).await {
+        Ok((icon, _)) => {
+            let _ = ctx.tx.send(Msg::IconMapped {
+                key: format!("{source}/{id}"),
+                sha: icon.sha256,
+            });
+            IconOutcome::Found
+        }
+        Err(outcome) => outcome,
     }
+}
+
+/// How an HTTP failure ends an icon attempt: offline or a server error may pass.
+fn http_outcome(e: &HttpError) -> IconOutcome {
+    match e {
+        _ if e.is_offline() => IconOutcome::Retry,
+        HttpError::Status(s) if *s >= 500 => IconOutcome::Retry,
+        _ => IconOutcome::Absent,
+    }
+}
+
+/// How a failed details load ends an icon attempt: `Retry` when an `HttpError` that may
+/// pass is anywhere in the chain (also behind the transparent `WingetError::Http`).
+pub fn details_outcome(e: &anyhow::Error) -> IconOutcome {
+    for cause in e.chain() {
+        let http =
+            cause.downcast_ref::<HttpError>().or_else(|| match cause
+                .downcast_ref::<crate::sources::winget::WingetError>(
+            ) {
+                Some(crate::sources::winget::WingetError::Http(h)) => Some(h),
+                _ => None,
+            });
+        if let Some(h) = http {
+            return http_outcome(h);
+        }
+    }
+    IconOutcome::Absent
+}
+
+/// Icon bytes by content hash (blob store, else downloaded), or how the attempt ended.
+pub async fn fetch_icon(
+    http: &Http,
+    blobs: &BlobStore,
+    icon: &crate::core::IconRef,
+) -> Result<Vec<u8>, IconOutcome> {
+    use crate::icons::IconError;
+    crate::icons::fetch(http, blobs, icon)
+        .await
+        .map_err(|e| match &e {
+            IconError::Http(h) => http_outcome(h),
+            IconError::TooLarge | IconError::Integrity => IconOutcome::Absent,
+            IconError::Cache(_) => IconOutcome::Retry,
+        })
 }
 
 /// True while `mine` is still the newest list prefetch.
@@ -911,23 +968,24 @@ impl Drop for RunningKey {
     }
 }
 
-/// Icon bytes for the details; any failure is only logged, never an error of the details.
-async fn load_icon(
+/// The icon of a package whose details loaded, remembered in `icons.json`; a failure is
+/// only logged, never an error of the details.
+async fn details_icon(
     ctx: &Ctx,
     source: &str,
     id: &str,
-    icon: Option<&crate::core::IconRef>,
-) -> Option<Vec<u8>> {
-    let icon = icon?;
+    d: &crate::core::PackageDetails,
+) -> Result<(crate::core::IconRef, Vec<u8>), IconOutcome> {
+    let icon = icon_ref(ctx, source, id, d).await?;
     let blobs = BlobStore::new(ctx.data.blobs_dir());
-    match crate::icons::fetch(&ctx.http, &blobs, icon).await {
+    match fetch_icon(&ctx.http, &blobs, &icon).await {
         Ok(bytes) => {
             crate::icons::remember(&ctx.data, source, id, &icon.sha256);
-            Some(bytes)
+            Ok((icon, bytes))
         }
-        Err(e) => {
-            tracing::debug!(%source, %id, error = %e, "icon not loaded");
-            None
+        Err(outcome) => {
+            tracing::debug!(%source, %id, ?outcome, "icon not loaded");
+            Err(outcome)
         }
     }
 }
@@ -989,17 +1047,28 @@ async fn icon_ref(
     source: &str,
     id: &str,
     d: &crate::core::PackageDetails,
-) -> Option<crate::core::IconRef> {
+) -> Result<crate::core::IconRef, IconOutcome> {
     if source == "winget" {
-        return d.icon.clone();
+        return own_icon(d);
     }
-    let home = d.homepage.as_deref()?;
+    let Some(home) = d.homepage.as_deref() else {
+        return Err(IconOutcome::Absent);
+    };
     twin_icon(ctx, id, home).await
 }
 
+/// The icon a winget manifest declares; `Absent` when it declares none.
+pub fn own_icon(d: &crate::core::PackageDetails) -> Result<crate::core::IconRef, IconOutcome> {
+    d.icon.clone().ok_or(IconOutcome::Absent)
+}
+
 /// Icon of the winget package that is the same app as a Scoop one: named alike and with the
-/// same homepage site, exactly one. Any failure only means "no twin".
-async fn twin_icon(ctx: &Ctx, scoop_app: &str, homepage: &str) -> Option<crate::core::IconRef> {
+/// same homepage site, exactly one. A failure means "no twin", unless it may pass.
+async fn twin_icon(
+    ctx: &Ctx,
+    scoop_app: &str,
+    homepage: &str,
+) -> Result<crate::core::IconRef, IconOutcome> {
     let (data_path, name) = (ctx.data.catalog_path(), scoop_app.to_owned());
     let read = tokio::task::spawn_blocking(move || {
         let catalog = jobs::open_catalog_for_reading(&data_path)?;
@@ -1015,26 +1084,53 @@ async fn twin_icon(ctx: &Ctx, scoop_app: &str, homepage: &str) -> Option<crate::
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             tracing::debug!(app = %scoop_app, error = %e, "winget candidates not read");
-            return None;
+            return Err(IconOutcome::Absent);
         }
         Err(e) => match e.try_into_panic() {
             Ok(p) => std::panic::resume_unwind(p),
             Err(e) => {
                 tracing::debug!(error = %e, "winget candidates cancelled");
-                return None;
+                return Err(IconOutcome::Retry);
             }
         },
     };
-    crate::sources::scoop::winget_match::twin_from(&pkgs, homepage, |pkg| async move {
-        match winget_details(ctx, pkg).await {
-            Ok(d) => Some(d),
-            Err(e) => {
-                tracing::debug!(id = %pkg.entry.id, error = %e, "twin details not loaded");
-                None
+    twin_icon_from(&pkgs, homepage, |pkg| winget_details(ctx, pkg)).await
+}
+
+/// The twin's icon among the winget `pkgs` named like a Scoop app, `load` giving each one's
+/// details. A candidate whose details failed in a way that may pass makes a missing twin
+/// `Retry`: that candidate might have been it.
+pub async fn twin_icon_from<'a, F, Fut>(
+    pkgs: &'a [crate::catalog::StoredPackage],
+    homepage: &str,
+    load: F,
+) -> Result<crate::core::IconRef, IconOutcome>
+where
+    F: Fn(&'a crate::catalog::StoredPackage) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<crate::core::PackageDetails>>,
+{
+    let retry = AtomicBool::new(false);
+    let twin = crate::sources::scoop::winget_match::twin_from(pkgs, homepage, |pkg| {
+        let (details, retry) = (load(pkg), &retry);
+        async move {
+            match details.await {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::debug!(id = %pkg.entry.id, error = %e, "twin details not loaded");
+                    if details_outcome(&e) == IconOutcome::Retry {
+                        retry.store(true, Ordering::SeqCst);
+                    }
+                    None
+                }
             }
         }
     })
-    .await
+    .await;
+    match twin {
+        Some(icon) => Ok(icon),
+        None if retry.load(Ordering::SeqCst) => Err(IconOutcome::Retry),
+        None => Err(IconOutcome::Absent),
+    }
 }
 
 #[cfg(windows)]

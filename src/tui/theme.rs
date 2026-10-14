@@ -45,6 +45,8 @@ pub struct Glyphs {
     pub toast_info: &'static str,
     pub toast_warn: &'static str,
     pub toast_err: &'static str,
+    /// Drawn in the icon's place for a package known to have none.
+    pub no_icon: &'static str,
 }
 
 const BRAILLE: &[&str] = &["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
@@ -77,6 +79,7 @@ static NERD: Glyphs = Glyphs {
     toast_info: "\u{f05a}",
     toast_warn: "\u{f071}",
     toast_err: "\u{f057}",
+    no_icon: "\u{f03d7}",
 };
 
 static UNICODE: Glyphs = Glyphs {
@@ -106,6 +109,7 @@ static UNICODE: Glyphs = Glyphs {
     toast_info: "ℹ",
     toast_warn: "⚠",
     toast_err: "✗",
+    no_icon: "▢",
 };
 
 static ASCII: Glyphs = Glyphs {
@@ -135,6 +139,7 @@ static ASCII: Glyphs = Glyphs {
     toast_info: "i",
     toast_warn: "!",
     toast_err: "x",
+    no_icon: "[ ]",
 };
 
 impl Glyphs {

@@ -817,3 +817,103 @@ mod prefetch {
         assert_eq!(left, vec!["winget/k1".to_string()]);
     }
 }
+
+fn twin_candidate(id: &str) -> wingetrs::catalog::StoredPackage {
+    wingetrs::catalog::StoredPackage {
+        entry: wingetrs::core::PackageEntry {
+            source: SourceKind::Winget,
+            source_name: "winget".into(),
+            id: id.into(),
+            name: id.into(),
+            moniker: None,
+            version: "1".into(),
+            publisher: None,
+            description: None,
+            tags: Vec::new(),
+            commands: Vec::new(),
+        },
+        arp_min_version: None,
+        arp_max_version: None,
+        winget_hash: Some(vec![7; 32]),
+        raw: None,
+    }
+}
+
+#[tokio::test]
+async fn offline_is_retry_not_absent() {
+    use wingetrs::cache::BlobStore;
+    use wingetrs::core::{IconRef, PackageDetails};
+    use wingetrs::tui::app::IconOutcome;
+    use wingetrs::tui::run::{fetch_icon, own_icon, twin_icon_from};
+    let dir = TempDir::new().unwrap();
+    let blobs = BlobStore::new(dir.path().join("blobs"));
+    let http = Http::new().unwrap();
+    // Bound then dropped: nothing listens there, so the connection is refused.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/", l.local_addr().unwrap())
+    };
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/gone.png"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let icon = |url: String| IconRef {
+        url,
+        sha256: "ab".repeat(32),
+    };
+
+    // Details loaded, the icon host refuses the connection.
+    let got = fetch_icon(&http, &blobs, &icon(format!("{closed}i.png"))).await;
+    assert_eq!(got.err(), Some(IconOutcome::Retry));
+    // The icon is gone from its host.
+    let got = fetch_icon(&http, &blobs, &icon(format!("{}/gone.png", server.uri()))).await;
+    assert_eq!(got.err(), Some(IconOutcome::Absent));
+    // A manifest without `Icons`.
+    let bare = PackageDetails {
+        source: SourceKind::Winget,
+        id: "Acme.Tool".into(),
+        name: "Tool".into(),
+        version: "1".into(),
+        publisher: None,
+        description: None,
+        homepage: Some("https://acme.org".into()),
+        license: None,
+        tags: Vec::new(),
+        installers: Vec::new(),
+        available_versions: Vec::new(),
+        icon: None,
+    };
+    assert_eq!(own_icon(&bare).err(), Some(IconOutcome::Absent));
+
+    // Scoop: the twin candidate's details fail on the connection, or with a 404.
+    let twin = |base: String| {
+        let (http, blobs) = (&http, &blobs);
+        async move {
+            let pkgs = [twin_candidate("Acme.Tool")];
+            twin_icon_from(&pkgs, "https://acme.org", |p| {
+                let base = base.clone();
+                async move {
+                    let hash = p.winget_hash.clone().unwrap_or_default();
+                    Ok(wingetrs::sources::winget::details::details(
+                        http,
+                        blobs,
+                        &base,
+                        &p.entry.id,
+                        &hash,
+                        None,
+                    )
+                    .await?)
+                }
+            })
+            .await
+            .err()
+        }
+    };
+    assert_eq!(twin(closed.clone()).await, Some(IconOutcome::Retry));
+    assert_eq!(
+        twin(format!("{}/", server.uri())).await,
+        Some(IconOutcome::Absent)
+    );
+}

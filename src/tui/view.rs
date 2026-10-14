@@ -17,7 +17,7 @@ use crate::tui::theme::{Glyphs, Theme};
 use crate::tui::toast::draw_toasts;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
@@ -647,18 +647,35 @@ fn draw_list<'a>(
     }
     let size = (LIST_ICON_COLS, ITEM_ROWS as u16);
     let mut places = Vec::new();
-    for (n, key) in app.list_keys(window).into_iter().enumerate() {
-        let Some((source, id)) = key else { continue };
-        let Some(proto) = app.icons.get(&format!("{source}/{id}"), size) else {
-            continue;
-        };
+    let keys = app.list_keys(window.clone());
+    for (n, (key, placeholder)) in keys
+        .into_iter()
+        .zip(app.list_placeholders(window))
+        .enumerate()
+    {
         let y = usize::from(inner.y) + n * per_item;
         let rect = Rect::new(inner.x, y as u16, size.0, size.1);
-        if rect.bottom() <= inner.bottom() {
-            places.push((rect, proto));
+        if rect.bottom() > inner.bottom() {
+            continue;
+        }
+        let proto = key.and_then(|(source, id)| app.icons.get(&format!("{source}/{id}"), size));
+        match proto {
+            Some(proto) => places.push((rect, proto)),
+            None if placeholder => draw_no_icon(theme, g, frame, rect),
+            None => {}
         }
     }
     places
+}
+
+/// The no-icon placeholder, centred in the icon's rectangle: text, never an encoded image.
+fn draw_no_icon(theme: &Theme, g: &Glyphs, frame: &mut Frame, rect: Rect) {
+    if rect.height == 0 {
+        return;
+    }
+    let row = Rect::new(rect.x, rect.y + (rect.height - 1) / 2, rect.width, 1);
+    let glyph = Paragraph::new(Span::styled(g.no_icon, theme.muted())).alignment(Alignment::Center);
+    frame.render_widget(glyph, row);
 }
 
 /// `area` without its `cols` leftmost columns.
@@ -914,9 +931,15 @@ fn draw_details<'a>(
 ) -> Option<(Rect, &'a Protocol)> {
     let (mut lines, identity) = details_lines(app, theme, g);
     // Guard: the narrowest details pane drawn today (60-column terminal) is 23 columns.
-    let icon = selected_icon(app).filter(|_| {
-        area.width >= DETAIL_ICON_COLS + DETAIL_ICON_GAP + 10 && area.height >= DETAIL_ICON_ROWS
-    });
+    let fits =
+        area.width >= DETAIL_ICON_COLS + DETAIL_ICON_GAP + 10 && area.height >= DETAIL_ICON_ROWS;
+    // `None` inside: the no-icon placeholder goes in the icon's place.
+    let icon = match selected_icon(app) {
+        _ if !fits => None,
+        Some(proto) => Some(Some(proto)),
+        None if icon_visible(app) && app.selected_placeholder() => Some(None),
+        None => None,
+    };
     let Some(proto) = icon else {
         let p = Paragraph::new(lines).wrap(Wrap { trim: true });
         frame.render_widget(p, area);
@@ -942,7 +965,13 @@ fn draw_details<'a>(
         area.height - DETAIL_ICON_ROWS,
     );
     frame.render_widget(Paragraph::new(rest).wrap(Wrap { trim: true }), below);
-    Some((icon_rect, proto))
+    match proto {
+        Some(proto) => Some((icon_rect, proto)),
+        None => {
+            draw_no_icon(theme, g, frame, icon_rect);
+            None
+        }
+    }
 }
 
 /// A bar row with `BAR_PAD_X` of margin on both sides.

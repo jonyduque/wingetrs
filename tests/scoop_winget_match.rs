@@ -191,8 +191,12 @@ fn details_are_sent_before_the_twin_search() {
     let from = src.find("fn spawn_details").unwrap();
     let body = &src[from..from + src[from..].find("/// Debounced fetch").unwrap()];
     let sent = body.find("ctx.tx.send(msg)").unwrap();
-    let twin = body.find("icon_ref(").unwrap();
+    // `details_icon` is where the twin search (`icon_ref`) starts.
+    let twin = body.find("details_icon(").unwrap();
     assert!(sent < twin, "{body}");
+    let icon = src.find("async fn details_icon").unwrap();
+    let icon_body = &src[icon..icon + src[icon..].find("async fn load_details").unwrap()];
+    assert!(icon_body.contains("icon_ref("), "{icon_body}");
     let load = src.find("async fn load_details").unwrap();
     let load_body = &src[load..load + src[load..].find("async fn winget_details").unwrap()];
     assert!(!load_body.contains("twin_icon"), "{load_body}");

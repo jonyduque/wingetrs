@@ -2608,12 +2608,63 @@ fn icon_mapped_encodes_the_visible_row() {
 }
 
 fn done(a: &mut App, (s, id): &(String, String)) -> Vec<Cmd> {
+    ended(a, (s, id), wingetrs::tui::app::IconOutcome::Found)
+}
+
+fn ended(
+    a: &mut App,
+    (s, id): (&String, &String),
+    outcome: wingetrs::tui::app::IconOutcome,
+) -> Vec<Cmd> {
     update(
         a,
         Msg::PrefetchDone {
             key: format!("{s}/{id}"),
+            outcome,
         },
     )
+}
+
+/// Every `PrefetchIcons` key asked while scrolling the first row out and back in.
+fn asked_after_round_trip(a: &mut App) -> Vec<(String, String)> {
+    let mut got = Vec::new();
+    for _ in 0..10 {
+        got.extend(prefetches(&update(a, key(KeyCode::Down))));
+    }
+    for _ in 0..10 {
+        got.extend(prefetches(&update(a, key(KeyCode::Up))));
+    }
+    got.into_iter().flat_map(|(_, keys)| keys).collect()
+}
+
+#[test]
+fn outcome_absent_marks_absent_and_tried() {
+    let mut a = icon_app(50, 10);
+    let first = row_keys(&a, 0..1).remove(0);
+    let cmds = ended(
+        &mut a,
+        (&first.0, &first.1),
+        wingetrs::tui::app::IconOutcome::Absent,
+    );
+    assert!(prefetches(&cmds).is_empty(), "{cmds:?}");
+    assert!(a.icon_absent.contains(&format!("{}/{}", first.0, first.1)));
+    let asked = asked_after_round_trip(&mut a);
+    assert!(!asked.is_empty(), "the round trip asked for the new rows");
+    assert!(!asked.contains(&first), "{asked:?}");
+}
+
+#[test]
+fn outcome_retry_is_asked_again() {
+    let mut a = icon_app(50, 10);
+    let first = row_keys(&a, 0..1).remove(0);
+    ended(
+        &mut a,
+        (&first.0, &first.1),
+        wingetrs::tui::app::IconOutcome::Retry,
+    );
+    assert!(!a.icon_absent.contains(&format!("{}/{}", first.0, first.1)));
+    let asked = asked_after_round_trip(&mut a);
+    assert!(asked.contains(&first), "{asked:?}");
 }
 
 #[test]

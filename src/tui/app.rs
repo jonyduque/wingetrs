@@ -37,6 +37,17 @@ pub enum SourceFilter {
     Scoop,
 }
 
+/// How one attempt to get a package's icon ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconOutcome {
+    /// The icon was obtained.
+    Found,
+    /// The package has no icon to get (none declared, refused, or gone): not asked again.
+    Absent,
+    /// Failed for a reason that may pass (offline, server error, cache): asked again later.
+    Retry,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum Msg {
     Key(KeyEvent),
@@ -85,9 +96,11 @@ pub enum Msg {
         key: String,
         sha: String,
     },
-    /// The list's icon fetch of `key` ended (with or without an icon); it is not asked again.
+    /// An icon fetch of `key` ended (list prefetch or the selected package's details);
+    /// `outcome` says whether it is asked again.
     PrefetchDone {
         key: String,
+        outcome: IconOutcome,
     },
     /// The icon of `key` encoded for `size` cells (columns, rows), or why it could not be.
     IconReady {
@@ -443,6 +456,8 @@ pub struct App {
     pub pins: std::collections::BTreeSet<String>,
     /// `<source>/<id>` of the list rows whose icon fetch ended in this session.
     icon_tried: HashSet<String>,
+    /// `<source>/<id>` known to have no icon in this session: drawn as the placeholder.
+    pub icon_absent: HashSet<String>,
     /// Keys of the newest `Cmd::PrefetchIcons`.
     last_prefetch: HashSet<String>,
     /// Generation of the newest `Cmd::PrefetchIcons`.
@@ -578,6 +593,7 @@ impl App {
             icon_map: BTreeMap::new(),
             pins: std::collections::BTreeSet::new(),
             icon_tried: HashSet::new(),
+            icon_absent: HashSet::new(),
             last_prefetch: HashSet::new(),
             list_fetch_gen: 0,
             list_icons_visible: true,
@@ -1003,6 +1019,63 @@ impl App {
         }
     }
 
+    /// Whether `key` is known to have no icon: none to get, or one that does not decode.
+    pub fn icon_known_absent(&self, key: &str) -> bool {
+        self.icon_absent.contains(key) || self.icon_none.contains(key)
+    }
+
+    /// Whether a row with this correlation shows the no-icon placeholder: unmatched rows
+    /// have no package to take one from; ambiguous ones are not known yet.
+    fn row_placeholder(&self, c: &Correlation) -> bool {
+        match c {
+            Correlation::Matched {
+                source, package_id, ..
+            } => self.icon_known_absent(&format!("{source}/{package_id}")),
+            Correlation::Ambiguous { .. } => false,
+            Correlation::Unmatched => true,
+        }
+    }
+
+    /// For each row of `window` (aligned with `list_keys`), whether its icon slot shows the
+    /// no-icon placeholder when it has no encoded icon.
+    pub fn list_placeholders(&self, window: std::ops::Range<usize>) -> Vec<bool> {
+        match self.tab {
+            Tab::Search => self
+                .hits
+                .iter()
+                .skip(window.start)
+                .take(window.len())
+                .map(|h| {
+                    self.search.entries().get(h.index).is_some_and(|e| {
+                        self.icon_known_absent(&format!("{}/{}", e.source_name, e.id))
+                    })
+                })
+                .collect(),
+            Tab::Installed | Tab::Updates => self
+                .installed_view()
+                .into_iter()
+                .skip(window.start)
+                .take(window.len())
+                .map(|r| self.row_placeholder(&r.correlation))
+                .collect(),
+            Tab::Settings => Vec::new(),
+        }
+    }
+
+    /// Whether the selected row's icon is the no-icon placeholder (same rule as the list).
+    pub fn selected_placeholder(&self) -> bool {
+        match self.tab {
+            Tab::Search => self
+                .selected_key()
+                .is_some_and(|(s, id)| self.icon_known_absent(&format!("{s}/{id}"))),
+            Tab::Installed | Tab::Updates => self
+                .installed_view()
+                .get(self.selected)
+                .is_some_and(|r| self.row_placeholder(&r.correlation)),
+            Tab::Settings => false,
+        }
+    }
+
     /// Rows of the list on screen.
     fn list_window(&self) -> std::ops::Range<usize> {
         crate::tui::view::list_window(
@@ -1285,8 +1358,18 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.icon_map.insert(key, sha);
             Vec::new()
         }
-        Msg::PrefetchDone { key } => {
-            app.icon_tried.insert(key);
+        Msg::PrefetchDone { key, outcome } => {
+            match outcome {
+                IconOutcome::Found => {
+                    app.icon_tried.insert(key);
+                }
+                IconOutcome::Absent => {
+                    app.icon_tried.insert(key.clone());
+                    app.icon_absent.insert(key);
+                }
+                // Not marked: the next request for the screen asks again.
+                IconOutcome::Retry => {}
+            }
             Vec::new()
         }
         Msg::IconReady {
