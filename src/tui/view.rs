@@ -938,7 +938,7 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
     if let Some(age) = app.index_age_secs {
         push(Span::styled(
             format!(" {} índice {} ", g.refresh, format_age(age)),
-            theme.pill_b(),
+            theme.muted(),
         ));
     }
     let bar = bar_area(area);
