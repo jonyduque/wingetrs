@@ -2262,7 +2262,8 @@ fn enter_in_installed_opens_actions_menu() {
         menu_items(&a),
         vec![
             ("Atualizar".to_string(), true, None),
-            ("Remover".to_string(), true, None)
+            ("Remover".to_string(), true, None),
+            ("Fixar versão".to_string(), true, None)
         ]
     );
     assert_eq!(
@@ -2286,8 +2287,6 @@ fn enter_in_installed_opens_actions_menu() {
             .as_deref()
             .is_some_and(|n| n.contains("wingetrs"))
     );
-    assert!(update(&mut foreign, key(KeyCode::Enter)).is_empty());
-    update(&mut foreign, key(KeyCode::Down));
     assert!(update(&mut foreign, key(KeyCode::Enter)).is_empty());
     assert!(
         foreign.modal.is_some(),
@@ -3678,4 +3677,80 @@ fn ctrl_space_marks_with_query() {
     step(&mut a, ctrl(' '));
     assert_eq!(a.marked_count(), 1);
     assert_eq!(a.query, "z");
+}
+
+#[test]
+fn pinned_app_is_not_upgraded() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    a.pins.insert(wingetrs::pins::key("wingetrs", "beta"));
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.text == "versão fixada (desafixe no menu)"),
+        "{:?}",
+        a.toasts
+    );
+    // In the menu, "Atualizar" is disabled with the reason.
+    let mut m = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    m.pins.insert(wingetrs::pins::key("wingetrs", "beta"));
+    update(&mut m, key(KeyCode::Enter));
+    let items = menu_items(&m);
+    assert_eq!(items[0].0, "Atualizar");
+    assert!(!items[0].1);
+    assert_eq!(items[0].2.as_deref(), Some("versão fixada"));
+    assert_eq!(items[2].0, "Desafixar");
+}
+
+#[test]
+fn pin_from_menu_applies_and_reverts_on_error() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", false)],
+    );
+    update(&mut a, key(KeyCode::Enter));
+    assert_eq!(menu_items(&a)[2].0, "Fixar versão");
+    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Down));
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    let k = wingetrs::pins::key("wingetrs", "beta");
+    assert_eq!(
+        cmds,
+        vec![Cmd::SetPin {
+            key: k.clone(),
+            pinned: true
+        }]
+    );
+    assert!(a.pins.contains(&k));
+    update(
+        &mut a,
+        Msg::PinSaved {
+            key: k.clone(),
+            pinned: true,
+            result: Err("disco cheio".into()),
+        },
+    );
+    assert!(!a.pins.contains(&k));
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Error && t.text.contains("disco cheio")),
+        "{:?}",
+        a.toasts
+    );
+    update(
+        &mut a,
+        Msg::PinSaved {
+            key: k,
+            pinned: true,
+            result: Ok(()),
+        },
+    );
+    assert!(a.toasts.iter().any(|t| t.text == "versão fixada: beta"));
 }

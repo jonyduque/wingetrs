@@ -356,6 +356,8 @@ async fn upgrade(
     f: Flags,
 ) -> anyhow::Result<()> {
     let list = ops::upgradable(ctx)?;
+    let pins = crate::pins::load(ctx.data);
+    let (list, pinned) = list.without_pinned(&pins);
     let state = ops::read_state(&ctx.data.install_layout())?;
     let chosen: Vec<(String, String, String)> = match target {
         Some(t) => {
@@ -364,6 +366,9 @@ async fn upgrade(
                 list.skipped.iter().find(|(a, _)| a.eq_ignore_ascii_case(t))
             {
                 bail!("{app}: {reason}");
+            }
+            if crate::pins::is_pinned(&pins, "wingetrs", t) {
+                bail!("{t} está com a versão fixada; desafixe na TUI (menu de ações)");
             }
             let found: Vec<_> = list
                 .upgradable
@@ -385,12 +390,18 @@ async fn upgrade(
             }
             if !all {
                 print!("{}", output::upgrades_text(&list.upgradable));
+                for app in &pinned {
+                    println!("{app} (fixado)");
+                }
                 if list.upgradable.is_empty() {
                     println!("Nada para atualizar.");
                 } else {
                     println!("Use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`.");
                 }
                 return Ok(());
+            }
+            for app in &pinned {
+                println!("fixado, pulado: {app}");
             }
             list.upgradable
         }

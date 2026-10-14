@@ -212,6 +212,7 @@ async fn event_loop(
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
+    spawn_job(&ctx, |c, _| Msg::PinsLoaded(crate::pins::load(&c.data)));
     if app.icon_protocol != crate::tui::icons::IconProtocol::Off {
         spawn_job(&ctx, |c, _| {
             Msg::IconMapLoaded(crate::icons::load_map(&c.data))
@@ -298,6 +299,13 @@ async fn event_loop(
                 }
                 Cmd::Refresh { force } => spawn_refresh(&ctx, force),
                 Cmd::ScanInstalled => spawn_scan(&ctx),
+                Cmd::SetPin { key, pinned } => {
+                    spawn_job(&ctx, move |c, _| Msg::PinSaved {
+                        result: crate::pins::set(&c.data, &key, pinned).map_err(|e| e.to_string()),
+                        key,
+                        pinned,
+                    });
+                }
                 Cmd::LoadDetails { source, id } => {
                     spawn_details(&ctx, source, id);
                 }

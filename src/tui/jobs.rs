@@ -178,7 +178,9 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
 
 /// Plans upgrading every upgradable app; `keep` keeps the old versions.
 pub fn plan_upgrade_all(c: &OpsCtx<'_>, keep: bool) -> Result<Planned, String> {
-    let list = ops::upgradable(c).map_err(|e| e.to_string())?;
+    let (list, _pinned) = ops::upgradable(c)
+        .map_err(|e| e.to_string())?
+        .without_pinned(&crate::pins::load(c.data));
     if list.upgradable.is_empty() {
         return Err("nenhum app para atualizar".to_string());
     }

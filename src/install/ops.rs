@@ -868,6 +868,28 @@ pub struct UpgradeList {
     pub skipped: Vec<(String, String)>,
 }
 
+impl UpgradeList {
+    /// Splits off the pinned apps (`wingetrs/<app>` in `pins`): the list keeps the rest and the
+    /// names returned are the apps left out because their version is pinned.
+    pub fn without_pinned(
+        self,
+        pins: &std::collections::BTreeSet<String>,
+    ) -> (UpgradeList, Vec<String>) {
+        let (pinned, upgradable): (Vec<_>, Vec<_>) = self
+            .upgradable
+            .into_iter()
+            .partition(|(app, _, _)| crate::pins::is_pinned(pins, "wingetrs", app));
+        let names = pinned.into_iter().map(|(app, _, _)| app).collect();
+        (
+            UpgradeList {
+                upgradable,
+                skipped: self.skipped,
+            },
+            names,
+        )
+    }
+}
+
 /// Every `state.db` app whose catalog version is newer (`upgrade --all`).
 pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
     let _span = tracing::debug_span!("upgrade.list").entered();

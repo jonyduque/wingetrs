@@ -390,3 +390,114 @@ async fn uninstall_dry_run_leaves_the_root_untouched_and_takes_no_lock() {
     assert_eq!(lab.snapshot(), before);
     assert!(!lab.root.join("install.lock").exists());
 }
+
+/// Two apps installed at 0.9 whose catalog version is 1.0, so both are upgradable.
+fn install_old(lab: &Lab, apps: &[&str]) {
+    use wingetrs::install::state::AppRecord;
+    let mut db = StateDb::open(&lab.root.join("state.db")).unwrap();
+    for app in apps {
+        db.record(
+            &AppRecord {
+                app: (*app).into(),
+                bucket: "main".into(),
+                version: "0.9".into(),
+                arch: None,
+                installed_at: 1,
+                manifest_sha256: "00".into(),
+            },
+            &[],
+        )
+        .unwrap();
+        let cur = lab.root.join("apps").join(app).join("current");
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::write(cur.join("install.json"), b"{}").unwrap();
+    }
+}
+
+fn pin(lab: &Lab, key: &str) {
+    pins::set(&wingetrs::cache::DataDir::new(&lab.root), key, true).unwrap();
+}
+
+use wingetrs::pins;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_all_skips_pinned() {
+    let server = MockServer::start().await;
+    let lab = Lab::new(&server, "pinall").await;
+    install_old(&lab, &["solo", "x"]);
+    pin(&lab, &pins::key("wingetrs", "solo"));
+    // `x` exists in two buckets in the catalog; the state says `main`, so it resolves.
+    let out = tokio::task::block_in_place(|| lab.run(&["upgrade", "--all", "--dry-run", "--yes"]));
+    let (so, se) = (text(&out.stdout), text(&out.stderr));
+    assert!(out.status.success(), "{se}");
+    assert!(so.contains("fixado, pulado: solo"), "{so}");
+    assert!(so.contains("x 1.0"), "{so}");
+    assert!(!so.contains("solo 1.0"), "{so}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_upgrade_pinned_app_refuses() {
+    let server = MockServer::start().await;
+    let lab = Lab::new(&server, "pinone").await;
+    install_old(&lab, &["solo"]);
+    pin(&lab, &pins::key("wingetrs", "solo"));
+    let out = tokio::task::block_in_place(|| lab.run(&["upgrade", "solo", "--yes"]));
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr)
+            .contains("solo está com a versão fixada; desafixe na TUI (menu de ações)"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!lab.root.join("apps").join("solo").join("1.0").exists());
+    // Without arguments the list marks it.
+    let out = tokio::task::block_in_place(|| lab.run(&["upgrade"]));
+    assert!(
+        text(&out.stdout).contains("solo (fixado)"),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_and_tui_use_the_same_key() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    use wingetrs::tui::app::{App, Cmd, Msg, Tab, update};
+    use wingetrs::tui::theme::GlyphSet;
+    let server = MockServer::start().await;
+    let lab = Lab::new(&server, "samekey").await;
+    install_old(&lab, &["solo"]);
+    // The key the TUI would write for a wingetrs row...
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.tab = Tab::Installed;
+    a.installed = vec![ListRow {
+        name: "solo".into(),
+        origin: "wingetrs".into(),
+        installed_version: Some("0.9".into()),
+        correlation: Correlation::Matched {
+            source: "scoop:main".into(),
+            package_id: "solo".into(),
+            rule: Rule::ScoopManifest,
+        },
+        latest: None,
+        state: UpdateState::UpToDate,
+        tiebreak: None,
+    }];
+    let k = |c| Msg::Key(KeyEvent::new(c, KeyModifiers::NONE));
+    update(&mut a, k(KeyCode::Enter));
+    update(&mut a, k(KeyCode::Down));
+    update(&mut a, k(KeyCode::Down));
+    let cmds = update(&mut a, k(KeyCode::Enter));
+    let Some(Cmd::SetPin { key, .. }) = cmds.into_iter().next() else {
+        panic!("no SetPin");
+    };
+    // ...is the one the CLI consults.
+    pin(&lab, &key);
+    let out = tokio::task::block_in_place(|| lab.run(&["upgrade", "solo", "--yes"]));
+    assert!(
+        text(&out.stderr).contains("versão fixada"),
+        "{}",
+        text(&out.stderr)
+    );
+}

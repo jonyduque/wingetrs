@@ -1939,3 +1939,30 @@ fn mark_column_aligns_both_lines() {
     assert_eq!(a.marked_count(), 1);
     assert!(!a.has_visible_mark());
 }
+
+#[test]
+fn pinned_row_shows_the_pin_glyph() {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    use wingetrs::tui::app::Tab;
+    let mut a = App::new(entries(), GlyphSet::Unicode);
+    a.tab = Tab::Installed;
+    a.size = (100, 24);
+    a.installed = vec![ListRow {
+        name: "beta".into(),
+        origin: "wingetrs".into(),
+        installed_version: Some("1".into()),
+        correlation: Correlation::Matched {
+            source: "scoop:main".into(),
+            package_id: "beta".into(),
+            rule: Rule::ScoopManifest,
+        },
+        latest: None,
+        state: UpdateState::UpToDate,
+        tiebreak: None,
+    }];
+    let pin = wingetrs::tui::theme::Glyphs::for_set(GlyphSet::Unicode).pin;
+    assert!(!render(&a, 100, 24).contains(pin));
+    a.pins.insert(wingetrs::pins::key("wingetrs", "beta"));
+    let out = render(&a, 100, 24);
+    assert!(out.contains(pin), "{out}");
+}

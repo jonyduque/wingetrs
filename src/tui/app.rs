@@ -68,6 +68,14 @@ pub enum Msg {
     },
     /// The `icons.json` map (`<source>/<id>` -> SHA-256 of the cached icon), read at startup.
     IconMapLoaded(BTreeMap<String, String>),
+    /// The pinned apps (`pins.json`), read at startup.
+    PinsLoaded(std::collections::BTreeSet<String>),
+    /// Result of writing `key` (un)pinned; the `App` already applied it and reverts on `Err`.
+    PinSaved {
+        key: String,
+        pinned: bool,
+        result: Result<(), String>,
+    },
     /// An icon was just cached: `key` now has its blob under `sha`.
     IconMapped {
         key: String,
@@ -222,6 +230,8 @@ pub enum Modal {
         upgrade: Option<(String, String)>,
         /// Name to remove when wingetrs installed the app.
         remove: Option<String>,
+        /// `(pin key, pin it?)` of the third item; `None` when the menu acts on marked rows.
+        pin: Option<(String, bool)>,
         /// The tab has marked rows: the items act on them, not on `app`.
         marked: bool,
     },
@@ -245,6 +255,11 @@ pub enum Cmd {
         id: String,
     },
     ScanInstalled,
+    /// Pin or unpin `key` (`<origin>/<name>`) in `pins.json`; answers with `Msg::PinSaved`.
+    SetPin {
+        key: String,
+        pinned: bool,
+    },
     /// Plan installing (or upgrading) one catalog package.
     /// `keep`: keep the old version when this is an upgrade (setting at key time).
     PlanInstall {
@@ -391,6 +406,8 @@ pub struct App {
     icon_in_flight: HashSet<(String, (u16, u16))>,
     /// Cached icons known to the list: `<source>/<id>` -> SHA-256 of the blob.
     pub icon_map: BTreeMap<String, String>,
+    /// Pinned apps (`<origin>/<name>`): never upgraded.
+    pub pins: std::collections::BTreeSet<String>,
     /// `<source>/<id>` of the list rows whose icon fetch ended in this session.
     icon_tried: HashSet<String>,
     /// Keys of the newest `Cmd::PrefetchIcons`.
@@ -526,6 +543,7 @@ impl App {
             icon_gen: 0,
             icon_in_flight: HashSet::new(),
             icon_map: BTreeMap::new(),
+            pins: std::collections::BTreeSet::new(),
             icon_tried: HashSet::new(),
             last_prefetch: HashSet::new(),
             list_fetch_gen: 0,
@@ -1179,6 +1197,42 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             }
             Vec::new()
         }
+        Msg::PinsLoaded(loaded) => {
+            app.pins.extend(loaded);
+            Vec::new()
+        }
+        Msg::PinSaved {
+            key,
+            pinned,
+            result,
+        } => {
+            let name = key
+                .split_once('/')
+                .map_or(key.as_str(), |(_, n)| n)
+                .to_owned();
+            match result {
+                Ok(()) => {
+                    let text = if pinned {
+                        format!("versão fixada: {name}")
+                    } else {
+                        format!("desafixado: {name}")
+                    };
+                    app.push_toast(ToastKind::Success, text);
+                }
+                Err(e) => {
+                    if pinned {
+                        app.pins.remove(&key);
+                    } else {
+                        app.pins.insert(key);
+                    }
+                    app.push_toast(
+                        ToastKind::Error,
+                        format!("falha ao gravar a fixação de {name}: {e}"),
+                    );
+                }
+            }
+            Vec::new()
+        }
         Msg::IconMapped { key, sha } => {
             app.icon_map.insert(key, sha);
             Vec::new()
@@ -1624,6 +1678,7 @@ fn request_save(app: &mut App) -> Vec<Cmd> {
     }]
 }
 
+const PINNED_NOTE: &str = "versão fixada";
 const NOT_OURS_NOTE: &str = "instalado fora do wingetrs";
 const NOT_OURS: &str = "só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui";
 
@@ -1684,9 +1739,15 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
 
 /// The one rule for who can be upgraded: ours, matched to a catalog package, with a newer version.
 /// `Err` carries the reason, as the note of a disabled menu item.
-fn upgrade_target(r: &ListRow) -> Result<(String, String), &'static str> {
+fn upgrade_target(
+    r: &ListRow,
+    pins: &std::collections::BTreeSet<String>,
+) -> Result<(String, String), &'static str> {
     if r.origin != "wingetrs" {
         return Err(NOT_OURS_NOTE);
+    }
+    if crate::pins::is_pinned(pins, &r.origin, &r.name) {
+        return Err(PINNED_NOTE);
     }
     match (&r.correlation, &r.state) {
         (
@@ -1724,10 +1785,14 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
     let keep = app.settings.behavior.keep_old;
     let target = match app.installed_view().get(app.selected) {
         None => return start_planning(app, Cmd::PlanUpgradeAll { keep }),
-        Some(r) => upgrade_target(r),
+        Some(r) => upgrade_target(r, &app.pins),
     };
     match target {
         Ok((source_name, id)) => plan_upgrade(app, source_name, id),
+        Err(PINNED_NOTE) => {
+            app.push_toast(ToastKind::Warning, "versão fixada (desafixe no menu)");
+            Vec::new()
+        }
         Err(_) => {
             app.push_toast(ToastKind::Warning, NOT_OURS);
             Vec::new()
@@ -1826,7 +1891,7 @@ fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
     let mut skipped = Vec::new();
     let view = app.installed_view();
     for r in rows.iter().filter_map(|&i| view.get(i)) {
-        match upgrade_target(r) {
+        match upgrade_target(r, &app.pins) {
             Ok((source_name, id)) => items.push((
                 r.name.clone(),
                 Cmd::PlanInstall {
@@ -1868,7 +1933,10 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     if let Some((rows, _)) = marked_rows(app) {
         let view = app.installed_view();
         let marked: Vec<&ListRow> = rows.iter().filter_map(|&i| view.get(i).copied()).collect();
-        let upgradable = marked.iter().filter(|r| upgrade_target(r).is_ok()).count();
+        let upgradable = marked
+            .iter()
+            .filter(|r| upgrade_target(r, &app.pins).is_ok())
+            .count();
         let removable = marked.iter().filter(|r| r.origin == "wingetrs").count();
         let item = |label: &str, n: usize| PickerItem {
             label: format!("{label} marcados ({n})"),
@@ -1883,6 +1951,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             app: title,
             upgrade: None,
             remove: None,
+            pin: None,
             marked: true,
         });
         return Vec::new();
@@ -1890,7 +1959,9 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     let Some(r) = app.installed_view().get(app.selected).copied() else {
         return Vec::new();
     };
-    let upgrade = upgrade_target(r);
+    let upgrade = upgrade_target(r, &app.pins);
+    let pin_key = crate::pins::key(&r.origin, &r.name);
+    let pinned = app.pins.contains(&pin_key);
     let remove = (r.origin == "wingetrs").then(|| r.name.clone());
     let items = vec![
         PickerItem {
@@ -1905,6 +1976,12 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             selectable: remove.is_some(),
             note: remove.is_none().then(|| NOT_OURS.to_string()),
         },
+        PickerItem {
+            label: if pinned { "Desafixar" } else { "Fixar versão" }.to_string(),
+            detail: String::new(),
+            selectable: true,
+            note: None,
+        },
     ];
     let name = r.name.clone();
     app.modal = Some(Modal::Actions {
@@ -1912,6 +1989,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
         app: name,
         upgrade: upgrade.ok(),
         remove,
+        pin: Some((pin_key, !pinned)),
         marked: false,
     });
     Vec::new()
@@ -2391,6 +2469,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             app: name,
             upgrade,
             remove,
+            pin,
             marked,
         } => match picker.key(key) {
             PickOutcome::Pending => {
@@ -2399,6 +2478,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     app: name,
                     upgrade,
                     remove,
+                    pin,
                     marked,
                 });
                 Vec::new()
@@ -2412,6 +2492,18 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             PickOutcome::Picked(chosen) => match (chosen.first(), upgrade, remove) {
                 (Some(0), Some((source_name, id)), _) => plan_upgrade(app, source_name, id),
                 (Some(1), _, Some(target)) => plan_remove(app, target),
+                (Some(2), _, _) => match pin {
+                    Some((key, pinned)) => {
+                        // Applied now; `Msg::PinSaved` reverts it if the write fails.
+                        if pinned {
+                            app.pins.insert(key.clone());
+                        } else {
+                            app.pins.remove(&key);
+                        }
+                        vec![Cmd::SetPin { key, pinned }]
+                    }
+                    None => Vec::new(),
+                },
                 _ => Vec::new(),
             },
         },

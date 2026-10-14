@@ -31,6 +31,8 @@ pub struct Glyphs {
     pub selected: &'static str,
     /// Before the name of a row marked with Space.
     pub mark: &'static str,
+    /// Next to the state of a row whose version is pinned.
+    pub pin: &'static str,
     pub spinner: &'static [&'static str],
     pub tab_search: &'static str,
     pub tab_installed: &'static str,
@@ -63,6 +65,7 @@ static NERD: Glyphs = Glyphs {
     id: "\u{f1b2}",
     selected: "▶",
     mark: "\u{f00c}",
+    pin: "\u{f08d}",
     spinner: BRAILLE,
     tab_search: "\u{f002}",
     tab_installed: "\u{f0a0}",
@@ -91,6 +94,7 @@ static UNICODE: Glyphs = Glyphs {
     id: "#",
     selected: "▶",
     mark: "✓",
+    pin: "⚲",
     spinner: BRAILLE,
     tab_search: "⌕",
     tab_installed: "▤",
@@ -119,6 +123,7 @@ static ASCII: Glyphs = Glyphs {
     id: "#",
     selected: ">",
     mark: "*",
+    pin: "!",
     spinner: ASCII_SPINNER,
     tab_search: "",
     tab_installed: "",

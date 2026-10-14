@@ -556,7 +556,7 @@ fn list_lines<'a>(
                 left.extend(mark((r.origin.clone(), r.name.clone())));
                 left.extend(name_for(sel, &r.name, &[]));
                 let old = r.installed_version.clone().unwrap_or_default();
-                let right = match (&r.state, app.tab) {
+                let mut right = match (&r.state, app.tab) {
                     (UpdateState::Available { latest }, Tab::Updates) => vec![
                         Span::styled(old, theme.dim()),
                         Span::styled(" → ", theme.fg_dim()),
@@ -568,6 +568,10 @@ fn list_lines<'a>(
                         state_span(theme, g, r),
                     ],
                 };
+                if crate::pins::is_pinned(&app.pins, &r.origin, &r.name) {
+                    right.push(Span::raw(" "));
+                    right.push(Span::styled(g.pin, theme.warn()));
+                }
                 let detail = match &r.correlation {
                     Correlation::Matched {
                         source, package_id, ..

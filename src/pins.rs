@@ -1,0 +1,58 @@
+//! Pinned apps: `pins.json` holds the set of `<origin>/<name>` keys whose version is frozen.
+//! The only place that decides "is this app pinned?" is [`is_pinned`].
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::cache::DataDir;
+
+static PINS_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Serializes the load-modify-rename of `pins.json` within the process.
+static PINS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn pins_path(data: &DataDir) -> std::path::PathBuf {
+    data.root().join("pins.json")
+}
+
+/// Key of an app in the pin set: `<origin>/<name>` (the CLI uses origin `wingetrs`).
+pub fn key(origin: &str, name: &str) -> String {
+    format!("{origin}/{name}")
+}
+
+/// Whether `<origin>/<name>` is in `pins`.
+pub fn is_pinned(pins: &BTreeSet<String>, origin: &str, name: &str) -> bool {
+    pins.contains(&key(origin, name))
+}
+
+/// Missing or corrupt file yields an empty set.
+pub fn load(data: &DataDir) -> BTreeSet<String> {
+    let Ok(bytes) = std::fs::read(pins_path(data)) else {
+        return BTreeSet::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Pins or unpins `key`, rewriting the file whole by temporary + rename.
+pub fn set(data: &DataDir, key: &str, pinned: bool) -> std::io::Result<()> {
+    // Poison is harmless: the guarded data is `()` and the file is always rewritten whole by rename.
+    let _guard = PINS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut pins = load(data);
+    if pinned {
+        pins.insert(key.to_owned());
+    } else {
+        pins.remove(key);
+    }
+    let json = serde_json::to_vec(&pins).map_err(std::io::Error::other)?;
+    let p = pins_path(data);
+    std::fs::create_dir_all(data.root())?;
+    let tmp = p.with_extension(format!(
+        "json.{}-{}.tmp",
+        std::process::id(),
+        PINS_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, json)?;
+    crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &p)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
