@@ -6644,3 +6644,78 @@ Testes:
 4. Os testes usam `DataDir` em tempdir; cole a linha que mostra isso.
 
 **Commit:** `feat: choose the catalog match of an ambiguous installed app`
+
+### Task 101: Ícone de app do Scoop pelo pacote equivalente do winget
+
+**Modelo:** sonnet (revisor opus: casamento entre fontes e rede).
+
+#### Where this fits
+
+- **Decisão do usuário** (2026-10-14, depois da sonda da Task 99): implementar **só o caminho pelo winget**. A busca pela homepage fica de fora, porque 3 de 15 ícones saíram errados.
+- **Números da sonda** (150 apps):
+  - 10% dos apps têm um par único no winget;
+  - 0 de 15 ícones errados (1 duvidoso: `docker` casou com o Docker Desktop);
+  - 35% das homepages do Scoop são `github.com`, e nesses pares o nome do dono no caminho importa.
+- **Pacotes do Scoop:**
+  - `details_from_raw` (`src/sources/scoop/manifest.rs`, ~:101) lê `homepage` do manifesto guardado em `catalog.db` (coluna `raw`) e devolve `icon: None`;
+  - a chave de um pacote do Scoop na TUI é `scoop:<bucket>/<app>` (`source_name/id`).
+- **Ícones do winget:**
+  - `load_details` + `load_icon` (`src/tui/run.rs`) usam `icons::fetch` e `icons::remember`;
+  - `icons.json` mapeia `source/id` para o sha.
+- **Lista:**
+  - `list_fetch_cmds` (`src/tui/app.rs`, Task 92) só pede pacotes `winget`;
+  - `prefetch_one` (`run.rs`) faz detalhes → ícone.
+- **Catálogo:**
+  - `Catalog` (`src/catalog/mod.rs`) tem `get`, `find_by_id` e `lookup(MapTable, key)`;
+  - a coluna `moniker` existe em `packages`.
+
+#### What binds this task
+
+- **Funções puras** num módulo novo, `src/sources/scoop/winget_match.rs`:
+  - `pub fn norm(s: &str) -> String`: minúsculas, só `[a-z0-9]`.
+  - `pub fn site(url: &str) -> Option<String>`:
+    - host em minúsculas, sem `www.`;
+    - para `github.com`, `gitlab.com` e `codeberg.org`, o host mais o 1º segmento do caminho (o dono), em minúsculas, como `github.com/owner`;
+    - URL inválida devolve `None`.
+  - `pub fn pick(scoop_homepage: &str, candidates: &[(String /*winget id*/, Option<String> /*homepage*/)]) -> Option<String>`:
+    - devolve o id do **único** candidato cujo `site` é igual ao do Scoop;
+    - zero candidatos iguais, ou mais de um, devolve `None`.
+- **Candidatos:** `Catalog::winget_candidates(&self, scoop_name: &str) -> Result<Vec<String>, CatalogError>`.
+  - Devolve os ids do winget cujo `moniker`, `name` ou última parte do `id` (depois do último `.`) tenham `norm` igual a `norm(scoop_name)`.
+  - Limite de 5 ids, em ordem por id.
+  - Use SQL ou um índice em memória, à escolha. Meça o tempo de uma chamada no catálogo real com um teste `#[ignore]` e cole o número. Se passar de 5 ms, avise no relatório.
+- **Caminho na TUI.** Para um pacote do Scoop, nos detalhes e no prefetch da lista:
+  1. pegue a homepage dos detalhes do Scoop;
+  2. pegue os candidatos;
+  3. para cada candidato, carregue os detalhes do winget pelo mesmo `load_details`, que usa o cache de blobs, e leia a homepage;
+  4. aplique `pick`;
+  5. se houver um par e ele tiver `icon`, `load_icon` busca, verifica e guarda;
+  6. `icons::remember` grava **sob a chave do Scoop** (`scoop:<bucket>/<app>`), para a lista e os detalhes acharem o ícone pelo caminho que já existe.
+- **Os detalhes do Scoop** passam a mostrar o ícone do par. O resto dos detalhes continua sendo o do Scoop. Não troque o publisher nem a descrição.
+- **`list_fetch_cmds`** passa a incluir pacotes do Scoop. Valem o mesmo debounce, o mesmo teto de 4, `icon_tried` e `last_prefetch` (Task 92).
+- **Fora do escopo:** busca pela homepage do app; persistir "sem par" entre sessões.
+
+**Files:**
+- Create: `src/sources/scoop/winget_match.rs`
+- Modify: `src/sources/scoop/mod.rs`, `src/catalog/mod.rs`, `src/tui/run.rs`, `src/tui/app.rs`
+- Test: `tests/scoop_winget_match.rs` (novo), `tests/catalog.rs` (ou o arquivo de testes de catálogo que existir), `tests/tui_state.rs`
+
+Testes:
+1. `site_normalizes_hosts_and_code_forges`:
+   - `https://www.7-zip.org/` ⇒ `7-zip.org`;
+   - `https://github.com/BurntSushi/ripgrep` ⇒ `github.com/burntsushi`;
+   - `http://GITLAB.com/Foo/bar/-/x` ⇒ `gitlab.com/foo`;
+   - `"lixo"` ⇒ `None`.
+2. `pick_requires_exactly_one_same_site`: um igual ⇒ `Some`; dois iguais ⇒ `None`; nenhum ⇒ `None`; candidato com homepage `None` não conta.
+3. `winget_candidates_match_moniker_name_and_id_tail`: catálogo em memória com `BurntSushi.ripgrep.MSVC` (moniker `rg`), `Foo.Ripgrep` e `X.Other`. Para `ripgrep`, devolve `Foo.Ripgrep`; para `rg`, devolve `BurntSushi.ripgrep.MSVC`. Confira também o limite de 5.
+4. `scoop_rows_are_prefetched`: em Pesquisar, um hit do Scoop visível sem ícone ⇒ entra no `PrefetchIcons`.
+5. Teste `#[ignore]` com o tempo de `winget_candidates` no catálogo real; cole o número.
+
+#### Checks beyond the steps
+
+1. Mutação: `pick` aceitar o primeiro igual quando há dois ⇒ PEGA (teste 2).
+2. Mutação: `site` ignorar o dono no github ⇒ PEGA (teste 1).
+3. Mutação: `list_fetch_cmds` voltar a filtrar só o winget ⇒ PEGA (teste 4).
+4. Ao vivo, se der: rode o binário release com um `LOCALAPPDATA` temporário que tenha a cópia do catálogo (método da Task 77) e abra os detalhes de um app do Scoop que a sonda achou com par (ex.: `7zip` no main). Como não há terminal interativo, chame `load_details` + o caminho novo num teste `#[ignore]`, e cole se o ícone veio e de qual id do winget.
+
+**Commit:** `feat: scoop app icon from its winget twin`
