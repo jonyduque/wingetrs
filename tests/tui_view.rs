@@ -2156,3 +2156,54 @@ fn empty_filter_message() {
     a.filter = SourceFilter::Scoop;
     assert!(render(&a, 100, 24).contains("nenhum pacote neste filtro"));
 }
+
+// ---- Task 109: action buttons ----
+
+#[test]
+fn buttons_match_regions() {
+    use wingetrs::installed::correlate::ListRow;
+    use wingetrs::tui::app::{Tab, buttons};
+    use wingetrs::tui::regions::regions;
+    let mut installed = Vec::new();
+    for name in ["alpha", "beta"] {
+        installed.push(ListRow {
+            name: name.into(),
+            origin: "wingetrs".into(),
+            installed_version: Some("1".into()),
+            ..Default::default()
+        });
+    }
+    let mut shown = 0;
+    for (w, h) in [(80u16, 24u16), (100, 30), (60, 15)] {
+        for tab in [Tab::Search, Tab::Installed] {
+            let mut a = typed("");
+            a.installed = installed.clone();
+            a.tab = tab;
+            a.size = (w, h);
+            let r = regions(&a, ratatui::layout::Rect::new(0, 0, w, h));
+            let labels = buttons(&a);
+            let theme = Theme::new(true, ColorDepth::NoColor);
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| view(&a, &theme, f)).unwrap();
+            let buf = t.backend().buffer().clone();
+            for (i, (rect, _)) in r.buttons.iter().enumerate() {
+                let cells: String = (rect.x..rect.right())
+                    .map(|x| buf[(x, rect.y)].symbol().to_string())
+                    .collect();
+                assert_eq!(cells, format!(" {} ", labels[i].0), "{w}x{h} {tab:?}");
+                assert!(rect.right() <= r.window.right(), "{w}x{h} {tab:?}");
+                assert!(rect.y >= r.details.bottom(), "text above the buttons");
+                shown += 1;
+            }
+            // The first button of each row starts at the pane's left edge.
+            assert!(
+                r.buttons.iter().all(|(rect, _)| rect.x >= r.details.x),
+                "{w}x{h}"
+            );
+            if let Some((first, _)) = r.buttons.first() {
+                assert_eq!(first.x, r.details.x, "{w}x{h} {tab:?}");
+            }
+        }
+    }
+    assert!(shown > 0, "no button was ever shown");
+}

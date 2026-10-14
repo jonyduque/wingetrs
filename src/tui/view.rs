@@ -3,7 +3,8 @@ use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{
-    App, ITEM_ROWS, Modal, RunProgress, ShowFilter, SourceFilter, Tab, queue_rows,
+    ActionId, App, ITEM_ROWS, Modal, RunProgress, ShowFilter, SourceFilter, Tab, buttons,
+    queue_rows,
 };
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
@@ -129,6 +130,7 @@ fn draw_screen<'a>(
                 .set_string(divider, y, "│", divider_style);
         }
         icons.extend(draw_details(app, theme, g, frame, r.details));
+        draw_buttons(app, theme, frame, &r.buttons);
     } else {
         draw_search_line(app, theme, g, frame, r.search_line);
         icons = draw_list(app, theme, g, frame, r.list);
@@ -1004,6 +1006,14 @@ fn draw_details<'a>(
             draw_no_icon(theme, g, frame, icon_rect);
             None
         }
+    }
+}
+
+/// Paints the action buttons where `regions` put them.
+fn draw_buttons(app: &App, theme: &Theme, frame: &mut Frame, rects: &[(Rect, ActionId)]) {
+    let style = theme.accent().add_modifier(Modifier::REVERSED);
+    for ((rect, _), (label, _)) in rects.iter().zip(buttons(app)) {
+        frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), *rect);
     }
 }
 

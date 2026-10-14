@@ -1671,6 +1671,9 @@ fn on_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
                 }
                 return Vec::new();
             }
+            if let Some((_, id)) = r.buttons.iter().find(|(rect, _)| inside(*rect)) {
+                return run_button(app, *id);
+            }
             let Some(index) = crate::tui::regions::item_at(app, r.list, ev.column, ev.row) else {
                 return Vec::new();
             };
@@ -1964,6 +1967,11 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
     if let Some((rows, hidden)) = marked_rows(app) {
         return remove_marked(app, &rows, hidden);
     }
+    remove_one(app)
+}
+
+/// Plans removing the selected app alone, whatever the marks.
+fn remove_one(app: &mut App) -> Vec<Cmd> {
     let name = match app.installed_view().get(app.selected) {
         None => return Vec::new(),
         Some(r) if r.origin == "wingetrs" => r.name.clone(),
@@ -2072,9 +2080,20 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
         return upgrade_marked(app, &rows, hidden);
     }
     let keep = app.settings.behavior.keep_old;
-    let target = match app.installed_view().get(app.selected) {
-        None => return start_planning(app, Cmd::PlanUpgradeAll { keep }),
-        Some(r) => upgrade_target(app, r),
+    if app.installed_view().get(app.selected).is_none() {
+        return start_planning(app, Cmd::PlanUpgradeAll { keep });
+    }
+    upgrade_one(app)
+}
+
+/// Plans upgrading the selected app alone, whatever the marks.
+fn upgrade_one(app: &mut App) -> Vec<Cmd> {
+    let Some(target) = app
+        .installed_view()
+        .get(app.selected)
+        .map(|r| upgrade_target(app, r))
+    else {
+        return Vec::new();
     };
     match target {
         Ok(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
@@ -2390,6 +2409,157 @@ fn row_choice(r: &ListRow) -> Option<RowChoice> {
         }),
         _ => None,
     }
+}
+
+/// Rows the buttons act on: the visible marked rows, else the selected one. Also whether they
+/// are marks, and how many marks are out of view.
+fn button_target(app: &App) -> (Vec<usize>, bool, usize) {
+    match marked_rows(app) {
+        Some((rows, hidden)) if !rows.is_empty() => (rows, true, hidden),
+        _ => (vec![app.selected], false, 0),
+    }
+}
+
+/// Whether the action `id` applies to `row`, by the one rule of `actions_for`.
+fn action_possible(app: &App, row: usize, id: ActionId) -> bool {
+    actions_for(app, row)
+        .iter()
+        .any(|(_, note, i)| *i == id && note.is_none())
+}
+
+fn row_pinned(app: &App, row: usize) -> bool {
+    app.installed_view()
+        .get(row)
+        .is_some_and(|r| crate::pins::is_pinned(&app.pins, &r.origin, &r.name))
+}
+
+/// The buttons under the details: label and action, only for actions that apply to at least
+/// one row of the target. Keys are the ones the tab already has.
+pub fn buttons(app: &App) -> Vec<(String, ActionId)> {
+    if app.tab == Tab::Settings || app.visible_len() == 0 {
+        return Vec::new();
+    }
+    let (rows, _, _) = button_target(app);
+    let ids: &[ActionId] = match app.tab {
+        Tab::Search => &[ActionId::Install],
+        Tab::Updates => &[ActionId::Upgrade],
+        _ => &[
+            ActionId::Upgrade,
+            ActionId::Remove,
+            ActionId::Pin,
+            ActionId::Choose,
+            ActionId::UndoChoice,
+        ],
+    };
+    let mut out = Vec::new();
+    for &id in ids {
+        // The correspondence picker is for one app at a time.
+        if id == ActionId::Choose && rows.len() != 1 {
+            continue;
+        }
+        let Some(&first) = rows.iter().find(|&&r| action_possible(app, r, id)) else {
+            continue;
+        };
+        let base = match id {
+            ActionId::Install => "Instalar",
+            ActionId::Upgrade => "Atualizar",
+            ActionId::Remove => "Remover",
+            ActionId::Pin if row_pinned(app, first) => "Desafixar",
+            ActionId::Pin => "Fixar",
+            ActionId::Choose => "Correspondência",
+            ActionId::UndoChoice => "Desfazer correspondência",
+            ActionId::ToggleMark => continue,
+        };
+        let key = match (app.tab, id) {
+            (Tab::Search, ActionId::Install) | (Tab::Updates, ActionId::Upgrade) => Some("enter"),
+            (Tab::Installed, ActionId::Remove) => Some("u"),
+            _ => None,
+        };
+        out.push((
+            match key {
+                Some(k) => format!("{base} ({k})"),
+                None => base.to_string(),
+            },
+            id,
+        ));
+    }
+    out
+}
+
+/// Runs the button `id` over the rows of the target where it applies, and says how many were
+/// left out.
+fn run_button(app: &mut App, id: ActionId) -> Vec<Cmd> {
+    let (rows, marked, hidden) = button_target(app);
+    let possible: Vec<usize> = rows
+        .iter()
+        .copied()
+        .filter(|&r| action_possible(app, r, id))
+        .collect();
+    let Some(&first) = possible.first() else {
+        return Vec::new();
+    };
+    let left_out = rows.len() - possible.len();
+    let cmds = match id {
+        ActionId::Install if marked => install_marked(app, possible, hidden),
+        ActionId::Install => install_one(app),
+        ActionId::Upgrade if marked => upgrade_marked(app, &possible, hidden),
+        ActionId::Upgrade => upgrade_one(app),
+        ActionId::Remove if marked => remove_marked(app, &possible, hidden),
+        ActionId::Remove => remove_one(app),
+        ActionId::Pin => {
+            // Every row goes to the state opposite to the first one's.
+            let pinned = !row_pinned(app, first);
+            let keys: Vec<String> = app
+                .installed_view()
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| possible.contains(i))
+                .map(|(_, r)| crate::pins::key(&r.origin, &r.name))
+                .collect();
+            keys.into_iter()
+                .map(|key| {
+                    // Applied now; `Msg::PinSaved` reverts it if the write fails.
+                    if pinned {
+                        app.pins.insert(key.clone());
+                    } else {
+                        app.pins.remove(&key);
+                    }
+                    Cmd::SetPin { key, pinned }
+                })
+                .collect()
+        }
+        ActionId::Choose => {
+            let choice = app
+                .installed_view()
+                .get(first)
+                .copied()
+                .and_then(row_choice);
+            open_choosing(app, choice)
+        }
+        ActionId::UndoChoice => app
+            .installed_view()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| possible.contains(i))
+            .filter_map(|(_, r)| match row_choice(r) {
+                Some(RowChoice::Undo { app_key }) => Some(Cmd::SetOverride {
+                    app_key,
+                    choice: None,
+                }),
+                _ => None,
+            })
+            .collect(),
+        ActionId::ToggleMark => Vec::new(),
+    };
+    if left_out > 0 {
+        let text = if left_out == 1 {
+            "1 item ficou de fora (ação não se aplica)".to_string()
+        } else {
+            format!("{left_out} itens ficaram de fora (ação não se aplica)")
+        };
+        app.push_toast(ToastKind::Info, text);
+    }
+    cmds
 }
 
 /// Opens the actions menu of the selected row (any list tab), whatever the marks. The cursor

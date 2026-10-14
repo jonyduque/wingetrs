@@ -1,5 +1,5 @@
 //! The one screen geometry: drawing and mouse hit-testing both read it from here.
-use crate::tui::app::{App, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Tab, items_in_rows};
+use crate::tui::app::{ActionId, App, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Tab, buttons, items_in_rows};
 use crate::tui::layout::{FILTER_GAP, ITEM_GAP, PAD_X, inset, split_with_gutter};
 use crate::tui::settings::ORDER;
 use crate::tui::tabs::tab_rects;
@@ -23,7 +23,10 @@ pub struct Regions {
     pub list: Rect,
     /// Column of the list/details divider, when the details are shown.
     pub divider: Option<u16>,
+    /// The details text, above the buttons.
     pub details: Rect,
+    /// Action buttons at the foot of the details pane, in drawing order.
+    pub buttons: Vec<(Rect, ActionId)>,
     /// Area `draw_settings` paints into (Settings tab only).
     pub settings: Rect,
     /// One rectangle per setting of `ORDER` (those that fit), Settings tab only.
@@ -94,6 +97,7 @@ pub fn regions(app: &App, area: Rect) -> Regions {
             r.list = left;
             r.divider = Some(divider);
             r.details = right;
+            place_buttons(app, &mut r);
         }
     }
     if r.settings.width > 0 && r.settings.height > 0 {
@@ -111,6 +115,42 @@ pub fn regions(app: &App, area: Rect) -> Regions {
             .collect();
     }
     r
+}
+
+/// Details text rows kept above the buttons; with less room the buttons are not shown.
+const MIN_DETAIL_ROWS: u16 = 3;
+
+/// Flows the buttons along the foot of `r.details`, wrapping when they do not fit, and takes
+/// their rows (and one blank line) from the details text.
+fn place_buttons(app: &App, r: &mut Regions) {
+    let labels = buttons(app);
+    let area = r.details;
+    if labels.is_empty() || area.width == 0 {
+        return;
+    }
+    let mut placed: Vec<(u16, u16, u16, ActionId)> = Vec::new();
+    let (mut x, mut row) = (0u16, 0u16);
+    for (label, id) in labels {
+        let w = u16::try_from(label.chars().count() + 2)
+            .unwrap_or(u16::MAX)
+            .min(area.width);
+        if x > 0 && x + w > area.width {
+            x = 0;
+            row += 1;
+        }
+        placed.push((x, row, w, id));
+        x += w + 1;
+    }
+    let rows = row + 1;
+    if area.height < rows + 1 + MIN_DETAIL_ROWS {
+        return;
+    }
+    let top = area.bottom() - rows;
+    r.buttons = placed
+        .into_iter()
+        .map(|(x, row, w, id)| (Rect::new(area.x + x, top + row, w, 1), id))
+        .collect();
+    r.details.height = area.height - rows - 1;
 }
 
 /// Rows `[start, end)` of the list that `list` shows, as `draw_list` windows them.

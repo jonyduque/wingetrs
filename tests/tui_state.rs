@@ -4457,3 +4457,88 @@ fn ctrl_e_keeps_selection() {
     assert_eq!(a.selected, 0);
     assert_eq!(a.installed_view()[0].name, "dup");
 }
+
+// ---- Task 109: action buttons ----
+
+fn press_space(a: &mut App) {
+    update(a, key(KeyCode::Char(' ')));
+}
+
+/// Centre cell of the button whose action is `id`.
+fn button_cell(a: &App, id: wingetrs::tui::app::ActionId) -> (u16, u16) {
+    let (rect, _) = regions(a, screen(a))
+        .buttons
+        .into_iter()
+        .find(|(_, i)| *i == id)
+        .expect("button present");
+    (rect.x + rect.width / 2, rect.y)
+}
+
+fn toasts(a: &App) -> Vec<String> {
+    a.toasts.iter().map(|t| t.text.clone()).collect()
+}
+
+#[test]
+fn click_install_button() {
+    use wingetrs::tui::app::ActionId;
+    let mut a = ten_hits();
+    let by_key = update(&mut a, key(KeyCode::Enter));
+    let mut b = ten_hits();
+    let (x, y) = button_cell(&b, ActionId::Install);
+    let by_click = click_at(&mut b, Instant::now(), x, y);
+    assert!(matches!(by_click.as_slice(), [Cmd::PlanInstall { .. }]));
+    assert_eq!(by_click, by_key);
+    assert_eq!(b.marked_count(), 0);
+}
+
+#[test]
+fn installed_buttons_apply_to_possible_subset() {
+    use wingetrs::tui::app::ActionId;
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![
+            irow("one", "wingetrs", "scoop:main", true),
+            irow("two", "wingetrs", "scoop:main", true),
+            irow("three", "wingetrs", "scoop:main", false),
+        ],
+    );
+    a.size = (100, 30);
+    for i in 0..3 {
+        a.selected = i;
+        press_space(&mut a);
+    }
+    a.selected = 0;
+    let (x, y) = button_cell(&a, ActionId::Upgrade);
+    let cmds = click_at(&mut a, Instant::now(), x, y);
+    let [Cmd::PlanBatch { items }] = cmds.as_slice() else {
+        panic!("expected one batch, got {cmds:?}");
+    };
+    assert_eq!(items.len(), 2);
+    assert!(
+        toasts(&a).contains(&"1 item ficou de fora (ação não se aplica)".to_string()),
+        "{:?}",
+        toasts(&a)
+    );
+}
+
+#[test]
+fn no_button_when_action_applies_to_none() {
+    use wingetrs::tui::app::{ActionId, buttons};
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![
+            irow("one", "wingetrs", "scoop:main", false),
+            irow("two", "wingetrs", "scoop:main", false),
+        ],
+    );
+    a.size = (100, 30);
+    let ids: Vec<ActionId> = buttons(&a).into_iter().map(|(_, id)| id).collect();
+    assert!(!ids.contains(&ActionId::Upgrade), "{ids:?}");
+    assert!(ids.contains(&ActionId::Remove), "{ids:?}");
+    assert!(
+        regions(&a, screen(&a))
+            .buttons
+            .iter()
+            .all(|(_, id)| *id != ActionId::Upgrade)
+    );
+}
