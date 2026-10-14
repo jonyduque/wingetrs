@@ -58,3 +58,29 @@ fn legacy_override_key_still_applies() {
     set(&data, "arp/hkcu/X", Some(pkg("New.Id"))).unwrap();
     assert_eq!(lookup(&load(&data), &app), Some(&pkg("New.Id")));
 }
+
+#[test]
+fn undo_removes_legacy_choice() {
+    use wingetrs::installed::overrides::lookup;
+    use wingetrs::installed::{Hive, InstallSource, InstalledApp};
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    let app = InstalledApp {
+        source: InstallSource::Arp(Hive::User),
+        key: "X".into(),
+        name: "X".into(),
+        publisher: None,
+        version: None,
+        product_code: None,
+        upgrade_code: None,
+        family_name: None,
+        scoop_bucket: None,
+    };
+    std::fs::write(
+        dir.path().join("correlations.json"),
+        br#"{"arp/X":{"kind":"Package","source":"winget","package_id":"Old.Id"}}"#,
+    )
+    .unwrap();
+    set(&data, "arp/hkcu/X", None).unwrap();
+    assert_eq!(lookup(&load(&data), &app), None);
+}

@@ -793,3 +793,15 @@ fn cli_list_shows_extra_records() {
     let text = wingetrs::cli::output::list_text(&rows, false);
     assert!(text.contains("+1 registro"), "{text}");
 }
+
+#[test]
+fn wingetrs_record_always_leads() {
+    let mut scoop = kindle(Hive::User, "7zip", "26.04");
+    scoop.source = InstallSource::Scoop;
+    let mut ours = kindle(Hive::User, "7zip", "26.03");
+    ours.source = InstallSource::Wingetrs;
+    let rows = run(&[scoop, ours]);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].origin, "wingetrs");
+    assert_eq!(rows[0].others[0].origin, "scoop");
+}

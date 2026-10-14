@@ -2008,8 +2008,94 @@ fn details_list_records_and_warning() {
     assert!(screen.contains("usuário · 2.9.1 · arp"), "{screen}");
     assert!(screen.contains("máquina 32-bit · 2.8.3 · arp"), "{screen}");
     assert!(screen.contains("mais de um registro"), "{screen}");
-    assert!(screen.contains("+1"), "{screen}");
+    let row = screen.lines().find(|l| l.contains("Kindle")).unwrap();
+    assert!(row.contains(" +1"), "{screen}");
     a.installed[0].others.clear();
     let screen = render(&a, 140, 24);
     assert!(!screen.contains("Registros"), "{screen}");
+}
+
+/// Installed rows: an absent icon, one not tried yet, an unmatched app and an ambiguous one.
+fn placeholder_app() -> App {
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule};
+    use wingetrs::tui::app::{IconOutcome, Tab};
+    let mut a = App::new(vec![], GlyphSet::Unicode);
+    let matched = |id: &str| Correlation::Matched {
+        source: "winget".into(),
+        package_id: id.into(),
+        rule: Rule::ScoopManifest,
+    };
+    let row = |name: &str, correlation: Correlation| ListRow {
+        name: name.into(),
+        origin: "arp".into(),
+        installed_version: Some("1".into()),
+        correlation,
+        ..Default::default()
+    };
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![
+            row("Alpha", matched("Acme.Alpha")),
+            row("Bravo", matched("Acme.Bravo")),
+            row("Charlie", Correlation::Unmatched),
+            row(
+                "Delta",
+                Correlation::Ambiguous {
+                    source: "winget".into(),
+                    candidates: vec!["X.Delta".into(), "Y.Delta".into()],
+                    rule: Rule::ScoopManifest,
+                },
+            ),
+        ]),
+    );
+    update(
+        &mut a,
+        Msg::PrefetchDone {
+            key: "winget/Acme.Alpha".into(),
+            outcome: IconOutcome::Absent,
+        },
+    );
+    a.tab = Tab::Installed;
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    a
+}
+
+/// Whether the list's icon slot left of `name` holds the placeholder. Only the list pane
+/// (before the details' border) is looked at.
+fn slot_has_placeholder(screen: &str, name: &str) -> bool {
+    let list = screen
+        .lines()
+        .filter_map(|l| l.split('│').nth(1))
+        .find(|l| l.contains(name))
+        .unwrap();
+    let at = list.find(name).unwrap();
+    list[..at].contains('▢')
+}
+
+#[test]
+fn placeholder_drawn_only_when_absent() {
+    let mut a = placeholder_app();
+    // The selection stays off the absent row so only the list can show it.
+    a.selected = 3;
+    let screen = render(&a, 120, 30);
+    assert!(slot_has_placeholder(&screen, "Alpha"), "{screen}");
+    assert!(!slot_has_placeholder(&screen, "Bravo"), "{screen}");
+    assert!(slot_has_placeholder(&screen, "Charlie"), "{screen}");
+    assert!(!slot_has_placeholder(&screen, "Delta"), "{screen}");
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Off;
+    let screen = render(&a, 120, 30);
+    assert!(!screen.contains('▢'), "{screen}");
+}
+
+#[test]
+fn details_placeholder_for_absent_selected() {
+    let mut a = placeholder_app();
+    // One in the list's slot and one in the details.
+    a.selected = 0;
+    let screen = render(&a, 120, 30);
+    assert_eq!(screen.matches('▢').count(), 3, "{screen}");
+    // A row with no result yet: only the two list rows that are absent.
+    a.selected = 1;
+    let screen = render(&a, 120, 30);
+    assert_eq!(screen.matches('▢').count(), 2, "{screen}");
 }

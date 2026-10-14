@@ -271,6 +271,8 @@ pub fn group_duplicates(rows: Vec<ListRow>) -> Vec<ListRow> {
             }
             let rank = |r: &ListRow| {
                 (
+                    // Our own install always leads: it is the one the actions can act on.
+                    r.origin == "wingetrs",
                     r.installed_version.as_deref().map(Version::parse),
                     matches!(r.correlation, Correlation::Matched { .. }),
                 )

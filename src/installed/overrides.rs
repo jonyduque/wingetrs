@@ -70,6 +70,13 @@ pub fn set(data: &DataDir, app_key: &str, choice: Option<Choice>) -> std::io::Re
         }
         None => {
             map.remove(app_key);
+            // Undo must also drop the legacy `arp/<subkey>` entry, or the choice would live on.
+            if let Some(sub) = ["hklm64", "hklm32", "hkcu"]
+                .iter()
+                .find_map(|t| app_key.strip_prefix(&format!("arp/{t}/")))
+            {
+                map.remove(&format!("arp/{sub}"));
+            }
         }
     }
     crate::fs_retry::write_json_atomic(&overrides_path(data), &map, &OVERRIDES_TMP_SEQ)
