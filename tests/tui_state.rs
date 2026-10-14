@@ -2930,6 +2930,7 @@ fn right_click_opens_full_menu() {
     right_click_at(&mut s, x, y);
     let labels: Vec<String> = menu_items(&s).into_iter().map(|i| i.0).collect();
     assert_eq!(labels, ["Instalar", "Marcar"]);
+    assert!(matches!(&s.modal, Some(Modal::Actions { app, .. }) if !app.is_empty()));
     assert_eq!(s.marked_count(), 0);
 
     let mut off = ten_hits();

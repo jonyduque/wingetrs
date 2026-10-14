@@ -2423,6 +2423,19 @@ fn open_item_menu(app: &mut App) -> Vec<Cmd> {
         choice: None,
         ids,
     };
+    if app.tab == Tab::Search
+        && let Some(e) = app
+            .hits
+            .get(app.selected)
+            .and_then(|h| app.search.entries().get(h.index))
+        && let Modal::Actions { app: name, .. } = &mut modal
+    {
+        *name = if e.name.is_empty() {
+            e.id.clone()
+        } else {
+            e.name.clone()
+        };
+    }
     if app.tab != Tab::Search
         && let Some(r) = app.installed_view().get(app.selected).copied()
     {
