@@ -66,6 +66,7 @@ fn read_one(c: &Candidate) -> InstalledApp {
         upgrade_code: None,
         family_name: Some(c.family.clone()),
         scoop_bucket: None,
+        stale: None,
     }
 }
 

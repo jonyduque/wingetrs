@@ -13,7 +13,7 @@ pub mod scoop;
 pub mod tiebreak;
 pub mod winget_tracking;
 
-pub use arp::filter_arp;
+pub use arp::{filter_arp, missing_uninstaller};
 pub use guid::{pack_guid, unpack_guid};
 pub use scoop::read_scoop;
 
@@ -44,6 +44,8 @@ pub struct InstalledApp {
     pub upgrade_code: Option<String>,
     pub family_name: Option<String>,
     pub scoop_bucket: Option<String>,
+    /// ARP only: the uninstaller path that no longer exists (a likely leftover record).
+    pub stale: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -57,6 +59,7 @@ pub struct RawArpEntry {
     pub system_component: Option<u32>,
     pub parent_key_name: Option<String>,
     pub release_type: Option<String>,
+    pub uninstall_string: Option<String>,
 }
 
 /// Keeps one MSIX app per family name: the highest version (winget-style ordering).

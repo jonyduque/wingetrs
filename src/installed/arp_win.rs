@@ -1,7 +1,8 @@
 //! Windows registry reading for ARP entries and MSI upgrade codes.
 use super::arp::{reg_dword, reg_string};
-use super::{Hive, InstalledApp, RawArpEntry, filter_arp, unpack_guid};
+use super::{Hive, InstalledApp, RawArpEntry, filter_arp, missing_uninstaller, unpack_guid};
 use std::collections::HashMap;
+use std::path::Path;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::{RegKey, RegValue};
 
@@ -60,6 +61,12 @@ fn read_hive(
     super::timed(step, || read_keys(&base, hive, codes, out));
 }
 
+/// Reads the disk only: the uninstaller path from `UninstallString` when that file is gone.
+fn stale_uninstaller(cmd: Option<&str>) -> Option<String> {
+    missing_uninstaller(cmd?, |v| std::env::var(v).ok(), Path::exists)
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 fn read_keys(
     base: &RegKey,
     hive: Hive,
@@ -82,8 +89,11 @@ fn read_keys(
             system_component: d("SystemComponent"),
             parent_key_name: s("ParentKeyName"),
             release_type: s("ReleaseType"),
+            uninstall_string: s("UninstallString"),
         };
-        if let Some(app) = filter_arp(raw, codes) {
+        let uninstall = raw.uninstall_string.clone();
+        if let Some(mut app) = filter_arp(raw, codes) {
+            app.stale = stale_uninstaller(uninstall.as_deref());
             out.push(app);
         }
     }

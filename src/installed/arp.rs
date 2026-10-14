@@ -1,6 +1,7 @@
 //! Pure ARP (Add/Remove Programs) filtering.
 use super::{Hive, InstallSource, InstalledApp, RawArpEntry};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 const SKIPPED_RELEASE_TYPES: [&str; 4] = ["update", "hotfix", "security update", "service pack"];
 
@@ -73,5 +74,58 @@ pub fn filter_arp(
         upgrade_code,
         family_name: None,
         scoop_bucket: None,
+        stale: None,
     })
+}
+
+/// Names that run other things: a missing one says nothing about the uninstaller.
+const GENERIC_LAUNCHERS: [&str; 6] = [
+    "msiexec.exe",
+    "rundll32.exe",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "winget.exe",
+];
+
+/// Expands `%VAR%` with `expand`; `None` when a variable is unknown or unbalanced.
+fn expand_vars(s: &str, expand: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 1..];
+        let j = tail.find('%')?;
+        out.push_str(&expand(&tail[..j])?);
+        rest = &tail[j + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The executable path of an uninstall command when it is absolute, not a generic launcher
+/// and does not exist; `None` whenever nothing can be claimed.
+pub fn missing_uninstaller(
+    cmd: &str,
+    expand: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let cmd = cmd.trim();
+    let raw = if let Some(rest) = cmd.strip_prefix('"') {
+        &rest[..rest.find('"')?]
+    } else {
+        let end = cmd.to_ascii_lowercase().find(".exe")? + ".exe".len();
+        &cmd[..end]
+    };
+    let expanded = expand_vars(raw, &expand)?;
+    let b = expanded.as_bytes();
+    if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\' {
+        return None;
+    }
+    let path = PathBuf::from(expanded);
+    let file = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if GENERIC_LAUNCHERS.contains(&file.as_str()) || exists(&path) {
+        return None;
+    }
+    Some(path)
 }

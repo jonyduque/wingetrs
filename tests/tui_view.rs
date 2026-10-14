@@ -1999,6 +1999,7 @@ fn details_list_records_and_warning() {
             location: "máquina 32-bit".into(),
             installed_version: Some("2.8.3".into()),
             state: UpdateState::Unknown,
+            stale: None,
         }],
         ..Default::default()
     }];
@@ -2098,4 +2099,44 @@ fn details_placeholder_for_absent_selected() {
     a.selected = 1;
     let screen = render(&a, 120, 30);
     assert_eq!(screen.matches('▢').count(), 2, "{screen}");
+}
+
+#[test]
+fn stale_shows_in_row_and_details() {
+    use wingetrs::installed::correlate::{ListRow, OtherRecord, UpdateState};
+    use wingetrs::tui::app::Tab;
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.installed = vec![ListRow {
+        name: "Kindle".into(),
+        origin: "arp".into(),
+        location: "usuário".into(),
+        installed_version: Some("2.9.1".into()),
+        stale: Some(r"C:\Old\uninst.exe".into()),
+        others: vec![OtherRecord {
+            app_key: "arp/hklm32/K".into(),
+            origin: "arp".into(),
+            location: "máquina 32-bit".into(),
+            installed_version: Some("2.8.3".into()),
+            state: UpdateState::Unknown,
+            stale: None,
+        }],
+        ..Default::default()
+    }];
+    a.tab = Tab::Installed;
+    let screen = render(&a, 160, 24);
+    let row = screen.lines().position(|l| l.contains("Kindle")).unwrap();
+    let below = screen.lines().nth(row + 1).unwrap();
+    assert!(below.contains("sobra provável"), "{screen}");
+    assert!(
+        screen.contains(r"Sobra provável: o desinstalador C:\Old\uninst.exe não existe"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("usuário · 2.9.1 · arp · sobra provável"),
+        "{screen}"
+    );
+    assert!(!screen.contains("2.8.3 · arp · sobra"), "{screen}");
+    a.installed[0].stale = None;
+    let screen = render(&a, 160, 24);
+    assert!(!screen.contains("sobra provável"), "{screen}");
 }

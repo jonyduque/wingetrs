@@ -57,6 +57,8 @@ pub struct OtherRecord {
     pub location: String,
     pub installed_version: Option<String>,
     pub state: UpdateState,
+    /// The uninstaller that no longer exists (`InstalledApp::stale`).
+    pub stale: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -79,6 +81,8 @@ pub struct ListRow {
     /// The other records of the same name, in scan order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<OtherRecord>,
+    /// The uninstaller that no longer exists: a likely leftover record.
+    pub stale: Option<String>,
 }
 
 const WINGET_SOURCE: &str = "winget";
@@ -293,6 +297,7 @@ pub fn group_duplicates(rows: Vec<ListRow>) -> Vec<ListRow> {
                     location: r.location,
                     installed_version: r.installed_version,
                     state: r.state,
+                    stale: r.stale,
                 })
                 .collect();
             main
@@ -332,6 +337,7 @@ fn row(
         state,
         tiebreak: None,
         others: Vec::new(),
+        stale: app.stale.clone(),
     }
 }
 

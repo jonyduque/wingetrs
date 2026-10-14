@@ -27,6 +27,7 @@ fn read_one(app_dir: &Path) -> Option<InstalledApp> {
             .get("bucket")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        stale: None,
     })
 }
 

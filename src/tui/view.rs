@@ -499,14 +499,16 @@ fn list_lines<'a>(
     // names stay aligned.
     let mark_col = app.has_visible_mark();
     let mark_w = Span::raw(g.mark).width() + 1;
-    let second = |sel: bool, text: String| -> Line<'a> {
+    let second = |sel: bool, stale: bool, text: String| -> Line<'a> {
         let indent = if mark_col { mark_w } else { 0 };
-        let room = width.saturating_sub(4 + indent);
-        Line::from(vec![
-            bar(sel),
-            Span::raw(" ".repeat(2 + indent)),
-            Span::styled(clip(&text, room), desc_style(sel)),
-        ])
+        let mut room = width.saturating_sub(4 + indent);
+        let mut spans = vec![bar(sel), Span::raw(" ".repeat(2 + indent))];
+        if stale {
+            spans.push(Span::styled(format!("{STALE_LABEL} · "), theme.alert()));
+            room = room.saturating_sub(STALE_LABEL.chars().count() + 3);
+        }
+        spans.push(Span::styled(clip(&text, room), desc_style(sel)));
+        Line::from(spans)
     };
     let mark = |key: (String, String)| -> Option<Span<'a>> {
         if !mark_col {
@@ -540,7 +542,7 @@ fn list_lines<'a>(
                     Some(d) => format!("{} · {d}", e.id),
                     None => format!("{} · {}", e.id, e.source_name),
                 };
-                items.push([compose(left, right, width), second(sel, detail)]);
+                items.push([compose(left, right, width), second(sel, false, detail)]);
             }
         }
         Tab::Installed | Tab::Updates => {
@@ -582,7 +584,10 @@ fn list_lines<'a>(
                     Correlation::Unmatched => "sem correspondência no catálogo".to_string(),
                     Correlation::Ambiguous { .. } => "correspondência ambígua".to_string(),
                 };
-                items.push([compose(left, right, width), second(sel, detail)]);
+                items.push([
+                    compose(left, right, width),
+                    second(sel, r.stale.is_some(), detail),
+                ]);
             }
         }
         Tab::Settings => {}
@@ -693,6 +698,9 @@ struct Basics {
     description: Option<String>,
     install: Option<Line<'static>>,
 }
+
+/// Second-line and details marker of an ARP record whose uninstaller is gone.
+const STALE_LABEL: &str = "sobra provável";
 
 fn install_status(theme: &Theme, g: &Glyphs, r: &ListRow) -> Line<'static> {
     let installed = r.installed_version.as_deref().unwrap_or("?");
@@ -816,6 +824,17 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
     {
         out.push(labeled(theme, g.license, g.gap, l.clone()));
     }
+    if matches!(app.tab, Tab::Installed | Tab::Updates)
+        && let Some(r) = app.installed_view().get(app.selected)
+        && let Some(path) = &r.stale
+    {
+        out.push(Line::from(Span::styled(
+            format!(
+                "Sobra provável: o desinstalador {path} não existe. A limpeza fica para a fase 2d."
+            ),
+            theme.alert(),
+        )));
+    }
     let desc = match loaded {
         Some(Ok(d)) => d.description.clone().or(b.description.clone()),
         _ => b.description.clone(),
@@ -830,22 +849,31 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
         out.push(Line::raw(""));
         out.push(heading(theme, "Registros"));
         let version = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".to_string());
+        let stale = |s: &Option<String>| {
+            if s.is_some() {
+                " · sobra provável"
+            } else {
+                ""
+            }
+        };
         out.push(Line::from(Span::styled(
             format!(
-                "  {} · {} · {}",
+                "  {} · {} · {}{}",
                 r.location,
                 version(&r.installed_version),
-                r.origin
+                r.origin,
+                stale(&r.stale)
             ),
             theme.fg(),
         )));
         for o in &r.others {
             out.push(Line::from(Span::styled(
                 format!(
-                    "  {} · {} · {}",
+                    "  {} · {} · {}{}",
                     o.location,
                     version(&o.installed_version),
-                    o.origin
+                    o.origin,
+                    stale(&o.stale)
                 ),
                 theme.fg(),
             )));

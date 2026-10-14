@@ -48,6 +48,7 @@ fn legacy_override_key_still_applies() {
         upgrade_code: None,
         family_name: None,
         scoop_bucket: None,
+        stale: None,
     };
     std::fs::write(
         dir.path().join("correlations.json"),
@@ -75,6 +76,7 @@ fn undo_removes_legacy_choice() {
         upgrade_code: None,
         family_name: None,
         scoop_bucket: None,
+        stale: None,
     };
     std::fs::write(
         dir.path().join("correlations.json"),

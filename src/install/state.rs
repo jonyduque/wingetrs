@@ -298,6 +298,7 @@ pub fn scan_wingetrs(layout: &Layout) -> Vec<InstalledApp> {
             upgrade_code: None,
             family_name: None,
             scoop_bucket: bucket,
+            stale: None,
         });
     }
     apps.sort_by(|a, b| a.key.cmp(&b.key));

@@ -39,6 +39,7 @@ fn arp(key: &str, name: &str, publisher: &str, version: &str) -> InstalledApp {
         upgrade_code: None,
         family_name: None,
         scoop_bucket: None,
+        stale: None,
     }
 }
 

@@ -111,6 +111,15 @@ fn aligned<const N: usize>(header: [&str; N], cells: &[[String; N]]) -> String {
     out
 }
 
+/// The name with `(sobra provável)` when the row's uninstaller is gone.
+fn shown_name(r: &ListRow) -> String {
+    if r.stale.is_some() {
+        format!("{} (sobra provável)", r.name)
+    } else {
+        r.name.clone()
+    }
+}
+
 /// `, +N registros` for a row that folded other records, else empty.
 fn extra_suffix(r: &ListRow) -> String {
     if r.others.is_empty() {
@@ -155,7 +164,7 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
                     )
                 };
                 cells.push([
-                    r.name.clone(),
+                    shown_name(r),
                     package_id.clone(),
                     installed,
                     available,
@@ -166,7 +175,7 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
             Correlation::Ambiguous { candidates, .. } => {
                 ambiguous.push(format!(
                     "{} ({installed}{}, {}): {}",
-                    r.name,
+                    shown_name(r),
                     extra_suffix(r),
                     r.origin,
                     candidates.join(", ")
@@ -175,7 +184,7 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
             Correlation::Unmatched => {
                 unmatched.push(format!(
                     "{} ({installed}{}, {})",
-                    r.name,
+                    shown_name(r),
                     extra_suffix(r),
                     r.origin
                 ));

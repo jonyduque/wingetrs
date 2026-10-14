@@ -171,6 +171,60 @@ fn live_scan_is_fast_and_nonempty() {
     assert!(scan.elapsed_ms < 500);
 }
 
+#[test]
+#[ignore = "live: registro real"]
+fn live_stale_arp_records() {
+    let scan = wingetrs::installed::scan_all();
+    let stale: Vec<_> = scan.apps.iter().filter(|a| a.stale.is_some()).collect();
+    for a in &stale {
+        eprintln!("stale: {} -> {:?}", a.name, a.stale);
+    }
+    eprintln!("stale count = {}", stale.len());
+}
+
+fn lookup_env(name: &str) -> Option<String> {
+    (name == "LOCALAPPDATA").then(|| r"C:\L".to_string())
+}
+
+#[test]
+fn missing_uninstaller_cases() {
+    let missing = |cmd: &str| {
+        wingetrs::installed::missing_uninstaller(cmd, lookup_env, |_| false)
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    assert_eq!(
+        missing(r#""C:\X\u.exe" /S"#).as_deref(),
+        Some(r"C:\X\u.exe")
+    );
+    assert_eq!(
+        missing(r"C:\Program Files (x86)\Steam\steam.exe steam://uninstall/255710").as_deref(),
+        Some(r"C:\Program Files (x86)\Steam\steam.exe")
+    );
+    assert_eq!(
+        missing(r"%LOCALAPPDATA%\A\u.exe").as_deref(),
+        Some(r"C:\L\A\u.exe")
+    );
+    assert_eq!(missing(r"%NOPE%\u.exe"), None);
+    assert_eq!(missing("winget uninstall --product-code x"), None);
+    assert_eq!(missing(r"C:\Windows\System32\winget.exe uninstall x"), None);
+    assert_eq!(missing("MsiExec.exe /X{ABC}"), None);
+    assert_eq!(missing(r"C:\Windows\System32\MsiExec.exe /X{ABC}"), None);
+    assert_eq!(
+        missing(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -c x"),
+        None
+    );
+    assert_eq!(missing("powershell -c x"), None);
+    assert_eq!(missing("u.exe"), None);
+}
+
+#[test]
+fn existing_uninstaller_is_not_stale() {
+    let found = wingetrs::installed::missing_uninstaller(r#""C:\X\u.exe" /S"#, lookup_env, |p| {
+        p == std::path::Path::new(r"C:\X\u.exe")
+    });
+    assert_eq!(found, None);
+}
+
 fn utf16le(s: &str, nul: bool) -> Vec<u8> {
     let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
     if nul {
@@ -245,6 +299,7 @@ fn msix_frameworks_are_deduped_by_family_keeping_highest_version() {
         upgrade_code: None,
         family_name: Some(fam.into()),
         scoop_bucket: None,
+        stale: None,
     };
     let out = dedupe_msix_by_family(vec![
         m("Microsoft.VCLibs.140.00_8wekyb3d8bbwe", "14.0.33519.0"),
