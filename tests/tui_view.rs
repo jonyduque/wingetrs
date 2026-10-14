@@ -1742,36 +1742,41 @@ fn tab_titles_match_regions() {
     use ratatui::layout::Rect;
     use wingetrs::tui::app::Tab;
     use wingetrs::tui::regions::regions;
-    for (w, h) in [(80, 24), (100, 30), (60, 15)] {
-        for tab in [Tab::Search, Tab::Installed, Tab::Updates, Tab::Settings] {
-            let mut a = App::new(entries(), GlyphSet::Ascii);
-            a.tab = tab;
-            a.size = (w, h);
-            let out = render(&a, w, h);
-            let lines: Vec<Vec<char>> = out.lines().map(|l| l.chars().collect()).collect();
-            let r = regions(&a, Rect::new(0, 0, w, h));
-            assert_eq!(r.tabs.len(), 4);
-            for ((rect, t), name) in
-                r.tabs
-                    .iter()
-                    .zip(["Pesquisar", "Instalados", "Atualizações", "Ajustes"])
-            {
-                // Some row of the rectangle holds the whole title text.
-                let found = (rect.y..rect.bottom()).any(|y| {
-                    let row: String = lines[usize::from(y)]
+    let theme = Theme::new(true, ColorDepth::NoColor);
+    let mut narrow_seen = false;
+    for glyphs in [GlyphSet::Ascii, GlyphSet::Unicode, GlyphSet::Nerd] {
+        for (w, h) in [(80, 24), (100, 30), (60, 15)] {
+            for tab in [Tab::Search, Tab::Installed, Tab::Updates, Tab::Settings] {
+                let mut a = App::new(entries(), glyphs);
+                a.tab = tab;
+                a.size = (w, h);
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| view(&a, &theme, f)).unwrap();
+                let buf = t.backend().buffer().clone();
+                let r = regions(&a, Rect::new(0, 0, w, h));
+                assert_eq!(r.tabs.len(), 4);
+                narrow_seen |= r.tabs[0].0.height == 1;
+                for ((rect, t), name) in
+                    r.tabs
                         .iter()
-                        .skip(usize::from(rect.x))
-                        .take(usize::from(rect.width))
-                        .collect();
-                    row.contains(name)
-                });
-                assert!(
-                    found,
-                    "{name} ({t:?}) not inside {rect:?} at {w}x{h}, tab {tab:?}"
-                );
+                        .zip(["Pesquisar", "Instalados", "Atualizações", "Ajustes"])
+                {
+                    // Some row of the rectangle holds the whole title text, cell by cell.
+                    let found = (rect.y..rect.bottom()).any(|y| {
+                        let row: String = (rect.x..rect.right())
+                            .map(|x| buf[(x, y)].symbol().to_string())
+                            .collect();
+                        row.contains(name)
+                    });
+                    assert!(
+                        found,
+                        "{name} ({t:?}) not inside {rect:?} at {w}x{h}, {glyphs:?}, tab {tab:?}"
+                    );
+                }
             }
         }
     }
+    assert!(narrow_seen, "the narrow form must be covered");
 }
 
 #[test]

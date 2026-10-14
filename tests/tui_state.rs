@@ -2823,13 +2823,6 @@ fn click_on_item_selects_it() {
     // Second visible item (index 4), first line.
     click_at(&mut a, t0, list.x + 2, list.y + 2);
     assert_eq!(a.selected, 4);
-    // Past the last item's lines hits nothing (a gap line when ITEM_GAP > 0).
-    a.selected = 3;
-    let beyond = list.y + 2 * 10;
-    if beyond < list.bottom() {
-        click_at(&mut a, t0, list.x + 2, beyond);
-        assert_eq!(a.selected, 3);
-    }
     assert_eq!(item_at(&a, list, list.x, list.y), Some(3));
 }
 
@@ -2929,4 +2922,22 @@ fn click_below_the_last_item_hits_nothing() {
     assert_eq!(item_at(&a, list, list.x, list.y + 6), None);
     click_at(&mut a, Instant::now(), list.x + 2, list.y + 6);
     assert_eq!(a.selected, 0);
+}
+
+#[test]
+fn motion_is_not_a_message() {
+    use wingetrs::tui::run::mouse_msg;
+    let ev = |kind| MouseEvent {
+        kind,
+        column: 1,
+        row: 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(mouse_msg(ev(MouseEventKind::Moved)).is_none());
+    assert!(mouse_msg(ev(MouseEventKind::Drag(MouseButton::Left))).is_none());
+    assert!(mouse_msg(ev(MouseEventKind::Up(MouseButton::Left))).is_none());
+    assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Right))).is_none());
+    assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Left))).is_some());
+    assert!(mouse_msg(ev(MouseEventKind::ScrollDown)).is_some());
+    assert!(mouse_msg(ev(MouseEventKind::ScrollUp)).is_some());
 }

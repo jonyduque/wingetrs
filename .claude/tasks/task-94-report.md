@@ -33,3 +33,11 @@ Decisions:
 - Extra: src/tui/mod.rs (new module), made `tab_labels` and `MIN_WIDTH_FOR_DETAILS` pub(crate).
 
 Concerns: mouse_enabled does not yet gate EnableMouseCapture (Task 95). The mouse capture/hook in run.rs is not exercised by tests (needs a real terminal): não medido/ao vivo.
+
+## Revisão (fix commit)
+Commits: e1cad42 feat(tui): mouse for tabs, selection, wheel and double click (SHA do relatório anterior "e5e8526" estava errado; este é o real); o fix vem em seguida (`fix(tui): mouse filters motion; tabs drawn from regions`, ver `git log`).
+Gate: `[OK]   test (729 passed, 18 ignored) 187s` / `[OK]   gate verde`
+Mutation proofs:
+- `[OK] mutação PEGA: '| MouseEventKind::ScrollUp' -> '| MouseEventKind::Moved | MouseEventKind::ScrollUp' fez o teste falhar (exit 101).` (motion_is_not_a_message)
+- `[OK] mutação PEGA: '.zip(TAB_ORDER)' -> '.map(|mut r| { r.x += 4; r }).zip(TAB_ORDER)' fez o teste falhar (exit 101).` (regions desloca 4 colunas; draw_tabs agora lê `tab_rects`, então deslocar o próprio `tab_rects` move desenho e clique juntos e não é detectável, correto por construção; 1 coluna não sai do retângulo por causa do padding, por isso 4)
+Decisions: draw_tabs pinta cada título em `tab_rects` (helper `is_narrow` comum); teste de equivalência itera Ascii/Unicode/Nerd, compara por célula e afirma que a forma estreita foi coberta; `mouse_msg` pública em run.rs.
