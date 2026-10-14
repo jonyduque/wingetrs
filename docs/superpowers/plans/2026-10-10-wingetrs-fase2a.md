@@ -7353,3 +7353,79 @@ Testes:
 3. Mutação: a rolagem não seguir o cursor ⇒ PEGA (teste 3).
 
 **Commit:** `feat(tui): confirmation lists packages with icons, versions and manager; scrollable with buttons`
+
+### Task 111: Ponte não trava quando um processo neto segura a saída
+
+**Modelo:** opus (revisor opus: threads, Win32 e cancelamento de E/S).
+
+#### Where this fits
+
+- Emenda da fase 2a (2026-10-14, "Processo neto segurando a saída").
+- `src/bridge/spawn_win.rs` (107 linhas, leia inteiro):
+  - `run(program, args, on_line)` cria o processo com stdin nulo, stdout e stderr em pipe e `CREATE_NO_WINDOW`;
+  - duas threads (`spawn_reader`) leem os pipes em pedaços de 8 KiB e mandam as linhas por um `mpsc`;
+  - `Readers` junta as duas em todos os caminhos (`join` explícito e `Drop`);
+  - `run` faz `for line in rx`, que só termina quando **os dois pipes** dão EOF, e só depois chama `child.wait()`.
+- **O defeito:** se a ferramenta lança um processo que herda os handles do pipe e continua vivo depois que ela sai (instalador, `git` do scoop, serviço), o EOF não chega. O `for line in rx` espera esse processo neto e o job da TUI fica parado em "Atualizando…" até ele morrer. O mesmo vale para o `Drop` de `Readers` (pânico de `on_line`).
+- `tests/bridge.rs` tem `spawn_runs_fake_tool` (`#[cfg(windows)]`, com `cmd.exe /d /c`) como modelo de teste.
+- O crate `windows` 0.62.2 já é dependência. `windows::Win32::System::IO::CancelSynchronousIo(HANDLE) -> windows_core::Result<()>` precisa da feature `Win32_System_IO`. `std::os::windows::io::AsRawHandle` é implementado por `JoinHandle<T>`.
+
+#### What binds this task
+
+- **Sem tempo-limite para a ferramenta.** Isso continua igual: enquanto a ferramenta (o filho direto) roda, a ponte espera pelo tempo que for.
+- **Carência depois da saída:**
+  - `pub const PIPE_GRACE: Duration = Duration::from_secs(2)`;
+  - `pub fn run_with_grace(program, args, grace: Duration, on_line) -> std::io::Result<(i32, Vec<String>)>`;
+  - `run` chama `run_with_grace(.., PIPE_GRACE, ..)`. A assinatura de `run` não muda e nenhum chamador muda.
+- **Laço principal:**
+  - `rx.recv_timeout(100 ms)` em vez de `for line in rx`;
+  - `child.try_wait()` em **toda** iteração, inclusive quando chega linha, para que um neto que escreve sem parar não adie o corte;
+  - na primeira vez em que o filho saiu, guarda o instante e o código;
+  - `Disconnected` (os dois leitores terminaram) ⇒ sai do laço;
+  - filho saiu há `≥ grace` e ainda há leitor vivo ⇒ chama `Readers::stop()` e continua drenando até `Disconnected`.
+- **`Readers::stop()`:**
+  - marca um `Arc<AtomicBool>` compartilhado com os leitores;
+  - para cada leitor com `!is_finished()`, chama `CancelSynchronousIo` no handle da thread (`AsRawHandle`);
+  - repete a cada 50 ms até os dois terminarem, porque o cancelamento só pega uma leitura **em andamento** (`ERROR_NOT_FOUND` se a thread estiver entre duas leituras);
+  - o erro de `CancelSynchronousIo` é ignorado: `ERROR_NOT_FOUND` é esperado.
+- **Leitor:**
+  - confere a flag antes de cada `read`;
+  - flag marcada, ou erro `raw_os_error() == Some(995)` (`ERROR_OPERATION_ABORTED`) com a flag marcada ⇒ fim normal (`Ok(tail.finish())`);
+  - erro 995 **sem** a flag continua sendo erro.
+- **`Drop` de `Readers`** chama `stop()` antes de juntar. Assim um pânico de `on_line` com um neto vivo não trava. Isso vale nos dois ramos (com pânico e sem pânico).
+- **Corte registrado:** `tracing::warn!` uma vez, com o programa e a carência, quando `stop()` foi chamado depois da saída.
+- **Retorno:**
+  - o código é o do filho, mesmo com o corte;
+  - as linhas já lidas continuam em `on_line` e no `Tail`;
+  - o processo neto **nunca** é encerrado: nada de `TerminateProcess`, Job Object ou `taskkill`.
+- `unsafe` só na chamada de `CancelSynchronousIo`, com um comentário `// SAFETY:` (o handle vem de um `JoinHandle` vivo, que ainda não foi juntado).
+- **Cargo.toml:** acrescentar `"Win32_System_IO"` às features do `windows`. Nenhum crate novo. O `Cargo.lock` não muda (cole `git diff --stat Cargo.lock`, que deve ficar vazio).
+
+**Files:**
+- Modify: `src/bridge/spawn_win.rs`, `Cargo.toml`
+- Test: `tests/bridge.rs`
+
+Testes (todos `#[cfg(windows)]`, em `tests/bridge.rs`):
+1. **`grandchild_holding_pipe_does_not_hang`:**
+   - programa: `cmd.exe /d /c "start /b ping -n 9 127.0.0.1 & echo pronto & exit /b 3"`. O `ping` herda o stdout e vive cerca de 8 s;
+   - `run_with_grace(.., Duration::from_millis(500), ..)` roda numa thread de teste com um `mpsc`, e o teste espera com `recv_timeout(5 s)`;
+   - esperado: volta em menos de 5 s, código `3` e a linha `pronto` vista;
+   - a thread de teste é sempre juntada. Se o teste falhar, ela termina sozinha quando o `ping` morre (cerca de 8 s).
+   - Rode-o **antes** da correção e cole a falha (timeout).
+2. **`grace_lets_late_output_arrive`:**
+   - `cmd.exe /d /c "start /b cmd /d /c \"ping -n 2 127.0.0.1 >nul & echo tarde\" & exit /b 0"`;
+   - com `grace = 3 s`, a linha `tarde` (cerca de 1 s depois da saída) aparece em `on_line`.
+   - Isso prova que a carência espera e que o corte não é imediato.
+3. **`spawn_runs_fake_tool`** continua passando sem mudança.
+4. **`stop_ignores_finished_readers`** (unitário, se `Readers` ficar testável dentro do módulo; senão, coberto pelo 3): uma chamada a `stop()` com os leitores já terminados volta na hora.
+
+#### Checks beyond the steps
+
+1. Mutação: o leitor ignorar a flag (tirar a conferência antes do `read`) **e** `stop()` não repetir o cancelamento (uma chamada só) ⇒ rode o teste 1 dez vezes e cole quantas passam. Isso mostra se a repetição é necessária. Não é mutação de PEGA obrigatória: é medição.
+2. Mutação: `try_wait` só no ramo de timeout ⇒ escreva um teste em que o neto escreve uma linha a cada 50 ms (`ping -n 9 -w 1 …` sem `>nul` produz linha por resposta; se o intervalo for de 1 s, diga isso e use outro gerador) e cole se pega. Se nenhum gerador do `cmd` produzir linha mais rápido que 100 ms, registre "não coberto" no relatório.
+3. Mutação: `Drop` sem `stop()` ⇒ um teste com `on_line` que entra em pânico na primeira linha e neto vivo ⇒ `catch_unwind` volta em menos de 5 s. Esse teste **é obrigatório** e a mutação deve PEGAR.
+4. Mutação: o código devolvido vir da carência (`-1`) em vez do filho ⇒ PEGA (teste 1, código `3`).
+5. Cole `pwsh -File scripts/leftovers.ps1` no fim. Nenhum `ping` pode sobrar depois de 10 s do último teste.
+6. **Nada ao vivo.** Não rode o winget nem o scoop.
+
+**Commit:** `fix(bridge): stop reading two seconds after the tool exits when a grandchild holds its output`
