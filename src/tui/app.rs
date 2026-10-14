@@ -1308,6 +1308,13 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     if key.kind == KeyEventKind::Release {
         return Vec::new();
     }
+    // A second Ctrl+C once quitting was asked for (dialog open or confirmed) quits at once:
+    // the way out if the job in progress hangs.
+    let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+    let quit_asked = matches!(app.modal, Some(Modal::Confirm { action: None, .. }));
+    if ctrl_c && (quit_asked || app.quit_after_running) {
+        return vec![Cmd::Quit];
+    }
     if app.modal.is_some() {
         return on_modal_key(app, key);
     }
@@ -1711,6 +1718,10 @@ fn enqueue(app: &mut App, action: Action) -> Vec<Cmd> {
         label: action.label(),
         action,
     };
+    if app.quit_after_running {
+        app.push_toast(ToastKind::Warning, "saindo: operação não enfileirada");
+        return Vec::new();
+    }
     if can_start(app) && app.queue.is_empty() {
         return start(app, q);
     }
@@ -1741,13 +1752,24 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
         return vec![Cmd::Quit];
     }
     let n = app.queue.len();
-    let plan_text = if app.running.is_some() {
-        format!(
+    let mut plan_text = match (&app.running, n) {
+        (Some(_), 0) => "Há uma operação em andamento; ela termina antes de fechar.".to_string(),
+        (Some(_), _) => format!(
             "Há {n} operações na fila e uma em andamento. Sair cancela as pendentes; a em andamento termina antes de fechar."
-        )
-    } else {
-        format!("Há {n} operações na fila. Sair cancela as pendentes.")
+        ),
+        (None, _) => format!("Há {n} operações na fila. Sair cancela as pendentes."),
     };
+    // Quitting right after a removal skips its residues dialog.
+    let removing = matches!(
+        app.running,
+        Some(Running {
+            action: Some(Action::Remove(_)),
+            ..
+        })
+    );
+    if removing && app.settings.behavior.residues == ResidueMode::Ask {
+        plan_text.push_str(" Resíduos dela não serão limpos.");
+    }
     app.modal = Some(Modal::Confirm {
         plan_text,
         action: None,

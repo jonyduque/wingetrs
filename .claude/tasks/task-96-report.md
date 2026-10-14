@@ -3,7 +3,8 @@
 Status: DONE
 
 Commits:
-(see `git log --format='%h %s' fdd9d42..HEAD` — the single commit of this task, SHA in the orchestrator message)
+- 1d33ff8 feat(tui): operation queue; running no longer blocks the screen
+- fix(tui): queue quit edge cases (review minors: no enqueue while quitting, quit text for N=0 and residues, second Ctrl+C forces quit; SHA in `git log fdd9d42..HEAD`)
 
 Gate:
 ```

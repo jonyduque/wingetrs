@@ -1733,7 +1733,8 @@ fn second_upgrade_while_running_plans_again() {
     update(&mut a, ready("a"));
     assert!(a.running.is_some());
     // Running no longer blocks the screen: another plan may start.
-    assert_eq!(update(&mut a, key(KeyCode::Char('U'))).len(), 1);
+    let cmds = update(&mut a, key(KeyCode::Char('U')));
+    assert!(matches!(cmds[0], Cmd::PlanInstall { .. }), "{cmds:?}");
     assert!(a.modal.is_none());
 }
 
@@ -3293,4 +3294,77 @@ fn esc_and_ctrl_c_also_ask_while_running() {
     }
     let mut idle = app();
     assert_eq!(update(&mut idle, key(KeyCode::Char('q'))), vec![Cmd::Quit]);
+}
+
+#[test]
+fn nothing_is_queued_once_quitting() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    update(&mut a, key(KeyCode::Char('q')));
+    update(&mut a, key(KeyCode::Enter));
+    assert!(a.quit_after_running);
+    let cmds = update(&mut a, ready("b"));
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(a.queue.is_empty());
+    assert_eq!(a.toasts[0].text, "saindo: operação não enfileirada");
+}
+
+fn quit_text(a: &mut App) -> String {
+    update(a, key(KeyCode::Char('q')));
+    match &a.modal {
+        Some(Modal::Confirm { plan_text, .. }) => plan_text.clone(),
+        _ => panic!("no quit dialog"),
+    }
+}
+
+#[test]
+fn quit_text_fits_what_is_running() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    assert_eq!(
+        quit_text(&mut a),
+        "Há uma operação em andamento; ela termina antes de fechar."
+    );
+    let mut r = unconfirmed();
+    r.settings.behavior.residues = ResidueMode::Ask;
+    update(
+        &mut r,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Remover a".into(),
+            action: removal("a"),
+        })),
+    );
+    assert_eq!(
+        quit_text(&mut r),
+        "Há uma operação em andamento; ela termina antes de fechar. Resíduos dela não serão limpos."
+    );
+    let mut keep = unconfirmed();
+    keep.settings.behavior.residues = ResidueMode::Keep;
+    update(
+        &mut keep,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "Remover a".into(),
+            action: removal("a"),
+        })),
+    );
+    assert!(!quit_text(&mut keep).contains("Resíduos"));
+}
+
+#[test]
+fn second_ctrl_c_forces_quit() {
+    let mut a = unconfirmed();
+    update(&mut a, ready("a"));
+    assert!(update(&mut a, ctrl('c')).is_empty());
+    assert!(confirm_open(&a));
+    assert_eq!(update(&mut a, ctrl('c')), vec![Cmd::Quit]);
+    // Also after quitting was confirmed and the job seems stuck.
+    let mut b = unconfirmed();
+    update(&mut b, ready("a"));
+    update(&mut b, ctrl('c'));
+    assert!(update(&mut b, key(KeyCode::Enter)).is_empty());
+    assert_eq!(update(&mut b, ctrl('c')), vec![Cmd::Quit]);
+    // A plan's confirmation still ignores Ctrl+C.
+    let mut c = app();
+    update(&mut c, ready("a"));
+    assert!(update(&mut c, ctrl('c')).is_empty());
 }
