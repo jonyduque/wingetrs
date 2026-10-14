@@ -859,6 +859,23 @@ async fn offline_is_retry_not_absent() {
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/busy.png"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let png = b"not really a png".to_vec();
+    Mock::given(method("GET"))
+        .and(path("/ok.png"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(png.clone()))
+        .mount(&server)
+        .await;
+    // Every path answers 503: a twin candidate's details on a busy CDN.
+    let busy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&busy)
+        .await;
     let icon = |url: String| IconRef {
         url,
         sha256: "ab".repeat(32),
@@ -870,6 +887,18 @@ async fn offline_is_retry_not_absent() {
     // The icon is gone from its host.
     let got = fetch_icon(&http, &blobs, &icon(format!("{}/gone.png", server.uri()))).await;
     assert_eq!(got.err(), Some(IconOutcome::Absent));
+    // The icon host is in trouble for now.
+    let got = fetch_icon(&http, &blobs, &icon(format!("{}/busy.png", server.uri()))).await;
+    assert_eq!(got.err(), Some(IconOutcome::Retry));
+    // Downloaded and verified, but the blob store cannot be written (its dir is a file).
+    let not_a_dir = dir.path().join("file");
+    std::fs::write(&not_a_dir, b"x").unwrap();
+    let ok = IconRef {
+        url: format!("{}/ok.png", server.uri()),
+        sha256: hex::encode(Sha256::digest(&png)),
+    };
+    let got = fetch_icon(&http, &BlobStore::new(not_a_dir), &ok).await;
+    assert_eq!(got.err(), Some(IconOutcome::Retry));
     // A manifest without `Icons`.
     let bare = PackageDetails {
         source: SourceKind::Winget,
@@ -912,6 +941,10 @@ async fn offline_is_retry_not_absent() {
         }
     };
     assert_eq!(twin(closed.clone()).await, Some(IconOutcome::Retry));
+    assert_eq!(
+        twin(format!("{}/", busy.uri())).await,
+        Some(IconOutcome::Retry)
+    );
     assert_eq!(
         twin(format!("{}/", server.uri())).await,
         Some(IconOutcome::Absent)

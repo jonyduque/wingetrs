@@ -1083,8 +1083,9 @@ async fn twin_icon(
     let pkgs = match read.await {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
+            // E.g. the catalog being replaced by an update: may pass.
             tracing::debug!(app = %scoop_app, error = %e, "winget candidates not read");
-            return Err(IconOutcome::Absent);
+            return Err(IconOutcome::Retry);
         }
         Err(e) => match e.try_into_panic() {
             Ok(p) => std::panic::resume_unwind(p),

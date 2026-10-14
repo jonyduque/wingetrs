@@ -194,6 +194,9 @@ fn details_are_sent_before_the_twin_search() {
     // `details_icon` is where the twin search (`icon_ref`) starts.
     let twin = body.find("details_icon(").unwrap();
     assert!(sent < twin, "{body}");
+    if let Some(direct) = body.find("icon_ref(") {
+        assert!(sent < direct, "{body}");
+    }
     let icon = src.find("async fn details_icon").unwrap();
     let icon_body = &src[icon..icon + src[icon..].find("async fn load_details").unwrap()];
     assert!(icon_body.contains("icon_ref("), "{icon_body}");
