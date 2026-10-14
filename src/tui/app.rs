@@ -252,6 +252,12 @@ pub enum Cmd {
         sha: String,
         size: (u16, u16),
     },
+    /// Fetch the icons of these visible winget rows (details, then icon) off the UI thread;
+    /// each one obtained answers with `Msg::IconMapped`. A newer generation supersedes it.
+    PrefetchIcons {
+        generation: u64,
+        keys: Vec<(String, String)>,
+    },
     /// Run `run_search` off the UI thread and answer with `Msg::SearchDone`.
     Search {
         generation: u64,
@@ -335,6 +341,12 @@ pub struct App {
     icon_in_flight: HashSet<(String, (u16, u16))>,
     /// Cached icons known to the list: `<source>/<id>` -> SHA-256 of the blob.
     pub icon_map: BTreeMap<String, String>,
+    /// `<source>/<id>` of the list rows whose icon was already asked for in this session.
+    icon_tried: HashSet<String>,
+    /// Generation of the newest `Cmd::PrefetchIcons`.
+    pub list_fetch_gen: u64,
+    /// Fetch the icons of the visible list rows.
+    pub list_icons_visible: bool,
     /// `"{source}/{id}"` of the selected package while its details are being loaded.
     pub details_pending: Option<String>,
     pub refreshing: bool,
@@ -429,6 +441,9 @@ impl App {
             icon_gen: 0,
             icon_in_flight: HashSet::new(),
             icon_map: BTreeMap::new(),
+            icon_tried: HashSet::new(),
+            list_fetch_gen: 0,
+            list_icons_visible: true,
             details_pending: None,
             refreshing: false,
             offline: false,
@@ -765,6 +780,46 @@ impl App {
         }
     }
 
+    /// Rows of the list on screen.
+    fn list_window(&self) -> std::ops::Range<usize> {
+        crate::tui::view::list_window(
+            self.selected.min(self.visible_len().saturating_sub(1)),
+            self.scroll,
+            self.visible_len(),
+            self.page(),
+        )
+    }
+
+    /// Requests fetching the icons of the visible winget rows that are neither cached nor
+    /// already asked for in this session, in screen order; at most one command.
+    fn list_fetch_cmds(&mut self) -> Vec<Cmd> {
+        if !self.list_icons_visible
+            || self.tab == Tab::Settings
+            || !crate::tui::view::icon_visible(self)
+        {
+            return Vec::new();
+        }
+        let keys: Vec<(String, String)> = self
+            .list_keys(self.list_window())
+            .into_iter()
+            .flatten()
+            .filter(|(source, id)| {
+                let key = format!("{source}/{id}");
+                source == "winget"
+                    && !self.icon_map.contains_key(&key)
+                    && self.icon_tried.insert(key)
+            })
+            .collect();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        self.list_fetch_gen += 1;
+        vec![Cmd::PrefetchIcons {
+            generation: self.list_fetch_gen,
+            keys,
+        }]
+    }
+
     /// Requests encoding of the visible rows' cached icons that are neither encoded, being
     /// encoded, nor known to be undecodable; at most `MAX_ICON_JOBS` in flight. The bytes
     /// come from the blob store (never the network) on a worker.
@@ -776,14 +831,8 @@ impl App {
             return Vec::new();
         }
         let size = (LIST_ICON_COLS, ITEM_ROWS as u16);
-        let window = crate::tui::view::list_window(
-            self.selected.min(self.visible_len().saturating_sub(1)),
-            self.scroll,
-            self.visible_len(),
-            self.page(),
-        );
         let mut cmds = Vec::new();
-        for (source, id) in self.list_keys(window).into_iter().flatten() {
+        for (source, id) in self.list_keys(self.list_window()).into_iter().flatten() {
             if self.icon_in_flight.len() >= MAX_ICON_JOBS {
                 break;
             }
@@ -861,10 +910,12 @@ impl App {
     }
 }
 
-/// Applies `msg`; the result also asks for the visible list rows' cached icons.
+/// Applies `msg`; the result also asks for the visible list rows' cached icons and for
+/// fetching those not tried yet.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
     let mut cmds = apply(app, msg);
     cmds.extend(app.list_icon_cmds());
+    cmds.extend(app.list_fetch_cmds());
     cmds
 }
 

@@ -2063,8 +2063,9 @@ fn icon_requests_are_capped() {
 }
 
 #[test]
-fn list_never_fetches_icons() {
-    // Visible rows without a cached icon produce no request of any kind.
+fn list_encodes_only_cached_icons() {
+    // Visible rows without a cached icon produce no encode request (fetching them is
+    // `Cmd::PrefetchIcons`, which answers with `Msg::IconMapped`).
     let mut a = icon_app(50, 10);
     let mut cmds = update(&mut a, Msg::IconMapLoaded(Default::default()));
     cmds.extend(
@@ -2073,6 +2074,7 @@ fn list_never_fetches_icons() {
             .filter(|c| !matches!(c, Cmd::LoadDetails { .. })),
     );
     cmds.extend(update(&mut a, Msg::Resize(100, 60)));
+    cmds.retain(|c| !matches!(c, Cmd::PrefetchIcons { .. }));
     assert!(cmds.is_empty(), "{cmds:?}");
     // With a cached one the only request is a read-and-encode of that blob.
     let hit = map_of(&a, 0..3, &[1]);
@@ -2130,6 +2132,8 @@ fn icon_encoded_for_an_old_protocol_is_discarded() {
     let mut a = app();
     a.icon_protocol = IconProtocol::Iterm2;
     a.settings.icons = "iterm2".into();
+    // The list's icon fetch is not under test here.
+    a.list_icons_visible = false;
     let k = selected_icon_key(&a);
     let cmds = update(
         &mut a,
@@ -2504,4 +2508,114 @@ fn rescan_keeps_the_selected_item() {
     update(&mut a, Msg::InstalledLoaded(rows));
     assert_eq!(a.selected_key().unwrap().1, "charlie");
     assert_eq!(a.selected, 2);
+}
+
+/// `(generation, keys)` of every `Cmd::PrefetchIcons` in `cmds`.
+fn prefetches(cmds: &[Cmd]) -> Vec<(u64, Vec<(String, String)>)> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            Cmd::PrefetchIcons { generation, keys } => Some((*generation, keys.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The winget rows of `window`, in screen order.
+fn winget_keys(a: &App, window: std::ops::Range<usize>) -> Vec<(String, String)> {
+    a.list_keys(window)
+        .into_iter()
+        .flatten()
+        .filter(|(s, _)| s == "winget")
+        .collect()
+}
+
+#[test]
+fn prefetch_asks_for_visible_winget_rows_once() {
+    let mut a = app();
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    assert_eq!(a.list_keys(0..3).into_iter().flatten().count(), 3);
+    let want = winget_keys(&a, 0..3);
+    assert_eq!(want.len(), 2, "{want:?}");
+    let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, want);
+    // The same screen again asks for nothing.
+    assert!(prefetches(&update(&mut a, Msg::Resize(100, 40))).is_empty());
+    assert!(prefetches(&update(&mut a, Msg::Tick)).is_empty());
+}
+
+#[test]
+fn prefetch_skips_mapped_and_off() {
+    let mut a = app();
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let all = winget_keys(&a, 0..3);
+    let (s, id) = &all[0];
+    a.icon_map.insert(format!("{s}/{id}"), "sha".into());
+    let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].1, vec![all[1].clone()]);
+
+    let mut off = app();
+    assert_eq!(off.icon_protocol, wingetrs::tui::icons::IconProtocol::Off);
+    assert!(prefetches(&update(&mut off, Msg::Resize(100, 40))).is_empty());
+
+    let mut modal = app();
+    modal.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    modal.modal = Some(Modal::Running {
+        label: "x".into(),
+        progress: None,
+    });
+    assert!(prefetches(&update(&mut modal, Msg::Resize(100, 40))).is_empty());
+    // Closing it asks for the rows now in view.
+    modal.modal = None;
+    assert_eq!(prefetches(&update(&mut modal, Msg::Tick)).len(), 1);
+
+    let mut help = app();
+    help.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    help.show_help = true;
+    assert!(prefetches(&update(&mut help, Msg::Resize(100, 40))).is_empty());
+
+    let mut hidden = app();
+    hidden.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    hidden.list_icons_visible = false;
+    assert!(prefetches(&update(&mut hidden, Msg::Resize(100, 40))).is_empty());
+}
+
+#[test]
+fn scrolling_bumps_the_generation() {
+    let mut a = icon_app(50, 10);
+    let first = a.list_fetch_gen;
+    assert!(first > 0, "the first screen was asked for");
+    let mut got = Vec::new();
+    for _ in 0..10 {
+        got.extend(prefetches(&update(&mut a, key(KeyCode::Down))));
+    }
+    // One row scrolled in: only it is asked for.
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].0 > first);
+    assert_eq!(got[0].1, winget_keys(&a, 10..11));
+    let second = got[0].0;
+    let got = prefetches(&update(&mut a, key(KeyCode::End)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].0 > second);
+    assert_eq!(got[0].1, winget_keys(&a, 40..50));
+}
+
+#[test]
+fn icon_mapped_encodes_the_visible_row() {
+    let mut a = icon_app(50, 10);
+    let (s, id) = winget_keys(&a, 3..4).remove(0);
+    let cmds = update(
+        &mut a,
+        Msg::IconMapped {
+            key: format!("{s}/{id}"),
+            sha: "fresh".into(),
+        },
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(c,
+            Cmd::EncodeCachedIcon { source, id: i, sha, .. }
+                if *source == s && *i == id && sha == "fresh")),
+        "{cmds:?}"
+    );
 }

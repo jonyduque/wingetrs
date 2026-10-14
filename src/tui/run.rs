@@ -27,6 +27,10 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const TICK: Duration = Duration::from_millis(100);
 const DETAILS_DEBOUNCE: Duration = Duration::from_millis(150);
+/// Wait before fetching the list's icons; a newer screen meanwhile drops the request.
+const LIST_FETCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// Most list packages whose icon is being fetched at once.
+pub const MAX_LIST_FETCH: usize = 4;
 /// Most messages folded into one frame.
 const BATCH_CAP: usize = 256;
 /// A `draw` slower than this (one 60 Hz frame) is logged at debug level.
@@ -98,6 +102,10 @@ struct Ctx {
     tx: UnboundedSender<Msg>,
     /// Generation of the newest detail request; older ones are dropped after the debounce.
     details_gen: AtomicU64,
+    /// Generation of the newest list icon prefetch; older ones stop starting packages.
+    list_fetch_gen: AtomicU64,
+    /// Slots for list packages being fetched, shared by every generation.
+    list_fetch_slots: Arc<tokio::sync::Semaphore>,
     /// Encoder for package icons; `None` when icons are off.
     icon_picker: std::sync::Mutex<Option<ratatui_image::picker::Picker>>,
 }
@@ -175,6 +183,8 @@ async fn event_loop(
         http: Http::new()?,
         tx,
         details_gen: AtomicU64::new(0),
+        list_fetch_gen: AtomicU64::new(0),
+        list_fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_LIST_FETCH)),
         // After `ratatui::init`, so the pixel size is that of the terminal in use.
         icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
     });
@@ -308,6 +318,7 @@ async fn event_loop(
                     sha,
                     size,
                 } => spawn_cached_icon(&ctx, generation, source, id, sha, size),
+                Cmd::PrefetchIcons { generation, keys } => spawn_prefetch(&ctx, generation, keys),
                 Cmd::Execute(action) => spawn_execute(&ctx, action),
                 Cmd::CleanResidues { app, residues } => spawn_clean(&ctx, app, residues),
                 Cmd::Search {
@@ -675,6 +686,109 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
             let _ = ctx.tx.send(Msg::IconLoaded { key, bytes });
         }
     });
+}
+
+/// Debounced fetch of the visible list rows' icons through the details path; dropped when
+/// a newer screen supersedes it. Sends only `Msg::IconMapped`, never the details.
+fn spawn_prefetch(ctx: &Arc<Ctx>, generation: u64, keys: Vec<(String, String)>) {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        let work = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let fetch = |source: String, id: String| {
+                    let ctx = Arc::clone(&ctx);
+                    async move { prefetch_one(&ctx, &source, &id).await }
+                };
+                prefetch_list(
+                    &ctx.list_fetch_gen,
+                    generation,
+                    LIST_FETCH_DEBOUNCE,
+                    &ctx.list_fetch_slots,
+                    keys,
+                    fetch,
+                )
+                .await;
+            }
+        });
+        match work.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => {
+                let _ = ctx.tx.send(Msg::Panicked(e.into_panic()));
+            }
+            Err(e) => tracing::debug!(error = %e, "list icon prefetch cancelled"),
+        }
+    });
+}
+
+/// Details, then icon, of one list package; announces the icon when it was obtained.
+async fn prefetch_one(ctx: &Ctx, source: &str, id: &str) {
+    let icon = match load_details(ctx, source, id).await {
+        Ok(d) => d.icon,
+        Err(e) => {
+            tracing::debug!(%source, %id, error = %e, "list details not loaded");
+            return;
+        }
+    };
+    if load_icon(ctx, source, id, icon.as_ref()).await.is_some()
+        && let Some(icon) = icon
+    {
+        let _ = ctx.tx.send(Msg::IconMapped {
+            key: format!("{source}/{id}"),
+            sha: icon.sha256,
+        });
+    }
+}
+
+/// True while `mine` is still the newest list prefetch.
+pub fn still_current(generation: &AtomicU64, mine: u64) -> bool {
+    generation.load(Ordering::SeqCst) == mine
+}
+
+/// Marks `mine` as the newest prefetch, waits `debounce`, then runs `fetch` for each key in
+/// order, each on its own task holding one of `slots`. The generation is checked before
+/// each package starts; once superseded, the rest is skipped. Every task is awaited, and a
+/// panic in one is re-raised here after the others end.
+pub async fn prefetch_list<F, Fut>(
+    generation: &AtomicU64,
+    mine: u64,
+    debounce: Duration,
+    slots: &Arc<tokio::sync::Semaphore>,
+    keys: Vec<(String, String)>,
+    fetch: F,
+) where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    generation.store(mine, Ordering::SeqCst);
+    tokio::time::sleep(debounce).await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for (source, id) in keys {
+        let Ok(slot) = Arc::clone(slots).acquire_owned().await else {
+            break;
+        };
+        if !still_current(generation, mine) {
+            break;
+        }
+        let job = fetch(source, id);
+        tasks.spawn(async move {
+            job.await;
+            drop(slot);
+        });
+    }
+    let mut panic = None;
+    while let Some(done) = tasks.join_next().await {
+        match done {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => {
+                panic.get_or_insert(e.into_panic());
+            }
+            Err(e) => tracing::debug!(error = %e, "list icon task cancelled"),
+        }
+    }
+    if let Some(p) = panic {
+        std::panic::resume_unwind(p);
+    }
 }
 
 /// Icon bytes for the details; any failure is only logged, never an error of the details.

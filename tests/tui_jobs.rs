@@ -538,3 +538,145 @@ async fn purge_plan_says_data_will_be_deleted() {
     assert!(text.contains("mantidos"), "{text}");
     assert!(!p.purge);
 }
+
+mod prefetch {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+    use wingetrs::tui::run::{MAX_LIST_FETCH, prefetch_list};
+
+    fn keys(n: usize) -> Vec<(String, String)> {
+        (0..n).map(|i| ("winget".into(), format!("k{i}"))).collect()
+    }
+
+    fn slots() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(MAX_LIST_FETCH))
+    }
+
+    /// Waits (hang detector: 10 s) until `n` reaches `want`.
+    async fn wait_for(n: &AtomicUsize, want: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while n.load(Ordering::SeqCst) < want {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("never reached");
+    }
+
+    #[tokio::test]
+    async fn prefetch_drops_superseded_generation() {
+        let generation = AtomicU64::new(0);
+        let slots = slots();
+        let (old, new) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let counting = |n: &Arc<AtomicUsize>| {
+            let n = Arc::clone(n);
+            move |_: String, _: String| {
+                let n = Arc::clone(&n);
+                async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+        let debounce = Duration::from_millis(50);
+        tokio::join!(
+            prefetch_list(&generation, 1, debounce, &slots, keys(3), counting(&old)),
+            prefetch_list(&generation, 2, debounce, &slots, keys(3), counting(&new)),
+        );
+        assert_eq!(old.load(Ordering::SeqCst), 0, "the superseded one fetched");
+        assert_eq!(new.load(Ordering::SeqCst), 3);
+    }
+
+    /// Fetches that count themselves and wait for `gate` before ending.
+    fn gated(
+        started: &Arc<AtomicUsize>,
+        running: &Arc<AtomicUsize>,
+        peak: &Arc<AtomicUsize>,
+        gate: &Arc<Semaphore>,
+    ) -> impl Fn(String, String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + use<> {
+        let (started, running, peak, gate) = (
+            Arc::clone(started),
+            Arc::clone(running),
+            Arc::clone(peak),
+            Arc::clone(gate),
+        );
+        move |_, _| {
+            let (started, running, peak, gate) = (
+                Arc::clone(&started),
+                Arc::clone(&running),
+                Arc::clone(&peak),
+                Arc::clone(&gate),
+            );
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                gate.acquire().await.unwrap().forget();
+                running.fetch_sub(1, Ordering::SeqCst);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_runs_at_most_four_at_once() {
+        let counters: [Arc<AtomicUsize>; 3] = Default::default();
+        let [started, running, peak] = &counters;
+        let gate = Arc::new(Semaphore::new(0));
+        let generation = Arc::new(AtomicU64::new(0));
+        let fetch = gated(started, running, peak, &gate);
+        let run = tokio::spawn({
+            let generation = Arc::clone(&generation);
+            async move { prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await }
+        });
+        wait_for(started, MAX_LIST_FETCH).await;
+        // Room for a fifth to start if the limit were missing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gate.add_permits(8);
+        run.await.unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 8);
+        assert_eq!(peak.load(Ordering::SeqCst), MAX_LIST_FETCH);
+    }
+
+    #[tokio::test]
+    async fn prefetch_checks_the_generation_before_each_package() {
+        let counters: [Arc<AtomicUsize>; 3] = Default::default();
+        let [started, running, peak] = &counters;
+        let gate = Arc::new(Semaphore::new(0));
+        let generation = Arc::new(AtomicU64::new(0));
+        let fetch = gated(started, running, peak, &gate);
+        let run = tokio::spawn({
+            let generation = Arc::clone(&generation);
+            async move { prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await }
+        });
+        wait_for(started, MAX_LIST_FETCH).await;
+        // A newer screen while the first four run: the other four never start.
+        generation.store(2, Ordering::SeqCst);
+        gate.add_permits(8);
+        run.await.unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), MAX_LIST_FETCH);
+    }
+
+    #[tokio::test]
+    async fn prefetch_reraises_a_package_panic_after_the_others_end() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let fetch = {
+            let done = Arc::clone(&done);
+            move |_: String, id: String| {
+                let done = Arc::clone(&done);
+                async move {
+                    assert_ne!(id, "k1", "boom");
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        };
+        let run = tokio::spawn(async move {
+            let generation = AtomicU64::new(0);
+            prefetch_list(&generation, 1, Duration::ZERO, &slots(), keys(8), fetch).await
+        });
+        let err = run.await.unwrap_err();
+        assert!(err.is_panic());
+        assert_eq!(done.load(Ordering::SeqCst), 7);
+    }
+}
