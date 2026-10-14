@@ -1013,7 +1013,7 @@ impl App {
         )
     }
 
-    /// Requests fetching the icons of the visible winget rows that are neither cached nor
+    /// Requests fetching the icons of the visible rows that are neither cached nor
     /// done, in screen order; at most one command. Only when some row is not in the previous
     /// request: the new one covers every visible row, so superseding the old loses nothing,
     /// and rows ending never ask again.
@@ -1028,7 +1028,6 @@ impl App {
             .list_keys(self.list_window())
             .into_iter()
             .flatten()
-            .filter(|(source, _)| source == "winget")
             .map(|(source, id)| {
                 let key = format!("{source}/{id}");
                 ((source, id), key)

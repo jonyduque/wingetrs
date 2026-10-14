@@ -579,6 +579,38 @@ impl Catalog {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Winget ids whose moniker, name or id tail (after the last `.`) normalizes to the same
+    /// letters and digits as a Scoop app name; at most 5, ordered by id.
+    pub fn winget_candidates(&self, scoop_name: &str) -> Result<Vec<String>, CatalogError> {
+        const MAX: usize = 5;
+        let want = crate::sources::scoop::winget_match::norm(scoop_name);
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut st = self.conn.prepare_cached(
+            "SELECT id, name, moniker FROM packages WHERE source = 'winget' ORDER BY id",
+        )?;
+        let mut rows = st.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let id: String = r.get(0)?;
+            let name: String = r.get(1)?;
+            let moniker: Option<String> = r.get(2)?;
+            let tail = id.rsplit('.').next().unwrap_or(&id);
+            let hit = [Some(tail), Some(name.as_str()), moniker.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|s| crate::sources::scoop::winget_match::norm(s) == want);
+            if hit {
+                out.push(id);
+                if out.len() == MAX {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn is_empty(&self) -> Result<bool, CatalogError> {
         let n: i64 = self
             .conn

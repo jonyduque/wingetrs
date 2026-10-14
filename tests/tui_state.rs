@@ -2510,22 +2510,18 @@ fn prefetches(cmds: &[Cmd]) -> Vec<(u64, Vec<(String, String)>)> {
         .collect()
 }
 
-/// The winget rows of `window`, in screen order.
-fn winget_keys(a: &App, window: std::ops::Range<usize>) -> Vec<(String, String)> {
-    a.list_keys(window)
-        .into_iter()
-        .flatten()
-        .filter(|(s, _)| s == "winget")
-        .collect()
+/// The rows of `window`, in screen order.
+fn row_keys(a: &App, window: std::ops::Range<usize>) -> Vec<(String, String)> {
+    a.list_keys(window).into_iter().flatten().collect()
 }
 
 #[test]
-fn prefetch_asks_for_visible_winget_rows_once() {
+fn prefetch_asks_for_visible_rows_once() {
     let mut a = app();
     a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
     assert_eq!(a.list_keys(0..3).into_iter().flatten().count(), 3);
-    let want = winget_keys(&a, 0..3);
-    assert_eq!(want.len(), 2, "{want:?}");
+    let want = row_keys(&a, 0..3);
+    assert_eq!(want.len(), 3, "{want:?}");
     let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].1, want);
@@ -2538,12 +2534,12 @@ fn prefetch_asks_for_visible_winget_rows_once() {
 fn prefetch_skips_mapped_and_off() {
     let mut a = app();
     a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
-    let all = winget_keys(&a, 0..3);
+    let all = row_keys(&a, 0..3);
     let (s, id) = &all[0];
     a.icon_map.insert(format!("{s}/{id}"), "sha".into());
     let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].1, vec![all[1].clone()]);
+    assert_eq!(got[0].1, all[1..].to_vec());
 
     let mut off = app();
     assert_eq!(off.icon_protocol, wingetrs::tui::icons::IconProtocol::Off);
@@ -2581,18 +2577,18 @@ fn scrolling_bumps_the_generation() {
     // superseding the first one loses nothing still on screen.
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].0 > first);
-    assert_eq!(got[0].1, winget_keys(&a, 1..11));
+    assert_eq!(got[0].1, row_keys(&a, 1..11));
     let second = got[0].0;
     let got = prefetches(&update(&mut a, key(KeyCode::End)));
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].0 > second);
-    assert_eq!(got[0].1, winget_keys(&a, 40..50));
+    assert_eq!(got[0].1, row_keys(&a, 40..50));
 }
 
 #[test]
 fn icon_mapped_encodes_the_visible_row() {
     let mut a = icon_app(50, 10);
-    let (s, id) = winget_keys(&a, 3..4).remove(0);
+    let (s, id) = row_keys(&a, 3..4).remove(0);
     let cmds = update(
         &mut a,
         Msg::IconMapped {
@@ -2620,7 +2616,7 @@ fn done(a: &mut App, (s, id): &(String, String)) -> Vec<Cmd> {
 #[test]
 fn alternating_screens_converge() {
     let mut a = icon_app(50, 10);
-    let first = winget_keys(&a, 0..10);
+    let first = row_keys(&a, 0..10);
     // Nothing changes on screen: nothing more is asked.
     let size = a.size;
     for _ in 0..5 {
@@ -2634,12 +2630,12 @@ fn alternating_screens_converge() {
     };
     let got = scroll(&mut a, KeyCode::Down);
     assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].1, winget_keys(&a, 1..11));
+    assert_eq!(got[0].1, row_keys(&a, 1..11));
     let got = scroll(&mut a, KeyCode::Up);
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].1, first);
     // Once every attempt is done, going back and forth asks for nothing.
-    for k in winget_keys(&a, 0..11) {
+    for k in row_keys(&a, 0..11) {
         assert!(prefetches(&done(&mut a, &k)).is_empty());
     }
     for _ in 0..3 {
@@ -2651,7 +2647,7 @@ fn alternating_screens_converge() {
 #[test]
 fn shrinking_never_reemits() {
     let mut a = icon_app(50, 10);
-    let keys = winget_keys(&a, 0..10);
+    let keys = row_keys(&a, 0..10);
     assert!(prefetches(&done(&mut a, &keys[0])).is_empty());
     let (s, id) = &keys[1];
     let mapped = update(
@@ -2671,7 +2667,7 @@ fn shrinking_never_reemits() {
         got.extend(prefetches(&update(&mut a, key(KeyCode::Up))));
     }
     let mut want = keys[2..].to_vec();
-    want.extend(winget_keys(&a, 10..11));
+    want.extend(row_keys(&a, 10..11));
     assert_eq!(got.len(), 1, "{got:?}");
     assert_eq!(got[0].1, want);
 }
@@ -3891,4 +3887,19 @@ fn override_saved_toasts_and_rescans() {
             .iter()
             .any(|t| t.text == "correspondência salva: A.A")
     );
+}
+
+#[test]
+fn scoop_rows_are_prefetched() {
+    let mut a = ten_hits();
+    a.icon_protocol = wingetrs::tui::icons::IconProtocol::Sixel;
+    let got = prefetches(&update(&mut a, Msg::Resize(100, 40)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    let scoop = a.list_keys(0..10).into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(scoop.len(), 10);
+    assert!(
+        scoop.iter().all(|(s, _)| s.starts_with("scoop")),
+        "{scoop:?}"
+    );
+    assert_eq!(got[0].1, scoop);
 }

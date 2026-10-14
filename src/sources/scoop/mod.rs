@@ -1,6 +1,7 @@
 //! Scoop source.
 pub mod bucket;
 pub mod manifest;
+pub mod winget_match;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScoopError {

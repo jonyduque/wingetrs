@@ -642,3 +642,39 @@ fn removing_a_winget_source_still_drops_its_maps() {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+#[test]
+fn winget_candidates_match_moniker_name_and_id_tail() {
+    let mut c = Catalog::open_in_memory().unwrap();
+    let mut rg = pkg("BurntSushi.ripgrep.MSVC", "Ripgrep (MSVC)", "1");
+    rg.moniker = Some("rg".into());
+    let many: Vec<NewPackage> = (0..7)
+        .map(|i| pkg(&format!("Many.P{i}"), "Many", "1"))
+        .collect();
+    let mut all = vec![
+        rg,
+        pkg("Foo.Ripgrep", "Foo Ripgrep", "1"),
+        pkg("X.Other", "Other", "1"),
+    ];
+    all.extend(many);
+    c.replace_source(
+        "winget",
+        SourceKind::Winget,
+        "1",
+        0,
+        &all,
+        &WingetMaps::default(),
+    )
+    .unwrap();
+    assert_eq!(c.winget_candidates("ripgrep").unwrap(), ["Foo.Ripgrep"]);
+    assert_eq!(
+        c.winget_candidates("rg").unwrap(),
+        ["BurntSushi.ripgrep.MSVC"]
+    );
+    let many = c.winget_candidates("many").unwrap();
+    assert_eq!(
+        many,
+        ["Many.P0", "Many.P1", "Many.P2", "Many.P3", "Many.P4"]
+    );
+    assert!(c.winget_candidates("").unwrap().is_empty());
+}

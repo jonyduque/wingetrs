@@ -946,30 +946,79 @@ async fn load_details(
     }
     .context("pacote não encontrado no catálogo")?;
     match pkg.entry.source {
-        SourceKind::Winget => {
-            let hash = pkg
-                .winget_hash
-                .as_deref()
-                .context("pacote winget sem hash de manifesto")?;
-            let blobs = BlobStore::new(ctx.data.blobs_dir());
-            Ok(crate::sources::winget::details::details(
-                &ctx.http,
-                &blobs,
-                crate::sources::winget::CDN_BASE,
-                &pkg.entry.id,
-                hash,
-                None,
-            )
-            .await?)
-        }
+        SourceKind::Winget => winget_details(ctx, &pkg).await,
         SourceKind::Scoop => {
             let raw = pkg.raw.as_deref().context("pacote scoop sem manifesto")?;
-            Ok(crate::sources::scoop::manifest::details_from_raw(
-                &pkg.entry.id,
-                raw,
-            )?)
+            let mut d = crate::sources::scoop::manifest::details_from_raw(&pkg.entry.id, raw)?;
+            if let Some(home) = d.homepage.clone() {
+                d.icon = twin_icon(ctx, &pkg.entry.id, &home).await;
+            }
+            Ok(d)
         }
     }
+}
+
+async fn winget_details(
+    ctx: &Ctx,
+    pkg: &crate::catalog::StoredPackage,
+) -> anyhow::Result<crate::core::PackageDetails> {
+    let hash = pkg
+        .winget_hash
+        .as_deref()
+        .context("pacote winget sem hash de manifesto")?;
+    let blobs = BlobStore::new(ctx.data.blobs_dir());
+    Ok(crate::sources::winget::details::details(
+        &ctx.http,
+        &blobs,
+        crate::sources::winget::CDN_BASE,
+        &pkg.entry.id,
+        hash,
+        None,
+    )
+    .await?)
+}
+
+/// Icon of the winget package that is the same app as a Scoop one: named alike and with the
+/// same homepage site, exactly one. Any failure only means "no twin".
+async fn twin_icon(ctx: &Ctx, scoop_app: &str, homepage: &str) -> Option<crate::core::IconRef> {
+    let (data_path, name) = (ctx.data.catalog_path(), scoop_app.to_owned());
+    let read = tokio::task::spawn_blocking(move || {
+        let catalog = jobs::open_catalog_for_reading(&data_path)?;
+        let mut out = Vec::new();
+        for id in catalog.winget_candidates(&name)? {
+            if let Some(p) = catalog.get("winget", &id)? {
+                out.push(p);
+            }
+        }
+        anyhow::Ok(out)
+    });
+    let pkgs = match read.await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            tracing::debug!(app = %scoop_app, error = %e, "winget candidates not read");
+            return None;
+        }
+        Err(e) => match e.try_into_panic() {
+            Ok(p) => std::panic::resume_unwind(p),
+            Err(e) => {
+                tracing::debug!(error = %e, "winget candidates cancelled");
+                return None;
+            }
+        },
+    };
+    let mut details = Vec::new();
+    for pkg in &pkgs {
+        match winget_details(ctx, pkg).await {
+            Ok(d) => details.push(d),
+            Err(e) => tracing::debug!(id = %pkg.entry.id, error = %e, "twin details not loaded"),
+        }
+    }
+    let cands: Vec<(String, Option<String>)> = details
+        .iter()
+        .map(|d| (d.id.clone(), d.homepage.clone()))
+        .collect();
+    let id = crate::sources::scoop::winget_match::pick(homepage, &cands)?;
+    details.into_iter().find(|d| d.id == id)?.icon
 }
 
 #[cfg(windows)]
