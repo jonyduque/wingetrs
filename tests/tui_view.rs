@@ -2142,3 +2142,17 @@ fn help_key_is_bold() {
     let theme = Theme::new(true, ColorDepth::TrueColor);
     assert!(theme.help_key().add_modifier.contains(Modifier::BOLD));
 }
+
+#[test]
+fn empty_filter_message() {
+    use wingetrs::tui::app::{ShowFilter, SourceFilter, Tab};
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.tab = Tab::Installed;
+    assert!(render(&a, 100, 24).contains("nenhum pacote instalado encontrado"));
+    a.show = ShowFilter::Duplicates;
+    let text = render(&a, 100, 24);
+    assert!(text.contains("nenhum pacote neste filtro"), "{text}");
+    a.show = ShowFilter::All;
+    a.filter = SourceFilter::Scoop;
+    assert!(render(&a, 100, 24).contains("nenhum pacote neste filtro"));
+}

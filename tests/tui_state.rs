@@ -4344,3 +4344,36 @@ fn help_bar_has_no_arrows_and_new_labels() {
     }
     assert!(!text.contains("↑/↓") && !text.contains("←/→"), "{text}");
 }
+
+#[test]
+fn show_filter_only_in_installed() {
+    let mut rows = show_rows();
+    for r in &mut rows {
+        r.state = UpdateState::Available { latest: "2".into() };
+    }
+    let mut a = on_tab(Tab::Installed, rows.clone());
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.show, ShowFilter::Unmatched);
+    assert_eq!(a.visible_len(), 2);
+    a.tab = Tab::Updates;
+    assert_eq!(a.visible_len(), rows.len());
+}
+
+#[test]
+fn ctrl_e_keeps_selection() {
+    let mut a = on_tab(Tab::Installed, show_rows());
+    // Name order: ambiguous, dup, matched, unmatched; select "unmatched" (visible under Unmatched).
+    let pos = a
+        .installed_view()
+        .iter()
+        .position(|r| r.name == "unmatched")
+        .unwrap();
+    a.selected = pos;
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.installed_view()[a.selected].name, "unmatched");
+    assert_ne!(a.selected, pos);
+    // "unmatched" is hidden under Duplicates: selection falls to 0.
+    update(&mut a, ctrl('e'));
+    assert_eq!(a.selected, 0);
+    assert_eq!(a.installed_view()[0].name, "dup");
+}
