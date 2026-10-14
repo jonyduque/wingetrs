@@ -1430,6 +1430,10 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 app.refresh_forced = true;
                 vec![Cmd::Refresh { force: true }]
             }
+            KeyCode::Char(' ') if app.tab != Tab::Settings => {
+                app.toggle_mark();
+                Vec::new()
+            }
             KeyCode::Char('s') => {
                 app.filter = match app.filter {
                     SourceFilter::All => SourceFilter::Winget,
@@ -1507,7 +1511,11 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             app.show_help = true;
             Vec::new()
         }
-        KeyCode::Char(' ') if app.tab != Tab::Settings => {
+        KeyCode::Insert if app.tab != Tab::Settings => {
+            app.toggle_mark();
+            Vec::new()
+        }
+        KeyCode::Char(' ') if empty && app.tab != Tab::Settings => {
             app.toggle_mark();
             Vec::new()
         }

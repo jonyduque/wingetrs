@@ -1060,16 +1060,19 @@ fn hints_change_with_the_tab() {
     use wingetrs::tui::help::hints;
     let mut a = App::new(entries(), GlyphSet::Ascii);
     a.tab = Tab::Search;
-    assert_eq!(keys_of(&hints(&a)), ["↑/↓", "←/→", "enter", "ctrl+s", "?"]);
+    assert_eq!(
+        keys_of(&hints(&a)),
+        ["↑/↓", "←/→", "enter", "espaço", "ctrl+s", "?"]
+    );
     a.tab = Tab::Installed;
     assert_eq!(
         keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "u", "o", "ctrl+s", "?"]
+        ["↑/↓", "←/→", "enter", "u", "o", "espaço", "ctrl+s", "?"]
     );
     a.tab = Tab::Updates;
     assert_eq!(
         keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "o", "ctrl+s", "?"]
+        ["↑/↓", "←/→", "enter", "o", "espaço", "ctrl+s", "?"]
     );
     assert!(!keys_of(&hints(&a)).contains(&"esc".to_string()));
 }

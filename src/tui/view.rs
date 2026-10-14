@@ -973,7 +973,7 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
 }
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 16 + 2 * DIALOG_PAD_Y);
+    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 17 + 2 * DIALOG_PAD_Y);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(
@@ -988,7 +988,8 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("PgUp PgDn", "mover de 10 em 10"),
         key("←→ / Tab", "trocar aba"),
         key("Enter", "foco nos detalhes"),
-        key("Espaço", "marcar / desmarcar"),
+        key("Espaço", "marcar (busca vazia)"),
+        key("Ins Ctrl+Esp", "marcar (sempre)"),
         key("i", "instalar (aba Busca, scoop)"),
         key("u", "remover (aba Instalados)"),
         key("U", "atualizar (aba Atualizações)"),

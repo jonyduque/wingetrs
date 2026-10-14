@@ -43,6 +43,11 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         }
         Tab::Settings => {}
     }
+    if app.query.is_empty() {
+        out.push(("espaço", "marcar"));
+    } else {
+        out.push(("ins", "marcar"));
+    }
     out.push(("ctrl+s", "fonte"));
     if queue {
         out.push(("f", "fila"));

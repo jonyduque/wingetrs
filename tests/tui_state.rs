@@ -3644,3 +3644,38 @@ fn esc_clears_marks_before_query() {
     assert_eq!(a.query, "");
     assert_eq!(update(&mut a, key(KeyCode::Esc)), vec![Cmd::Quit]);
 }
+
+#[test]
+fn space_types_into_nonempty_query() {
+    let mut a = app();
+    for c in "visual".chars() {
+        step(&mut a, key(KeyCode::Char(c)));
+    }
+    step(&mut a, key(KeyCode::Char(' ')));
+    for c in "studio".chars() {
+        step(&mut a, key(KeyCode::Char(c)));
+    }
+    assert_eq!(a.query, "visual studio");
+    assert_eq!(a.marked_count(), 0);
+}
+
+#[test]
+fn insert_marks_with_query() {
+    let mut a = app();
+    step(&mut a, key(KeyCode::Char('z')));
+    assert_eq!(a.visible_len(), 1);
+    step(&mut a, key(KeyCode::Insert));
+    assert_eq!(a.marked_count(), 1);
+    assert_eq!(a.query, "z");
+    step(&mut a, key(KeyCode::Insert));
+    assert_eq!(a.marked_count(), 0);
+}
+
+#[test]
+fn ctrl_space_marks_with_query() {
+    let mut a = app();
+    step(&mut a, key(KeyCode::Char('z')));
+    step(&mut a, ctrl(' '));
+    assert_eq!(a.marked_count(), 1);
+    assert_eq!(a.query, "z");
+}
