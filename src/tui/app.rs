@@ -295,8 +295,10 @@ pub enum Modal {
         pin: Option<(String, bool)>,
         /// The tab has marked rows: the items act on them, not on `app`.
         marked: bool,
-        /// Correlation item of the row (first for `Choose`, last for `Undo`).
+        /// Correlation item of the row.
         choice: Option<RowChoice>,
+        /// What each picker item does (empty when `marked`).
+        ids: Vec<ActionId>,
     },
     Residues {
         picker: Picker,
@@ -313,6 +315,18 @@ pub enum Modal {
     },
     /// The operation queue; `selected` is the id of the row under the cursor.
     Queue { selected: u64 },
+}
+
+/// What an item of the single-row actions menu does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionId {
+    Install,
+    Upgrade,
+    Remove,
+    Pin,
+    Choose,
+    UndoChoice,
+    ToggleMark,
 }
 
 /// Extra item of the actions menu that acts on the correlation of the selected installed row.
@@ -547,8 +561,6 @@ pub struct App {
     list_icons_in_flight: Option<String>,
     /// Whether terminal mouse events are acted on (the capture itself is `run`'s).
     pub mouse_enabled: bool,
-    /// Time, tab and index of the last left click, for the double click.
-    last_click: Option<(Instant, Tab, usize)>,
     /// The operation in progress; the screen stays usable meanwhile.
     pub running: Option<Running>,
     /// Confirmed actions waiting for `running`, in order.
@@ -675,7 +687,6 @@ impl App {
             icons_in_flight: None,
             list_icons_in_flight: None,
             mouse_enabled: true,
-            last_click: None,
             running: None,
             queue: VecDeque::new(),
             next_op_id: 0,
@@ -1636,13 +1647,12 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
     }
 }
 
-/// Two left clicks on the same item within this time act as `Enter`.
-pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Items a wheel notch moves the selection.
 const WHEEL_ITEMS: usize = 3;
 
-/// Mouse: left click on a tab, list item or setting row; double click is `Enter`; the wheel
-/// moves the list. Ignored under a modal or the help, and when `mouse_enabled` is off.
+/// Mouse: left click on a tab, list item (selects and toggles its mark) or setting row; right
+/// click on an item opens its actions menu; the wheel moves the list. Ignored under a modal or
+/// the help, and when `mouse_enabled` is off.
 fn on_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
     if !app.mouse_enabled || app.modal.is_some() || app.show_help {
         return Vec::new();
@@ -1653,36 +1663,27 @@ fn on_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some((_, tab)) = r.tabs.iter().find(|(rect, _)| inside(*rect)) {
-                app.last_click = None;
                 return app.set_tab(*tab);
             }
-            let hit = if app.tab == Tab::Settings {
-                r.setting_rows.iter().position(|rect| inside(*rect))
-            } else {
-                crate::tui::regions::item_at(app, r.list, ev.column, ev.row)
-            };
-            let Some(index) = hit else {
-                app.last_click = None;
+            if app.tab == Tab::Settings {
+                if let Some(index) = r.setting_rows.iter().position(|rect| inside(*rect)) {
+                    app.settings.selected = index;
+                }
+                return Vec::new();
+            }
+            let Some(index) = crate::tui::regions::item_at(app, r.list, ev.column, ev.row) else {
                 return Vec::new();
             };
-            let double = matches!(app.last_click,
-                Some((at, tab, i)) if tab == app.tab && i == index
-                    && app.now.saturating_duration_since(at) <= DOUBLE_CLICK);
-            if app.tab == Tab::Settings {
-                app.settings.selected = index;
-            }
-            let mut cmds = if app.tab == Tab::Settings {
-                Vec::new()
-            } else {
-                app.move_to(index)
+            let cmds = app.move_to(index);
+            app.toggle_mark();
+            cmds
+        }
+        MouseEventKind::Down(MouseButton::Right) if app.tab != Tab::Settings => {
+            let Some(index) = crate::tui::regions::item_at(app, r.list, ev.column, ev.row) else {
+                return Vec::new();
             };
-            if double {
-                app.last_click = None;
-                let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-                cmds.extend(on_key(app, enter));
-            } else {
-                app.last_click = Some((app.now, app.tab, index));
-            }
+            let mut cmds = app.move_to(index);
+            cmds.extend(open_item_menu(app));
             cmds
         }
         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if app.tab != Tab::Settings => {
@@ -1934,6 +1935,11 @@ fn install_selected(app: &mut App) -> Vec<Cmd> {
     if let Some((rows, hidden)) = marked_rows(app) {
         return install_marked(app, rows, hidden);
     }
+    install_one(app)
+}
+
+/// Plans installing the selected package alone, whatever the marks.
+fn install_one(app: &mut App) -> Vec<Cmd> {
     let Some(hit) = app.hits.get(app.selected) else {
         return Vec::new();
     };
@@ -2293,17 +2299,80 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             pin: None,
             marked: true,
             choice: None,
+            ids: Vec::new(),
         });
         return Vec::new();
     }
-    let Some(r) = app.installed_view().get(app.selected).copied() else {
+    open_item_menu(app)
+}
+
+/// The one rule for the actions of a row: label, the reason it is disabled (if it is) and what
+/// it does. `row` is the visible index in the current tab.
+fn actions_for(app: &App, row: usize) -> Vec<(String, Option<String>, ActionId)> {
+    let mark_label = match app.view_keys().get(row) {
+        Some(k) if app.is_marked(k) => "Desmarcar",
+        _ => "Marcar",
+    };
+    let mark = (mark_label.to_string(), None, ActionId::ToggleMark);
+    if app.tab == Tab::Search {
+        let Some(e) = app
+            .hits
+            .get(row)
+            .and_then(|h| app.search.entries().get(h.index))
+        else {
+            return Vec::new();
+        };
+        let note = (e.source != SourceKind::Scoop).then(|| "instalação na fase 2d".to_string());
+        return vec![("Instalar".to_string(), note, ActionId::Install), mark];
+    }
+    let Some(r) = app.installed_view().get(row).copied() else {
         return Vec::new();
     };
     let upgrade = upgrade_target(app, r);
-    let pin_key = crate::pins::key(&r.origin, &r.name);
     let pinned = crate::pins::is_pinned(&app.pins, &r.origin, &r.name);
-    let remove = (r.origin == "wingetrs").then(|| r.name.clone());
-    let choice = match &r.correlation {
+    let mut items = vec![
+        (
+            match &upgrade {
+                Ok(Target::Bridge(job)) => format!("Atualizar (via {})", job.tool.name()),
+                _ => "Atualizar".to_string(),
+            },
+            upgrade.as_ref().err().map(|n| (*n).to_string()),
+            ActionId::Upgrade,
+        ),
+        (
+            "Remover".to_string(),
+            (r.origin != "wingetrs").then(|| NOT_OURS.to_string()),
+            ActionId::Remove,
+        ),
+        (
+            if pinned { "Desafixar" } else { "Fixar versão" }.to_string(),
+            None,
+            ActionId::Pin,
+        ),
+    ];
+    match row_choice(r) {
+        Some(RowChoice::Choose { .. }) => items.insert(
+            0,
+            (
+                "Escolher correspondência".to_string(),
+                None,
+                ActionId::Choose,
+            ),
+        ),
+        Some(RowChoice::Undo { .. }) => items.push((
+            "Desfazer escolha de correspondência".to_string(),
+            None,
+            ActionId::UndoChoice,
+        )),
+        None => {}
+    }
+    items.push(mark);
+    items
+}
+
+/// The correlation item the row offers, if any.
+fn row_choice(r: &ListRow) -> Option<RowChoice> {
+    match &r.correlation {
         Correlation::Ambiguous {
             source, candidates, ..
         } => Some(RowChoice::Choose {
@@ -2320,69 +2389,82 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             app_key: r.app_key.clone(),
         }),
         _ => None,
-    };
-    let mut items = vec![
-        PickerItem {
-            label: match &upgrade {
-                Ok(Target::Bridge(job)) => format!("Atualizar (via {})", job.tool.name()),
-                _ => "Atualizar".to_string(),
-            },
-            detail: String::new(),
-            selectable: upgrade.is_ok(),
-            note: upgrade.as_ref().err().map(|n| (*n).to_string()),
-        },
-        PickerItem {
-            label: "Remover".to_string(),
-            detail: String::new(),
-            selectable: remove.is_some(),
-            note: remove.is_none().then(|| NOT_OURS.to_string()),
-        },
-        PickerItem {
-            label: if pinned { "Desafixar" } else { "Fixar versão" }.to_string(),
-            detail: String::new(),
-            selectable: true,
-            note: None,
-        },
-    ];
-    let menu_item = |label: &str| PickerItem {
-        label: label.to_string(),
-        detail: String::new(),
-        selectable: true,
-        note: None,
-    };
-    match choice {
-        Some(RowChoice::Choose { .. }) => items.insert(0, menu_item("Escolher correspondência")),
-        Some(RowChoice::Undo { .. }) => {
-            items.push(menu_item("Desfazer escolha de correspondência"));
-        }
-        None => {}
     }
-    let name = r.name.clone();
-    app.modal = Some(Modal::Actions {
-        picker: Picker::single_at(items, 0),
-        app: name,
-        upgrade: upgrade.ok(),
-        remove,
-        pin: Some((pin_key, !pinned)),
+}
+
+/// Opens the actions menu of the selected row (any list tab), whatever the marks. The cursor
+/// starts on the first enabled item that is not `Remover`.
+fn open_item_menu(app: &mut App) -> Vec<Cmd> {
+    let acts = actions_for(app, app.selected);
+    if acts.is_empty() {
+        return Vec::new();
+    }
+    let at = acts
+        .iter()
+        .position(|(_, note, id)| note.is_none() && *id != ActionId::Remove)
+        .unwrap_or(0);
+    let items: Vec<PickerItem> = acts
+        .iter()
+        .map(|(label, note, _)| PickerItem {
+            label: label.clone(),
+            detail: String::new(),
+            selectable: note.is_none(),
+            note: note.clone(),
+        })
+        .collect();
+    let ids: Vec<ActionId> = acts.iter().map(|(_, _, id)| *id).collect();
+    let mut modal = Modal::Actions {
+        picker: Picker::single_at(items, at),
+        app: String::new(),
+        upgrade: None,
+        remove: None,
+        pin: None,
         marked: false,
-        choice,
-    });
+        choice: None,
+        ids,
+    };
+    if app.tab != Tab::Search
+        && let Some(r) = app.installed_view().get(app.selected).copied()
+    {
+        let pinned = crate::pins::is_pinned(&app.pins, &r.origin, &r.name);
+        if let Modal::Actions {
+            app: name,
+            upgrade,
+            remove,
+            pin,
+            choice,
+            ..
+        } = &mut modal
+        {
+            *name = r.name.clone();
+            *upgrade = upgrade_target(app, r).ok();
+            *remove = (r.origin == "wingetrs").then(|| r.name.clone());
+            *pin = Some((crate::pins::key(&r.origin, &r.name), !pinned));
+            *choice = row_choice(r);
+        }
+    }
+    app.modal = Some(modal);
     Vec::new()
 }
 
-/// Runs the fixed item `at` (upgrade, remove, pin) of the actions menu of one installed app.
-fn pick_action(
+/// Runs the item `id` of the actions menu of the selected row.
+fn run_action(
     app: &mut App,
-    at: Option<usize>,
+    id: ActionId,
     upgrade: Option<Target>,
     remove: Option<String>,
     pin: Option<(String, bool)>,
+    choice: Option<RowChoice>,
 ) -> Vec<Cmd> {
-    match (at, upgrade, remove) {
-        (Some(0), Some(Target::Ours(source_name, id)), _) => plan_upgrade(app, source_name, id),
-        (Some(0), Some(Target::Bridge(job)), _) => start_bridge(app, job),
-        (Some(1), _, Some(target)) => plan_remove(app, target),
-        (Some(2), _, _) => match pin {
+    match id {
+        ActionId::Install => install_one(app),
+        ActionId::Upgrade => match upgrade {
+            Some(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
+            Some(Target::Bridge(job)) => start_bridge(app, job),
+            None => Vec::new(),
+        },
+        ActionId::Remove => remove.map_or_else(Vec::new, |target| plan_remove(app, target)),
+        ActionId::Pin => match pin {
             Some((key, pinned)) => {
                 // Applied now; `Msg::PinSaved` reverts it if the write fails.
                 if pinned {
@@ -2394,7 +2476,18 @@ fn pick_action(
             }
             None => Vec::new(),
         },
-        _ => Vec::new(),
+        ActionId::Choose => open_choosing(app, choice),
+        ActionId::UndoChoice => match choice {
+            Some(RowChoice::Undo { app_key }) => vec![Cmd::SetOverride {
+                app_key,
+                choice: None,
+            }],
+            _ => Vec::new(),
+        },
+        ActionId::ToggleMark => {
+            app.toggle_mark();
+            Vec::new()
+        }
     }
 }
 
@@ -2902,6 +2995,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             pin,
             marked,
             choice,
+            ids,
         } => match picker.key(key) {
             PickOutcome::Pending => {
                 app.modal = Some(Modal::Actions {
@@ -2912,6 +3006,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     pin,
                     marked,
                     choice,
+                    ids,
                 });
                 Vec::new()
             }
@@ -2922,24 +3017,10 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 _ => Vec::new(),
             },
             PickOutcome::Picked(chosen) => {
-                let at = chosen.first().copied();
-                // `Choose` is the first item and shifts the fixed ones by one; `Undo` is last.
-                let fixed = match &choice {
-                    Some(RowChoice::Choose { .. }) => {
-                        if at == Some(0) {
-                            return open_choosing(app, choice);
-                        }
-                        at.and_then(|i| i.checked_sub(1))
-                    }
-                    Some(RowChoice::Undo { app_key }) if at == Some(3) => {
-                        return vec![Cmd::SetOverride {
-                            app_key: app_key.clone(),
-                            choice: None,
-                        }];
-                    }
-                    _ => at,
-                };
-                pick_action(app, fixed, upgrade, remove, pin)
+                match chosen.first().and_then(|&i| ids.get(i)).copied() {
+                    Some(id) => run_action(app, id, upgrade, remove, pin, choice),
+                    None => Vec::new(),
+                }
             }
         },
         Modal::Choosing {

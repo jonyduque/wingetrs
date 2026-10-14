@@ -489,8 +489,6 @@ async fn cli_and_tui_use_the_same_key() {
     }];
     let k = |c| Msg::Key(KeyEvent::new(c, KeyModifiers::NONE));
     update(&mut a, k(KeyCode::Enter));
-    update(&mut a, k(KeyCode::Down));
-    update(&mut a, k(KeyCode::Down));
     let cmds = update(&mut a, k(KeyCode::Enter));
     let Some(Cmd::SetPin { key, .. }) = cmds.into_iter().next() else {
         panic!("no SetPin");

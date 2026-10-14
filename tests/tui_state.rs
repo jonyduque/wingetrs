@@ -2269,7 +2269,8 @@ fn enter_in_installed_opens_actions_menu() {
         vec![
             ("Atualizar".to_string(), true, None),
             ("Remover".to_string(), true, None),
-            ("Fixar versão".to_string(), true, None)
+            ("Fixar versão".to_string(), true, None),
+            ("Marcar".to_string(), true, None)
         ]
     );
     assert_eq!(
@@ -2296,11 +2297,6 @@ fn enter_in_installed_opens_actions_menu() {
             .as_deref()
             .is_some_and(|n| n.contains("wingetrs"))
     );
-    assert!(update(&mut foreign, key(KeyCode::Enter)).is_empty());
-    assert!(
-        foreign.modal.is_some(),
-        "a disabled item keeps the menu open"
-    );
     assert!(update(&mut foreign, key(KeyCode::Esc)).is_empty());
     assert!(foreign.modal.is_none());
 
@@ -2313,7 +2309,6 @@ fn enter_in_installed_opens_actions_menu() {
         menu_items(&current)[0].2.as_deref(),
         Some("sem atualização")
     );
-    assert!(update(&mut current, key(KeyCode::Enter)).is_empty());
 }
 
 #[test]
@@ -2324,7 +2319,7 @@ fn actions_menu_remove_plans_remove() {
     );
     a.settings.behavior.purge = true;
     update(&mut a, key(KeyCode::Enter));
-    update(&mut a, key(KeyCode::Down));
+    update(&mut a, key(KeyCode::Up));
     assert_eq!(
         update(&mut a, key(KeyCode::Enter)),
         vec![Cmd::PlanRemove {
@@ -2342,13 +2337,17 @@ fn actions_menu_never_defaults_to_remove() {
     );
     a.settings.behavior.confirm = wingetrs::config::ConfirmMode::Never;
     update(&mut a, key(KeyCode::Enter));
-    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
-    assert!(matches!(a.modal, Some(Modal::Actions { .. })));
-    update(&mut a, key(KeyCode::Down));
-    assert!(matches!(
-        update(&mut a, key(KeyCode::Enter)).as_slice(),
-        [Cmd::PlanRemove { .. }]
-    ));
+    match &a.modal {
+        Some(Modal::Actions { picker, .. }) => {
+            assert_ne!(picker.items()[picker.selected()].label, "Remover");
+        }
+        _ => panic!("actions menu not open"),
+    }
+    assert!(
+        !update(&mut a, key(KeyCode::Enter))
+            .iter()
+            .any(|c| matches!(c, Cmd::PlanRemove { .. }))
+    );
 }
 
 fn srow(name: &str, origin: &str, source: Option<&str>, state: UpdateState) -> ListRow {
@@ -2865,37 +2864,119 @@ fn click_on_item_selects_it() {
     assert_eq!(item_at(&a, list, list.x, list.y), Some(3));
 }
 
+fn right_click_at(a: &mut App, column: u16, row: u16) -> Vec<Cmd> {
+    update(
+        a,
+        mouse(MouseEventKind::Down(MouseButton::Right), column, row),
+    )
+}
+
+/// Cell of the first line of the `n`th visible item.
+fn item_cell(a: &App, n: u16) -> (u16, u16) {
+    let list = regions(a, screen(a)).list;
+    (list.x + 2, list.y + 2 * n)
+}
+
 #[test]
-fn double_click_runs_enter() {
+fn left_click_selects_and_toggles_mark() {
+    for tab in [Tab::Search, Tab::Installed] {
+        let mut a = ten_hits();
+        a.installed = vec![
+            irow("one", "wingetrs", "scoop:main", false),
+            irow("two", "wingetrs", "scoop:main", false),
+            irow("three", "wingetrs", "scoop:main", false),
+        ];
+        a.tab = tab;
+        let (x, y) = item_cell(&a, 1);
+        click_at(&mut a, Instant::now(), x, y);
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.marked_count(), 1, "{tab:?}");
+        click_at(&mut a, Instant::now(), x, y);
+        assert_eq!(a.marked_count(), 0, "{tab:?}");
+    }
+}
+
+#[test]
+fn double_click_no_longer_runs_enter() {
     let t0 = Instant::now();
-    let item_cell = |a: &App, n: u16| {
-        let list = regions(a, screen(a)).list;
-        (list.x + 2, list.y + 2 * n)
-    };
-    // Reference: one click then Enter.
-    let mut b = ten_hits();
-    let (x, y) = item_cell(&b, 1);
-    click_at(&mut b, t0, x, y);
-    let enter = update(&mut b, key(KeyCode::Enter));
-    assert!(!enter.is_empty(), "Enter on a search row plans an install");
-
     let mut a = ten_hits();
+    let (x, y) = item_cell(&a, 1);
     click_at(&mut a, t0, x, y);
-    let double = click_at(&mut a, t0 + Duration::from_millis(100), x, y);
-    assert_eq!(double, enter);
+    let cmds = click_at(&mut a, t0 + Duration::from_millis(100), x, y);
+    assert!(!cmds.iter().any(|c| matches!(c, Cmd::PlanInstall { .. })));
+    assert!(a.modal.is_none());
+}
 
-    let mut slow = ten_hits();
-    click_at(&mut slow, t0, x, y);
-    let late = click_at(&mut slow, t0 + Duration::from_millis(500), x, y);
-    assert!(late.is_empty());
-    assert_eq!(slow.selected, 1);
+#[test]
+fn right_click_opens_full_menu() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", true)],
+    );
+    a.size = (100, 30);
+    let (x, y) = item_cell(&a, 0);
+    right_click_at(&mut a, x, y);
+    let labels: Vec<String> = menu_items(&a).into_iter().map(|i| i.0).collect();
+    assert_eq!(labels, ["Atualizar", "Remover", "Fixar versão", "Marcar"]);
+    match &a.modal {
+        Some(Modal::Actions { picker, .. }) => assert_eq!(picker.selected(), 0),
+        _ => panic!("actions menu not open"),
+    }
+    assert_eq!(a.marked_count(), 0);
 
-    let mut other = ten_hits();
-    click_at(&mut other, t0, x, y);
-    let (x2, y2) = item_cell(&other, 2);
-    let second = click_at(&mut other, t0 + Duration::from_millis(100), x2, y2);
-    assert_ne!(second, enter);
-    assert_eq!(other.selected, 2);
+    let mut s = ten_hits();
+    select_source(&mut s, SourceKind::Scoop);
+    let (x, y) = item_cell(&s, 0);
+    right_click_at(&mut s, x, y);
+    let labels: Vec<String> = menu_items(&s).into_iter().map(|i| i.0).collect();
+    assert_eq!(labels, ["Instalar", "Marcar"]);
+    assert_eq!(s.marked_count(), 0);
+
+    let mut off = ten_hits();
+    let list = regions(&off, screen(&off)).list;
+    right_click_at(&mut off, list.x + 2, list.y + 25);
+    assert!(
+        off.modal.is_none(),
+        "a right click off any item does nothing"
+    );
+}
+
+#[test]
+fn menu_never_opens_on_remove() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", false)],
+    );
+    a.size = (100, 30);
+    let (x, y) = item_cell(&a, 0);
+    right_click_at(&mut a, x, y);
+    match &a.modal {
+        Some(Modal::Actions { picker, .. }) => {
+            assert!(!picker.items()[0].selectable);
+            assert_ne!(picker.items()[picker.selected()].label, "Remover");
+        }
+        _ => panic!("actions menu not open"),
+    }
+}
+
+#[test]
+fn menu_mark_item_toggles_mark() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", false)],
+    );
+    a.size = (100, 30);
+    let (x, y) = item_cell(&a, 0);
+    right_click_at(&mut a, x, y);
+    update(&mut a, key(KeyCode::End));
+    update(&mut a, key(KeyCode::Enter));
+    assert!(a.modal.is_none());
+    assert_eq!(a.marked_count(), 1);
+    right_click_at(&mut a, x, y);
+    assert_eq!(
+        menu_items(&a).last().map(|i| i.0.as_str()),
+        Some("Desmarcar")
+    );
 }
 
 #[test]
@@ -2975,7 +3056,8 @@ fn motion_is_not_a_message() {
     assert!(mouse_msg(ev(MouseEventKind::Moved)).is_none());
     assert!(mouse_msg(ev(MouseEventKind::Drag(MouseButton::Left))).is_none());
     assert!(mouse_msg(ev(MouseEventKind::Up(MouseButton::Left))).is_none());
-    assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Right))).is_none());
+    assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Middle))).is_none());
+    assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Right))).is_some());
     assert!(mouse_msg(ev(MouseEventKind::Down(MouseButton::Left))).is_some());
     assert!(mouse_msg(ev(MouseEventKind::ScrollDown)).is_some());
     assert!(mouse_msg(ev(MouseEventKind::ScrollUp)).is_some());
@@ -3775,8 +3857,6 @@ fn pin_from_menu_applies_and_reverts_on_error() {
     );
     update(&mut a, key(KeyCode::Enter));
     assert_eq!(menu_items(&a)[2].0, "Fixar versão");
-    update(&mut a, key(KeyCode::Down));
-    update(&mut a, key(KeyCode::Down));
     let cmds = update(&mut a, key(KeyCode::Enter));
     let k = wingetrs::pins::key("wingetrs", "beta");
     assert_eq!(
@@ -3910,11 +3990,10 @@ fn undo_choice_in_menu() {
     );
     update(&mut a, key(KeyCode::Enter));
     let items = menu_items(&a);
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 5);
     assert_eq!(items[3].0, "Desfazer escolha de correspondência");
-    for _ in 0..3 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    update(&mut a, key(KeyCode::End));
+    update(&mut a, key(KeyCode::Up));
     assert_eq!(
         update(&mut a, key(KeyCode::Enter)),
         vec![Cmd::SetOverride {

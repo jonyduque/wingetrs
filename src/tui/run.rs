@@ -427,13 +427,13 @@ pub fn clock_turn(app: &mut App, now: Instant, msgs: Vec<Msg>) -> Vec<Cmd> {
     cmds
 }
 
-/// Mouse events the app acts on: left press and the wheel. Motion, drag and release are
+/// Mouse events the app acts on: left or right press and the wheel. Motion, drag and release are
 /// dropped so they do not wake the loop for a redraw.
 pub fn mouse_msg(m: crossterm::event::MouseEvent) -> Option<Msg> {
     use crossterm::event::{MouseButton, MouseEventKind};
     matches!(
         m.kind,
-        MouseEventKind::Down(MouseButton::Left)
+        MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
             | MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
     )
