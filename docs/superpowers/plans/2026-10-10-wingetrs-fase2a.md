@@ -7010,3 +7010,108 @@ Testes:
 2. `leftovers.ps1` limpo.
 
 **Commit:** `chore(tasks): upgrade bridge probe report for task 105`
+
+### Task 106: Ponte de atualização: atualizar pelo winget e pelo scoop
+
+**Modelo:** opus (revisor opus: processo externo, threads, injeção de argumentos e códigos de saída).
+
+#### Where this fits
+
+- Emenda da fase 2a (2026-10-14, ponte). Sonda: `.claude/tasks/task-105-report.md`. Leia as §1.3, §2.2–2.4, §3 e §4 inteiras; as tabelas e as linhas de comando abaixo saem delas.
+- `src/tui/app.rs`:
+  - `upgrade_target(r, pins)` (~:1873) devolve `Err(NOT_OURS_NOTE)` para qualquer origem que não seja `wingetrs`;
+  - `Action` (~:161) tem as variantes `Apply | Remove`;
+  - `Queued` (~:215) e a fila (`queue`, `running`, `can_start`; Task 96);
+  - `Modal::Actions` (Task 90);
+  - as marcas viram um lote em `PlanBatch`/`BatchPlanned` (Task 97);
+  - `U`/`Enter` em Atualizações chamam `upgrade_selected` (~:1912).
+- `src/tui/jobs.rs` executa os `Action` e reporta progresso por mensagens. `src/tui/run.rs` despacha os `Cmd`.
+- `src/installed/scoop.rs` lê a versão instalada de um app do Scoop (`<root>\apps\<app>\current\manifest.json`) e a raiz (`scoop_root()`). Isso é só leitura.
+- `ListRow` (Task 102) tem `origin` (`arp`, `msix`, `scoop` ou `wingetrs`), `name`, `correlation`, `state` e `others`. Na origem `scoop`, `name` é o nome da pasta do app.
+- `crate::pins::is_pinned(pins, origin, name)` (Task 98).
+
+#### What binds this task
+
+- **Módulo `src/bridge/mod.rs`, puro e testável em qualquer plataforma:**
+  - `pub enum Tool { Winget, Scoop }`;
+  - `pub struct BridgeJob { pub tool: Tool, pub target: String /* winget id ou app do scoop */, pub name: String /* nome da linha */ }`;
+  - `pub fn bridge_target(r: &ListRow, pins: &BTreeSet<String>) -> Result<BridgeJob, &'static str>`:
+    - origem `arp` ou `msix` com `Matched { source == "winget" }` e `Available` ⇒ `Winget`;
+    - origem `scoop` com `Available` ⇒ `Scoop` (`target = name`);
+    - fixado ⇒ `Err(PINNED_NOTE)`;
+    - sem atualização ⇒ `Err("sem atualização")`;
+    - o resto ⇒ `Err(NOT_OURS_NOTE)`.
+  - `pub fn valid_target(tool, s) -> bool`: `^[A-Za-z0-9][A-Za-z0-9._+-]*$`, com no máximo 128 caracteres. Isso recusa `-` no início (argumento injetado), `&`, `'`, espaço, `..\`. Alvo inválido ⇒ erro antes de criar o processo.
+  - `pub fn command(job, scoop_root: &Path, pwsh: &str) -> (String /*programa*/, Vec<String> /*args*/)`, exatamente como na §4.1 da sonda:
+    - **winget:** `winget upgrade --id <id> --exact --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements`, com cada argumento separado.
+    - **scoop:** `<pwsh> -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); & '<root>\apps\scoop\current\bin\scoop.ps1' update <app>; exit $LASTEXITCODE"`. Nesse texto, o `'` do caminho vira `''`.
+  - `pub fn winget_message(code: i32) -> String`: a tabela da §4.4, comparando `code as u32`, com "outro" ⇒ `"O winget terminou com erro 0x{:08X}."`.
+  - `pub fn scoop_message(code: i32, before: Option<&str>, after: Option<&str>, lines: &[String]) -> (bool /*atualizou*/, String)`: as regras da §4.4 do scoop. O código 0 sozinho **nunca** conta como sucesso: precisa de `after != before`.
+  - `pub struct Tail`: guarda as últimas 20 linhas úteis e devolve a última. A entrada é feita de pedaços de bytes. As linhas são separadas por `\n`, tirando o `\r` do fim e ficando com o trecho depois do último `\r`. Linhas vazias são descartadas. Cada linha passa por `from_utf8_lossy` e fica com no máximo 1024 bytes. Uma linha sem `\n` que passa de 64 KiB é cortada e descartada até o próximo `\n`, para a memória não crescer sem limite.
+- **Execução em `src/bridge/spawn_win.rs`** (`#[cfg(windows)]` no `mod`):
+  - `pub fn run(program, args, on_line: impl FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>`;
+  - `Command` com `stdin(Stdio::null())`, stdout e stderr em pipe e `creation_flags(CREATE_NO_WINDOW)`;
+  - stdout e stderr lidos por duas threads, **juntadas em todos os caminhos**, com pânico relançado (`resume_unwind`). As linhas das duas vão para o mesmo `Tail`/`on_line`, em ordem de chegada;
+  - devolve o código e as últimas linhas;
+  - `ErrorKind::NotFound` ⇒ o chamador mostra `"winget não encontrado"` ou `"scoop não encontrado"`.
+- **Sem tempo-limite e sem cancelar depois de começar.** Depois de 10 minutos sem linha nova, o progresso mostra `"ainda aguardando o instalador (pode haver uma janela ou pedido do UAC aberto)"`. O item na fila que ainda não começou pode ser tirado, como hoje.
+- **TUI:**
+  - `upgrade_target` passa a devolver `Result<Target, &'static str>`, com `enum Target { Ours(String, String), Bridge(BridgeJob) }`. A regra do wingetrs vem primeiro; sem ela, vale `bridge_target`. Uma regra só para o menu, o `U`, o `Enter` em Atualizações e o lote marcado.
+  - O menu de ações mostra `"Atualizar (via winget)"` ou `"Atualizar (via scoop)"`.
+  - `Action::Bridge(BridgeJob)`, com o rótulo `"Atualizando <nome> via winget"`.
+  - **Confirmação**, conforme o ajuste "Confirmar antes de aplicar":
+    - o texto mostra o comando exato;
+    - para o winget, acrescenta `"Pode aparecer um pedido do UAC, às vezes só piscando na barra de tarefas."`;
+    - para o scoop, acrescenta `"O scoop pode atualizar os buckets (git pull) antes."`.
+  - **Lote marcado:** os itens da ponte viram um `Queued` cada, depois do `Apply` dos nossos. Uma confirmação só cobre o lote todo.
+  - **Fim:**
+    - toast com a mensagem (`Success` se atualizou, `Error` senão);
+    - erro ⇒ as últimas linhas vão para o log (`tracing::warn!`);
+    - depois, `ScanInstalled`.
+  - **Scoop:** a versão de antes é lida no job, imediatamente antes de criar o processo, e a de depois, imediatamente depois.
+- **Ferramenta ausente:**
+  - no boot, um job lê se `winget --version` roda (uma vez por sessão) e se o `scoop.ps1` existe sob `scoop_root()`, e manda `Msg::ToolsDetected { winget: bool, scoop: bool }`;
+  - com `false`, o item fica desabilitado com `"winget não está instalado"` ou `"scoop não está instalado"`;
+  - antes do resultado, fica habilitado, e o `NotFound` da execução cobre o caso.
+- **Testes nunca rodam o winget nem o scoop reais.**
+  - O executor é testado com `cmd.exe /c` como programa falso. Exemplos: `echo linha & exit /b -1978335212`, saída com CRLF, `\r` solto e bytes não-UTF-8 via `type` de um arquivo temporário. Isso fica em testes `#[cfg(windows)]`.
+  - O resto é testado em funções puras.
+  - O job da TUI recebe o executor por um trait ou por uma closure, para os testes de `tui_jobs` usarem um falso.
+
+**Files:**
+- Create: `src/bridge/mod.rs`, `src/bridge/spawn_win.rs`
+- Modify: `src/lib.rs`, `src/tui/app.rs`, `src/tui/jobs.rs`, `src/tui/run.rs`
+- Test: `tests/bridge.rs` (novo), `tests/tui_state.rs`, `tests/tui_jobs.rs`
+
+Testes:
+1. **`bridge_target_rules`:**
+   - arp com winget e `Available` ⇒ `Winget`;
+   - msix também;
+   - scoop com `Available` ⇒ `Scoop`;
+   - wingetrs ⇒ `Err` (cai no `Ours` da TUI);
+   - fixado ⇒ `PINNED_NOTE`;
+   - `UpToDate` ⇒ `"sem atualização"`;
+   - `Matched` em fonte `scoop:*` com origem arp ⇒ `NOT_OURS_NOTE`.
+2. **`command_lines_match_the_probe`:** os argumentos exatos do winget. No scoop, o `-Command` contém `OutputEncoding`, o caminho com `'` dobrado e `exit $LASTEXITCODE`.
+3. **`invalid_targets_refused`:** `-x`, `a&b`, `x'y`, `..\x`, string vazia e 129 caracteres ⇒ `false`; `Foo.Bar-2`, `7zip` e `vcredist2015` ⇒ `true`.
+4. **`winget_codes_to_messages`:** cada linha da tabela, incluindo `-1978335212` ⇒ `"O winget não encontrou este pacote instalado."`, e um código desconhecido ⇒ hex.
+5. **`scoop_exit_zero_needs_new_version`:** 0 com `before == after` e a linha `(latest version)` ⇒ `(false, "Já está na versão mais recente.")`. 0 com versão nova ⇒ `true`. 0 com a linha `isn't installed` ⇒ não encontrado. Código 1 ⇒ `"O scoop falhou (código 1)."`.
+6. **`tail_splits_lines`:**
+   - CRLF, LF, `a\rb\n` ⇒ `b`;
+   - vazias descartadas;
+   - não-UTF-8 sem pânico;
+   - 1 MiB sem `\n` ⇒ memória limitada: o tamanho interno fica ≤ 64 KiB + um pedaço.
+7. **`spawn_runs_fake_tool`** (`#[cfg(windows)]`, com `cmd.exe`): o código negativo volta igual, as linhas chegam em ordem, o stdin está fechado (`set /p x=` sai na hora) e um programa inexistente dá `NotFound`.
+8. **`bridge_upgrade_from_menu`** (`tui_state`): uma linha arp com winget e `Available` ⇒ menu com `"Atualizar (via winget)"` ⇒ confirmação com o comando e o aviso do UAC ⇒ `Action::Bridge` na fila.
+9. **`marked_batch_mixes_ours_and_bridge`:** um item nosso e dois da ponte, marcados ⇒ uma confirmação ⇒ a fila tem `Apply` e depois 2 `Bridge`.
+10. **`tool_missing_disables_item`:** `ToolsDetected { winget: false, .. }` ⇒ o item fica desabilitado com o motivo.
+
+#### Checks beyond the steps
+
+1. Mutação: `scoop_message` aceitar código 0 sem comparar versões ⇒ PEGA (teste 5).
+2. Mutação: `valid_target` aceitar `-` no início ⇒ PEGA (teste 3).
+3. Mutação: tirar `--disable-interactivity` ⇒ PEGA (teste 2).
+4. Mutação: a thread de stderr não ser juntada (troque o `join` por `drop`) ⇒ a regra mecânica de threads do gate falha ou o teste 7 pega. Cole qual dos dois.
+5. **Nada ao vivo.** Não rode um upgrade real. Cole `git grep -n "Command::new" src/bridge`: só o `spawn_win.rs` cria processo.
+
+**Commit:** `feat: upgrade apps installed by winget or scoop through their own CLI`
