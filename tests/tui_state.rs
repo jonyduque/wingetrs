@@ -609,7 +609,7 @@ fn upper_u_upgrades_selected_or_all() {
         update(&mut empty, key(KeyCode::Char('U'))),
         vec![Cmd::PlanUpgradeAll { keep: false }]
     );
-    let mut foreign = on_tab(Tab::Updates, vec![irow("gamma", "arp", "winget", true)]);
+    let mut foreign = on_tab(Tab::Updates, vec![irow("gamma", "arp", "scoop:main", true)]);
     assert!(update(&mut foreign, key(KeyCode::Char('U'))).is_empty());
     assert!(!foreign.toasts.is_empty());
 }
@@ -2281,7 +2281,10 @@ fn enter_in_installed_opens_actions_menu() {
         }]
     );
 
-    let mut foreign = on_tab(Tab::Installed, vec![irow("gamma", "arp", "winget", true)]);
+    let mut foreign = on_tab(
+        Tab::Installed,
+        vec![irow("gamma", "arp", "scoop:main", true)],
+    );
     update(&mut foreign, key(KeyCode::Enter));
     let items = menu_items(&foreign);
     assert!(!items[0].1);
@@ -3486,7 +3489,7 @@ fn upgrade_marked_plans_batch_and_one_confirm() {
         vec![
             irow("alpha", "wingetrs", "scoop:main", true),
             irow("beta", "wingetrs", "scoop:main", true),
-            irow("gamma", "arp", "winget", true),
+            irow("gamma", "arp", "scoop:extras", true),
         ],
     );
     mark_all(&mut a);
@@ -3956,4 +3959,274 @@ fn scoop_rows_are_prefetched() {
         "{scoop:?}"
     );
     assert_eq!(got[0].1, scoop);
+}
+use wingetrs::bridge::{BridgeJob, Tool};
+use wingetrs::tui::app::{BRIDGE_WAITING, Running};
+
+fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
+    BridgeJob {
+        tool,
+        target: target.into(),
+        name: target.into(),
+    }
+}
+
+fn confirm_text(a: &App) -> String {
+    match &a.modal {
+        Some(Modal::Confirm { plan_text, .. }) => plan_text.clone(),
+        _ => panic!("confirmation not open"),
+    }
+}
+
+#[test]
+fn bridge_upgrade_from_menu() {
+    let mut a = on_tab(Tab::Installed, vec![irow("Git.Git", "arp", "winget", true)]);
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert_eq!(
+        menu_items(&a)[0],
+        ("Atualizar (via winget)".to_string(), true, None)
+    );
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    let text = confirm_text(&a);
+    assert!(
+        text.contains(
+            "winget upgrade --id Git.Git --exact --source winget --silent --disable-interactivity --accept-package-agreements --accept-source-agreements"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("Pode aparecer um pedido do UAC, às vezes só piscando na barra de tarefas."),
+        "{text}"
+    );
+    // Another operation in progress: the upgrade waits in line.
+    a.running = Some(Running {
+        id: 99,
+        label: "outra".into(),
+        progress: None,
+        action: None,
+    });
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert!(a.modal.is_none());
+    assert_eq!(a.queue.len(), 1);
+    assert_eq!(
+        a.queue[0].action,
+        Action::Bridge(bridge_job(Tool::Winget, "Git.Git"))
+    );
+    assert_eq!(a.queue[0].label, "Atualizando Git.Git via winget");
+
+    let mut s = on_tab(
+        Tab::Installed,
+        vec![irow("7zip", "scoop", "scoop:main", true)],
+    );
+    s.scoop_root = PathBuf::from(r"C:\s");
+    s.pwsh = "pwsh".into();
+    update(&mut s, key(KeyCode::Enter));
+    assert_eq!(menu_items(&s)[0].0, "Atualizar (via scoop)");
+    update(&mut s, key(KeyCode::Enter));
+    let text = confirm_text(&s);
+    assert!(
+        text.contains(r"& 'C:\s\apps\scoop\current\bin\scoop.ps1' update 7zip;"),
+        "{text}"
+    );
+    assert!(text.contains("pwsh -NoProfile"), "{text}");
+    assert!(
+        text.contains("O scoop pode atualizar os buckets (git pull) antes."),
+        "{text}"
+    );
+    assert_eq!(
+        update(&mut s, key(KeyCode::Enter)),
+        vec![Cmd::Execute(Action::Bridge(bridge_job(
+            Tool::Scoop,
+            "7zip"
+        )))]
+    );
+
+    // `U` and `Enter` in Updates follow the same rule.
+    for k in [KeyCode::Char('U'), KeyCode::Enter] {
+        let mut u = on_tab(Tab::Updates, vec![irow("Git.Git", "msix", "winget", true)]);
+        assert!(update(&mut u, key(k)).is_empty());
+        assert!(confirm_text(&u).contains("--id Git.Git"));
+    }
+}
+
+#[test]
+fn marked_batch_mixes_ours_and_bridge() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            irow("beta", "wingetrs", "scoop:main", true),
+            irow("Git.Git", "arp", "winget", true),
+            irow("7zip", "scoop", "scoop:main", true),
+            irow("Zed", "arp", "scoop:extras", true),
+        ],
+    );
+    a.marks.insert(
+        Tab::Updates,
+        [
+            ("wingetrs".to_string(), "beta".to_string()),
+            ("arp".to_string(), "Git.Git".to_string()),
+            ("scoop".to_string(), "7zip".to_string()),
+            ("arp".to_string(), "Zed".to_string()),
+        ]
+        .into(),
+    );
+    assert_eq!(
+        update(&mut a, key(KeyCode::Char('U'))),
+        vec![Cmd::PlanBatch {
+            items: vec![Cmd::PlanInstall {
+                source_name: "scoop:main".into(),
+                id: "beta".into(),
+                keep: false
+            }]
+        }]
+    );
+    assert!(a.modal.is_none(), "one confirmation, after the plan");
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![Ok(Planned::Ready {
+            text: "Instalar beta".into(),
+            action: apply_action("beta"),
+        })]),
+    );
+    let text = confirm_text(&a);
+    assert!(text.contains("Instalar beta"), "{text}");
+    assert!(text.contains("--id Git.Git"), "{text}");
+    assert!(text.contains("update 7zip"), "{text}");
+    assert!(!text.contains("Zed"), "{text}");
+    assert!(a.toasts.iter().any(|t| t.text.contains("Zed")), "skipped");
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(cmds, vec![Cmd::Execute(apply_action("beta"))]);
+    assert!(a.modal.is_none());
+    let mut queued: Vec<Action> = a.queue.iter().map(|q| q.action.clone()).collect();
+    queued.sort_by_key(|q| format!("{q:?}"));
+    assert_eq!(
+        queued,
+        vec![
+            Action::Bridge(bridge_job(Tool::Scoop, "7zip")),
+            Action::Bridge(bridge_job(Tool::Winget, "Git.Git")),
+        ]
+    );
+    assert!(a.marks.get(&Tab::Updates).is_none_or(|m| m.is_empty()));
+
+    // Only bridge rows marked: no plan to wait for, the confirmation opens at once.
+    let mut b = on_tab(
+        Tab::Updates,
+        vec![
+            irow("Git.Git", "arp", "winget", true),
+            irow("7zip", "scoop", "scoop:main", true),
+        ],
+    );
+    b.marks.insert(
+        Tab::Updates,
+        [
+            ("arp".to_string(), "Git.Git".to_string()),
+            ("scoop".to_string(), "7zip".to_string()),
+        ]
+        .into(),
+    );
+    assert!(update(&mut b, key(KeyCode::Char('U'))).is_empty());
+    match &b.modal {
+        Some(Modal::Confirm { action, then, .. }) => {
+            assert!(matches!(action, Some(Action::Bridge(_))));
+            assert_eq!(then.len(), 1);
+            assert!(matches!(then[0], Action::Bridge(_)));
+        }
+        _ => panic!("confirmation not open"),
+    }
+}
+
+#[test]
+fn tool_missing_disables_item() {
+    let rows = vec![
+        irow("Git.Git", "arp", "winget", true),
+        irow("7zip", "scoop", "scoop:main", true),
+    ];
+    let mut a = on_tab(Tab::Installed, rows.clone());
+    update(
+        &mut a,
+        Msg::ToolsDetected {
+            winget: false,
+            scoop: true,
+        },
+    );
+    let git = a
+        .installed_view()
+        .iter()
+        .position(|r| r.name == "Git.Git")
+        .unwrap();
+    a.selected = git;
+    update(&mut a, key(KeyCode::Enter));
+    assert_eq!(
+        menu_items(&a)[0],
+        (
+            "Atualizar".to_string(),
+            false,
+            Some("winget não está instalado".to_string())
+        )
+    );
+    update(&mut a, key(KeyCode::Esc));
+    a.selected = 1 - git;
+    update(&mut a, key(KeyCode::Enter));
+    assert_eq!(
+        menu_items(&a)[0],
+        ("Atualizar (via scoop)".to_string(), true, None)
+    );
+
+    let mut u = on_tab(Tab::Updates, rows);
+    update(
+        &mut u,
+        Msg::ToolsDetected {
+            winget: true,
+            scoop: false,
+        },
+    );
+    u.selected = u
+        .installed_view()
+        .iter()
+        .position(|r| r.name == "7zip")
+        .unwrap();
+    assert!(update(&mut u, key(KeyCode::Char('U'))).is_empty());
+    assert!(u.modal.is_none());
+    assert!(
+        u.toasts
+            .iter()
+            .any(|t| t.text == "scoop não está instalado")
+    );
+}
+
+#[test]
+fn bridge_progress_shows_lines_then_waiting_after_ten_minutes() {
+    let mut a = on_tab(Tab::Updates, vec![irow("Git.Git", "arp", "winget", true)]);
+    a.settings.behavior.confirm = wingetrs::config::ConfirmMode::Never;
+    let job = bridge_job(Tool::Winget, "Git.Git");
+    assert_eq!(
+        update(&mut a, key(KeyCode::Char('U'))),
+        vec![Cmd::Execute(Action::Bridge(job))]
+    );
+    let label = |a: &App| a.running.as_ref().unwrap().label.clone();
+    assert_eq!(label(&a), "Atualizando Git.Git via winget");
+    update(&mut a, Msg::BridgeLine("Baixando".into()));
+    assert_eq!(label(&a), "Atualizando Git.Git via winget · Baixando");
+    a.now += std::time::Duration::from_secs(599);
+    update(&mut a, Msg::Tick);
+    assert_eq!(label(&a), "Atualizando Git.Git via winget · Baixando");
+    a.now += std::time::Duration::from_secs(2);
+    update(&mut a, Msg::Tick);
+    assert_eq!(
+        label(&a),
+        format!("Atualizando Git.Git via winget · {BRIDGE_WAITING}")
+    );
+    let cmds = update(
+        &mut a,
+        Msg::InstallFinished(Err(InstallFail::Other(
+            "Git.Git: O instalador falhou.".into(),
+        ))),
+    );
+    assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+    assert!(a.running.is_none());
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Error && t.text == "Git.Git: O instalador falhou.")
+    );
 }

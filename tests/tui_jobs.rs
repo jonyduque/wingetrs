@@ -950,3 +950,133 @@ async fn offline_is_retry_not_absent() {
         Some(IconOutcome::Absent)
     );
 }
+use wingetrs::bridge::{BridgeJob, Tool};
+use wingetrs::tui::app::Done;
+
+fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
+    BridgeJob {
+        tool,
+        target: target.into(),
+        name: format!("App {target}"),
+    }
+}
+
+fn scoop_manifest(root: &Path, app: &str, version: &str) {
+    let dir = root.join("apps").join(app).join("current");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        format!(r#"{{"version": "{version}"}}"#),
+    )
+    .unwrap();
+}
+
+#[test]
+fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
+    let root = Path::new("C:/nao-usado");
+    let job = bridge_job(Tool::Winget, "Git.Git");
+    let mut calls: Vec<(String, Vec<String>)> = Vec::new();
+    let mut seen = Vec::new();
+    let mut exec = |program: &str, args: &[String], on_line: &mut dyn FnMut(&str)| {
+        calls.push((program.to_string(), args.to_vec()));
+        on_line("Baixando");
+        Ok((0, vec!["Baixando".to_string()]))
+    };
+    let done = jobs::run_bridge(&job, root, "pwsh", &mut exec, &mut |l: &str| {
+        seen.push(l.to_string())
+    })
+    .unwrap();
+    assert_eq!(
+        done,
+        Done {
+            summary: "App Git.Git: Atualizado.".into(),
+            residues: None
+        }
+    );
+    assert_eq!(seen, ["Baixando"]);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "winget");
+    assert!(calls[0].1.contains(&"--disable-interactivity".to_string()));
+
+    let mut not_found = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        Ok((-1978335212, vec!["Nenhum pacote".to_string()]))
+    };
+    assert_eq!(
+        jobs::run_bridge(&job, root, "pwsh", &mut not_found, &mut |_: &str| {}),
+        Err(InstallFail::Other(
+            "App Git.Git: O winget não encontrou este pacote instalado.".into()
+        ))
+    );
+
+    let mut missing = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    };
+    assert_eq!(
+        jobs::run_bridge(&job, root, "pwsh", &mut missing, &mut |_: &str| {}),
+        Err(InstallFail::Other(
+            "App Git.Git: winget não encontrado".into()
+        ))
+    );
+    let scoop = bridge_job(Tool::Scoop, "7zip");
+    assert_eq!(
+        jobs::run_bridge(&scoop, root, "pwsh", &mut missing, &mut |_: &str| {}),
+        Err(InstallFail::Other("App 7zip: scoop não encontrado".into()))
+    );
+}
+
+#[test]
+fn run_bridge_refuses_an_invalid_target_before_running() {
+    let mut ran = false;
+    let mut exec = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        ran = true;
+        Ok((0, Vec::new()))
+    };
+    for target in ["-x", "a&b", r"..\x"] {
+        let r = jobs::run_bridge(
+            &bridge_job(Tool::Scoop, target),
+            Path::new("C:/s"),
+            "pwsh",
+            &mut exec,
+            &mut |_: &str| {},
+        );
+        assert!(matches!(r, Err(InstallFail::Other(_))), "{target}");
+    }
+    assert!(!ran);
+}
+
+#[test]
+fn run_bridge_scoop_compares_versions_read_around_the_run() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().to_path_buf();
+    scoop_manifest(&root, "7zip", "1.0");
+    let job = bridge_job(Tool::Scoop, "7zip");
+
+    // Exit 0, new version written by the "tool" during the run: upgraded.
+    let mut upgrades = |program: &str, args: &[String], _: &mut dyn FnMut(&str)| {
+        assert_eq!(program, "pwsh");
+        assert!(args[4].contains("update 7zip"));
+        scoop_manifest(&root, "7zip", "2.0");
+        Ok((0, Vec::new()))
+    };
+    let done = jobs::run_bridge(&job, &root, "pwsh", &mut upgrades, &mut |_: &str| {}).unwrap();
+    assert_eq!(done.summary, "App 7zip: Atualizado para a versão 2.0.");
+
+    // Exit 0, same version: not an upgrade, whatever the code says.
+    let mut stays = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        Ok((0, vec!["7zip: 2.0 (latest version)".to_string()]))
+    };
+    assert_eq!(
+        jobs::run_bridge(&job, &root, "pwsh", &mut stays, &mut |_: &str| {}),
+        Err(InstallFail::Other(
+            "App 7zip: Já está na versão mais recente.".into()
+        ))
+    );
+
+    let mut fails = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| Ok((1, Vec::new()));
+    assert_eq!(
+        jobs::run_bridge(&job, &root, "pwsh", &mut fails, &mut |_: &str| {}),
+        Err(InstallFail::Other(
+            "App 7zip: O scoop falhou (código 1).".into()
+        ))
+    );
+}

@@ -113,6 +113,9 @@ struct Ctx {
     list_fetch_running: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Encoder for package icons; `None` when icons are off.
     icon_picker: std::sync::Mutex<Option<ratatui_image::picker::Picker>>,
+    /// Scoop root and PowerShell program of the bridge upgrades (the same the `App` shows).
+    scoop_root: Option<std::path::PathBuf>,
+    pwsh: String,
 }
 
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
@@ -198,6 +201,10 @@ async fn event_loop(
 ) -> anyhow::Result<()> {
     // Small file, read before the first event so an early Enter already sees the pins.
     app.pins = crate::pins::load(&data);
+    let scoop_root = crate::installed::scoop::scoop_root();
+    let pwsh = crate::bridge::find_pwsh(std::env::var_os("PATH").as_deref());
+    app.scoop_root = scoop_root.clone().unwrap_or_default();
+    app.pwsh.clone_from(&pwsh);
     let (tx, mut rx) = unbounded_channel::<Msg>();
     let ctx = Arc::new(Ctx {
         data,
@@ -210,12 +217,15 @@ async fn event_loop(
         list_fetch_running: Arc::default(),
         // After `ratatui::init`, so the pixel size is that of the terminal in use.
         icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
+        scoop_root,
+        pwsh,
     });
     ctx.http
         .set_allow_http_redirect(ctx.cfg.behavior.allow_http_redirect);
     let mut events = EventStream::new();
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
+    spawn_job(&ctx, |c, _| detect_tools(c));
     if app.icon_protocol != crate::tui::icons::IconProtocol::Off {
         spawn_job(&ctx, |c, _| {
             Msg::IconMapLoaded(crate::icons::load_map(&c.data))
@@ -1208,7 +1218,60 @@ fn spawn_plan(
     });
 }
 
+/// Once per session: whether `winget --version` runs and `scoop.ps1` exists.
+fn detect_tools(c: &Ctx) -> Msg {
+    let winget = run_tool("winget", &["--version".to_string()], &mut |_| {}).is_ok();
+    let scoop = c
+        .scoop_root
+        .as_deref()
+        .is_some_and(|r| crate::bridge::scoop_ps1(r).is_file());
+    Msg::ToolsDetected { winget, scoop }
+}
+
+#[cfg(windows)]
+fn run_tool(
+    program: &str,
+    args: &[String],
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    crate::bridge::spawn_win::run(program, args, on_line)
+}
+
+#[cfg(not(windows))]
+fn run_tool(
+    _program: &str,
+    _args: &[String],
+    _on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "a ponte de atualização só funciona no Windows",
+    ))
+}
+
+/// Runs a bridge upgrade (no `install.lock`, no ops context); each output line becomes the
+/// progress text.
+fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
+    spawn_job(ctx, move |c, _| {
+        let tx = c.tx.clone();
+        let mut on_line = |line: &str| {
+            let _ = tx.send(Msg::BridgeLine(line.to_string()));
+        };
+        let root = c.scoop_root.clone().unwrap_or_default();
+        Msg::InstallFinished(jobs::run_bridge(
+            &job,
+            &root,
+            &c.pwsh,
+            &mut run_tool,
+            &mut on_line,
+        ))
+    });
+}
+
 fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
+    if let Action::Bridge(job) = action {
+        return spawn_bridge(ctx, job);
+    }
     spawn_job(ctx, move |c, handle| {
         let tx = c.tx.clone();
         let throttle = jobs::ProgressThrottle::new(Instant::now());

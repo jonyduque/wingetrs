@@ -1,4 +1,5 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
+use crate::bridge::{self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, Tool};
 use crate::catalog::search::{SearchHit, SearchIndex};
 use crate::config::{Behavior, Config, ConfirmMode, ResidueMode};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
@@ -19,6 +20,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -143,6 +145,13 @@ pub enum Msg {
     },
     /// A worker thread panicked; the event loop re-raises it before `update` sees it.
     Panicked(Box<dyn std::any::Any + Send>),
+    /// Startup check of the bridge tools: `winget --version` runs, `scoop.ps1` exists.
+    ToolsDetected {
+        winget: bool,
+        scoop: bool,
+    },
+    /// Newest output line of the bridge upgrade in progress.
+    BridgeLine(String),
 }
 
 /// What the user is asked to confirm, or to choose from.
@@ -162,6 +171,8 @@ pub enum Action {
     /// One plan list per app (dependencies first), applied in order.
     Apply(Vec<Vec<InstallPlan>>),
     Remove(UninstallPlan),
+    /// Upgrade through the tool that installed the app (winget or scoop).
+    Bridge(BridgeJob),
 }
 
 impl Action {
@@ -172,6 +183,7 @@ impl Action {
                 format!("Instalando {}", apps.join(", "))
             }
             Action::Remove(p) => format!("Removendo {}", p.app),
+            Action::Bridge(job) => format!("Atualizando {} via {}", job.name, job.tool.name()),
         }
     }
 }
@@ -221,6 +233,29 @@ pub struct Queued {
 /// Wait before trying the queue again after another process held `install.lock`.
 pub const BUSY_RETRY: Duration = Duration::from_secs(2);
 
+/// Silence of a bridge upgrade after which the progress says it may be waiting for the user.
+pub const BRIDGE_QUIET: Duration = Duration::from_secs(600);
+
+/// Progress text of a bridge upgrade silent for `BRIDGE_QUIET`.
+pub const BRIDGE_WAITING: &str =
+    "ainda aguardando o instalador (pode haver uma janela ou pedido do UAC aberto)";
+
+/// How an installed app is upgraded: by wingetrs (`(source_name, id)` to plan) or by the tool
+/// that installed it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    Ours(String, String),
+    Bridge(BridgeJob),
+}
+
+/// Whether the bridge tools exist; `None` until the startup check answers (enabled meanwhile:
+/// a missing tool then fails with "não encontrado").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tools {
+    pub winget: Option<bool>,
+    pub scoop: Option<bool>,
+}
+
 /// The dialog on top of the screen; it takes every key until it closes.
 pub enum Modal {
     Confirm {
@@ -243,8 +278,8 @@ pub enum Modal {
     Actions {
         picker: Picker,
         app: String,
-        /// `(source_name, id)` when the app can be upgraded.
-        upgrade: Option<(String, String)>,
+        /// How the app is upgraded, when it can be.
+        upgrade: Option<Target>,
         /// Name to remove when wingetrs installed the app.
         remove: Option<String>,
         /// `(pin key, pin it?)` of the third item; `None` when the menu acts on marked rows.
@@ -519,6 +554,13 @@ pub struct App {
     pub marks: HashMap<Tab, HashSet<RowKey>>,
     /// What the batch plan in flight was made of.
     batch: Option<Batch>,
+    /// Which bridge tools exist (`Msg::ToolsDetected`).
+    pub tools: Tools,
+    /// Scoop root and PowerShell program of the bridge command lines (shown in the confirmation).
+    pub scoop_root: PathBuf,
+    pub pwsh: String,
+    /// When the bridge upgrade in progress started or last printed a line.
+    pub bridge_last_line: Option<Instant>,
 }
 
 /// Identity of a marked row: `(origin, name)` in Installed and Updates,
@@ -532,6 +574,8 @@ struct Batch {
     labels: Vec<String>,
     skipped: Vec<String>,
     hidden: usize,
+    /// Bridge upgrades of the marked rows, queued after the planned actions.
+    bridges: Vec<BridgeJob>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -629,6 +673,10 @@ impl App {
             pending_modals: VecDeque::new(),
             marks: HashMap::new(),
             batch: None,
+            tools: Tools::default(),
+            scoop_root: PathBuf::new(),
+            pwsh: "pwsh".to_string(),
+            bridge_last_line: None,
         };
         app.research();
         app
@@ -1232,6 +1280,12 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             if app.animating() {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
+            if app
+                .bridge_last_line
+                .is_some_and(|t| app.now.saturating_duration_since(t) >= BRIDGE_QUIET)
+            {
+                set_bridge_line(app, BRIDGE_WAITING);
+            }
             Vec::new()
         }
         Msg::CatalogLoaded(entries) => {
@@ -1489,6 +1543,20 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::InstallFinished(result) => on_finished(app, result),
+        Msg::ToolsDetected { winget, scoop } => {
+            app.tools = Tools {
+                winget: Some(winget),
+                scoop: Some(scoop),
+            };
+            Vec::new()
+        }
+        Msg::BridgeLine(line) => {
+            if app.bridge_last_line.is_some() {
+                app.bridge_last_line = Some(app.now);
+                set_bridge_line(app, &line);
+            }
+            Vec::new()
+        }
         Msg::RetryQueue => {
             app.waiting_lock = false;
             pump(app)
@@ -1809,8 +1877,6 @@ fn request_save(app: &mut App) -> Vec<Cmd> {
     }]
 }
 
-const PINNED_NOTE: &str = "versão fixada";
-const NOT_OURS_NOTE: &str = "instalado fora do wingetrs";
 const NOT_OURS: &str = "só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui";
 
 /// Marks a plan as in flight; `None` when one already is.
@@ -1868,26 +1934,77 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
     plan_remove(app, name)
 }
 
-/// The one rule for who can be upgraded: ours, matched to a catalog package, with a newer version.
+/// The one rule for who can be upgraded (actions menu, `U`, `Enter` in Updates, marked
+/// batch): ours, matched to a catalog package, with a newer version; else, an app winget or
+/// scoop installed, through that tool (`bridge::bridge_target`) when the tool is there.
 /// `Err` carries the reason, as the note of a disabled menu item.
-fn upgrade_target(
-    r: &ListRow,
-    pins: &std::collections::BTreeSet<String>,
-) -> Result<(String, String), &'static str> {
-    if r.origin != "wingetrs" {
-        return Err(NOT_OURS_NOTE);
+fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, &'static str> {
+    if r.origin == "wingetrs" {
+        if crate::pins::is_pinned(&app.pins, &r.origin, &r.name) {
+            return Err(PINNED_NOTE);
+        }
+        return match (&r.correlation, &r.state) {
+            (
+                Correlation::Matched {
+                    source, package_id, ..
+                },
+                UpdateState::Available { .. },
+            ) => Ok(Target::Ours(source.clone(), package_id.clone())),
+            _ => Err("sem atualização"),
+        };
     }
-    if crate::pins::is_pinned(pins, &r.origin, &r.name) {
-        return Err(PINNED_NOTE);
+    let job = bridge::bridge_target(r, &app.pins)?;
+    let present = match job.tool {
+        Tool::Winget => app.tools.winget,
+        Tool::Scoop => app.tools.scoop,
+    };
+    match (present, job.tool) {
+        (Some(false), Tool::Winget) => Err("winget não está instalado"),
+        (Some(false), Tool::Scoop) => Err("scoop não está instalado"),
+        _ => Ok(Target::Bridge(job)),
     }
-    match (&r.correlation, &r.state) {
-        (
-            Correlation::Matched {
-                source, package_id, ..
-            },
-            UpdateState::Available { .. },
-        ) => Ok((source.clone(), package_id.clone())),
-        _ => Err("sem atualização"),
+}
+
+/// Confirmation text of a bridge upgrade: the exact command and what may happen meanwhile.
+fn bridge_text(app: &App, job: &BridgeJob) -> String {
+    let (program, args) = bridge::command(job, &app.scoop_root, &app.pwsh);
+    let note = match job.tool {
+        Tool::Winget => "Pode aparecer um pedido do UAC, às vezes só piscando na barra de tarefas.",
+        Tool::Scoop => "O scoop pode atualizar os buckets (git pull) antes.",
+    };
+    format!(
+        "Atualizar {} via {}:\n  {}\n{note}\n",
+        job.name,
+        job.tool.name(),
+        bridge::command_text(&program, &args)
+    )
+}
+
+/// Upgrades one app through its own tool: confirmed per the `confirm` setting, then queued.
+fn start_bridge(app: &mut App, job: BridgeJob) -> Vec<Cmd> {
+    let text = bridge_text(app, &job);
+    let action = Action::Bridge(job);
+    if !needs_confirm(app.settings.behavior.confirm, &action) {
+        return enqueue(app, action);
+    }
+    open_modal(
+        app,
+        Modal::Confirm {
+            plan_text: text,
+            action: Some(action),
+            then: Vec::new(),
+            clear_marks: None,
+        },
+    );
+    Vec::new()
+}
+
+/// Shows `line` as the progress of the bridge upgrade in progress.
+fn set_bridge_line(app: &mut App, line: &str) {
+    if let Some(r) = &mut app.running
+        && let Some(action @ Action::Bridge(_)) = &r.action
+    {
+        r.label = format!("{} · {line}", action.label());
     }
 }
 
@@ -1916,16 +2033,21 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
     let keep = app.settings.behavior.keep_old;
     let target = match app.installed_view().get(app.selected) {
         None => return start_planning(app, Cmd::PlanUpgradeAll { keep }),
-        Some(r) => upgrade_target(r, &app.pins),
+        Some(r) => upgrade_target(app, r),
     };
     match target {
-        Ok((source_name, id)) => plan_upgrade(app, source_name, id),
+        Ok(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
+        Ok(Target::Bridge(job)) => start_bridge(app, job),
         Err(PINNED_NOTE) => {
             app.push_toast(ToastKind::Warning, "versão fixada (desafixe no menu)");
             Vec::new()
         }
-        Err(_) => {
+        Err(NOT_OURS_NOTE) => {
             app.push_toast(ToastKind::Warning, NOT_OURS);
+            Vec::new()
+        }
+        Err(note) => {
+            app.push_toast(ToastKind::Warning, note);
             Vec::new()
         }
     }
@@ -1967,12 +2089,16 @@ fn report_left_out(app: &mut App, skipped: &[String], hidden: usize) {
 fn start_batch(
     app: &mut App,
     items: Vec<(String, Cmd)>,
+    bridges: Vec<BridgeJob>,
     skipped: Vec<String>,
     hidden: usize,
 ) -> Vec<Cmd> {
     if items.is_empty() {
         report_left_out(app, &skipped, hidden);
-        return Vec::new();
+        // Bridge upgrades need no plan: straight to the one confirmation.
+        let tab = app.tab;
+        let confirm = app.settings.behavior.confirm;
+        return confirm_batch(app, Vec::new(), Vec::new(), bridges, confirm, tab);
     }
     if app.planning {
         return Vec::new();
@@ -1983,8 +2109,47 @@ fn start_batch(
         labels,
         skipped,
         hidden,
+        bridges,
     });
     start_planning(app, Cmd::PlanBatch { items })
+}
+
+/// The actions of a marked batch, then one bridge upgrade per job: one confirmation covers
+/// them all (when any needs it), else they are queued; the tab's marks are cleared either way.
+fn confirm_batch(
+    app: &mut App,
+    mut texts: Vec<String>,
+    mut actions: Vec<Action>,
+    bridges: Vec<BridgeJob>,
+    confirm: ConfirmMode,
+    tab: Tab,
+) -> Vec<Cmd> {
+    for job in bridges {
+        texts.push(bridge_text(app, &job));
+        actions.push(Action::Bridge(job));
+    }
+    if actions.is_empty() {
+        return Vec::new();
+    }
+    if actions.iter().any(|a| needs_confirm(confirm, a)) {
+        let mut rest = actions.into_iter();
+        open_modal(
+            app,
+            Modal::Confirm {
+                plan_text: texts.join("\n\n"),
+                action: rest.next(),
+                then: rest.collect(),
+                clear_marks: Some(tab),
+            },
+        );
+        return Vec::new();
+    }
+    let mut cmds = Vec::new();
+    for action in actions {
+        cmds.extend(enqueue(app, action));
+    }
+    app.marks.remove(&tab);
+    cmds
 }
 
 /// Marked rows of Search: plan installing each Scoop one; winget ones are skipped.
@@ -2012,18 +2177,19 @@ fn install_marked(app: &mut App, rows: Vec<usize>, hidden: usize) -> Vec<Cmd> {
             skipped.push(e.name.clone());
         }
     }
-    start_batch(app, items, skipped, hidden)
+    start_batch(app, items, Vec::new(), skipped, hidden)
 }
 
 /// Marked rows of Installed/Updates: plan upgrading those `upgrade_target` accepts.
 fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
     let keep = app.settings.behavior.keep_old;
     let mut items = Vec::new();
+    let mut bridges = Vec::new();
     let mut skipped = Vec::new();
     let view = app.installed_view();
     for r in rows.iter().filter_map(|&i| view.get(i)) {
-        match upgrade_target(r, &app.pins) {
-            Ok((source_name, id)) => items.push((
+        match upgrade_target(app, r) {
+            Ok(Target::Ours(source_name, id)) => items.push((
                 r.name.clone(),
                 Cmd::PlanInstall {
                     source_name,
@@ -2031,10 +2197,11 @@ fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
                     keep,
                 },
             )),
+            Ok(Target::Bridge(job)) => bridges.push(job),
             Err(_) => skipped.push(r.name.clone()),
         }
     }
-    start_batch(app, items, skipped, hidden)
+    start_batch(app, items, bridges, skipped, hidden)
 }
 
 /// Marked rows of Installed: plan removing those wingetrs installed.
@@ -2056,7 +2223,7 @@ fn remove_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
             skipped.push(r.name.clone());
         }
     }
-    start_batch(app, items, skipped, hidden)
+    start_batch(app, items, Vec::new(), skipped, hidden)
 }
 
 /// `Enter` in Installed: the actions menu of the selected app, or of the marked ones.
@@ -2066,7 +2233,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
         let marked: Vec<&ListRow> = rows.iter().filter_map(|&i| view.get(i).copied()).collect();
         let upgradable = marked
             .iter()
-            .filter(|r| upgrade_target(r, &app.pins).is_ok())
+            .filter(|r| upgrade_target(app, r).is_ok())
             .count();
         let removable = marked.iter().filter(|r| r.origin == "wingetrs").count();
         let item = |label: &str, n: usize| PickerItem {
@@ -2091,7 +2258,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     let Some(r) = app.installed_view().get(app.selected).copied() else {
         return Vec::new();
     };
-    let upgrade = upgrade_target(r, &app.pins);
+    let upgrade = upgrade_target(app, r);
     let pin_key = crate::pins::key(&r.origin, &r.name);
     let pinned = crate::pins::is_pinned(&app.pins, &r.origin, &r.name);
     let remove = (r.origin == "wingetrs").then(|| r.name.clone());
@@ -2115,7 +2282,10 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     };
     let mut items = vec![
         PickerItem {
-            label: "Atualizar".to_string(),
+            label: match &upgrade {
+                Ok(Target::Bridge(job)) => format!("Atualizar (via {})", job.tool.name()),
+                _ => "Atualizar".to_string(),
+            },
             detail: String::new(),
             selectable: upgrade.is_ok(),
             note: upgrade.as_ref().err().map(|n| (*n).to_string()),
@@ -2163,12 +2333,13 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
 fn pick_action(
     app: &mut App,
     at: Option<usize>,
-    upgrade: Option<(String, String)>,
+    upgrade: Option<Target>,
     remove: Option<String>,
     pin: Option<(String, bool)>,
 ) -> Vec<Cmd> {
     match (at, upgrade, remove) {
-        (Some(0), Some((source_name, id)), _) => plan_upgrade(app, source_name, id),
+        (Some(0), Some(Target::Ours(source_name, id)), _) => plan_upgrade(app, source_name, id),
+        (Some(0), Some(Target::Bridge(job)), _) => start_bridge(app, job),
         (Some(1), _, Some(target)) => plan_remove(app, target),
         (Some(2), _, _) => match pin {
             Some((key, pinned)) => {
@@ -2302,6 +2473,7 @@ fn can_start(app: &App) -> bool {
 }
 
 fn start(app: &mut App, q: Queued) -> Vec<Cmd> {
+    app.bridge_last_line = matches!(q.action, Action::Bridge(_)).then_some(app.now);
     app.running = Some(Running {
         id: q.id,
         label: q.label,
@@ -2509,7 +2681,7 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
                 texts.push(text);
                 match action {
                     Action::Apply(g) => groups.extend(g),
-                    remove @ Action::Remove(_) => removals.push(remove),
+                    other => removals.push(other),
                 }
             }
             Ok(Planned::Choose(_)) => ambiguous.push(label),
@@ -2527,32 +2699,12 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
         actions.push(Action::Apply(groups));
     }
     actions.extend(removals);
-    if actions.is_empty() {
-        return Vec::new();
-    }
-    if actions.iter().any(|a| needs_confirm(confirm, a)) {
-        let mut rest = actions.into_iter();
-        open_modal(
-            app,
-            Modal::Confirm {
-                plan_text: texts.join("\n\n"),
-                action: rest.next(),
-                then: rest.collect(),
-                clear_marks: Some(batch.tab),
-            },
-        );
-        return Vec::new();
-    }
-    let mut cmds = Vec::new();
-    for action in actions {
-        cmds.extend(enqueue(app, action));
-    }
-    app.marks.remove(&batch.tab);
-    cmds
+    confirm_batch(app, texts, actions, batch.bridges, confirm, batch.tab)
 }
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
     let finished = app.running.take();
+    app.bridge_last_line = None;
     // Success or not, the disk may have changed.
     let mut cmds = vec![Cmd::ScanInstalled];
     match result {

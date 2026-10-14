@@ -1,0 +1,336 @@
+//! Upgrade bridge: who goes through winget/scoop, the exact command lines, exit codes and output.
+use std::collections::BTreeSet;
+use std::path::Path;
+use wingetrs::bridge::{
+    self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, Tail, Tool, bridge_target, scoop_message,
+    valid_target, winget_message,
+};
+use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+
+fn row(name: &str, origin: &str, source: &str, state: UpdateState) -> ListRow {
+    ListRow {
+        name: name.into(),
+        origin: origin.into(),
+        installed_version: Some("1".into()),
+        correlation: Correlation::Matched {
+            source: source.into(),
+            package_id: format!("Pub.{name}"),
+            rule: Rule::ProductCode,
+        },
+        latest: Some("2".into()),
+        state,
+        ..Default::default()
+    }
+}
+
+fn available() -> UpdateState {
+    UpdateState::Available { latest: "2".into() }
+}
+
+#[test]
+fn bridge_target_rules() {
+    let none = BTreeSet::new();
+    let arp = bridge_target(&row("Git", "arp", "winget", available()), &none).unwrap();
+    assert_eq!(arp.tool, Tool::Winget);
+    assert_eq!(arp.target, "Pub.Git");
+    assert_eq!(arp.name, "Git");
+    let msix = bridge_target(&row("Term", "msix", "winget", available()), &none).unwrap();
+    assert_eq!(msix.tool, Tool::Winget);
+    assert_eq!(msix.target, "Pub.Term");
+    let scoop = bridge_target(&row("7zip", "scoop", "scoop:main", available()), &none).unwrap();
+    assert_eq!(scoop.tool, Tool::Scoop);
+    assert_eq!(scoop.target, "7zip");
+    assert!(bridge_target(&row("beta", "wingetrs", "scoop:main", available()), &none).is_err());
+    let pins: BTreeSet<String> = ["arp/Git".to_string()].into();
+    assert_eq!(
+        bridge_target(&row("Git", "arp", "winget", available()), &pins),
+        Err(PINNED_NOTE)
+    );
+    assert_eq!(
+        bridge_target(&row("Git", "arp", "winget", UpdateState::UpToDate), &none),
+        Err("sem atualização")
+    );
+    assert_eq!(
+        bridge_target(&row("7zip", "arp", "scoop:main", available()), &none),
+        Err(NOT_OURS_NOTE)
+    );
+}
+
+fn job(tool: Tool, target: &str) -> BridgeJob {
+    BridgeJob {
+        tool,
+        target: target.into(),
+        name: target.into(),
+    }
+}
+
+#[test]
+fn command_lines_match_the_probe() {
+    let (program, args) = bridge::command(&job(Tool::Winget, "Git.Git"), Path::new("C:/s"), "pwsh");
+    assert_eq!(program, "winget");
+    assert_eq!(
+        args,
+        [
+            "upgrade",
+            "--id",
+            "Git.Git",
+            "--exact",
+            "--source",
+            "winget",
+            "--silent",
+            "--disable-interactivity",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ]
+    );
+    let root = Path::new(r"C:\Users\o'neil\scoop");
+    let (program, args) = bridge::command(&job(Tool::Scoop, "7zip"), root, "powershell");
+    assert_eq!(program, "powershell");
+    assert_eq!(
+        args[..4],
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+    );
+    assert_eq!(args.len(), 5);
+    let script = &args[4];
+    assert!(script.starts_with("[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "));
+    assert!(
+        script
+            .contains(r"& 'C:\Users\o''neil\scoop\apps\scoop\current\bin\scoop.ps1' update 7zip;"),
+        "{script}"
+    );
+    assert!(script.ends_with("; exit $LASTEXITCODE"));
+}
+
+#[test]
+fn invalid_targets_refused() {
+    for bad in [
+        "-x",
+        "a&b",
+        "x'y",
+        r"..\x",
+        "",
+        &"a".repeat(129),
+        "a b",
+        "a/b",
+    ] {
+        assert!(!valid_target(Tool::Winget, bad), "{bad:?}");
+        assert!(!valid_target(Tool::Scoop, bad), "{bad:?}");
+    }
+    for good in [
+        "Foo.Bar-2",
+        "7zip",
+        "vcredist2015",
+        &"a".repeat(128),
+        "a+b_c",
+    ] {
+        assert!(valid_target(Tool::Winget, good), "{good:?}");
+        assert!(valid_target(Tool::Scoop, good), "{good:?}");
+    }
+}
+
+#[test]
+fn winget_codes_to_messages() {
+    let table: &[(u32, &str)] = &[
+        (0, "Atualizado."),
+        (
+            0x8A15002B,
+            "Nenhuma atualização aplicável para este pacote.",
+        ),
+        (0x8A150014, "O winget não encontrou este pacote instalado."),
+        (0x8A150016, "Mais de um pacote corresponde a este id."),
+        (
+            0x8A150068,
+            "Pacote fixado no winget (pin); remova o pin para atualizar.",
+        ),
+        (
+            0x8A15008E,
+            "A nova versão usa outro tipo de instalador; atualize pelo winget manualmente.",
+        ),
+        (0x8A150006, "O instalador falhou."),
+        (0x8A150049, "O instalador falhou."),
+        (0x8A150052, "O instalador falhou."),
+        (
+            0x8A150101,
+            "O aplicativo está em uso; feche-o e tente de novo.",
+        ),
+        (
+            0x8A150103,
+            "O aplicativo está em uso; feche-o e tente de novo.",
+        ),
+        (
+            0x8A150102,
+            "Outra instalação está em andamento; tente mais tarde.",
+        ),
+        (
+            0x8A150109,
+            "Atualizado; reinicie o computador para concluir.",
+        ),
+        (0x8A15010A, "É preciso reiniciar o computador."),
+        (0x8A15010B, "É preciso reiniciar o computador."),
+        (0x8A15010C, "Atualização cancelada."),
+        (0x80004004, "Atualização cancelada."),
+        (0x800704C7, "Permissão de administrador recusada."),
+        (0x8A150008, "Falha no download do instalador."),
+        (
+            0x8A150011,
+            "O hash do instalador não confere com o manifesto.",
+        ),
+        (0x8A150041, "Contrato não aceito."),
+        (0x8A150046, "Contrato não aceito."),
+    ];
+    for &(code, text) in table {
+        assert_eq!(winget_message(code as i32), text, "0x{code:08X}");
+    }
+    assert_eq!(
+        winget_message(-1978335212),
+        "O winget não encontrou este pacote instalado."
+    );
+    assert_eq!(
+        winget_message(0x8A15FFFFu32 as i32),
+        "O winget terminou com erro 0x8A15FFFF."
+    );
+    assert_eq!(winget_message(1), "O winget terminou com erro 0x00000001.");
+    assert!(bridge::winget_updated(0));
+    assert!(bridge::winget_updated(0x8A150109u32 as i32));
+    assert!(!bridge::winget_updated(-1978335212));
+}
+
+fn lines(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn scoop_exit_zero_needs_new_version() {
+    assert_eq!(
+        scoop_message(
+            0,
+            Some("1"),
+            Some("1"),
+            &lines(&["7zip: 1 (latest version)"])
+        ),
+        (false, "Já está na versão mais recente.".to_string())
+    );
+    assert_eq!(
+        scoop_message(
+            0,
+            Some("1"),
+            Some("1"),
+            &lines(&["WARN  The latest version of '7zip' (1) is already installed."])
+        ),
+        (false, "Já está na versão mais recente.".to_string())
+    );
+    let (updated, text) = scoop_message(0, Some("1"), Some("2"), &[]);
+    assert!(updated, "{text}");
+    assert_eq!(
+        scoop_message(0, None, None, &lines(&["ERROR '7zip' isn't installed."])),
+        (false, "O scoop não encontrou este app.".to_string())
+    );
+    assert_eq!(
+        scoop_message(
+            0,
+            Some("1"),
+            Some("1"),
+            &lines(&["'7zip' is held to version 1"])
+        ),
+        (false, "App segurado no scoop (hold).".to_string())
+    );
+    assert_eq!(
+        scoop_message(
+            0,
+            Some("1"),
+            Some("1"),
+            &lines(&["Running process detected, skip updating."])
+        ),
+        (
+            false,
+            "O app está aberto; feche-o e tente de novo.".to_string()
+        )
+    );
+    assert_eq!(
+        scoop_message(0, Some("1"), Some("1"), &[]),
+        (false, "O scoop não atualizou o app.".to_string())
+    );
+    assert_eq!(
+        scoop_message(0, Some("1"), None, &[]),
+        (false, "O scoop não atualizou o app.".to_string())
+    );
+    assert_eq!(
+        scoop_message(1, Some("1"), Some("2"), &[]),
+        (false, "O scoop falhou (código 1).".to_string())
+    );
+}
+
+#[test]
+fn tail_splits_lines() {
+    let mut t = Tail::new();
+    assert_eq!(t.push(b"um\r\ndo"), vec!["um".to_string()]);
+    assert_eq!(t.push(b"is\nx"), vec!["dois".to_string()]);
+    assert_eq!(t.push(b"\ra\rb\n"), vec!["b".to_string()]);
+    assert_eq!(t.last(), Some("b"));
+    assert!(
+        t.push(b"\n\r\n  \r\n").is_empty(),
+        "empty lines are dropped"
+    );
+    assert_eq!(t.lines(), ["um", "dois", "b"]);
+    assert_eq!(
+        t.push(b"x\xff\xfey\n"),
+        vec!["x\u{FFFD}\u{FFFD}y".to_string()]
+    );
+    let long = t.push(&[b'z'; 5000]);
+    assert!(long.is_empty());
+    let long = t.push(b"\n");
+    assert_eq!(long.len(), 1);
+    assert!(long[0].len() <= 1024 && long[0].starts_with("zzz"));
+    let chunk = vec![b'q'; 64 * 1024];
+    for _ in 0..16 {
+        assert!(t.push(&chunk).is_empty());
+        assert!(t.buffered() <= 64 * 1024 + chunk.len(), "{}", t.buffered());
+    }
+    assert_eq!(
+        t.push(b"\nfinal\nresto"),
+        vec!["q".repeat(1024), "final".to_string()]
+    );
+    assert_eq!(t.finish(), Some("resto".to_string()));
+    assert_eq!(t.finish(), None);
+    for i in 0..30 {
+        t.push(format!("l{i}\n").as_bytes());
+    }
+    assert_eq!(t.lines().len(), 20);
+    assert_eq!(t.lines()[0], "l10");
+    assert_eq!(t.last(), Some("l29"));
+}
+
+#[cfg(windows)]
+#[test]
+fn spawn_runs_fake_tool() {
+    use wingetrs::bridge::spawn_win::run;
+    let cmd = |script: &str| vec!["/d".to_string(), "/c".to_string(), script.to_string()];
+    let mut seen = Vec::new();
+    let (code, tail) = run(
+        "cmd.exe",
+        &cmd("echo um& echo erro 1>&2& echo dois& (set /p x=fim<nul) 1>&2& exit /b -1978335212"),
+        |l| seen.push(l.to_string()),
+    )
+    .unwrap();
+    assert_eq!(code, -1978335212);
+    let out: Vec<&String> = seen.iter().filter(|l| *l == "um" || *l == "dois").collect();
+    assert_eq!(out, ["um", "dois"], "stdout lines arrive in order");
+    assert!(seen.iter().any(|l| l == "erro"), "{seen:?}");
+    assert_eq!(seen.last().map(String::as_str), Some("fim"), "{seen:?}");
+    assert_eq!(tail, seen);
+
+    // Stdin is closed: `set /p` returns at once instead of waiting for input.
+    let (code, tail) = run("cmd.exe", &cmd("set /p x=& echo depois& exit /b 3"), |_| {}).unwrap();
+    assert_eq!(code, 3);
+    assert_eq!(tail.last().map(String::as_str), Some("depois"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("out.bin");
+    std::fs::write(&file, b"ok\xff\xfe\r\nmeio\rfim\n\nsem-fim").unwrap();
+    let (code, tail) = run("cmd.exe", &cmd(&format!("type {}", file.display())), |_| {}).unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(tail, ["ok\u{FFFD}\u{FFFD}", "fim", "sem-fim"]);
+
+    let missing = run("wingetrs-ferramenta-inexistente", &[], |_| {}).unwrap_err();
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+}

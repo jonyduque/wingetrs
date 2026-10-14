@@ -1,5 +1,6 @@
 //! Install/remove/upgrade jobs of the TUI. Every function takes the `OpsCtx` as a parameter so
 //! tests drive them with fakes; `run.rs` builds the production context.
+use crate::bridge::{self, BridgeJob, Tool};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
 use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
@@ -236,7 +237,68 @@ pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallF
                 residues: Some((plan.app, residues)),
             })
         }
+        // Runs outside `install.lock` and the ops context: see `run_bridge`.
+        Action::Bridge(job) => Err(InstallFail::Other(format!(
+            "{}: atualização via {} fora do executor da ponte",
+            job.name,
+            job.tool.name()
+        ))),
     }
+}
+
+/// Runner of a bridge command: `(program, args, on_line)` -> exit code and last lines.
+pub type BridgeExec<'a> =
+    &'a mut dyn FnMut(&str, &[String], &mut dyn FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>;
+
+/// Upgrades an app through winget or scoop. The target is checked before anything runs; for
+/// scoop, the installed version is read right before and right after the run, since its exit
+/// code 0 alone does not mean it upgraded. On failure the last lines go to the log.
+pub fn run_bridge(
+    job: &BridgeJob,
+    scoop_root: &Path,
+    pwsh: &str,
+    exec: BridgeExec<'_>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Done, InstallFail> {
+    let fail = |message: String| Err(InstallFail::Other(format!("{}: {message}", job.name)));
+    if !bridge::valid_target(job.tool, &job.target) {
+        return fail(format!("identificador inválido: {}", job.target));
+    }
+    let (program, args) = bridge::command(job, scoop_root, pwsh);
+    let version = || match job.tool {
+        Tool::Scoop => bridge::scoop_version(scoop_root, &job.target),
+        Tool::Winget => None,
+    };
+    let before = version();
+    let run = exec(&program, &args, on_line);
+    let after = version();
+    let (code, lines) = match run {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return fail(format!("{} não encontrado", job.tool.name()));
+        }
+        Err(e) => return fail(format!("falha ao iniciar {program}: {e}")),
+    };
+    let (updated, message) = match job.tool {
+        Tool::Winget => (bridge::winget_updated(code), bridge::winget_message(code)),
+        Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),
+    };
+    if updated {
+        return Ok(Done {
+            summary: format!("{}: {message}", job.name),
+            residues: None,
+        });
+    }
+    tracing::warn!(
+        tool = job.tool.name(),
+        target = %job.target,
+        code,
+        "bridge upgrade failed: {message}
+    {}",
+        lines.join("
+    ")
+    );
+    fail(message)
 }
 
 /// Removes the chosen residues; returns one message per item that failed.
