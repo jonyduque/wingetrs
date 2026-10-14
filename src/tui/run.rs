@@ -145,6 +145,14 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     app.status = Some("carregando catálogo…".into());
     // `ratatui::init` also installs a panic hook that restores the terminal before the message.
     let mut terminal = ratatui::init();
+    // Mouse capture must be off again after a panic too: chain a hook that disables it
+    // and then calls the previous one (ratatui's, which restores the terminal and prints).
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        previous_hook(info);
+    }));
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     app.size = terminal
         .size()
         .map(|s| (s.width, s.height))
@@ -164,6 +172,7 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
             (_, Err(e)) => Err(e.into()),
         }
     }));
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
@@ -372,6 +381,7 @@ pub fn clock_turn(app: &mut App, now: Instant, msgs: Vec<Msg>) -> Vec<Cmd> {
 fn input_msg(ev: Event) -> Option<Msg> {
     match ev {
         Event::Key(k) => Some(Msg::Key(k)),
+        Event::Mouse(m) => Some(Msg::Mouse(m)),
         Event::Resize(w, h) => Some(Msg::Resize(w, h)),
         _ => None,
     }

@@ -2,33 +2,31 @@
 use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
-use crate::tui::app::{App, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, RunProgress, Tab};
+use crate::tui::app::{App, ITEM_ROWS, Modal, RunProgress, Tab};
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
 use crate::tui::layout::{
     BAR_PAD_X, BORDER, DETAIL_ICON_COLS, DETAIL_ICON_GAP, DETAIL_ICON_ROWS, DIALOG_PAD_X,
-    DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, LIST_ICON_COLS, LIST_ICON_GAP, PAD_X, PICKER_FOOTER_SLACK,
-    inset, split_icon, split_with_gutter,
+    DIALOG_PAD_Y, ITEM_GAP, LIST_ICON_COLS, LIST_ICON_GAP, PICKER_FOOTER_SLACK, inset, split_icon,
 };
 use crate::tui::picker::{Picker, window};
+use crate::tui::regions::{list_visible, regions};
 use crate::tui::settings::{ORDER, SettingId};
 use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{Glyphs, Theme};
 use crate::tui::toast::draw_toasts;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui_image::protocol::Protocol;
 
 /// Below this width the details panel is hidden.
-const MIN_WIDTH_FOR_DETAILS: u16 = 60;
+pub(crate) const MIN_WIDTH_FOR_DETAILS: u16 = 60;
 /// Below this height only the list is drawn.
 pub const MIN_HEIGHT_FOR_CHROME: u16 = 8;
-/// Lines taken by the tab header.
-const TABS_ROWS: u16 = 3;
 
 pub fn view(app: &App, theme: &Theme, frame: &mut Frame) {
     let area = frame.area();
@@ -95,25 +93,18 @@ fn draw_screen<'a>(
     area: Rect,
 ) -> (Option<Rect>, IconPlaces<'a>) {
     let g = Glyphs::for_set(app.glyphs);
+    let r = regions(app, area);
     if area.height < MIN_HEIGHT_FOR_CHROME {
         if app.tab == Tab::Settings {
-            draw_settings(app, theme, g, frame, area);
+            draw_settings(app, theme, g, frame, r.settings);
         } else {
-            return (None, draw_list(app, theme, g, frame, area));
+            return (None, draw_list(app, theme, g, frame, r.list));
         }
         return (None, Vec::new());
     }
-    let help_rows = u16::from(area.height >= HELP_BAR_MIN_HEIGHT);
-    let rows = Layout::vertical([
-        Constraint::Length(TABS_ROWS),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(help_rows),
-    ])
-    .split(area);
     draw_tabs(
         frame,
-        rows[0],
+        r.tabs_area,
         &tab_labels(app, g),
         tab_index(app.tab),
         theme,
@@ -122,43 +113,35 @@ fn draw_screen<'a>(
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
         .border_type(BorderType::Rounded)
         .border_style(theme.accent());
-    let inner = inset(window.inner(rows[1]), PAD_X, 0);
-    frame.render_widget(window, rows[1]);
-    let parts = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(FILTER_GAP),
-        Constraint::Min(0),
-    ])
-    .split(inner);
-    let body = parts[2];
+    frame.render_widget(window, r.window);
     let mut icons = Vec::new();
     if app.tab == Tab::Settings {
-        draw_settings(app, theme, g, frame, inner);
-    } else if area.width < MIN_WIDTH_FOR_DETAILS {
-        draw_search_line(app, theme, g, frame, parts[0]);
-        icons = draw_list(app, theme, g, frame, body);
-    } else {
-        draw_search_line(app, theme, g, frame, parts[0]);
-        let (left, divider, right) = split_with_gutter(body, 55);
-        icons = draw_list(app, theme, g, frame, left);
+        draw_settings(app, theme, g, frame, r.settings);
+    } else if let Some(divider) = r.divider {
+        draw_search_line(app, theme, g, frame, r.search_line);
+        icons = draw_list(app, theme, g, frame, r.list);
         let divider_style = theme.border();
-        for y in body.y..body.bottom() {
+        for y in r.list.y..r.list.bottom() {
             frame
                 .buffer_mut()
                 .set_string(divider, y, "│", divider_style);
         }
-        icons.extend(draw_details(app, theme, g, frame, right));
+        icons.extend(draw_details(app, theme, g, frame, r.details));
+    } else {
+        draw_search_line(app, theme, g, frame, r.search_line);
+        icons = draw_list(app, theme, g, frame, r.list);
     }
-    draw_status(app, theme, g, frame, rows[2]);
+    let help_rows = r.help.height;
+    draw_status(app, theme, g, frame, r.status);
     if help_rows > 0 {
-        let bar = bar_area(rows[3]);
+        let bar = bar_area(r.help);
         let line = help_line(&hints(app), usize::from(bar.width), theme);
         frame.render_widget(Paragraph::new(line), bar);
     }
     if app.show_help {
         draw_help(theme, frame, area);
     }
-    (Some(rows[1]), icons)
+    (Some(r.window), icons)
 }
 
 fn tab_index(tab: Tab) -> usize {
@@ -193,7 +176,7 @@ fn updates_count(app: &App) -> usize {
         .count()
 }
 
-fn tab_labels(app: &App, g: &Glyphs) -> Vec<TabLabel> {
+pub(crate) fn tab_labels(app: &App, g: &Glyphs) -> Vec<TabLabel> {
     let count = updates_count(app);
     let with_glyph = |glyph: &str, name: &str| {
         if glyph.is_empty() {
@@ -598,11 +581,8 @@ fn draw_list<'a>(
         frame.render_widget(Paragraph::new(msg), inner);
         return Vec::new();
     }
-    let len = app.visible_len();
     let per_item = ITEM_ROWS + usize::from(ITEM_GAP);
-    let h = crate::tui::app::items_in_rows(usize::from(inner.height));
-    let sel = app.selected.min(len.saturating_sub(1));
-    let window = list_window(sel, app.scroll, len, h);
+    let window = list_visible(app, inner);
     let indent = LIST_ICON_COLS + LIST_ICON_GAP;
     let icons_on = app.icon_protocol != IconProtocol::Off && inner.width >= indent + 20;
     let text_area = if icons_on {

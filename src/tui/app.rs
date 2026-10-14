@@ -14,7 +14,9 @@ use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::settings::{SettingId, SettingsState, glyphs_name};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,6 +39,7 @@ pub enum SourceFilter {
 #[allow(clippy::large_enum_variant)]
 pub enum Msg {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Resize(u16, u16),
     Tick,
     /// A toast deadline passed: prune and redraw.
@@ -391,6 +394,10 @@ pub struct App {
     /// The `icons` value of the save in flight (goes with `save_in_flight`).
     icons_in_flight: Option<String>,
     list_icons_in_flight: Option<String>,
+    /// Whether terminal mouse events are acted on (the capture itself is `run`'s).
+    pub mouse_enabled: bool,
+    /// Time, tab and index of the last left click, for the double click.
+    last_click: Option<(Instant, Tab, usize)>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -476,6 +483,8 @@ impl App {
             save_in_flight: None,
             icons_in_flight: None,
             list_icons_in_flight: None,
+            mouse_enabled: true,
+            last_click: None,
         };
         app.research();
         app
@@ -937,6 +946,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
     app.prune_toasts();
     match msg {
         Msg::Key(k) => on_key(app, k),
+        Msg::Mouse(m) => on_mouse(app, m),
         Msg::Clock => Vec::new(),
         Msg::Resize(w, h) => {
             app.size = (w, h);
@@ -1174,6 +1184,69 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             }
             Vec::new()
         }
+    }
+}
+
+/// Two left clicks on the same item within this time act as `Enter`.
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Items a wheel notch moves the selection.
+const WHEEL_ITEMS: usize = 3;
+
+/// Mouse: left click on a tab, list item or setting row; double click is `Enter`; the wheel
+/// moves the list. Ignored under a modal or the help, and when `mouse_enabled` is off.
+fn on_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
+    if !app.mouse_enabled || app.modal.is_some() || app.show_help {
+        return Vec::new();
+    }
+    let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
+    let r = crate::tui::regions::regions(app, area);
+    let inside = |rect: ratatui::layout::Rect| rect.contains((ev.column, ev.row).into());
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((_, tab)) = r.tabs.iter().find(|(rect, _)| inside(*rect)) {
+                app.last_click = None;
+                return app.set_tab(*tab);
+            }
+            let hit = if app.tab == Tab::Settings {
+                r.setting_rows.iter().position(|rect| inside(*rect))
+            } else {
+                crate::tui::regions::item_at(app, r.list, ev.column, ev.row)
+            };
+            let Some(index) = hit else {
+                app.last_click = None;
+                return Vec::new();
+            };
+            let double = matches!(app.last_click,
+                Some((at, tab, i)) if tab == app.tab && i == index
+                    && app.now.saturating_duration_since(at) <= DOUBLE_CLICK);
+            if app.tab == Tab::Settings {
+                app.settings.selected = index;
+            }
+            let mut cmds = if app.tab == Tab::Settings {
+                Vec::new()
+            } else {
+                app.move_to(index)
+            };
+            if double {
+                app.last_click = None;
+                let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                cmds.extend(on_key(app, enter));
+            } else {
+                app.last_click = Some((app.now, app.tab, index));
+            }
+            cmds
+        }
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if app.tab != Tab::Settings => {
+            if !inside(r.list) {
+                return Vec::new();
+            }
+            if ev.kind == MouseEventKind::ScrollDown {
+                app.move_to(app.selected.saturating_add(WHEEL_ITEMS))
+            } else {
+                app.move_to(app.selected.saturating_sub(WHEEL_ITEMS))
+            }
+        }
+        _ => Vec::new(),
     }
 }
 

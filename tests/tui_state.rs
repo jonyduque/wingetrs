@@ -2765,3 +2765,168 @@ fn list_icons_reverts_on_save_failure() {
     assert_eq!(a.settings.list_icons, "visible");
     assert!(a.list_icons_visible);
 }
+
+// ---- Task 94: mouse ----
+
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use std::time::Instant;
+use wingetrs::tui::regions::{item_at, regions};
+
+fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Msg {
+    Msg::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn click_at(a: &mut App, at: Instant, column: u16, row: u16) -> Vec<Cmd> {
+    a.now = at;
+    update(
+        a,
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+    )
+}
+
+fn ten_hits() -> App {
+    let es = (0..10)
+        .map(|i| entry(SourceKind::Scoop, &format!("pkg{i}"), &format!("Pkg{i}")))
+        .collect();
+    let mut a = App::new(es, GlyphSet::Ascii);
+    a.size = (100, 30);
+    a
+}
+
+fn screen(a: &App) -> Rect {
+    Rect::new(0, 0, a.size.0, a.size.1)
+}
+
+#[test]
+fn click_on_tab_switches_tab() {
+    let mut a = ten_hits();
+    let r = regions(&a, screen(&a));
+    let (rect, tab) = r.tabs[1];
+    assert_eq!(tab, Tab::Installed);
+    click_at(&mut a, Instant::now(), rect.x + rect.width / 2, rect.y + 1);
+    assert_eq!(a.tab, Tab::Installed);
+}
+
+#[test]
+fn click_on_item_selects_it() {
+    let mut a = ten_hits();
+    a.selected = 3;
+    a.scroll = 3;
+    let list = regions(&a, screen(&a)).list;
+    let t0 = Instant::now();
+    // Second visible item (index 4), first line.
+    click_at(&mut a, t0, list.x + 2, list.y + 2);
+    assert_eq!(a.selected, 4);
+    // Past the last item's lines hits nothing (a gap line when ITEM_GAP > 0).
+    a.selected = 3;
+    let beyond = list.y + 2 * 10;
+    if beyond < list.bottom() {
+        click_at(&mut a, t0, list.x + 2, beyond);
+        assert_eq!(a.selected, 3);
+    }
+    assert_eq!(item_at(&a, list, list.x, list.y), Some(3));
+}
+
+#[test]
+fn double_click_runs_enter() {
+    let t0 = Instant::now();
+    let item_cell = |a: &App, n: u16| {
+        let list = regions(a, screen(a)).list;
+        (list.x + 2, list.y + 2 * n)
+    };
+    // Reference: one click then Enter.
+    let mut b = ten_hits();
+    let (x, y) = item_cell(&b, 1);
+    click_at(&mut b, t0, x, y);
+    let enter = update(&mut b, key(KeyCode::Enter));
+    assert!(!enter.is_empty(), "Enter on a search row plans an install");
+
+    let mut a = ten_hits();
+    click_at(&mut a, t0, x, y);
+    let double = click_at(&mut a, t0 + Duration::from_millis(100), x, y);
+    assert_eq!(double, enter);
+
+    let mut slow = ten_hits();
+    click_at(&mut slow, t0, x, y);
+    let late = click_at(&mut slow, t0 + Duration::from_millis(500), x, y);
+    assert!(late.is_empty());
+    assert_eq!(slow.selected, 1);
+
+    let mut other = ten_hits();
+    click_at(&mut other, t0, x, y);
+    let (x2, y2) = item_cell(&other, 2);
+    let second = click_at(&mut other, t0 + Duration::from_millis(100), x2, y2);
+    assert_ne!(second, enter);
+    assert_eq!(other.selected, 2);
+}
+
+#[test]
+fn wheel_scrolls_the_list() {
+    let mut a = ten_hits();
+    let list = regions(&a, screen(&a)).list;
+    let (x, y) = (list.x + 2, list.y + 1);
+    update(&mut a, mouse(MouseEventKind::ScrollDown, x, y));
+    assert_eq!(a.selected, 3);
+    for _ in 0..5 {
+        update(&mut a, mouse(MouseEventKind::ScrollDown, x, y));
+    }
+    assert_eq!(a.selected, 9);
+    update(&mut a, mouse(MouseEventKind::ScrollUp, x, y));
+    assert_eq!(a.selected, 6);
+}
+
+#[test]
+fn mouse_ignored_under_modal_and_when_disabled() {
+    let mut a = ten_hits();
+    let list = regions(&a, screen(&a)).list;
+    let (x, y) = (list.x + 2, list.y + 3);
+    a.mouse_enabled = false;
+    click_at(&mut a, Instant::now(), x, y);
+    update(&mut a, mouse(MouseEventKind::ScrollDown, x, y));
+    assert_eq!(a.selected, 0);
+    a.mouse_enabled = true;
+    update(&mut a, ready_confirm());
+    assert!(a.modal.is_some());
+    click_at(&mut a, Instant::now(), x, y);
+    update(&mut a, mouse(MouseEventKind::ScrollDown, x, y));
+    assert_eq!(a.selected, 0);
+    assert!(a.modal.is_some());
+}
+
+fn ready_confirm() -> Msg {
+    Msg::Planned(Ok(wingetrs::tui::app::Planned::Ready {
+        text: "x".into(),
+        action: wingetrs::tui::app::Action::Apply(vec![]),
+    }))
+}
+
+#[test]
+fn settings_click_selects_row() {
+    let mut a = ten_hits();
+    a.tab = Tab::Settings;
+    let id = wingetrs::tui::settings::ORDER[2];
+    let before = a.settings.value_index(id);
+    let rows = regions(&a, screen(&a)).setting_rows;
+    let rect = rows[2];
+    click_at(&mut a, Instant::now(), rect.x + 3, rect.y);
+    assert_eq!(a.settings.selected, 2);
+    assert_eq!(a.settings.value_index(id), before);
+}
+
+#[test]
+fn click_below_the_last_item_hits_nothing() {
+    let mut a = app();
+    a.size = (100, 30);
+    let list = regions(&a, screen(&a)).list;
+    // Three items take six lines; the line right after them is empty.
+    assert_eq!(item_at(&a, list, list.x, list.y + 5), Some(2));
+    assert_eq!(item_at(&a, list, list.x, list.y + 6), None);
+    click_at(&mut a, Instant::now(), list.x + 2, list.y + 6);
+    assert_eq!(a.selected, 0);
+}

@@ -25,6 +25,40 @@ fn label_style(labels: &[TabLabel], i: usize, active: usize, theme: &Theme) -> S
     }
 }
 
+/// Screen rectangle of each tab title inside `area`, the same geometry `draw_tabs` paints:
+/// the whole box (3 lines) in the wide form, the label text on the middle line when narrow.
+pub fn tab_rects(area: Rect, labels: &[TabLabel]) -> Vec<Rect> {
+    if area.width < 2 || area.height == 0 {
+        return Vec::new();
+    }
+    let pad = 2 * usize::from(TAB_PAD_X);
+    let widths: Vec<usize> = labels
+        .iter()
+        .map(|l| Span::raw(l.text.as_str()).width())
+        .collect();
+    let total: usize = widths.iter().map(|w| w + pad + 2).sum();
+    let at = |x: usize, w: usize, y: u16, h: u16| {
+        let x = area.x.saturating_add(u16::try_from(x).unwrap_or(u16::MAX));
+        let w = u16::try_from(w).unwrap_or(u16::MAX);
+        Rect::new(x, y, w, h).intersection(area)
+    };
+    let mut x = 0;
+    let mut out = Vec::new();
+    if total + 1 > usize::from(area.width) {
+        x += usize::from(TAB_PAD_X);
+        for w in &widths {
+            out.push(at(x, *w, area.y.saturating_add(1), 1));
+            x += w + 3;
+        }
+    } else {
+        for w in &widths {
+            out.push(at(x, w + pad + 2, area.y, area.height.min(3)));
+            x += w + pad + 2;
+        }
+    }
+    out
+}
+
 /// Draws the three header lines into `area` (needs height 3 and width >= 2 to draw fully).
 pub fn draw_tabs(frame: &mut Frame, area: Rect, labels: &[TabLabel], active: usize, theme: &Theme) {
     if area.width < 2 || area.height == 0 {

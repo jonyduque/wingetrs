@@ -1734,3 +1734,64 @@ fn nerd_detail_glyphs_have_two_spaces() {
     assert!(u.contains("§ Zlicense-text"));
     assert!(!u.contains("§  Zlicense-text"));
 }
+
+// ---- Task 94: drawing and mouse share one geometry ----
+
+#[test]
+fn tab_titles_match_regions() {
+    use ratatui::layout::Rect;
+    use wingetrs::tui::app::Tab;
+    use wingetrs::tui::regions::regions;
+    for (w, h) in [(80, 24), (100, 30), (60, 15)] {
+        for tab in [Tab::Search, Tab::Installed, Tab::Updates, Tab::Settings] {
+            let mut a = App::new(entries(), GlyphSet::Ascii);
+            a.tab = tab;
+            a.size = (w, h);
+            let out = render(&a, w, h);
+            let lines: Vec<Vec<char>> = out.lines().map(|l| l.chars().collect()).collect();
+            let r = regions(&a, Rect::new(0, 0, w, h));
+            assert_eq!(r.tabs.len(), 4);
+            for ((rect, t), name) in
+                r.tabs
+                    .iter()
+                    .zip(["Pesquisar", "Instalados", "Atualizações", "Ajustes"])
+            {
+                // Some row of the rectangle holds the whole title text.
+                let found = (rect.y..rect.bottom()).any(|y| {
+                    let row: String = lines[usize::from(y)]
+                        .iter()
+                        .skip(usize::from(rect.x))
+                        .take(usize::from(rect.width))
+                        .collect();
+                    row.contains(name)
+                });
+                assert!(
+                    found,
+                    "{name} ({t:?}) not inside {rect:?} at {w}x{h}, tab {tab:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn setting_rows_match_the_drawing() {
+    use ratatui::layout::Rect;
+    use wingetrs::tui::app::Tab;
+    use wingetrs::tui::regions::regions;
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.tab = Tab::Settings;
+    a.size = (100, 30);
+    let out = render(&a, 100, 30);
+    let lines: Vec<&str> = out.lines().collect();
+    let r = regions(&a, Rect::new(0, 0, 100, 30));
+    assert_eq!(r.setting_rows.len(), wingetrs::tui::settings::ORDER.len());
+    for (rect, id) in r.setting_rows.iter().zip(wingetrs::tui::settings::ORDER) {
+        assert!(
+            lines[usize::from(rect.y)].contains(id.label()),
+            "{} not on row {}",
+            id.label(),
+            rect.y
+        );
+    }
+}
