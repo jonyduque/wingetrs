@@ -114,7 +114,14 @@ pub fn missing_uninstaller(
     let raw = if let Some(rest) = cmd.strip_prefix('"') {
         &rest[..rest.find('"')?]
     } else {
-        let end = cmd.to_ascii_lowercase().find(".exe")? + ".exe".len();
+        // The first `.exe` that ends a token: a name like foo.exe.d is not cut.
+        let lower = cmd.to_ascii_lowercase();
+        let end = lower.match_indices(".exe").find_map(|(i, m)| {
+            let end = i + m.len();
+            let next = cmd[end..].chars().next();
+            next.is_none_or(|c| c.is_whitespace() || c == '/')
+                .then_some(end)
+        })?;
         &cmd[..end]
     };
     let expanded = expand_vars(raw, &expand)?;

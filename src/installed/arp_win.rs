@@ -2,7 +2,6 @@
 use super::arp::{reg_dword, reg_string};
 use super::{Hive, InstalledApp, RawArpEntry, filter_arp, missing_uninstaller, unpack_guid};
 use std::collections::HashMap;
-use std::path::Path;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 use winreg::{RegKey, RegValue};
 
@@ -63,8 +62,12 @@ fn read_hive(
 
 /// Reads the disk only: the uninstaller path from `UninstallString` when that file is gone.
 fn stale_uninstaller(cmd: Option<&str>) -> Option<String> {
-    missing_uninstaller(cmd?, |v| std::env::var(v).ok(), Path::exists)
-        .map(|p| p.to_string_lossy().into_owned())
+    missing_uninstaller(
+        cmd?,
+        |v| std::env::var(v).ok(),
+        |p| !matches!(p.try_exists(), Ok(false)),
+    )
+    .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn read_keys(

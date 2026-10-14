@@ -213,6 +213,20 @@ fn missing_uninstaller_cases() {
         missing(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -c x"),
         None
     );
+    assert_eq!(missing(r"C:\Windows\System32\rundll32.exe x,y"), None);
+    assert_eq!(
+        missing(r"C:\Program Files\PowerShell\7\pwsh.exe -c x"),
+        None
+    );
+    assert_eq!(missing(r"C:\Windows\System32\cmd.exe /c x"), None);
+    assert_eq!(
+        missing(r"C:\foo.exe.d\u.exe /S").as_deref(),
+        Some(r"C:\foo.exe.d\u.exe")
+    );
+    assert_eq!(
+        missing(r"C:\Steam\steam.exe/uninstall").as_deref(),
+        Some(r"C:\Steam\steam.exe")
+    );
     assert_eq!(missing("powershell -c x"), None);
     assert_eq!(missing("u.exe"), None);
 }

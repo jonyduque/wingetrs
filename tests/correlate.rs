@@ -796,6 +796,17 @@ fn cli_list_shows_extra_records() {
 }
 
 #[test]
+fn cli_list_marks_stale_and_json_has_it() {
+    let mut app = kindle(Hive::User, "Old App", "1.0");
+    app.stale = Some(r"C:\gone\u.exe".into());
+    let rows = run(&[app]);
+    let text = wingetrs::cli::output::list_text(&rows, false);
+    assert!(text.contains("Old App (sobra provável)"), "{text}");
+    let json = serde_json::to_string(&rows).unwrap();
+    assert!(json.contains(r#""stale":"C:\\gone\\u.exe""#), "{json}");
+}
+
+#[test]
 fn wingetrs_record_always_leads() {
     let mut scoop = kindle(Hive::User, "7zip", "26.04");
     scoop.source = InstallSource::Scoop;
