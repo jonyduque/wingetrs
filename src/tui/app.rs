@@ -296,7 +296,17 @@ pub const MAX_ICON_JOBS: usize = 8;
 /// Most toasts on screen at once.
 pub const MAX_TOASTS: usize = 3;
 
+/// Order of the Installed and Updates lists; lives for the session only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Source,
+    State,
+}
+
 pub struct App {
+    pub sort_installed: SortKey,
+    pub sort_updates: SortKey,
     pub tab: Tab,
     pub filter: SourceFilter,
     pub query: String,
@@ -399,6 +409,8 @@ pub fn chrome_rows(height: u16) -> usize {
 impl App {
     pub fn new(entries: Vec<PackageEntry>, glyphs: GlyphSet) -> App {
         let mut app = App {
+            sort_installed: SortKey::Name,
+            sort_updates: SortKey::Name,
             tab: Tab::Search,
             filter: SourceFilter::All,
             query: String::new(),
@@ -489,10 +501,21 @@ impl App {
         self.toasts.iter().filter_map(|t| t.expires).min()
     }
 
-    /// Installed rows visible in the Installed/Updates tabs after query and source filter.
+    /// Order in force for the current tab.
+    pub fn sort_key(&self) -> SortKey {
+        if self.tab == Tab::Updates {
+            self.sort_updates
+        } else {
+            self.sort_installed
+        }
+    }
+
+    /// Installed rows visible in the Installed/Updates tabs after query and source filter,
+    /// in the tab's sort order (the one place that orders them).
     pub fn installed_view(&self) -> Vec<&ListRow> {
         let q = self.query.to_lowercase();
-        self.installed
+        let mut rows: Vec<&ListRow> = self
+            .installed
             .iter()
             .filter(|r| {
                 self.tab != Tab::Updates || matches!(r.state, UpdateState::Available { .. })
@@ -506,7 +529,55 @@ impl App {
                 }
                 _ => false,
             })
-            .collect()
+            .collect();
+        // Stable sort: ties fall to the lowercase name, the final tie-break.
+        match self.sort_key() {
+            SortKey::Name => {
+                rows.sort_by_cached_key(|r| (0u8, String::new(), r.name.to_lowercase()))
+            }
+            SortKey::Source => rows.sort_by_cached_key(|r| match &r.correlation {
+                Correlation::Matched { source, .. } => (0u8, source.clone(), r.name.to_lowercase()),
+                _ => (1u8, String::new(), r.name.to_lowercase()),
+            }),
+            SortKey::State => rows.sort_by_cached_key(|r| {
+                let rank = match r.state {
+                    UpdateState::Available { .. } => 0u8,
+                    UpdateState::Broken => 1,
+                    UpdateState::Unknown => 2,
+                    UpdateState::UpToDate => 3,
+                };
+                (rank, String::new(), r.name.to_lowercase())
+            }),
+        }
+        rows
+    }
+
+    /// Next order in the cycle (`o`); the same item stays selected, or 0 if it vanished.
+    fn cycle_sort(&mut self) {
+        let kept = self
+            .installed_view()
+            .get(self.selected)
+            .map(|r| (r.name.clone(), r.origin.clone()));
+        if self.tab == Tab::Updates {
+            self.sort_updates = match self.sort_updates {
+                SortKey::Name => SortKey::Source,
+                _ => SortKey::Name,
+            };
+        } else {
+            self.sort_installed = match self.sort_installed {
+                SortKey::Name => SortKey::Source,
+                SortKey::Source => SortKey::State,
+                SortKey::State => SortKey::Name,
+            };
+        }
+        self.selected = kept
+            .and_then(|(n, o)| {
+                self.installed_view()
+                    .iter()
+                    .position(|r| r.name == n && r.origin == o)
+            })
+            .unwrap_or(0);
+        self.clamp();
     }
 
     /// Rows visible in the current tab after filters.
@@ -1090,6 +1161,10 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('i') if empty && app.tab == Tab::Search => install_selected(app),
         KeyCode::Char('u') if empty && app.tab == Tab::Installed => remove_selected(app),
         KeyCode::Char('U') if empty && app.tab == Tab::Updates => upgrade_selected(app),
+        KeyCode::Char('o') if empty && matches!(app.tab, Tab::Installed | Tab::Updates) => {
+            app.cycle_sort();
+            app.details_cmd()
+        }
         KeyCode::Char('q') if empty => vec![Cmd::Quit],
         KeyCode::Char('?') if empty => {
             app.show_help = true;

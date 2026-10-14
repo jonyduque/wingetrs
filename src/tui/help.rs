@@ -26,9 +26,11 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         Tab::Installed => {
             out.push(("enter", "ações"));
             out.push(("u", "remover"));
+            out.push(("o", "ordem: nome|fonte|estado"));
         }
         Tab::Updates => {
             out.push(("enter", "atualizar"));
+            out.push(("o", "ordem: nome|fonte|estado"));
         }
         Tab::Settings => {}
     }

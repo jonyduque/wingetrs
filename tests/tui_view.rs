@@ -1001,10 +1001,13 @@ fn hints_change_with_the_tab() {
     a.tab = Tab::Installed;
     assert_eq!(
         keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "u", "ctrl+s", "?"]
+        ["↑/↓", "←/→", "enter", "u", "o", "ctrl+s", "?"]
     );
     a.tab = Tab::Updates;
-    assert_eq!(keys_of(&hints(&a)), ["↑/↓", "←/→", "enter", "ctrl+s", "?"]);
+    assert_eq!(
+        keys_of(&hints(&a)),
+        ["↑/↓", "←/→", "enter", "o", "ctrl+s", "?"]
+    );
     assert!(!keys_of(&hints(&a)).contains(&"esc".to_string()));
 }
 

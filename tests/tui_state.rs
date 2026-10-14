@@ -962,7 +962,7 @@ fn cached_installed_view_matches_a_fresh_filter() {
                     update(&mut a, key(KeyCode::Char(c)));
                 }
                 // Reference: the plain filter over `installed`.
-                let expected: Vec<&str> = rows
+                let mut expected: Vec<&str> = rows
                     .iter()
                     .filter(|r| {
                         tab != Tab::Updates || matches!(r.state, UpdateState::Available { .. })
@@ -976,6 +976,8 @@ fn cached_installed_view_matches_a_fresh_filter() {
                     })
                     .map(|r| r.name.as_str())
                     .collect();
+                // The view is ordered by name (the default sort).
+                expected.sort_by_key(|n| n.to_lowercase());
                 let got: Vec<&str> = a.installed_view().iter().map(|r| r.name.as_str()).collect();
                 assert_eq!(got, expected, "tab {tab:?} toggles {toggles} query {q:?}");
             }
@@ -2350,4 +2352,122 @@ fn actions_menu_never_defaults_to_remove() {
         update(&mut a, key(KeyCode::Enter)).as_slice(),
         [Cmd::PlanRemove { .. }]
     ));
+}
+
+fn srow(name: &str, origin: &str, source: Option<&str>, state: UpdateState) -> ListRow {
+    ListRow {
+        name: name.into(),
+        origin: origin.into(),
+        installed_version: Some("1".into()),
+        correlation: match source {
+            Some(s) => Correlation::Matched {
+                source: s.into(),
+                package_id: name.into(),
+                rule: Rule::ScoopManifest,
+            },
+            None => Correlation::Unmatched,
+        },
+        latest: None,
+        state,
+        tiebreak: None,
+    }
+}
+
+fn names(a: &App) -> Vec<String> {
+    a.installed_view().iter().map(|r| r.name.clone()).collect()
+}
+
+fn sort_rows() -> Vec<ListRow> {
+    let avail = || UpdateState::Available { latest: "2".into() };
+    vec![
+        srow("delta", "arp", None, UpdateState::UpToDate),
+        srow("Bravo", "wingetrs", Some("scoop:main"), avail()),
+        srow("charlie", "arp", Some("winget"), UpdateState::Unknown),
+        srow("alpha", "arp", None, UpdateState::Broken),
+    ]
+}
+
+#[test]
+fn installed_sorts_by_name_source_state() {
+    let mut a = on_tab(Tab::Installed, sort_rows());
+    assert_eq!(names(&a), ["alpha", "Bravo", "charlie", "delta"]);
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(names(&a), ["Bravo", "charlie", "alpha", "delta"]);
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(names(&a), ["Bravo", "alpha", "charlie", "delta"]);
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(names(&a), ["alpha", "Bravo", "charlie", "delta"]);
+}
+
+#[test]
+fn updates_sort_cycles_name_source() {
+    let avail = || UpdateState::Available { latest: "2".into() };
+    let rows = vec![
+        srow("zeta", "arp", Some("winget"), avail()),
+        srow("beta", "scoop", Some("scoop:main"), avail()),
+        srow("alpha", "arp", Some("winget"), avail()),
+    ];
+    let mut a = on_tab(Tab::Updates, rows);
+    assert_eq!(names(&a), ["alpha", "beta", "zeta"]);
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(names(&a), ["beta", "alpha", "zeta"]);
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(names(&a), ["alpha", "beta", "zeta"]);
+}
+
+#[test]
+fn sort_keeps_the_selected_item() {
+    let mut a = on_tab(Tab::Installed, sort_rows());
+    a.selected = 1;
+    assert_eq!(a.selected_key().unwrap().1, "Bravo");
+    update(&mut a, key(KeyCode::Char('o')));
+    assert_eq!(a.selected, 0);
+    assert_eq!(a.selected_key().unwrap().1, "Bravo");
+}
+
+#[test]
+fn remove_acts_on_the_sorted_row() {
+    let mut a = on_tab(Tab::Installed, sort_rows());
+    a.selected = 1;
+    update(&mut a, key(KeyCode::Char('o')));
+    let cmds = update(&mut a, key(KeyCode::Char('u')));
+    let shown = a.installed_view()[a.selected].name.clone();
+    assert_eq!(shown, "Bravo");
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, Cmd::PlanRemove { app, .. } if app == "Bravo")),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: timing of installed_view with 2000 rows, run with --release"]
+fn installed_view_sorted_by_state_timing() {
+    let rows: Vec<ListRow> = (0..2000)
+        .map(|i| {
+            let st = match i % 4 {
+                0 => UpdateState::UpToDate,
+                1 => UpdateState::Unknown,
+                2 => UpdateState::Broken,
+                _ => UpdateState::Available { latest: "2".into() },
+            };
+            srow(
+                &format!("App{}", (i * 7919) % 2000),
+                "arp",
+                Some("winget"),
+                st,
+            )
+        })
+        .collect();
+    let mut a = on_tab(Tab::Installed, rows);
+    a.sort_installed = wingetrs::tui::app::SortKey::State;
+    let mut t: Vec<std::time::Duration> = (0..200)
+        .map(|_| {
+            let s = std::time::Instant::now();
+            std::hint::black_box(a.installed_view());
+            s.elapsed()
+        })
+        .collect();
+    t.sort();
+    eprintln!("median installed_view(2000, State) = {:?}", t[100]);
 }
