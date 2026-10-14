@@ -3368,3 +3368,279 @@ fn second_ctrl_c_forces_quit() {
     update(&mut c, ready("a"));
     assert!(update(&mut c, ctrl('c')).is_empty());
 }
+// ---- marks (Task 97) ----
+
+fn space(a: &mut App) {
+    step(a, key(KeyCode::Char(' ')));
+}
+
+fn mark_all(a: &mut App) {
+    for i in 0..a.visible_len() {
+        a.selected = i;
+        space(a);
+    }
+}
+
+fn ready_remove(app: &str) -> Result<Planned, String> {
+    Ok(Planned::Ready {
+        text: format!("Remover {app}"),
+        action: removal(app),
+    })
+}
+
+fn ready_apply(app: &str) -> Result<Planned, String> {
+    Ok(Planned::Ready {
+        text: format!("Instalar {app}"),
+        action: apply_action(app),
+    })
+}
+
+fn has_toast(a: &App, needle: &str) -> bool {
+    a.toasts.iter().any(|t| t.text.contains(needle))
+}
+
+fn row_key(origin: &str, name: &str) -> (String, String) {
+    (origin.to_string(), name.to_string())
+}
+
+fn plan_remove_cmd(app: &str) -> Cmd {
+    Cmd::PlanRemove {
+        app: app.into(),
+        purge: false,
+    }
+}
+
+#[test]
+fn space_toggles_mark_in_state() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("alpha", "wingetrs", "scoop:main", false)],
+    );
+    space(&mut a);
+    assert_eq!(a.marked_count(), 1);
+    assert!(a.is_marked(&row_key("wingetrs", "alpha")));
+    assert_eq!(a.query, "", "space is not text");
+    space(&mut a);
+    assert_eq!(a.marked_count(), 0);
+}
+
+#[test]
+fn upgrade_marked_plans_batch_and_one_confirm() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            irow("alpha", "wingetrs", "scoop:main", true),
+            irow("beta", "wingetrs", "scoop:main", true),
+            irow("gamma", "arp", "winget", true),
+        ],
+    );
+    mark_all(&mut a);
+    assert_eq!(a.marked_count(), 3);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    let items = match cmds.as_slice() {
+        [Cmd::PlanBatch { items }] => items.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert!(
+        items
+            .iter()
+            .all(|i| matches!(i, Cmd::PlanInstall { id, .. } if id != "gamma"))
+    );
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![ready_apply("alpha"), ready_apply("beta")]),
+    );
+    let Some(Modal::Confirm { plan_text, .. }) = &a.modal else {
+        panic!("no confirm");
+    };
+    assert!(
+        plan_text.contains("alpha") && plan_text.contains("beta"),
+        "{plan_text}"
+    );
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.text.contains("pulados") && t.text.contains("gamma")),
+        "{:?}",
+        a.toasts
+    );
+    assert_eq!(a.marked_count(), 3, "marks stay until queued");
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(
+        cmds,
+        vec![Cmd::Execute(Action::Apply(vec![
+            vec![plan("alpha")],
+            vec![plan("beta")]
+        ]))]
+    );
+    assert_eq!(a.marked_count(), 0);
+}
+
+#[test]
+fn remove_marked_enqueues_one_per_app() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![
+            irow("alpha", "wingetrs", "scoop:main", false),
+            irow("beta", "wingetrs", "scoop:main", false),
+            irow("gamma", "scoop", "scoop:main", false),
+        ],
+    );
+    a.selected = 0;
+    space(&mut a);
+    a.selected = 1;
+    space(&mut a);
+    let cmds = update(&mut a, key(KeyCode::Char('u')));
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanBatch {
+            items: vec![plan_remove_cmd("alpha"), plan_remove_cmd("beta")]
+        }]
+    );
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![ready_remove("alpha"), ready_remove("beta")]),
+    );
+    assert!(confirm_open(&a));
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(cmds, vec![Cmd::Execute(removal("alpha"))]);
+    assert!(a.running.as_ref().unwrap().label.contains("alpha"));
+    assert_eq!(a.queue.len(), 1);
+    assert_eq!(a.queue[0].action, removal("beta"));
+    assert_eq!(a.marked_count(), 0);
+}
+
+#[test]
+fn marks_survive_rescan_and_sort_by_identity() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![
+            irow("alpha", "wingetrs", "scoop:main", false),
+            irow("beta", "wingetrs", "bucket-a", false),
+        ],
+    );
+    a.selected = 1;
+    space(&mut a);
+    assert!(a.is_marked(&row_key("wingetrs", "beta")));
+    // beta moves to another position in the new scan.
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![
+            irow("aaa", "wingetrs", "scoop:main", false),
+            irow("alpha", "wingetrs", "scoop:main", false),
+            irow("beta", "wingetrs", "bucket-a", false),
+        ]),
+    );
+    assert_eq!(a.marked_count(), 1);
+    assert!(a.is_marked(&row_key("wingetrs", "beta")));
+    // The order by source puts beta first; the mark follows it.
+    update(&mut a, key(KeyCode::Char('o')));
+    a.selected = 0;
+    let cmds = update(&mut a, key(KeyCode::Char('u')));
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanBatch {
+            items: vec![plan_remove_cmd("beta")]
+        }]
+    );
+    // A row that vanished loses its mark.
+    update(
+        &mut a,
+        Msg::InstalledLoaded(vec![irow("alpha", "wingetrs", "scoop:main", false)]),
+    );
+    assert_eq!(a.marked_count(), 0);
+}
+
+#[test]
+fn hidden_marks_are_not_acted_on() {
+    let scoop = |name: &str| entry(SourceKind::Scoop, name, name);
+    let mut a = App::new(
+        vec![scoop("alpha"), scoop("beta"), scoop("alpine")],
+        GlyphSet::Nerd,
+    );
+    for name in ["alpha", "beta"] {
+        a.selected = a
+            .hits
+            .iter()
+            .position(|h| a.search.entries()[h.index].name == name)
+            .unwrap();
+        space(&mut a);
+    }
+    assert_eq!(a.marked_count(), 2);
+    for c in "alp".chars() {
+        step(&mut a, key(KeyCode::Char(c)));
+    }
+    assert_eq!(a.visible_len(), 2, "alpha and alpine");
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanBatch {
+            items: vec![Cmd::PlanInstall {
+                source_name: "scoop:main".into(),
+                id: "alpha".into(),
+                keep: false
+            }]
+        }]
+    );
+    update(&mut a, Msg::BatchPlanned(vec![ready_apply("alpha")]));
+    assert!(has_toast(&a, "1 marcados fora da vista"), "{:?}", a.toasts);
+}
+
+#[test]
+fn marked_winget_hits_are_skipped_and_named() {
+    let mut a = app();
+    mark_all(&mut a);
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::PlanBatch { items }] if items.len() == 1),
+        "{cmds:?}"
+    );
+    update(&mut a, Msg::BatchPlanned(vec![ready_apply("ripgrep")]));
+    assert!(has_toast(&a, "pulados: "), "{:?}", a.toasts);
+    assert!(has_toast(&a, "PowerToys"), "{:?}", a.toasts);
+}
+
+#[test]
+fn ambiguous_and_failed_batch_items_are_reported() {
+    let mut a = on_tab(
+        Tab::Updates,
+        vec![
+            irow("alpha", "wingetrs", "scoop:main", true),
+            irow("beta", "wingetrs", "scoop:main", true),
+            irow("gamma", "wingetrs", "scoop:main", true),
+        ],
+    );
+    mark_all(&mut a);
+    update(&mut a, key(KeyCode::Char('U')));
+    update(
+        &mut a,
+        Msg::BatchPlanned(vec![
+            Ok(Planned::Choose(vec![])),
+            Err("falhou".into()),
+            ready_apply("gamma"),
+        ]),
+    );
+    assert!(has_toast(&a, "ambíguo, escolha individualmente: alpha"));
+    assert!(has_toast(&a, "beta: falhou"));
+    assert!(confirm_open(&a));
+}
+
+#[test]
+fn esc_clears_marks_before_query() {
+    let mut a = app();
+    space(&mut a);
+    step(&mut a, key(KeyCode::Char('p')));
+    assert_eq!(a.marked_count(), 1);
+    // An error toast is closed first, the marks stay.
+    a.push_toast(wingetrs::tui::app::ToastKind::Error, "x");
+    step(&mut a, key(KeyCode::Esc));
+    assert_eq!(a.marked_count(), 1);
+    assert!(a.toasts.is_empty());
+    step(&mut a, key(KeyCode::Esc));
+    assert_eq!(a.marked_count(), 0);
+    assert_eq!(a.query, "p");
+    step(&mut a, key(KeyCode::Esc));
+    assert_eq!(a.query, "");
+    assert_eq!(update(&mut a, key(KeyCode::Esc)), vec![Cmd::Quit]);
+}

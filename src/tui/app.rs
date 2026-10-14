@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tab {
     Search,
     Installed,
@@ -93,6 +93,8 @@ pub enum Msg {
     SettingsSaved(Result<(), String>),
     /// Result of planning an install, upgrade or removal.
     Planned(Result<Planned, String>),
+    /// Results of a `Cmd::PlanBatch`, in the order of its items.
+    BatchPlanned(Vec<Result<Planned, String>>),
     /// Download/extract progress of the running operation.
     InstallProgress {
         label: String,
@@ -201,6 +203,10 @@ pub enum Modal {
         /// `None`: the quit confirmation (Enter drops the queue and quits once the
         /// operation in progress ends).
         action: Option<Action>,
+        /// Further actions confirmed together with `action` (a batch of removals).
+        then: Vec<Action>,
+        /// Tab whose marks are cleared once the actions are queued.
+        clear_marks: Option<Tab>,
     },
     Picking {
         picker: Picker,
@@ -216,6 +222,8 @@ pub enum Modal {
         upgrade: Option<(String, String)>,
         /// Name to remove when wingetrs installed the app.
         remove: Option<String>,
+        /// The tab has marked rows: the items act on them, not on `app`.
+        marked: bool,
     },
     Residues {
         picker: Picker,
@@ -248,6 +256,11 @@ pub enum Cmd {
     PlanRemove {
         app: String,
         purge: bool,
+    },
+    /// Plan each of these `PlanInstall`/`PlanRemove` in turn, in one job; answers with
+    /// `Msg::BatchPlanned`.
+    PlanBatch {
+        items: Vec<Cmd>,
     },
     /// Plan upgrading every app with a newer catalog version.
     PlanUpgradeAll {
@@ -437,6 +450,23 @@ pub struct App {
     pub quit_after_running: bool,
     /// Dialogs that arrived while another was open; shown, in order, as it closes.
     pending_modals: VecDeque<Modal>,
+    /// Rows marked with Space per tab, by identity (see `RowKey`), not by position.
+    pub marks: HashMap<Tab, HashSet<RowKey>>,
+    /// What the batch plan in flight was made of.
+    batch: Option<Batch>,
+}
+
+/// Identity of a marked row: `(origin, name)` in Installed and Updates,
+/// `(source_name, id)` in Search.
+pub type RowKey = (String, String);
+
+/// A batch plan in flight: the app behind each item, the tab it came from and what was
+/// left out when it was built (reported when the plan arrives).
+struct Batch {
+    tab: Tab,
+    labels: Vec<String>,
+    skipped: Vec<String>,
+    hidden: usize,
 }
 
 const MAX_HITS: usize = 1000;
@@ -530,6 +560,8 @@ impl App {
             waiting_lock: false,
             quit_after_running: false,
             pending_modals: VecDeque::new(),
+            marks: HashMap::new(),
+            batch: None,
         };
         app.research();
         app
@@ -697,6 +729,75 @@ impl App {
             }
             Tab::Settings => None,
         }
+    }
+
+    /// Identity of every row of the current tab's view, in view order.
+    fn view_keys(&self) -> Vec<RowKey> {
+        match self.tab {
+            Tab::Search => self
+                .hits
+                .iter()
+                .filter_map(|h| self.search.entries().get(h.index))
+                .map(|e| (e.source_name.clone(), e.id.clone()))
+                .collect(),
+            Tab::Installed | Tab::Updates => self
+                .installed_view()
+                .into_iter()
+                .map(|r| (r.origin.clone(), r.name.clone()))
+                .collect(),
+            Tab::Settings => Vec::new(),
+        }
+    }
+
+    /// Rows marked in the current tab (visible or not).
+    pub fn marked_count(&self) -> usize {
+        self.marks.get(&self.tab).map_or(0, HashSet::len)
+    }
+
+    /// Whether the row `key` of the current tab is marked.
+    pub fn is_marked(&self, key: &RowKey) -> bool {
+        self.marks.get(&self.tab).is_some_and(|m| m.contains(key))
+    }
+
+    /// Space: marks or unmarks the selected row.
+    fn toggle_mark(&mut self) {
+        let Some(key) = self.view_keys().into_iter().nth(self.selected) else {
+            return;
+        };
+        let marks = self.marks.entry(self.tab).or_default();
+        if !marks.remove(&key) {
+            marks.insert(key);
+        }
+    }
+
+    /// Drops the marks of rows that no longer exist (after a new scan or catalog).
+    fn prune_marks(&mut self) {
+        let installed: HashSet<RowKey> = self
+            .installed
+            .iter()
+            .map(|r| (r.origin.clone(), r.name.clone()))
+            .collect();
+        let upgradable: HashSet<RowKey> = self
+            .installed
+            .iter()
+            .filter(|r| matches!(r.state, UpdateState::Available { .. }))
+            .map(|r| (r.origin.clone(), r.name.clone()))
+            .collect();
+        let catalog: HashSet<RowKey> = self
+            .search
+            .entries()
+            .iter()
+            .map(|e| (e.source_name.clone(), e.id.clone()))
+            .collect();
+        for (tab, keys) in &mut self.marks {
+            match tab {
+                Tab::Search => keys.retain(|k| catalog.contains(k)),
+                Tab::Installed => keys.retain(|k| installed.contains(k)),
+                Tab::Updates => keys.retain(|k| upgradable.contains(k)),
+                Tab::Settings => keys.clear(),
+            }
+        }
+        self.marks.retain(|_, keys| !keys.is_empty());
     }
 
     fn search_kind(&self) -> Option<SourceKind> {
@@ -1006,6 +1107,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::CatalogLoaded(entries) => {
             app.search = Arc::new(SearchIndex::new(entries));
+            app.prune_marks();
             app.research();
             app.clamp();
             app.details_cmd()
@@ -1026,6 +1128,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                 Ok(entries) => {
                     let empty = entries.is_empty();
                     app.search = Arc::new(SearchIndex::new(entries));
+                    app.prune_marks();
                     app.research();
                     app.clamp();
                     cmds.extend(app.details_cmd());
@@ -1044,6 +1147,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::InstalledLoaded(rows) => {
             let kept = app.selected_ident();
             app.installed = rows;
+            app.prune_marks();
             if let Some(i) = app.position_of(kept) {
                 app.selected = i;
             }
@@ -1185,6 +1289,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Planned(result) => on_planned(app, result),
+        Msg::BatchPlanned(results) => on_batch_planned(app, results),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
             if let Some(r) = &mut app.running {
@@ -1379,6 +1484,9 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             if let Some(i) = app.toasts.iter().position(|t| t.kind == ToastKind::Error) {
                 app.toasts.remove(i);
                 Vec::new()
+            } else if app.marked_count() > 0 {
+                app.marks.remove(&app.tab);
+                Vec::new()
             } else if !empty {
                 app.query.clear();
                 app.view_changed()
@@ -1397,6 +1505,10 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char('f') if empty => open_queue(app),
         KeyCode::Char('?') if empty => {
             app.show_help = true;
+            Vec::new()
+        }
+        KeyCode::Char(' ') if app.tab != Tab::Settings => {
+            app.toggle_mark();
             Vec::new()
         }
         KeyCode::Backspace => {
@@ -1518,6 +1630,9 @@ fn start_planning(app: &mut App, cmd: Cmd) -> Vec<Cmd> {
 
 /// `i`: plan installing the selected package (scoop only).
 fn install_selected(app: &mut App) -> Vec<Cmd> {
+    if let Some((rows, hidden)) = marked_rows(app) {
+        return install_marked(app, rows, hidden);
+    }
     let Some(hit) = app.hits.get(app.selected) else {
         return Vec::new();
     };
@@ -1539,6 +1654,9 @@ fn install_selected(app: &mut App) -> Vec<Cmd> {
 
 /// `u`: plan removing the selected app, which must be one wingetrs installed.
 fn remove_selected(app: &mut App) -> Vec<Cmd> {
+    if let Some((rows, hidden)) = marked_rows(app) {
+        return remove_marked(app, &rows, hidden);
+    }
     let name = match app.installed_view().get(app.selected) {
         None => return Vec::new(),
         Some(r) if r.origin == "wingetrs" => r.name.clone(),
@@ -1586,6 +1704,9 @@ fn plan_remove(app: &mut App, name: String) -> Vec<Cmd> {
 
 /// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.
 fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
+    if let Some((rows, hidden)) = marked_rows(app) {
+        return upgrade_marked(app, &rows, hidden);
+    }
     let keep = app.settings.behavior.keep_old;
     let target = match app.installed_view().get(app.selected) {
         None => return start_planning(app, Cmd::PlanUpgradeAll { keep }),
@@ -1600,8 +1721,158 @@ fn upgrade_selected(app: &mut App) -> Vec<Cmd> {
     }
 }
 
-/// `Enter` in Installed: the actions menu of the selected app.
+/// View positions of the marked rows that are visible, and how many marked rows are out of
+/// view (hidden by the query or the source filter); `None` when the tab has no marks.
+fn marked_rows(app: &App) -> Option<(Vec<usize>, usize)> {
+    let marks = app.marks.get(&app.tab).filter(|m| !m.is_empty())?;
+    let rows: Vec<usize> = app
+        .view_keys()
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| marks.contains(*k))
+        .map(|(i, _)| i)
+        .collect();
+    let hidden = marks.len() - rows.len();
+    Some((rows, hidden))
+}
+
+/// Toasts what a batch leaves out: rows that cannot take the action and marked rows out of view.
+fn report_left_out(app: &mut App, skipped: &[String], hidden: usize) {
+    if !skipped.is_empty() {
+        app.push_toast(
+            ToastKind::Warning,
+            format!("pulados: {}", skipped.join(", ")),
+        );
+    }
+    if hidden > 0 {
+        app.push_toast(
+            ToastKind::Warning,
+            format!("{hidden} marcados fora da vista não incluídos"),
+        );
+    }
+}
+
+/// Plans `items` (label, command) as one batch, or only reports what was left out when there
+/// is nothing to plan.
+fn start_batch(
+    app: &mut App,
+    items: Vec<(String, Cmd)>,
+    skipped: Vec<String>,
+    hidden: usize,
+) -> Vec<Cmd> {
+    if items.is_empty() {
+        report_left_out(app, &skipped, hidden);
+        return Vec::new();
+    }
+    if app.planning {
+        return Vec::new();
+    }
+    let (labels, items): (Vec<String>, Vec<Cmd>) = items.into_iter().unzip();
+    app.batch = Some(Batch {
+        tab: app.tab,
+        labels,
+        skipped,
+        hidden,
+    });
+    start_planning(app, Cmd::PlanBatch { items })
+}
+
+/// Marked rows of Search: plan installing each Scoop one; winget ones are skipped.
+fn install_marked(app: &mut App, rows: Vec<usize>, hidden: usize) -> Vec<Cmd> {
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    for i in rows {
+        let Some(e) = app
+            .hits
+            .get(i)
+            .and_then(|h| app.search.entries().get(h.index))
+        else {
+            continue;
+        };
+        if e.source == SourceKind::Scoop {
+            items.push((
+                e.name.clone(),
+                Cmd::PlanInstall {
+                    source_name: e.source_name.clone(),
+                    id: e.id.clone(),
+                    keep: false,
+                },
+            ));
+        } else {
+            skipped.push(e.name.clone());
+        }
+    }
+    start_batch(app, items, skipped, hidden)
+}
+
+/// Marked rows of Installed/Updates: plan upgrading those `upgrade_target` accepts.
+fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
+    let keep = app.settings.behavior.keep_old;
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    let view = app.installed_view();
+    for r in rows.iter().filter_map(|&i| view.get(i)) {
+        match upgrade_target(r) {
+            Ok((source_name, id)) => items.push((
+                r.name.clone(),
+                Cmd::PlanInstall {
+                    source_name,
+                    id,
+                    keep,
+                },
+            )),
+            Err(_) => skipped.push(r.name.clone()),
+        }
+    }
+    start_batch(app, items, skipped, hidden)
+}
+
+/// Marked rows of Installed: plan removing those wingetrs installed.
+fn remove_marked(app: &mut App, rows: &[usize], hidden: usize) -> Vec<Cmd> {
+    let purge = app.settings.behavior.purge;
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    let view = app.installed_view();
+    for r in rows.iter().filter_map(|&i| view.get(i)) {
+        if r.origin == "wingetrs" {
+            items.push((
+                r.name.clone(),
+                Cmd::PlanRemove {
+                    app: r.name.clone(),
+                    purge,
+                },
+            ));
+        } else {
+            skipped.push(r.name.clone());
+        }
+    }
+    start_batch(app, items, skipped, hidden)
+}
+
+/// `Enter` in Installed: the actions menu of the selected app, or of the marked ones.
 fn open_actions(app: &mut App) -> Vec<Cmd> {
+    if let Some((rows, _)) = marked_rows(app) {
+        let view = app.installed_view();
+        let marked: Vec<&ListRow> = rows.iter().filter_map(|&i| view.get(i).copied()).collect();
+        let upgradable = marked.iter().filter(|r| upgrade_target(r).is_ok()).count();
+        let removable = marked.iter().filter(|r| r.origin == "wingetrs").count();
+        let item = |label: &str, n: usize| PickerItem {
+            label: format!("{label} marcados ({n})"),
+            detail: String::new(),
+            selectable: n > 0,
+            note: (n == 0).then(|| "nenhum marcado aceita".to_string()),
+        };
+        let items = vec![item("Atualizar", upgradable), item("Remover", removable)];
+        let title = format!("{} marcados", marked.len());
+        app.modal = Some(Modal::Actions {
+            picker: Picker::single_at(items, 0),
+            app: title,
+            upgrade: None,
+            remove: None,
+            marked: true,
+        });
+        return Vec::new();
+    }
     let Some(r) = app.installed_view().get(app.selected).copied() else {
         return Vec::new();
     };
@@ -1627,6 +1898,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
         app: name,
         upgrade: upgrade.ok(),
         remove,
+        marked: false,
     });
     Vec::new()
 }
@@ -1773,6 +2045,8 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
     app.modal = Some(Modal::Confirm {
         plan_text,
         action: None,
+        then: Vec::new(),
+        clear_marks: None,
     });
     Vec::new()
 }
@@ -1861,6 +2135,8 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
                 Modal::Confirm {
                     plan_text: text,
                     action: Some(action),
+                    then: Vec::new(),
+                    clear_marks: None,
                 },
             );
         }
@@ -1879,6 +2155,71 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
         Err(message) => app.push_toast(ToastKind::Error, message),
     }
     Vec::new()
+}
+
+/// Results of a batch plan: one confirmation for all the plans, then everything is queued.
+fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec<Cmd> {
+    app.planning = false;
+    app.status = None;
+    let confirm = app
+        .planning_confirm
+        .take()
+        .unwrap_or(app.settings.behavior.confirm);
+    let Some(batch) = app.batch.take() else {
+        return Vec::new();
+    };
+    report_left_out(app, &batch.skipped, batch.hidden);
+    let mut groups = Vec::new();
+    let mut removals = Vec::new();
+    let mut texts = Vec::new();
+    let mut ambiguous = Vec::new();
+    for (i, result) in results.into_iter().enumerate() {
+        let label = batch.labels.get(i).cloned().unwrap_or_default();
+        match result {
+            Ok(Planned::Ready { text, action }) => {
+                texts.push(text);
+                match action {
+                    Action::Apply(g) => groups.extend(g),
+                    remove @ Action::Remove(_) => removals.push(remove),
+                }
+            }
+            Ok(Planned::Choose(_)) => ambiguous.push(label),
+            Err(message) => app.push_toast(ToastKind::Error, format!("{label}: {message}")),
+        }
+    }
+    if !ambiguous.is_empty() {
+        app.push_toast(
+            ToastKind::Warning,
+            format!("ambíguo, escolha individualmente: {}", ambiguous.join(", ")),
+        );
+    }
+    let mut actions = Vec::new();
+    if !groups.is_empty() {
+        actions.push(Action::Apply(groups));
+    }
+    actions.extend(removals);
+    if actions.is_empty() {
+        return Vec::new();
+    }
+    if actions.iter().any(|a| needs_confirm(confirm, a)) {
+        let mut rest = actions.into_iter();
+        open_modal(
+            app,
+            Modal::Confirm {
+                plan_text: texts.join("\n\n"),
+                action: rest.next(),
+                then: rest.collect(),
+                clear_marks: Some(batch.tab),
+            },
+        );
+        return Vec::new();
+    }
+    let mut cmds = Vec::new();
+    for action in actions {
+        cmds.extend(enqueue(app, action));
+    }
+    app.marks.remove(&batch.tab);
+    cmds
 }
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
@@ -1970,9 +2311,23 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         return Vec::new();
     };
     match modal {
-        Modal::Confirm { plan_text, action } => match key.code {
+        Modal::Confirm {
+            plan_text,
+            action,
+            then,
+            clear_marks,
+        } => match key.code {
             KeyCode::Enter => match action {
-                Some(action) => enqueue(app, action),
+                Some(action) => {
+                    let mut cmds = enqueue(app, action);
+                    for next in then {
+                        cmds.extend(enqueue(app, next));
+                    }
+                    if let Some(tab) = clear_marks {
+                        app.marks.remove(&tab);
+                    }
+                    cmds
+                }
                 None => {
                     // Quit: the pending ones are dropped, the one in progress is waited for.
                     app.queue.clear();
@@ -1982,7 +2337,12 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             },
             KeyCode::Esc => Vec::new(),
             _ => {
-                app.modal = Some(Modal::Confirm { plan_text, action });
+                app.modal = Some(Modal::Confirm {
+                    plan_text,
+                    action,
+                    then,
+                    clear_marks,
+                });
                 Vec::new()
             }
         },
@@ -2017,6 +2377,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             app: name,
             upgrade,
             remove,
+            marked,
         } => match picker.key(key) {
             PickOutcome::Pending => {
                 app.modal = Some(Modal::Actions {
@@ -2024,10 +2385,16 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     app: name,
                     upgrade,
                     remove,
+                    marked,
                 });
                 Vec::new()
             }
             PickOutcome::Cancelled => Vec::new(),
+            PickOutcome::Picked(chosen) if marked => match (chosen.first(), marked_rows(app)) {
+                (Some(0), Some((rows, hidden))) => upgrade_marked(app, &rows, hidden),
+                (Some(1), Some((rows, hidden))) => remove_marked(app, &rows, hidden),
+                _ => Vec::new(),
+            },
             PickOutcome::Picked(chosen) => match (chosen.first(), upgrade, remove) {
                 (Some(0), Some((source_name, id)), _) => plan_upgrade(app, source_name, id),
                 (Some(1), _, Some(target)) => plan_remove(app, target),

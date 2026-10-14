@@ -313,6 +313,14 @@ async fn event_loop(
                 Cmd::PlanRemove { app, purge } => {
                     spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app, purge));
                 }
+                Cmd::PlanBatch { items } => {
+                    spawn_job(&ctx, move |c, _| {
+                        Msg::BatchPlanned(
+                            with_ops(c, &no_progress, |o| jobs::plan_batch(o, &items))
+                                .unwrap_or_else(|e| vec![Err(e)]),
+                        )
+                    });
+                }
                 Cmd::PlanUpgradeAll { keep } => {
                     spawn_plan(&ctx, move |o| jobs::plan_upgrade_all(o, keep));
                 }

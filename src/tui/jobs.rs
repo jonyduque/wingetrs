@@ -6,7 +6,7 @@ use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
-use crate::tui::app::{Action, Done, InstallFail, Msg, Planned};
+use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -114,6 +114,23 @@ fn plans_text(groups: &[Vec<InstallPlan>]) -> String {
         .map(|p| p.to_string())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Plans each item of a batch in turn (one failure does not stop the others); only
+/// `PlanInstall` and `PlanRemove` are plans.
+pub fn plan_batch(c: &OpsCtx<'_>, items: &[Cmd]) -> Vec<Result<Planned, String>> {
+    items
+        .iter()
+        .map(|item| match item {
+            Cmd::PlanInstall {
+                source_name,
+                id,
+                keep,
+            } => plan_install(c, source_name, id, *keep),
+            Cmd::PlanRemove { app, purge } => plan_remove(c, app, *purge),
+            _ => Err("item de lote inválido".to_string()),
+        })
+        .collect()
 }
 
 /// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`; `keep` keeps

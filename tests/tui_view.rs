@@ -1863,3 +1863,19 @@ fn setting_rows_match_the_drawing() {
         );
     }
 }
+#[test]
+fn space_toggles_mark_and_glyph() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut a = App::new(entries(), GlyphSet::Unicode);
+    let space = || Msg::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    let glyph = wingetrs::tui::theme::Glyphs::for_set(GlyphSet::Unicode).mark;
+    assert!(!render(&a, 100, 24).contains(glyph));
+    update(&mut a, space());
+    let marked = render(&a, 100, 24);
+    assert!(marked.contains(glyph), "{marked}");
+    assert!(marked.contains("1 marcados"), "{marked}");
+    update(&mut a, space());
+    let cleared = render(&a, 100, 24);
+    assert!(!cleared.contains(glyph), "{cleared}");
+    assert!(!cleared.contains("marcados"), "{cleared}");
+}

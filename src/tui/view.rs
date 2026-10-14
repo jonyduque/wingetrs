@@ -135,7 +135,20 @@ fn draw_screen<'a>(
     draw_status(app, theme, g, frame, r.status);
     if help_rows > 0 {
         let bar = bar_area(r.help);
-        let line = help_line(&hints(app), usize::from(bar.width), theme);
+        let marked = app.marked_count();
+        let lead = if marked > 0 {
+            format!("{marked} marcados • ")
+        } else {
+            String::new()
+        };
+        let room = usize::from(bar.width).saturating_sub(lead.chars().count());
+        let mut line = help_line(&hints(app), room, theme);
+        if !lead.is_empty() {
+            line.spans.insert(
+                0,
+                Span::styled(lead, theme.accent().add_modifier(Modifier::BOLD)),
+            );
+        }
         frame.render_widget(Paragraph::new(line), bar);
     }
     if app.show_help {
@@ -490,6 +503,18 @@ fn list_lines<'a>(
             Span::styled(clip(&text, room), desc_style(sel)),
         ])
     };
+    // With any mark in the tab every row gets the column, so the names stay aligned.
+    let mark_col = app.marked_count() > 0;
+    let mark = |key: (String, String)| -> Option<Span<'a>> {
+        if !mark_col {
+            return None;
+        }
+        Some(if app.is_marked(&key) {
+            Span::styled(format!("{} ", g.mark), theme.ok())
+        } else {
+            Span::raw(" ".repeat(Span::raw(g.mark).width() + 1))
+        })
+    };
     let mut items: Vec<[Line<'a>; ITEM_ROWS]> = Vec::new();
     match app.tab {
         Tab::Search => {
@@ -505,6 +530,7 @@ fn list_lines<'a>(
                 };
                 let sel = i == app.selected;
                 let mut left = vec![bar(sel), source_glyph(theme, g, e.source), Span::raw(" ")];
+                left.extend(mark((e.source_name.clone(), e.id.clone())));
                 left.extend(name_for(sel, &e.name, &h.name_indices));
                 let right = vec![Span::styled(e.version.clone(), theme.fg_dim())];
                 let detail = match e.description.as_deref().filter(|d| !d.is_empty()) {
@@ -524,6 +550,7 @@ fn list_lines<'a>(
             {
                 let sel = i == app.selected;
                 let mut left = vec![bar(sel), row_source_glyph(theme, g, r), Span::raw(" ")];
+                left.extend(mark((r.origin.clone(), r.name.clone())));
                 left.extend(name_for(sel, &r.name, &[]));
                 let old = r.installed_version.clone().unwrap_or_default();
                 let right = match (&r.state, app.tab) {
@@ -946,7 +973,7 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
 }
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 15 + 2 * DIALOG_PAD_Y);
+    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 16 + 2 * DIALOG_PAD_Y);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(
@@ -961,6 +988,7 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("PgUp PgDn", "mover de 10 em 10"),
         key("←→ / Tab", "trocar aba"),
         key("Enter", "foco nos detalhes"),
+        key("Espaço", "marcar / desmarcar"),
         key("i", "instalar (aba Busca, scoop)"),
         key("u", "remover (aba Instalados)"),
         key("U", "atualizar (aba Atualizações)"),
