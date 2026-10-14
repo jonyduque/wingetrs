@@ -5903,3 +5903,45 @@ Com wiremock só há `http`, então o caso `https→http` real não tem teste de
 5. Rode `target/release/wingetrs.exe show Notepad++.Notepad++ --source winget` com o `LOCALAPPDATA` real. Deve funcionar como antes; cole a 1ª linha da saída.
 
 **Commit:** `feat(http): refuse https to http redirects unless allowed in settings`
+
+## Gravação concorrente do `icons.json` (Task 88)
+
+Pendência das Tasks 83–86. `icons::remember` lê o mapa, insere a entrada e grava pelo par temp+rename. Dois detalhes abertos em sequência rápida rodam isso em paralelo, então o último rename apaga a entrada do outro. O efeito é só que o ícone baixa de novo, mas a lista (Task 85) fica sem o ícone até lá.
+
+### Task 88: Serializar `icons::remember` dentro do processo
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+`src/icons.rs`:
+- `remember` (~:57) chama `try_remember` (~:63), que faz `load_map` → `insert` → grava `icons.json.<pid>-<seq>.tmp` → `fs_retry::retry` com rename.
+- `MAP_TMP_SEQ` (~:42) já dá nome único ao temporário.
+- O único chamador em produção é `load_icon` em `src/tui/run.rs` (~:691), dentro de uma task tokio por abertura de detalhes.
+
+#### What binds this task
+
+- Um `static MAP_LOCK: std::sync::Mutex<()>` no módulo. `try_remember` segura o guard do `load_map` até o fim do rename.
+- O mutex envenenado é recuperado com `unwrap_or_else(std::sync::PoisonError::into_inner)`: o dado protegido é `()`, e o arquivo é sempre reescrito inteiro por rename. Escreva um comentário de uma linha dizendo isso.
+- **Fora do escopo:**
+  - duas instâncias do wingetrs gravando ao mesmo tempo. Vira uma linha no doc comment de `remember`: "entre processos, a última gravação vence; o pior caso é baixar o ícone de novo";
+  - mover a chamada para `spawn_blocking`;
+  - mudar o formato do arquivo.
+
+**Files:**
+- Modify: `src/icons.rs`
+- Test: `tests/icons.rs`
+
+Testes:
+1. `concurrent_remember_keeps_every_entry`:
+   - 16 threads (`std::thread::scope`), cada uma com um id distinto, todas soltas juntas por um `std::sync::Barrier`;
+   - cada thread chama `icons::remember(&data, "winget", &format!("P.{i}"), &sha)` 4 vezes, com sha distinto por chamada (64 hex);
+   - depois, `load_map` tem as 16 chaves, e cada uma traz o sha da última chamada da sua thread;
+   - repita tudo 5 vezes num `DataDir` novo a cada rodada, para a mutação falhar com folga.
+
+#### Checks beyond the steps
+
+1. Mutação: remover a linha que pega o guard ⇒ PEGA (teste 1). Rode a mutação **3 vezes** e cole as 3 linhas. Se alguma não pegar, aumente as rodadas ou as threads até as 3 pegarem, e diga quanto o teste leva.
+2. O teste roda em menos de 2 s em debug; cole o tempo.
+
+**Commit:** `fix(icons): serialize icons.json updates within the process`
