@@ -2314,11 +2314,7 @@ fn enter_in_installed_opens_actions_menu() {
         menu_items(&current)[0].2.as_deref(),
         Some("sem atualização")
     );
-    // The picker starts on the first item that can be chosen.
-    assert!(matches!(
-        update(&mut current, key(KeyCode::Enter)).as_slice(),
-        [Cmd::PlanRemove { .. }]
-    ));
+    assert!(update(&mut current, key(KeyCode::Enter)).is_empty());
 }
 
 #[test]
@@ -2337,4 +2333,21 @@ fn actions_menu_remove_plans_remove() {
             purge: true
         }]
     );
+}
+
+#[test]
+fn actions_menu_never_defaults_to_remove() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![irow("beta", "wingetrs", "scoop:main", false)],
+    );
+    a.settings.behavior.confirm = wingetrs::config::ConfirmMode::Never;
+    update(&mut a, key(KeyCode::Enter));
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert!(matches!(a.modal, Some(Modal::Actions { .. })));
+    update(&mut a, key(KeyCode::Down));
+    assert!(matches!(
+        update(&mut a, key(KeyCode::Enter)).as_slice(),
+        [Cmd::PlanRemove { .. }]
+    ));
 }

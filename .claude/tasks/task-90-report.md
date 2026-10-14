@@ -25,3 +25,7 @@ Decisions:
 - Testes antigos de Focus (escape_ladder, arrows..., divisor, hints) ajustados; snapshot novo actions_modal_snapshot.
 
 Concerns: none
+
+## Correção (revisão)
+- Menu de ações abre sempre no item 0 via `Picker::single_at(items, 0)`; dica duplicada removida (Instalados mantém `u remover`). Gate: `[OK]   gate verde` (697 passed).
+- Mutação: `Picker::single_at(items, 0)` -> `Picker::single(items)`: [OK] mutação PEGA ... fez o teste falhar (exit 101) (`actions_menu_never_defaults_to_remove`).

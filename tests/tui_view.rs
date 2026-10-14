@@ -997,20 +997,14 @@ fn hints_change_with_the_tab() {
     use wingetrs::tui::help::hints;
     let mut a = App::new(entries(), GlyphSet::Ascii);
     a.tab = Tab::Search;
-    assert_eq!(
-        keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "i", "ctrl+s", "?"]
-    );
+    assert_eq!(keys_of(&hints(&a)), ["↑/↓", "←/→", "enter", "ctrl+s", "?"]);
     a.tab = Tab::Installed;
     assert_eq!(
         keys_of(&hints(&a)),
         ["↑/↓", "←/→", "enter", "u", "ctrl+s", "?"]
     );
     a.tab = Tab::Updates;
-    assert_eq!(
-        keys_of(&hints(&a)),
-        ["↑/↓", "←/→", "enter", "U", "ctrl+s", "?"]
-    );
+    assert_eq!(keys_of(&hints(&a)), ["↑/↓", "←/→", "enter", "ctrl+s", "?"]);
     assert!(!keys_of(&hints(&a)).contains(&"esc".to_string()));
 }
 
@@ -1090,12 +1084,12 @@ fn help_line_colors_keys_and_descriptions() {
     let a = App::new(entries(), GlyphSet::Ascii);
     let buf = screen_cells(&a, 100, 24, &theme);
     let y = (0..24)
-        .find(|&y| row_text(&buf, y).contains("i instalar"))
+        .find(|&y| row_text(&buf, y).contains("enter instalar"))
         .expect("help row");
     let text = row_text(&buf, y);
-    let x = col_of(&text, text.find("i instalar").unwrap());
+    let x = col_of(&text, text.find("enter instalar").unwrap());
     assert_eq!(buf[(x, y)].fg, theme.help_key().fg.unwrap());
-    assert_eq!(buf[(x + 2, y)].fg, theme.help_desc().fg.unwrap());
+    assert_eq!(buf[(x + 6, y)].fg, theme.help_desc().fg.unwrap());
 }
 
 #[test]

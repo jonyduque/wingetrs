@@ -1307,7 +1307,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
     ];
     let name = r.name.clone();
     app.modal = Some(Modal::Actions {
-        picker: Picker::single(items),
+        picker: Picker::single_at(items, 0),
         app: name,
         upgrade: upgrade.ok(),
         remove,

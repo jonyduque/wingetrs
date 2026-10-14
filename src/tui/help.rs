@@ -22,7 +22,6 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.tab {
         Tab::Search => {
             out.push(("enter", "instalar"));
-            out.push(("i", "instalar"));
         }
         Tab::Installed => {
             out.push(("enter", "ações"));
@@ -30,7 +29,6 @@ pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
         }
         Tab::Updates => {
             out.push(("enter", "atualizar"));
-            out.push(("U", "atualizar"));
         }
         Tab::Settings => {}
     }

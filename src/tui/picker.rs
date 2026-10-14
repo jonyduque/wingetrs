@@ -31,6 +31,13 @@ impl Picker {
         Picker::build(items, vec![false; n], false)
     }
 
+    /// Single mode with the cursor on `at`, even when that item is disabled.
+    pub fn single_at(items: Vec<PickerItem>, at: usize) -> Picker {
+        let mut p = Picker::single(items);
+        p.selected = at.min(p.items.len().saturating_sub(1));
+        p
+    }
+
     /// Multiple mode: `initial` pre-checks rows (missing entries count as unchecked).
     pub fn multi(items: Vec<PickerItem>, initial: &[bool]) -> Picker {
         let checked = items
