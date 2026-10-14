@@ -132,6 +132,7 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     app.settings.icons.clone_from(&cfg.icons);
     app.settings.saved_icons.clone_from(&cfg.icons);
     app.settings.list_icons.clone_from(&cfg.list_icons);
+    app.settings.saved_list_icons.clone_from(&cfg.list_icons);
     app.list_icons_visible = cfg.list_icons == crate::config::LIST_ICONS[0];
     app.buckets_summary = cfg
         .scoop_buckets

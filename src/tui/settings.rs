@@ -101,6 +101,8 @@ pub struct SettingsState {
     pub icons_touched: bool,
     /// Value of `list_icons` in `config.toml` terms (`visible`, `opened`).
     pub list_icons: String,
+    /// Last `list_icons` written successfully.
+    pub saved_list_icons: String,
     /// The user changed Ícones da lista this session; only then is it written to the file.
     pub list_icons_touched: bool,
 }
@@ -127,6 +129,7 @@ impl SettingsState {
             saved_icons: crate::tui::icons::DEFAULT_SETTING.to_string(),
             icons_touched: false,
             list_icons: crate::config::LIST_ICONS[0].to_string(),
+            saved_list_icons: crate::config::LIST_ICONS[0].to_string(),
             list_icons_touched: false,
         }
     }

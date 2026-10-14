@@ -2727,3 +2727,41 @@ fn list_icons_setting_cycles_saves_and_applies() {
         }]
     ));
 }
+
+fn on_list_icons_row() -> App {
+    let mut a = on_settings();
+    for _ in 0..7 {
+        update(&mut a, key(KeyCode::Down));
+    }
+    a
+}
+
+#[test]
+fn list_icons_change_during_save_is_saved_next() {
+    let mut a = on_list_icons_row();
+    let first = update(&mut a, key(KeyCode::Enter));
+    assert!(matches!(
+        first.as_slice(),
+        [Cmd::SaveSettings { list_icons: Some(l), .. }] if l == "opened"
+    ));
+    // Back to visible while the first save is in flight: no new save yet.
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    let cmds = update(&mut a, Msg::SettingsSaved(Ok(())));
+    assert!(
+        matches!(
+            cmds.as_slice(),
+            [Cmd::SaveSettings { list_icons: Some(l), .. }] if l == "visible"
+        ),
+        "{cmds:?}"
+    );
+}
+
+#[test]
+fn list_icons_reverts_on_save_failure() {
+    let mut a = on_list_icons_row();
+    update(&mut a, key(KeyCode::Enter));
+    assert!(!a.list_icons_visible);
+    update(&mut a, Msg::SettingsSaved(Err("x".into())));
+    assert_eq!(a.settings.list_icons, "visible");
+    assert!(a.list_icons_visible);
+}

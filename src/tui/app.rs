@@ -390,6 +390,7 @@ pub struct App {
     save_in_flight: Option<(Behavior, GlyphSet, bool)>,
     /// The `icons` value of the save in flight (goes with `save_in_flight`).
     icons_in_flight: Option<String>,
+    list_icons_in_flight: Option<String>,
 }
 
 const MAX_HITS: usize = 1000;
@@ -474,6 +475,7 @@ impl App {
             buckets_summary: String::new(),
             save_in_flight: None,
             icons_in_flight: None,
+            list_icons_in_flight: None,
         };
         app.research();
         app
@@ -1076,14 +1078,21 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             // (toast, and on failure the revert) is decided by that one. A failure with a
             // newer change pending therefore does not revert; the retry carries the newest.
             let sent_icons = app.icons_in_flight.take();
+            let sent_list_icons = app.list_icons_in_flight.take();
             let newer = sent.is_some_and(|s| s != current)
                 || sent_icons
                     .as_ref()
-                    .is_some_and(|i| *i != app.settings.icons);
+                    .is_some_and(|i| *i != app.settings.icons)
+                || sent_list_icons
+                    .as_ref()
+                    .is_some_and(|l| *l != app.settings.list_icons);
             if let (Ok(()), Some(sent)) = (&result, sent) {
                 app.settings.saved = sent;
                 if let Some(i) = sent_icons {
                     app.settings.saved_icons = i;
+                }
+                if let Some(l) = sent_list_icons {
+                    app.settings.saved_list_icons = l;
                 }
             }
             if newer {
@@ -1104,6 +1113,11 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                     if app.settings.icons != app.settings.saved_icons {
                         app.settings.icons = app.settings.saved_icons.clone();
                         apply_icons(app);
+                    }
+                    if app.settings.list_icons != app.settings.saved_list_icons {
+                        app.settings.list_icons = app.settings.saved_list_icons.clone();
+                        app.list_icons_visible =
+                            app.settings.list_icons == crate::config::LIST_ICONS[0];
                     }
                     app.push_toast(ToastKind::Error, format!("falha ao salvar: {e}"));
                 }
@@ -1333,6 +1347,7 @@ fn request_save(app: &mut App) -> Vec<Cmd> {
     let s = &app.settings;
     app.save_in_flight = Some((s.behavior, s.glyphs, s.dark));
     app.icons_in_flight = Some(s.icons.clone());
+    app.list_icons_in_flight = Some(s.list_icons.clone());
     app.status = Some("salvando…".to_string());
     vec![Cmd::SaveSettings {
         behavior: s.behavior,

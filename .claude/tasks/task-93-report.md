@@ -22,3 +22,6 @@ Decisions:
 - Snapshot: new row consumed one blank row after Tema block (Aparência section grew by one).
 
 Concerns: none
+
+## Fix: list_icons joins save coalescing
+Added list_icons_in_flight, saved_list_icons, `newer` term, revert (with list_icons_visible) on Err. Tests list_icons_change_during_save_is_saved_next, list_icons_reverts_on_save_failure. Mutations (remove from `newer`; `if false` on revert): both `[OK] mutação PEGA`. Gate: `[OK] gate verde` (719 passed, 18 ignored). The earlier "no revert" decision is superseded.
