@@ -100,4 +100,4 @@ Rejeitado: sugestão só por nome quando falta o publisher. Não pode contar com
 
 ## Rascunhos completos
 
-Os rascunhos completos estão no scratchpad da sessão, em `brainstorm/*.md`. Os agentes Plan são só leitura, e os textos deles foram consolidados aqui.
+Os agentes Plan rodam só em leitura e devolveram os textos na mensagem, que foram consolidados aqui. Os dois agentes sonnet gravaram rascunhos no scratchpad da sessão, que não fica no repositório.
