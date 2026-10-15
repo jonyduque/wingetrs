@@ -4864,3 +4864,16 @@ fn detection_leaves_other_modals_alone() {
     update(&mut a, detected(false, false));
     assert!(matches!(&a.modal, Some(Modal::ConfirmQuit { text }) if text == "sair?"));
 }
+
+#[test]
+fn search_menu_follows_tool_detection() {
+    let mut a = app();
+    select_source(&mut a, SourceKind::Scoop);
+    let (c, r) = item_cell(&a, 0);
+    right_click_at(&mut a, c, r);
+    let before = menu_items(&a);
+    assert_eq!(before[0].0, "Instalar");
+    let cmds = update(&mut a, detected(false, true));
+    assert!(cmds.is_empty());
+    assert_eq!(menu_items(&a), before, "still open, same items");
+}

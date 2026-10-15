@@ -2853,8 +2853,6 @@ fn run_button(app: &mut App, id: ActionId) -> Vec<Cmd> {
     cmds
 }
 
-/// Opens the actions menu of the selected row (any list tab), whatever the marks. The cursor
-/// starts on the first enabled item that is not `Remover`.
 /// Rebuilds an open actions menu with the constructor that opened it, so it reflects the tools
 /// just detected; the cursor stays on its item when that item is still enabled.
 fn refresh_open_actions(app: &mut App) -> Vec<Cmd> {
@@ -2875,6 +2873,8 @@ fn refresh_open_actions(app: &mut App) -> Vec<Cmd> {
     cmds
 }
 
+/// Opens the actions menu of the selected row (any list tab), whatever the marks. The cursor
+/// starts on the first enabled item that is not `Remover`.
 fn open_item_menu(app: &mut App) -> Vec<Cmd> {
     let acts = actions_for(app, app.selected);
     if acts.is_empty() {
