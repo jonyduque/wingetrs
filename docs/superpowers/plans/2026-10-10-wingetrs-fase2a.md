@@ -7475,3 +7475,124 @@ Testes:
 2. Mutação: remontar sempre com `open_item_menu` ⇒ PEGA (teste 2).
 
 **Commit:** `fix(tui): an open actions menu follows the tool detection`
+
+## Lacunas da ponte (2026-10-15)
+
+Origem: pendências 5–7 do relatório de 2026-10-15 (Tasks 106 e 111).
+
+### Task 113: Sonda: como saber que o winget pediu reinício
+
+**Modelo:** opus (só leitura e relatório; nenhum código de produto).
+
+#### Where this fits
+
+- Sonda 105 (`.claude/tasks/task-105-report.md` §4.4):
+  - `INSTALL_REBOOT_REQUIRED_TO_FINISH` vira `S_OK` (código 0) com um aviso no texto (`InstallFlow.cpp`, l. 511–516);
+  - o texto sai no idioma do Windows (pt-BR aqui);
+  - `winget_message(0)` hoje diz só "Atualizado.".
+- `src/bridge/mod.rs`: `winget_message`, `Tail` (as últimas 20 linhas ficam guardadas).
+
+#### What binds this task
+
+Medir, sem rodar nenhum instalador:
+1. **O texto do aviso.**
+   - Ache o recurso do aviso em `src/AppInstallerCLIPackage/Shared/Strings/<locale>/winget.resw` no commit de `docs/reference/winget-cli/SOURCE_COMMIT.txt` (WebFetch do GitHub). O nome provável começa com `InstallFlowReboot…`; confirme no `InstallFlow.cpp` desse commit.
+   - Cole a chave e o texto em `en-US` e `pt-BR`, e a lista de idiomas que o winget traz.
+2. **Os sinais de reinício pendente no registro.** Leia, só leitura, se cada um existe nesta máquina agora:
+   - `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending`;
+   - `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired`;
+   - o valor `PendingFileRenameOperations` em `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager`.
+   - Cole o comando (`reg query`) e a saída resumida.
+   - Diga quais o MSI (`ScheduleReboot`/`ForceReboot`), o NSIS e o Inno costumam usar, com a fonte.
+3. **Recomendação** entre:
+   - (A) casar o texto do `.resw` do idioma atual, sem embutir texto traduzido à mão;
+   - (B) comparar os sinais do registro antes e depois do job;
+   - (C) os dois, com (B) só reforçando.
+   - Diga o falso positivo de cada uma; por exemplo, o Windows Update já pendente antes do job.
+
+**Files:**
+- Create: `.claude/tasks/task-113-report.md`
+
+Testes: nenhum (sonda).
+
+#### Checks beyond the steps
+
+1. Nada de rodar `winget install`/`upgrade` nem instalador. Nada de escrever no registro.
+
+**Commit:** `docs(probe): how winget reports a pending reboot`
+
+### Task 114: Aviso de reinício depois de uma atualização pela ponte
+
+**Modelo:** sonnet (revisor opus se a 113 escolher registro).
+
+#### Where this fits
+
+- Saída da Task 113 (relatório, decisão do orquestrador anotada no topo do brief na hora do despacho).
+- `src/bridge/mod.rs` (`winget_message`, `Tail`), `src/tui/jobs.rs` (fim do `Action::Bridge`), toast `Success`.
+
+#### What binds this task
+
+- `pub fn reboot_requested(code: i32, lines: &[String], markers: &[&str]) -> bool`, pura:
+  - código `0x8A15_0109` ⇒ `true`;
+  - código 0 com uma linha que contém um dos `markers` (os textos medidos na 113) ⇒ `true`;
+  - o resto ⇒ `false`.
+- Se a 113 recomendar (B) ou (C): `pub struct RebootSignals { cbs: bool, wu: bool, pfro_len: usize }` lido em `src/bridge/reboot_win.rs` (`#[cfg(windows)]`, só leitura), antes e depois do job. "Passou a pedir" = algum `false → true` ou `pfro_len` maior. A função que compara é pura e testada.
+- Com o pedido de reinício, o toast fica `"Atualizado; reinicie o computador para concluir."` (`Success`) e a mesma frase vai para o log.
+- Nunca reinicia nada.
+
+**Files:**
+- Modify: `src/bridge/mod.rs`, `src/tui/jobs.rs`
+- Create (se B/C): `src/bridge/reboot_win.rs`
+- Test: `tests/bridge.rs`, `tests/tui_jobs.rs`
+
+Testes:
+1. **`reboot_marker_after_success`:** código 0 + uma linha com o marcador `pt-BR` ⇒ `true`; sem a linha ⇒ `false`; código 1 com a linha ⇒ `false`.
+2. **`reboot_code_0x8a150109`** ⇒ `true`.
+3. **`bridge_job_toasts_reboot`** (`tui_jobs`, executor falso): o toast tem "reinicie".
+4. (B/C) **`signals_compare`:** pendente antes e depois ⇒ `false`; `false → true` ⇒ `true`; `pfro_len` 3 → 5 ⇒ `true`.
+
+#### Checks beyond the steps
+
+1. Mutação: ignorar os marcadores ⇒ PEGA (teste 1).
+2. Teste unitário sem registro real: o leitor `_win` só tem um teste `#[ignore = "live: lê HKLM"]`.
+
+**Commit:** `feat(bridge): tell the user when winget asks for a reboot`
+
+### Task 115: Cobrir o cancelamento repetido, o 995 sem flag e medir a oscilação do teste tardio
+
+**Modelo:** sonnet (revisor opus: threads e Win32).
+
+#### Where this fits
+
+- `src/bridge/spawn_win.rs` (Task 111):
+  - `Readers::stop()` (~:55) marca a flag e chama `CancelIoEx` em cada leitor vivo, repetindo a cada 50 ms;
+  - `spawn_reader` (~:94) trata o 995 (`OPERATION_ABORTED`, ~:116) como fim só com a flag marcada.
+- Ledger 111: nenhum teste exercita a repetição (10/10 passa sem ela) nem o 995 sem a flag.
+- `tests/bridge.rs::grace_lets_late_output_arrive` (~:403) usa `ping -n 2` (cerca de 1 s) contra uma carência de 3 s.
+
+#### What binds this task
+
+- Separar o laço de leitura da origem do pipe: `fn read_loop(pipe: &mut impl Read, stop: &AtomicBool, tx: &Sender<String>) -> io::Result<Option<String>>`, chamado por `spawn_reader`. O comportamento não muda.
+- Separar o cancelamento: `stop()` recebe ou guarda um `cancel: fn(usize)` (o real chama `CancelIoEx`), para que um teste injete um cancelamento que só "pega" na 2ª chamada.
+- Nada muda no caminho real nem na assinatura de `run`/`run_with_grace`.
+- **Oscilação:** rode `grace_lets_late_output_arrive` 30 vezes com a máquina carregada (`cargo build --release` de outro target em paralelo, `CARGO_TARGET_DIR=target/t115-load`, apagado no fim) e cole quantas passam. Com alguma falha, troque o `ping` por uma espera determinística:
+  - o neto espera um arquivo criado pelo teste depois que `run_with_grace` voltar do filho;
+  - ou a carência vai para 5 s com `ping -n 2`.
+  - Escolha pela medição e diga por quê.
+
+**Files:**
+- Modify: `src/bridge/spawn_win.rs`
+- Test: `tests/bridge.rs` (ou testes de módulo em `spawn_win.rs`, se `read_loop` não for público)
+
+Testes:
+1. **`read_loop_995_without_flag_is_error`:** um `Read` falso devolve `io::Error::from_raw_os_error(995)` com a flag desmarcada ⇒ `Err`; com a flag marcada ⇒ `Ok`.
+2. **`read_loop_checks_flag_before_read`:** com a flag marcada, um `Read` falso que entra em pânico se for chamado ⇒ `Ok` sem chamar.
+3. **`stop_retries_until_readers_finish`:** um leitor falso (thread presa num `Receiver`) e um `cancel` falso que só solta na 2ª chamada ⇒ `stop()` volta, com ≥ 2 chamadas contadas.
+
+#### Checks beyond the steps
+
+1. Mutação: `stop()` sem repetir ⇒ PEGA (teste 3).
+2. Mutação: 995 sem flag tratado como fim ⇒ PEGA (teste 1).
+3. Cole a contagem das 30 rodadas e `pwsh -File scripts/leftovers.ps1` no fim.
+
+**Commit:** `test(bridge): cover cancel retry and unflagged abort; settle the late-output test`
