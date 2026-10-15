@@ -4,9 +4,9 @@ use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,14 +21,13 @@ const CANCEL_RETRY: Duration = Duration::from_millis(50);
 /// (an installer, scoop's `git`) would otherwise hold the bridge until it dies.
 pub const PIPE_GRACE: Duration = Duration::from_secs(2);
 
-/// What a reader thread ends with: the pipe's unterminated last line, and the pipe itself, so
-/// its handle stays open (and cannot be reused) until the reader is joined.
-type ReaderEnd = (std::io::Result<Option<String>>, Box<dyn Send>);
-
-/// A pipe reader and its pipe's raw handle, used only to cancel the read under way.
+/// A pipe reader; it ends with the pipe's unterminated last line. The slot shares the pipe
+/// with the thread, so the handle stays open (and cannot be reused) until the slot is dropped,
+/// which is always after the join, even when the thread panicked.
 struct Reader {
-    thread: JoinHandle<ReaderEnd>,
-    pipe: usize,
+    thread: JoinHandle<std::io::Result<Option<String>>>,
+    _pipe: Arc<dyn Send + Sync>,
+    raw: usize,
 }
 
 /// The stdout and stderr readers. Joined on every path: explicitly in `run`, or by `Drop`
@@ -43,7 +42,7 @@ struct Readers {
 fn join(slot: &mut Option<Reader>) -> std::io::Result<Option<String>> {
     match slot.take().map(|r| r.thread.join()) {
         None => Ok(None),
-        Some(Ok((rest, _pipe))) => rest,
+        Some(Ok(rest)) => rest,
         Some(Err(p)) => std::panic::resume_unwind(p),
     }
 }
@@ -65,8 +64,9 @@ impl Readers {
                 return;
             }
             for r in live {
-                let pipe = windows::Win32::Foundation::HANDLE(r.pipe as *mut std::ffi::c_void);
-                // SAFETY: the reader owns the pipe until it is joined, so the handle is open.
+                let pipe = windows::Win32::Foundation::HANDLE(r.raw as *mut std::ffi::c_void);
+                // SAFETY: `r._pipe` keeps the pipe open for as long as `r` lives, so the handle
+                // is valid here whatever the thread did.
                 // `ERROR_NOT_FOUND` (no read under way right now) is expected: retried below.
                 let _ = unsafe { windows::Win32::System::IO::CancelIoEx(pipe, None) };
             }
@@ -92,12 +92,16 @@ impl Drop for Readers {
 }
 
 fn spawn_reader(
-    mut pipe: impl Read + AsRawHandle + Send + 'static,
+    pipe: impl Read + AsRawHandle + Send + 'static,
     tx: Sender<String>,
     stop: Arc<AtomicBool>,
 ) -> Reader {
     let raw = pipe.as_raw_handle() as usize;
+    let pipe = Arc::new(Mutex::new(pipe));
+    let shared = Arc::clone(&pipe);
     let thread = std::thread::spawn(move || {
+        // Only this thread locks it; the slot just keeps it alive.
+        let mut pipe = shared.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tail = Tail::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -114,16 +118,20 @@ fn spawn_reader(
                 {
                     break;
                 }
-                Err(e) => return (Err(e), Box::new(pipe) as Box<dyn Send>),
+                Err(e) => return Err(e),
             };
             for line in tail.push(&buf[..n]) {
                 // No receiver means the caller is unwinding: keep draining so the tool can exit.
                 let _ = tx.send(line);
             }
         }
-        (Ok(tail.finish()), Box::new(pipe) as Box<dyn Send>)
+        Ok(tail.finish())
     });
-    Reader { thread, pipe: raw }
+    Reader {
+        thread,
+        _pipe: pipe,
+        raw,
+    }
 }
 
 /// Runs `program` and waits for it with no time limit; `on_line` gets every useful output
