@@ -1,7 +1,7 @@
 # wingetrs — Fase 1: catálogo e leitura (design)
 
 Data: 2026-10-07
-Status: aguardando revisão
+Status: aprovada e implementada (Tasks 1–23; validação em docs/superpowers/reports/2026-10-07-fase1-validacao.md)
 
 ## 1. Objetivo
 

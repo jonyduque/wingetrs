@@ -3,7 +3,7 @@
 Gerenciador de pacotes para Windows em Rust (TUI ratatui + CLI) sobre o catálogo do winget (CDN `source2.msix`) e buckets do Scoop.
 
 - **Fase 1 (concluída, somente leitura):** `update`, `search`, `show`, `list`. Spec `docs/superpowers/specs/2026-10-07-wingetrs-fase1-design.md`, plano `docs/superpowers/plans/2026-10-07-wingetrs-fase1.md`, validação `docs/superpowers/reports/2026-10-07-fase1-validacao.md`.
-- **Fase 2a (em implementação):** instalar/remover/atualizar apps do Scoop. Spec `docs/superpowers/specs/2026-10-10-wingetrs-fase2a-scoop-design.md`, plano `docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md` (Tasks 24–40).
+- **Fase 2a (concluída, sem prova ao vivo):** instalar/remover/atualizar apps do Scoop + ponte de atualização via winget/scoop. Spec `docs/superpowers/specs/2026-10-10-wingetrs-fase2a-scoop-design.md`, plano `docs/superpowers/plans/2026-10-10-wingetrs-fase2a.md` (Tasks 24–112).
 - Ledger de tarefas: `.claude/tasks/progress.md`
 - **Armadilhas medidas (leia antes de escrever brief ou otimizar): `docs/ARMADILHAS.md`**
 - Referência portada do winget-cli (MIT, commit em `SOURCE_COMMIT.txt`): `docs/reference/winget-cli/`
@@ -59,7 +59,7 @@ As marcadas com ⚙ são verificadas mecanicamente por `scripts/check_rules.ps1`
 ## Comandos proibidos para agentes
 
 - `git checkout`/`restore`/`stash`/`clean`/`reset` em arquivos que você não criou; `git add -A`/`git add .` (outros agentes podem estar trabalhando no mesmo checkout — adicione só os seus arquivos).
-- `git push` (não há remoto; integração é do orquestrador).
+- `git push` (remoto privado `origin` em github.com/jonyduque/wingetrs; push e release são do usuário ou do orquestrador com pedido explícito).
 - `cargo update` (versões travadas no `Cargo.lock`).
 - `find /`, `Get-ChildItem C:\ -Recurse` ou qualquer varredura do disco inteiro: um `find / -name oracle.py` esquecido por um subagente ficou horas consumindo CPU e invalidou os benchmarks. Procure só dentro do repositório, do scratchpad ou de caminhos conhecidos.
 - Deixar processos em segundo plano vivos ao terminar (servidores, watchers, buscas, laços `until … sleep`): encerre tudo que você iniciou antes de responder.

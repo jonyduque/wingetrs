@@ -1,7 +1,7 @@
 # wingetrs — Fase 2a: instalação de apps do Scoop (design)
 
 Data: 2026-10-10
-Status: aguardando revisão
+Status: aprovada; 2a implementada (Tasks 24–112, com emendas abaixo; validação em docs/superpowers/reports/2026-10-10-fase2a-validacao.md, sem prova ao vivo)
 
 ## 1. Objetivo e contexto
 
