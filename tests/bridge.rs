@@ -343,3 +343,114 @@ fn spawn_runs_fake_tool() {
     let missing = run("wingetrs-ferramenta-inexistente", &[], |_| {}).unwrap_err();
     assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
 }
+
+#[cfg(windows)]
+type Bounded = Option<std::thread::Result<std::io::Result<(i32, Vec<String>)>>>;
+
+/// Runs `run_with_grace` on a test thread and waits at most `limit` for it. The thread is
+/// always joined: if the bridge hangs, it ends on its own when the grandchild dies.
+#[cfg(windows)]
+fn run_bounded(
+    script: &str,
+    grace: std::time::Duration,
+    limit: std::time::Duration,
+    mut on_line: impl FnMut(&str) + Send + 'static,
+) -> (Bounded, std::time::Duration) {
+    use wingetrs::bridge::spawn_win::run_with_grace;
+    let args = vec!["/d".to_string(), "/c".to_string(), script.to_string()];
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = std::time::Instant::now();
+    let h = std::thread::spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_with_grace("cmd.exe", &args, grace, |l| on_line(l))
+        }));
+        let _ = tx.send(r);
+    });
+    let got = rx.recv_timeout(limit).ok();
+    let elapsed = start.elapsed();
+    if let Err(p) = h.join() {
+        std::panic::resume_unwind(p);
+    }
+    (got, elapsed)
+}
+
+#[cfg(windows)]
+#[test]
+fn grandchild_holding_pipe_does_not_hang() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let s = Arc::clone(&seen);
+    let (got, elapsed) = run_bounded(
+        "start /b ping -n 9 127.0.0.1 & echo pronto & exit /b 3",
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        move |l| s.lock().unwrap().push(l.to_string()),
+    );
+    let (code, tail) = got
+        .unwrap_or_else(|| panic!("bridge still running after {elapsed:?}"))
+        .unwrap()
+        .unwrap();
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(code, 3);
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|l| l == "pronto"), "{seen:?}");
+    assert!(tail.iter().any(|l| l == "pronto"), "{tail:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn grace_lets_late_output_arrive() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let s = Arc::clone(&seen);
+    let (got, elapsed) = run_bounded(
+        // Carets, not quotes: Rust escapes an inner `"` as `\"`, which cmd does not read.
+        "start /b cmd /d /c ping -n 2 127.0.0.1 ^>nul ^& echo tarde& exit /b 0",
+        Duration::from_secs(3),
+        Duration::from_secs(10),
+        move |l| s.lock().unwrap().push(l.to_string()),
+    );
+    let (code, _) = got
+        .unwrap_or_else(|| panic!("bridge still running after {elapsed:?}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(code, 0);
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().any(|l| l == "tarde"), "{seen:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn panic_in_on_line_with_grandchild_does_not_hang() {
+    use std::time::Duration;
+    let (got, elapsed) = run_bounded(
+        "start /b ping -n 9 127.0.0.1 & echo pronto & exit /b 3",
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        |_| panic!("on_line falhou"),
+    );
+    let got = got.unwrap_or_else(|| panic!("bridge still running after {elapsed:?}"));
+    assert!(got.is_err(), "the on_line panic propagates");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn chatty_grandchild_does_not_delay_the_cut() {
+    use std::time::Duration;
+    // The grandchild writes a line every fraction of a millisecond for about 11 s, so the
+    // bridge never sees a quiet 100 ms; the tool's exit must still be noticed.
+    let (got, elapsed) = run_bounded(
+        "start /b cmd /d /c for /l %i in (1,1,150000) do @echo x& exit /b 4",
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+        |_| {},
+    );
+    let (code, _) = got
+        .unwrap_or_else(|| panic!("bridge still running after {elapsed:?}"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(code, 4);
+}
