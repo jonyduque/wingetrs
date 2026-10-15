@@ -7429,3 +7429,49 @@ Testes (todos `#[cfg(windows)]`, em `tests/bridge.rs`):
 6. **Nada ao vivo.** Não rode o winget nem o scoop.
 
 **Commit:** `fix(bridge): stop reading two seconds after the tool exits when a grandchild holds its output`
+
+### Task 112: Menu de ações aberto acompanha a detecção das ferramentas
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `src/tui/app.rs`:
+  - `Msg::ToolsDetected { winget, scoop }` (~:1622) só grava `app.tools`;
+  - o menu de ações é montado uma vez ao abrir:
+    - `open_actions(app)` (~:2521), para os marcados;
+    - `open_item_menu(app)` (~:2858), para um item: Enter em Instalados, clique direito;
+  - `Modal::Actions { picker, marked, .. }` (~:319) guarda a lista já pronta.
+- **O defeito:** a detecção roda no boot e leva alguns segundos (`winget --version`). Um menu aberto antes dela mostra "Atualizar (via winget)" habilitado; depois que `ToolsDetected { winget: false }` chega, ele continua habilitado até ser fechado e reaberto. O inverso também vale.
+- `Picker` (`src/tui/picker.rs`) tem o cursor em `selected` (privado) e os construtores `single`/`single_at`. Veja se já existe um getter público do cursor (`grep -n "pub fn" src/tui/picker.rs`). Se não houver, acrescente `pub fn selected(&self) -> usize`.
+- O teste modelo é `tool_missing_disables_item` em `tests/tui_state.rs` (~:4222), com os auxiliares `irow`, `on_tab`, `menu_items` e `key`.
+
+#### What binds this task
+
+- Em `Msg::ToolsDetected`, depois de gravar `app.tools`, se `app.modal` for `Some(Modal::Actions { marked, picker, .. })`:
+  - guarda o cursor atual;
+  - remonta pelo **mesmo** construtor que o abriu: `marked == true` ⇒ `open_actions(app)`, `false` ⇒ `open_item_menu(app)`. Nada de copiar a lógica dos itens;
+  - devolve o cursor ao mesmo índice se esse item continuar habilitado. Senão, fica onde o construtor o pôs.
+- Qualquer outro modal, ou nenhum modal, fica intocado (por exemplo, a confirmação já aberta não muda).
+- Os `Cmd` que o construtor devolver são devolvidos pelo `update`. Hoje ele devolve vazio; não invente comandos.
+
+**Files:**
+- Modify: `src/tui/app.rs` (e `src/tui/picker.rs`, se faltar o getter)
+- Test: `tests/tui_state.rs`
+
+Testes:
+1. **`open_menu_follows_tool_detection`:**
+   - menu de item aberto numa linha arp + winget com `Available`, **antes** de `ToolsDetected` ⇒ "Atualizar" habilitado;
+   - chega `ToolsDetected { winget: false, scoop: true }` ⇒ o mesmo menu, ainda aberto, mostra "Atualizar" desabilitado com `"winget não está instalado"`.
+2. **`open_marked_menu_follows_tool_detection`:**
+   - duas linhas da ponte winget marcadas, menu dos marcados aberto ⇒ "Atualizar marcados (2)";
+   - chega `ToolsDetected { winget: false, .. }` ⇒ "Atualizar marcados (0)" desabilitado.
+3. **`detection_keeps_cursor_when_still_enabled`:** cursor no 2º item habilitado, `ToolsDetected { winget: true, scoop: true }` ⇒ o cursor continua no 2º.
+4. **`detection_leaves_other_modals_alone`:** a confirmação aberta continua igual (`==` no modal, ou nos campos que importam) depois de `ToolsDetected`.
+
+#### Checks beyond the steps
+
+1. Mutação: tirar a remontagem ⇒ PEGA (testes 1 e 2).
+2. Mutação: remontar sempre com `open_item_menu` ⇒ PEGA (teste 2).
+
+**Commit:** `fix(tui): an open actions menu follows the tool detection`
