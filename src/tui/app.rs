@@ -1624,7 +1624,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                 winget: Some(winget),
                 scoop: Some(scoop),
             };
-            Vec::new()
+            refresh_open_actions(app)
         }
         Msg::BridgeLine(line) => {
             if app.bridge_last_line.is_some() {
@@ -2855,6 +2855,26 @@ fn run_button(app: &mut App, id: ActionId) -> Vec<Cmd> {
 
 /// Opens the actions menu of the selected row (any list tab), whatever the marks. The cursor
 /// starts on the first enabled item that is not `Remover`.
+/// Rebuilds an open actions menu with the constructor that opened it, so it reflects the tools
+/// just detected; the cursor stays on its item when that item is still enabled.
+fn refresh_open_actions(app: &mut App) -> Vec<Cmd> {
+    let Some(Modal::Actions { marked, picker, .. }) = &app.modal else {
+        return Vec::new();
+    };
+    let (marked, at) = (*marked, picker.selected());
+    let cmds = if marked {
+        open_actions(app)
+    } else {
+        open_item_menu(app)
+    };
+    if let Some(Modal::Actions { picker, .. }) = &mut app.modal
+        && picker.items().get(at).is_some_and(|i| i.selectable)
+    {
+        *picker = Picker::single_at(picker.items().to_vec(), at);
+    }
+    cmds
+}
+
 fn open_item_menu(app: &mut App) -> Vec<Cmd> {
     let acts = actions_for(app, app.selected);
     if acts.is_empty() {

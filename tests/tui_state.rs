@@ -4790,3 +4790,77 @@ fn bridge_item_takes_versions_from_its_own_row() {
         _ => panic!("confirmation not open"),
     }
 }
+
+// ---- Task 112: an open actions menu follows the tool detection ----
+
+fn detected(winget: bool, scoop: bool) -> Msg {
+    Msg::ToolsDetected { winget, scoop }
+}
+
+#[test]
+fn open_menu_follows_tool_detection() {
+    let mut a = on_tab(Tab::Installed, vec![irow("Git.Git", "arp", "winget", true)]);
+    update(&mut a, key(KeyCode::Enter));
+    assert_eq!(
+        menu_items(&a)[0],
+        ("Atualizar (via winget)".to_string(), true, None)
+    );
+    let cmds = update(&mut a, detected(false, true));
+    assert!(cmds.is_empty());
+    assert_eq!(
+        menu_items(&a)[0],
+        (
+            "Atualizar".to_string(),
+            false,
+            Some("winget não está instalado".to_string())
+        )
+    );
+}
+
+#[test]
+fn open_marked_menu_follows_tool_detection() {
+    let mut a = on_tab(
+        Tab::Installed,
+        vec![
+            irow("A", "arp", "winget", true),
+            irow("B", "arp", "winget", true),
+        ],
+    );
+    mark_all(&mut a);
+    update(&mut a, key(KeyCode::Enter));
+    assert_eq!(menu_items(&a)[0].0, "Atualizar marcados (2)");
+    assert!(menu_items(&a)[0].1);
+    update(&mut a, detected(false, true));
+    let items = menu_items(&a);
+    assert_eq!(items[0].0, "Atualizar marcados (0)");
+    assert!(!items[0].1);
+}
+
+#[test]
+fn detection_keeps_cursor_when_still_enabled() {
+    let mut a = on_tab(Tab::Installed, vec![irow("Git.Git", "arp", "winget", true)]);
+    update(&mut a, key(KeyCode::Enter));
+    let n = menu_items(&a).len();
+    assert!(n >= 2);
+    update(&mut a, key(KeyCode::Down));
+    let at = match &a.modal {
+        Some(Modal::Actions { picker, .. }) => picker.selected(),
+        _ => panic!("actions menu not open"),
+    };
+    assert!(at > 0 && menu_items(&a)[at].1, "cursor on an enabled item");
+    update(&mut a, detected(true, true));
+    match &a.modal {
+        Some(Modal::Actions { picker, .. }) => assert_eq!(picker.selected(), at),
+        _ => panic!("actions menu not open"),
+    }
+}
+
+#[test]
+fn detection_leaves_other_modals_alone() {
+    let mut a = on_tab(Tab::Installed, vec![irow("Git.Git", "arp", "winget", true)]);
+    a.modal = Some(Modal::ConfirmQuit {
+        text: "sair?".into(),
+    });
+    update(&mut a, detected(false, false));
+    assert!(matches!(&a.modal, Some(Modal::ConfirmQuit { text }) if text == "sair?"));
+}
