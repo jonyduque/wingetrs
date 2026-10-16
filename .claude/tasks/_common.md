@@ -16,7 +16,7 @@
 Grave `.claude/tasks/task-{N}-report.md` com, nesta ordem:
 
 1. `Status: DONE | DONE_WITH_CONCERNS | BLOCKED`
-2. `Commits:` lista de SHAs (`git log --format='%h %s' <base>..HEAD`), colados da saída real.
+2. `Commits:` só os **seus** SHAs, colados da saída real de `git log --format='%h %s' <base>..HEAD -- <arquivos da lista Files>` (com outros agentes no mesmo checkout, `<base>..HEAD` sozinho traz commits alheios). Nunca um comando ou texto no lugar dos SHAs.
 3. `Gate:` as linhas finais reais de `scripts/verify.ps1` (copiadas, não resumidas).
 4. `Mutation proofs:` para cada regra listada em "Checks beyond the steps", o comando `scripts/mutate.ps1` executado e a linha de saída real (`[OK] mutação PEGA...`). Uma regra sem saída colada conta como não verificada. Se a tarefa declarar "no mutation proof", escreva isso explicitamente.
 5. `Decisions:` escolhas que o brief não fixou, com o motivo (máx. 5 linhas).
