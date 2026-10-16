@@ -91,6 +91,9 @@
 //! ```
 
 #![warn(missing_docs)]
+// wingetrs patch (2026-10-16, Task 125): the 0.6.0 signatures trip this
+// newer rustc lint; silenced here only, the code is unchanged.
+#![allow(mismatched_lifetime_syntaxes)]
 
 pub use lzxd::WindowSize;
 

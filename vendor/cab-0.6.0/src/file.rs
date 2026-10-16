@@ -69,6 +69,13 @@ impl FileEntry {
         self.uncompressed_size
     }
 
+    // wingetrs patch (2026-10-16, Task 125): the caller checks for
+    // overlapping files and charges gaps before decoding.
+    /// Returns the offset of the file within its decompressed folder.
+    pub fn uncompressed_offset(&self) -> u32 {
+        self.uncompressed_offset
+    }
+
     /// Returns true if this file has the "read-only" attribute set.
     pub fn is_read_only(&self) -> bool {
         (self.attributes & consts::ATTR_READ_ONLY) != 0

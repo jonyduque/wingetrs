@@ -6,10 +6,10 @@
 //! first byte is written. Each cabinet folder is decoded once, in offset order.
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use cab::{Cabinet, CompressionType};
+use cab::{Cabinet, CompressionType, FolderEntry};
 use msi::{Package, Row, Select, StreamReader};
 
 use crate::install::extract::{
@@ -24,6 +24,12 @@ type Pkg = Package<BufReader<File>>;
 const WORD_COUNT_COMPRESSED: i32 = 0x2;
 /// `File.Attributes` bit: this file sits uncompressed next to the MSI.
 const FILE_NONCOMPRESSED: i32 = 0x2000;
+/// Largest `cbUncomp` of one CFDATA block (MS-CAB).
+const MAX_BLOCK: u64 = 0x8000;
+/// CFHEADER flags `cfhdrPREV_CABINET | cfhdrNEXT_CABINET`.
+const CAB_SPANNED: u16 = 0x3;
+/// CFFILE `iFolder` values from 0xFFFD up: continued from or into another cabinet.
+const IFOLD_CONTINUED: u16 = 0xFFFD;
 
 /// Extracts the `msiexec /a` tree of `file` into `root` through `mapper`.
 pub(super) fn extract_msi(
@@ -35,9 +41,10 @@ pub(super) fn extract_msi(
     let mut budget = Budget::for_file(file, limits)?;
     // `BufReader` has no `Write`: the package cannot be modified.
     let src = BufReader::new(File::open(file).map_err(io_at("abrir", file))?);
-    let mut pkg = Package::open(src).map_err(|e| ExtractError::Archive(format!("MSI: {e}")))?;
-    // D4-1: third-party decoder panic becomes an error (spec 2b)
+    // D4-1: third-party decoder panic becomes an error (spec 2b); the OLE and
+    // table parsers of `msi` run inside too.
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut pkg = Package::open(src).map_err(|e| ExtractError::Archive(format!("MSI: {e}")))?;
         extract_package(&mut pkg, root, mapper, limits, &mut budget)
     }));
     match run {
@@ -79,6 +86,11 @@ fn extract_package(
     let mut sizes: Vec<HashMap<String, u64>> = Vec::new();
     let mut entries = 0u64;
     for name in &cabinets {
+        if continued(pkg, name)? {
+            return Err(ExtractError::Unsupported(format!(
+                "gabinete com arquivos continuados: {name}"
+            )));
+        }
         let cab = open_cabinet(pkg, name)?;
         let mut in_cab = HashMap::new();
         for folder in cab.folder_entries() {
@@ -87,6 +99,8 @@ fn extract_package(
                     "gabinete Quantum no MSI: {name}"
                 )));
             }
+            // Seeking decodes the bytes between files without handing them out.
+            budget.charge(folder_gaps(folder)?)?;
             for e in folder.file_entries() {
                 entries += 1;
                 in_cab.insert(e.name().to_string(), u64::from(e.uncompressed_size()));
@@ -214,6 +228,76 @@ fn drain(data: &mut dyn Read, budget: &mut Budget) -> Result<(), ExtractError> {
     }
 }
 
+/// Bytes the folder decodes outside its files. Refuses overlapping files and
+/// files past the most data the folder's blocks can hold.
+fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
+    let mut spans: Vec<(u64, u64)> = folder
+        .file_entries()
+        .map(|e| {
+            (
+                u64::from(e.uncompressed_offset()),
+                u64::from(e.uncompressed_size()),
+            )
+        })
+        .collect();
+    spans.sort_unstable();
+    let (mut end, mut in_files) = (0u64, 0u64);
+    for (offset, size) in spans {
+        if offset < end {
+            return Err(ExtractError::Archive(
+                "gabinete com arquivos sobrepostos".to_string(),
+            ));
+        }
+        end = offset + size;
+        in_files += size;
+    }
+    if end > u64::from(folder.num_data_blocks()) * MAX_BLOCK {
+        return Err(ExtractError::Archive(
+            "gabinete com arquivos além dos dados da pasta".to_string(),
+        ));
+    }
+    Ok(end - in_files)
+}
+
+/// Whether the cabinet spans cabinets (header flags or a continued CFFILE),
+/// read from the raw header: `cab` refuses those entries as out of bounds.
+fn continued(pkg: &mut Pkg, name: &str) -> Result<bool, ExtractError> {
+    let stream = pkg
+        .read_stream(name)
+        .map_err(|e| ExtractError::Archive(format!("gabinete {name}: {e}")))?;
+    raw_continued(BufReader::new(stream))
+        .map_err(|e| ExtractError::Archive(format!("gabinete {name}: {e}")))
+}
+
+fn raw_continued<R: BufRead + Seek>(mut r: R) -> io::Result<bool> {
+    let mut h = [0u8; 36];
+    r.read_exact(&mut h)?;
+    if u16::from_le_bytes([h[30], h[31]]) & CAB_SPANNED != 0 {
+        return Ok(true);
+    }
+    let first_file = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+    let files = u16::from_le_bytes([h[28], h[29]]);
+    r.seek(SeekFrom::Start(u64::from(first_file)))?;
+    let mut name = Vec::new();
+    for _ in 0..files {
+        let mut e = [0u8; 16];
+        r.read_exact(&mut e)?;
+        if u16::from_le_bytes([e[8], e[9]]) >= IFOLD_CONTINUED {
+            return Ok(true);
+        }
+        name.clear();
+        // szName is NUL-terminated, at most 256 bytes (MS-CAB).
+        (&mut r).take(257).read_until(0, &mut name)?;
+        if name.last() != Some(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nome de arquivo sem fim no gabinete",
+            ));
+        }
+    }
+    Ok(false)
+}
+
 fn open_cabinet(
     pkg: &mut Pkg,
     name: &str,
@@ -314,4 +398,87 @@ fn tables(pkg: &mut Pkg) -> Result<Tables, ExtractError> {
         files.push((f, int(&r, "Attributes").unwrap_or(0)));
     }
     Ok((dirs, comps, files))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use std::io::{Cursor, Write};
+
+    use msi::{Column, Insert, PackageType, Value};
+
+    use super::*;
+    use crate::install::extract::DEFAULT_LIMITS;
+
+    fn table(p: &mut Package<Cursor<Vec<u8>>>, name: &str, cols: Vec<Column>, row: Vec<Value>) {
+        p.create_table(name, cols).unwrap();
+        p.insert_rows(Insert::into(name).row(row)).unwrap();
+    }
+
+    #[test]
+    fn unsafe_layout_leaves_root_empty() {
+        let mut p = Package::create(PackageType::Installer, Cursor::new(Vec::new())).unwrap();
+        p.summary_info_mut().set_word_count(WORD_COUNT_COMPRESSED);
+        let id = |n: &str| Column::build(n).id_string(72);
+        table(
+            &mut p,
+            "Directory",
+            vec![
+                Column::build("Directory").primary_key().id_string(72),
+                Column::build("Directory_Parent").nullable().id_string(72),
+                Column::build("DefaultDir").text_string(255),
+            ],
+            vec!["TARGETDIR".into(), Value::Null, "SourceDir".into()],
+        );
+        table(
+            &mut p,
+            "Component",
+            vec![
+                Column::build("Component").primary_key().id_string(72),
+                id("Directory_"),
+            ],
+            vec!["C".into(), "TARGETDIR".into()],
+        );
+        table(
+            &mut p,
+            "File",
+            vec![
+                Column::build("File").primary_key().id_string(72),
+                id("Component_"),
+                Column::build("FileName").text_string(255),
+                Column::build("Sequence").int32(),
+            ],
+            vec!["f_a".into(), "C".into(), "..".into(), 1.into()],
+        );
+        table(
+            &mut p,
+            "Media",
+            vec![
+                Column::build("DiskId").primary_key().int16(),
+                Column::build("LastSequence").int32(),
+                Column::build("Cabinet").nullable().string(255),
+            ],
+            vec![Value::Int(1), 1.into(), "#cab1".into()],
+        );
+        let cab = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/msi/three.cab"),
+        )
+        .unwrap();
+        p.write_stream("cab1").unwrap().write_all(&cab).unwrap();
+        let bytes = p.into_inner().unwrap().into_inner();
+
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("x.msi");
+        std::fs::write(&file, bytes).unwrap();
+        let root = d.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut mapper = Mapper {
+            dir: Vec::new(),
+            to: Vec::new(),
+            dir_seen: false,
+        };
+        let r = extract_msi(&file, &root, &mut mapper, &DEFAULT_LIMITS);
+        assert!(matches!(r, Err(ExtractError::MsiLayout(_))), "{r:?}");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
 }

@@ -176,6 +176,8 @@ impl<R: Read + Seek> Cabinet<R> {
     // wingetrs patch (2026-10-16, Task 125): `read_file` builds a new
     // decoder per file and decodes the folder from its start, O(n^2) per
     // folder (a 2,616-file MSI took > 577 s against 16 s sequential).
+    // Also in this patch: `FileEntry::uncompressed_offset` (file.rs) and
+    // `allow(mismatched_lifetime_syntaxes)` (lib.rs).
     /// Visits every file, one decoder pass per folder, in offset order.
     pub fn for_each_file<F>(&mut self, mut f: F) -> io::Result<()>
     where

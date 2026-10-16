@@ -10,7 +10,9 @@ use std::rc::Rc;
 
 use msi::{Column, Insert, Package, PackageType, Value};
 use sha2::{Digest, Sha256};
-use wingetrs::install::extract::{DEFAULT_LIMITS, ExtractError, ExtractSource, extract_all_with};
+use wingetrs::install::extract::{
+    DEFAULT_LIMITS, ExtractError, ExtractSource, Limits, extract_all_with,
+};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/msi");
 
@@ -185,6 +187,14 @@ fn list(d: &Path) -> Vec<String> {
 }
 
 fn run(bytes: &[u8], extract_dir: Option<&str>) -> (tempfile::TempDir, Result<(), ExtractError>) {
+    run_with(bytes, extract_dir, &DEFAULT_LIMITS)
+}
+
+fn run_with(
+    bytes: &[u8],
+    extract_dir: Option<&str>,
+    limits: &Limits,
+) -> (tempfile::TempDir, Result<(), ExtractError>) {
     let d = tempfile::tempdir().unwrap();
     let f = d.path().join("x.msi");
     std::fs::write(&f, bytes).unwrap();
@@ -196,7 +206,7 @@ fn run(bytes: &[u8], extract_dir: Option<&str>) -> (tempfile::TempDir, Result<()
             extract_to: None,
         }],
         &d.path().join("out"),
-        &DEFAULT_LIMITS,
+        limits,
     );
     (d, r)
 }
@@ -461,4 +471,90 @@ fn truncated_cab_is_error() {
         );
         assert_eq!(list(d.path()), ["x.msi"], "cut {cut}");
     }
+}
+
+/// Byte offset of CFFILE entry `i` (16 fixed bytes, then the NUL-terminated name).
+fn cffile(c: &[u8], i: usize) -> usize {
+    let mut at = u32::from_le_bytes(c[16..20].try_into().unwrap()) as usize;
+    for _ in 0..i {
+        at += 16;
+        at += c[at..].iter().position(|&b| b == 0).unwrap() + 1;
+    }
+    at
+}
+
+fn with_cab(s: &mut MsiSpec, c: Vec<u8>) -> Vec<u8> {
+    s.streams = vec![("cab1", c)];
+    build(s)
+}
+
+fn one_file_spec() -> MsiSpec {
+    let mut s = spec(vec![], vec![file("f_one", "C_TARGETDIR", "one.txt", 1)]);
+    s.streams = vec![("cab1", cab("one.cab"))];
+    s
+}
+
+#[test]
+fn overlapping_files_refused() {
+    let mut c = cab("three.cab");
+    // f_c starts where f_b starts (f_a is 7 bytes at 0, f_b at 7).
+    let (b, cc) = (cffile(&c, 1), cffile(&c, 2));
+    assert_eq!(&c[b + 16..b + 20], b"f_b\0");
+    let off: [u8; 4] = c[b + 4..b + 8].try_into().unwrap();
+    c[cc + 4..cc + 8].copy_from_slice(&off);
+    let (d, r) = run(&with_cab(&mut tree_spec(), c), None);
+    match r {
+        Err(ExtractError::Archive(m)) => assert!(m.contains("sobrepostos"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn gap_before_file_is_charged() {
+    let mut c = cab("one.cab");
+    let f = cffile(&c, 0);
+    c[f + 4..f + 8].copy_from_slice(&30_000u32.to_le_bytes());
+    let limits = Limits {
+        ratio: 1,
+        floor: 1000,
+        ceiling: 1000,
+        ..DEFAULT_LIMITS
+    };
+    let (d, r) = run_with(&with_cab(&mut one_file_spec(), c), None, &limits);
+    assert!(
+        matches!(r, Err(ExtractError::TooLarge { limit: 1000 })),
+        "{r:?}"
+    );
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn short_folder_data_is_error() {
+    let mut c = cab("one.cab");
+    // f_one declares 100 bytes; the folder only decodes 5.
+    let f = cffile(&c, 0);
+    assert_eq!(&c[f..f + 4], 5u32.to_le_bytes());
+    c[f..f + 4].copy_from_slice(&100u32.to_le_bytes());
+    let (d, r) = run(&with_cab(&mut one_file_spec(), c), None);
+    match r {
+        Err(ExtractError::Archive(m)) => assert!(m.contains("terminou com"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn continued_cabinet_unsupported() {
+    // Header flag cfhdrNEXT_CABINET.
+    let mut c = cab("three.cab");
+    c[30] |= 0x2;
+    let m = unsupported(run(&with_cab(&mut tree_spec(), c), None).1);
+    assert!(m.contains("continuados"), "{m}");
+    // A CFFILE continued from the previous cabinet (iFolder 0xFFFD), flags clear.
+    let mut c = cab("three.cab");
+    let f = cffile(&c, 0);
+    c[f + 8..f + 10].copy_from_slice(&0xFFFDu16.to_le_bytes());
+    let m = unsupported(run(&with_cab(&mut tree_spec(), c), None).1);
+    assert!(m.contains("continuados"), "{m}");
 }
