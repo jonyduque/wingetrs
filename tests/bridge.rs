@@ -2,8 +2,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use wingetrs::bridge::{
-    self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, Tail, Tool, bridge_target, scoop_message,
-    valid_target, winget_message,
+    self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, REBOOT_MARKERS, Tail, Tool, bridge_target,
+    reboot_requested, scoop_message, valid_target, winget_message,
 };
 use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
 
@@ -453,4 +453,36 @@ fn chatty_grandchild_does_not_delay_the_cut() {
         .unwrap()
         .unwrap();
     assert_eq!(code, 4);
+}
+
+#[test]
+fn reboot_marker_after_success() {
+    let pt = vec![
+        "Instalado com êxito".to_string(),
+        "Reiniciar seu PC para terminar a instalação.".to_string(),
+    ];
+    let m = &REBOOT_MARKERS;
+    assert!(reboot_requested(0, &pt, m));
+    assert!(!reboot_requested(0, &pt[..1], m));
+    assert!(!reboot_requested(1, &pt, m));
+    let colored = vec!["\x1b[0mReiniciar seu PC para terminar a instalação.\x1b[0m".to_string()];
+    assert!(reboot_requested(0, &colored, m));
+    let ascii = vec!["Reiniciar seu PC para terminar a instalacao.".to_string()];
+    assert!(reboot_requested(0, &ascii, m));
+    let it = vec!["Riavvia il PC per completare l'installazione..".to_string()];
+    assert!(reboot_requested(0, &it, m));
+}
+
+#[test]
+fn reboot_code_0x8a150109() {
+    assert!(reboot_requested(
+        0x8A15_0109u32 as i32,
+        &[],
+        &REBOOT_MARKERS
+    ));
+    assert!(!reboot_requested(
+        0x8A15_002Bu32 as i32,
+        &[],
+        &REBOOT_MARKERS
+    ));
 }

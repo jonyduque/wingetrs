@@ -285,6 +285,11 @@ pub fn run_bridge(
         Err(e) => return fail(format!("falha ao iniciar {program}: {e}")),
     };
     let (updated, message) = match job.tool {
+        Tool::Winget if bridge::reboot_requested(code, &lines, &bridge::REBOOT_MARKERS) => {
+            let message = "Atualizado; reinicie o computador para concluir.";
+            tracing::info!(target = %job.target, "{message}");
+            (true, message.to_string())
+        }
         Tool::Winget => (bridge::winget_updated(code), bridge::winget_message(code)),
         Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),
     };

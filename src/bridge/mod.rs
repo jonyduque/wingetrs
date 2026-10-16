@@ -179,6 +179,72 @@ pub fn winget_updated(code: i32) -> bool {
     code == 0 || code as u32 == 0x8A15_0109
 }
 
+/// Texts of `InstallFlowReturnCodeRebootRequiredToFinish` in the 11 locales winget ships
+/// (Localization/Resources/<locale>/winget.resw, winget-cli commit 3973956; task 113 report).
+/// winget exits 0 and prints one of these as its last line, never 0x8A150109 (task 113).
+pub const REBOOT_MARKERS: [&str; 11] = [
+    "Restart your PC to finish installation.",
+    "Starten Sie den PC neu, um die Installation abzuschließen.",
+    "Reinicie el equipo para finalizar la instalación.",
+    "Redémarrez votre PC pour terminer l’installation.",
+    "Riavvia il PC per completare l'installazione..",
+    "PC を再起動してインストールを完了します。",
+    "PC를 다시 시작하여 설치를 완료합니다.",
+    "Reiniciar seu PC para terminar a instalação.",
+    "Перезапустите компьютер, чтобы завершить установку.",
+    "重启电脑以完成安装。",
+    "重新啟動您的電腦以完成安裝。",
+];
+
+/// Drops `ESC [ ... letter` sequences and folds the accented Latin letters to ASCII, so a
+/// marker still matches when winget colors the line or the pipe mangles accents.
+fn plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(match c {
+            'ç' => 'c',
+            'Ç' => 'C',
+            'ã' | 'á' | 'â' | 'à' => 'a',
+            'Ã' | 'Á' | 'Â' | 'À' => 'A',
+            'õ' | 'ó' | 'ô' => 'o',
+            'Õ' | 'Ó' | 'Ô' => 'O',
+            'é' | 'ê' => 'e',
+            'É' | 'Ê' => 'E',
+            'í' => 'i',
+            'Í' => 'I',
+            'ú' => 'u',
+            'Ú' => 'U',
+            other => other,
+        });
+    }
+    out
+}
+
+/// Whether a winget run asks for a reboot: the HRESULT, or exit 0 with a marker line.
+pub fn reboot_requested(code: i32, lines: &[String], markers: &[&str]) -> bool {
+    if code as u32 == 0x8A15_0109 {
+        return true;
+    }
+    if code != 0 {
+        return false;
+    }
+    let markers: Vec<String> = markers.iter().map(|m| plain(m)).collect();
+    lines.iter().any(|l| {
+        let l = plain(l);
+        markers.iter().any(|m| l.contains(m.as_str()))
+    })
+}
+
 /// winget's exit code (an HRESULT) as a message (task 105 probe, §4.4).
 pub fn winget_message(code: i32) -> String {
     let text = match code as u32 {

@@ -1113,3 +1113,23 @@ fn run_bridge_scoop_without_a_root_fails_before_running() {
         .is_ok()
     );
 }
+
+#[test]
+fn bridge_job_toasts_reboot() {
+    let job = bridge_job(Tool::Winget, "Git.Git");
+    let mut exec = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        Ok((
+            0,
+            vec!["Reiniciar seu PC para terminar a instalação.".to_string()],
+        ))
+    };
+    let done = jobs::run_bridge(
+        &job,
+        Some(Path::new("C:/x")),
+        "pwsh",
+        &mut exec,
+        &mut |_: &str| {},
+    )
+    .unwrap();
+    assert!(done.summary.contains("reinicie"), "{}", done.summary);
+}
