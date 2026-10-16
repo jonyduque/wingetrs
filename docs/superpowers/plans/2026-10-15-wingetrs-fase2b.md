@@ -584,9 +584,10 @@ Testes (sem `msiexec` nem mutex real; `busy`, `launch` e `sleep` falsos):
 3. **Plano:** o `Display` de `Step::Extract` mostra o motor: `(7z)`, `(MSI, sem executar o instalador)`, `(tar.xz)`, `(zip)` para nupkg. Zip, tar.gz e cópia ficam como hoje.
 4. **Ciclo completo**, com os fakes dos testes de executor existentes (`grep -ln "execute_install" tests`).
 5. Pânico do decodificador (leitor injetado, como na Task 123) ⇒ erro com rollback, sem travar.
+6. **Hook de pânico da TUI (revisão da Task 123):** o hook global (`src/tui/run.rs:156`, encadeado ao do ratatui) roda **antes** do `catch_unwind` do D4-1: ele restaura o terminal e imprime, e a TUI segue viva com a tela quebrada. A extração precisa de um hook que, na thread do `spawn_blocking` da extração, não mexa no terminal (por exemplo, um `thread_local` "dentro do decodificador" que o hook consulta e, se ligado, só registra no log). Teste: pânico injetado na extração com o hook da TUI instalado ⇒ o hook não restaura o terminal (um contador falso no lugar da restauração fica em 0) e o erro chega ao job.
 
 **Files:**
-- Modify: `src/install/archive.rs`, `src/install/plan.rs`, `src/install/executor.rs`, `tests/install_archive.rs`
+- Modify: `src/install/archive.rs`, `src/install/plan.rs`, `src/install/executor.rs`, `src/tui/run.rs`, `tests/install_archive.rs`
 - Test: o arquivo de testes de executor existente, `tests/install_planner.rs` + snapshots **novos** (`insta`) para 7z e MSI
 
 Testes:
