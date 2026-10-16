@@ -13,12 +13,18 @@
 
 .EXAMPLE
     pwsh -File scripts/mutate.ps1 -Path src/core/version.rs -Anchor 'a.cmp(&b)' -Replacement 'b.cmp(&a)' -TestCommand 'cargo test --quiet version'
+
+.EXAMPLE
+    Multi-line anchors: put the exact text in files (a command-line argument cannot carry newlines reliably).
+    pwsh -File scripts/mutate.ps1 -Path src/x.rs -AnchorFile target/tmp/a.txt -ReplacementFile target/tmp/r.txt -TestCommand 'cargo test --quiet x'
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string]$Path,
-    [Parameter(Mandatory)] [string]$Anchor,
-    [Parameter(Mandatory)] [AllowEmptyString()] [string]$Replacement,
+    [string]$Anchor,
+    [AllowEmptyString()] [string]$Replacement,
+    [string]$AnchorFile,
+    [string]$ReplacementFile,
     [Parameter(Mandatory)] [string]$TestCommand
 )
 
@@ -28,10 +34,22 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if (-not (Test-Path $Path)) { "[!] arquivo não existe: $Path"; exit 2 }
 
+if ($AnchorFile) { $Anchor = [IO.File]::ReadAllText((Resolve-Path $AnchorFile)) }
+if ($ReplacementFile) { $Replacement = [IO.File]::ReadAllText((Resolve-Path $ReplacementFile)) }
+if ([string]::IsNullOrEmpty($Anchor)) { "[!] informe -Anchor ou -AnchorFile"; exit 2 }
+if ($null -eq $Replacement) { "[!] informe -Replacement ou -ReplacementFile"; exit 2 }
 $orig = [IO.File]::ReadAllBytes((Resolve-Path $Path))
 $text = [Text.Encoding]::UTF8.GetString($orig)
+# Match line endings: a multi-line anchor written with LF still finds a CRLF file, and vice versa.
+if ($text.Contains("`r`n")) {
+    $Anchor = $Anchor -replace "(?<!`r)`n", "`r`n"
+    $Replacement = $Replacement -replace "(?<!`r)`n", "`r`n"
+} else {
+    $Anchor = $Anchor -replace "`r`n", "`n"
+    $Replacement = $Replacement -replace "`r`n", "`n"
+}
 $count = ([regex]::Matches($text, [regex]::Escape($Anchor))).Count
-if ($count -ne 1) { "[!] âncora encontrada $count vezes (precisa ser 1): $Anchor"; exit 2 }
+if ($count -ne 1) { "[!] âncora encontrada $count vezes (precisa ser 1): $(($Anchor -split "`r?`n")[0])"; exit 2 }
 
 $mutant = $text.Replace($Anchor, $Replacement)
 try {
