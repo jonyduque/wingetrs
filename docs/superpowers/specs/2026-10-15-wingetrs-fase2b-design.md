@@ -133,6 +133,7 @@ examples/oracle_2a.rs           cobertura por ArchiveKind e sub-caso
 5. **1618 mesmo assim:** o item volta para a fila, até 3 tentativas com espera crescente (5, 15, 45 s); depois, erro "o Windows Installer está ocupado por outro programa".
 6. **Sem cancelamento depois de lançar:** o botão de cancelar fica desabilitado e o job espera o `msiexec` terminar (a S3 mediu: matar o cliente não cancela; o serviço terminou em 254 s segurando o mutex). Timeout de 10 min só para avisar, nunca para matar.
 7. **Saída:** `TARGETDIR` dentro de `.staging-*` da raiz; o executor trata a árvore igual à da extração própria (mesmo `mapper`, `safepath`, orçamento) e apaga o `.msi` administrativo que o `msiexec` copia para a raiz.
+9. **"Transform obrigatório" é heurística (Task 125):** o MSI é recusado (e oferecido à reserva) quando a tabela `Property` tem `TRANSFORMS` não vazio. Pacotes que de fato exigem transform (InstallShield multilíngue com substorages `:1033.mst` aplicados pelo `setup.exe`) quase nunca declaram `TRANSFORMS`, e o `msiexec /a` também não aplica transform; a checagem é só uma recusa conservadora.
 8. **Equivalência:** teste `#[ignore = "live: msiexec"]` que roda os dois caminhos sobre 3 MSI reais e compara a árvore (caminhos + SHA-256).
 
 ## (d) Sondas
