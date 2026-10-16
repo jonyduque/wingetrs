@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs_retry;
 use crate::install::archive::ArchiveKind;
+use crate::install::extract_7z::extract_7z;
 use crate::install::safepath;
+use crate::install::sniff::{self, Sniffed};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
@@ -28,6 +30,14 @@ pub enum ExtractError {
     TooLarge { limit: u64 },
     #[error("arquivo com mais de {limit} entradas (possível bomba de descompressão)")]
     TooManyEntries { limit: u64 },
+    #[error("arquivo 7z protegido por senha")]
+    Encrypted,
+    #[error("método de compressão não suportado: {0}")]
+    UnsupportedMethod(String),
+    #[error("dicionário de {dict} bytes passa do limite de {limit}")]
+    DictionaryTooLarge { dict: u64, limit: u64 },
+    #[error("falha no decodificador: {0}")]
+    Decoder(String),
 }
 
 /// Decompression-bomb limits; the byte budget of one archive is `clamp(size × ratio, floor, ceiling)`.
@@ -48,13 +58,13 @@ pub const DEFAULT_LIMITS: Limits = Limits {
 };
 
 /// Bytes actually written for one archive, against its budget.
-struct Budget {
-    limit: u64,
-    used: u64,
+pub(super) struct Budget {
+    pub(super) limit: u64,
+    pub(super) used: u64,
 }
 
 impl Budget {
-    fn for_file(file: &Path, limits: &Limits) -> Result<Self, ExtractError> {
+    pub(super) fn for_file(file: &Path, limits: &Limits) -> Result<Self, ExtractError> {
         let len = fs::metadata(file)?.len();
         let limit = len
             .saturating_mul(limits.ratio)
@@ -63,7 +73,7 @@ impl Budget {
         Ok(Budget { limit, used: 0 })
     }
 
-    fn charge(&mut self, n: u64) -> Result<(), ExtractError> {
+    pub(super) fn charge(&mut self, n: u64) -> Result<(), ExtractError> {
         self.used = self.used.saturating_add(n);
         if self.used > self.limit {
             return Err(ExtractError::TooLarge { limit: self.limit });
@@ -72,7 +82,7 @@ impl Budget {
     }
 }
 
-fn check_entries(count: u64, limits: &Limits) -> Result<(), ExtractError> {
+pub(super) fn check_entries(count: u64, limits: &Limits) -> Result<(), ExtractError> {
     if count > limits.max_entries {
         return Err(ExtractError::TooManyEntries {
             limit: limits.max_entries,
@@ -94,7 +104,7 @@ fn io_at<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> Extr
 
 /// Splits an archive path on `/` and `\` into safe components; refuses `..`,
 /// absolute paths, drive prefixes, UNC and `\\?\` forms.
-fn safe_components(raw: &str) -> Result<Vec<String>, ExtractError> {
+pub(super) fn safe_components(raw: &str) -> Result<Vec<String>, ExtractError> {
     safepath::safe_components(raw).ok_or_else(|| ExtractError::UnsafePath(raw.to_string()))
 }
 
@@ -115,15 +125,15 @@ impl Drop for TempGuard {
 }
 
 /// Maps archive entries to paths relative to the temp root (applies extract_dir / extract_to).
-struct Mapper {
-    dir: Vec<String>,
-    to: Vec<String>,
-    dir_seen: bool,
+pub(super) struct Mapper {
+    pub(super) dir: Vec<String>,
+    pub(super) to: Vec<String>,
+    pub(super) dir_seen: bool,
 }
 
 impl Mapper {
     /// `None` when the entry is outside `extract_dir`.
-    fn map(&mut self, comps: Vec<String>) -> Option<PathBuf> {
+    pub(super) fn map(&mut self, comps: Vec<String>) -> Option<PathBuf> {
         if comps.len() < self.dir.len() || comps[..self.dir.len()] != self.dir[..] {
             return None;
         }
@@ -236,7 +246,8 @@ fn extract_one(
             fs::copy(s.file, &target).map_err(io_at("copiar", &target))?;
             mapper.dir_seen = true;
         }
-        Ok(ArchiveKind::SevenZip | ArchiveKind::Msi | ArchiveKind::Nupkg | ArchiveKind::TarXz) => {
+        Ok(ArchiveKind::SevenZip) => extract_sniffed(s, tmp, mapper, limits)?,
+        Ok(ArchiveKind::Msi | ArchiveKind::Nupkg | ArchiveKind::TarXz) => {
             return Err(ExtractError::Unsupported(s.file_name.to_string()));
         }
         Err(ext) => {
@@ -254,7 +265,53 @@ fn extract_one(
     Ok(())
 }
 
-fn write_entry(
+/// How far past the PE sections a 7z SFX archive is searched for.
+const MAX_SFX_SCAN: u64 = 32 << 20;
+
+/// A `.7z` download is read by its content: 7z, zip in disguise, or 7z SFX.
+fn extract_sniffed(
+    s: &ExtractSource<'_>,
+    tmp: &Path,
+    mapper: &mut Mapper,
+    limits: &Limits,
+) -> Result<(), ExtractError> {
+    let mut f = fs::File::open(s.file).map_err(io_at("abrir", s.file))?;
+    let mut head = Vec::with_capacity(64 * 1024);
+    (&mut f)
+        .take(64 * 1024)
+        .read_to_end(&mut head)
+        .map_err(io_at("ler", s.file))?;
+    match sniff::sniff(&head) {
+        Sniffed::SevenZip => extract_7z(f, s.file, tmp, mapper, limits),
+        Sniffed::Zip => {
+            tracing::info!(file = s.file_name, format = "zip", "arquivo .7z é um zip");
+            extract_zip(s.file, tmp, mapper, limits)
+        }
+        Sniffed::Pe => {
+            let start = sniff::pe_overlay_start(&head);
+            match sniff::find_7z_in_pe(&mut f, start, MAX_SFX_SCAN).map_err(io_at("ler", s.file))? {
+                Some(at) => {
+                    tracing::info!(
+                        file = s.file_name,
+                        format = "7z sfx",
+                        offset = at,
+                        "arquivo .7z é um 7z SFX"
+                    );
+                    let sub = sniff::OffsetReader::new(f, at).map_err(io_at("ler", s.file))?;
+                    extract_7z(sub, s.file, tmp, mapper, limits)
+                }
+                None => Err(ExtractError::Unsupported(
+                    "instalador .exe, não um arquivo 7z".to_string(),
+                )),
+            }
+        }
+        Sniffed::Other => Err(ExtractError::Unsupported(
+            "conteúdo não reconhecido como 7z".to_string(),
+        )),
+    }
+}
+
+pub(super) fn write_entry(
     root: &Path,
     rel: &Path,
     is_dir: bool,
