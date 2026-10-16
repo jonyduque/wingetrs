@@ -59,7 +59,7 @@ As marcadas com ⚙ são verificadas mecanicamente por `scripts/check_rules.ps1`
 ## Comandos proibidos para agentes
 
 - `git checkout`/`restore`/`stash`/`clean`/`reset` em arquivos que você não criou; `git add -A`/`git add .` (outros agentes podem estar trabalhando no mesmo checkout — adicione só os seus arquivos).
-- `git push` (remoto privado `origin` em github.com/jonyduque/wingetrs; push e release são do usuário ou do orquestrador com pedido explícito).
+- `git push`, `git tag` e `gh release` **só na sessão principal** (remoto privado `origin` em github.com/jonyduque/wingetrs). Subagente nunca publica: termina com os commits locais e o orquestrador faz o push, e só com pedido explícito do usuário. Motivo: push é irreversível para quem já baixou, e o settings não distingue sessão principal de subagente.
 - `cargo update` (versões travadas no `Cargo.lock`).
 - `find /`, `Get-ChildItem C:\ -Recurse` ou qualquer varredura do disco inteiro: um `find / -name oracle.py` esquecido por um subagente ficou horas consumindo CPU e invalidou os benchmarks. Procure só dentro do repositório, do scratchpad ou de caminhos conhecidos.
 - Deixar processos em segundo plano vivos ao terminar (servidores, watchers, buscas, laços `until … sleep`): encerre tudo que você iniciou antes de responder.
