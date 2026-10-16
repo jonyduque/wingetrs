@@ -961,12 +961,24 @@ fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
     }
 }
 
-/// A fresh `msi.lock` path per call, so parallel bridge tests never queue behind each other.
-fn msi_lock() -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("tui_jobs-msi-{}-{n}.lock", std::process::id()))
+/// A fresh `msi.lock` per call, so parallel bridge tests never queue behind each other; the
+/// directory goes away with the value.
+struct MsiLock {
+    _dir: TempDir,
+    path: PathBuf,
+}
+
+impl std::ops::Deref for MsiLock {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn msi_lock() -> MsiLock {
+    let dir = TempDir::new().unwrap();
+    let path = Layout::new(dir.path()).msi_lock();
+    MsiLock { _dir: dir, path }
 }
 
 fn scoop_manifest(root: &Path, app: &str, version: &str) {
@@ -1261,5 +1273,12 @@ fn bridge_winget_takes_msi_lock() {
     });
     drop(tx);
     let events: Vec<String> = rx.iter().collect();
-    assert_eq!(events, ["released", "exec winget held=true"]);
+    assert_eq!(
+        events,
+        [
+            "released".to_string(),
+            format!("line {}", jobs::STARTING_WINGET),
+            "exec winget held=true".to_string()
+        ]
+    );
 }

@@ -249,6 +249,8 @@ pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallF
 
 /// Progress text of a winget job queued behind another Windows Installer run of wingetrs.
 pub const WAITING_INSTALLER: &str = "aguardando outro instalador";
+/// Progress text once a queued winget job got `msi.lock`.
+pub const STARTING_WINGET: &str = "iniciando o winget";
 
 /// Runner of a bridge command: `(program, args, on_line)` -> exit code and last lines.
 pub type BridgeExec<'a> =
@@ -283,11 +285,19 @@ pub fn run_bridge(
     };
     let _msi = match job.tool {
         Tool::Winget => {
-            let mut status = |_: msi_queue::Status| on_line(WAITING_INSTALLER);
-            match msi_queue::lock_msi(msi_lock, &mut status) {
-                Ok(lock) => Some(lock),
+            let mut waited = false;
+            let mut status = |_: msi_queue::Status| {
+                waited = true;
+                on_line(WAITING_INSTALLER);
+            };
+            let lock = match msi_queue::lock_msi(msi_lock, &mut status) {
+                Ok(lock) => lock,
                 Err(e) => return fail(e.to_string()),
+            };
+            if waited {
+                on_line(STARTING_WINGET);
             }
+            Some(lock)
         }
         Tool::Scoop => None,
     };

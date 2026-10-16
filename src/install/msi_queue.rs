@@ -63,6 +63,18 @@ pub fn attempt_from_code(code: i32) -> Attempt {
     }
 }
 
+/// Command line of `msiexec /a`: `/a "<msi>" /qn TARGETDIR="<target>" /l*v "<log>"`. Trailing
+/// separators are stripped from the target, since a trailing `\` would escape the closing quote.
+pub fn admin_args(msi: &Path, target_dir: &Path, log: &Path) -> String {
+    let target = target_dir.to_string_lossy();
+    format!(
+        r#"/a "{}" /qn TARGETDIR="{}" /l*v "{}""#,
+        msi.display(),
+        target.trim_end_matches(['\\', '/']),
+        log.display()
+    )
+}
+
 /// Waits while `busy()` (Global\_MSIExecute), retries 1618 per `policy`, reports each state.
 pub fn run_queued(
     policy: &Policy,
@@ -73,15 +85,18 @@ pub fn run_queued(
 ) -> Result<(), MsiQueueError> {
     let max_checks = policy.wait_max.as_millis() / policy.poll.as_millis().max(1);
     let mut retries = policy.retries.iter();
+    // `wait_max` is a total budget across retries, not one per attempt.
+    let mut checks = 0u128;
     for attempt in 1u8.. {
-        let mut checks = 0u128;
+        let mut reported = false;
         while busy() {
             checks += 1;
             if checks >= max_checks {
                 return Err(MsiQueueError::InstallerBusy);
             }
-            if checks == 1 {
+            if !reported {
                 status(Status::WaitingInstaller);
+                reported = true;
             }
             sleep(policy.poll);
         }

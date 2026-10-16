@@ -8,7 +8,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::msi_queue::{
-    self, Attempt, MsiQueueError, POLICY, Policy, Status, attempt_from_code,
+    self, Attempt, MsiQueueError, POLICY, Policy, Status, admin_args, attempt_from_code,
 };
 
 const HANG: Duration = Duration::from_secs(60);
@@ -115,6 +115,47 @@ fn busy_too_long_fails() {
         MsiQueueError::InstallerBusy.to_string(),
         "o Windows Installer está ocupado por outro programa"
     );
+}
+
+#[test]
+fn installer_wait_budget_is_total_across_retries() {
+    // 200 busy polls, a 1618, then busy again: the budget left is 100 checks, not 300.
+    let mut busy = vec![true; 200];
+    busy.push(false);
+    busy.extend(vec![true; 1000]);
+    let (r, events) = run(
+        &POLICY,
+        Script {
+            busy,
+            attempts: vec![Ok(Attempt::Busy1618), Ok(Attempt::Done)],
+        },
+    );
+    assert_eq!(r, Err(MsiQueueError::InstallerBusy));
+    let busy_answers = events.iter().filter(|e| **e == Event::Busy).count() - 1;
+    let expected = (POLICY.wait_max.as_secs() / POLICY.poll.as_secs()) as usize;
+    assert_eq!(busy_answers, expected);
+    assert_eq!(events.iter().filter(|e| **e == Event::Launch).count(), 1);
+    let waiting = Event::Status(Status::WaitingInstaller);
+    assert_eq!(events.iter().filter(|e| **e == waiting).count(), 2);
+}
+
+#[test]
+fn admin_args_quote_paths_and_strip_trailing_separators() {
+    let msi = std::path::Path::new(r"C:\c\gedit setup.msi");
+    let log = std::path::Path::new(r"C:\r\log\msiexec-gedit-1.log");
+    let expected = r#"/a "C:\c\gedit setup.msi" /qn TARGETDIR="C:\r\apps\gedit\.staging-1" /l*v "C:\r\log\msiexec-gedit-1.log""#;
+    for target in [
+        r"C:\r\apps\gedit\.staging-1",
+        r"C:\r\apps\gedit\.staging-1\",
+        r"C:\r\apps\gedit\.staging-1\\",
+        r"C:\r\apps\gedit\.staging-1/",
+    ] {
+        assert_eq!(
+            admin_args(msi, std::path::Path::new(target), log),
+            expected,
+            "{target}"
+        );
+    }
 }
 
 #[test]

@@ -1,5 +1,5 @@
 //! msiexec /a launcher and installer mutex probe (phase 2b, Task 127).
-use super::msi_queue::{Attempt, attempt_from_code};
+use super::msi_queue::{Attempt, admin_args, attempt_from_code};
 use std::io;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
@@ -50,15 +50,12 @@ pub fn installer_busy() -> bool {
 /// `msiexec.exe /a "<msi>" /qn TARGETDIR="<target>" /l*v "<log>"`, awaited without ever
 /// killing it.
 pub fn msiexec_admin(msi: &Path, target_dir: &Path, log: &Path) -> io::Result<Attempt> {
-    // msiexec parses its own command line: quote the paths verbatim.
-    let args = format!(
-        r#"/a "{}" /qn TARGETDIR="{}" /l*v "{}""#,
-        msi.display(),
-        target_dir.display(),
-        log.display()
-    );
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // msiexec parses its own command line: the arguments go verbatim.
     let mut child = Command::new("msiexec.exe")
-        .raw_arg(&args)
+        .raw_arg(admin_args(msi, target_dir, log))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
