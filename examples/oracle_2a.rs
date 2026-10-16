@@ -14,6 +14,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use wingetrs::install::archive::ArchiveKind;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::manifest::{Arch, resolve};
 use wingetrs::install::planner::{PlanInput, plan_install};
@@ -77,6 +78,107 @@ fn group(reason: &str) -> String {
     }
 }
 
+/// Download sub-case of a plannable manifest: the most demanding kind among its sources
+/// (`None` when it has no source), with `extract_dir` noted for 7z and MSI. The flag is
+/// whether phase 2a already handled it (zip, tar.gz, plain).
+fn sub_case(raw: &str) -> Option<(String, bool)> {
+    let m = resolve(raw, Arch::host()).ok()?;
+    let rank = |k: ArchiveKind| match k {
+        ArchiveKind::Msi => 6,
+        ArchiveKind::SevenZip => 5,
+        ArchiveKind::Nupkg => 4,
+        ArchiveKind::TarXz => 3,
+        ArchiveKind::TarGz => 2,
+        ArchiveKind::Zip => 1,
+        ArchiveKind::Plain => 0,
+    };
+    let (kind, src) = m
+        .sources
+        .iter()
+        .filter_map(|s| ArchiveKind::of(&s.file_name).ok().map(|k| (k, s)))
+        .max_by_key(|(k, _)| rank(*k))?;
+    let name = match kind {
+        ArchiveKind::Zip => "zip",
+        ArchiveKind::TarGz => "tar.gz",
+        ArchiveKind::TarXz => "tar.xz",
+        ArchiveKind::Nupkg => "nupkg",
+        ArchiveKind::Plain => "plain",
+        ArchiveKind::SevenZip | ArchiveKind::Msi => {
+            let base = if kind == ArchiveKind::Msi {
+                "msi"
+            } else {
+                "7z"
+            };
+            let dir = if src.extract_dir.is_some() {
+                "com"
+            } else {
+                "sem"
+            };
+            return Some((format!("{base} {dir} extract_dir"), false));
+        }
+    };
+    let in_2a = matches!(
+        kind,
+        ArchiveKind::Zip | ArchiveKind::TarGz | ArchiveKind::Plain
+    );
+    Some((name.to_string(), in_2a))
+}
+
+/// Coverage by bucket over every scoop manifest (scripts included in the denominator):
+/// sub-case counts, unsupported reasons, and the "2a" / "2b" columns.
+fn coverage(all: &[(String, String, String)], layout: &Layout) {
+    #[derive(Default)]
+    struct Bucket {
+        total: usize,
+        in_2a: usize,
+        in_2b: usize,
+        cases: BTreeMap<String, usize>,
+        reasons: BTreeMap<String, usize>,
+    }
+    let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
+    for (source, id, raw) in all {
+        let name = source.strip_prefix("scoop:").unwrap_or(source);
+        let b = buckets.entry(name.to_string()).or_default();
+        b.total += 1;
+        match check(id, name, raw, layout) {
+            Ok(()) => {
+                b.in_2b += 1;
+                let (case, is_2a) = sub_case(raw).unwrap_or(("sem fonte".to_string(), false));
+                b.in_2a += usize::from(is_2a);
+                *b.cases.entry(case).or_default() += 1;
+            }
+            Err(e) => *b.reasons.entry(group(&e)).or_default() += 1,
+        }
+    }
+    println!("cobertura por bucket (denominador: todos os manifestos scoop do bucket)");
+    println!(
+        "  {:<12} {:>7} {:>16} {:>16}",
+        "bucket", "total", "2a", "2b"
+    );
+    let pct = |n: usize, t: usize| format!("{n} ({:.1}%)", n as f64 * 100.0 / t.max(1) as f64);
+    for (name, b) in &buckets {
+        println!(
+            "  {name:<12} {:>7} {:>16} {:>16}",
+            b.total,
+            pct(b.in_2a, b.total),
+            pct(b.in_2b, b.total)
+        );
+    }
+    for (name, b) in &buckets {
+        println!("sub-casos de {name}:");
+        for (c, n) in &b.cases {
+            println!(
+                "  {n:>5}  {c}  ({:.1}%)",
+                *n as f64 * 100.0 / b.total as f64
+            );
+        }
+        println!("  não suportados de {name}, por motivo:");
+        for (r, n) in &b.reasons {
+            println!("  {n:>5}  {r}");
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let fixtures = args.get(1).context("faltou o diretório de fixtures")?;
@@ -132,6 +234,7 @@ fn main() -> anyhow::Result<()> {
         all.push(r?);
     }
     let total = all.len();
+    coverage(&all, &layout);
     let mut simple: Vec<(String, String, String, String)> = all
         .into_iter()
         .filter(|(_, _, raw)| is_simple(raw))
