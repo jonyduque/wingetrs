@@ -1,0 +1,26 @@
+---
+source: tests/install_planner.rs
+expression: p.to_string()
+---
+Instalar app 3.02a09 (bucket main, sem arquitetura)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://downloads.sourceforge.net/project/tumagcc/schily-cdrtools-3.02a09.7z (schily-cdrtools-3.02a09.7z, sha1 f1b6a74e8963a97acd66e166064ab4f907e5237a)
+  3. Extrair [1] schily-cdrtools-3.02a09.7z (7z) para C:\W\apps\app\.staging-3.02a09 (só a subpasta win32)
+  4. Mover C:\W\apps\app\.staging-3.02a09 para C:\W\apps\app\3.02a09
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\3.02a09 (junção)
+  6. Criar comando btcflash em C:\W\shims (btcflash.exe + btcflash.shim) -> C:\W\apps\app\current\btcflash.exe
+  7. Criar comando cdda2wav em C:\W\shims (cdda2wav.exe + cdda2wav.shim) -> C:\W\apps\app\current\cdda2wav.exe
+  8. Criar comando cdrecord em C:\W\shims (cdrecord.exe + cdrecord.shim) -> C:\W\apps\app\current\cdrecord.exe
+  9. Criar comando devdump em C:\W\shims (devdump.exe + devdump.shim) -> C:\W\apps\app\current\devdump.exe
+ 10. Criar comando isodebug em C:\W\shims (isodebug.exe + isodebug.shim) -> C:\W\apps\app\current\isodebug.exe
+ 11. Criar comando isodump em C:\W\shims (isodump.exe + isodump.shim) -> C:\W\apps\app\current\isodump.exe
+ 12. Criar comando isoinfo em C:\W\shims (isoinfo.exe + isoinfo.shim) -> C:\W\apps\app\current\isoinfo.exe
+ 13. Criar comando isovfy em C:\W\shims (isovfy.exe + isovfy.shim) -> C:\W\apps\app\current\isovfy.exe
+ 14. Criar comando mkhybrid em C:\W\shims (mkhybrid.exe + mkhybrid.shim) -> C:\W\apps\app\current\mkhybrid.exe
+ 15. Criar comando mkisofs em C:\W\shims (mkisofs.exe + mkisofs.shim) -> C:\W\apps\app\current\mkisofs.exe
+ 16. Criar comando readcd em C:\W\shims (readcd.exe + readcd.shim) -> C:\W\apps\app\current\readcd.exe
+ 17. Criar comando rscsi em C:\W\shims (rscsi.exe + rscsi.shim) -> C:\W\apps\app\current\rscsi.exe
+ 18. Criar comando scgcheck em C:\W\shims (scgcheck.exe + scgcheck.shim) -> C:\W\apps\app\current\scgcheck.exe
+ 19. Criar comando scgskeleton em C:\W\shims (scgskeleton.exe + scgskeleton.shim) -> C:\W\apps\app\current\scgskeleton.exe
+ 20. Garantir C:\W\shims no PATH do usuário
+ 21. Registrar app 3.02a09 (main) em C:\W\state.db

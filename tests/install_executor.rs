@@ -1129,3 +1129,331 @@ async fn stale_replaced_folders_are_swept_after_success() {
     assert!(real.join("keep.txt").exists(), "real version folder kept");
     assert!(current_target(&s).ends_with("1.0"));
 }
+
+// ---- Task 128: 7z and MSI through the executor ----
+
+/// Non-solid 7z with the given content method.
+fn sevenz_of(entries: &[(&str, &[u8])], method: sevenz_rust2::EncoderMethod) -> Vec<u8> {
+    let mut w = sevenz_rust2::ArchiveWriter::new(std::io::Cursor::new(Vec::new())).unwrap();
+    w.set_content_methods(vec![method.into()]);
+    for (name, data) in entries {
+        w.push_archive_entry(
+            sevenz_rust2::ArchiveEntry::new_file(name),
+            Some(std::io::Cursor::new(data.to_vec())),
+        )
+        .unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}
+
+fn fixture_7z() -> Vec<u8> {
+    sevenz_of(
+        &[
+            ("pkg/tool.exe", &fake_pe(3)),
+            ("pkg/conf/default.ini", b"[default]\r\n"),
+        ],
+        sevenz_rust2::EncoderMethod::LZMA2,
+    )
+}
+
+/// MSI with `pkg\one.txt` (`f_one` of `tests/fixtures/msi/one.cab`, "one\r\n"), built
+/// as `tests/install_msi.rs` does.
+fn fixture_msi() -> Vec<u8> {
+    use msi::{Column, Insert, Package, PackageType, Value};
+    let cab = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/msi/one.cab"
+    ))
+    .unwrap();
+    let mut p = Package::create(PackageType::Installer, std::io::Cursor::new(Vec::new())).unwrap();
+    p.summary_info_mut().set_word_count(2);
+    p.create_table(
+        "Directory",
+        vec![
+            Column::build("Directory").primary_key().id_string(72),
+            Column::build("Directory_Parent").nullable().id_string(72),
+            Column::build("DefaultDir").text_string(255),
+        ],
+    )
+    .unwrap();
+    p.create_table(
+        "Component",
+        vec![
+            Column::build("Component").primary_key().id_string(72),
+            Column::build("Directory_").id_string(72),
+        ],
+    )
+    .unwrap();
+    p.create_table(
+        "File",
+        vec![
+            Column::build("File").primary_key().id_string(72),
+            Column::build("Component_").id_string(72),
+            Column::build("FileName").text_string(255),
+            Column::build("FileSize").int32(),
+            Column::build("Version").nullable().string(72),
+            Column::build("Attributes").nullable().int16(),
+            Column::build("Sequence").int32(),
+        ],
+    )
+    .unwrap();
+    p.create_table(
+        "Media",
+        vec![
+            Column::build("DiskId").primary_key().int16(),
+            Column::build("LastSequence").int32(),
+            Column::build("Cabinet").nullable().string(255),
+        ],
+    )
+    .unwrap();
+    p.insert_rows(
+        Insert::into("Directory")
+            .row(vec!["TARGETDIR".into(), Value::Null, "SourceDir".into()])
+            .row(vec!["D1".into(), "TARGETDIR".into(), "pkg".into()]),
+    )
+    .unwrap();
+    p.insert_rows(Insert::into("Component").row(vec!["C_D1".into(), "D1".into()]))
+        .unwrap();
+    p.insert_rows(Insert::into("File").row(vec![
+        "f_one".into(),
+        "C_D1".into(),
+        "one.txt".into(),
+        0.into(),
+        Value::Null,
+        Value::Int(0),
+        1.into(),
+    ]))
+    .unwrap();
+    p.insert_rows(Insert::into("Media").row(vec![Value::Int(1), 1.into(), "#cab1".into()]))
+        .unwrap();
+    p.write_stream("cab1").unwrap().write_all(&cab).unwrap();
+    p.into_inner().unwrap().into_inner()
+}
+
+/// After a purge uninstall nothing of the app is left: every entry from before is intact
+/// and the only new entries are empty shared folders (`apps`, `persist`).
+fn assert_nothing_left(s: &World, before: &std::collections::BTreeMap<String, String>) {
+    let after = s.snapshot();
+    for (k, v) in before {
+        assert_eq!(after.get(k), Some(v), "{k} mudou");
+    }
+    let extra: Vec<_> = after
+        .iter()
+        .filter(|(k, v)| !before.contains_key(*k) && v.as_str() != "dir:")
+        .collect();
+    assert!(extra.is_empty(), "sobras: {extra:?}");
+    assert!(!s.layout.app_dir("app").exists());
+    assert!(!s.layout.persist_dir("app").exists());
+    assert!(s.state.apps().unwrap().is_empty());
+    assert!(s.shortcuts.dump().is_empty());
+}
+
+#[tokio::test]
+async fn install_remove_7z_leaves_nothing() {
+    let s = setup().await;
+    let before = s.snapshot();
+    let before_env = s.env.dump();
+    let (url, sha) = s.serve("pkg-1.0.7z", fixture_7z()).await;
+    let plan = s.plan_from("app", &manifest_json(&url, &sha), false);
+    install(&s, &plan).await;
+    assert_eq!(
+        std::fs::read(s.layout.current("app").join("tool.exe")).unwrap(),
+        fake_pe(3)
+    );
+    assert_eq!(
+        std::fs::read(s.layout.persist_dir("app").join("conf/default.ini")).unwrap(),
+        b"[default]\r\n"
+    );
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    wingetrs::install::executor::execute_uninstall(&s.uninstall_plan(true), &mut ctx).unwrap();
+    drop(ctx);
+    assert_nothing_left(&s, &before);
+    assert_eq!(s.env.dump(), before_env);
+}
+
+#[tokio::test]
+async fn install_remove_msi_leaves_nothing() {
+    let s = setup().await;
+    let before = s.snapshot();
+    let before_env = s.env.dump();
+    let (url, sha) = s.serve("pkg-1.0.msi", fixture_msi()).await;
+    let manifest = serde_json::json!({
+        "version": "1.0",
+        "url": url,
+        "hash": sha,
+        "extract_dir": "pkg",
+    })
+    .to_string();
+    let plan = s.plan_from("app", &manifest, false);
+    install(&s, &plan).await;
+    let current = s.layout.current("app");
+    assert_eq!(std::fs::read(current.join("one.txt")).unwrap(), b"one\r\n");
+    let names: Vec<_> = std::fs::read_dir(&current)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "install.json")
+        .collect();
+    assert_eq!(names, ["one.txt"]);
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    wingetrs::install::executor::execute_uninstall(&s.uninstall_plan(true), &mut ctx).unwrap();
+    drop(ctx);
+    assert_nothing_left(&s, &before);
+    assert_eq!(s.env.dump(), before_env);
+}
+
+fn root_list(s: &World) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(s.layout.root())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "blobs" && n != "tmp")
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn corrupt_7z_rolls_back_identically() {
+    let s = setup().await;
+    let mut a = sevenz_of(
+        &[("pkg/tool.exe", &fake_pe(3))],
+        sevenz_rust2::EncoderMethod::COPY,
+    );
+    a[32] ^= 0xFF;
+    let (url, sha) = s.serve("pkg-1.0.7z", a).await;
+    let plan = s.plan_from("app", &manifest_json(&url, &sha), false);
+    let (before_list, before) = (root_list(&s), s.snapshot());
+    let (before_env, before_sc) = (s.env.dump(), s.shortcuts.dump());
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let err = wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap_err()
+        .to_string();
+    drop(ctx);
+    assert!(
+        err.contains("(extrair [1])") && err.contains("ChecksumVerificationFailed"),
+        "{err}"
+    );
+    assert_eq!(root_list(&s), before_list);
+    assert_eq!(s.snapshot(), before);
+    assert_eq!(s.env.dump(), before_env);
+    assert_eq!(s.shortcuts.dump(), before_sc);
+    assert!(s.state.apps().unwrap().is_empty());
+}
+
+static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Real extraction, then waits until the runtime ticked twice since it began. On the
+/// runtime thread the ticker cannot run: fails after 10 s instead of hanging.
+fn extract_while_ticking(
+    file: &Path,
+    name: &str,
+    dir: Option<&str>,
+    to: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    use std::sync::atomic::Ordering;
+    let start = TICKS.load(Ordering::SeqCst);
+    let r = wingetrs::install::extract::extract(file, name, dir, to, dest);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while TICKS.load(Ordering::SeqCst) < start + 2 {
+        if std::time::Instant::now() > deadline {
+            return Err(wingetrs::install::extract::ExtractError::Archive(
+                "runtime parado durante a extração".into(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    r
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn extract_runs_off_the_runtime() {
+    let s = setup().await;
+    let big: Vec<u8> = (0..32usize << 20).map(|i| (i % 251) as u8).collect();
+    let a = sevenz_of(
+        &[("pkg/tool.exe", &fake_pe(3)), ("pkg/big.bin", &big)],
+        sevenz_rust2::EncoderMethod::COPY,
+    );
+    let (url, sha) = s.serve("pkg-1.0.7z", a).await;
+    let plan = s.plan_from("app", &manifest_json(&url, &sha), false);
+    let ticker = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            TICKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let r =
+        wingetrs::install::executor::execute_install_with(&plan, &mut ctx, extract_while_ticking)
+            .await;
+    ticker.abort();
+    drop(ctx);
+    r.unwrap();
+    let big_len = std::fs::metadata(s.layout.current("app").join("big.bin"))
+        .unwrap()
+        .len();
+    assert_eq!(big_len, 32 << 20);
+}
+
+const PANIC_MARK: &str = "decoder blew up ZZQ";
+
+/// Writes part of the tree, then panics the way a decoder does: on the extraction
+/// thread, caught there and turned into `ExtractError::Decoder` (D4-1).
+fn panicking_decoder(
+    _file: &Path,
+    _name: &str,
+    _dir: Option<&str>,
+    _to: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    std::fs::create_dir_all(dest.join("pkg")).unwrap();
+    std::fs::write(dest.join("pkg/partial.bin"), b"half").unwrap();
+    std::panic::catch_unwind(|| -> Result<(), wingetrs::install::extract::ExtractError> {
+        panic!("{PANIC_MARK}")
+    })
+    .unwrap_or_else(|_| {
+        Err(wingetrs::install::extract::ExtractError::Decoder(
+            PANIC_MARK.into(),
+        ))
+    })
+}
+
+#[tokio::test]
+async fn decoder_panic_rolls_back() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let s = setup().await;
+    let before = s.snapshot();
+    let before_env = s.env.dump();
+    let restored = std::sync::Arc::new(AtomicUsize::new(0));
+    let previous = std::panic::take_hook();
+    // The TUI hook, with a counter in place of the terminal restore.
+    wingetrs::tui::run::install_panic_hook({
+        let restored = restored.clone();
+        move |info| {
+            if info.to_string().contains(PANIC_MARK) {
+                restored.fetch_add(1, Ordering::SeqCst);
+            }
+            previous(info);
+        }
+    });
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let r = wingetrs::install::executor::execute_install_with(&s.plan, &mut ctx, panicking_decoder)
+        .await;
+    drop(ctx);
+    // Back to the default hook before any assertion can panic.
+    drop(std::panic::take_hook());
+    let err = r.unwrap_err().to_string();
+    assert!(
+        err.contains("(extrair [1])")
+            && err.contains(&format!("falha no decodificador: {PANIC_MARK}")),
+        "{err}"
+    );
+    assert_eq!(
+        restored.load(Ordering::SeqCst),
+        0,
+        "o hook restaurou o terminal"
+    );
+    assert_eq!(s.snapshot(), before);
+    assert_eq!(s.env.dump(), before_env);
+    assert!(s.state.apps().unwrap().is_empty());
+}

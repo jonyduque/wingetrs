@@ -298,7 +298,7 @@ async fn dependency_cycle_is_reported_with_the_chain() {
 #[tokio::test]
 async fn unsupported_dependency_fails_before_any_download() {
     let mut w = World::new().await;
-    w.put_raw("cdrtools", "1", fx("unsup-7z__main__cdrtools.json"));
+    w.put_raw("cdrtools", "1", fx("unsup-script__main__7zip.json"));
     let zip = zip_of(&[("pkg/top.exe", &fake_pe(3))]);
     let sha = sha256_hex(&zip);
     Mock::given(method("GET"))

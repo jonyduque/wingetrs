@@ -44,12 +44,14 @@ impl ArchiveKind {
         }
     }
 
-    /// Whether the extractor can read this kind today. Zip, TarGz, TarXz, Nupkg, Plain.
+    /// Whether the extractor can read this kind today: every kind `of` accepts.
     pub fn supported(self) -> bool {
         matches!(
             self,
             ArchiveKind::Zip
                 | ArchiveKind::TarGz
+                | ArchiveKind::SevenZip
+                | ArchiveKind::Msi
                 | ArchiveKind::TarXz
                 | ArchiveKind::Nupkg
                 | ArchiveKind::Plain
@@ -74,6 +76,17 @@ impl ArchiveKind {
         match self {
             ArchiveKind::Plain => "Copiar",
             _ => "Extrair",
+        }
+    }
+
+    /// Engine named in the plan display, for the kinds whose suffix does not say it.
+    pub fn engine(self) -> Option<&'static str> {
+        match self {
+            ArchiveKind::SevenZip => Some("7z"),
+            ArchiveKind::Msi => Some("MSI, sem executar o instalador"),
+            ArchiveKind::TarXz => Some("tar.xz"),
+            ArchiveKind::Nupkg => Some("zip"),
+            ArchiveKind::Zip | ArchiveKind::TarGz | ArchiveKind::Plain => None,
         }
     }
 }

@@ -153,10 +153,10 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     // Mouse capture must be off again after a panic too: chain a hook that disables it
     // and then calls the previous one (ratatui's, which restores the terminal and prints).
     let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    install_panic_hook(move |info| {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         previous_hook(info);
-    }));
+    });
     app.mouse_enabled = cfg.behavior.mouse;
     if app.mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
@@ -183,6 +183,21 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result.unwrap_or_else(|p| std::panic::resume_unwind(p))
+}
+
+/// Installs a panic hook that calls `restore` (terminal restore and message), except on a
+/// thread extracting an archive: the decoder turns that panic into an error and the TUI
+/// keeps running, so the hook only logs it.
+pub fn install_panic_hook(
+    restore: impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
+) {
+    std::panic::set_hook(Box::new(move |info| {
+        if crate::install::executor::in_decoder() {
+            tracing::error!(panic = %info, "pânico durante a extração");
+            return;
+        }
+        restore(info);
+    }));
 }
 
 fn index_age(data: &DataDir) -> Option<i64> {

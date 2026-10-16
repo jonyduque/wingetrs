@@ -1,11 +1,13 @@
 //! Plan executor: applies an [`InstallPlan`] step by step, journaling an undo action for
 //! every change, and rolls everything back in reverse order on any failure. `current`
 //! only moves at `LinkCurrent`, so the previous version keeps working until then.
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tracing::Instrument;
 
@@ -36,6 +38,36 @@ impl StepHook for NoHook {
 
 /// Files under a directory that another process holds open.
 pub type InUseCheck<'a> = &'a (dyn Fn(&Path) -> Vec<PathBuf> + Send + Sync);
+
+/// Extraction entry point, `extract::extract` in production (file, file name, extract_dir,
+/// extract_to, destination). Tests inject one that panics like a decoder.
+pub type ExtractFn =
+    fn(&Path, &str, Option<&str>, Option<&str>, &Path) -> Result<(), extract::ExtractError>;
+
+thread_local! {
+    /// Set on the blocking thread while it extracts. The decoders turn their panics into
+    /// errors (D4-1), so the TUI panic hook must leave the terminal alone on this thread.
+    static IN_DECODER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the current thread is extracting an archive (read by the TUI panic hook).
+pub fn in_decoder() -> bool {
+    IN_DECODER.with(Cell::get)
+}
+
+/// Clears [`IN_DECODER`] on drop, also when the extraction unwinds.
+struct DecoderFlag;
+impl DecoderFlag {
+    fn set() -> DecoderFlag {
+        IN_DECODER.with(|f| f.set(true));
+        DecoderFlag
+    }
+}
+impl Drop for DecoderFlag {
+    fn drop(&mut self) {
+        IN_DECODER.with(|f| f.set(false));
+    }
+}
 
 pub struct ExecCtx<'a> {
     pub layout: &'a Layout,
@@ -216,6 +248,7 @@ struct Run<'p> {
     journal: Vec<(String, Undo)>,
     /// Label of the step being run (journal entries are tagged with it).
     label: String,
+    extract: ExtractFn,
 }
 
 impl Run<'_> {
@@ -342,6 +375,16 @@ fn check_order(steps: &[Step]) -> Result<(), String> {
 /// Never broadcasts the environment change: the caller calls `effects.env.broadcast()` once
 /// after a successful install (and after a failed one whose rollback touched the environment).
 pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Result<(), ExecError> {
+    execute_install_with(plan, ctx, extract::extract).await
+}
+
+/// [`execute_install`] with an injected extraction (tests).
+#[doc(hidden)]
+pub async fn execute_install_with(
+    plan: &InstallPlan,
+    ctx: &mut ExecCtx<'_>,
+    extract: ExtractFn,
+) -> Result<(), ExecError> {
     let fail_early = |message: String| ExecError::Failed {
         index: 0,
         step: "validar plano".into(),
@@ -367,6 +410,7 @@ pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Resul
         artifacts: Vec::new(),
         journal: Vec::new(),
         label: String::new(),
+        extract,
     };
     // Removing the old version runs only after every other step succeeded.
     let (main, cleanup): (Vec<_>, Vec<_>) = plan
@@ -583,14 +627,32 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 run.ensure_dirs(&layout.app_dir(app))?;
                 run.push(Undo::RemovePath(staging.clone()));
             }
-            extract::extract(
-                &file,
-                &source.file_name,
-                source.extract_dir.as_deref(),
-                source.extract_to.as_deref(),
-                &staging,
-            )
-            .map_err(|e| e.to_string())
+            // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
+            let work = {
+                let (extract, name) = (run.extract, source.file_name.clone());
+                let (dir, to) = (source.extract_dir.clone(), source.extract_to.clone());
+                move || {
+                    let _flag = DecoderFlag::set();
+                    extract(&file, &name, dir.as_deref(), to.as_deref(), &staging)
+                }
+            };
+            tracing::info!("extraindo {}", source.file_name);
+            let start = Instant::now();
+            let job = tokio::task::spawn_blocking(work);
+            let result = match job.await {
+                Ok(r) => r.map_err(|e| e.to_string()),
+                Err(e) => match e.try_into_panic() {
+                    Ok(p) => std::panic::resume_unwind(p),
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+            tracing::info!(
+                ms = start.elapsed().as_millis() as u64,
+                ok = result.is_ok(),
+                "extração de {} terminada",
+                source.file_name
+            );
+            result
         }
         Step::Promote => {
             let staging = layout.staging_dir(app, version);

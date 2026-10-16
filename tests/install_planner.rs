@@ -472,3 +472,94 @@ fn control_characters_in_args_are_refused() {
     assert!(matches!(r, Err(PlanError::UnsafeArgs(_))), "{r:?}");
     assert!(plan_bin(r#"[["a.exe","a","--x path = C:\\evil.exe"]]"#).is_ok());
 }
+
+fn plan_url(
+    url_file: &str,
+    extra: &str,
+) -> Result<wingetrs::install::plan::InstallPlan, PlanError> {
+    let j = format!(
+        r#"{{"version":"1","url":"https://x/{url_file}","hash":"{}"{extra}}}"#,
+        "a".repeat(64)
+    );
+    let m = resolve(&j, Arch::X64).unwrap();
+    let l = root();
+    plan_install(&PlanInput {
+        app: "app",
+        bucket: "main",
+        manifest: &m,
+        layout: &l,
+        shortcut_root: Path::new(SC),
+        installed: None,
+        launcher_present: true,
+        keep_old: false,
+        manifest_sha256: "",
+    })
+}
+
+#[test]
+fn sevenzip_manifest_resolves() {
+    let p = plan_url("tool.7z", "").unwrap().to_string();
+    assert!(
+        p.contains(r"Extrair [1] tool.7z (7z) para C:\W\apps\app\.staging-1"),
+        "{p}"
+    );
+}
+
+#[test]
+fn msi_manifest_resolves() {
+    let p = plan_url("tool.msi", r#","extract_dir":"Files\\Tool""#)
+        .unwrap()
+        .to_string();
+    assert!(
+        p.contains(
+            r"Extrair [1] tool.msi (MSI, sem executar o instalador) para C:\W\apps\app\.staging-1 (só a subpasta Files\Tool)"
+        ),
+        "{p}"
+    );
+}
+
+#[test]
+fn engine_shown_for_tar_xz_and_nupkg_only() {
+    let line = |f: &str| {
+        let p = plan_url(f, "").unwrap().to_string();
+        p.lines()
+            .find(|l| l.contains("Extrair") || l.contains("Copiar"))
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        line("a.tar.xz"),
+        r"2. Extrair [1] a.tar.xz (tar.xz) para C:\W\apps\app\.staging-1"
+    );
+    assert_eq!(
+        line("a.nupkg"),
+        r"2. Extrair [1] a.nupkg (zip) para C:\W\apps\app\.staging-1"
+    );
+    assert_eq!(
+        line("a.zip"),
+        r"2. Extrair [1] a.zip para C:\W\apps\app\.staging-1"
+    );
+    assert_eq!(
+        line("a.tar.gz"),
+        r"2. Extrair [1] a.tar.gz para C:\W\apps\app\.staging-1"
+    );
+    assert_eq!(
+        line("a.exe"),
+        r"2. Copiar [1] a.exe para C:\W\apps\app\.staging-1"
+    );
+}
+
+#[test]
+fn rar_still_unsupported() {
+    let j = format!(
+        r#"{{"version":"1","url":"https://x/tool.rar","hash":"{}"}}"#,
+        "a".repeat(64)
+    );
+    match resolve(&j, Arch::X64) {
+        Err(wingetrs::install::manifest::ManifestError::Unsupported { reason }) => {
+            assert!(reason.contains(".rar"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+}

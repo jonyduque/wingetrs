@@ -1,0 +1,13 @@
+---
+source: tests/install_planner.rs
+expression: p.to_string()
+---
+Instalar app 19.00 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://download.sourceforge.net/project/sevenzip/7-Zip/19.00/7z1900-x64.msi (7z1900-x64.msi, sha256 a7803233eedb6a4b59b3024ccf9292a6fffb94507dc998aa67c5b745d197a5dc)
+  3. Extrair [1] 7z1900-x64.msi (MSI, sem executar o instalador) para C:\W\apps\app\.staging-19.00 (só a subpasta Files\7-Zip)
+  4. Mover C:\W\apps\app\.staging-19.00 para C:\W\apps\app\19.00
+  5. Apontar C:\W\apps\app\current -> C:\W\apps\app\19.00 (junção)
+  6. Criar comando 7z1900-helper em C:\W\shims (7z1900-helper.exe + 7z1900-helper.shim) -> C:\W\apps\app\current\7z.exe
+  7. Garantir C:\W\shims no PATH do usuário
+  8. Registrar app 19.00 (main) em C:\W\state.db

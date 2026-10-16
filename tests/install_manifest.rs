@@ -101,8 +101,6 @@ fn unsupported_manifests_say_why() {
         o => panic!("{f}: {o:?}"),
     };
     assert!(reason("unsup-script__main__7zip.json").contains("post_install"));
-    assert!(reason("unsup-7z__main__cdrtools.json").contains(".7z"));
-    assert!(reason("unsup-msi__main__7zip19.00-helper.json").contains(".msi"));
     let r = reason("unsup-innosetup__main__boost.json");
     assert!(r.contains("innosetup") || r.contains("pre_install"), "{r}");
     let nohash = r#"{"version":"1","url":"https://x/a.zip"}"#;
@@ -191,7 +189,7 @@ fn support_keys_inside_architecture_variant() {
 fn extension_is_decided_by_the_renamed_file() {
     let a = r#"{"version":"1","url":"https://x/x.7z#/a.zip","hash":"aa"}"#;
     assert!(resolve(a, Arch::X64).is_ok());
-    let b = r#"{"version":"1","url":"https://x/x.zip#/a.7z","hash":"aa"}"#;
+    let b = r#"{"version":"1","url":"https://x/x.zip#/a.rar","hash":"aa"}"#;
     assert!(unsup(b));
 }
 

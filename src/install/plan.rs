@@ -219,7 +219,11 @@ impl InstallPlan {
                 let mut verb = "Extrair";
                 if let Some(src) = self.source(*index) {
                     name = format!("[{}] {}", index + 1, src.file_name);
-                    verb = ArchiveKind::of(&src.file_name).map_or("Copiar", ArchiveKind::verb);
+                    let kind = ArchiveKind::of(&src.file_name);
+                    verb = kind.map_or("Copiar", ArchiveKind::verb);
+                    if let Some(engine) = kind.ok().and_then(ArchiveKind::engine) {
+                        name = format!("{name} ({engine})");
+                    }
                     if let Some(to) = &src.extract_to {
                         dest = dest.join(to);
                     }

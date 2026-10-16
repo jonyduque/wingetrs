@@ -32,11 +32,19 @@ fn archive_kind_table() {
 
 #[test]
 fn supported_kinds() {
-    for k in [Zip, TarGz, Plain, Nupkg, TarXz] {
+    for k in [Zip, TarGz, Plain, Nupkg, TarXz, SevenZip, Msi] {
         assert!(k.supported(), "{k:?}");
     }
-    for k in [SevenZip, Msi] {
-        assert!(!k.supported(), "{k:?}");
+}
+
+#[test]
+fn engine_named_only_where_the_suffix_does_not_say_it() {
+    assert_eq!(SevenZip.engine(), Some("7z"));
+    assert_eq!(Msi.engine(), Some("MSI, sem executar o instalador"));
+    assert_eq!(TarXz.engine(), Some("tar.xz"));
+    assert_eq!(Nupkg.engine(), Some("zip"));
+    for k in [Zip, TarGz, Plain] {
+        assert_eq!(k.engine(), None, "{k:?}");
     }
 }
 
