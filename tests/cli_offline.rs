@@ -229,3 +229,50 @@ fn foreground_update_still_waits_for_the_lock() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("outra atualização em andamento"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_logs_join_wait() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let s = MockServer::start().await;
+    let ok = |p: &'static str, body: &'static [u8]| {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+    };
+    ok(
+        "/source2.msix",
+        include_bytes!("fixtures/winget/source2-mini.msix"),
+    )
+    .mount(&s)
+    .await;
+    ok(
+        "/main.tgz",
+        include_bytes!("fixtures/scoop/Main-mini.tar.gz"),
+    )
+    .mount(&s)
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/extras.tgz"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&s)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("wingetrs");
+    std::fs::create_dir_all(&data).unwrap();
+    drop(wingetrs::catalog::Catalog::open(&data.join("catalog.db")).unwrap());
+    let uri = s.uri();
+    let out = tokio::task::block_in_place(|| {
+        Command::new(env!("CARGO_BIN_EXE_wingetrs"))
+            .args(["search", "", "-n", "5", "-vv"])
+            .env("LOCALAPPDATA", dir.path())
+            .env("WINGETRS_WINGET_INDEX_URL", format!("{uri}/source2.msix"))
+            .env("WINGETRS_SCOOP_BASE_URL", &uri)
+            .output()
+            .unwrap()
+    });
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("search.join_wait"), "{err}");
+    assert!(err.contains("startup.ensure"), "{err}");
+}

@@ -426,12 +426,13 @@ fn search_with(
     limit: usize,
     sleep: impl FnMut(std::time::Duration),
 ) -> Result<Option<Vec<Found>>, IndexFileError> {
-    let bytes = match read_retrying_with(path, sleep) {
+    let read = tracing::debug_span!("idx.read").in_scope(|| read_retrying_with(path, sleep));
+    let bytes = match read {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(IndexFileError::Io(e.to_string())),
     };
-    let view = IndexView::parse(&bytes)?;
+    let view = tracing::debug_span!("idx.parse").in_scope(|| IndexView::parse(&bytes))?;
     let q = Query::new(query);
     let n = view.len();
     let workers = if n < PARALLEL_MIN {
@@ -441,6 +442,7 @@ fn search_with(
             .map_or(1, |c| c.get())
             .clamp(1, 8)
     };
+    let scan_span = tracing::debug_span!("idx.scan").entered();
     let mut scored: Vec<Scored> = if workers <= 1 {
         scan(&view, 0, n, &q, filter)?
     } else {
@@ -464,14 +466,17 @@ fn search_with(
         }
         all
     };
+    drop(scan_span);
     // Entries are in catalog (rowid) order and the sorts are stable, like the in-memory path.
-    sort_ranked(
-        &mut scored,
-        q.is_empty(),
-        |s| s.score,
-        |s| std::borrow::Cow::Borrowed(s.lower_name.as_str()),
-    );
-    scored.truncate(limit);
+    tracing::debug_span!("idx.sort").in_scope(|| {
+        sort_ranked(
+            &mut scored,
+            q.is_empty(),
+            |s| s.score,
+            |s| std::borrow::Cow::Borrowed(s.lower_name.as_str()),
+        );
+        scored.truncate(limit);
+    });
     let mut found = Vec::with_capacity(scored.len());
     for s in scored {
         found.push(Found {

@@ -654,29 +654,37 @@ async fn run_async(
         } => {
             // A valid non-empty search.idx proves a catalog exists: skip opening SQLite.
             let (catalog, updated) = if data.catalog_path().exists()
-                && index_file::probe(&data.search_index_path()).is_some_and(|n| n > 0)
+                && tracing::debug_span!("search.probe")
+                    .in_scope(|| index_file::probe(&data.search_index_path()))
+                    .is_some_and(|n| n > 0)
             {
                 let ep = Endpoints::production(&cfg)?;
-                refresh_if_stale(&data, &ep);
+                tracing::debug_span!("search.refresh_check")
+                    .in_scope(|| refresh_if_stale(&data, &ep));
                 (None, false)
             } else {
                 let (c, updated) = ensure_catalog_ran(&data, &cfg, &http, early.as_mut()).await?;
                 (Some(c), updated)
             };
-            let early = early.as_mut().and_then(EarlySearch::join);
+            let early = tracing::debug_span!("search.join_wait")
+                .in_scope(|| early.as_mut().and_then(EarlySearch::join));
             if let Some(out) = &early {
                 out.log_warning();
             }
             // An early search error (not a panic) falls back to a fresh search.
             let found = match early.map(|o| o.result) {
                 Some(Ok(found)) if !updated => found,
-                _ => search_best(&data, &query, source, limit)?,
+                _ => tracing::debug_span!("search.fallback")
+                    .in_scope(|| search_best(&data, &query, source, limit))?,
             };
             let rows: Vec<_> = found.into_iter().map(|f| f.entry).collect();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&rows)?);
-            } else {
-                print!("{}", output::search_table(&rows));
+            {
+                let _print = tracing::debug_span!("search.print").entered();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    print!("{}", output::search_table(&rows));
+                }
             }
             // The process exits next: skip closing the db.
             std::mem::forget(catalog);
@@ -898,10 +906,18 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }
         _ => None,
     };
+    // Before the subscriber exists: time with Instant and emit as events after init_logging.
+    let t0 = std::time::Instant::now();
     data.ensure()?;
+    let ensure_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = std::time::Instant::now();
     let _guard = init_logging(&data, if stderr_logging(&cli) { cli.verbose } else { 0 });
+    let log_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(target: "wingetrs::startup", stage = "startup.ensure", ms = ensure_ms);
+    tracing::debug!(target: "wingetrs::startup", stage = "startup.log", ms = log_ms);
     let after_log = std::time::Instant::now();
-    let cfg = Config::load(&data.config_path())?;
+    let cfg =
+        tracing::debug_span!("startup.config").in_scope(|| Config::load(&data.config_path()))?;
     if cli.command.is_none() {
         // The TUI builds its own runtime; glyphs: flag > config.toml > nerd.
         let glyphs = match cli.glyphs {
