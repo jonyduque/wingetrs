@@ -162,6 +162,7 @@ impl World {
             progress,
             in_use: &nothing_in_use,
             residue: ResidueScan::none(),
+            msiexec: wingetrs::install::executor::Msiexec::DISABLED,
         }
     }
 }
@@ -1279,6 +1280,218 @@ fn bridge_winget_takes_msi_lock() {
             "released".to_string(),
             format!("line {}", jobs::STARTING_WINGET),
             "exec winget held=true".to_string()
+        ]
+    );
+}
+// ---- msiexec /a fallback in the jobs (Task 129) ----
+
+use wingetrs::install::executor::Msiexec;
+use wingetrs::install::msi_queue::Attempt;
+
+/// The smallest MSI the own extractor refuses: files outside the package (word count 0).
+fn uncompressed_msi() -> Vec<u8> {
+    use msi::{Package, PackageType};
+    let mut p = Package::create(PackageType::Installer, std::io::Cursor::new(Vec::new())).unwrap();
+    p.summary_info_mut().set_word_count(0);
+    p.into_inner().unwrap().into_inner()
+}
+
+impl World {
+    /// Serves `uncompressed_msi` as `<id>-1.0.msi` and puts its manifest in the catalog.
+    async fn add_msi(&mut self, id: &str) {
+        let bytes = uncompressed_msi();
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let name = format!("{id}-1.0.msi");
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&self.server)
+            .await;
+        let raw = serde_json::json!({
+            "version": "1.0",
+            "url": format!("{}/{name}", self.server.uri()),
+            "hash": sha,
+        })
+        .to_string();
+        self.packages.retain(|p| p.id != id);
+        self.packages.push(NewPackage {
+            id: id.into(),
+            name: id.into(),
+            version: "1.0".into(),
+            raw: Some(raw),
+            ..Default::default()
+        });
+        self.catalog
+            .replace_source(
+                "scoop:main",
+                SourceKind::Scoop,
+                "v",
+                1,
+                &self.packages,
+                &WingetMaps::default(),
+            )
+            .unwrap();
+    }
+}
+
+fn never_busy() -> bool {
+    false
+}
+
+fn fake_admin(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
+    std::fs::create_dir_all(target)?;
+    std::fs::write(target.join("tool.txt"), b"tool")?;
+    Ok(Attempt::Done)
+}
+
+fn planned_groups(
+    ctx: &wingetrs::install::ops::OpsCtx<'_>,
+    id: &str,
+) -> Vec<Vec<wingetrs::install::plan::InstallPlan>> {
+    match jobs::plan_install(ctx, "scoop:main", id, false) {
+        Ok(Planned::Ready {
+            action: Action::Apply(groups),
+            ..
+        }) => groups,
+        other => panic!("expected Ready: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn run_action_needs_msiexec_then_runs_the_allowed_item_only() {
+    let mut w = World::new().await;
+    w.add_msi("m").await;
+    let mut ctx = w.ctx(LockWait::NoWait, &quiet);
+    ctx.msiexec = Msiexec {
+        busy: never_busy,
+        launch: fake_admin,
+    };
+    let groups = planned_groups(&ctx, "m");
+    let r = jobs::run_action(&ctx, Action::Apply(groups.clone())).await;
+    match r {
+        Err(InstallFail::NeedsMsiexec {
+            app,
+            reason,
+            applied,
+        }) => {
+            assert_eq!(app, "m");
+            assert!(reason.contains("sem compressão"), "{reason}");
+            assert!(applied.is_empty());
+        }
+        other => panic!("expected NeedsMsiexec: {other:?}"),
+    }
+    // Allowed for another app: `m` still needs its own confirmation.
+    let other = Action::ApplyMsiexec {
+        groups: groups.clone(),
+        app: "outro".into(),
+    };
+    assert!(matches!(
+        jobs::run_action(&ctx, other).await,
+        Err(InstallFail::NeedsMsiexec { .. })
+    ));
+    let allowed = Action::ApplyMsiexec {
+        groups,
+        app: "m".into(),
+    };
+    let done = jobs::run_action(&ctx, allowed).await.unwrap();
+    assert_eq!(done.summary, "Instalado: m");
+    assert_eq!(
+        std::fs::read(w.layout.current("m").join("tool.txt")).unwrap(),
+        b"tool"
+    );
+}
+
+static ORDER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn order_push(e: &str) {
+    ORDER.lock().unwrap().push(e.to_string());
+}
+
+/// Waits (10 s hang detector) until `ORDER` has `e`.
+fn order_wait(e: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ORDER.lock().unwrap().iter().any(|x| x == e) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
+
+/// Holds the Windows Installer turn until the bridge job queued behind `msi.lock`.
+fn admin_waiting_for_bridge(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
+    // SourceDir < _msiexec < .staging-1.0 < app < apps < root.
+    let root = target.ancestors().nth(5).unwrap();
+    let layout = Layout::new(root);
+    let install_held = UpdateLock::try_acquire(&layout.install_lock())
+        .unwrap()
+        .is_none();
+    let msi_held = UpdateLock::try_acquire(&layout.msi_lock())
+        .unwrap()
+        .is_none();
+    order_push(&format!(
+        "msiexec start install.lock={install_held} msi.lock={msi_held}"
+    ));
+    if !order_wait(&format!("bridge: {}", jobs::WAITING_INSTALLER)) {
+        return Err(std::io::Error::other("a ponte não entrou na fila"));
+    }
+    std::fs::create_dir_all(target)?;
+    std::fs::write(target.join("tool.txt"), b"tool")?;
+    order_push("msiexec end");
+    Ok(Attempt::Done)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn msiexec_fallback_and_bridge_job_queue_without_deadlock() {
+    let mut w = World::new().await;
+    w.add_msi("m").await;
+    let mut ctx = w.ctx(LockWait::NoWait, &quiet);
+    ctx.msiexec = Msiexec {
+        busy: never_busy,
+        launch: admin_waiting_for_bridge,
+    };
+    let groups = planned_groups(&ctx, "m");
+    let lock_path = w.layout.msi_lock();
+    let bridge = std::thread::spawn(move || {
+        if !order_wait("msiexec start install.lock=true msi.lock=true") {
+            return Err(InstallFail::Other("o msiexec não começou".into()));
+        }
+        let mut exec = |program: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+            order_push(&format!("{program} run"));
+            Ok((0, Vec::new()))
+        };
+        jobs::run_bridge(
+            &bridge_job(Tool::Winget, "Git.Git"),
+            None,
+            &lock_path,
+            "pwsh",
+            &mut exec,
+            &mut |line: &str| order_push(&format!("bridge: {line}")),
+        )
+    });
+    let install = jobs::run_action(
+        &ctx,
+        Action::ApplyMsiexec {
+            groups,
+            app: "m".into(),
+        },
+    )
+    .await;
+    let bridged = match bridge.join() {
+        Ok(r) => r,
+        Err(p) => std::panic::resume_unwind(p),
+    };
+    install.unwrap();
+    bridged.unwrap();
+    assert_eq!(
+        *ORDER.lock().unwrap(),
+        [
+            "msiexec start install.lock=true msi.lock=true".to_string(),
+            format!("bridge: {}", jobs::WAITING_INSTALLER),
+            "msiexec end".to_string(),
+            format!("bridge: {}", jobs::STARTING_WINGET),
+            "winget run".to_string(),
         ]
     );
 }

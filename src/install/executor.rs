@@ -6,6 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use tracing::Instrument;
@@ -15,6 +16,7 @@ use crate::fs_retry;
 use crate::http::Http;
 use crate::install::download::{self, Progress};
 use crate::install::layout::Layout;
+use crate::install::msi_queue::{self, Attempt};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimSpec, ShortcutSpec, Step, UninstallPlan,
 };
@@ -43,6 +45,32 @@ pub type InUseCheck<'a> = &'a (dyn Fn(&Path) -> Vec<PathBuf> + Send + Sync);
 pub type ExtractFn =
     fn(&Path, &str, Option<&str>, Option<&str>, &Path) -> Result<(), extract::ExtractError>;
 
+/// The `msiexec /a` fallback for an MSI the own extractor does not support, injected like the
+/// other effects. Production: `msiexec_win::{installer_busy, msiexec_admin}`.
+#[derive(Debug, Clone, Copy)]
+pub struct Msiexec {
+    /// Whether another Windows Installer run holds its mutex.
+    pub busy: fn() -> bool,
+    /// `(msi, target_dir, log)`: runs `msiexec /a` and waits for it.
+    pub launch: fn(&Path, &Path, &Path) -> io::Result<Attempt>,
+}
+
+fn never_busy() -> bool {
+    false
+}
+
+fn refuse_launch(_: &Path, _: &Path, _: &Path) -> io::Result<Attempt> {
+    Err(io::Error::other("msiexec desativado neste ambiente"))
+}
+
+impl Msiexec {
+    /// Never runs `msiexec` (non-Windows, tests, `WINGETRS_TEST_ENV_KEY`).
+    pub const DISABLED: Msiexec = Msiexec {
+        busy: never_busy,
+        launch: refuse_launch,
+    };
+}
+
 pub struct ExecCtx<'a> {
     pub layout: &'a Layout,
     pub data: &'a DataDir,
@@ -53,6 +81,8 @@ pub struct ExecCtx<'a> {
     pub progress: Progress<'a>,
     /// Production: `fs_win::files_in_use`; tests pass a closure.
     pub in_use: InUseCheck<'a>,
+    /// `Some` when this install may fall back to `msiexec /a` (authorized by the user).
+    pub msiexec: Option<Msiexec>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,6 +98,16 @@ pub enum ExecError {
     InUse(String),
     #[error("{0}")]
     Hook(String),
+    /// The own extractor refused an MSI that only the Windows Installer can unpack; the install
+    /// was rolled back and needs the user's authorization for `msiexec /a`.
+    #[error(
+        "{app}: este MSI precisa do Windows Installer ({reason}); rode de novo com --allow-msiexec. O msiexec /a não pode ser cancelado depois de começar e grava arquivos em C:\\Windows\\Installer."
+    )]
+    NeedsMsiexec {
+        app: String,
+        source_index: usize,
+        reason: String,
+    },
 }
 
 /// User environment variable holding the PATH.
@@ -225,6 +265,8 @@ struct Run<'p> {
     extract: ExtractFn,
     /// Panic of the extraction worker: re-raised only after the rollback.
     panic: Option<Box<dyn std::any::Any + Send>>,
+    /// `(source index, reason)` of an MSI that needs `msiexec /a`, not authorized.
+    needs_msiexec: Option<(usize, String)>,
 }
 
 impl Run<'_> {
@@ -388,6 +430,7 @@ pub async fn execute_install_with(
         label: String::new(),
         extract,
         panic: None,
+        needs_msiexec: None,
     };
     // Removing the old version runs only after every other step succeeded.
     let (main, cleanup): (Vec<_>, Vec<_>) = plan
@@ -414,6 +457,13 @@ pub async fn execute_install_with(
             let undone = rollback(journal, ctx);
             if let Some(p) = run.panic.take() {
                 std::panic::resume_unwind(p);
+            }
+            if let Some((source_index, reason)) = run.needs_msiexec.take() {
+                return Err(ExecError::NeedsMsiexec {
+                    app: plan.app.clone(),
+                    source_index,
+                    reason,
+                });
             }
             return Err(ExecError::Failed {
                 index: i,
@@ -611,13 +661,45 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
                 let (dir, to) = (source.extract_dir.clone(), source.extract_to.clone());
-                move || extract(&file, &name, dir.as_deref(), to.as_deref(), &staging)
+                let (msiexec, layout, app) = (ctx.msiexec, layout.clone(), app.to_string());
+                let staging = staging.clone();
+                move || -> Result<(), Refused> {
+                    let e = match extract(&file, &name, dir.as_deref(), to.as_deref(), &staging) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => e,
+                    };
+                    if !extract::needs_installer(&file, &name, &e) {
+                        return Err(Refused::Failed(e.to_string()));
+                    }
+                    let reason = match e {
+                        extract::ExtractError::Unsupported(r) => r,
+                        other => other.to_string(),
+                    };
+                    let Some(m) = msiexec else {
+                        return Err(Refused::NeedsMsiexec(reason));
+                    };
+                    tracing::info!("{name}: {reason}; usando msiexec /a (autorizado)");
+                    let source = extract::ExtractSource {
+                        file: &file,
+                        file_name: &name,
+                        extract_dir: dir.as_deref(),
+                        extract_to: to.as_deref(),
+                    };
+                    extract_with_msiexec(m, &layout, &app, &source, &staging)
+                        .map_err(Refused::Failed)
+                }
             };
             tracing::info!("extraindo {}", source.file_name);
             let start = Instant::now();
-            let job = tokio::task::spawn_blocking(work);
-            let result = match job.await {
-                Ok(r) => r.map_err(|e| e.to_string()),
+            let job = AwaitWorker::spawn(work, staging);
+            let result = match job.join().await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(Refused::Failed(m))) => Err(m),
+                Ok(Err(Refused::NeedsMsiexec(reason))) => {
+                    let message = format!("o MSI precisa do Windows Installer ({reason})");
+                    run.needs_msiexec = Some((*index, reason));
+                    Err(message)
+                }
                 Err(e) => match e.try_into_panic() {
                     // Re-raised by `execute_install` once the staging folder is rolled back.
                     Ok(p) => {
@@ -755,6 +837,128 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             ctx.state.record(&rec, &arts).map_err(|e| e.to_string())
         }
         Step::RemoveOldVersion { .. } => Ok(()),
+    }
+}
+
+/// Why the extraction worker did not fill the staging folder.
+enum Refused {
+    Failed(String),
+    NeedsMsiexec(String),
+}
+
+/// Folder under the staging folder where `msiexec /a` works (removed once its tree moved).
+const MSIEXEC_DIR: &str = "_msiexec";
+
+/// Fallback for an MSI the own extractor refused: `msiexec /a` into
+/// `<staging>\_msiexec\SourceDir`, queued behind `msi.lock` (taken after `install.lock`,
+/// never before) and the Windows Installer mutex, then its tree moved into `staging` through
+/// `extract::import_admin_tree`. Blocks until `msiexec` ends: it is never killed.
+pub fn extract_with_msiexec(
+    m: Msiexec,
+    layout: &Layout,
+    app: &str,
+    source: &extract::ExtractSource<'_>,
+    staging: &Path,
+) -> Result<(), String> {
+    let work = staging.join(MSIEXEC_DIR);
+    fs::create_dir_all(&work).map_err(|e| io_msg(&work, e))?;
+    // msiexec names its administrative copy after the package file: give it the manifest's name.
+    let admin = match safepath::safe_components(source.file_name).as_deref() {
+        Some([one]) => one.clone(),
+        _ => "package.msi".to_string(),
+    };
+    let package = work.join(&admin);
+    if fs::hard_link(source.file, &package).is_err() {
+        fs::copy(source.file, &package).map_err(|e| io_msg(&package, e))?;
+    }
+    let target = work.join("SourceDir");
+    let mut status = |s: msi_queue::Status| tracing::info!(app, status = ?s, "msiexec /a");
+    let lock = msi_queue::lock_msi(&layout.msi_lock(), &mut status).map_err(|e| e.to_string())?;
+    let mut attempt = 0u32;
+    let ran = msi_queue::run_queued(
+        &msi_queue::POLICY,
+        &mut || (m.busy)(),
+        &mut || {
+            attempt += 1;
+            (m.launch)(&package, &target, &layout.msiexec_log(app, attempt))
+        },
+        &mut std::thread::sleep,
+        &mut status,
+    );
+    drop(lock);
+    ran.map_err(|e| format!("msiexec /a: {e}"))?;
+    extract::import_admin_tree(source, &target, &admin, staging, &extract::DEFAULT_LIMITS)
+        .map_err(|e| e.to_string())?;
+    not_found_ok(remove_any(&work)).map_err(|e| io_msg(&work, e))
+}
+
+/// Set once the worker ends (returned or unwound).
+type DoneFlag = Arc<(Mutex<bool>, Condvar)>;
+
+/// Sets the flag when dropped: also while the worker unwinds.
+struct SignalDone(DoneFlag);
+
+impl Drop for SignalDone {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        cvar.notify_all();
+    }
+}
+
+/// A blocking worker writing into `staging` (extraction, `msiexec /a`). If the awaiting
+/// future is dropped (the install was cancelled), the drop waits for the worker to end and
+/// only then removes `staging`: nothing is rolled back, nor left behind, while it still writes.
+struct AwaitWorker<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+    done: DoneFlag,
+    staging: PathBuf,
+}
+
+impl<T: Send + 'static> AwaitWorker<T> {
+    fn spawn(work: impl FnOnce() -> T + Send + 'static, staging: PathBuf) -> AwaitWorker<T> {
+        let done: DoneFlag = Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = SignalDone(Arc::clone(&done));
+        let handle = tokio::task::spawn_blocking(move || {
+            let _signal = signal;
+            work()
+        });
+        AwaitWorker {
+            handle: Some(handle),
+            done,
+            staging,
+        }
+    }
+
+    /// Awaits the worker; once it answered, dropping `self` does nothing.
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let r = match self.handle.as_mut() {
+            Some(handle) => handle.await,
+            None => unreachable!("an AwaitWorker is joined once"),
+        };
+        self.handle = None;
+        r
+    }
+}
+
+impl<T> Drop for AwaitWorker<T> {
+    fn drop(&mut self) {
+        if self.handle.take().is_none() {
+            return;
+        }
+        let (lock, cvar) = &*self.done;
+        let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while !*done {
+            done = cvar.wait(done).unwrap_or_else(|p| p.into_inner());
+        }
+        drop(done);
+        tracing::warn!(
+            "instalação cancelada durante a extração; removendo {}",
+            self.staging.display()
+        );
+        if let Err(e) = not_found_ok(remove_any(&self.staging)) {
+            tracing::warn!("{}: {e}", self.staging.display());
+        }
     }
 }
 

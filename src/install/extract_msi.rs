@@ -154,7 +154,7 @@ fn extract_package(
 
 /// Spells the leading components as `dir` when they match it ignoring case: on
 /// Windows `extract_dir = "pfiles/App"` finds `PFiles\app` (Scoop runs there).
-fn align_case(mut rel: Vec<String>, dir: &[String]) -> Vec<String> {
+pub(super) fn align_case(mut rel: Vec<String>, dir: &[String]) -> Vec<String> {
     if rel.len() >= dir.len()
         && rel
             .iter()

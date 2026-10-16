@@ -13,7 +13,7 @@ use crate::core::SourceKind;
 use crate::core::version::Version;
 use crate::http::Http;
 use crate::install::download::{self, DownloadError, Progress};
-use crate::install::executor::{self, ExecCtx, ExecError, InUseCheck, NoHook};
+use crate::install::executor::{self, ExecCtx, ExecError, InUseCheck, Msiexec, NoHook};
 use crate::install::layout::Layout;
 use crate::install::manifest::{self, Arch, ManifestError, Resolved};
 use crate::install::path_edit;
@@ -120,6 +120,29 @@ pub struct OpsCtx<'a> {
     /// Production: `install::fs_win::files_in_use`.
     pub in_use: InUseCheck<'a>,
     pub residue: ResidueScan<'a>,
+    /// Launcher of the `msiexec /a` fallback; used only for apps the caller authorized
+    /// ([`AllowMsiexec`]).
+    pub msiexec: Msiexec,
+}
+
+/// Which apps of an `apply` may fall back to `msiexec /a` (CLI `--allow-msiexec`: all; TUI:
+/// the one item the user confirmed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AllowMsiexec {
+    #[default]
+    No,
+    All,
+    App(String),
+}
+
+impl AllowMsiexec {
+    pub fn allows(&self, app: &str) -> bool {
+        match self {
+            AllowMsiexec::No => false,
+            AllowMsiexec::All => true,
+            AllowMsiexec::App(a) => a.eq_ignore_ascii_case(app),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -237,7 +260,12 @@ fn effects<'a>(ctx: &'a OpsCtx<'_>) -> Effects<'a> {
     }
 }
 
-fn exec_ctx<'a>(ctx: &'a OpsCtx<'_>, layout: &'a Layout, state: &'a mut StateDb) -> ExecCtx<'a> {
+fn exec_ctx<'a>(
+    ctx: &'a OpsCtx<'_>,
+    layout: &'a Layout,
+    state: &'a mut StateDb,
+    msiexec: Option<Msiexec>,
+) -> ExecCtx<'a> {
     ExecCtx {
         layout,
         data: ctx.data,
@@ -247,6 +275,7 @@ fn exec_ctx<'a>(ctx: &'a OpsCtx<'_>, layout: &'a Layout, state: &'a mut StateDb)
         hook: &NoHook,
         progress: ctx.progress,
         in_use: ctx.in_use,
+        msiexec,
     }
 }
 
@@ -569,12 +598,21 @@ fn revalidate<'p>(
 /// `PartlyApplied`). The environment change is broadcast once at the end when any
 /// variable ended up different.
 pub async fn apply(ctx: &OpsCtx<'_>, plans: &[InstallPlan]) -> Result<(), OpsError> {
+    apply_allowing(ctx, plans, &AllowMsiexec::No).await
+}
+
+/// [`apply`] where the apps `allow` names may fall back to `msiexec /a`.
+pub async fn apply_allowing(
+    ctx: &OpsCtx<'_>,
+    plans: &[InstallPlan],
+    allow: &AllowMsiexec,
+) -> Result<(), OpsError> {
     let targets = plans
         .last()
         .map(|p| p.app.to_lowercase())
         .into_iter()
         .collect();
-    apply_with_targets(ctx, plans, &targets).await
+    apply_with_targets(ctx, plans, &targets, allow).await
 }
 
 /// Concatenates plan groups in order, dropping a plan whose app (case-insensitive) already
@@ -594,13 +632,22 @@ pub async fn apply_groups(
     ctx: &OpsCtx<'_>,
     groups: Vec<Vec<InstallPlan>>,
 ) -> Result<Vec<InstallPlan>, OpsError> {
+    apply_groups_allowing(ctx, groups, &AllowMsiexec::No).await
+}
+
+/// [`apply_groups`] where the apps `allow` names may fall back to `msiexec /a`.
+pub async fn apply_groups_allowing(
+    ctx: &OpsCtx<'_>,
+    groups: Vec<Vec<InstallPlan>>,
+    allow: &AllowMsiexec,
+) -> Result<Vec<InstallPlan>, OpsError> {
     let targets = groups
         .iter()
         .filter_map(|g| g.last())
         .map(|p| p.app.to_lowercase())
         .collect();
     let merged = merge_groups(groups);
-    apply_with_targets(ctx, &merged, &targets).await?;
+    apply_with_targets(ctx, &merged, &targets, allow).await?;
     Ok(merged)
 }
 
@@ -636,6 +683,7 @@ async fn apply_with_targets(
     ctx: &OpsCtx<'_>,
     plans: &[InstallPlan],
     targets: &std::collections::HashSet<String>,
+    allow: &AllowMsiexec,
 ) -> Result<(), OpsError> {
     let layout = layout(ctx);
     let _lock = lock_async(&layout, ctx.wait)
@@ -659,7 +707,8 @@ async fn apply_with_targets(
     let mut result = Ok(());
     let mut applied: Vec<String> = Vec::new();
     for plan in plans {
-        let mut exec = exec_ctx(ctx, &layout, &mut state);
+        let msiexec = allow.allows(&plan.app).then_some(ctx.msiexec);
+        let mut exec = exec_ctx(ctx, &layout, &mut state, msiexec);
         let step_span = tracing::debug_span!("install.execute", app = %plan.app);
         if let Err(e) = executor::execute_install(plan, &mut exec)
             .instrument(step_span)
@@ -765,7 +814,7 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     let env = ctx.effects.env;
     let before = env_snapshot(env, &names)?;
     let result = {
-        let mut exec = exec_ctx(ctx, &layout, &mut state);
+        let mut exec = exec_ctx(ctx, &layout, &mut state, None);
         tracing::debug_span!("uninstall.execute")
             .in_scope(|| executor::execute_uninstall(plan, &mut exec))
     };

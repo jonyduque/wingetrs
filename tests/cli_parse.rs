@@ -176,7 +176,8 @@ fn install_flags_parse() {
             target: "extras/x".into(),
             bucket: None,
             dry_run: true,
-            yes: true
+            yes: true,
+            allow_msiexec: false
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--bucket", "main"]).unwrap();
@@ -186,9 +187,19 @@ fn install_flags_parse() {
             target: "x".into(),
             bucket: Some("main".into()),
             dry_run: false,
-            yes: false
+            yes: false,
+            allow_msiexec: false
         })
     );
+    let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--allow-msiexec"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Install {
+            allow_msiexec: true,
+            yes: false,
+            ..
+        })
+    ));
     assert!(Cli::try_parse_from(["wingetrs", "install"]).is_err());
 }
 
@@ -218,7 +229,8 @@ fn upgrade_flags_parse_and_all_excludes_a_target() {
             all: true,
             keep: true,
             dry_run: false,
-            yes: true
+            yes: true,
+            allow_msiexec: false
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "upgrade", "x"]).unwrap();
@@ -229,7 +241,8 @@ fn upgrade_flags_parse_and_all_excludes_a_target() {
             all: false,
             keep: false,
             dry_run: false,
-            yes: false
+            yes: false,
+            allow_msiexec: false
         })
     );
     assert!(Cli::try_parse_from(["wingetrs", "upgrade", "x", "--all"]).is_err());

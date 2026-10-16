@@ -1,7 +1,7 @@
 //! `install`, `uninstall`, `upgrade` and `repair`: plan, show, confirm, execute.
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
 use super::{Command, output, style};
-use crate::install::ops::{self, OpsCtx, Resolution};
+use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
 use crate::install::residue::{self, Confidence, Residue};
 use crate::install::target::Candidate;
 use crate::tui::picker::PickerItem;
@@ -139,6 +139,19 @@ impl LineProgress {
 struct Flags {
     yes: bool,
     dry_run: bool,
+    /// `--allow-msiexec`: an MSI the own extractor refuses may use `msiexec /a`. Never
+    /// implied by `--yes`.
+    allow_msiexec: bool,
+}
+
+impl Flags {
+    fn allow(self) -> AllowMsiexec {
+        if self.allow_msiexec {
+            AllowMsiexec::All
+        } else {
+            AllowMsiexec::No
+        }
+    }
 }
 
 /// Asks to proceed: `--yes` skips, no terminal without `--yes` is an error.
@@ -160,29 +173,42 @@ pub async fn execute(ctx: &OpsCtx<'_>, ui: &dyn Ui, cmd: Command) -> anyhow::Res
             bucket,
             dry_run,
             yes,
-        } => install(ctx, ui, &target, bucket.as_deref(), Flags { yes, dry_run }).await,
+            allow_msiexec,
+        } => {
+            let f = Flags {
+                yes,
+                dry_run,
+                allow_msiexec,
+            };
+            install(ctx, ui, &target, bucket.as_deref(), f).await
+        }
         Command::Uninstall {
             target,
             purge,
             dry_run,
             yes,
-        } => uninstall(ctx, ui, &target, purge, Flags { yes, dry_run }),
+        } => {
+            let f = Flags {
+                yes,
+                dry_run,
+                allow_msiexec: false,
+            };
+            uninstall(ctx, ui, &target, purge, f)
+        }
         Command::Upgrade {
             target,
             all,
             keep,
             dry_run,
             yes,
+            allow_msiexec,
         } => {
-            upgrade(
-                ctx,
-                ui,
-                target.as_deref(),
-                all,
-                keep,
-                Flags { yes, dry_run },
-            )
-            .await
+            let f = Flags {
+                yes,
+                dry_run,
+                allow_msiexec,
+            };
+            upgrade(ctx, ui, target.as_deref(), all, keep, f).await
         }
         Command::Repair => {
             anstream::print!("{}", output::repair_text(&ops::repair(ctx)?));
@@ -258,7 +284,7 @@ async fn install(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
-    ops::apply(ctx, &plans).await?;
+    ops::apply_allowing(ctx, &plans, &f.allow()).await?;
     for p in &plans {
         anstream::println!(
             "{} {} {}",
@@ -448,7 +474,7 @@ async fn upgrade(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
-    for p in ops::apply_groups(ctx, groups).await? {
+    for p in ops::apply_groups_allowing(ctx, groups, &f.allow()).await? {
         anstream::println!(
             "{} {} {}",
             style::paint(style::OK, "Atualizado:"),
@@ -515,6 +541,7 @@ mod tests {
             progress: &no_progress,
             in_use: &nothing_in_use,
             residue: ResidueScan::none(),
+            msiexec: crate::install::executor::Msiexec::DISABLED,
         };
         let res = |name: &str, confidence, preselected| Residue {
             kind: ResidueKind::Folder {

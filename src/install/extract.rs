@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs_retry;
 use crate::install::archive::ArchiveKind;
 use crate::install::extract_7z::{MAX_7Z_DICT, extract_7z};
-use crate::install::extract_msi::extract_msi;
+use crate::install::extract_msi::{align_case, extract_msi};
 use crate::install::safepath;
 use crate::install::sniff::{self, Sniffed};
 
@@ -218,20 +218,38 @@ pub fn extract_all_with(
 ) -> Result<(), ExtractError> {
     let mut mappers = Vec::new();
     for s in sources {
-        mappers.push(Mapper {
-            dir: s
-                .extract_dir
-                .map(safe_components)
-                .transpose()?
-                .unwrap_or_default(),
-            to: s
-                .extract_to
-                .map(safe_components)
-                .transpose()?
-                .unwrap_or_default(),
-            dir_seen: false,
-        });
+        mappers.push(mapper_for(s)?);
     }
+    through_temp(dest, |tmp| {
+        for (s, mapper) in sources.iter().zip(mappers.iter_mut()) {
+            extract_one(s, tmp, mapper, limits)?;
+        }
+        Ok(())
+    })
+}
+
+fn mapper_for(s: &ExtractSource<'_>) -> Result<Mapper, ExtractError> {
+    Ok(Mapper {
+        dir: s
+            .extract_dir
+            .map(safe_components)
+            .transpose()?
+            .unwrap_or_default(),
+        to: s
+            .extract_to
+            .map(safe_components)
+            .transpose()?
+            .unwrap_or_default(),
+        dir_seen: false,
+    })
+}
+
+/// Runs `fill` on a fresh sibling temp folder of `dest` and moves the result into `dest`
+/// only when it succeeds; the temp folder is removed on every path.
+fn through_temp(
+    dest: &Path,
+    fill: impl FnOnce(&Path) -> Result<(), ExtractError>,
+) -> Result<(), ExtractError> {
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(io_at("criar pasta", parent))?;
     let tmp = parent.join(format!(
@@ -244,13 +262,85 @@ pub fn extract_all_with(
         path: tmp.clone(),
         armed: true,
     };
-    for (s, mapper) in sources.iter().zip(mappers.iter_mut()) {
-        extract_one(s, &tmp, mapper, limits)?;
-    }
+    fill(&tmp)?;
     merge_into(&tmp, dest)?;
     guard.armed = false;
     let _ = fs_retry::retry("apagar", &tmp, || fs::remove_dir_all(&tmp));
     Ok(())
+}
+
+/// Whether `msiexec /a` may extract what the own extractor refused: an MSI (by name and by
+/// its OLE signature) that it does not support. Integrity and safety errors never qualify.
+pub fn needs_installer(file: &Path, file_name: &str, e: &ExtractError) -> bool {
+    matches!(e, ExtractError::Unsupported(_))
+        && matches!(ArchiveKind::of(file_name), Ok(ArchiveKind::Msi))
+        && is_ole(file).unwrap_or(false)
+}
+
+/// Moves the tree `msiexec /a` left in `source_dir` (its `TARGETDIR`) into `dest` through
+/// the same mapper (`extract_dir` without case, `/` or `\`), `safepath` checks and byte
+/// budget as the own MSI extraction (`source.file` sizes the budget). `admin_msi` is the
+/// administrative copy of the package that `msiexec` leaves at the root: never moved.
+pub fn import_admin_tree(
+    source: &ExtractSource<'_>,
+    source_dir: &Path,
+    admin_msi: &str,
+    dest: &Path,
+    limits: &Limits,
+) -> Result<(), ExtractError> {
+    let mut mapper = mapper_for(source)?;
+    let mut budget = Budget::for_file(source.file, limits)?;
+    through_temp(dest, |tmp| {
+        let mut entries = 0u64;
+        let mut stack = vec![(source_dir.to_path_buf(), Vec::<String>::new())];
+        while let Some((dir, comps)) = stack.pop() {
+            for entry in fs::read_dir(&dir).map_err(io_at("listar", &dir))? {
+                let entry = entry.map_err(io_at("listar", &dir))?;
+                let path = entry.path();
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|n| ExtractError::UnsafePath(n.to_string_lossy().into_owned()))?;
+                if comps.is_empty() && name.eq_ignore_ascii_case(admin_msi) {
+                    continue;
+                }
+                entries += 1;
+                check_entries(entries, limits)?;
+                let mut rel = comps.clone();
+                rel.push(name);
+                let raw = rel.join("/");
+                // Names from disk have no separators: only the refusal matters.
+                safe_components(&raw)?;
+                let meta = fs::symlink_metadata(&path).map_err(io_at("ler tipo", &path))?;
+                if meta.file_type().is_symlink() {
+                    return Err(ExtractError::UnsafePath(raw));
+                }
+                let target = mapper.map(align_case(rel.clone(), &mapper.dir));
+                if meta.is_dir() {
+                    if let Some(t) = &target {
+                        fs::create_dir_all(tmp.join(t))
+                            .map_err(io_at("criar pasta", &tmp.join(t)))?;
+                    }
+                    stack.push((path, rel));
+                    continue;
+                }
+                budget.charge(meta.len())?;
+                if let Some(t) = target {
+                    let to = tmp.join(t);
+                    if let Some(p) = to.parent() {
+                        fs::create_dir_all(p).map_err(io_at("criar pasta", p))?;
+                    }
+                    rename_retrying(&path, &to)?;
+                }
+            }
+        }
+        if !mapper.dir.is_empty() && !mapper.dir_seen {
+            return Err(ExtractError::MissingExtractDir(
+                source.extract_dir.unwrap_or_default().to_string(),
+            ));
+        }
+        Ok(())
+    })
 }
 
 fn extract_one(

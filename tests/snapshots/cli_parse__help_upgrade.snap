@@ -26,6 +26,9 @@ Opções:
       --yes
           Não pergunta nada
 
+      --allow-msiexec
+          Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

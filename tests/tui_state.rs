@@ -4877,3 +4877,146 @@ fn search_menu_follows_tool_detection() {
     assert!(cmds.is_empty());
     assert_eq!(menu_items(&a), before, "still open, same items");
 }
+// ---- msiexec /a confirmation (Task 129) ----
+
+fn needs_msiexec(app: &str, applied: &[&str]) -> Msg {
+    Msg::InstallFinished(Err(InstallFail::NeedsMsiexec {
+        app: app.into(),
+        reason: "MSI sem compressão".into(),
+        applied: applied.iter().map(|a| a.to_string()).collect(),
+    }))
+}
+
+fn allowed(app: &str) -> Action {
+    Action::ApplyMsiexec {
+        groups: vec![vec![plan(app)]],
+        app: app.into(),
+    }
+}
+
+/// A batch of three groups is running and `b` needs `msiexec /a` after `a` was installed.
+fn batch_needing_msiexec() -> (App, Vec<Cmd>) {
+    let mut a = app();
+    let batch = Action::Apply(vec![vec![plan("a")], vec![plan("b")], vec![plan("c")]]);
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "lote".into(),
+            action: batch.clone(),
+        })),
+    );
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::Execute(batch)]
+    );
+    let cmds = update(&mut a, needs_msiexec("b", &["a"]));
+    (a, cmds)
+}
+
+#[test]
+fn tui_confirms_msiexec_per_item() {
+    let (mut a, cmds) = batch_needing_msiexec();
+    // `c` goes on at once; `a` is installed and not run again.
+    assert_eq!(
+        cmds,
+        vec![Cmd::ScanInstalled, Cmd::Execute(apply_action("c"))]
+    );
+    match &a.modal {
+        Some(Modal::Confirm { items, notes, .. }) => {
+            let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+            assert_eq!(names, ["b"]);
+            assert!(
+                notes.iter().any(|n| n
+                    == "Usa o Windows Installer (msiexec /a). Não pode ser cancelado depois de começar; grava arquivos em C:\\Windows\\Installer."),
+                "{notes:?}"
+            );
+        }
+        _ => panic!("sem confirmação"),
+    }
+    // Continuar: `b` waits behind `c`, allowed for itself only.
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert!(a.modal.is_none());
+    assert_eq!(a.queue.len(), 1);
+    assert_eq!(a.queue[0].action, allowed("b"));
+    assert_eq!(a.queue[0].label, "Instalando b (Windows Installer)");
+    let done = Done {
+        summary: "Instalado: c".into(),
+        residues: None,
+    };
+    assert_eq!(
+        update(&mut a, Msg::InstallFinished(Ok(done))),
+        vec![Cmd::ScanInstalled, Cmd::Execute(allowed("b"))]
+    );
+
+    // Cancelar: the item ends as an error and nothing is queued for it.
+    let (mut c, _) = batch_needing_msiexec();
+    assert!(update(&mut c, key(KeyCode::Esc)).is_empty());
+    assert!(c.modal.is_none());
+    assert!(c.queue.is_empty());
+    assert!(
+        c.toasts.iter().any(|t| t.kind == ToastKind::Error
+            && t.text == "b: cancelado; o MSI precisa do Windows Installer"),
+        "{:?}",
+        c.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+
+    // An app that is in none of the groups: an error, no confirmation.
+    let mut z = app();
+    update(&mut z, ready("a"));
+    update(&mut z, key(KeyCode::Enter));
+    let cmds = update(&mut z, needs_msiexec("zz", &[]));
+    assert_eq!(cmds, vec![Cmd::ScanInstalled]);
+    assert!(z.modal.is_none());
+    assert!(
+        z.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Error && t.text.starts_with("zz: ")),
+        "{:?}",
+        z.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn quit_waits_for_uncancellable_job() {
+    let mut a = app();
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "b".into(),
+            action: allowed("b"),
+        })),
+    );
+    assert_eq!(
+        update(&mut a, key(KeyCode::Enter)),
+        vec![Cmd::Execute(allowed("b"))]
+    );
+    assert!(update(&mut a, key(KeyCode::Char('q'))).is_empty());
+    match &a.modal {
+        Some(Modal::ConfirmQuit { text }) => assert_eq!(
+            text,
+            "O Windows Installer ainda está trabalhando; o wingetrs vai esperar ele terminar."
+        ),
+        _ => panic!("sem diálogo de saída"),
+    }
+    // Ctrl+C on the dialog does not quit at once (it does for other jobs).
+    assert!(update(&mut a, ctrl('c')).is_empty());
+    assert!(matches!(a.modal, Some(Modal::ConfirmQuit { .. })));
+    // Enter: quit once the job ends; a second Ctrl+C still waits.
+    assert!(update(&mut a, key(KeyCode::Enter)).is_empty());
+    assert!(a.quit_after_running);
+    assert!(!update(&mut a, ctrl('c')).contains(&Cmd::Quit));
+    update(&mut a, key(KeyCode::Esc));
+    let done = Done {
+        summary: "Instalado: b".into(),
+        residues: None,
+    };
+    let cmds = update(&mut a, Msg::InstallFinished(Ok(done)));
+    assert!(cmds.contains(&Cmd::Quit), "{cmds:?}");
+
+    // The same steps with an ordinary job: the second Ctrl+C quits at once.
+    let mut o = app();
+    update(&mut o, ready("a"));
+    update(&mut o, key(KeyCode::Enter));
+    update(&mut o, key(KeyCode::Char('q')));
+    assert_eq!(update(&mut o, ctrl('c')), vec![Cmd::Quit]);
+}

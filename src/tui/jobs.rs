@@ -3,8 +3,9 @@
 use crate::bridge::{self, BridgeJob, Tool};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
+use crate::install::executor::ExecError;
 use crate::install::msi_queue;
-use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
+use crate::install::ops::{self, AllowMsiexec, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
@@ -214,22 +215,47 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>, keep: bool) -> Result<Planned, String> {
 }
 
 fn fail(e: OpsError) -> InstallFail {
+    let needs = |e: &OpsError| match e {
+        OpsError::Exec(ExecError::NeedsMsiexec { app, reason, .. }) => {
+            Some((app.clone(), reason.clone()))
+        }
+        _ => None,
+    };
     match e {
         OpsError::Busy => InstallFail::Busy,
-        other => InstallFail::Other(other.to_string()),
+        OpsError::PartlyApplied { applied, error } => match needs(&error) {
+            Some((app, reason)) => InstallFail::NeedsMsiexec {
+                app,
+                reason,
+                applied,
+            },
+            None => InstallFail::Other(OpsError::PartlyApplied { applied, error }.to_string()),
+        },
+        other => match needs(&other) {
+            Some((app, reason)) => InstallFail::NeedsMsiexec {
+                app,
+                reason,
+                applied: Vec::new(),
+            },
+            None => InstallFail::Other(other.to_string()),
+        },
     }
+}
+
+fn installed(applied: Result<Vec<InstallPlan>, OpsError>) -> Result<Done, InstallFail> {
+    let names: Vec<String> = applied.map_err(fail)?.into_iter().map(|p| p.app).collect();
+    Ok(Done {
+        summary: format!("Instalado: {}", names.join(", ")),
+        residues: None,
+    })
 }
 
 /// Executes a confirmed action (the lock policy is the context's `wait`).
 pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallFail> {
     match action {
-        Action::Apply(groups) => {
-            let applied = ops::apply_groups(o, groups).await.map_err(fail)?;
-            let names: Vec<String> = applied.into_iter().map(|p| p.app).collect();
-            Ok(Done {
-                summary: format!("Instalado: {}", names.join(", ")),
-                residues: None,
-            })
+        Action::Apply(groups) => installed(ops::apply_groups(o, groups).await),
+        Action::ApplyMsiexec { groups, app } => {
+            installed(ops::apply_groups_allowing(o, groups, &AllowMsiexec::App(app)).await)
         }
         Action::Remove(plan) => {
             let residues = ops::uninstall(o, &plan).map_err(fail)?;

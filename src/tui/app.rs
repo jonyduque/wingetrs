@@ -182,6 +182,11 @@ pub enum Action {
     Remove(UninstallPlan),
     /// Upgrade through the tool that installed the app (winget or scoop).
     Bridge(BridgeJob),
+    /// Like `Apply`, after the user allowed `msiexec /a` for `app` (and only for it).
+    ApplyMsiexec {
+        groups: Vec<Vec<InstallPlan>>,
+        app: String,
+    },
 }
 
 impl Action {
@@ -190,6 +195,10 @@ impl Action {
             Action::Apply(groups) => {
                 let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
                 format!("Instalando {}", apps.join(", "))
+            }
+            Action::ApplyMsiexec { groups, .. } => {
+                let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
+                format!("Instalando {} (Windows Installer)", apps.join(", "))
             }
             Action::Remove(p) => format!("Removendo {}", p.app),
             Action::Bridge(job) => format!("Atualizando {} via {}", job.name, job.tool.name()),
@@ -209,8 +218,21 @@ pub struct Done {
 pub enum InstallFail {
     /// Another wingetrs process holds `install.lock`.
     Busy,
+    /// An MSI of `app` needs `msiexec /a`; `applied` were installed before it (and stay).
+    NeedsMsiexec {
+        app: String,
+        reason: String,
+        applied: Vec<String>,
+    },
     Other(String),
 }
+
+/// Note of the confirmation that authorizes `msiexec /a` for one item.
+pub const MSIEXEC_NOTE: &str = "Usa o Windows Installer (msiexec /a). Não pode ser cancelado depois de começar; grava arquivos em C:\\Windows\\Installer.";
+
+/// Text of the quit dialog while a job that may run `msiexec /a` is in progress.
+pub const MSIEXEC_QUIT: &str =
+    "O Windows Installer ainda está trabalhando; o wingetrs vai esperar ele terminar.";
 
 /// Download/extract progress shown while an operation runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -1755,7 +1777,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     // the way out if the job in progress hangs.
     let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
     let quit_asked = matches!(app.modal, Some(Modal::ConfirmQuit { .. }));
-    if ctrl_c && (quit_asked || app.quit_after_running) {
+    if ctrl_c && (quit_asked || app.quit_after_running) && !job_uncancellable(app) {
         return vec![Cmd::Quit];
     }
     if app.modal.is_some() {
@@ -2123,6 +2145,20 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     checked: true,
                 }));
             }
+            Action::ApplyMsiexec { groups, app } => {
+                let plan = groups
+                    .iter()
+                    .flatten()
+                    .find(|p| p.app.eq_ignore_ascii_case(app));
+                items.push(ConfirmItem {
+                    name: app.clone(),
+                    key: plan.map(|p| (format!("scoop:{}", p.bucket), p.app.clone())),
+                    from: plan.and_then(|p| p.upgrade_from.clone()),
+                    to: plan.map(|p| p.version.clone()),
+                    manager: "wingetrs",
+                    checked: true,
+                });
+            }
             Action::Remove(p) => items.push(ConfirmItem {
                 name: p.app.clone(),
                 key: ours(&p.app).and_then(row_key),
@@ -2159,6 +2195,7 @@ fn confirm_modal(
     for action in &actions {
         let note = match action {
             Action::Bridge(job) => bridge_note(job.tool).to_string(),
+            Action::ApplyMsiexec { .. } => MSIEXEC_NOTE.to_string(),
             Action::Remove(p) if p.purge => {
                 format!("Os dados persistentes de {} serão APAGADOS (purge).", p.app)
             }
@@ -3153,6 +3190,14 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
         return vec![Cmd::Quit];
     }
     let n = app.queue.len();
+    if job_uncancellable(app) {
+        let mut text = MSIEXEC_QUIT.to_string();
+        if n > 0 {
+            text.push_str(&format!(" Sair cancela as {n} operações na fila."));
+        }
+        app.modal = Some(Modal::ConfirmQuit { text });
+        return Vec::new();
+    }
     let mut text = match (&app.running, n) {
         (Some(_), 0) => "Há uma operação em andamento; ela termina antes de fechar.".to_string(),
         (Some(_), _) => format!(
@@ -3173,6 +3218,18 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
     }
     app.modal = Some(Modal::ConfirmQuit { text });
     Vec::new()
+}
+
+/// The job in progress may be running `msiexec /a`, which cannot be cancelled: quitting
+/// waits for it, even on a second Ctrl+C.
+pub fn job_uncancellable(app: &App) -> bool {
+    matches!(
+        app.running,
+        Some(Running {
+            action: Some(Action::ApplyMsiexec { .. }),
+            ..
+        })
+    )
 }
 
 /// Rows of the queue dialog with their op ids: the operation in progress (not selectable),
@@ -3350,10 +3407,73 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
             app.waiting_lock = true;
             cmds.push(Cmd::RetryQueue);
         }
+        Err(InstallFail::NeedsMsiexec {
+            app: name,
+            reason,
+            applied,
+        }) => {
+            let groups = match finished.and_then(|r| r.action) {
+                Some(Action::Apply(groups) | Action::ApplyMsiexec { groups, .. }) => groups,
+                _ => Vec::new(),
+            };
+            cmds.extend(ask_msiexec(app, name, reason, &applied, groups));
+        }
         Err(InstallFail::Other(message)) => app.push_toast(ToastKind::Error, message),
     }
     cmds.extend(pump(app));
     cmds
+}
+
+/// An MSI of `name` needs `msiexec /a`. The groups not applied yet that contain it wait for
+/// the user to confirm that one item (`Continuar` queues them allowed for `name` only;
+/// `Cancelar` ends the item as an error); the other groups not applied go back in line.
+fn ask_msiexec(
+    app: &mut App,
+    name: String,
+    reason: String,
+    applied: &[String],
+    groups: Vec<Vec<InstallPlan>>,
+) -> Vec<Cmd> {
+    let done = |p: &InstallPlan| applied.iter().any(|a| a.eq_ignore_ascii_case(&p.app));
+    let (with, rest): (Vec<_>, Vec<_>) = groups
+        .into_iter()
+        .filter(|g| g.last().is_some_and(|t| !done(t)))
+        .partition(|g| g.iter().any(|p| p.app.eq_ignore_ascii_case(&name)));
+    if with.is_empty() {
+        // Not one of this action's apps: nothing to confirm, and nothing is run again.
+        app.push_toast(
+            ToastKind::Error,
+            format!("{name}: o MSI precisa do Windows Installer ({reason})"),
+        );
+        return Vec::new();
+    }
+    let mut cmds = Vec::new();
+    if !rest.is_empty() {
+        cmds.extend(enqueue(app, Action::Apply(rest)));
+    }
+    let action = Action::ApplyMsiexec {
+        groups: with,
+        app: name.clone(),
+    };
+    let note = format!("{name}: o extrator do wingetrs não abre este MSI ({reason}).");
+    let modal = confirm_modal(app, vec![action], vec![note], None);
+    open_modal(app, modal);
+    cmds
+}
+
+/// `Cancelar` (or `Esc`) on a confirmation; declining `msiexec /a` ends that item as an error.
+fn cancel_confirm(app: &mut App) -> Vec<Cmd> {
+    if let Some(Modal::Confirm { actions, .. }) = app.modal.take() {
+        for action in actions {
+            if let Action::ApplyMsiexec { app: name, .. } = action {
+                app.push_toast(
+                    ToastKind::Error,
+                    format!("{name}: cancelado; o MSI precisa do Windows Installer"),
+                );
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Runs the cleanup of `residues` as the operation in progress.
@@ -3425,10 +3545,7 @@ fn confirm_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     };
     match key.code {
         KeyCode::Enter => return continue_confirm(app),
-        KeyCode::Esc => {
-            app.modal = None;
-            return Vec::new();
-        }
+        KeyCode::Esc => return cancel_confirm(app),
         KeyCode::Up => *cursor = cursor.saturating_sub(1),
         KeyCode::Down => *cursor = (*cursor + 1).min(items.len().saturating_sub(1)),
         KeyCode::Char(' ') => toggle_confirm_item(items, actions, notes, *cursor),
@@ -3475,10 +3592,7 @@ fn confirm_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
     {
         return match button {
             ConfirmButton::Continue => continue_confirm(app),
-            ConfirmButton::Cancel => {
-                app.modal = None;
-                Vec::new()
-            }
+            ConfirmButton::Cancel => cancel_confirm(app),
         };
     }
     let rows = usize::from(r.confirm_list.height) / ITEM_ROWS;

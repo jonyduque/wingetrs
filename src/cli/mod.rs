@@ -198,6 +198,9 @@ pub enum Command {
         /// Não pergunta nada (falha se o alvo for ambíguo)
         #[arg(long)]
         yes: bool,
+        /// Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
+        #[arg(long)]
+        allow_msiexec: bool,
     },
     /// Remove um app instalado pelo wingetrs
     #[command(
@@ -252,6 +255,9 @@ pub enum Command {
         /// Não pergunta nada
         #[arg(long)]
         yes: bool,
+        /// Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
+        #[arg(long)]
+        allow_msiexec: bool,
     },
     /// Gerencia os buckets do Scoop
     #[command(

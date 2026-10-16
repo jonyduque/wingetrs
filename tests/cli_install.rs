@@ -43,6 +43,14 @@ fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
     buf.into_inner()
 }
 
+/// The smallest MSI the own extractor refuses: files outside the package (word count 0).
+fn uncompressed_msi() -> Vec<u8> {
+    use msi::{Package, PackageType};
+    let mut p = Package::create(PackageType::Installer, std::io::Cursor::new(Vec::new())).unwrap();
+    p.summary_info_mut().set_word_count(0);
+    p.into_inner().unwrap().into_inner()
+}
+
 /// Deletes this test's own registry subkey on drop, also when an assertion panics.
 struct OwnKey(String);
 
@@ -62,7 +70,8 @@ struct Lab {
 }
 
 impl Lab {
-    /// `solo` exists only in `main` (served by `server`); `x` exists in `main` and `extras`.
+    /// `solo` exists only in `main` (served by `server`); `x` exists in `main` and `extras`;
+    /// `m` (only in `main`) is an MSI the own extractor refuses.
     async fn new(server: &MockServer, tag: &str) -> Lab {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().to_path_buf();
@@ -105,7 +114,28 @@ impl Lab {
             )
             .unwrap();
         };
-        put(&mut catalog, "main", &[pkg("solo"), pkg("x")]);
+        let msi = uncompressed_msi();
+        let msi_sha = hex::encode(Sha256::digest(&msi));
+        Mock::given(method("GET"))
+            .and(path("/m-1.0.msi"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(msi))
+            .mount(server)
+            .await;
+        let m = NewPackage {
+            id: "m".into(),
+            name: "m".into(),
+            version: "1.0".into(),
+            raw: Some(
+                serde_json::json!({
+                    "version": "1.0",
+                    "url": format!("{uri}/m-1.0.msi"),
+                    "hash": msi_sha,
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        put(&mut catalog, "main", &[pkg("solo"), pkg("x"), m]);
         put(&mut catalog, "extras", &[pkg("x")]);
         drop(catalog);
         // Fresh http.json: no detached background refresh may rewrite the catalog mid-test.
@@ -501,4 +531,29 @@ async fn cli_and_tui_use_the_same_key() {
         "{}",
         text(&out.stderr)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn yes_does_not_allow_msiexec() {
+    let server = MockServer::start().await;
+    let lab = Lab::new(&server, "msiexec").await;
+    let out = tokio::task::block_in_place(|| lab.run(&["install", "m", "--yes"]));
+    let se = text(&out.stderr);
+    assert!(!out.status.success(), "{se}");
+    assert!(
+        se.contains(
+            "m: este MSI precisa do Windows Installer (MSI sem compressão (arquivos fora do pacote)); rode de novo com --allow-msiexec. O msiexec /a não pode ser cancelado depois de começar e grava arquivos em C:\\Windows\\Installer."
+        ),
+        "{se}"
+    );
+    assert!(!lab.root.join("apps").join("m").exists());
+    // With the flag the fallback runs; under `WINGETRS_TEST_ENV_KEY` its launcher refuses
+    // instead of starting msiexec.
+    let out =
+        tokio::task::block_in_place(|| lab.run(&["install", "m", "--yes", "--allow-msiexec"]));
+    let se = text(&out.stderr);
+    assert!(!out.status.success(), "{se}");
+    assert!(se.contains("msiexec desativado neste ambiente"), "{se}");
+    assert!(!se.contains("rode de novo com --allow-msiexec"), "{se}");
+    assert!(!lab.root.join("apps").join("m").exists());
 }

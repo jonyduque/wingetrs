@@ -232,6 +232,7 @@ impl World {
             progress: &no_progress,
             in_use,
             residue: ResidueScan::none(),
+            msiexec: wingetrs::install::executor::Msiexec::DISABLED,
         }
     }
 

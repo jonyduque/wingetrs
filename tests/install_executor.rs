@@ -173,6 +173,7 @@ impl World {
             hook,
             progress: &no_progress,
             in_use: &nothing_in_use,
+            msiexec: None,
         }
     }
 
@@ -1159,6 +1160,12 @@ fn fixture_7z() -> Vec<u8> {
 /// MSI with `pkg\one.txt` (`f_one` of `tests/fixtures/msi/one.cab`, "one\r\n"), built
 /// as `tests/install_msi.rs` does.
 fn fixture_msi() -> Vec<u8> {
+    msi_with(2, "one.txt")
+}
+
+/// `fixture_msi` with another Summary word count (0 = files outside the package, which the
+/// own extractor does not support) and another `FileName`.
+fn msi_with(word_count: i32, file_name: &str) -> Vec<u8> {
     use msi::{Column, Insert, Package, PackageType, Value};
     let cab = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1166,7 +1173,7 @@ fn fixture_msi() -> Vec<u8> {
     ))
     .unwrap();
     let mut p = Package::create(PackageType::Installer, std::io::Cursor::new(Vec::new())).unwrap();
-    p.summary_info_mut().set_word_count(2);
+    p.summary_info_mut().set_word_count(word_count);
     p.create_table(
         "Directory",
         vec![
@@ -1217,7 +1224,7 @@ fn fixture_msi() -> Vec<u8> {
     p.insert_rows(Insert::into("File").row(vec![
         "f_one".into(),
         "C_D1".into(),
-        "one.txt".into(),
+        file_name.into(),
         0.into(),
         Value::Null,
         Value::Int(0),
@@ -1493,4 +1500,398 @@ async fn extraction_worker_panic_rolls_back_then_propagates() {
     assert_eq!(root_list(&s), before_list);
     assert_eq!(s.snapshot(), before);
     assert!(s.state.apps().unwrap().is_empty());
+}
+// ---- msiexec /a fallback (Task 129) ----
+
+use wingetrs::install::executor::Msiexec;
+use wingetrs::install::msi_queue::Attempt;
+
+fn msi_manifest(url: &str, sha: &str, extract_dir: Option<&str>) -> String {
+    let mut m = serde_json::json!({ "version": "1.0", "url": url, "hash": sha });
+    if let Some(d) = extract_dir {
+        m["extract_dir"] = serde_json::json!(d);
+    }
+    m.to_string()
+}
+
+fn never_busy() -> bool {
+    false
+}
+
+/// What `msiexec /a` leaves in `TARGETDIR`: the tree (here with a different case than the
+/// manifest's `extract_dir`) and the administrative copy of the package at its root.
+fn fake_admin(msi: &Path, target: &Path, _log: &Path) -> std::io::Result<Attempt> {
+    let staging = target.parent().and_then(Path::parent).unwrap();
+    assert!(
+        target.ends_with("_msiexec/SourceDir"),
+        "{}",
+        target.display()
+    );
+    assert!(
+        staging
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".staging-"),
+        "{}",
+        target.display()
+    );
+    std::fs::create_dir_all(target.join("PKG"))?;
+    std::fs::write(target.join("PKG").join("one.txt"), b"one\r\n")?;
+    std::fs::write(target.join("readme.txt"), b"x")?;
+    std::fs::copy(msi, target.join(msi.file_name().unwrap()))?;
+    Ok(Attempt::Done)
+}
+
+fn must_not_launch(_: &Path, _: &Path, _: &Path) -> std::io::Result<Attempt> {
+    panic!("msiexec lançado para um erro que não é de formato");
+}
+
+const FAKE_MSIEXEC: Msiexec = Msiexec {
+    busy: never_busy,
+    launch: fake_admin,
+};
+
+const NO_LAUNCH: Msiexec = Msiexec {
+    busy: never_busy,
+    launch: must_not_launch,
+};
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn unsupported_msi_needs_msiexec() {
+    let s = setup().await;
+    let (before_list, before) = (root_list(&s), s.snapshot());
+    let (url, sha) = s.serve("pkg-1.0.msi", msi_with(0, "one.txt")).await;
+    let plan = s.plan_from("app", &msi_manifest(&url, &sha, Some("pkg")), false);
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let r = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
+    drop(ctx);
+    match r {
+        Err(ExecError::NeedsMsiexec {
+            app,
+            source_index,
+            reason,
+        }) => {
+            assert_eq!(app, "app");
+            assert_eq!(source_index, 0);
+            assert!(reason.contains("sem compressão"), "{reason}");
+        }
+        other => panic!("esperava NeedsMsiexec: {other:?}"),
+    }
+    // Rolled back: the app folder the extraction created is gone again.
+    assert!(!s.layout.app_dir("app").exists());
+    assert_eq!(root_list(&s), before_list);
+    assert_eq!(s.snapshot(), before);
+    assert!(s.state.apps().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn allowed_msiexec_extracts_via_fake() {
+    let s = setup().await;
+    let (url, sha) = s.serve("pkg-1.0.msi", msi_with(0, "one.txt")).await;
+    let plan = s.plan_from("app", &msi_manifest(&url, &sha, None), false);
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    ctx.msiexec = Some(FAKE_MSIEXEC);
+    wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap();
+    drop(ctx);
+    let current = s.layout.current("app");
+    // No `pkg-1.0.msi` (the administrative copy) and no `_msiexec` work folder.
+    assert_eq!(
+        names_in(&current),
+        ["PKG", "install.json", "readme.txt"],
+        "{}",
+        current.display()
+    );
+    assert_eq!(
+        std::fs::read(current.join("PKG").join("one.txt")).unwrap(),
+        b"one\r\n"
+    );
+    assert_eq!(names_in(&s.layout.app_dir("app")), ["1.0", "current"]);
+    assert_eq!(s.state.apps().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn msiexec_tree_goes_through_extract_dir_without_case() {
+    let s = setup().await;
+    let (url, sha) = s.serve("pkg-1.0.msi", msi_with(0, "one.txt")).await;
+    let plan = s.plan_from("app", &msi_manifest(&url, &sha, Some("pkg")), false);
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    ctx.msiexec = Some(FAKE_MSIEXEC);
+    wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap();
+    drop(ctx);
+    let current = s.layout.current("app");
+    assert_eq!(names_in(&current), ["install.json", "one.txt"]);
+    assert_eq!(std::fs::read(current.join("one.txt")).unwrap(), b"one\r\n");
+}
+
+#[tokio::test]
+async fn integrity_error_never_falls_back() {
+    let s = setup().await;
+    // Unsafe name inside an MSI the own extractor reads: refused as such, never offered to
+    // msiexec, with or without authorization.
+    let (url, sha) = s.serve("pkg-1.0.msi", msi_with(2, "..")).await;
+    let plan = s.plan_from("app", &msi_manifest(&url, &sha, Some("pkg")), false);
+    for allowed in [None, Some(NO_LAUNCH)] {
+        let before = s.snapshot();
+        let mut ctx = s.ctx_with_hook(&NoHook);
+        ctx.msiexec = allowed;
+        let r = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
+        drop(ctx);
+        match r {
+            Err(ExecError::Failed { message, .. }) => {
+                assert!(message.contains("nome inseguro"), "{message}");
+            }
+            other => panic!("esperava Failed: {other:?}"),
+        }
+        assert_eq!(s.snapshot(), before);
+    }
+    // Wrong hash: the download fails before any extraction.
+    let (url, _) = s.serve("bad-1.0.msi", msi_with(0, "one.txt")).await;
+    let wrong = sha256_hex(b"something else");
+    let plan = s.plan_from("app", &msi_manifest(&url, &wrong, Some("pkg")), false);
+    for allowed in [None, Some(NO_LAUNCH)] {
+        let mut ctx = s.ctx_with_hook(&NoHook);
+        ctx.msiexec = allowed;
+        let r = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
+        drop(ctx);
+        assert!(
+            matches!(&r, Err(ExecError::Failed { step, .. }) if step.starts_with("baixar")),
+            "{r:?}"
+        );
+    }
+    assert!(s.state.apps().unwrap().is_empty());
+}
+
+/// `msiexec` left a name `safepath` refuses (trailing dot, writable only through `\\?\`).
+fn fake_admin_unsafe_name(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
+    std::fs::create_dir_all(target.join("pkg"))?;
+    std::fs::write(target.join("pkg").join("ok.txt"), b"ok")?;
+    let verbatim = format!(r"\\?\{}", target.join("pkg").join("evil.").display());
+    std::fs::write(verbatim, b"x")?;
+    Ok(Attempt::Done)
+}
+
+/// `msiexec` left a junction in the tree.
+fn fake_admin_junction(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
+    std::fs::create_dir_all(target.join("pkg"))?;
+    let outside = target.parent().unwrap().join("outside");
+    std::fs::create_dir_all(&outside)?;
+    wingetrs::install::link::create(&outside, &target.join("pkg").join("link"))?;
+    Ok(Attempt::Done)
+}
+
+#[tokio::test]
+async fn msiexec_tree_with_unsafe_entries_is_refused_and_rolled_back() {
+    let s = setup().await;
+    let (url, sha) = s.serve("pkg-1.0.msi", msi_with(0, "one.txt")).await;
+    let plan = s.plan_from("app", &msi_manifest(&url, &sha, Some("pkg")), false);
+    for (launch, what) in [
+        (
+            fake_admin_unsafe_name as fn(&Path, &Path, &Path) -> std::io::Result<Attempt>,
+            "pkg/evil.",
+        ),
+        (fake_admin_junction, "pkg/link"),
+    ] {
+        let before = s.snapshot();
+        let mut ctx = s.ctx_with_hook(&NoHook);
+        ctx.msiexec = Some(Msiexec {
+            busy: never_busy,
+            launch,
+        });
+        let r = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
+        drop(ctx);
+        match r {
+            Err(ExecError::Failed { message, .. }) => assert!(
+                message.contains(&format!("caminho inseguro no arquivo: {what}")),
+                "{message}"
+            ),
+            other => panic!("esperava Failed: {other:?}"),
+        }
+        assert!(!s.layout.app_dir("app").exists());
+        // `msi.lock` stays once created, like `install.lock`.
+        let without_lock = |mut m: std::collections::BTreeMap<String, String>| {
+            m.remove("msi.lock");
+            m
+        };
+        assert_eq!(without_lock(s.snapshot()), without_lock(before));
+    }
+}
+
+fn admin_tree(files: &[(&str, &[u8])]) -> (TempDir, PathBuf, PathBuf) {
+    let t = tempfile::tempdir().unwrap();
+    let msi = t.path().join("x.msi");
+    std::fs::write(&msi, [0u8; 10]).unwrap();
+    let src = t.path().join("SourceDir");
+    for (name, bytes) in files {
+        let p = src.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+    (t, msi, src)
+}
+
+fn import(
+    msi: &Path,
+    src: &Path,
+    dest: &Path,
+    extract_dir: Option<&str>,
+    limits: &wingetrs::install::extract::Limits,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    wingetrs::install::extract::import_admin_tree(
+        &wingetrs::install::extract::ExtractSource {
+            file: msi,
+            file_name: "x.msi",
+            extract_dir,
+            extract_to: None,
+        },
+        src,
+        "x.msi",
+        dest,
+        limits,
+    )
+}
+
+#[test]
+fn admin_tree_import_keeps_the_extraction_limits() {
+    use wingetrs::install::extract::{DEFAULT_LIMITS, ExtractError, Limits};
+    // 10-byte package, ratio 1: a 10-byte budget.
+    let tight = Limits {
+        ratio: 1,
+        floor: 0,
+        ceiling: 10,
+        max_entries: 3,
+    };
+    let (t, msi, src) = admin_tree(&[("a/b.txt", b"0123456789"), ("x.msi", b"admin copy")]);
+    // The administrative copy at the root is neither moved nor charged.
+    import(&msi, &src, &t.path().join("ok"), None, &tight).unwrap();
+    assert_eq!(names_in(&t.path().join("ok")), ["a"]);
+
+    let (t, msi, src) = admin_tree(&[("a/b.txt", b"0123456789A")]);
+    let r = import(&msi, &src, &t.path().join("big"), None, &tight);
+    assert!(
+        matches!(r, Err(ExtractError::TooLarge { limit: 10 })),
+        "{r:?}"
+    );
+    assert!(!t.path().join("big").exists());
+
+    let (t, msi, src) = admin_tree(&[("a/1", b""), ("a/2", b""), ("a/3", b"")]);
+    let r = import(&msi, &src, &t.path().join("many"), None, &tight);
+    assert!(
+        matches!(r, Err(ExtractError::TooManyEntries { limit: 3 })),
+        "{r:?}"
+    );
+
+    let (t, msi, src) = admin_tree(&[("a/b.txt", b"b")]);
+    let r = import(
+        &msi,
+        &src,
+        &t.path().join("nodir"),
+        Some("pkg"),
+        &DEFAULT_LIMITS,
+    );
+    assert!(
+        matches!(&r, Err(ExtractError::MissingExtractDir(d)) if d == "pkg"),
+        "{r:?}"
+    );
+}
+
+static CANCEL_EVENTS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+static CANCEL_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CANCEL_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts, waits to be released (10 s hang detector), then writes into the staging folder.
+fn slow_extract(
+    _file: &Path,
+    _name: &str,
+    _dir: Option<&str>,
+    _to: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    use std::sync::atomic::Ordering;
+    CANCEL_STARTED.store(true, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !CANCEL_RELEASE.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::fs::create_dir_all(dest.join("pkg")).unwrap();
+    std::fs::write(dest.join("pkg/late.bin"), b"late").unwrap();
+    CANCEL_EVENTS.lock().unwrap().push("worker ended");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_install_waits_for_the_extraction_worker() {
+    use std::sync::atomic::Ordering;
+    let s = setup().await;
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let mut fut = Box::pin(wingetrs::install::executor::execute_install_with(
+        &s.plan,
+        &mut ctx,
+        slow_extract,
+    ));
+    while !CANCEL_STARTED.load(Ordering::SeqCst) {
+        tokio::select! {
+            r = &mut fut => panic!("terminou antes de cancelar: {r:?}"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+    }
+    let releaser = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        CANCEL_RELEASE.store(true, Ordering::SeqCst);
+    });
+    // Cancelling = dropping the future while the worker still runs.
+    drop(fut);
+    CANCEL_EVENTS.lock().unwrap().push("cancel returned");
+    releaser.join().unwrap();
+    drop(ctx);
+    assert_eq!(
+        *CANCEL_EVENTS.lock().unwrap(),
+        ["worker ended", "cancel returned"]
+    );
+    // Removed only after the worker wrote its last file.
+    assert!(!s.layout.staging_dir("app", "1.0").exists());
+}
+
+#[tokio::test]
+async fn only_an_msi_the_extractor_refuses_falls_back() {
+    let s = setup().await;
+    // Unsupported, but not an MSI to unpack: a `.msi` without the OLE signature, and an MSI
+    // file named `.7z`. Never offered to msiexec, with or without authorization.
+    for (name, bytes, why) in [
+        ("pkg-1.0.msi", fake_pe(2), "conteúdo não é MSI"),
+        (
+            "pkg-1.0.7z",
+            msi_with(0, "one.txt"),
+            "conteúdo não reconhecido como 7z",
+        ),
+    ] {
+        let (url, sha) = s.serve(name, bytes).await;
+        let plan = s.plan_from("app", &msi_manifest(&url, &sha, Some("pkg")), false);
+        for allowed in [None, Some(NO_LAUNCH)] {
+            let mut ctx = s.ctx_with_hook(&NoHook);
+            ctx.msiexec = allowed;
+            let r = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
+            drop(ctx);
+            match r {
+                Err(ExecError::Failed { message, .. }) => {
+                    assert!(message.contains(why), "{message}");
+                }
+                other => panic!("esperava Failed: {other:?}"),
+            }
+        }
+    }
+    assert!(!s.layout.app_dir("app").exists());
 }
