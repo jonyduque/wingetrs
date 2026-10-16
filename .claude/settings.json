@@ -21,15 +21,21 @@
       "Bash(git cat-file:*)",
       "Bash(git rev-parse:*)",
       "Bash(sqlite3:*)"
-    ],
-    "deny": [
-      "Bash(git push:*)",
-      "Bash(cargo update:*)",
-      "Bash(git reset --hard:*)",
-      "Bash(git clean:*)"
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -I \"$CLAUDE_PROJECT_DIR/scripts/hooks/subagent-guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
