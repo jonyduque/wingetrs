@@ -8,6 +8,7 @@ Status: **aprovada (decisões do usuário em 2026-10-15); plano `docs/superpower
 - **D2-3:** `msi` + `cab` reproduzindo o layout do `msiexec /a`, com o `msiexec /a` como reserva sob confirmação. O usuário autorizou rodar o `msiexec /a`. Consequência: dois caminhos para o mesmo resultado exigem teste de equivalência (ao vivo, `#[ignore]`), e o que o `msiexec /a` grava fora da raiz (medido na S3) entra como exceção explícita no `CLAUDE.md` antes do P4.
 - **D3-1**, mais `.tar.xz` se a S1 mostrar leitor xz sem dependência C. **Condição atendida (S1, Task 117):** `lzma_rust2::XzReader` com a feature `xz` lê `.tar.xz`; `.tar.xz`/`.txz` entram na 2b.
 - **D4-1:** `catch_unwind` só em volta do decodificador.
+- **`rust-version` 1.89 ⇒ 1.93** (Task 123, 95ef55a): exigido pelo `sevenz-rust2` 0.24.0; toolchain instalado 1.99.
 - Todas as sondas (S1–S5) autorizadas, inclusive o 7-Zip do usuário e o `msiexec /a`.
 Rascunho de um agente opus, só leitura. Base: HEAD `0c01402`. Referência do Scoop: `~/scoop/apps/scoop/current/lib/decompress.ps1`, commit `e6aa3b3`, só leitura.
 
