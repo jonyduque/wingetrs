@@ -86,12 +86,17 @@ pub fn choose(flag: ColorArg, is_tty: bool, no_color: bool, clicolor_force: bool
     }
 }
 
+/// `CLICOLOR_FORCE` forces color unless unset, empty or `0`.
+fn force_from(v: Option<&std::ffi::OsStr>) -> bool {
+    v.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Decides from the environment and installs the choice for painting and for `anstream`.
 pub fn init(flag: ColorArg) {
     let var = |k: &str| std::env::var_os(k);
     let is_tty = std::io::stdout().is_terminal();
     let no_color = var("NO_COLOR").is_some_and(|v| !v.is_empty());
-    let force = var("CLICOLOR_FORCE").is_some_and(|v| !v.is_empty() && v != "0");
+    let force = force_from(var("CLICOLOR_FORCE").as_deref());
     let chosen = choose(flag, is_tty, no_color, force);
     ENABLED.store(chosen == ColorChoice::Always, Ordering::Relaxed);
     // On a terminal let anstream enable VT (or convert) itself.
@@ -160,6 +165,15 @@ mod tests {
                 "{flag:?} {tty} {nc} {force}"
             );
         }
+    }
+
+    #[test]
+    fn clicolor_force_zero_and_empty_do_not_force() {
+        use std::ffi::OsStr;
+        assert!(!force_from(None));
+        assert!(!force_from(Some(OsStr::new(""))));
+        assert!(!force_from(Some(OsStr::new("0"))));
+        assert!(force_from(Some(OsStr::new("1"))));
     }
 
     #[test]

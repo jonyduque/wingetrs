@@ -147,6 +147,52 @@ fn help_is_styled() {
 }
 
 #[test]
+fn help_color_flag_overrides_pipe() {
+    let help = |flag: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_wingetrs"))
+            .arg("--help")
+            .args(flag)
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove("NO_COLOR")
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert!(help(&["--color", "always"]).contains(''));
+    assert!(help(&["--color=always"]).contains(''));
+    assert!(!help(&["--color", "never"]).contains(''));
+}
+
+#[test]
+fn list_text_alignment_ignores_ansi() {
+    use wingetrs::cli::{output::list_text, style::with_enabled};
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    let row = |n: &str, id: &str, v: &str, latest: Option<&str>| ListRow {
+        name: n.into(),
+        origin: "arp".into(),
+        installed_version: Some(v.into()),
+        correlation: Correlation::Matched {
+            source: "winget".into(),
+            package_id: id.into(),
+            rule: Rule::ProductCode,
+        },
+        state: latest.map_or(UpdateState::UpToDate, |l| UpdateState::Available {
+            latest: l.into(),
+        }),
+        ..Default::default()
+    };
+    let rows = vec![
+        row("Zip", "7zip.7zip", "1.0", Some("2.0")),
+        row("Ação longa", "A.B", "10.20.30", None),
+    ];
+    let plain = with_enabled(false, || list_text(&rows, false));
+    let colored = with_enabled(true, || list_text(&rows, false));
+    assert!(colored.contains(''));
+    let stripped = anstream::adapter::strip_str(&colored).to_string();
+    assert_eq!(stripped, plain);
+}
+
+#[test]
 fn help_plain_when_piped() {
     let out = Command::new(env!("CARGO_BIN_EXE_wingetrs"))
         .arg("--help")
