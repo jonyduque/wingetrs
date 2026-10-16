@@ -30,7 +30,9 @@ $cases = @(
     @{ Name = 'forma do spawn_boot'; Text = "fn f(c: u8) {`n    let c = c;`n    tokio::task::spawn_blocking(move || {`n        let _ = c;`n    });`n}"; Want = 1 },
     @{ Name = 'formas ligadas'; Text = $bound; Want = 0 },
     @{ Name = 'regra antiga viva'; Text = 'fn f() { println!("x"); }'; Want = 1 },
-    @{ Name = 'anstyle fora de cli/style.rs'; Text = 'const X: anstyle::Style = anstyle::Style::new();'; Want = 1 }
+    @{ Name = 'anstyle fora de cli/style.rs'; Text = 'const X: anstyle::Style = anstyle::Style::new();'; Want = 1 },
+    @{ Name = 'limite de relogio'; Text = 'fn t() { assert!(s.elapsed() < d); }'; Want = 1 },
+    @{ Name = 'limite de relogio com clock-ok'; Text = 'fn t() { assert!(s.elapsed() < d); } // clock-ok: cap only'; Want = 0 }
 )
 $base = Join-Path ([IO.Path]::GetTempPath()) ("check_rules_selftest-" + [guid]::NewGuid())
 $bad = @()

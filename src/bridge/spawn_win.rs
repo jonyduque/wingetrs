@@ -269,9 +269,15 @@ mod tests {
         {
             std::thread::yield_now();
         }
-        let start = Instant::now();
-        readers.stop();
-        assert!(start.elapsed() < CANCEL_RETRY, "{:?}", start.elapsed());
+        // Finished readers are never cancelled, so `stop` neither cancels nor waits a retry
+        // (counted, not timed: a 50 ms bound failed under load).
+        static CANCELS_AFTER_END: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        fn count(_: usize) {
+            CANCELS_AFTER_END.fetch_add(1, Ordering::SeqCst);
+        }
+        readers.stop_with(count);
+        assert_eq!(CANCELS_AFTER_END.load(Ordering::SeqCst), 0);
     }
 
     struct Failing(i32);

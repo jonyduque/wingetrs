@@ -66,6 +66,20 @@ foreach ($f in $files) {
         }
     }
 }
+# Tasks 112 and 129: wall-clock bounds in tests (`elapsed() < x`) failed the gate under load or
+# after the machine slept. Checked in test code too (unlike the rules above); a deliberate one
+# carries `clock-ok: <why>` on the same line.
+$clockRoots = @($Path)
+if ($Path -eq 'src' -and (Test-Path 'tests')) { $clockRoots += 'tests' }
+foreach ($f in (Get-ChildItem -Recurse -File -Path $clockRoots -Filter *.rs)) {
+    $rel = [IO.Path]::GetRelativePath($root, $f.FullName)
+    $lines = @(Get-Content $f.FullName)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '\.elapsed\(\)\s*<' -and $lines[$i] -notmatch 'clock-ok') {
+            $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'limite de relogio em teste', $lines[$i].Trim()
+        }
+    }
+}
 if ($violations.Count -gt 0) {
     $violations | ForEach-Object { "  $_" }
     exit 1

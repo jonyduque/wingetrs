@@ -147,7 +147,7 @@ fn list_without_catalog_and_without_network_fails_cleanly_and_fast() {
     assert!(!err.contains("panicked"), "{err}");
     // Rule: never hangs on the network. Connection refused returns at once; the bound is only
     // a generous hang detector (a real hang would be the 30 s+ connect/lock timeouts).
-    assert!(t.elapsed() < std::time::Duration::from_secs(60));
+    assert!(t.elapsed() < std::time::Duration::from_secs(60)); // clock-ok: 60 s hang detector, not a speed bound
 }
 
 fn spawn_update_with_lock_held(
