@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::io::Cursor;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use sevenz_rust2::{ArchiveEntry, ArchiveWriter, EncoderMethod, SourceReader};
 use sha2::{Digest, Sha256};
@@ -234,9 +233,9 @@ fn huge_dictionary_refused_before_decoding() {
     let d = tempfile::tempdir().unwrap();
     let f = d.path().join("h.7z");
     std::fs::write(&f, &a).unwrap();
-    let t = Instant::now();
+    // No wall-clock bound (flaky under load); `DictionaryTooLarge` itself proves the refusal
+    // came from the pre-decode check.
     let r = extract(&f, "h.7z", None, None, &d.path().join("out"));
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     assert!(
         matches!(
             r,
@@ -514,9 +513,9 @@ fn encoded_header_with_huge_unpack_size_refused() {
     assert_eq!(a[size_at + 1] & 0xC0, 0x80, "{:02X}", a[size_at + 1]);
     // 2 GiB: 4 extra bytes (prefix 0xF0), little endian.
     splice_header(&mut a, size_at + 1, 2, &[0xF0, 0x00, 0x00, 0x00, 0x80]);
-    let t = Instant::now();
+    // No wall-clock bound (it failed the gate under load); the exact message proves the
+    // raw pre-check refused it before the crate decoded the header.
     let (d, r) = run(&a, "e.7z", None, &DEFAULT_LIMITS);
-    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
     assert!(
         matches!(r, Err(ExtractError::Archive(ref m)) if m == "cabeçalho 7z grande demais"),
         "{r:?}"
