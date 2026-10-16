@@ -5,5 +5,9 @@
   {"Id": "D.Amb", "Name": "Ambiguous App", "InstalledVersion": "1.0", "Source": "winget"},
   {"Id": "E.Swapped", "Name": "Swapped App", "InstalledVersion": "1.0", "Source": "winget"},
   {"Id": "F.Allowed", "Name": "Allowed App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "G.Foo", "Name": "Foo App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "H.Bar", "Name": "Bar App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "I.Dup", "Name": "Dup App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "I.Dup", "Name": "Dup App", "InstalledVersion": "1.0", "Source": "winget"},
   {"Id": "ARP\\Machine\\X64\\ABC", "Name": "Not In Catalog", "InstalledVersion": "9", "Source": ""}
 ]
