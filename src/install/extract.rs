@@ -241,9 +241,15 @@ fn extract_one(
             extract_tar(flate2::read::GzDecoder::new(f), s.file, tmp, mapper, limits)?;
         }
         Ok(ArchiveKind::TarXz) => {
-            let f = fs::File::open(s.file).map_err(io_at("abrir", s.file))?;
-            extract_tar(
-                lzma_rust2::XzReader::new_mem_limit(f, true, XZ_MEM_LIMIT_KB),
+            extract_tar_guarded(
+                || {
+                    let f = fs::File::open(s.file).map_err(io_at("abrir", s.file))?;
+                    Ok(lzma_rust2::XzReader::new_mem_limit(
+                        f,
+                        true,
+                        XZ_MEM_LIMIT_KB,
+                    ))
+                },
                 s.file,
                 tmp,
                 mapper,
@@ -425,9 +431,31 @@ const XZ_MEM_LIMIT_KB: u32 = (MAX_7Z_DICT >> 10) as u32;
 /// Maps a tar/decompressor error; the xz memory-limit refusal gets its own message.
 fn tar_err(e: io::Error) -> ExtractError {
     if e.kind() == io::ErrorKind::OutOfMemory {
-        return ExtractError::Archive("dicionário xz maior que o limite de 1 GiB".to_string());
+        return ExtractError::Archive(
+            "dicionário xz grande demais (limite de memória de 1 GiB)".to_string(),
+        );
     }
     ExtractError::Archive(e.to_string())
+}
+
+/// `extract_tar` over a third-party decoder: opening and every read run under `catch_unwind`.
+fn extract_tar_guarded<R: Read>(
+    open: impl FnOnce() -> Result<R, ExtractError>,
+    file: &Path,
+    root: &Path,
+    mapper: &mut Mapper,
+    limits: &Limits,
+) -> Result<(), ExtractError> {
+    // D4-1: third-party decoder panic becomes an error (spec 2b)
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        extract_tar(open()?, file, root, mapper, limits)
+    }));
+    match run {
+        Ok(r) => r,
+        Err(payload) => Err(ExtractError::Decoder(
+            crate::install::extract_7z::panic_message(payload.as_ref()),
+        )),
+    }
 }
 
 /// Walks a tar stream already wrapped in its decompressor; `file` only sizes the budget.
@@ -507,6 +535,29 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::fs_retry::release_on_retry;
+
+    #[test]
+    fn a_panicking_tar_decoder_becomes_a_decoder_error() {
+        struct Boom;
+        impl Read for Boom {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("boom");
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.tar.xz");
+        fs::write(&f, b"x").unwrap();
+        let mut mapper = Mapper {
+            dir: Vec::new(),
+            to: Vec::new(),
+            dir_seen: false,
+        };
+        let r = extract_tar_guarded(|| Ok(Boom), &f, d.path(), &mut mapper, &DEFAULT_LIMITS);
+        assert!(
+            matches!(&r, Err(ExtractError::Decoder(m)) if m.contains("boom")),
+            "{r:?}"
+        );
+    }
 
     #[cfg(windows)]
     #[test]

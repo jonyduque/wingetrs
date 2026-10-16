@@ -110,6 +110,26 @@ fn tar_xz_with_a_4_gib_dictionary_is_refused_before_allocating() {
 }
 
 #[test]
+fn damaged_tar_xz_is_a_typed_error() {
+    let data: Vec<u8> = (0..20000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    let xz = tarxz_with(&[("a.bin", &data)], None);
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.tar.xz");
+    let dest = d.path().join("out");
+    std::fs::write(&f, &xz[..xz.len() / 2]).unwrap();
+    let r = extract(&f, "a.tar.xz", None, None, &dest);
+    assert!(r.is_err(), "truncated: {r:?}");
+    let mut bad = xz.clone();
+    bad[xz.len() / 3] ^= 0xFF;
+    std::fs::write(&f, bad).unwrap();
+    let r = extract(&f, "a.tar.xz", None, None, &dest);
+    assert!(r.is_err(), "flipped: {r:?}");
+    assert!(!dest.exists());
+}
+
+#[test]
 fn tar_xz_symlink_refused() {
     let d = tempfile::tempdir().unwrap();
     let f = d.path().join("a.tar.xz");
