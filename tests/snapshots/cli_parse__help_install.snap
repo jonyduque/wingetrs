@@ -14,6 +14,9 @@ Opções:
       --bucket <BUCKET>
           Restringe a um bucket
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
       --dry-run
           Mostra o plano e sai, sem alterar nada
 

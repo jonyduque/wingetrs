@@ -29,7 +29,8 @@ $cases = @(
     @{ Name = '1a linha nao olha a ultima'; Text = "tokio::task::spawn_blocking(|| 1);`nlet x ="; Want = 1 },
     @{ Name = 'forma do spawn_boot'; Text = "fn f(c: u8) {`n    let c = c;`n    tokio::task::spawn_blocking(move || {`n        let _ = c;`n    });`n}"; Want = 1 },
     @{ Name = 'formas ligadas'; Text = $bound; Want = 0 },
-    @{ Name = 'regra antiga viva'; Text = 'fn f() { println!("x"); }'; Want = 1 }
+    @{ Name = 'regra antiga viva'; Text = 'fn f() { println!("x"); }'; Want = 1 },
+    @{ Name = 'anstyle fora de cli/style.rs'; Text = 'const X: anstyle::Style = anstyle::Style::new();'; Want = 1 }
 )
 $base = Join-Path ([IO.Path]::GetTempPath()) ("check_rules_selftest-" + [guid]::NewGuid())
 $bad = @()

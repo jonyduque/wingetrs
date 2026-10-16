@@ -23,6 +23,8 @@ $rules = @(
     @{ Name = 'cfg!(windows) na logica'; Pattern = 'cfg!\(\s*windows\s*\)'; Skip = '' },
     # Colors only through theme tokens.
     @{ Name = 'Color:: fora de theme.rs'; Pattern = '\bColor::'; Skip = '^src[\\/]tui[\\/]theme\.rs$' },
+    # CLI colors only through src/cli/style.rs.
+    @{ Name = 'anstyle fora de cli/style.rs'; Pattern = '\b(anstyle|AnsiColor)::'; Skip = '^src[\\/]cli[\\/]style\.rs$' },
     # Windows APIs only in *_win.rs.
     @{ Name = 'API Windows fora de *_win.rs'; Pattern = '(?<![\w:])(winreg|windows)::'; Skip = '_win\.rs$' }
 )

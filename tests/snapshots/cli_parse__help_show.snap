@@ -14,6 +14,9 @@ Opções:
       --source <FONTE>
           Restringe a uma fonte (winget ou scoop)
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
       --version <VERSÃO>
           Versão específica a mostrar
 

@@ -1,56 +1,52 @@
-//! Plain-text rendering for CLI commands (no colors).
+//! Text rendering for CLI commands; colored through `style::paint` when color is on.
+use super::style::{DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, paint};
 use crate::core::{PackageDetails, PackageEntry};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 
-fn pad(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    format!("{s}{}", " ".repeat(width.saturating_sub(n)))
+/// `text` painted, then padded to `width` columns counted on the plain text.
+fn pad(style: Style, text: &str, width: usize) -> String {
+    let pad = " ".repeat(width.saturating_sub(text.chars().count()));
+    format!("{}{pad}", paint(style, text))
+}
+
+/// Prints `value` as pretty JSON, never colored.
+pub fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    use std::io::Write;
+    let text = serde_json::to_string_pretty(value)?;
+    writeln!(std::io::stdout().lock(), "{text}")?;
+    Ok(())
 }
 
 /// `Nome  Id  Versão  Fonte` with aligned columns.
 pub fn search_table(rows: &[PackageEntry]) -> String {
-    let header = ["Nome", "Id", "Versão", "Fonte"];
-    let cells: Vec<[&str; 4]> = rows
+    let cells: Vec<[String; 4]> = rows
         .iter()
         .map(|e| {
             [
-                e.name.as_str(),
-                e.id.as_str(),
-                e.version.as_str(),
-                e.source_name.as_str(),
+                e.name.clone(),
+                e.id.clone(),
+                e.version.clone(),
+                e.source_name.clone(),
             ]
         })
         .collect();
-    let mut widths = header.map(|h| h.chars().count());
-    for r in &cells {
-        for (w, c) in widths.iter_mut().zip(r) {
-            *w = (*w).max(c.chars().count());
-        }
-    }
-    let line = |r: &[&str; 4]| {
-        let parts: Vec<String> = r.iter().zip(widths).map(|(c, w)| pad(c, w)).collect();
-        parts.join("  ").trim_end().to_string()
-    };
-    let mut out = String::new();
-    out.push_str(&line(&header));
-    out.push('\n');
-    for r in &cells {
-        out.push_str(&line(r));
-        out.push('\n');
-    }
-    out
+    aligned(
+        ["Nome", "Id", "Versão", "Fonte"],
+        [NAME, ID, VERSION, SOURCE],
+        &cells,
+    )
 }
 
 pub fn details_text(d: &PackageDetails) -> String {
     let mut out = String::new();
     let mut field = |k: &str, v: &str| {
-        out.push_str(&format!("{k}: {v}\n"));
+        out.push_str(&format!("{}: {v}\n", paint(HEADER, k)));
     };
-    field("Nome", &d.name);
-    field("Id", &d.id);
-    field("Versão", &d.version);
-    field("Fonte", d.source.as_str());
+    field("Nome", &paint(NAME, &d.name));
+    field("Id", &paint(ID, &d.id));
+    field("Versão", &paint(VERSION, &d.version));
+    field("Fonte", &paint(SOURCE, d.source.as_str()));
     if let Some(v) = &d.publisher {
         field("Publicador", v);
     }
@@ -72,40 +68,53 @@ pub fn details_text(d: &PackageDetails) -> String {
     for i in &d.installers {
         let scope = i.scope.as_deref().unwrap_or("-");
         out.push_str(&format!(
-            "Instalador: {} {} {} {}\n",
-            i.architecture, i.installer_type, scope, i.url
+            "{}: {} {} {} {}\n",
+            paint(HEADER, "Instalador"),
+            i.architecture,
+            i.installer_type,
+            scope,
+            i.url
         ));
     }
     out
 }
 
 pub fn report_line(r: &SourceReport) -> String {
+    let src = paint(SOURCE, &r.source.to_string());
     match &r.outcome {
-        Outcome::Fresh => format!("{}: em dia", r.source),
-        Outcome::Unchanged => format!("{}: sem mudanças", r.source),
+        Outcome::Fresh => format!("{src}: {}", paint(OK, "em dia")),
+        Outcome::Unchanged => format!("{src}: sem mudanças"),
         Outcome::Updated { packages, skipped } => {
-            format!("{}: {packages} pacotes ({skipped} ignorados)", r.source)
+            let n = paint(OK, &format!("{packages} pacotes"));
+            format!("{src}: {n} ({skipped} ignorados)")
         }
-        Outcome::Failed { message: m, .. } => format!("{}: falhou: {m}", r.source),
+        Outcome::Failed { message: m, .. } => {
+            format!("{src}: {} {m}", paint(ERROR, "falhou:"))
+        }
     }
 }
 
-fn aligned<const N: usize>(header: [&str; N], cells: &[[String; N]]) -> String {
+fn aligned<const N: usize>(header: [&str; N], styles: [Style; N], cells: &[[String; N]]) -> String {
     let mut widths = header.map(|h| h.chars().count());
     for r in cells {
         for (w, c) in widths.iter_mut().zip(r) {
             *w = (*w).max(c.chars().count());
         }
     }
-    let line = |r: &[&str]| {
-        let parts: Vec<String> = r.iter().zip(widths).map(|(c, w)| pad(c, w)).collect();
+    let line = |r: &[&str], styles: [Style; N]| {
+        let parts: Vec<String> = r
+            .iter()
+            .zip(widths)
+            .zip(styles)
+            .map(|((c, w), st)| pad(st, c, w))
+            .collect();
         parts.join("  ").trim_end().to_string()
     };
-    let mut out = line(&header);
+    let mut out = line(&header, [HEADER; N]);
     out.push('\n');
     for r in cells {
         let refs: Vec<&str> = r.iter().map(String::as_str).collect();
-        out.push_str(&line(&refs));
+        out.push_str(&line(&refs, styles));
         out.push('\n');
     }
     out
@@ -193,6 +202,7 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
     }
     let mut out = aligned(
         ["Nome", "Id", "Instalada", "Disponível", "Fonte", "Origem"],
+        [NAME, ID, VERSION, NEW_VERSION, SOURCE, DIM],
         &cells,
     );
     if !upgradable_only {
@@ -203,7 +213,7 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
             if items.is_empty() {
                 continue;
             }
-            out.push_str(&format!("\n{title} ({}):\n", items.len()));
+            out.push_str(&format!("\n{} ({}):\n", paint(HEADER, title), items.len()));
             for i in items {
                 out.push_str(&format!("  {i}\n"));
             }
@@ -230,7 +240,7 @@ pub fn ambiguous_text(target: &str, candidates: &[String]) -> String {
     let mut s = format!("'{target}' existe em mais de um lugar; use bucket/id:");
     for c in candidates {
         s.push_str("\n  ");
-        s.push_str(c);
+        s.push_str(&paint(ID, c));
     }
     s
 }
@@ -242,7 +252,11 @@ pub fn not_found_text(query: &str, suggestions: &[String]) -> String {
     } else {
         format!(
             "nenhum pacote encontrado para '{query}'; você quis dizer: {}?",
-            suggestions.join(", ")
+            suggestions
+                .iter()
+                .map(|x| paint(ID, x))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     }
 }
@@ -252,7 +266,12 @@ pub fn uninstall_plan_text(
     plan: &crate::install::plan::UninstallPlan,
     layout: &crate::install::layout::Layout,
 ) -> String {
-    let mut s = format!("Desinstalar {} {}\n", plan.app, plan.version);
+    let mut s = format!(
+        "{} {} {}\n",
+        paint(HEADER, "Desinstalar"),
+        paint(NAME, &plan.app),
+        paint(VERSION, &plan.version)
+    );
     let mut n = 1;
     let mut line = |text: String| {
         s.push_str(&format!("{n:>3}. {text}\n"));
@@ -285,7 +304,12 @@ pub fn residue_label(r: &crate::install::residue::Residue) -> String {
 pub fn upgrades_text(rows: &[(String, String, String)]) -> String {
     let mut s = String::new();
     for (app, from, to) in rows {
-        s.push_str(&format!("{app}  {from} -> {to}\n"));
+        s.push_str(&format!(
+            "{}  {} -> {}\n",
+            paint(NAME, app),
+            paint(VERSION, from),
+            paint(NEW_VERSION, to)
+        ));
     }
     s
 }
@@ -298,11 +322,16 @@ pub fn repair_text(r: &crate::install::ops::RepairReport) -> String {
             v.join(", ")
         }
     };
+    let h = |t: &str| paint(HEADER, t);
     format!(
-        "Reconstruídos: {}\nMantidos: {}\nRegistros removidos (app sumiu do disco): {}\nPulados (sem install.json legível): {}\n",
+        "{}: {}\n{}: {}\n{}: {}\n{}: {}\n",
+        h("Reconstruídos"),
         list(&r.rebuilt),
+        h("Mantidos"),
         list(&r.kept),
+        h("Registros removidos (app sumiu do disco)"),
         list(&r.removed),
+        h("Pulados (sem install.json legível)"),
         list(&r.skipped)
     )
 }

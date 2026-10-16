@@ -7,6 +7,9 @@ Reconstrói o estado a partir do disco
 Uso: wingetrs repair
 
 Opções:
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

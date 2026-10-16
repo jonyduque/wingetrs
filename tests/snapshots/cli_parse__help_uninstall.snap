@@ -14,6 +14,9 @@ Opções:
       --purge
           Apaga também os dados persistentes do app
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
       --dry-run
           Mostra o plano e sai, sem alterar nada
 

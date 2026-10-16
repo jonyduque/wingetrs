@@ -12,6 +12,9 @@ Comandos:
   rm    Remove um bucket (recusa se houver apps instalados dele)
 
 Opções:
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

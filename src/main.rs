@@ -5,7 +5,10 @@ fn main() -> std::process::ExitCode {
     match wingetrs::cli::run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("erro: {e:#}");
+            anstream::eprintln!(
+                "{} {e:#}",
+                wingetrs::cli::style::paint(wingetrs::cli::style::ERROR, "erro:")
+            );
             std::process::ExitCode::FAILURE
         }
     }

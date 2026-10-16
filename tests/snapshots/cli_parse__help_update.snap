@@ -10,6 +10,9 @@ Opções:
       --force
           Baixa o catálogo mesmo que esteja recente
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

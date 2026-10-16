@@ -1,6 +1,6 @@
 //! `install`, `uninstall`, `upgrade` and `repair`: plan, show, confirm, execute.
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
-use super::{Command, output};
+use super::{Command, output, style};
 use crate::install::ops::{self, OpsCtx, Resolution};
 use crate::install::residue::{self, Confidence, Residue};
 use crate::install::target::Candidate;
@@ -64,7 +64,7 @@ impl Ui for TtyUi {
     }
 
     fn confirm(&self, question: &str) -> anyhow::Result<bool> {
-        print!("{question} [s/N] ");
+        anstream::print!("{question} [s/N] ");
         std::io::stdout().flush()?;
         let mut line = String::new();
         std::io::stdin().read_line(&mut line)?;
@@ -185,7 +185,7 @@ pub async fn execute(ctx: &OpsCtx<'_>, ui: &dyn Ui, cmd: Command) -> anyhow::Res
             .await
         }
         Command::Repair => {
-            print!("{}", output::repair_text(&ops::repair(ctx)?));
+            anstream::print!("{}", output::repair_text(&ops::repair(ctx)?));
             Ok(())
         }
         _ => bail!("comando não é uma operação de instalação"),
@@ -233,7 +233,7 @@ fn choose(
 
 fn print_plans(plans: &[crate::install::plan::InstallPlan]) {
     for p in plans {
-        println!("{p}");
+        anstream::println!("{p}");
     }
 }
 
@@ -245,22 +245,27 @@ async fn install(
     f: Flags,
 ) -> anyhow::Result<()> {
     let Some(cand) = choose(ctx, ui, target, bucket, f.yes)? else {
-        println!("Cancelado.");
+        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     };
     let plans = ops::plan_for(ctx, &cand, false)?;
     print_plans(&plans);
     if f.dry_run {
-        println!("Simulação: nada foi alterado.");
+        anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
     }
     if !proceed(ui, f)? {
-        println!("Cancelado.");
+        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
     ops::apply(ctx, &plans).await?;
     for p in &plans {
-        println!("Instalado: {} {}", p.app, p.version);
+        anstream::println!(
+            "{} {} {}",
+            style::paint(style::OK, "Instalado:"),
+            p.app,
+            p.version
+        );
     }
     Ok(())
 }
@@ -275,20 +280,25 @@ fn uninstall(
     // Installed apps are named by id only; accept `bucket/id` too.
     let app = target.rsplit('/').next().unwrap_or(target);
     let plan = ops::plan_uninstall(ctx, app, purge)?;
-    print!(
+    anstream::print!(
         "{}",
         output::uninstall_plan_text(&plan, &ctx.data.install_layout())
     );
     if f.dry_run {
-        println!("Simulação: nada foi alterado.");
+        anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
     }
     if !proceed(ui, f)? {
-        println!("Cancelado.");
+        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
     let residues = ops::uninstall(ctx, &plan)?;
-    println!("Desinstalado: {} {}", plan.app, plan.version);
+    anstream::println!(
+        "{} {} {}",
+        style::paint(style::OK, "Desinstalado:"),
+        plan.app,
+        plan.version
+    );
     clean_residues(ctx, ui, &plan.app, &residues, f.yes)
 }
 
@@ -326,22 +336,28 @@ fn clean_residues(
             None => Vec::new(),
         }
     } else {
-        println!("Resíduos encontrados (nada foi removido; use --yes para os de confiança alta):");
+        anstream::println!(
+            "Resíduos encontrados (nada foi removido; use --yes para os de confiança alta):"
+        );
         for r in residues {
-            println!("  {}", output::residue_label(r));
+            anstream::println!("  {}", output::residue_label(r));
         }
         return Ok(());
     };
     if selected.is_empty() {
-        println!("Nenhum resíduo removido.");
+        anstream::println!("Nenhum resíduo removido.");
         return Ok(());
     }
     let backups = ctx.data.install_layout().backups();
     let results = residue::clean(&selected, app, &ctx.effects, &backups);
     for (r, res) in selected.iter().zip(results) {
         match res {
-            Ok(()) => println!("Removido: {}", output::residue_label(r)),
-            Err(e) => eprintln!("aviso: {e}"),
+            Ok(()) => anstream::println!(
+                "{} {}",
+                style::paint(style::OK, "Removido:"),
+                output::residue_label(r)
+            ),
+            Err(e) => anstream::eprintln!("{} {e}", style::paint(style::WARN, "aviso:")),
         }
     }
     Ok(())
@@ -379,35 +395,35 @@ async fn upgrade(
                 if state.get(t)?.is_none() {
                     return Err(ops::OpsError::NotInstalled(t.to_string()).into());
                 }
-                println!("{t} já está na versão mais recente.");
+                anstream::println!("{t} já está na versão mais recente.");
                 return Ok(());
             }
             found
         }
         None => {
             for (app, reason) in &list.skipped {
-                eprintln!("aviso: {app}: {reason}");
+                anstream::eprintln!("{} {app}: {reason}", style::paint(style::WARN, "aviso:"));
             }
             if !all {
-                print!("{}", output::upgrades_text(&list.upgradable));
+                anstream::print!("{}", output::upgrades_text(&list.upgradable));
                 for app in &pinned {
-                    println!("{app} (fixado)");
+                    anstream::println!("{app} (fixado)");
                 }
                 if list.upgradable.is_empty() {
-                    println!("Nada para atualizar.");
+                    anstream::println!("Nada para atualizar.");
                 } else {
-                    println!("Use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`.");
+                    anstream::println!("Use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`.");
                 }
                 return Ok(());
             }
             for app in &pinned {
-                println!("fixado, pulado: {app}");
+                anstream::println!("fixado, pulado: {app}");
             }
             list.upgradable
         }
     };
     if chosen.is_empty() {
-        println!("Nada para atualizar.");
+        anstream::println!("Nada para atualizar.");
         return Ok(());
     }
     let mut groups = Vec::new();
@@ -425,15 +441,20 @@ async fn upgrade(
         print_plans(g);
     }
     if f.dry_run {
-        println!("Simulação: nada foi alterado.");
+        anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
     }
     if !proceed(ui, f)? {
-        println!("Cancelado.");
+        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
     for p in ops::apply_groups(ctx, groups).await? {
-        println!("Atualizado: {} {}", p.app, p.version);
+        anstream::println!(
+            "{} {} {}",
+            style::paint(style::OK, "Atualizado:"),
+            p.app,
+            p.version
+        );
     }
     Ok(())
 }

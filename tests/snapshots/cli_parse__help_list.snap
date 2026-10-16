@@ -10,6 +10,9 @@ Opções:
       --upgradable
           Mostra só pacotes com atualização disponível
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
       --source <FONTE>
           Restringe a uma fonte (winget ou scoop)
 

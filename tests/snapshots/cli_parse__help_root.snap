@@ -21,6 +21,9 @@ Opções:
       --glyphs <GLIFOS>
           Conjunto de glifos da TUI (nerd, unicode ou ascii)
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

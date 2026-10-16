@@ -4,6 +4,7 @@ pub mod output;
 pub mod picker;
 #[cfg(windows)]
 mod run_win;
+pub mod style;
 
 use crate::cache::{DataDir, now_unix};
 use crate::catalog::Catalog;
@@ -42,19 +43,24 @@ Uso: {usage}
     subcommand_help_heading = "Comandos",
     next_help_heading = "Opções",
     help_template = HELP_TEMPLATE,
-    after_help = "Exemplos:
-  wingetrs                       abre a TUI
-  wingetrs update                atualiza o catálogo
-  wingetrs search powertoys      busca pacotes
-  wingetrs show Microsoft.PowerToys
-  wingetrs list --upgradable     lista pacotes com atualização
-  wingetrs install ripgrep       instala um app do Scoop
-  wingetrs upgrade --all         atualiza tudo que o wingetrs instalou"
+    after_help = style::root_after_help(),
+    styles = style::CLAP_STYLES
 )]
 pub struct Cli {
     /// Conjunto de glifos da TUI (nerd, unicode ou ascii)
     #[arg(long, value_enum, hide_possible_values = true, value_name = "GLIFOS")]
     pub glyphs: Option<GlyphArg>,
+    /// Cores na saída (auto, always ou never)
+    #[arg(
+        long,
+        value_enum,
+        global = true,
+        default_value = "auto",
+        hide_default_value = true,
+        hide_possible_values = true,
+        value_name = "QUANDO"
+    )]
+    pub color: style::ColorArg,
     /// Verbosidade (-v, -vv): também loga no stderr
     #[arg(short, long, action = clap::ArgAction::Count, global = true, display_order = 9000)]
     pub verbose: u8,
@@ -528,7 +534,7 @@ fn search_best(
 
 fn print_reports(reports: &[SourceReport]) {
     for r in reports {
-        println!("{}", output::report_line(r));
+        anstream::println!("{}", output::report_line(r));
     }
 }
 
@@ -681,9 +687,9 @@ async fn run_async(
             {
                 let _print = tracing::debug_span!("search.print").entered();
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                    output::print_json(&rows)?;
                 } else {
-                    print!("{}", output::search_table(&rows));
+                    anstream::print!("{}", output::search_table(&rows));
                 }
             }
             // The process exits next: skip closing the db.
@@ -737,9 +743,9 @@ async fn run_async(
                 }
             };
             if json {
-                println!("{}", serde_json::to_string_pretty(&details)?);
+                output::print_json(&details)?;
             } else {
-                print!("{}", output::details_text(&details));
+                anstream::print!("{}", output::details_text(&details));
             }
             Ok(())
         }
@@ -805,9 +811,9 @@ async fn run_async(
             }
             crate::installed::timed("output", || {
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                    output::print_json(&rows)?;
                 } else {
-                    print!("{}", output::list_text(&rows, upgradable));
+                    anstream::print!("{}", output::list_text(&rows, upgradable));
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
@@ -838,7 +844,7 @@ fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::
     match action {
         BucketAction::List => {
             for (name, repo) in buckets::resolved(&cfg)? {
-                println!("{name}  {repo}");
+                anstream::println!("{name}  {repo}");
             }
             Ok(())
         }
@@ -855,7 +861,7 @@ fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::
                     let ui = install_cmd::TtyUi::new(&cfg);
                     let q = format!("O bucket {name} ({repo}) não é conhecido. Adicionar?");
                     if !install_cmd::Ui::confirm(&ui, &q)? {
-                        println!("Cancelado.");
+                        anstream::println!("Cancelado.");
                         return Ok(());
                     }
                     buckets::add(&mut cfg, &name, &spec, true)?;
@@ -863,14 +869,16 @@ fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::
                 other => other?,
             }
             cfg.save(&data.config_path())?;
-            println!("Bucket {name} adicionado. Rode `wingetrs update` para baixar o catálogo.");
+            anstream::println!(
+                "Bucket {name} adicionado. Rode `wingetrs update` para baixar o catálogo."
+            );
             Ok(())
         }
         BucketAction::Rm { name } => {
             let state_db = data.install_layout().state_db();
             buckets::remove_and_cleanup(data, &mut cfg, &name, &state_db)?;
             cfg.save(&data.config_path())?;
-            println!("Bucket {name} removido.");
+            anstream::println!("Bucket {name} removido.");
             Ok(())
         }
     }
@@ -888,6 +896,7 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
+    style::init(cli.color);
     let data = DataDir::from_env()?;
     // Start the search before logging, config and runtime setup: it only needs the file.
     let early: Option<EarlySearch> = match &cli.command {

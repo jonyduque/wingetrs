@@ -14,6 +14,9 @@ Opções:
       --all
           Atualiza todos os apps com versão nova
 
+      --color <QUANDO>
+          Cores na saída (auto, always ou never)
+
       --keep
           Mantém a versão antiga em disco
 
