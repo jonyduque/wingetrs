@@ -1,7 +1,14 @@
 # wingetrs — Fase 2b: downloads `.7z` e `.msi` sem script (design)
 
 Data: 2026-10-15
-Status: **rascunho; as decisões D1–D4 são do usuário.**
+Status: **aprovada (decisões do usuário em 2026-10-15); plano `docs/superpowers/plans/2026-10-15-wingetrs-fase2b.md` (Tasks 116–119; P2–P8 depois das sondas).**
+
+**Decisões do usuário (2026-10-15):**
+- **D1-1:** `sevenz-rust2`.
+- **D2-3:** `msi` + `cab` reproduzindo o layout do `msiexec /a`, com o `msiexec /a` como reserva sob confirmação. O usuário autorizou rodar o `msiexec /a`. Consequência: dois caminhos para o mesmo resultado exigem teste de equivalência (ao vivo, `#[ignore]`), e o que o `msiexec /a` grava fora da raiz (medido na S3) entra como exceção explícita no `CLAUDE.md` antes do P4.
+- **D3-1**, mais `.tar.xz` se a S1 mostrar leitor xz sem dependência C.
+- **D4-1:** `catch_unwind` só em volta do decodificador.
+- Todas as sondas (S1–S5) autorizadas, inclusive o 7-Zip do usuário e o `msiexec /a`.
 Rascunho de um agente opus, só leitura. Base: HEAD `0c01402`. Referência do Scoop: `~/scoop/apps/scoop/current/lib/decompress.ps1`, commit `e6aa3b3`, só leitura.
 
 ## (a) Objetivo e escopo
