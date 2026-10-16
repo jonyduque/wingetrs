@@ -627,8 +627,9 @@ Testes:
 2. **CLI:** `wingetrs install x --allow-msiexec` usa a reserva nesse caso. Sem a flag, a mensagem é: "este MSI precisa do Windows Installer (<motivo>); rode de novo com --allow-msiexec. O msiexec /a não pode ser cancelado depois de começar e grava arquivos em C:\Windows\Installer." `--yes` **não** autoriza.
 3. **TUI:** `NeedsMsiexec` abre a confirmação daquele item com a nota "Usa o Windows Installer (msiexec /a). Não pode ser cancelado depois de começar; grava arquivos em C:\Windows\Installer.". `Continuar` reenfileira o item autorizado; `Cancelar` encerra o item como erro.
 4. **Execução:** `TARGETDIR` = `<staging>\_msiexec\SourceDir`, dentro da raiz; `run_queued(POLICY, installer_busy, msiexec_admin, ...)`. A árvore de `SourceDir` passa pelo mesmo `mapper` (`extract_dir` sem caixa e com `/`), `safepath` e orçamento da extração própria; o `.msi` administrativo que o `msiexec` deixa na raiz do `TARGETDIR` é apagado.
-5. **Sem cancelamento:** enquanto o `msiexec` roda, o job fica `uncancellable`; sair da TUI abre o `ConfirmQuit` com "O Windows Installer ainda está trabalhando; o wingetrs vai esperar ele terminar." e a TUI espera o job.
-6. **Equivalência ao vivo:** teste `#[ignore = "live: msiexec"]` com 3 MSI pequenos (vetores da Task 119): extração própria × reserva ⇒ mesma árvore (caminhos + SHA-256).
+5. **Ordem das travas (revisão da Task 127):** sempre `install.lock` antes de `msi.lock`, nunca o inverso; a ponte só pega `msi.lock`. Teste: duas operações concorrentes (uma instalação com reserva e um job da ponte) terminam ambas, sem impasse, com uma ordem de eventos registrada.
+6. **Sem cancelamento:** enquanto o `msiexec` roda, o job fica `uncancellable`; sair da TUI abre o `ConfirmQuit` com "O Windows Installer ainda está trabalhando; o wingetrs vai esperar ele terminar." e a TUI espera o job.
+7. **Equivalência ao vivo:** teste `#[ignore = "live: msiexec"]` com 3 MSI pequenos (vetores da Task 119): extração própria × reserva ⇒ mesma árvore (caminhos + SHA-256).
 
 **Files:**
 - Modify: `src/install/executor.rs`, `src/install/ops.rs`, `src/cli/mod.rs`, `src/tui/app.rs`, `src/tui/jobs.rs`
