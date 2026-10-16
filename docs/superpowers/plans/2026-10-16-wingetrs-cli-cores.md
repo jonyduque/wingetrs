@@ -51,7 +51,7 @@
 Testes (`tests/cli_color.rs`; o binário roda por `assert_cmd`/`std::process::Command` como nos testes de CLI existentes, contra o mesmo cenário offline):
 1. `piped_output_has_no_escape`: `wingetrs search <termo>` com stdout capturado ⇒ nenhum byte `0x1B`.
 2. `color_always_paints`: `--color always` ⇒ contém `0x1B` e, depois de `strip_str`, é **igual** à saída sem cor do teste 1.
-3. `no_color_env_wins_over_auto`: `NO_COLOR=1` sem flag ⇒ sem `0x1B` (o teste força terminal? não dá: prove pela função pura de decisão, item abaixo).
+3. `no_color_env_wins_over_always_absent`: `NO_COLOR=1` e sem flag ⇒ sem `0x1B`. (O teste não consegue simular um terminal; o caso "terminal + NO_COLOR" é provado pela função pura do teste 4.)
 4. `color_choice_table` (teste de módulo da função pura `choose(flag, is_tty, no_color, clicolor_force) -> ColorChoice`): as 8 combinações relevantes, com `--color` vencendo as variáveis e `NO_COLOR` vencendo `auto`.
 5. `json_never_colored`: `search --json --color always` ⇒ JSON válido e sem `0x1B`.
 6. `table_alignment_ignores_ansi`: `search_table` com cor, depois de `strip_str`, tem as mesmas colunas da versão sem cor (compare linha a linha).
