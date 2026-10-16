@@ -33,12 +33,12 @@ pub(super) fn extract_7z<R: Read + Seek>(
     let mut src = src;
     check_header(&mut src)?;
     // D4-1: third-party decoder panic becomes an error (spec 2b)
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let run = crate::install::extract::catch_decoder(|| {
         let mut reader = ArchiveReader::new(src, Password::empty()).map_err(from_7z)?;
         reader.set_thread_count(1);
         validate(reader.archive(), &budget, limits)?;
         decode(&mut reader, root, mapper, &mut budget)
-    }));
+    });
     match run {
         Ok(r) => r,
         Err(payload) => Err(ExtractError::Decoder(panic_message(payload.as_ref()))),
@@ -555,6 +555,54 @@ mod tests {
         assert!(
             matches!(r, Err(ExtractError::Decoder(ref m)) if m == "decoder blew up at 32"),
             "{r:?}"
+        );
+    }
+
+    /// Like [`PanicsInData`], but first records what the TUI panic hook would read.
+    struct RecordsFlagThenPanics {
+        inner: Cursor<Vec<u8>>,
+        seen: std::rc::Rc<std::cell::Cell<Option<bool>>>,
+    }
+
+    impl Read for RecordsFlagThenPanics {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if (32..64).contains(&self.inner.position()) {
+                self.seen.set(Some(crate::install::extract::in_decoder()));
+                panic!("decoder blew up");
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for RecordsFlagThenPanics {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn decoder_panic_happens_with_the_flag_set() {
+        let a = solid(&[("x", vec![7u8; 4096])]);
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.7z");
+        std::fs::write(&f, &a).unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        assert!(!crate::install::extract::in_decoder());
+        let r = extract_7z(
+            RecordsFlagThenPanics {
+                inner: Cursor::new(a),
+                seen: seen.clone(),
+            },
+            &f,
+            &d.path().join("root"),
+            &mut mapper(&[]),
+            &crate::install::extract::DEFAULT_LIMITS,
+        );
+        assert!(matches!(r, Err(ExtractError::Decoder(_))), "{r:?}");
+        assert_eq!(seen.get(), Some(true), "flag not set inside the decoder");
+        assert!(
+            !crate::install::extract::in_decoder(),
+            "flag left set after the decoder"
         );
     }
 }

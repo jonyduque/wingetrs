@@ -263,8 +263,10 @@ fn build_sources(root: &Obj, variant: Option<&Obj>) -> Result<Vec<Source>, Manif
         let (url, file_name) = split_fragment(raw_url);
         match ArchiveKind::of(&file_name) {
             Err(ext) => return unsupported(format!("download {ext}: formato não suportado")),
+            // Unreachable today (every kind `of` accepts is supported); stays as the gate for a
+            // kind added before its extractor, and `manifest_and_extractor_agree` ties both.
             Ok(k) if !k.supported() => {
-                return unsupported(format!("download {}: suportado na fase 2b", k.ext()));
+                return unsupported(format!("download {}: formato ainda não suportado", k.ext()));
             }
             Ok(_) => {}
         }

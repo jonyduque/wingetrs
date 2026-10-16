@@ -3,6 +3,7 @@
 //! Everything is written into a sibling temp directory first and only moved into
 //! `dest` once the whole archive was validated and extracted; on error the temp
 //! directory is removed.
+use std::cell::Cell;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,6 +15,30 @@ use crate::install::extract_7z::{MAX_7Z_DICT, extract_7z};
 use crate::install::extract_msi::extract_msi;
 use crate::install::safepath;
 use crate::install::sniff::{self, Sniffed};
+
+thread_local! {
+    /// Set while a third-party decoder runs under [`catch_decoder`] on this thread.
+    static IN_DECODER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this thread is inside a decoder guarded by [`catch_decoder`]. Read by the TUI
+/// panic hook: that panic becomes an extraction error, so the terminal must stay as is.
+pub fn in_decoder() -> bool {
+    IN_DECODER.with(Cell::get)
+}
+
+/// D4-1: runs a third-party decoder under `catch_unwind` with [`in_decoder`] set.
+pub fn catch_decoder<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+    /// Puts the previous value back, also while unwinding.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_DECODER.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(IN_DECODER.with(|c| c.replace(true)));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractError {
@@ -447,9 +472,7 @@ fn extract_tar_guarded<R: Read>(
     limits: &Limits,
 ) -> Result<(), ExtractError> {
     // D4-1: third-party decoder panic becomes an error (spec 2b)
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        extract_tar(open()?, file, root, mapper, limits)
-    }));
+    let run = catch_decoder(|| extract_tar(open()?, file, root, mapper, limits));
     match run {
         Ok(r) => r,
         Err(payload) => Err(ExtractError::Decoder(

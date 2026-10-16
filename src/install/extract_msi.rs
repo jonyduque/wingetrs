@@ -43,10 +43,10 @@ pub(super) fn extract_msi(
     let src = BufReader::new(File::open(file).map_err(io_at("abrir", file))?);
     // D4-1: third-party decoder panic becomes an error (spec 2b); the OLE and
     // table parsers of `msi` run inside too.
-    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let run = crate::install::extract::catch_decoder(|| {
         let mut pkg = Package::open(src).map_err(|e| ExtractError::Archive(format!("MSI: {e}")))?;
         extract_package(&mut pkg, root, mapper, limits, &mut budget)
-    }));
+    });
     match run {
         Ok(r) => r,
         Err(payload) => Err(ExtractError::Decoder(panic_message(payload.as_ref()))),

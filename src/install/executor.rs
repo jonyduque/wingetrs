@@ -1,7 +1,6 @@
 //! Plan executor: applies an [`InstallPlan`] step by step, journaling an undo action for
 //! every change, and rolls everything back in reverse order on any failure. `current`
 //! only moves at `LinkCurrent`, so the previous version keeps working until then.
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -40,34 +39,9 @@ impl StepHook for NoHook {
 pub type InUseCheck<'a> = &'a (dyn Fn(&Path) -> Vec<PathBuf> + Send + Sync);
 
 /// Extraction entry point, `extract::extract` in production (file, file name, extract_dir,
-/// extract_to, destination). Tests inject one that panics like a decoder.
+/// extract_to, destination). Tests inject one that panics.
 pub type ExtractFn =
     fn(&Path, &str, Option<&str>, Option<&str>, &Path) -> Result<(), extract::ExtractError>;
-
-thread_local! {
-    /// Set on the blocking thread while it extracts. The decoders turn their panics into
-    /// errors (D4-1), so the TUI panic hook must leave the terminal alone on this thread.
-    static IN_DECODER: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Whether the current thread is extracting an archive (read by the TUI panic hook).
-pub fn in_decoder() -> bool {
-    IN_DECODER.with(Cell::get)
-}
-
-/// Clears [`IN_DECODER`] on drop, also when the extraction unwinds.
-struct DecoderFlag;
-impl DecoderFlag {
-    fn set() -> DecoderFlag {
-        IN_DECODER.with(|f| f.set(true));
-        DecoderFlag
-    }
-}
-impl Drop for DecoderFlag {
-    fn drop(&mut self) {
-        IN_DECODER.with(|f| f.set(false));
-    }
-}
 
 pub struct ExecCtx<'a> {
     pub layout: &'a Layout,
@@ -249,6 +223,8 @@ struct Run<'p> {
     /// Label of the step being run (journal entries are tagged with it).
     label: String,
     extract: ExtractFn,
+    /// Panic of the extraction worker: re-raised only after the rollback.
+    panic: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl Run<'_> {
@@ -411,6 +387,7 @@ pub async fn execute_install_with(
         journal: Vec::new(),
         label: String::new(),
         extract,
+        panic: None,
     };
     // Removing the old version runs only after every other step succeeded.
     let (main, cleanup): (Vec<_>, Vec<_>) = plan
@@ -435,6 +412,9 @@ pub async fn execute_install_with(
         if let Err(message) = result {
             let journal = std::mem::take(&mut run.journal);
             let undone = rollback(journal, ctx);
+            if let Some(p) = run.panic.take() {
+                std::panic::resume_unwind(p);
+            }
             return Err(ExecError::Failed {
                 index: i,
                 step: run.label,
@@ -631,10 +611,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
                 let (dir, to) = (source.extract_dir.clone(), source.extract_to.clone());
-                move || {
-                    let _flag = DecoderFlag::set();
-                    extract(&file, &name, dir.as_deref(), to.as_deref(), &staging)
-                }
+                move || extract(&file, &name, dir.as_deref(), to.as_deref(), &staging)
             };
             tracing::info!("extraindo {}", source.file_name);
             let start = Instant::now();
@@ -642,7 +619,11 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let result = match job.await {
                 Ok(r) => r.map_err(|e| e.to_string()),
                 Err(e) => match e.try_into_panic() {
-                    Ok(p) => std::panic::resume_unwind(p),
+                    // Re-raised by `execute_install` once the staging folder is rolled back.
+                    Ok(p) => {
+                        run.panic = Some(p);
+                        Err("pânico na extração".to_string())
+                    }
                     Err(e) => Err(e.to_string()),
                 },
             };

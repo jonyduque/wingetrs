@@ -185,14 +185,14 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     result.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
-/// Installs a panic hook that calls `restore` (terminal restore and message), except on a
-/// thread extracting an archive: the decoder turns that panic into an error and the TUI
+/// Installs a panic hook that calls `restore` (terminal restore and message), except inside
+/// an archive decoder: `extract::catch_decoder` turns that panic into an error and the TUI
 /// keeps running, so the hook only logs it.
 pub fn install_panic_hook(
     restore: impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
 ) {
     std::panic::set_hook(Box::new(move |info| {
-        if crate::install::executor::in_decoder() {
+        if crate::install::extract::in_decoder() {
             tracing::error!(panic = %info, "pânico durante a extração");
             return;
         }

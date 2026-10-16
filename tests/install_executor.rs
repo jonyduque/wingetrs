@@ -1369,12 +1369,9 @@ fn extract_while_ticking(
 #[tokio::test(flavor = "current_thread")]
 async fn extract_runs_off_the_runtime() {
     let s = setup().await;
-    let big: Vec<u8> = (0..32usize << 20).map(|i| (i % 251) as u8).collect();
-    let a = sevenz_of(
-        &[("pkg/tool.exe", &fake_pe(3)), ("pkg/big.bin", &big)],
-        sevenz_rust2::EncoderMethod::COPY,
-    );
-    let (url, sha) = s.serve("pkg-1.0.7z", a).await;
+    // The tick wait in `extract_while_ticking`, not the archive size, proves the extraction
+    // left the runtime thread: the smallest real 7z is enough.
+    let (url, sha) = s.serve("pkg-1.0.7z", fixture_7z()).await;
     let plan = s.plan_from("app", &manifest_json(&url, &sha), false);
     let ticker = tokio::spawn(async {
         loop {
@@ -1389,16 +1386,16 @@ async fn extract_runs_off_the_runtime() {
     ticker.abort();
     drop(ctx);
     r.unwrap();
-    let big_len = std::fs::metadata(s.layout.current("app").join("big.bin"))
-        .unwrap()
-        .len();
-    assert_eq!(big_len, 32 << 20);
+    assert_eq!(
+        std::fs::read(s.layout.current("app").join("tool.exe")).unwrap(),
+        fake_pe(3)
+    );
 }
 
 const PANIC_MARK: &str = "decoder blew up ZZQ";
 
-/// Writes part of the tree, then panics the way a decoder does: on the extraction
-/// thread, caught there and turned into `ExtractError::Decoder` (D4-1).
+/// Writes part of the tree, then panics inside `catch_decoder`, as the real decoders do
+/// (D4-1): caught on the extraction thread and turned into `ExtractError::Decoder`.
 fn panicking_decoder(
     _file: &Path,
     _name: &str,
@@ -1408,9 +1405,9 @@ fn panicking_decoder(
 ) -> Result<(), wingetrs::install::extract::ExtractError> {
     std::fs::create_dir_all(dest.join("pkg")).unwrap();
     std::fs::write(dest.join("pkg/partial.bin"), b"half").unwrap();
-    std::panic::catch_unwind(|| -> Result<(), wingetrs::install::extract::ExtractError> {
-        panic!("{PANIC_MARK}")
-    })
+    wingetrs::install::extract::catch_decoder(
+        || -> Result<(), wingetrs::install::extract::ExtractError> { panic!("{PANIC_MARK}") },
+    )
     .unwrap_or_else(|_| {
         Err(wingetrs::install::extract::ExtractError::Decoder(
             PANIC_MARK.into(),
@@ -1425,6 +1422,9 @@ async fn decoder_panic_rolls_back() {
     let before = s.snapshot();
     let before_env = s.env.dump();
     let restored = std::sync::Arc::new(AtomicUsize::new(0));
+    // The panic hook is process-wide: while it is swapped, a panic in any other test of this
+    // binary goes through it too. It only counts panics carrying PANIC_MARK and still calls
+    // the previous hook, so other tests keep their messages and cannot move the counter.
     let previous = std::panic::take_hook();
     // The TUI hook, with a counter in place of the terminal restore.
     wingetrs::tui::run::install_panic_hook({
@@ -1455,5 +1455,42 @@ async fn decoder_panic_rolls_back() {
     );
     assert_eq!(s.snapshot(), before);
     assert_eq!(s.env.dump(), before_env);
+    assert!(s.state.apps().unwrap().is_empty());
+}
+
+/// A panic outside any decoder guard: our own bug, not a decoder's.
+fn extractor_bug(
+    _file: &Path,
+    _name: &str,
+    _dir: Option<&str>,
+    _to: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    std::fs::create_dir_all(dest.join("pkg")).unwrap();
+    std::fs::write(dest.join("pkg/partial.bin"), b"half").unwrap();
+    panic!("extractor bug ZZW")
+}
+
+#[tokio::test]
+async fn extraction_worker_panic_rolls_back_then_propagates() {
+    use futures_util::FutureExt;
+    let s = setup().await;
+    let (before_list, before) = (root_list(&s), s.snapshot());
+    let mut ctx = s.ctx_with_hook(&NoHook);
+    let caught = std::panic::AssertUnwindSafe(wingetrs::install::executor::execute_install_with(
+        &s.plan,
+        &mut ctx,
+        extractor_bug,
+    ))
+    .catch_unwind()
+    .await;
+    drop(ctx);
+    let payload = caught.expect_err("the worker panic must propagate");
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("extractor bug ZZW")
+    );
+    assert_eq!(root_list(&s), before_list);
+    assert_eq!(s.snapshot(), before);
     assert!(s.state.apps().unwrap().is_empty());
 }

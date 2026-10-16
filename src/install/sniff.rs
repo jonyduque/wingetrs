@@ -123,9 +123,9 @@ fn is_valid_7z_at<R: Read + Seek>(r: &mut R, at: u64) -> io::Result<bool> {
         return Ok(false);
     }
     // D4-1: third-party decoder panic becomes an error (spec 2b)
-    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let opened = crate::install::extract::catch_decoder(|| {
         sevenz_rust2::Archive::read(&mut sub, &sevenz_rust2::Password::empty())
-    }));
+    });
     match opened {
         Ok(r) => Ok(r.is_ok()),
         Err(payload) => {
