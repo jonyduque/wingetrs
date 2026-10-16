@@ -1,0 +1,9 @@
+[
+  {"Id": "A.Same", "Name": "Same App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "B.Diff", "Name": "Diff App", "InstalledVersion": "2.0", "Source": "winget"},
+  {"Id": "C.Missing", "Name": "Missing App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "D.Amb", "Name": "Ambiguous App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "E.Swapped", "Name": "Swapped App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "F.Allowed", "Name": "Allowed App", "InstalledVersion": "1.0", "Source": "winget"},
+  {"Id": "ARP\\Machine\\X64\\ABC", "Name": "Not In Catalog", "InstalledVersion": "9", "Source": ""}
+]

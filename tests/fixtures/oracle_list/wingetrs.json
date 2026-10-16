@@ -1,0 +1,13 @@
+[
+  {"name": "Same App 1.0", "origin": "arp", "installed_version": "1.0",
+   "correlation": {"Matched": {"source": "winget", "package_id": "a.same", "rule": "ProductCode"}}},
+  {"name": "Diff App", "origin": "arp", "installed_version": "2.1",
+   "correlation": {"Matched": {"source": "winget", "package_id": "B.Diff", "rule": "ProductCode"}}},
+  {"name": "Ambiguous App", "origin": "arp", "installed_version": "1.0",
+   "correlation": {"Ambiguous": {"candidates": ["D.Amb", "D.Amb2"]}}},
+  {"name": "Swapped App", "origin": "arp", "installed_version": "1.0",
+   "correlation": {"Matched": {"source": "winget", "package_id": "Z.Other", "rule": "Name"}}},
+  {"name": "Allowed App", "origin": "arp", "installed_version": "1.0", "correlation": "Unmatched"},
+  {"name": "Scoop Thing", "origin": "scoop", "installed_version": "3",
+   "correlation": {"Matched": {"source": "scoop", "package_id": "Z.Other", "rule": "Name"}}}
+]
