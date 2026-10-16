@@ -273,6 +273,23 @@ async fn search_logs_join_wait() {
     });
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
-    assert!(err.contains("search.join_wait"), "{err}");
-    assert!(err.contains("startup.ensure"), "{err}");
+    // Strip ANSI colour codes so the exact span/event text can be matched.
+    let mut plain = String::new();
+    let mut chars = err.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    assert!(
+        plain.contains("search.join_wait: wingetrs::cli: close"),
+        "{plain}"
+    );
+    assert!(plain.contains("stage=\"startup.ensure\" ms="), "{plain}");
 }
