@@ -72,7 +72,12 @@ fn manifest_and_extractor_agree() {
             let err = wingetrs::install::extract::extract(&file, name, None, None, &dest)
                 .expect_err(name);
             assert!(err.to_string().contains("não suportado"), "{name}: {err}");
-            assert!(!dest.join(name).exists(), "{name} copiado como solto");
+            assert!(!dest.exists(), "{name}: dest criado");
+            let left: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(left, [std::ffi::OsString::from(name)], "{name}: sobras");
         }
     }
 }
