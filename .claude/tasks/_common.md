@@ -6,7 +6,7 @@
 - Commits pequenos, mensagem em inglês no formato `feat(<módulo>): ...`/`test(...)`/`fix(...)`, terminando com a linha `Co-Authored-By: Claude <noreply@anthropic.com>`. Nunca `git push`.
 - Não adicione dependências fora das listadas no brief. Não edite arquivos fora da lista **Files** sem registrar o motivo no relatório.
 - **Cada regra listada em "Checks beyond the steps" ou "The decision this task must get right" precisa da sua prova de mutação colada.** Se você pular uma, diga qual e por quê — o orquestrador vai rodá-la.
-- **Desempenho:** spans antes de otimizar; benchmark sempre com `-Baseline target/release/examples/noop.exe`; número decisivo ⇒ compare A/B contra a base (worktree temporário, removido no fim). Otimização sem ganho medido é revertida.
+- **Desempenho:** spans antes de otimizar; benchmark sempre com `-Baseline target/release/examples/noop.exe`; número decisivo ⇒ compare A/B contra a base (worktree temporário **com o mesmo `target/`** via `CARGO_TARGET_DIR`, removido no fim). Otimização sem ganho medido é revertida.
 - **Threads/pânico:** toda thread que você criar é juntada em todos os caminhos; `join()` nunca termina em `.ok()`/`if let Ok`/`unwrap_or_default` (o gate barra). Veja `docs/ARMADILHAS.md`.
 - Nunca varra o disco inteiro (`find /`, `Get-ChildItem C:\ -Recurse`); procure só no repositório e em caminhos conhecidos. Encerre todo processo que você iniciou em segundo plano (inclusive laços `until … sleep`) antes de responder; confira com `pwsh -File scripts/leftovers.ps1`.
 - Se algo do brief não existir ou contradizer o código real: pare, registre `BLOCKED: <motivo com evidência>` no relatório. Não invente uma alternativa silenciosa.
@@ -25,3 +25,4 @@ Grave `.claude/tasks/task-{N}-report.md` com, nesta ordem:
 Não conta como entrega: "tests pass" sem saída colada; prova de mutação sem a linha `[OK] mutação PEGA`; número que não foi medido (escreva "não medido").
 
 A mensagem final ao orquestrador: no máximo 10 linhas — status, SHAs, caminho do relatório.
+- **Disco:** nunca crie worktree ou `target/` separado para compilar ou rodar o gate (cada `target` de debug passa de 10 GB e o disco encheu em 2026-10-16). Se o checkout não compila por causa de arquivo de outro agente, espere ou rode só os seus testes e diga no relatório; o orquestrador roda o gate. Sonda que baixa corpus apaga os downloads e as árvores extraídas no fim, mantendo só os vetores que o relatório cita.

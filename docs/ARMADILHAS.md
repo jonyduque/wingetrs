@@ -52,6 +52,8 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 
 ## Ambiente e repositório
 
+- **Disco cheio no meio do lote (2026-10-16).** Sobras de sondas (corpus 7z/MSI e árvores do `msiexec /a`, ~16 GB), um `target/orch` antigo (42 GB), um `tgt-dev` no scratchpad (11 GB) e dois agentes criando worktree com `target` próprio levaram o C: a 6 GB livres e o gate a `os error 112`. Regra no `_common.md`: sem `target` separado; sonda apaga o corpus no fim.
+
 - **Escape `\xNN` no texto de um comando vira byte bruto.** 2026-10-15/16: `\x1b` num brief (via `python -c`, `sed`, `perl`) e `\x03\x04` numa spec (via heredoc Python) chegaram ao arquivo como bytes de controle, mesmo escapados em dobro. Em texto gerado por comando, monte o caractere com `chr(27)` e o texto literal com `chr(92) + 'x1b'`, ou escreva hex com espaços (`50 4B 03 04`); depois confira com `grep -c` por bytes `< 0x20`.
 
 - **Apagar por caminho interpolado.** Task 72: script gerado com `Remove-Item "$root\$Name\*"` e `$Name` vazio apagou o scratchpad inteiro da sessão. Antes de apagar, confira que cada parte do caminho é não vazia (`if (-not $Name) { throw }`) e que o alvo fica dentro de uma pasta criada pelo próprio script.
