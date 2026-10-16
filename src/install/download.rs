@@ -166,6 +166,25 @@ fn cached(data: &DataDir, idx: &BTreeMap<String, String>, spec: &HashSpec) -> Op
     (sha_hex == name && algo_hex.eq_ignore_ascii_case(&spec.hex)).then_some(path)
 }
 
+/// `cached` on the blocking pool: hashing a large blob must not stall the runtime workers.
+async fn cached_blocking(
+    data: &DataDir,
+    idx: &BTreeMap<String, String>,
+    spec: &HashSpec,
+) -> Result<Option<PathBuf>, DownloadError> {
+    let job = tokio::task::spawn_blocking({
+        let (data, idx, spec) = (data.clone(), idx.clone(), spec.clone());
+        move || cached(&data, &idx, &spec)
+    });
+    match job.await {
+        Ok(r) => Ok(r),
+        Err(e) => match e.try_into_panic() {
+            Ok(p) => std::panic::resume_unwind(p),
+            Err(e) => Err(DownloadError::Io(e.to_string())),
+        },
+    }
+}
+
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Removes the temp file on drop unless disarmed (covers every error path).
@@ -258,7 +277,7 @@ pub async fn fetch_each(
     let tasks = sources.iter().map(|src| {
         let (sem, idx) = (&sem, &idx);
         async move {
-            if let Some(p) = cached(data, idx, &src.hash) {
+            if let Some(p) = cached_blocking(data, idx, &src.hash).await? {
                 return Ok((p, None));
             }
             let _permit = sem
@@ -358,5 +377,35 @@ mod tests {
         std::fs::write(data.blobs_dir().join(&name), content).unwrap();
         let idx = BTreeMap::from([(algo_key(&spec), name)]);
         assert_eq!(cached(&data, &idx, &spec), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cached_lookup_does_not_block_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = DataDir::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(data.blobs_dir()).unwrap();
+        let content: Vec<u8> = (0..64 << 20).map(|i: usize| (i % 251) as u8).collect();
+        let name = hex_of(&Sha256::digest(&content));
+        std::fs::write(data.blobs_dir().join(&name), &content).unwrap();
+        let spec = HashSpec {
+            algo: HashAlgo::Sha256,
+            hex: name,
+        };
+        let ticks = std::sync::Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        let found = cached_blocking(&data, &BTreeMap::new(), &spec)
+            .await
+            .unwrap();
+        ticker.abort();
+        assert!(found.is_some());
+        assert!(ticks.load(Ordering::Relaxed) >= 2, "runtime was blocked");
     }
 }
