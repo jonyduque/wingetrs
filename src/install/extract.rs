@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs_retry;
 use crate::install::archive::ArchiveKind;
 use crate::install::extract_7z::extract_7z;
+use crate::install::extract_msi::extract_msi;
 use crate::install::safepath;
 use crate::install::sniff::{self, Sniffed};
 
@@ -38,6 +39,8 @@ pub enum ExtractError {
     DictionaryTooLarge { dict: u64, limit: u64 },
     #[error("falha no decodificador: {0}")]
     Decoder(String),
+    #[error("layout do MSI inválido: {0}")]
+    MsiLayout(String),
 }
 
 /// Decompression-bomb limits; the byte budget of one archive is `clamp(size × ratio, floor, ceiling)`.
@@ -98,7 +101,10 @@ impl From<io::Error> for ExtractError {
 }
 
 /// Maps a filesystem error to `ExtractError::Io` naming the operation (Portuguese) and the path.
-fn io_at<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> ExtractError + 'a {
+pub(super) fn io_at<'a>(
+    op: &'static str,
+    path: &'a Path,
+) -> impl FnOnce(io::Error) -> ExtractError + 'a {
     move |e| ExtractError::Io(format!("{op} {}: {e}", path.display()))
 }
 
@@ -247,7 +253,13 @@ fn extract_one(
             mapper.dir_seen = true;
         }
         Ok(ArchiveKind::SevenZip) => extract_sniffed(s, tmp, mapper, limits)?,
-        Ok(ArchiveKind::Msi | ArchiveKind::Nupkg | ArchiveKind::TarXz) => {
+        Ok(ArchiveKind::Msi) => {
+            if !is_ole(s.file)? {
+                return Err(ExtractError::Unsupported("conteúdo não é MSI".to_string()));
+            }
+            extract_msi(s.file, tmp, mapper, limits)?;
+        }
+        Ok(ArchiveKind::Nupkg | ArchiveKind::TarXz) => {
             return Err(ExtractError::Unsupported(s.file_name.to_string()));
         }
         Err(ext) => {
@@ -263,6 +275,19 @@ fn extract_one(
         ));
     }
     Ok(())
+}
+
+/// OLE compound file signature, the container of every MSI.
+const OLE_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+fn is_ole(file: &Path) -> Result<bool, ExtractError> {
+    let mut head = Vec::with_capacity(OLE_MAGIC.len());
+    fs::File::open(file)
+        .map_err(io_at("abrir", file))?
+        .take(OLE_MAGIC.len() as u64)
+        .read_to_end(&mut head)
+        .map_err(io_at("ler", file))?;
+    Ok(head == OLE_MAGIC)
 }
 
 /// How far past the PE sections a 7z SFX archive is searched for.

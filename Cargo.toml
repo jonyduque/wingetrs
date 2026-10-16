@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.1"
+cab = "=0.6.0"
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 directories = "6.0.0"
@@ -25,6 +26,7 @@ futures-util = "0.3.34"
 hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "ico", "jpeg", "gif"] }
 md-5 = "0.11.0"
+msi = "=0.10.0"
 nucleo = "0.5.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm"] }
@@ -57,6 +59,10 @@ insta = "1.49.0"
 sevenz-rust2 = { version = "=0.24.0", default-features = false, features = ["bzip2", "deflate", "ppmd", "compress"] }
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+# Task 125: `cab` with `Cabinet::for_each_file` (one decoder pass per folder).
+[patch.crates-io]
+cab = { path = "vendor/cab-0.6.0" }
 
 [lints.clippy]
 unwrap_used = "deny"

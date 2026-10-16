@@ -4,6 +4,7 @@ pub mod download;
 pub mod executor;
 pub mod extract;
 pub(crate) mod extract_7z;
+pub(crate) mod extract_msi;
 pub mod layout;
 pub mod link;
 pub mod manifest;
