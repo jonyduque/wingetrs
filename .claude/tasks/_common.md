@@ -2,6 +2,7 @@
 
 - Leia `CLAUDE.md` (regras do projeto, comandos proibidos, economia de contexto). Não leia o plano nem a spec inteiros; este brief é autocontido.
 - TDD: escreva o teste, rode e veja falhar pelo motivo certo, implemente, rode e veja passar.
+- **Ciclo rápido:** durante o TDD e as mutações rode só o binário de teste da tarefa (`cargo test --quiet --test <arquivo>`, ~19 s depois de mexer em `src/`), nunca a suíte toda (~77 s só para compilar os 52 binários + ~80 s para rodar). O gate completo roda **uma vez**, antes do commit final.
 - Gate antes de cada commit: `pwsh -File scripts/verify.ps1` deve terminar com `[OK]   gate verde`. Se demorar, espere ativamente (um laço que confere o arquivo de saída até aparecer o exit) antes de encerrar o turno — não encerre esperando notificação.
 - Commits pequenos, mensagem em inglês no formato `feat(<módulo>): ...`/`test(...)`/`fix(...)`, terminando com a linha `Co-Authored-By: Claude <noreply@anthropic.com>`. Nunca `git push`.
 - Não adicione dependências fora das listadas no brief. Não edite arquivos fora da lista **Files** sem registrar o motivo no relatório.
@@ -10,6 +11,15 @@
 - **Threads/pânico:** toda thread que você criar é juntada em todos os caminhos; `join()` nunca termina em `.ok()`/`if let Ok`/`unwrap_or_default` (o gate barra). Veja `docs/ARMADILHAS.md`.
 - Nunca varra o disco inteiro (`find /`, `Get-ChildItem C:\ -Recurse`); procure só no repositório e em caminhos conhecidos. Encerre todo processo que você iniciou em segundo plano (inclusive laços `until … sleep`) antes de responder; confira com `pwsh -File scripts/leftovers.ps1`.
 - Se algo do brief não existir ou contradizer o código real: pare, registre `BLOCKED: <motivo com evidência>` no relatório. Não invente uma alternativa silenciosa.
+
+#### Autorrevisão antes de entregar
+
+Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira cada um no seu diff antes de reportar:
+- **Cada recusa tem uma fixture que falha só nela** (anti-item, limite de entradas, cada formato de dicionário, sobreposição, "terminou com"...). Apague a linha da checagem de cabeça: algum teste cai? Se não, falta fixture.
+- **Todo número lido da entrada** (tamanho, offset, dicionário, contagem, tamanho de cabeçalho) tem teto **antes** de alocar ou decodificar, inclusive em caminhos secundários (candidatos SFX, cabeçalho compactado, saltos entre arquivos).
+- **Código de terceiros que lê dado externo** (abrir **e** ler) fica dentro do `catch_decoder`/`catch_unwind` do D4-1.
+- **"Nada gravado"** é provado olhando uma pasta que existiria se algo tivesse sido gravado, não uma que nunca existe.
+- **Cada braço de `match`/`if`** tem um teste que o alcança, nas duas ordens quando a ordem importa.
 
 #### Report contract
 

@@ -71,6 +71,12 @@ cab = { path = "vendor/cab-0.6.0" }
 unwrap_used = "deny"
 expect_used = "deny"
 
+# Measured 2026-10-16: full debug info made the incremental build of the 52 test
+# binaries take 153 s; line tables only, 77 s (and ~half the target size). Panics
+# still show file:line.
+[profile.dev]
+debug = "line-tables-only"
+
 # Normalization regexes dominate `list` time in debug builds.
 [profile.dev.package.fancy-regex]
 opt-level = 3

@@ -52,6 +52,8 @@ Cada item aconteceu de verdade neste projeto e tem evidência no ledger (`.claud
 
 ## Ambiente e repositório
 
+- **Debug info cheia dobra o tempo de link dos testes (medido 2026-10-16).** 52 binários de teste: compilar e linkar depois de mexer em `src/` levava 153 s com `debug` padrão e 77 s com `debug = "line-tables-only"` (agora no `Cargo.toml`); um teste só, 34 s → 19 s; `target/` de 122 GB (com binários velhos acumulados) para 6 GB depois de `cargo clean`. `rust-lld` não ganhou nada (105 s). Gate incremental: 194 s; do zero: 580 s.
+
 - **Disco cheio no meio do lote (2026-10-16).** Sobras de sondas (corpus 7z/MSI e árvores do `msiexec /a`, ~16 GB), um `target/orch` antigo (42 GB), um `tgt-dev` no scratchpad (11 GB) e dois agentes criando worktree com `target` próprio levaram o C: a 6 GB livres e o gate a `os error 112`. Regra no `_common.md`: sem `target` separado; sonda apaga o corpus no fim.
 
 - **Escape `\xNN` no texto de um comando vira byte bruto.** 2026-10-15/16: `\x1b` num brief (via `python -c`, `sed`, `perl`) e `\x03\x04` numa spec (via heredoc Python) chegaram ao arquivo como bytes de controle, mesmo escapados em dobro. Em texto gerado por comando, monte o caractere com `chr(27)` e o texto literal com `chr(92) + 'x1b'`, ou escreva hex com espaços (`50 4B 03 04`); depois confira com `grep -c` por bytes `< 0x20`.
