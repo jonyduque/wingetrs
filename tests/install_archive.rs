@@ -31,11 +31,11 @@ fn archive_kind_table() {
 }
 
 #[test]
-fn only_2a_kinds_supported_for_now() {
-    for k in [Zip, TarGz, Plain] {
+fn supported_kinds() {
+    for k in [Zip, TarGz, Plain, Nupkg, TarXz] {
         assert!(k.supported(), "{k:?}");
     }
-    for k in [SevenZip, Msi, Nupkg, TarXz] {
+    for k in [SevenZip, Msi] {
         assert!(!k.supported(), "{k:?}");
     }
 }

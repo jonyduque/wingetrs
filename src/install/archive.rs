@@ -44,11 +44,15 @@ impl ArchiveKind {
         }
     }
 
-    /// Whether the extractor can read this kind today. P1: Zip, TarGz, Plain.
+    /// Whether the extractor can read this kind today. Zip, TarGz, TarXz, Nupkg, Plain.
     pub fn supported(self) -> bool {
         matches!(
             self,
-            ArchiveKind::Zip | ArchiveKind::TarGz | ArchiveKind::Plain
+            ArchiveKind::Zip
+                | ArchiveKind::TarGz
+                | ArchiveKind::TarXz
+                | ArchiveKind::Nupkg
+                | ArchiveKind::Plain
         )
     }
 

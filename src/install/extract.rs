@@ -235,8 +235,21 @@ fn extract_one(
     limits: &Limits,
 ) -> Result<(), ExtractError> {
     match ArchiveKind::of(s.file_name) {
-        Ok(ArchiveKind::Zip) => extract_zip(s.file, tmp, mapper, limits)?,
-        Ok(ArchiveKind::TarGz) => extract_tar_gz(s.file, tmp, mapper, limits)?,
+        Ok(ArchiveKind::Zip | ArchiveKind::Nupkg) => extract_zip(s.file, tmp, mapper, limits)?,
+        Ok(ArchiveKind::TarGz) => {
+            let f = fs::File::open(s.file).map_err(io_at("abrir", s.file))?;
+            extract_tar(flate2::read::GzDecoder::new(f), s.file, tmp, mapper, limits)?;
+        }
+        Ok(ArchiveKind::TarXz) => {
+            let f = fs::File::open(s.file).map_err(io_at("abrir", s.file))?;
+            extract_tar(
+                lzma_rust2::XzReader::new(f, true),
+                s.file,
+                tmp,
+                mapper,
+                limits,
+            )?;
+        }
         Ok(ArchiveKind::Plain) => {
             let comps = safe_components(s.file_name)?;
             if comps.is_empty() {
@@ -258,9 +271,6 @@ fn extract_one(
                 return Err(ExtractError::Unsupported("conteúdo não é MSI".to_string()));
             }
             extract_msi(s.file, tmp, mapper, limits)?;
-        }
-        Ok(ArchiveKind::Nupkg | ArchiveKind::TarXz) => {
-            return Err(ExtractError::Unsupported(s.file_name.to_string()));
         }
         Err(ext) => {
             return Err(ExtractError::Unsupported(format!(
@@ -409,7 +419,9 @@ fn extract_zip(
     Ok(())
 }
 
-fn extract_tar_gz(
+/// Walks a tar stream already wrapped in its decompressor; `file` only sizes the budget.
+fn extract_tar(
+    reader: impl Read,
     file: &Path,
     root: &Path,
     mapper: &mut Mapper,
@@ -417,8 +429,7 @@ fn extract_tar_gz(
 ) -> Result<(), ExtractError> {
     let mut budget = Budget::for_file(file, limits)?;
     let mut count: u64 = 0;
-    let f = fs::File::open(file)?;
-    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    let mut ar = tar::Archive::new(reader);
     let entries = ar
         .entries()
         .map_err(|e| ExtractError::Archive(e.to_string()))?;

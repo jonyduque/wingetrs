@@ -1736,6 +1736,9 @@ name = "lzma-rust2"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7277c9742229dc25243236d578b6471a798c554512c6f6a04365ec2e87c2a3bb"
+dependencies = [
+ "sha2 0.11.0",
+]
 
 [[package]]
 name = "lzxd"
@@ -4310,6 +4313,7 @@ dependencies = [
  "image",
  "insta",
  "junction",
+ "lzma-rust2",
  "md-5",
  "msi",
  "nucleo",

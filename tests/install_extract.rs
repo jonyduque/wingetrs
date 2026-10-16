@@ -37,6 +37,72 @@ fn targz_with(entries: &[(&str, &[u8])], symlink: Option<(&str, &str)>) -> Vec<u
     b.into_inner().unwrap().finish().unwrap()
 }
 
+fn tarxz_with(entries: &[(&str, &[u8])], symlink: Option<(&str, &str)>) -> Vec<u8> {
+    let enc = lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+    let mut b = tar::Builder::new(enc);
+    for (n, d) in entries {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(d.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, n, *d).unwrap();
+    }
+    if let Some((n, target)) = symlink {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        h.set_cksum();
+        b.append_link(&mut h, n, target).unwrap();
+    }
+    b.into_inner().unwrap().finish().unwrap()
+}
+
+#[test]
+fn extracts_tar_xz() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.tar.xz");
+    std::fs::write(
+        &f,
+        tarxz_with(&[("pkg/rg.exe", b"x"), ("pkg/doc/README", b"r")], None),
+    )
+    .unwrap();
+    let dest = d.path().join("out");
+    extract(&f, "a.tar.xz", Some("pkg"), None, &dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("rg.exe")).unwrap(), b"x");
+    assert_eq!(std::fs::read(dest.join("doc/README")).unwrap(), b"r");
+}
+
+#[test]
+fn tar_xz_symlink_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.tar.xz");
+    std::fs::write(
+        &f,
+        tarxz_with(&[("ok.txt", b"1")], Some(("link", "../../etc"))),
+    )
+    .unwrap();
+    let dest = d.path().join("inner").join("out");
+    let r = extract(&f, "a.tar.xz", None, None, &dest);
+    assert!(matches!(r, Err(ExtractError::UnsafePath(_))), "{r:?}");
+    assert!(!dest.exists());
+    assert_eq!(
+        std::fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+        0
+    );
+}
+
+#[test]
+fn extracts_nupkg() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.nupkg");
+    std::fs::write(&f, zip_with(&[("tools/x.exe", b"x"), ("a.nuspec", b"n")])).unwrap();
+    let dest = d.path().join("out");
+    extract(&f, "a.nupkg", None, None, &dest).unwrap();
+    assert_eq!(std::fs::read(dest.join("tools/x.exe")).unwrap(), b"x");
+    assert!(dest.join("a.nuspec").exists());
+}
+
 #[test]
 fn extract_dir_becomes_root() {
     let d = tempfile::tempdir().unwrap();
