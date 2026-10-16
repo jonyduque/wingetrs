@@ -390,13 +390,17 @@ fn check_order(steps: &[Step]) -> Result<(), String> {
 
 /// Applies `plan`; on failure everything done so far is undone in reverse order.
 ///
+/// Precondition: never cancel (drop) this future on an async worker thread. Dropped during an
+/// extraction it blocks until the extraction or `msiexec` worker ends; the TUI drives it with
+/// `block_on` on a blocking thread.
+///
 /// Never broadcasts the environment change: the caller calls `effects.env.broadcast()` once
 /// after a successful install (and after a failed one whose rollback touched the environment).
 pub async fn execute_install(plan: &InstallPlan, ctx: &mut ExecCtx<'_>) -> Result<(), ExecError> {
     execute_install_with(plan, ctx, extract::extract).await
 }
 
-/// [`execute_install`] with an injected extraction (tests).
+/// [`execute_install`] with an injected extraction (tests). Same precondition on dropping it.
 #[doc(hidden)]
 pub async fn execute_install_with(
     plan: &InstallPlan,
@@ -657,6 +661,8 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 run.ensure_dirs(&layout.app_dir(app))?;
                 run.push(Undo::RemovePath(staging.clone()));
             }
+            // Each `msiexec /a` launch, reported as `INSTALLER_RUNNING` progress.
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
             // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
@@ -685,14 +691,25 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                         extract_dir: dir.as_deref(),
                         extract_to: to.as_deref(),
                     };
-                    extract_with_msiexec(m, &layout, &app, &source, &staging)
+                    let started = || {
+                        // The receiver is gone only once the install stopped waiting.
+                        let _ = started_tx.send(());
+                    };
+                    extract_with_msiexec(m, &layout, &app, &source, &staging, &started)
                         .map_err(Refused::Failed)
                 }
             };
             tracing::info!("extraindo {}", source.file_name);
             let start = Instant::now();
-            let job = AwaitWorker::spawn(work, staging);
-            let result = match job.join().await {
+            let joined = AwaitWorker::spawn(work, staging).join();
+            tokio::pin!(joined);
+            let joined = loop {
+                tokio::select! {
+                    r = &mut joined => break r,
+                    Some(()) = started_rx.recv() => (ctx.progress)(INSTALLER_RUNNING, 0, None),
+                }
+            };
+            let result = match joined {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(Refused::Failed(m))) => Err(m),
                 Ok(Err(Refused::NeedsMsiexec(reason))) => {
@@ -846,22 +863,46 @@ enum Refused {
     NeedsMsiexec(String),
 }
 
-/// Folder under the staging folder where `msiexec /a` works (removed once its tree moved).
-const MSIEXEC_DIR: &str = "_msiexec";
+/// Progress label sent each time `msiexec /a` is launched: from then on the job cannot be
+/// cancelled (the TUI waits for it on quit).
+pub const INSTALLER_RUNNING: &str = "Windows Installer (msiexec /a)";
+
+/// Suffix of the sibling of the staging folder where `msiexec /a` works.
+const MSIEXEC_SUFFIX: &str = ".msiexec";
+
+/// Removes the `msiexec` work folder on every path out of [`extract_with_msiexec`]; `msiexec`
+/// has always exited by then.
+struct RemoveWork(PathBuf);
+
+impl Drop for RemoveWork {
+    fn drop(&mut self) {
+        if let Err(e) = not_found_ok(remove_any(&self.0)) {
+            tracing::warn!("{}: {e}", self.0.display());
+        }
+    }
+}
 
 /// Fallback for an MSI the own extractor refused: `msiexec /a` into
-/// `<staging>\_msiexec\SourceDir`, queued behind `msi.lock` (taken after `install.lock`,
-/// never before) and the Windows Installer mutex, then its tree moved into `staging` through
-/// `extract::import_admin_tree`. Blocks until `msiexec` ends: it is never killed.
+/// `<staging>.msiexec\SourceDir` (a sibling, so it never mixes with the package's own
+/// folders), queued behind `msi.lock` (taken after `install.lock`, never before) and the
+/// Windows Installer mutex, then its tree moved into `staging` through
+/// `extract::import_admin_tree`. Blocks until `msiexec` ends: it is never killed. `started`
+/// is called each time `msiexec` is launched.
 pub fn extract_with_msiexec(
     m: Msiexec,
     layout: &Layout,
     app: &str,
     source: &extract::ExtractSource<'_>,
     staging: &Path,
+    started: &dyn Fn(),
 ) -> Result<(), String> {
-    let work = staging.join(MSIEXEC_DIR);
+    let mut work = staging.as_os_str().to_owned();
+    work.push(MSIEXEC_SUFFIX);
+    let work = PathBuf::from(work);
+    // A work folder left by a crashed run is garbage of ours.
+    not_found_ok(remove_any(&work)).map_err(|e| io_msg(&work, e))?;
     fs::create_dir_all(&work).map_err(|e| io_msg(&work, e))?;
+    let _remove = RemoveWork(work.clone());
     // msiexec names its administrative copy after the package file: give it the manifest's name.
     let admin = match safepath::safe_components(source.file_name).as_deref() {
         Some([one]) => one.clone(),
@@ -872,7 +913,12 @@ pub fn extract_with_msiexec(
         fs::copy(source.file, &package).map_err(|e| io_msg(&package, e))?;
     }
     let target = work.join("SourceDir");
-    let mut status = |s: msi_queue::Status| tracing::info!(app, status = ?s, "msiexec /a");
+    let mut status = |s: msi_queue::Status| {
+        tracing::info!(app, status = ?s, "msiexec /a");
+        if let msi_queue::Status::Running { .. } = s {
+            started();
+        }
+    };
     let lock = msi_queue::lock_msi(&layout.msi_lock(), &mut status).map_err(|e| e.to_string())?;
     let mut attempt = 0u32;
     let ran = msi_queue::run_queued(
@@ -888,8 +934,7 @@ pub fn extract_with_msiexec(
     drop(lock);
     ran.map_err(|e| format!("msiexec /a: {e}"))?;
     extract::import_admin_tree(source, &target, &admin, staging, &extract::DEFAULT_LIMITS)
-        .map_err(|e| e.to_string())?;
-    not_found_ok(remove_any(&work)).map_err(|e| io_msg(&work, e))
+        .map_err(|e| e.to_string())
 }
 
 /// Set once the worker ends (returned or unwound).
@@ -946,12 +991,18 @@ impl<T> Drop for AwaitWorker<T> {
         if self.handle.take().is_none() {
             return;
         }
-        let (lock, cvar) = &*self.done;
-        let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
-        while !*done {
-            done = cvar.wait(done).unwrap_or_else(|p| p.into_inner());
+        let wait = || {
+            let (lock, cvar) = &*self.done;
+            let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !*done {
+                done = cvar.wait(done).unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        // On a multi-thread runtime, let its other tasks move off this thread meanwhile.
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(wait),
+            _ => wait(),
         }
-        drop(done);
         tracing::warn!(
             "instalação cancelada durante a extração; removendo {}",
             self.staging.display()

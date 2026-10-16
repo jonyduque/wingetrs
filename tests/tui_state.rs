@@ -4990,6 +4990,7 @@ fn quit_waits_for_uncancellable_job() {
         update(&mut a, key(KeyCode::Enter)),
         vec![Cmd::Execute(allowed("b"))]
     );
+    assert!(update(&mut a, Msg::InstallerRunning).is_empty());
     assert!(update(&mut a, key(KeyCode::Char('q'))).is_empty());
     match &a.modal {
         Some(Modal::ConfirmQuit { text }) => assert_eq!(
@@ -5019,4 +5020,28 @@ fn quit_waits_for_uncancellable_job() {
     update(&mut o, key(KeyCode::Enter));
     update(&mut o, key(KeyCode::Char('q')));
     assert_eq!(update(&mut o, ctrl('c')), vec![Cmd::Quit]);
+}
+
+#[test]
+fn msiexec_job_not_launched_yet_still_force_quits() {
+    let mut a = app();
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: "b".into(),
+            action: allowed("b"),
+        })),
+    );
+    update(&mut a, key(KeyCode::Enter));
+    // Still downloading, waiting for a lock or for the installer: the usual dialog, and the
+    // second Ctrl+C quits at once.
+    assert_eq!(
+        quit_text(&mut a),
+        "Há uma operação em andamento; ela termina antes de fechar."
+    );
+    assert_eq!(update(&mut a, ctrl('c')), vec![Cmd::Quit]);
+    // A launch reported for a job that already ended changes nothing.
+    let mut idle = app();
+    update(&mut idle, Msg::InstallerRunning);
+    assert_eq!(update(&mut idle, key(KeyCode::Char('q'))), vec![Cmd::Quit]);
 }

@@ -1521,18 +1521,12 @@ fn never_busy() -> bool {
 /// What `msiexec /a` leaves in `TARGETDIR`: the tree (here with a different case than the
 /// manifest's `extract_dir`) and the administrative copy of the package at its root.
 fn fake_admin(msi: &Path, target: &Path, _log: &Path) -> std::io::Result<Attempt> {
-    let staging = target.parent().and_then(Path::parent).unwrap();
-    assert!(
-        target.ends_with("_msiexec/SourceDir"),
-        "{}",
-        target.display()
-    );
-    assert!(
-        staging
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(".staging-"),
+    // A sibling of the staging folder, never inside it.
+    let work = target.parent().unwrap();
+    assert!(target.ends_with("SourceDir"), "{}", target.display());
+    assert_eq!(
+        work.file_name().unwrap(),
+        ".staging-1.0.msiexec",
         "{}",
         target.display()
     );
@@ -1684,6 +1678,15 @@ fn fake_admin_unsafe_name(_: &Path, target: &Path, _: &Path) -> std::io::Result<
     Ok(Attempt::Done)
 }
 
+/// `msiexec` left a name that is not valid UTF-16 (a lone surrogate, which NTFS accepts).
+fn fake_admin_non_utf8(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
+    use std::os::windows::ffi::OsStringExt;
+    std::fs::create_dir_all(target.join("pkg"))?;
+    let name = std::ffi::OsString::from_wide(&[0xD800, u16::from(b'a')]);
+    std::fs::write(target.join("pkg").join(name), b"x")?;
+    Ok(Attempt::Done)
+}
+
 /// `msiexec` left a junction in the tree.
 fn fake_admin_junction(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
     std::fs::create_dir_all(target.join("pkg"))?;
@@ -1704,6 +1707,7 @@ async fn msiexec_tree_with_unsafe_entries_is_refused_and_rolled_back() {
             "pkg/evil.",
         ),
         (fake_admin_junction, "pkg/link"),
+        (fake_admin_non_utf8, "pkg/\u{FFFD}a"),
     ] {
         let before = s.snapshot();
         let mut ctx = s.ctx_with_hook(&NoHook);

@@ -66,8 +66,10 @@ async fn own_extraction_matches_msiexec_admin() {
         let own = t.path().join("own").join(app);
         extract::extract_all(std::slice::from_ref(&src), &own).unwrap();
         let fallback = t.path().join("msiexec").join(app);
-        tokio::task::block_in_place(|| extract_with_msiexec(real, &layout, app, &src, &fallback))
-            .unwrap();
+        tokio::task::block_in_place(|| {
+            extract_with_msiexec(real, &layout, app, &src, &fallback, &|| {})
+        })
+        .unwrap();
         let tree = |p: &std::path::Path| wingetrs::install::snapshot::snapshot(p).unwrap();
         let (own_tree, fallback_tree) = (tree(&own), tree(&fallback));
         assert!(!own_tree.is_empty(), "{app}");

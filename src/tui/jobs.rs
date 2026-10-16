@@ -77,6 +77,23 @@ impl ProgressThrottle {
     }
 }
 
+/// Message for one progress report of a running action: the `msiexec /a` launch always goes
+/// through (never throttled), the rest through `throttle`.
+pub fn progress_msg(
+    throttle: &ProgressThrottle,
+    now: Instant,
+    label: &str,
+    done: u64,
+    total: Option<u64>,
+) -> Option<Msg> {
+    if label == crate::install::executor::INSTALLER_RUNNING {
+        return Some(Msg::InstallerRunning);
+    }
+    throttle
+        .admit(now, label, done, total)
+        .map(|(label, done, total)| Msg::InstallProgress { label, done, total })
+}
+
 /// Waits for a blocking job. A worker panic is handed to the main loop (never swallowed).
 pub async fn join_job(handle: tokio::task::JoinHandle<Msg>) -> Msg {
     match handle.await {

@@ -1291,8 +1291,8 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
         let tx = c.tx.clone();
         let throttle = jobs::ProgressThrottle::new(Instant::now());
         let progress = move |label: &str, done: u64, total: Option<u64>| {
-            if let Some((label, done, total)) = throttle.admit(Instant::now(), label, done, total) {
-                let _ = tx.send(Msg::InstallProgress { label, done, total });
+            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), label, done, total) {
+                let _ = tx.send(msg);
             }
         };
         let result = with_ops(c, &progress, |o| {

@@ -1285,7 +1285,7 @@ fn bridge_winget_takes_msi_lock() {
 }
 // ---- msiexec /a fallback in the jobs (Task 129) ----
 
-use wingetrs::install::executor::Msiexec;
+use wingetrs::install::executor::{INSTALLER_RUNNING, Msiexec};
 use wingetrs::install::msi_queue::Attempt;
 
 /// The smallest MSI the own extractor refuses: files outside the package (word count 0).
@@ -1361,7 +1361,9 @@ fn planned_groups(
 async fn run_action_needs_msiexec_then_runs_the_allowed_item_only() {
     let mut w = World::new().await;
     w.add_msi("m").await;
-    let mut ctx = w.ctx(LockWait::NoWait, &quiet);
+    let labels: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let record = |label: &str, _: u64, _: Option<u64>| labels.lock().unwrap().push(label.into());
+    let mut ctx = w.ctx(LockWait::NoWait, &record);
     ctx.msiexec = Msiexec {
         busy: never_busy,
         launch: fake_admin,
@@ -1393,8 +1395,12 @@ async fn run_action_needs_msiexec_then_runs_the_allowed_item_only() {
         groups,
         app: "m".into(),
     };
+    let no_launch = |l: &Vec<String>| !l.iter().any(|l| l == INSTALLER_RUNNING);
+    assert!(no_launch(&labels.lock().unwrap()));
     let done = jobs::run_action(&ctx, allowed).await.unwrap();
     assert_eq!(done.summary, "Instalado: m");
+    // The launch is reported, so the TUI marks the job uncancellable only from then on.
+    assert!(!no_launch(&labels.lock().unwrap()));
     assert_eq!(
         std::fs::read(w.layout.current("m").join("tool.txt")).unwrap(),
         b"tool"
@@ -1421,8 +1427,8 @@ fn order_wait(e: &str) -> bool {
 
 /// Holds the Windows Installer turn until the bridge job queued behind `msi.lock`.
 fn admin_waiting_for_bridge(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
-    // SourceDir < _msiexec < .staging-1.0 < app < apps < root.
-    let root = target.ancestors().nth(5).unwrap();
+    // SourceDir < .staging-1.0.msiexec < app < apps < root.
+    let root = target.ancestors().nth(4).unwrap();
     let layout = Layout::new(root);
     let install_held = UpdateLock::try_acquire(&layout.install_lock())
         .unwrap()
@@ -1494,4 +1500,20 @@ async fn msiexec_fallback_and_bridge_job_queue_without_deadlock() {
             "winget run".to_string(),
         ]
     );
+}
+
+#[test]
+fn installer_launch_is_never_throttled() {
+    let base = Instant::now();
+    let t = ProgressThrottle::new(base);
+    assert!(matches!(
+        jobs::progress_msg(&t, base, "a.zip", 1, Some(10)),
+        Some(Msg::InstallProgress { .. })
+    ));
+    // Within the gap: an ordinary report is dropped, the launch goes through.
+    assert!(jobs::progress_msg(&t, base, "a.zip", 2, Some(10)).is_none());
+    assert!(matches!(
+        jobs::progress_msg(&t, base, INSTALLER_RUNNING, 0, None),
+        Some(Msg::InstallerRunning)
+    ));
 }

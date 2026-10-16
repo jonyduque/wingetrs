@@ -297,10 +297,11 @@ pub fn import_admin_tree(
             for entry in fs::read_dir(&dir).map_err(io_at("listar", &dir))? {
                 let entry = entry.map_err(io_at("listar", &dir))?;
                 let path = entry.path();
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|n| ExtractError::UnsafePath(n.to_string_lossy().into_owned()))?;
+                let name = entry.file_name().into_string().map_err(|n| {
+                    let mut rel = comps.clone();
+                    rel.push(n.to_string_lossy().into_owned());
+                    ExtractError::UnsafePath(rel.join("/"))
+                })?;
                 if comps.is_empty() && name.eq_ignore_ascii_case(admin_msi) {
                     continue;
                 }

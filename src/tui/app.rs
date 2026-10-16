@@ -137,6 +137,8 @@ pub enum Msg {
         done: u64,
         total: Option<u64>,
     },
+    /// The running operation launched `msiexec /a`: from now on it cannot be cancelled.
+    InstallerRunning,
     /// The operation ended (also on failure, so the installed list is rescanned).
     InstallFinished(Result<Done, InstallFail>),
     /// `BUSY_RETRY` passed since another process held the lock: try the queue again.
@@ -624,6 +626,8 @@ pub struct App {
     pub waiting_lock: bool,
     /// Quit was confirmed with an operation in progress: quit when it ends.
     pub quit_after_running: bool,
+    /// The operation in progress launched `msiexec /a` (`Msg::InstallerRunning`).
+    pub installer_running: bool,
     /// Dialogs that arrived while another was open; shown, in order, as it closes.
     pending_modals: VecDeque<Modal>,
     /// Rows marked with Space per tab, by identity (see `RowKey`), not by position.
@@ -748,6 +752,7 @@ impl App {
             next_op_id: 0,
             waiting_lock: false,
             quit_after_running: false,
+            installer_running: false,
             pending_modals: VecDeque::new(),
             marks: HashMap::new(),
             batch: None,
@@ -1637,6 +1642,17 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::InstallProgress { label, done, total } => {
             if let Some(r) = &mut app.running {
                 r.progress = Some(RunProgress { label, done, total });
+            }
+            Vec::new()
+        }
+        Msg::InstallerRunning => {
+            if let Some(r) = &mut app.running {
+                app.installer_running = true;
+                r.progress = Some(RunProgress {
+                    label: crate::install::executor::INSTALLER_RUNNING.to_string(),
+                    done: 0,
+                    total: None,
+                });
             }
             Vec::new()
         }
@@ -3220,16 +3236,10 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
     Vec::new()
 }
 
-/// The job in progress may be running `msiexec /a`, which cannot be cancelled: quitting
-/// waits for it, even on a second Ctrl+C.
+/// The job in progress launched `msiexec /a`, which cannot be cancelled: quitting waits for
+/// it, even on a second Ctrl+C. Before the launch (download, locks, installer queue) it can.
 pub fn job_uncancellable(app: &App) -> bool {
-    matches!(
-        app.running,
-        Some(Running {
-            action: Some(Action::ApplyMsiexec { .. }),
-            ..
-        })
-    )
+    app.installer_running && app.running.is_some()
 }
 
 /// Rows of the queue dialog with their op ids: the operation in progress (not selectable),
@@ -3380,6 +3390,7 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
     let finished = app.running.take();
+    app.installer_running = false;
     app.bridge_last_line = None;
     // Success or not, the disk may have changed.
     let mut cmds = vec![Cmd::ScanInstalled];
