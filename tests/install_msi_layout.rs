@@ -105,6 +105,15 @@ fn collision_rules() {
         layout(&dirs, &comps, &files).unwrap(),
         vec![p("V", &["a.dll"])]
     );
+    // (a') reversed: the versioned file comes first with the higher sequence and still wins.
+    let files = [
+        f("V", "C2", "a.dll", Some("1.0"), 9),
+        f("U", "C1", "a.dll", None, 1),
+    ];
+    assert_eq!(
+        layout(&dirs, &comps, &files).unwrap(),
+        vec![p("V", &["a.dll"])]
+    );
     // (b) numeric version parts: 1.10.0 > 1.9.9.
     let files = [
         f("NEW", "C1", "b.dll", Some("1.10.0"), 5),
@@ -361,4 +370,86 @@ fn three_real_vectors() {
             ),
         ]
     );
+}
+
+fn deep_chain(n: usize) -> Vec<DirRow> {
+    let mut dirs = vec![root()];
+    let mut parent = "TARGETDIR".to_string();
+    for i in 1..=n {
+        let name = format!("D{i}");
+        dirs.push(d(&name, Some(&parent), &format!("n{i}")));
+        parent = name;
+    }
+    dirs
+}
+
+#[test]
+fn depth_limit_independent_of_file_order() {
+    let dirs = deep_chain(100);
+    let comps = [c("SHALLOW", "D50"), c("DEEP", "D100")];
+    let shallow = || f("S", "SHALLOW", "s.txt", None, 1);
+    let deep = || f("X", "DEEP", "x.txt", None, 2);
+    assert!(matches!(
+        layout(&dirs, &comps, &[shallow(), deep()]),
+        Err(LayoutError::TooDeep(_))
+    ));
+    assert!(matches!(
+        layout(&dirs, &comps, &[deep(), shallow()]),
+        Err(LayoutError::TooDeep(_))
+    ));
+    // The shallow file alone is within the limit.
+    assert_eq!(layout(&dirs, &comps, &[shallow()]).unwrap().len(), 1);
+}
+
+#[test]
+fn version_padding_and_non_numeric_parts() {
+    let dirs = [root()];
+    let comps = [c("C1", "TARGETDIR"), c("C2", "TARGETDIR")];
+    // 1.0 == 1.0.0 ⇒ tie ⇒ lower sequence.
+    let files = [
+        f("HI", "C1", "a.dll", Some("1.0.0"), 8),
+        f("LO", "C2", "a.dll", Some("1.0"), 2),
+    ];
+    assert_eq!(
+        layout(&dirs, &comps, &files).unwrap(),
+        vec![p("LO", &["a.dll"])]
+    );
+    // A non-numeric part counts as 0: 1.x == 1.0 ⇒ tie ⇒ lower sequence; 1.x < 1.1.
+    let files = [
+        f("X", "C1", "b.dll", Some("1.x"), 5),
+        f("Z", "C2", "b.dll", Some("1.0"), 3),
+    ];
+    assert_eq!(
+        layout(&dirs, &comps, &files).unwrap(),
+        vec![p("Z", &["b.dll"])]
+    );
+    let files = [
+        f("X", "C1", "b.dll", Some("1.x"), 1),
+        f("ONE", "C2", "b.dll", Some("1.1"), 3),
+    ];
+    assert_eq!(
+        layout(&dirs, &comps, &files).unwrap(),
+        vec![p("ONE", &["b.dll"])]
+    );
+}
+
+#[test]
+fn file_component_missing_from_component_table() {
+    let comps = [c("C1", "TARGETDIR")];
+    let files = [f("F1", "NOPE", "x", None, 1)];
+    assert!(matches!(
+        layout(&[root()], &comps, &files),
+        Err(LayoutError::MissingDirectory(_))
+    ));
+}
+
+#[test]
+fn default_dir_with_separator_refused() {
+    let dirs = [root(), d("A", Some("TARGETDIR"), "a/b")];
+    let comps = [c("C1", "A")];
+    let files = [f("F1", "C1", "x", None, 1)];
+    assert!(matches!(
+        layout(&dirs, &comps, &files),
+        Err(LayoutError::Unsafe(_))
+    ));
 }

@@ -71,22 +71,25 @@ fn component(name: &str) -> Result<Option<String>, LayoutError> {
     }
 }
 
+/// Memoized directory: depth below the root and source-relative path.
+type Memo = HashMap<String, (usize, Vec<String>)>;
+
 fn dir_path(
     key: &str,
     by_key: &HashMap<&str, &DirRow>,
-    memo: &mut HashMap<String, Vec<String>>,
+    memo: &mut Memo,
 ) -> Result<Vec<String>, LayoutError> {
-    if let Some(p) = memo.get(key) {
+    if let Some((_, p)) = memo.get(key) {
         return Ok(p.clone());
     }
     // Walk up to the root (no parent or parent == self), collecting source names.
     let mut chain: Vec<&DirRow> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
     let mut cur = key;
-    let mut base = Vec::new();
+    let (mut base_depth, mut base) = (0, Vec::new());
     loop {
-        if let Some(p) = memo.get(cur) {
-            base = p.clone();
+        if let Some((d, p)) = memo.get(cur) {
+            (base_depth, base) = (*d, p.clone());
             break;
         }
         let row = by_key
@@ -107,14 +110,19 @@ fn dir_path(
             }
         }
     }
+    // The memo hit carries its own depth, so the limit holds whatever the file order.
+    if base_depth + chain.len() > MAX_DEPTH {
+        return Err(LayoutError::TooDeep(key.to_string()));
+    }
     let mut path = base;
-    for row in chain.iter().rev() {
+    for (i, row) in chain.iter().rev().enumerate() {
         if let Some(c) = component(source_name(&row.default_dir))? {
             path.push(c);
         }
-        memo.insert(row.directory.clone(), path.clone());
+        memo.insert(row.directory.clone(), (base_depth + i + 1, path.clone()));
     }
-    memo.entry(key.to_string()).or_insert_with(|| path.clone());
+    memo.entry(key.to_string())
+        .or_insert_with(|| (base_depth, path.clone()));
     Ok(path)
 }
 
