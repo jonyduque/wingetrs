@@ -3,6 +3,7 @@
 use crate::bridge::{self, BridgeJob, Tool};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
+use crate::install::msi_queue;
 use crate::install::ops::{self, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
 use crate::install::residue::{self, Residue};
@@ -246,6 +247,9 @@ pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallF
     }
 }
 
+/// Progress text of a winget job queued behind another Windows Installer run of wingetrs.
+pub const WAITING_INSTALLER: &str = "aguardando outro instalador";
+
 /// Runner of a bridge command: `(program, args, on_line)` -> exit code and last lines.
 pub type BridgeExec<'a> =
     &'a mut dyn FnMut(&str, &[String], &mut dyn FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>;
@@ -254,9 +258,12 @@ pub type BridgeExec<'a> =
 /// scoop, the installed version is read right before and right after the run, since its exit
 /// code 0 alone does not mean it upgraded. On failure the last lines go to the log.
 /// `scoop_root` is `None` when it could not be found: a scoop job then fails before running.
+/// A winget job holds `msi_lock` while winget runs (its MSI installers share the Windows
+/// Installer mutex with ours); scoop never takes it.
 pub fn run_bridge(
     job: &BridgeJob,
     scoop_root: Option<&Path>,
+    msi_lock: &Path,
     pwsh: &str,
     exec: BridgeExec<'_>,
     on_line: &mut dyn FnMut(&str),
@@ -273,6 +280,16 @@ pub fn run_bridge(
     let version = || match job.tool {
         Tool::Scoop => bridge::scoop_version(scoop_root, &job.target),
         Tool::Winget => None,
+    };
+    let _msi = match job.tool {
+        Tool::Winget => {
+            let mut status = |_: msi_queue::Status| on_line(WAITING_INSTALLER);
+            match msi_queue::lock_msi(msi_lock, &mut status) {
+                Ok(lock) => Some(lock),
+                Err(e) => return fail(e.to_string()),
+            }
+        }
+        Tool::Scoop => None,
     };
     let before = version();
     let run = exec(&program, &args, on_line);

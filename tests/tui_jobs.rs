@@ -961,6 +961,14 @@ fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
     }
 }
 
+/// A fresh `msi.lock` path per call, so parallel bridge tests never queue behind each other.
+fn msi_lock() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("tui_jobs-msi-{}-{n}.lock", std::process::id()))
+}
+
 fn scoop_manifest(root: &Path, app: &str, version: &str) {
     let dir = root.join("apps").join(app).join("current");
     std::fs::create_dir_all(&dir).unwrap();
@@ -982,9 +990,14 @@ fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
         on_line("Baixando");
         Ok((0, vec!["Baixando".to_string()]))
     };
-    let done = jobs::run_bridge(&job, Some(root), "pwsh", &mut exec, &mut |l: &str| {
-        seen.push(l.to_string())
-    })
+    let done = jobs::run_bridge(
+        &job,
+        Some(root),
+        &msi_lock(),
+        "pwsh",
+        &mut exec,
+        &mut |l: &str| seen.push(l.to_string()),
+    )
     .unwrap();
     assert_eq!(
         done,
@@ -1002,7 +1015,14 @@ fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
         Ok((-1978335212, vec!["Nenhum pacote".to_string()]))
     };
     assert_eq!(
-        jobs::run_bridge(&job, Some(root), "pwsh", &mut not_found, &mut |_: &str| {}),
+        jobs::run_bridge(
+            &job,
+            Some(root),
+            &msi_lock(),
+            "pwsh",
+            &mut not_found,
+            &mut |_: &str| {}
+        ),
         Err(InstallFail::Other(
             "App Git.Git: O winget não encontrou este pacote instalado.".into()
         ))
@@ -1012,14 +1032,28 @@ fn run_bridge_winget_reports_codes_lines_and_missing_tool() {
         Err(std::io::Error::from(std::io::ErrorKind::NotFound))
     };
     assert_eq!(
-        jobs::run_bridge(&job, Some(root), "pwsh", &mut missing, &mut |_: &str| {}),
+        jobs::run_bridge(
+            &job,
+            Some(root),
+            &msi_lock(),
+            "pwsh",
+            &mut missing,
+            &mut |_: &str| {}
+        ),
         Err(InstallFail::Other(
             "App Git.Git: winget não encontrado".into()
         ))
     );
     let scoop = bridge_job(Tool::Scoop, "7zip");
     assert_eq!(
-        jobs::run_bridge(&scoop, Some(root), "pwsh", &mut missing, &mut |_: &str| {}),
+        jobs::run_bridge(
+            &scoop,
+            Some(root),
+            &msi_lock(),
+            "pwsh",
+            &mut missing,
+            &mut |_: &str| {}
+        ),
         Err(InstallFail::Other("App 7zip: scoop não encontrado".into()))
     );
 }
@@ -1035,6 +1069,7 @@ fn run_bridge_refuses_an_invalid_target_before_running() {
         let r = jobs::run_bridge(
             &bridge_job(Tool::Scoop, target),
             Some(Path::new("C:/s")),
+            &msi_lock(),
             "pwsh",
             &mut exec,
             &mut |_: &str| {},
@@ -1058,8 +1093,15 @@ fn run_bridge_scoop_compares_versions_read_around_the_run() {
         scoop_manifest(&root, "7zip", "2.0");
         Ok((0, Vec::new()))
     };
-    let done =
-        jobs::run_bridge(&job, Some(&root), "pwsh", &mut upgrades, &mut |_: &str| {}).unwrap();
+    let done = jobs::run_bridge(
+        &job,
+        Some(&root),
+        &msi_lock(),
+        "pwsh",
+        &mut upgrades,
+        &mut |_: &str| {},
+    )
+    .unwrap();
     assert_eq!(done.summary, "App 7zip: Atualizado para a versão 2.0.");
 
     // Exit 0, same version: not an upgrade, whatever the code says.
@@ -1067,7 +1109,14 @@ fn run_bridge_scoop_compares_versions_read_around_the_run() {
         Ok((0, vec!["7zip: 2.0 (latest version)".to_string()]))
     };
     assert_eq!(
-        jobs::run_bridge(&job, Some(&root), "pwsh", &mut stays, &mut |_: &str| {}),
+        jobs::run_bridge(
+            &job,
+            Some(&root),
+            &msi_lock(),
+            "pwsh",
+            &mut stays,
+            &mut |_: &str| {}
+        ),
         Err(InstallFail::Other(
             "App 7zip: Já está na versão mais recente.".into()
         ))
@@ -1075,7 +1124,14 @@ fn run_bridge_scoop_compares_versions_read_around_the_run() {
 
     let mut fails = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| Ok((1, Vec::new()));
     assert_eq!(
-        jobs::run_bridge(&job, Some(&root), "pwsh", &mut fails, &mut |_: &str| {}),
+        jobs::run_bridge(
+            &job,
+            Some(&root),
+            &msi_lock(),
+            "pwsh",
+            &mut fails,
+            &mut |_: &str| {}
+        ),
         Err(InstallFail::Other(
             "App 7zip: O scoop falhou (código 1).".into()
         ))
@@ -1093,6 +1149,7 @@ fn run_bridge_scoop_without_a_root_fails_before_running() {
         jobs::run_bridge(
             &bridge_job(Tool::Scoop, "7zip"),
             None,
+            &msi_lock(),
             "pwsh",
             &mut exec,
             &mut |_: &str| {}
@@ -1106,6 +1163,7 @@ fn run_bridge_scoop_without_a_root_fails_before_running() {
         jobs::run_bridge(
             &bridge_job(Tool::Winget, "Git.Git"),
             None,
+            &msi_lock(),
             "pwsh",
             &mut ok,
             &mut |_: &str| {}
@@ -1126,10 +1184,82 @@ fn bridge_job_toasts_reboot() {
     let done = jobs::run_bridge(
         &job,
         Some(Path::new("C:/x")),
+        &msi_lock(),
         "pwsh",
         &mut exec,
         &mut |_: &str| {},
     )
     .unwrap();
     assert!(done.summary.contains("reinicie"), "{}", done.summary);
+}
+
+#[test]
+fn bridge_winget_takes_msi_lock() {
+    use std::sync::mpsc::channel;
+    const HANG: Duration = Duration::from_secs(60);
+    let dir = TempDir::new().unwrap();
+    let lock_path = Layout::new(dir.path()).msi_lock();
+    let (tx, rx) = channel::<String>();
+    std::thread::scope(|s| {
+        // Declared inside the scope: a failing assertion drops it before the scope joins.
+        let held = UpdateLock::try_acquire(&lock_path).unwrap().unwrap();
+
+        // scoop never queues: it runs and finishes while the lock is held.
+        let scoop = s.spawn(|| {
+            let mut exec =
+                |_: &str, _: &[String], _: &mut dyn FnMut(&str)| Ok((1, Vec::<String>::new()));
+            jobs::run_bridge(
+                &bridge_job(Tool::Scoop, "7zip"),
+                Some(Path::new("C:/nao-usado")),
+                &lock_path,
+                "pwsh",
+                &mut exec,
+                &mut |_: &str| {},
+            )
+        });
+        let scoop_result = match scoop.join() {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        };
+        assert_eq!(
+            scoop_result,
+            Err(InstallFail::Other(
+                "App 7zip: O scoop falhou (código 1).".into()
+            ))
+        );
+
+        let winget = {
+            let tx = tx.clone();
+            let lock_path = &lock_path;
+            s.spawn(move || {
+                let exec_tx = tx.clone();
+                let mut exec = move |program: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+                    // msi.lock stays held while winget runs.
+                    let held = UpdateLock::try_acquire(lock_path).unwrap().is_none();
+                    exec_tx.send(format!("exec {program} held={held}")).unwrap();
+                    Ok((0, Vec::new()))
+                };
+                jobs::run_bridge(
+                    &bridge_job(Tool::Winget, "Git.Git"),
+                    None,
+                    lock_path,
+                    "pwsh",
+                    &mut exec,
+                    &mut |l: &str| tx.send(format!("line {l}")).unwrap(),
+                )
+            })
+        };
+        let first = rx.recv_timeout(HANG);
+        tx.send("released".to_string()).unwrap();
+        drop(held);
+        let done = match winget.join() {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        };
+        assert_eq!(first.unwrap(), format!("line {}", jobs::WAITING_INSTALLER));
+        assert!(done.is_ok(), "{done:?}");
+    });
+    drop(tx);
+    let events: Vec<String> = rx.iter().collect();
+    assert_eq!(events, ["released", "exec winget held=true"]);
 }

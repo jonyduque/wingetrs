@@ -1249,8 +1249,8 @@ fn run_tool(
     ))
 }
 
-/// Runs a bridge upgrade (no `install.lock`, no ops context); each output line becomes the
-/// progress text.
+/// Runs a bridge upgrade (no `install.lock`, no ops context; winget jobs queue on `msi.lock`);
+/// each output line becomes the progress text.
 fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
     spawn_job(ctx, move |c, _| {
         let tx = c.tx.clone();
@@ -1260,6 +1260,7 @@ fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
         Msg::InstallFinished(jobs::run_bridge(
             &job,
             c.scoop_root.as_deref(),
+            &c.data.install_layout().msi_lock(),
             &c.pwsh,
             &mut run_tool,
             &mut on_line,

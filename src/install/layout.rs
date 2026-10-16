@@ -46,4 +46,12 @@ impl Layout {
     pub fn install_lock(&self) -> PathBuf {
         self.root.join("install.lock")
     }
+    /// Orders the Windows Installer runs of wingetrs and its bridge winget jobs.
+    pub fn msi_lock(&self) -> PathBuf {
+        self.root.join("msi.lock")
+    }
+    /// Verbose log of attempt `n` of `msiexec /a` for `app`.
+    pub fn msiexec_log(&self, app: &str, n: u32) -> PathBuf {
+        self.root.join("log").join(format!("msiexec-{app}-{n}.log"))
+    }
 }
