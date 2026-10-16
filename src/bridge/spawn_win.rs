@@ -53,6 +53,11 @@ impl Readers {
     /// The cancel targets the pipe, not the thread: std reads child pipes overlapped
     /// (`ReadFileEx` + alertable `SleepEx`), which `CancelSynchronousIo` cannot reach.
     fn stop(&self) {
+        self.stop_with(cancel_io);
+    }
+
+    /// `stop` with the cancel injected, so a test can make it take effect only on a later try.
+    fn stop_with(&self, cancel: fn(usize)) {
         self.stop.store(true, Ordering::SeqCst);
         loop {
             let live: Vec<&Reader> = [&self.out, &self.err]
@@ -64,15 +69,20 @@ impl Readers {
                 return;
             }
             for r in live {
-                let pipe = windows::Win32::Foundation::HANDLE(r.raw as *mut std::ffi::c_void);
-                // SAFETY: `r._pipe` keeps the pipe open for as long as `r` lives, so the handle
-                // is valid here whatever the thread did.
-                // `ERROR_NOT_FOUND` (no read under way right now) is expected: retried below.
-                let _ = unsafe { windows::Win32::System::IO::CancelIoEx(pipe, None) };
+                cancel(r.raw);
             }
             std::thread::sleep(CANCEL_RETRY);
         }
     }
+}
+
+/// Cancels the read under way on the pipe `raw`.
+fn cancel_io(raw: usize) {
+    let pipe = windows::Win32::Foundation::HANDLE(raw as *mut std::ffi::c_void);
+    // SAFETY: the caller's `Reader::_pipe` keeps the pipe open for as long as the reader lives,
+    // so the handle is valid here whatever the thread did.
+    // `ERROR_NOT_FOUND` (no read under way right now) is expected: retried by the caller.
+    let _ = unsafe { windows::Win32::System::IO::CancelIoEx(pipe, None) };
 }
 
 impl Drop for Readers {
@@ -91,6 +101,37 @@ impl Drop for Readers {
     }
 }
 
+/// Reads `pipe` until EOF or `stop`; an abort (995) is the end only once `stop` is set.
+fn read_loop(
+    pipe: &mut impl Read,
+    stop: &AtomicBool,
+    tx: &Sender<String>,
+) -> std::io::Result<Option<String>> {
+    let mut tail = Tail::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let n = match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.raw_os_error() == Some(OPERATION_ABORTED) && stop.load(Ordering::SeqCst) =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        };
+        for line in tail.push(&buf[..n]) {
+            // No receiver means the caller is unwinding: keep draining so the tool can exit.
+            let _ = tx.send(line);
+        }
+    }
+    Ok(tail.finish())
+}
+
 fn spawn_reader(
     pipe: impl Read + AsRawHandle + Send + 'static,
     tx: Sender<String>,
@@ -102,30 +143,7 @@ fn spawn_reader(
     let thread = std::thread::spawn(move || {
         // Only this thread locks it; the slot just keeps it alive.
         let mut pipe = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut tail = Tail::new();
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            if stop.load(Ordering::SeqCst) {
-                break;
-            }
-            let n = match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e)
-                    if e.raw_os_error() == Some(OPERATION_ABORTED)
-                        && stop.load(Ordering::SeqCst) =>
-                {
-                    break;
-                }
-                Err(e) => return Err(e),
-            };
-            for line in tail.push(&buf[..n]) {
-                // No receiver means the caller is unwinding: keep draining so the tool can exit.
-                let _ = tx.send(line);
-            }
-        }
-        Ok(tail.finish())
+        read_loop(&mut *pipe, &stop, &tx)
     });
     Reader {
         thread,
@@ -254,5 +272,86 @@ mod tests {
         let start = Instant::now();
         readers.stop();
         assert!(start.elapsed() < CANCEL_RETRY, "{:?}", start.elapsed());
+    }
+
+    struct Failing(i32);
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from_raw_os_error(self.0))
+        }
+    }
+
+    #[test]
+    fn read_loop_995_without_flag_is_error() {
+        let (tx, _rx) = channel();
+        let stop = AtomicBool::new(false);
+        let err = read_loop(&mut Failing(OPERATION_ABORTED), &stop, &tx).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(OPERATION_ABORTED));
+        // A flag set during the read turns the same error into the end.
+        struct SetsFlag<'a>(&'a AtomicBool);
+        impl Read for SetsFlag<'_> {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                self.0.store(true, Ordering::SeqCst);
+                Err(std::io::Error::from_raw_os_error(OPERATION_ABORTED))
+            }
+        }
+        let stop = AtomicBool::new(false);
+        assert!(
+            read_loop(&mut SetsFlag(&stop), &stop, &tx)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_loop_checks_flag_before_read() {
+        struct Panics;
+        impl Read for Panics {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("read called with the flag set");
+            }
+        }
+        let (tx, _rx) = channel();
+        let stop = AtomicBool::new(true);
+        assert!(read_loop(&mut Panics, &stop, &tx).unwrap().is_none());
+    }
+
+    static CANCELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static RELEASE: Mutex<Option<Sender<()>>> = Mutex::new(None);
+
+    fn cancel_on_second_call(_: usize) {
+        if CANCELS.fetch_add(1, Ordering::SeqCst) + 1 >= 2
+            && let Some(tx) = RELEASE
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        {
+            let _ = tx.send(());
+        }
+    }
+
+    #[test]
+    fn stop_retries_until_readers_finish() {
+        let (release, held) = channel::<()>();
+        *RELEASE.lock().unwrap_or_else(PoisonError::into_inner) = Some(release.clone());
+        let thread = std::thread::spawn(move || {
+            let _ = held.recv();
+            Ok(None)
+        });
+        let readers = Readers {
+            out: Some(Reader {
+                thread,
+                _pipe: Arc::new(()),
+                raw: 0,
+            }),
+            err: None,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        readers.stop_with(cancel_on_second_call);
+        // Let the thread end even if the asserts fail: `Drop` would otherwise wait for it.
+        let _ = release.send(());
+        let calls = CANCELS.load(Ordering::SeqCst);
+        assert!(calls >= 2, "cancel called {calls} times");
+        assert!(readers.stop.load(Ordering::SeqCst));
     }
 }
