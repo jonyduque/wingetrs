@@ -16,7 +16,6 @@ pub enum Sniffed {
 const SEVEN_Z_MAGIC: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 /// Magic plus the format version (0, 4) written by every 7-Zip since 9.x.
 const SEVEN_Z_SIGNATURE: [u8; 8] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00, 0x04];
-const SIGNATURE_HEADER_SIZE: usize = 32;
 
 /// `head` = first bytes of the file (up to 64 KiB).
 pub fn sniff(head: &[u8]) -> Sniffed {
@@ -117,21 +116,24 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 fn is_valid_7z_at<R: Read + Seek>(r: &mut R, at: u64) -> io::Result<bool> {
-    let mut hh = [0u8; SIGNATURE_HEADER_SIZE];
-    r.seek(SeekFrom::Start(at))?;
-    if read_full(r, &mut hh)? < SIGNATURE_HEADER_SIZE {
-        return Ok(false);
-    }
-    // A zero start-header CRC sends `sevenz-rust2` into an unverified header guess: refuse it.
-    if hh[8..12] == [0, 0, 0, 0] {
-        return Ok(false);
-    }
     let mut sub = OffsetReader::new(&mut *r, at)?;
+    // Same header pre-check as the extractor: no oversized or zeroed header is opened.
+    if let Err(e) = crate::install::extract_7z::check_header(&mut sub) {
+        tracing::debug!(offset = at, error = %e, "candidato 7z recusado");
+        return Ok(false);
+    }
     // D4-1: third-party decoder panic becomes an error (spec 2b)
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sevenz_rust2::Archive::read(&mut sub, &sevenz_rust2::Password::empty())
     }));
-    Ok(matches!(opened, Ok(Ok(_))))
+    match opened {
+        Ok(r) => Ok(r.is_ok()),
+        Err(payload) => {
+            let msg = crate::install::extract_7z::panic_message(payload.as_ref());
+            tracing::warn!(offset = at, panic = %msg, "pânico ao validar candidato 7z");
+            Ok(false)
+        }
+    }
 }
 
 /// `Read + Seek` view of `inner` that starts at `offset` (an archive embedded in a PE).
