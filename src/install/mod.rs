@@ -1,4 +1,5 @@
 //! Scoop app install, uninstall and upgrade (phase 2a).
+pub mod archive;
 pub mod download;
 pub mod executor;
 pub mod extract;

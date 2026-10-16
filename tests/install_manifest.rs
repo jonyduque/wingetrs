@@ -274,3 +274,14 @@ fn bin_with_three_and_two_elements_is_unchanged() {
     assert_eq!(r.bin[2].alias, None);
     assert_eq!(r.bin[2].args, None);
 }
+
+#[test]
+fn innosetup_points_to_phase_2c() {
+    let json = r#"{"version":"1","url":"https://x/a.exe","hash":"0000000000000000000000000000000000000000000000000000000000000000","innosetup":true}"#;
+    match resolve(json, Arch::X64) {
+        Err(ManifestError::Unsupported { reason }) => {
+            assert!(reason.contains("fase 2c"), "{reason}")
+        }
+        o => panic!("{o:?}"),
+    }
+}

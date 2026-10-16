@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs_retry;
+use crate::install::archive::ArchiveKind;
 use crate::install::safepath;
 
 #[derive(Debug, thiserror::Error)]
@@ -19,6 +20,8 @@ pub enum ExtractError {
     MissingExtractDir(String),
     #[error("arquivo inválido: {0}")]
     Archive(String),
+    #[error("formato não suportado pelo extrator: {0}")]
+    Unsupported(String),
     #[error("E/S: {0}")]
     Io(String),
     #[error("arquivo descompactado passa de {limit} bytes (possível bomba de descompressão)")]
@@ -215,25 +218,33 @@ fn extract_one(
     mapper: &mut Mapper,
     limits: &Limits,
 ) -> Result<(), ExtractError> {
-    let lower = s.file_name.to_ascii_lowercase();
-    if lower.ends_with(".zip") {
-        extract_zip(s.file, tmp, mapper, limits)?;
-    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        extract_tar_gz(s.file, tmp, mapper, limits)?;
-    } else {
-        let comps = safe_components(s.file_name)?;
-        if comps.is_empty() {
-            return Err(ExtractError::UnsafePath(s.file_name.to_string()));
+    match ArchiveKind::of(s.file_name) {
+        Ok(ArchiveKind::Zip) => extract_zip(s.file, tmp, mapper, limits)?,
+        Ok(ArchiveKind::TarGz) => extract_tar_gz(s.file, tmp, mapper, limits)?,
+        Ok(ArchiveKind::Plain) => {
+            let comps = safe_components(s.file_name)?;
+            if comps.is_empty() {
+                return Err(ExtractError::UnsafePath(s.file_name.to_string()));
+            }
+            let mut target = tmp.to_path_buf();
+            for c in mapper.to.iter().chain(comps.iter()) {
+                target.push(c);
+            }
+            if let Some(p) = target.parent() {
+                fs::create_dir_all(p).map_err(io_at("criar pasta", p))?;
+            }
+            fs::copy(s.file, &target).map_err(io_at("copiar", &target))?;
+            mapper.dir_seen = true;
         }
-        let mut target = tmp.to_path_buf();
-        for c in mapper.to.iter().chain(comps.iter()) {
-            target.push(c);
+        Ok(ArchiveKind::SevenZip | ArchiveKind::Msi | ArchiveKind::Nupkg | ArchiveKind::TarXz) => {
+            return Err(ExtractError::Unsupported(s.file_name.to_string()));
         }
-        if let Some(p) = target.parent() {
-            fs::create_dir_all(p).map_err(io_at("criar pasta", p))?;
+        Err(ext) => {
+            return Err(ExtractError::Unsupported(format!(
+                "{} ({ext})",
+                s.file_name
+            )));
         }
-        fs::copy(s.file, &target).map_err(io_at("copiar", &target))?;
-        mapper.dir_seen = true;
     }
     if !mapper.dir.is_empty() && !mapper.dir_seen {
         return Err(ExtractError::MissingExtractDir(

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::install::archive::ArchiveKind;
 use crate::install::layout::Layout;
 use crate::install::manifest::{Arch, HashAlgo, Source};
 
@@ -218,13 +219,7 @@ impl InstallPlan {
                 let mut verb = "Extrair";
                 if let Some(src) = self.source(*index) {
                     name = format!("[{}] {}", index + 1, src.file_name);
-                    let lower = src.file_name.to_ascii_lowercase();
-                    if ![".zip", ".tar.gz", ".tgz"]
-                        .iter()
-                        .any(|e| lower.ends_with(e))
-                    {
-                        verb = "Copiar";
-                    }
+                    verb = ArchiveKind::of(&src.file_name).map_or("Copiar", ArchiveKind::verb);
                     if let Some(to) = &src.extract_to {
                         dest = dest.join(to);
                     }

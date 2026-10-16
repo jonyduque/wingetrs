@@ -1,0 +1,78 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use wingetrs::install::archive::ArchiveKind::{self, *};
+use wingetrs::install::manifest::{Arch, resolve};
+
+const TABLE: &[(&str, Result<ArchiveKind, &str>)] = &[
+    ("a.zip", Ok(Zip)),
+    ("A.ZIP", Ok(Zip)),
+    ("a.tar.gz", Ok(TarGz)),
+    ("a.tgz", Ok(TarGz)),
+    ("a.7z", Ok(SevenZip)),
+    ("a.msi", Ok(Msi)),
+    ("a.nupkg", Ok(Nupkg)),
+    ("a.tar.xz", Ok(TarXz)),
+    ("a.txz", Ok(TarXz)),
+    ("a.rar", Err(".rar")),
+    ("a.tar.bz2", Err(".tar.bz2")),
+    ("a.tbz2", Err(".tbz2")),
+    ("a.zst", Err(".zst")),
+    ("a.exe", Ok(Plain)),
+    ("a.gz", Ok(Plain)),
+    ("a.xz", Ok(Plain)),
+    ("setup.7z.exe", Ok(Plain)),
+    ("a.zip.ps1", Ok(Plain)),
+];
+
+#[test]
+fn archive_kind_table() {
+    for (name, want) in TABLE {
+        assert_eq!(ArchiveKind::of(name), *want, "{name}");
+    }
+}
+
+#[test]
+fn only_2a_kinds_supported_for_now() {
+    for k in [Zip, TarGz, Plain] {
+        assert!(k.supported(), "{k:?}");
+    }
+    for k in [SevenZip, Msi, Nupkg, TarXz] {
+        assert!(!k.supported(), "{k:?}");
+    }
+}
+
+#[test]
+fn verb_matches_kind() {
+    assert_eq!(Plain.verb(), "Copiar");
+    for k in [Zip, TarGz, SevenZip, Msi, Nupkg, TarXz] {
+        assert_eq!(k.verb(), "Extrair", "{k:?}");
+    }
+}
+
+fn resolve_single_url(url: &str) -> Result<(), String> {
+    let json = format!(
+        r#"{{"version":"1","url":"{url}","hash":"{}"}}"#,
+        "0".repeat(64)
+    );
+    resolve(&json, Arch::X64)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn manifest_and_extractor_agree() {
+    for (name, kind) in TABLE {
+        let manifest_ok = resolve_single_url(&format!("https://x.test/{name}")).is_ok();
+        let accepted = matches!(kind, Ok(k) if k.supported());
+        assert_eq!(manifest_ok, accepted, "manifesto: {name}");
+        if !accepted {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(name);
+            std::fs::write(&file, b"junk").unwrap();
+            let dest = dir.path().join("out");
+            let err = wingetrs::install::extract::extract(&file, name, None, None, &dest)
+                .expect_err(name);
+            assert!(err.to_string().contains("não suportado"), "{name}: {err}");
+            assert!(!dest.join(name).exists(), "{name} copiado como solto");
+        }
+    }
+}

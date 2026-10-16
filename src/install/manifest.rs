@@ -3,6 +3,8 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::install::archive::ArchiveKind;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Arch {
     X64,
@@ -210,9 +212,6 @@ const SCRIPT_KEYS: [&str; 7] = [
     "uninstaller",
     "psmodule",
 ];
-const UNSUPPORTED_EXTS: [&str; 9] = [
-    ".7z", ".msi", ".rar", ".nupkg", ".tar.xz", ".tar.bz2", ".txz", ".tbz2", ".zst",
-];
 
 fn check_keys(root: &Obj) -> Result<(), ManifestError> {
     for k in SCRIPT_KEYS {
@@ -226,7 +225,7 @@ fn check_keys(root: &Obj) -> Result<(), ManifestError> {
         .get("innosetup")
         .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
     {
-        return unsupported("usa innosetup: suportado na fase 2b");
+        return unsupported("usa innosetup: suportado na fase 2c");
     }
     Ok(())
 }
@@ -262,9 +261,12 @@ fn build_sources(root: &Obj, variant: Option<&Obj>) -> Result<Vec<Source>, Manif
     let mut sources = Vec::new();
     for (i, raw_url) in urls.iter().enumerate() {
         let (url, file_name) = split_fragment(raw_url);
-        let lower = file_name.to_ascii_lowercase();
-        if let Some(ext) = UNSUPPORTED_EXTS.iter().find(|e| lower.ends_with(**e)) {
-            return unsupported(format!("download {ext}: suportado na fase 2b"));
+        match ArchiveKind::of(&file_name) {
+            Err(ext) => return unsupported(format!("download {ext}: formato não suportado")),
+            Ok(k) if !k.supported() => {
+                return unsupported(format!("download {}: suportado na fase 2b", k.ext()));
+            }
+            Ok(_) => {}
         }
         let Some(raw_hash) = hashes.get(i) else {
             return unsupported("sem hash para verificar o download");
