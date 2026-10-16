@@ -115,6 +115,25 @@ examples/oracle_2a.rs           cobertura por ArchiveKind e sub-caso
 - O `Display` passa a mostrar o motor: `(7z)` ou `(MSI, sem executar o instalador)`.
 - `spawn_blocking` só entra se a S2 mostrar o runtime bloqueado; nesse caso o handle é sempre aguardado.
 
+## (c2) Resultados das sondas e desenho revisado (2026-10-16)
+
+**S2 (Task 118), 7z:** 24/24 7z reais idênticos ao `7z.exe`; **16 de 40 ".7z" não são 7z** (12 instaladores PE/NSIS, 2 zip renomeados por `#/dl.7z`, 2 7z SFX). Consequência:
+- O formato do extrator vem da **assinatura do conteúdo**, não só da extensão: `37 7A BC AF 27 1C` ⇒ 7z; `PK 03 04` ⇒ zip (extrator da 2a); `MZ` ⇒ procurar a assinatura 7z depois do PE (SFX) e, se houver, ler a partir dela; senão (NSIS e outros) ⇒ `NãoSuportado("instalador .exe, não um arquivo 7z")`. A extensão continua decidindo o que o **manifesto** aceita (`ArchiveKind`); a assinatura decide o **extrator**, e a divergência é registrada no log.
+- `sevenz-rust2` com 1 thread: ~10,5 s no maior (122 MB) contra 2,6 s do `7z.exe` ⇒ extração em `spawn_blocking` com o handle aguardado e progresso por bytes. Multithread só se uma tarefa futura provar `join` e pânico (a S1 leu threads sem `join`).
+- Limites (S4): razão máxima medida 21,5; maior dicionário 512 MiB. O decodificador não limita memória: recusar **antes** de decodificar por soma de tamanhos declarados e por dicionário acima de 1 GiB.
+
+**S3 (Task 119), MSI:** 73/73 OLE/CFB; 0 gabinete externo, sem compressão ou Quantum. Layout próprio **73/73 (100%) idêntico** ao `msiexec /a` com a regra de colisão "duas linhas `File` no mesmo caminho: maior `Version` vence; empate ⇒ menor `Sequence`". `extract_dir`: comparar sem caixa e aceitar `/` como separador. `cab` 0.6 `read_file` é O(n²) por pasta (webex > 577 s contra 16 s): ler cada pasta **sequencialmente** uma vez.
+
+**D2-3 mantida pelo usuário (2026-10-16): reserva `msiexec /a` com fila.** Exceção registrada no `CLAUDE.md`. Desenho:
+1. **Quando:** só quando a extração própria devolve `NãoSuportado` (Quantum, gabinete externo, sem compressão, layout recusado). Erro de integridade (hash, nome inseguro) **nunca** cai na reserva.
+2. **Confirmação por item:** o plano mostra `Extrair [1] x.msi com o Windows Installer (msiexec /a; não pode ser cancelado depois de começar)`; a TUI pede confirmação daquele item; a CLI exige `--allow-msiexec` (nunca só `--yes`).
+3. **Fila única `msi.lock`** (`%LOCALAPPDATA%\wingetrs\msi.lock`, trava de arquivo entre processos, mesmo mecanismo do `install.lock`): uma reserva por vez em todo o wingetrs. **Os jobs da ponte que chamam o winget também entram nessa fila**, porque o winget roda instaladores MSI e disputa o mesmo mutex.
+4. **Mutex global antes de lançar:** checar `Global\_MSIExecute` (só abrir para teste, nunca criar); ocupado ⇒ esperar com o estado "aguardando outro instalador (Windows Installer ocupado)", consultando a cada 2 s, até 10 min; estourou ⇒ erro claro.
+5. **1618 mesmo assim:** o item volta para a fila, até 3 tentativas com espera crescente (5, 15, 45 s); depois, erro "o Windows Installer está ocupado por outro programa".
+6. **Sem cancelamento depois de lançar:** o botão de cancelar fica desabilitado e o job espera o `msiexec` terminar (a S3 mediu: matar o cliente não cancela; o serviço terminou em 254 s segurando o mutex). Timeout de 10 min só para avisar, nunca para matar.
+7. **Saída:** `TARGETDIR` dentro de `.staging-*` da raiz; o executor trata a árvore igual à da extração própria (mesmo `mapper`, `safepath`, orçamento) e apaga o `.msi` administrativo que o `msiexec` copia para a raiz.
+8. **Equivalência:** teste `#[ignore = "live: msiexec"]` que roda os dois caminhos sobre 3 MSI reais e compara a árvore (caminhos + SHA-256).
+
 ## (d) Sondas
 
 | # | Sonda | Modelo | Autorização |
