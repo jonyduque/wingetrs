@@ -73,6 +73,42 @@ fn extracts_tar_xz() {
     assert_eq!(std::fs::read(dest.join("doc/README")).unwrap(), b"r");
 }
 
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for b in data {
+        c ^= u32::from(*b);
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+#[test]
+fn tar_xz_with_a_4_gib_dictionary_is_refused_before_allocating() {
+    let mut xz = tarxz_with(&[("a.txt", b"1")], None);
+    // Stream header is 12 bytes; the block header starts with its size byte.
+    let hdr_len = (usize::from(xz[12]) + 1) * 4;
+    assert_eq!(xz[14], 0x21, "LZMA2 filter id");
+    xz[16] = 40; // dictionary 4 GiB
+    let crc = crc32(&xz[12..12 + hdr_len - 4]);
+    xz[12 + hdr_len - 4..12 + hdr_len].copy_from_slice(&crc.to_le_bytes());
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.tar.xz");
+    std::fs::write(&f, xz).unwrap();
+    let dest = d.path().join("out");
+    let r = extract(&f, "a.tar.xz", None, None, &dest);
+    let Err(ExtractError::Archive(m)) = &r else {
+        panic!("{r:?}")
+    };
+    assert!(m.contains("1 GiB"), "{m}");
+    assert!(!dest.exists());
+}
+
 #[test]
 fn tar_xz_symlink_refused() {
     let d = tempfile::tempdir().unwrap();

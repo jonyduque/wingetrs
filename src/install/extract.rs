@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::fs_retry;
 use crate::install::archive::ArchiveKind;
-use crate::install::extract_7z::extract_7z;
+use crate::install::extract_7z::{MAX_7Z_DICT, extract_7z};
 use crate::install::extract_msi::extract_msi;
 use crate::install::safepath;
 use crate::install::sniff::{self, Sniffed};
@@ -243,7 +243,7 @@ fn extract_one(
         Ok(ArchiveKind::TarXz) => {
             let f = fs::File::open(s.file).map_err(io_at("abrir", s.file))?;
             extract_tar(
-                lzma_rust2::XzReader::new(f, true),
+                lzma_rust2::XzReader::new_mem_limit(f, true, XZ_MEM_LIMIT_KB),
                 s.file,
                 tmp,
                 mapper,
@@ -419,6 +419,17 @@ fn extract_zip(
     Ok(())
 }
 
+/// Per-block xz decoder memory cap in KiB, the same 1 GiB as the 7z dictionary cap.
+const XZ_MEM_LIMIT_KB: u32 = (MAX_7Z_DICT >> 10) as u32;
+
+/// Maps a tar/decompressor error; the xz memory-limit refusal gets its own message.
+fn tar_err(e: io::Error) -> ExtractError {
+    if e.kind() == io::ErrorKind::OutOfMemory {
+        return ExtractError::Archive("dicionário xz maior que o limite de 1 GiB".to_string());
+    }
+    ExtractError::Archive(e.to_string())
+}
+
 /// Walks a tar stream already wrapped in its decompressor; `file` only sizes the budget.
 fn extract_tar(
     reader: impl Read,
@@ -430,13 +441,11 @@ fn extract_tar(
     let mut budget = Budget::for_file(file, limits)?;
     let mut count: u64 = 0;
     let mut ar = tar::Archive::new(reader);
-    let entries = ar
-        .entries()
-        .map_err(|e| ExtractError::Archive(e.to_string()))?;
+    let entries = ar.entries().map_err(tar_err)?;
     for entry in entries {
         count += 1;
         check_entries(count, limits)?;
-        let mut entry = entry.map_err(|e| ExtractError::Archive(e.to_string()))?;
+        let mut entry = entry.map_err(tar_err)?;
         let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
         let comps = safe_components(&name)?;
         let ty = entry.header().entry_type();
