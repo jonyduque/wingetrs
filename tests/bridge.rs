@@ -486,3 +486,30 @@ fn reboot_code_0x8a150109() {
         &REBOOT_MARKERS
     ));
 }
+
+#[test]
+fn every_reboot_marker_matches() {
+    // Independent copy of the .resw texts: a typo in the const must not pass.
+    let expected = [
+        "Restart your PC to finish installation.",
+        "Starten Sie den PC neu, um die Installation abzuschließen.",
+        "Reinicie el equipo para finalizar la instalación.",
+        "Redémarrez votre PC pour terminer l’installation.",
+        "Riavvia il PC per completare l'installazione..",
+        "PC を再起動してインストールを完了します。",
+        "PC를 다시 시작하여 설치를 완료합니다.",
+        "Reiniciar seu PC para terminar a instalação.",
+        "Перезапустите компьютер, чтобы завершить установку.",
+        "重启电脑以完成安装。",
+        "重新啟動您的電腦以完成安裝。",
+    ];
+    assert_eq!(REBOOT_MARKERS, expected);
+    for m in expected {
+        assert!(
+            reboot_requested(0, &[m.to_string()], &REBOOT_MARKERS),
+            "{m}"
+        );
+        let wrapped = format!("\u{1b}[0m{m}\u{1b}[0m");
+        assert!(reboot_requested(0, &[wrapped], &REBOOT_MARKERS), "{m}");
+    }
+}
