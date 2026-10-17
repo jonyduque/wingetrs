@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -200,21 +200,49 @@ fn serve_reports_exec_errors_with_their_kind() {
     );
 }
 
+/// How a fake helper behaves.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Serves,
+    /// Takes the first request, then dies without answering (winget may have run).
+    LostMidway,
+    /// Already gone: the request cannot even be sent.
+    Unsendable,
+}
+
+/// A writer to a helper that is gone.
+struct Broken;
+
+impl Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
 /// A helper process played by a thread running `serve` over two in-memory pipes.
 struct FakeHelper {
     reader: BufReader<std::io::PipeReader>,
     writer: Box<dyn Write + Send>,
     thread: Option<std::thread::JoinHandle<()>>,
+    alive: Arc<AtomicBool>,
 }
 
 impl FakeHelper {
-    /// `lost`: the helper dies before answering anything.
-    fn spawn(calls: Calls, lost: bool) -> FakeHelper {
+    fn spawn(calls: Calls, mode: Mode, alive: Arc<AtomicBool>) -> FakeHelper {
         let (req_r, req_w) = std::io::pipe().unwrap();
         let (resp_r, resp_w) = std::io::pipe().unwrap();
         let thread = std::thread::spawn(move || {
-            if lost {
-                return;
+            let mut req_r = BufReader::new(req_r);
+            match mode {
+                Mode::Unsendable => return,
+                Mode::LostMidway => {
+                    let _ = worker::read_line(&mut req_r);
+                    return;
+                }
+                Mode::Serves => {}
             }
             let mut resp_w = resp_w;
             let mut exec = |p: &str, a: &[String], on_line: &mut dyn FnMut(&str)| {
@@ -222,12 +250,17 @@ impl FakeHelper {
                 on_line("elevado");
                 Ok((0, Vec::new()))
             };
-            let _ = worker::serve(&mut BufReader::new(req_r), &mut resp_w, &mut exec);
+            let _ = worker::serve(&mut req_r, &mut resp_w, &mut exec);
         });
+        let writer: Box<dyn Write + Send> = match mode {
+            Mode::Unsendable => Box::new(Broken),
+            _ => Box::new(req_w),
+        };
         FakeHelper {
             reader: BufReader::new(resp_r),
-            writer: Box::new(req_w),
+            writer,
             thread: Some(thread),
+            alive,
         }
     }
 
@@ -252,6 +285,9 @@ impl Helper for FakeHelper {
         self.join();
         true
     }
+    fn alive(&mut self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for FakeHelper {
@@ -266,20 +302,42 @@ impl Drop for FakeHelper {
 struct FakeTransport {
     starts: Arc<AtomicUsize>,
     refuse: bool,
-    /// The first helper started dies at once.
+    /// The first helper started takes the request and dies.
     first_lost: bool,
+    /// The first this many helpers are already gone when the request is sent.
+    unsendable: usize,
     calls: Calls,
+    /// Liveness of every helper started, in order (the process the parent checks).
+    alive: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+}
+
+impl FakeTransport {
+    /// The `n`-th helper started exits on its own (the idle limit).
+    fn exit_helper(&self, n: usize) {
+        self.alive.lock().unwrap()[n].store(false, Ordering::SeqCst);
+    }
 }
 
 impl Transport for FakeTransport {
     fn start(&self) -> Result<Box<dyn Helper>, String> {
         let n = self.starts.fetch_add(1, Ordering::SeqCst);
-        if self.refuse {
+        // Detector: a restart loop ends here instead of hanging the test.
+        if self.refuse || n >= 5 {
             return Err("recusado".into());
         }
+        let mode = if n < self.unsendable {
+            Mode::Unsendable
+        } else if self.first_lost && n == 0 {
+            Mode::LostMidway
+        } else {
+            Mode::Serves
+        };
+        let alive = Arc::new(AtomicBool::new(true));
+        self.alive.lock().unwrap().push(Arc::clone(&alive));
         Ok(Box::new(FakeHelper::spawn(
             Arc::clone(&self.calls),
-            self.first_lost && n == 0,
+            mode,
+            alive,
         )))
     }
 }
@@ -429,6 +487,53 @@ fn a_lost_helper_fails_its_job_and_is_started_again() {
 }
 
 #[test]
+fn a_helper_that_exited_idle_is_started_again() {
+    let w = World::new();
+    let t = FakeTransport::default();
+    let bridge = ElevatedBridge::new(Box::new(t.clone()));
+    let machine = |target| job(Tool::Winget, target, Some(InstallScope::Machine));
+    w.run(&bridge, &machine("A.A")).0.unwrap();
+    w.run(&bridge, &machine("B.B")).0.unwrap();
+    assert_eq!(t.starts.load(Ordering::SeqCst), 1);
+    t.exit_helper(0);
+    let (r, seen) = w.run(&bridge, &machine("C.C"));
+    r.unwrap();
+    assert_eq!(seen, ["elevado"]);
+    assert_eq!(t.starts.load(Ordering::SeqCst), 2, "a new elevation");
+    assert_eq!(t.calls.lock().unwrap().len(), 3);
+    assert!(w.current().is_empty());
+}
+
+#[test]
+fn an_unsendable_request_restarts_the_helper_once() {
+    let w = World::new();
+    let machine = |target| job(Tool::Winget, target, Some(InstallScope::Machine));
+    // The first helper is gone at the send: one restart, and the job runs elevated.
+    let t = FakeTransport {
+        unsendable: 1,
+        ..FakeTransport::default()
+    };
+    let bridge = ElevatedBridge::new(Box::new(t.clone()));
+    let (r, seen) = w.run(&bridge, &machine("A.A"));
+    r.unwrap();
+    assert_eq!(seen, ["elevado"]);
+    assert_eq!(t.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(*t.calls.lock().unwrap(), vec![winget_command("A.A")]);
+    // Every helper is gone at the send: one retry, never two, and the job fails.
+    let t = FakeTransport {
+        unsendable: usize::MAX,
+        ..FakeTransport::default()
+    };
+    let bridge = ElevatedBridge::new(Box::new(t.clone()));
+    let (r, _) = w.run(&bridge, &machine("B.B"));
+    let err = format!("{:?}", r.unwrap_err());
+    assert!(err.contains("auxiliar elevado"), "{err}");
+    assert_eq!(t.starts.load(Ordering::SeqCst), 2, "one retry, never two");
+    assert!(t.calls.lock().unwrap().is_empty());
+    assert!(w.current().is_empty(), "no silent unelevated run");
+}
+
+#[test]
 fn shutdown_sends_quit_and_waits() {
     let t = FakeTransport::default();
     let bridge = ElevatedBridge::new(Box::new(t.clone()));
@@ -546,7 +651,9 @@ fn worker_never_touches_the_data_dir() {
     let dir = TempDir::new().unwrap();
     let base = dir.path().join("localappdata");
     std::fs::create_dir(&base).unwrap();
-    let pipe = format!(r"\.\pipe\wingetrs-elevated-{}", "0".repeat(32));
+    // A valid name of no pipe: the worker gets past the name check, opens the parent and fails
+    // only at CreateFileW.
+    let pipe = format!(r"\\.\pipe\wingetrs-elevated-{}", "0".repeat(32));
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_wingetrs"))
         .args(["bridge-worker", "--pipe", &pipe, "--parent"])
         .arg(std::process::id().to_string())
@@ -556,6 +663,7 @@ fn worker_never_touches_the_data_dir() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
     assert!(stderr.contains("auxiliar elevado"), "{stderr}");
+    assert!(!stderr.contains("nome de pipe inválido"), "{stderr}");
     let left: Vec<_> = std::fs::read_dir(&base).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
 }

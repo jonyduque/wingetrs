@@ -367,6 +367,12 @@ impl Helper for PipeHelper {
         let woke = unsafe { WaitForSingleObject(raw(&self.process), ms) };
         woke == WAIT_OBJECT_0
     }
+
+    fn alive(&mut self) -> bool {
+        // SAFETY: the process handle is open while `self` lives.
+        let woke = unsafe { WaitForSingleObject(raw(&self.process), 0) };
+        woke == WAIT_TIMEOUT
+    }
 }
 
 /// The PID of `process`, which must be the client connected to `pipe`.
@@ -647,6 +653,10 @@ fn package_path(full_name: &str) -> std::io::Result<PathBuf> {
 /// `Program Files\WindowsApps`; `NotFound` when there is none in that place.
 pub fn winget_exe() -> std::io::Result<PathBuf> {
     let root = program_files()?;
+    // The first package of the family (in the system's order) that sits in the protected
+    // folder and has winget.exe wins; versions are not compared, since any copy there was
+    // put by Windows. A package elsewhere (a developer registration, say) is skipped, and
+    // none in place fails closed: nothing runs rather than a winget from a writable folder.
     for full_name in family_packages(WINGET_FAMILY)? {
         let found = package_path(&full_name)
             .ok()

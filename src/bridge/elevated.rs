@@ -18,6 +18,8 @@ pub trait Helper: Send {
     fn writer(&mut self) -> &mut dyn Write;
     /// Waits at most `limit` for the helper to exit; whether it did.
     fn wait_exit(&mut self, limit: Duration) -> bool;
+    /// Whether the helper process is still running (it exits on its own after a while idle).
+    fn alive(&mut self) -> bool;
 }
 
 /// Starts the helper (the one UAC prompt) and connects to it; `Err` carries the reason.
@@ -86,22 +88,14 @@ impl ElevatedBridge {
         let wanted = job.tool == Tool::Winget && job.scope == Some(InstallScope::Machine);
         let elevated = wanted && {
             let mut state = self.lock();
-            match &*state {
-                State::Running(_) => true,
-                State::Refused => false,
-                State::NotStarted => match self.transport.start() {
-                    Ok(helper) => {
-                        tracing::info!("bridge: elevated helper started");
-                        *state = State::Running(helper);
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "bridge: elevation refused; running unelevated");
-                        *state = State::Refused;
-                        on_line(REFUSED_NOTE);
-                        false
-                    }
-                },
+            match self.ensure_started(&mut state) {
+                Ok(()) => true,
+                Err(None) => false,
+                Err(Some(e)) => {
+                    tracing::warn!(error = %e, "bridge: elevation refused; running unelevated");
+                    on_line(REFUSED_NOTE);
+                    false
+                }
             }
         };
         if !elevated {
@@ -120,8 +114,37 @@ impl ElevatedBridge {
         }
     }
 
-    /// Runs one command of `job` through the helper. A broken helper is dropped, so the next
-    /// machine-wide job starts a new one.
+    /// Makes `state` `Running`: a helper that exited (idle) is dropped and a new one started
+    /// (a new UAC prompt). `Err(Some(reason))` when starting failed now (the state becomes
+    /// `Refused`), `Err(None)` when it was refused before.
+    fn ensure_started(&self, state: &mut State) -> Result<(), Option<String>> {
+        if let State::Running(helper) = state
+            && !helper.alive()
+        {
+            tracing::info!("bridge: elevated helper exited; starting a new one");
+            *state = State::NotStarted;
+        }
+        match state {
+            State::Running(_) => Ok(()),
+            State::Refused => Err(None),
+            State::NotStarted => match self.transport.start() {
+                Ok(helper) => {
+                    tracing::info!("bridge: elevated helper started");
+                    *state = State::Running(helper);
+                    Ok(())
+                }
+                Err(e) => {
+                    *state = State::Refused;
+                    Err(Some(e))
+                }
+            },
+        }
+    }
+
+    /// Runs one command of `job` through the helper. When the request cannot even be sent
+    /// (the helper died before winget started), a new helper is started and the request sent
+    /// once more; a helper lost after that is dropped, so the next machine-wide job starts a
+    /// new one.
     fn run_elevated(
         &self,
         job: &BridgeJob,
@@ -131,15 +154,25 @@ impl ElevatedBridge {
     ) -> std::io::Result<(i32, Vec<String>)> {
         let request = request_for(job, program, args)?;
         let mut state = self.lock();
-        let State::Running(helper) = &mut *state else {
-            return Err(lost("não está rodando"));
-        };
-        match ask(helper.as_mut(), &request, on_line) {
-            Ok(answer) => answer,
-            Err(e) => {
-                tracing::warn!(error = %e, "bridge: elevated helper lost");
-                *state = State::NotStarted;
-                Err(e)
+        let mut retried = false;
+        loop {
+            let State::Running(helper) = &mut *state else {
+                return Err(lost("não está rodando"));
+            };
+            let e = match ask(helper.as_mut(), &request, on_line) {
+                Ok(answer) => return answer,
+                Err(Lost::Unsent(e)) if !retried => e,
+                Err(Lost::Unsent(e) | Lost::Midway(e)) => {
+                    tracing::warn!(error = %e, "bridge: elevated helper lost");
+                    *state = State::NotStarted;
+                    return Err(e);
+                }
+            };
+            retried = true;
+            tracing::warn!(error = %e, "bridge: request not sent; starting a new helper");
+            *state = State::NotStarted;
+            if let Err(reason) = self.ensure_started(&mut state) {
+                return Err(lost(reason.unwrap_or_else(|| "recusado".to_string())));
             }
         }
     }
@@ -193,25 +226,37 @@ fn request_for(job: &BridgeJob, program: &str, args: &[String]) -> std::io::Resu
     ))
 }
 
+/// A broken channel to the helper.
+enum Lost {
+    /// The request was not sent: nothing ran.
+    Unsent(std::io::Error),
+    /// Broke after the request went out: the tool may have run.
+    Midway(std::io::Error),
+}
+
 /// Sends `request` and relays the helper's lines until its answer. The outer `Err` is a broken
 /// channel; the inner result is the helper's own answer.
 fn ask(
     helper: &mut dyn Helper,
     request: &Request,
     on_line: &mut dyn FnMut(&str),
-) -> std::io::Result<std::io::Result<(i32, Vec<String>)>> {
-    let line = worker::encode(request)?;
+) -> Result<std::io::Result<(i32, Vec<String>)>, Lost> {
+    let line = match worker::encode(request) {
+        Ok(line) => line,
+        Err(e) => return Ok(Err(e)),
+    };
     let sent = helper
         .writer()
         .write_all(line.as_bytes())
         .and_then(|()| helper.writer().flush());
-    sent.map_err(lost)?;
+    sent.map_err(|e| Lost::Unsent(lost(e)))?;
+    let midway = |e: std::io::Error| Lost::Midway(lost(e));
     let mut tail = Tail::new();
     loop {
-        let Some(line) = worker::read_line(helper.reader()).map_err(lost)? else {
-            return Err(lost("fechou o canal"));
+        let Some(line) = worker::read_line(helper.reader()).map_err(midway)? else {
+            return Err(midway(std::io::Error::other("fechou o canal")));
         };
-        match worker::decode::<Reply>(&line).map_err(lost)? {
+        match worker::decode::<Reply>(&line).map_err(midway)? {
             Reply::Line { text } => {
                 on_line(&text);
                 tail.add(text);
