@@ -61,10 +61,10 @@ impl Drop for OwnKey {
     }
 }
 
-struct Lab {
+pub(crate) struct Lab {
     _t: TempDir,
     local: PathBuf,
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     uri: String,
     key: OwnKey,
 }
@@ -72,7 +72,7 @@ struct Lab {
 impl Lab {
     /// `solo` exists only in `main` (served by `server`); `x` exists in `main` and `extras`;
     /// `m` (only in `main`) is an MSI the own extractor refuses.
-    async fn new(server: &MockServer, tag: &str) -> Lab {
+    pub(crate) async fn new(server: &MockServer, tag: &str) -> Lab {
         let t = tempfile::tempdir().unwrap();
         let local = t.path().to_path_buf();
         let root = local.join("wingetrs");
@@ -169,7 +169,7 @@ impl Lab {
         }
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    pub(crate) fn run(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_wingetrs"))
             .args(args)
             .stdin(Stdio::null())

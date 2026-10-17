@@ -4049,6 +4049,8 @@ fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
         tool,
         target: target.into(),
         name: target.into(),
+        installed: Some("1".into()),
+        available: Some("2".into()),
     }
 }
 
@@ -4716,6 +4718,8 @@ fn unchecking_an_apply_group() {
             tool: Tool::Winget,
             target: "Git.Git".into(),
             name: "Git.Git".into(),
+            installed: Some("1".into()),
+            available: Some("2".into()),
         })]
     );
 }

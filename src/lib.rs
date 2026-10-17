@@ -11,6 +11,7 @@ pub mod http;
 pub mod icons;
 pub mod install;
 pub mod installed;
+pub mod job_log;
 pub mod pins;
 pub mod sources;
 pub mod tui;

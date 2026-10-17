@@ -12,7 +12,7 @@ pub const PINNED_NOTE: &str = "versão fixada";
 pub const NOT_OURS_NOTE: &str = "instalado fora do wingetrs";
 
 /// Lines kept for the error log.
-pub const TAIL_LINES: usize = 20;
+pub const TAIL_LINES: usize = 40;
 /// Longest line kept, in bytes.
 pub const LINE_MAX: usize = 1024;
 /// Longest unterminated line buffered; the rest of it is dropped until the next `\n`.
@@ -41,6 +41,10 @@ pub struct BridgeJob {
     pub target: String,
     /// Name of the list row.
     pub name: String,
+    /// Installed version of the list row, for the job log.
+    pub installed: Option<String>,
+    /// Version the catalog offers, for the job log and the winget check.
+    pub available: Option<String>,
 }
 
 /// Whether `r` is upgraded through winget (ARP/MSIX matched in the winget catalog) or scoop
@@ -65,10 +69,16 @@ pub fn bridge_target(r: &ListRow, pins: &BTreeSet<String>) -> Result<BridgeJob, 
         ) if source == "winget" => (Tool::Winget, package_id.clone()),
         _ => return Err(NOT_OURS_NOTE),
     };
+    let available = match &r.state {
+        UpdateState::Available { latest } => Some(latest.clone()),
+        _ => None,
+    };
     Ok(BridgeJob {
         tool,
         target,
         name: r.name.clone(),
+        installed: r.installed_version.clone(),
+        available,
     })
 }
 
@@ -245,12 +255,50 @@ pub fn reboot_requested(code: i32, lines: &[String], markers: &[&str]) -> bool {
     })
 }
 
+/// The version winget picked, from its `<name> [<target>] <word> <version>` line (any
+/// language: the id in brackets and the last word of the line).
+pub fn winget_chosen_version(target: &str, lines: &[String]) -> Option<String> {
+    let id = format!("[{target}]");
+    lines.iter().find_map(|l| {
+        let l = plain(l);
+        let rest = l[l.find(&id)? + id.len()..]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let version = rest.last().filter(|_| rest.len() >= 2)?;
+        version
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then(|| version.to_string())
+    })
+}
+
+/// The installer's own log path winget prints (a line ending in `.log` with an absolute path).
+pub fn winget_installer_log(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|l| {
+        let l = plain(l);
+        let l = l.trim();
+        if !l.to_ascii_lowercase().ends_with(".log") {
+            return None;
+        }
+        let b = l.as_bytes();
+        let start = (0..b.len().saturating_sub(2)).find(|&i| {
+            b[i].is_ascii_alphabetic()
+                && b[i + 1] == b':'
+                && b[i + 2] == b'\\'
+                && (i == 0 || b[i - 1] == b' ')
+        })?;
+        Some(l[start..].to_string())
+    })
+}
+
 /// winget's exit code (an HRESULT) as a message (task 105 probe, §4.4).
 pub fn winget_message(code: i32) -> String {
     let text = match code as u32 {
         0 => "Atualizado.",
         0x8A15_002B => "Nenhuma atualização aplicável para este pacote.",
         0x8A15_0014 => "O winget não encontrou este pacote instalado.",
+        0x8A15_0114 => {
+            "O editor não permite atualizar este pacote pelo winget; use o atualizador do próprio app."
+        }
         0x8A15_0016 => "Mais de um pacote corresponde a este id.",
         0x8A15_0068 => "Pacote fixado no winget (pin); remova o pin para atualizar.",
         0x8A15_008E => {

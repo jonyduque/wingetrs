@@ -9,6 +9,7 @@ use crate::install::ops::{self, AllowMsiexec, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
+use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -269,6 +270,37 @@ fn installed(applied: Result<Vec<InstallPlan>, OpsError>) -> Result<Done, Instal
 
 /// Executes a confirmed action (the lock policy is the context's `wait`).
 pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallFail> {
+    let info = match &action {
+        Action::Apply(groups) | Action::ApplyMsiexec { groups, .. } => {
+            let plans = groups.iter().flatten();
+            let kind = JobInfo::plans_kind(plans.clone());
+            Some(JobInfo::for_plans(kind, plans))
+        }
+        Action::Remove(plan) => Some(JobInfo {
+            kind: "remove",
+            tool: "wingetrs",
+            target: plan.app.clone(),
+            name: plan.app.clone(),
+            from: Some(plan.version.clone()),
+            to: None,
+            cmd: None,
+        }),
+        // Logged by `run_bridge`.
+        Action::Bridge(_) => None,
+    };
+    let log = info.map(JobLog::start);
+    let result = run_action_inner(o, action).await;
+    if let Some(log) = log {
+        match &result {
+            Ok(done) => log.finish(Outcome::Ok, &done.summary),
+            Err(InstallFail::Other(m)) => log.finish(Outcome::Failed, m),
+            Err(other) => log.finish(Outcome::Failed, &format!("{other:?}")),
+        }
+    }
+    result
+}
+
+async fn run_action_inner(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallFail> {
     match action {
         Action::Apply(groups) => installed(ops::apply_groups(o, groups).await),
         Action::ApplyMsiexec { groups, app } => {
@@ -301,7 +333,9 @@ pub type BridgeExec<'a> =
 
 /// Upgrades an app through winget or scoop. The target is checked before anything runs; for
 /// scoop, the installed version is read right before and right after the run, since its exit
-/// code 0 alone does not mean it upgraded. On failure the last lines go to the log.
+/// code 0 alone does not mean it upgraded. For winget, exit 0 counts only when the version it
+/// picked is the one wingetrs offered (its own catalog may be older). Start and end of the job
+/// go to the log (`job.start`, `job.end`), with the last lines of output when it did not work.
 /// `scoop_root` is `None` when it could not be found: a scoop job then fails before running.
 /// A winget job holds `msi_lock` while winget runs (its MSI installers share the Windows
 /// Installer mutex with ours); scoop never takes it.
@@ -313,6 +347,46 @@ pub fn run_bridge(
     exec: BridgeExec<'_>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Done, InstallFail> {
+    let root = scoop_root.unwrap_or(Path::new(""));
+    let (program, args) = bridge::command(job, root, pwsh);
+    let mut log = JobLog::start(JobInfo {
+        kind: "bridge",
+        tool: job.tool.name(),
+        target: job.target.clone(),
+        name: job.name.clone(),
+        from: job.installed.clone(),
+        to: job.available.clone(),
+        cmd: Some(bridge::command_text(&program, &args)),
+    });
+    let result = bridge_run(
+        job,
+        scoop_root,
+        msi_lock,
+        (&program, &args),
+        exec,
+        on_line,
+        &mut log,
+    );
+    match &result {
+        Ok(done) => log.finish(Outcome::Ok, &done.summary),
+        Err(InstallFail::Other(m)) => {
+            let outcome = log.failure;
+            log.finish(outcome, m);
+        }
+        Err(other) => log.finish(Outcome::Failed, &format!("{other:?}")),
+    }
+    result
+}
+
+fn bridge_run(
+    job: &BridgeJob,
+    scoop_root: Option<&Path>,
+    msi_lock: &Path,
+    (program, args): (&str, &[String]),
+    exec: BridgeExec<'_>,
+    on_line: &mut dyn FnMut(&str),
+    log: &mut JobLog,
+) -> Result<Done, InstallFail> {
     let fail = |message: String| Err(InstallFail::Other(format!("{}: {message}", job.name)));
     if !bridge::valid_target(job.tool, &job.target) {
         return fail(format!("identificador inválido: {}", job.target));
@@ -321,7 +395,6 @@ pub fn run_bridge(
         (Tool::Scoop, None) => return fail("scoop não encontrado".to_string()),
         (_, root) => root.unwrap_or(Path::new("")),
     };
-    let (program, args) = bridge::command(job, scoop_root, pwsh);
     let version = || match job.tool {
         Tool::Scoop => bridge::scoop_version(scoop_root, &job.target),
         Tool::Winget => None,
@@ -345,7 +418,7 @@ pub fn run_bridge(
         Tool::Scoop => None,
     };
     let before = version();
-    let run = exec(&program, &args, on_line);
+    let run = exec(program, args, on_line);
     let after = version();
     let (code, lines) = match run {
         Ok(r) => r,
@@ -354,7 +427,13 @@ pub fn run_bridge(
         }
         Err(e) => return fail(format!("falha ao iniciar {program}: {e}")),
     };
-    let (updated, message) = match job.tool {
+    log.code = Some(code);
+    log.after = after.clone();
+    log.installer_log = match job.tool {
+        Tool::Winget => bridge::winget_installer_log(&lines),
+        Tool::Scoop => None,
+    };
+    let (mut updated, mut message) = match job.tool {
         Tool::Winget if bridge::reboot_requested(code, &lines, &bridge::REBOOT_MARKERS) => {
             let message = "Atualizado; reinicie o computador para concluir.";
             tracing::info!(target = %job.target, "{message}");
@@ -363,21 +442,26 @@ pub fn run_bridge(
         Tool::Winget => (bridge::winget_updated(code), bridge::winget_message(code)),
         Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),
     };
+    if updated && job.tool == Tool::Winget {
+        let chosen = bridge::winget_chosen_version(&job.target, &lines);
+        if let (Some(chosen), Some(available)) = (&chosen, &job.available)
+            && chosen != available
+        {
+            updated = false;
+            message = format!(
+                "O winget instalou {chosen}, não {available}: o catálogo local do winget está mais velho que o do wingetrs. Tente de novo mais tarde."
+            );
+            log.failure = Outcome::NoEffect;
+        }
+        log.after = chosen;
+    }
+    log.lines = lines;
     if updated {
         return Ok(Done {
             summary: format!("{}: {message}", job.name),
             residues: None,
         });
     }
-    tracing::warn!(
-        tool = job.tool.name(),
-        target = %job.target,
-        code,
-        "bridge upgrade failed: {message}
-    {}",
-        lines.join("
-    ")
-    );
     fail(message)
 }
 

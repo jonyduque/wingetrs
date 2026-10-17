@@ -4,6 +4,7 @@ use super::{Command, output, style};
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
 use crate::install::residue::{self, Confidence, Residue};
 use crate::install::target::Candidate;
+use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::picker::PickerItem;
 use anyhow::bail;
 use std::collections::BTreeMap;
@@ -165,6 +166,14 @@ fn proceed(ui: &dyn Ui, f: Flags) -> anyhow::Result<bool> {
     ui.confirm("Continuar?")
 }
 
+/// Writes the `job.end` line of a CLI job from its result.
+fn finish_log<T, E: std::fmt::Display>(log: JobLog, result: &Result<T, E>, ok: &str) {
+    match result {
+        Ok(_) => log.finish(Outcome::Ok, ok),
+        Err(e) => log.finish(Outcome::Failed, &e.to_string()),
+    }
+}
+
 /// Runs one of the operation commands.
 pub async fn execute(ctx: &OpsCtx<'_>, ui: &dyn Ui, cmd: Command) -> anyhow::Result<()> {
     match cmd {
@@ -284,7 +293,10 @@ async fn install(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
-    ops::apply_allowing(ctx, &plans, &f.allow()).await?;
+    let log = JobLog::start(JobInfo::for_plans("install", &plans));
+    let applied = ops::apply_allowing(ctx, &plans, &f.allow()).await;
+    finish_log(log, &applied, "instalado");
+    applied?;
     for p in &plans {
         anstream::println!(
             "{} {} {}",
@@ -318,7 +330,18 @@ fn uninstall(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
-    let residues = ops::uninstall(ctx, &plan)?;
+    let log = JobLog::start(JobInfo {
+        kind: "remove",
+        tool: "wingetrs",
+        target: plan.app.clone(),
+        name: plan.app.clone(),
+        from: Some(plan.version.clone()),
+        to: None,
+        cmd: None,
+    });
+    let removed = ops::uninstall(ctx, &plan);
+    finish_log(log, &removed, "removido");
+    let residues = removed?;
     anstream::println!(
         "{} {} {}",
         style::paint(style::OK, "Desinstalado:"),
@@ -474,7 +497,10 @@ async fn upgrade(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
-    for p in ops::apply_groups_allowing(ctx, groups, &f.allow()).await? {
+    let log = JobLog::start(JobInfo::for_plans("upgrade", groups.iter().flatten()));
+    let applied = ops::apply_groups_allowing(ctx, groups, &f.allow()).await;
+    finish_log(log, &applied, "atualizado");
+    for p in applied? {
         anstream::println!(
             "{} {} {}",
             style::paint(style::OK, "Atualizado:"),

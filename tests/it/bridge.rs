@@ -34,6 +34,8 @@ fn bridge_target_rules() {
     assert_eq!(arp.tool, Tool::Winget);
     assert_eq!(arp.target, "Pub.Git");
     assert_eq!(arp.name, "Git");
+    assert_eq!(arp.installed.as_deref(), Some("1"));
+    assert_eq!(arp.available.as_deref(), Some("2"));
     let msix = bridge_target(&row("Term", "msix", "winget", available()), &none).unwrap();
     assert_eq!(msix.tool, Tool::Winget);
     assert_eq!(msix.target, "Pub.Term");
@@ -61,6 +63,8 @@ fn job(tool: Tool, target: &str) -> BridgeJob {
         tool,
         target: target.into(),
         name: target.into(),
+        installed: None,
+        available: None,
     }
 }
 
@@ -301,12 +305,12 @@ fn tail_splits_lines() {
     );
     assert_eq!(t.finish(), Some("resto".to_string()));
     assert_eq!(t.finish(), None);
-    for i in 0..30 {
+    for i in 0..60 {
         t.push(format!("l{i}\n").as_bytes());
     }
-    assert_eq!(t.lines().len(), 20);
-    assert_eq!(t.lines()[0], "l10");
-    assert_eq!(t.last(), Some("l29"));
+    assert_eq!(t.lines().len(), 40);
+    assert_eq!(t.lines()[0], "l20");
+    assert_eq!(t.last(), Some("l59"));
 }
 
 #[cfg(windows)]

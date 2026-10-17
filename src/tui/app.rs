@@ -278,7 +278,8 @@ pub const BRIDGE_WAITING: &str =
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
     Ours(String, String),
-    Bridge(BridgeJob),
+    /// Boxed: the job carries two version strings and `Modal` would grow.
+    Bridge(Box<BridgeJob>),
 }
 
 /// Whether the bridge tools exist; `None` until the startup check answers (enabled meanwhile:
@@ -2092,7 +2093,7 @@ fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, &'static str> {
     match (present, job.tool) {
         (Some(false), Tool::Winget) => Err("winget não está instalado"),
         (Some(false), Tool::Scoop) => Err("scoop não está instalado"),
-        _ => Ok(Target::Bridge(job)),
+        _ => Ok(Target::Bridge(Box::new(job))),
     }
 }
 
@@ -2379,7 +2380,7 @@ fn upgrade_one(app: &mut App) -> Vec<Cmd> {
     };
     match target {
         Ok(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
-        Ok(Target::Bridge(job)) => start_bridge(app, job),
+        Ok(Target::Bridge(job)) => start_bridge(app, *job),
         Err(PINNED_NOTE) => {
             app.push_toast(ToastKind::Warning, "versão fixada (desafixe no menu)");
             Vec::new()
@@ -2541,7 +2542,7 @@ fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize, left_out: usize)
                     keep,
                 },
             )),
-            Ok(Target::Bridge(job)) => bridges.push(job),
+            Ok(Target::Bridge(job)) => bridges.push(*job),
             Err(_) => skipped.push(r.name.clone()),
         }
     }
@@ -3007,7 +3008,7 @@ fn run_action(
         ActionId::Install => install_one(app),
         ActionId::Upgrade => match upgrade {
             Some(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
-            Some(Target::Bridge(job)) => start_bridge(app, job),
+            Some(Target::Bridge(job)) => start_bridge(app, *job),
             None => Vec::new(),
         },
         ActionId::Remove => remove.map_or_else(Vec::new, |target| plan_remove(app, target)),

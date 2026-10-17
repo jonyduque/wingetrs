@@ -959,6 +959,8 @@ fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
         tool,
         target: target.into(),
         name: format!("App {target}"),
+        installed: None,
+        available: None,
     }
 }
 
