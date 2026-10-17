@@ -8,7 +8,7 @@ use wingetrs::installed::winget_tracking::{TrackedPackage, Tracking, read_tracki
 use wingetrs::installed::{Hive, InstallSource, InstalledApp};
 use wingetrs::sources::winget::index::read_index;
 
-const DB: &[u8] = include_bytes!("fixtures/winget/index-mini.db");
+const DB: &[u8] = include_bytes!("../fixtures/winget/index-mini.db");
 
 fn catalog() -> Catalog {
     let dir = tempfile::tempdir().unwrap();

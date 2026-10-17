@@ -6,11 +6,12 @@
 use wingetrs::installed::normalize::{Architecture, NameNormalizer};
 
 const NAMES: &str =
-    include_str!("../docs/reference/winget-cli/AppInstallerCLITests_TestData_InputNames.txt");
-const PUBS: &str =
-    include_str!("../docs/reference/winget-cli/AppInstallerCLITests_TestData_InputPublishers.txt");
+    include_str!("../../docs/reference/winget-cli/AppInstallerCLITests_TestData_InputNames.txt");
+const PUBS: &str = include_str!(
+    "../../docs/reference/winget-cli/AppInstallerCLITests_TestData_InputPublishers.txt"
+);
 const IDS: &str = include_str!(
-    "../docs/reference/winget-cli/AppInstallerCLITests_TestData_NormalizationInitialIds.txt"
+    "../../docs/reference/winget-cli/AppInstallerCLITests_TestData_NormalizationInitialIds.txt"
 );
 
 /// Measured pass count of the golden corpus. Raise it, never lower it.

@@ -2085,7 +2085,7 @@ fn list_encodes_only_cached_icons() {
         "{cmds:?}"
     );
     // The worker that serves it never touches the network.
-    let src = include_str!("../src/tui/run.rs");
+    let src = include_str!("../../src/tui/run.rs");
     let from = src.find("fn spawn_cached_icon").unwrap();
     let to = src[from..].find("/// Runs one keystroke").unwrap();
     let body = &src[from..from + to];

@@ -16,11 +16,11 @@ impl Env {
         for (p, body) in [
             (
                 "/source2.msix",
-                include_bytes!("fixtures/winget/source2-mini.msix").to_vec(),
+                include_bytes!("../fixtures/winget/source2-mini.msix").to_vec(),
             ),
             (
                 "/main.tgz",
-                include_bytes!("fixtures/scoop/Main-mini.tar.gz").to_vec(),
+                include_bytes!("../fixtures/scoop/Main-mini.tar.gz").to_vec(),
             ),
         ] {
             Mock::given(method("GET"))

@@ -1158,7 +1158,7 @@ fn fixture_7z() -> Vec<u8> {
 }
 
 /// MSI with `pkg\one.txt` (`f_one` of `tests/fixtures/msi/one.cab`, "one\r\n"), built
-/// as `tests/install_msi.rs` does.
+/// as `tests/it/install_msi.rs` does.
 fn fixture_msi() -> Vec<u8> {
     msi_with(2, "one.txt")
 }

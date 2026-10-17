@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-mod spans;
+use crate::spans;
 
 use wingetrs::cache::{DataDir, HttpEntry, HttpState};
 use wingetrs::catalog::Catalog;
@@ -11,8 +11,8 @@ use wingetrs::update::{
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const MSIX: &[u8] = include_bytes!("fixtures/winget/source2-mini.msix");
-const TGZ: &[u8] = include_bytes!("fixtures/scoop/Main-mini.tar.gz");
+const MSIX: &[u8] = include_bytes!("../fixtures/winget/source2-mini.msix");
+const TGZ: &[u8] = include_bytes!("../fixtures/scoop/Main-mini.tar.gz");
 
 async fn setup() -> (MockServer, Endpoints) {
     let s = MockServer::start().await;

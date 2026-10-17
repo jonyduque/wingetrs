@@ -5,8 +5,8 @@ use wingetrs::sources::winget::details::details;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const VD: &[u8] = include_bytes!("fixtures/winget/powertoys.versionData.mszyml");
-const MANIFEST: &[u8] = include_bytes!("fixtures/winget/powertoys-0.101.2362.0.merged.yaml");
+const VD: &[u8] = include_bytes!("../fixtures/winget/powertoys.versionData.mszyml");
+const MANIFEST: &[u8] = include_bytes!("../fixtures/winget/powertoys-0.101.2362.0.merged.yaml");
 const HASH_HEX: &str = "d193b67ac71ce5d456c10f6731447abb6df68ae12ef8691c92af8ed82659e720";
 
 async fn server(manifest: &[u8]) -> MockServer {

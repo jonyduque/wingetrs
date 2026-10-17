@@ -2,7 +2,7 @@
 use wingetrs::core::SourceKind;
 use wingetrs::sources::winget::manifest::parse;
 
-const PT: &[u8] = include_bytes!("fixtures/winget/powertoys-0.101.2362.0.merged.yaml");
+const PT: &[u8] = include_bytes!("../fixtures/winget/powertoys-0.101.2362.0.merged.yaml");
 
 #[test]
 fn parses_real_powertoys_manifest() {

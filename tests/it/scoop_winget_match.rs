@@ -187,7 +187,7 @@ fn twin_icon_is_the_unique_same_site_candidates() {
 
 #[test]
 fn details_are_sent_before_the_twin_search() {
-    let src = include_str!("../src/tui/run.rs");
+    let src = include_str!("../../src/tui/run.rs");
     let from = src.find("fn spawn_details").unwrap();
     let body = &src[from..from + src[from..].find("/// Debounced fetch").unwrap()];
     let sent = body.find("ctx.tx.send(msg)").unwrap();

@@ -6,11 +6,11 @@ use wingetrs::sources::winget::{WingetFetch, fetch_index};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const MSIX: &[u8] = include_bytes!("fixtures/winget/source2-mini.msix");
-const CORRUPT: &[u8] = include_bytes!("fixtures/winget/source2-mini-corrupt.msix");
-const MISSING_BLOCK: &[u8] = include_bytes!("fixtures/winget/source2-mini-missing-block.msix");
-const BAD_FILEHASH: &[u8] = include_bytes!("fixtures/winget/source2-mini-bad-filehash.msix");
-const DB: &[u8] = include_bytes!("fixtures/winget/index-mini.db");
+const MSIX: &[u8] = include_bytes!("../fixtures/winget/source2-mini.msix");
+const CORRUPT: &[u8] = include_bytes!("../fixtures/winget/source2-mini-corrupt.msix");
+const MISSING_BLOCK: &[u8] = include_bytes!("../fixtures/winget/source2-mini-missing-block.msix");
+const BAD_FILEHASH: &[u8] = include_bytes!("../fixtures/winget/source2-mini-bad-filehash.msix");
+const DB: &[u8] = include_bytes!("../fixtures/winget/index-mini.db");
 
 #[test]
 fn valid_msix_yields_exact_index_bytes() {

@@ -29,13 +29,13 @@ async fn deleted_catalog_with_fresh_http_state_is_rebuilt_by_search() {
     };
     ok(
         "/source2.msix",
-        include_bytes!("fixtures/winget/source2-mini.msix"),
+        include_bytes!("../fixtures/winget/source2-mini.msix"),
     )
     .mount(&s)
     .await;
     ok(
         "/main.tgz",
-        include_bytes!("fixtures/scoop/Main-mini.tar.gz"),
+        include_bytes!("../fixtures/scoop/Main-mini.tar.gz"),
     )
     .mount(&s)
     .await;
@@ -91,13 +91,13 @@ async fn existing_but_empty_catalog_is_updated_by_search() {
     };
     ok(
         "/source2.msix",
-        include_bytes!("fixtures/winget/source2-mini.msix"),
+        include_bytes!("../fixtures/winget/source2-mini.msix"),
     )
     .mount(&s)
     .await;
     ok(
         "/main.tgz",
-        include_bytes!("fixtures/scoop/Main-mini.tar.gz"),
+        include_bytes!("../fixtures/scoop/Main-mini.tar.gz"),
     )
     .mount(&s)
     .await;
@@ -242,13 +242,13 @@ async fn search_logs_join_wait() {
     };
     ok(
         "/source2.msix",
-        include_bytes!("fixtures/winget/source2-mini.msix"),
+        include_bytes!("../fixtures/winget/source2-mini.msix"),
     )
     .mount(&s)
     .await;
     ok(
         "/main.tgz",
-        include_bytes!("fixtures/scoop/Main-mini.tar.gz"),
+        include_bytes!("../fixtures/scoop/Main-mini.tar.gz"),
     )
     .mount(&s)
     .await;

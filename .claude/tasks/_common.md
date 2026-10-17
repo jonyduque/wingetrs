@@ -2,7 +2,7 @@
 
 - Leia `CLAUDE.md` (regras do projeto, comandos proibidos, economia de contexto). Não leia o plano nem a spec inteiros; este brief é autocontido.
 - TDD: escreva o teste, rode e veja falhar pelo motivo certo, implemente, rode e veja passar.
-- **Ciclo rápido:** durante o TDD e as mutações rode só o binário de teste da tarefa (`cargo test --quiet --test <arquivo>`, ~19 s depois de mexer em `src/`), nunca a suíte toda (~77 s só para compilar os 52 binários + ~80 s para rodar). O gate completo roda **uma vez**, antes do commit final.
+- **Ciclo rápido:** durante o TDD e as mutações rode só o módulo de teste da tarefa (`cargo test --quiet --test it <modulo>::`; os testes de integração ficam em `tests/it/<modulo>.rs`, num binário só; exceção: `cargo test --quiet --test install_extract`), nunca a suíte toda. Medido na Task 133 depois de mexer em `src/`: compilar o `it` ~15 s; compilar todos os alvos ~18 s; passo `test` do gate ~34 s (inclui o link). O gate completo roda **uma vez**, antes do commit final.
 - Gate antes de cada commit: `pwsh -File scripts/verify.ps1` deve terminar com `[OK]   gate verde`. Se demorar, espere ativamente (um laço que confere o arquivo de saída até aparecer o exit) antes de encerrar o turno — não encerre esperando notificação.
 - Commits pequenos, mensagem em inglês no formato `feat(<módulo>): ...`/`test(...)`/`fix(...)`, terminando com a linha `Co-Authored-By: Claude <noreply@anthropic.com>`. Nunca `git push`.
 - Não adicione dependências fora das listadas no brief. Não edite arquivos fora da lista **Files** sem registrar o motivo no relatório.

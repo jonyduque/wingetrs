@@ -2,10 +2,10 @@
 use wingetrs::sources::winget::mszip::{MszipError, decode};
 use wingetrs::sources::winget::version_data::{decode_and_parse, parse, version_data_path};
 
-const PT: &[u8] = include_bytes!("fixtures/winget/powertoys.versionData.mszyml");
-const PT_YAML: &[u8] = include_bytes!("fixtures/winget/powertoys.versionData.yaml");
-const DC: &[u8] = include_bytes!("fixtures/winget/discord-canary.versionData.mszyml");
-const DC_YAML: &[u8] = include_bytes!("fixtures/winget/discord-canary.versionData.yaml");
+const PT: &[u8] = include_bytes!("../fixtures/winget/powertoys.versionData.mszyml");
+const PT_YAML: &[u8] = include_bytes!("../fixtures/winget/powertoys.versionData.yaml");
+const DC: &[u8] = include_bytes!("../fixtures/winget/discord-canary.versionData.mszyml");
+const DC_YAML: &[u8] = include_bytes!("../fixtures/winget/discord-canary.versionData.yaml");
 
 #[test]
 fn single_block_matches_reference_decoder() {

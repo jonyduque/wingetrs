@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Operations layer: dependencies, lock, apply, uninstall, upgrade listing, repair and list.
-mod spans;
+use crate::spans;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

@@ -2,7 +2,7 @@
 use wingetrs::sources::scoop::bucket::{ScoopFetch, bucket_url, fetch_bucket, read_tarball};
 use wingetrs::sources::scoop::manifest::{details_from_raw, parse};
 
-const TGZ: &[u8] = include_bytes!("fixtures/scoop/Main-mini.tar.gz");
+const TGZ: &[u8] = include_bytes!("../fixtures/scoop/Main-mini.tar.gz");
 
 #[test]
 fn tarball_imports_valid_and_skips_broken() {
