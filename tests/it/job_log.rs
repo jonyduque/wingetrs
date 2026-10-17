@@ -323,3 +323,58 @@ fn no_retry_when_winget_failed() {
     assert_eq!(calls.len(), 1);
     assert!(!text.contains("job.retry"), "{text}");
 }
+
+/// Runs the job where call `n` answers `script[n]`, an `Err(NotFound)` when it is `None`.
+fn run_io_script(script: &[Option<(i32, &str)>]) -> (Result<String, InstallFail>, String, usize) {
+    let log = Log::default();
+    let _installed = log.install();
+    let (_dir, lock) = msi_lock();
+    let mut n = 0;
+    let mut exec = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| {
+        n += 1;
+        match script[n - 1] {
+            Some((code, out)) => Ok((code, vec![out.to_string()])),
+            None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }
+    };
+    let r = jobs::run_bridge(
+        &job(Some("2.24.0")),
+        None,
+        &lock,
+        "pwsh",
+        &mut exec,
+        &mut |_: &str| {},
+    );
+    (r.map(|d| d.summary), log.text(), n)
+}
+
+#[test]
+fn retry_failure_is_not_no_effect() {
+    let failed = 0x8A15_0006_u32 as i32;
+    let (r, text, n) = run_script_failed(failed);
+    assert_eq!(n, 3);
+    assert_eq!(
+        r,
+        Err(InstallFail::Other(format!(
+            "Antigravity: {}",
+            bridge::winget_message(failed)
+        )))
+    );
+    let end = text.lines().find(|l| l.contains("job.end")).unwrap();
+    assert!(end.contains("outcome=falhou"), "{end}");
+}
+
+fn run_script_failed(code: i32) -> (Result<String, InstallFail>, String, usize) {
+    run_io_script(&[Some((0, STALE)), Some((0, "")), Some((code, STALE))])
+}
+
+#[test]
+fn retry_that_cannot_start_drops_first_run_from_log() {
+    let (r, text, n) = run_io_script(&[Some((0, STALE)), Some((0, "")), None]);
+    assert_eq!(n, 3);
+    assert!(r.is_err());
+    let end = text.lines().find(|l| l.contains("job.end")).unwrap();
+    assert!(end.contains("code=-"), "{end}");
+    assert!(!end.contains("code=0"), "{end}");
+    assert!(!end.contains("2.23.1"), "{end}");
+}

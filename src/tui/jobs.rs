@@ -453,6 +453,9 @@ fn bridge_run(
     let before = version();
     let mut retried = false;
     loop {
+        // Nothing of the previous run may leak into the log of this one.
+        (log.failure, log.code, log.after) = (Outcome::Failed, None, None);
+        (log.lines, log.installer_log) = (Vec::new(), None);
         let (code, lines, seen_chosen) = match exec_once(program, args, exec, on_line, job) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
