@@ -5,7 +5,7 @@
     Each rule exists because the defect escaped at least once and was caught only by a reviewer.
     Exit 0 = clean, 1 = violations (listed as path:line: rule).
 #>
-[CmdletBinding()] param([string]$Path = 'src')
+[CmdletBinding()] param([string]$Path = 'src', [string]$ItDir = '')
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 # Any internal error must fail the gate, never pass it silently (a .Count on a one-line file once skipped checks).
@@ -77,6 +77,19 @@ foreach ($f in (Get-ChildItem -Recurse -File -Path $clockRoots -Filter *.rs)) {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         if ($lines[$i] -match '\.elapsed\(\)\s*<' -and $lines[$i] -notmatch 'clock-ok') {
             $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'limite de relogio em teste', $lines[$i].Trim()
+        }
+    }
+}
+# Task 133: tests/it/ is one binary; a file there without `mod <stem>;` in main.rs is never
+# compiled nor run, and nothing else would say so.
+if (-not $ItDir -and $Path -eq 'src') { $ItDir = 'tests/it' }
+if ($ItDir -and (Test-Path (Join-Path $ItDir 'main.rs'))) {
+    $mainText = Get-Content -Raw (Join-Path $ItDir 'main.rs')
+    $mods = @(Get-ChildItem -File -Path $ItDir -Filter *.rs | Where-Object Name -ne 'main.rs' | ForEach-Object BaseName) +
+            @(Get-ChildItem -Directory -Path $ItDir | Where-Object { Test-Path (Join-Path $_.FullName 'mod.rs') } | ForEach-Object Name)
+    foreach ($m in $mods) {
+        if ($mainText -notmatch "(?m)^\s*(pub\s+)?mod\s+$([regex]::Escape($m))\s*;") {
+            $violations += "{0}: [{1}] {2}" -f (Join-Path $ItDir 'main.rs'), 'modulo de teste sem mod no main.rs', $m
         }
     }
 }

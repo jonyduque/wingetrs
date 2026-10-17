@@ -24,7 +24,8 @@ $steps = @(
     @{ Name = 'clippy'; Cmd = { cargo clippy --quiet --all-targets --message-format short -- -D warnings 2>&1 } }
 )
 if (-not $NoTests) {
-    $steps += @{ Name = 'test'; Cmd = { cargo test --quiet --all-targets 2>&1 } }
+    # INSTA_UPDATE=no: a missing snapshot fails without leaving a .snap.new behind (Task 133 review).
+    $steps += @{ Name = 'test'; Cmd = { $env:INSTA_UPDATE = 'no'; cargo test --quiet --all-targets 2>&1 } }
 }
 
 $failed = $false

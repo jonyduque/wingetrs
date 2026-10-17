@@ -46,9 +46,21 @@ try {
         pwsh -NoProfile -File $checker -Path $dir *> $null
         if ($LASTEXITCODE -ne $c.Want) { $bad += "  [$($c.Name)] exit $LASTEXITCODE, esperado $($c.Want)" }
     }
+    # tests/it/: a module file without `mod` in main.rs must fail; registered ones pass.
+    foreach ($it in @(@{ Main = "mod a;`n"; Want = 1 }, @{ Main = "mod a;`n#[allow(dead_code)]`nmod b;`nmod spans;`n"; Want = 0 })) {
+        $n++
+        $dir = Join-Path $base "case$n"
+        New-Item -ItemType Directory -Force (Join-Path $dir 'spans') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $dir 'main.rs'), $it.Main)
+        [IO.File]::WriteAllText((Join-Path $dir 'a.rs'), '')
+        [IO.File]::WriteAllText((Join-Path $dir 'b.rs'), '')
+        [IO.File]::WriteAllText((Join-Path $dir 'spans/mod.rs'), '')
+        pwsh -NoProfile -File $checker -Path $dir -ItDir $dir *> $null
+        if ($LASTEXITCODE -ne $it.Want) { $bad += "  [tests/it sem mod ($($it.Want))] exit $LASTEXITCODE, esperado $($it.Want)" }
+    }
 } finally {
     Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
 }
 if ($bad.Count -gt 0) { $bad; exit 1 }
-"[OK] check_rules: $($cases.Count) casos plantados"
+"[OK] check_rules: $($cases.Count + 2) casos plantados"
 exit 0
