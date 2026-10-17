@@ -169,10 +169,32 @@ pub fn run_with_grace(
     program: &str,
     args: &[String],
     grace: Duration,
+    on_line: impl FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    run_command(cmd, program, grace, on_line)
+}
+
+/// `run` of the program at the absolute path `program` (no `PATH` search), started in `dir`.
+pub fn run_in(
+    program: &std::path::Path,
+    args: &[String],
+    dir: &std::path::Path,
+    on_line: impl FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(dir);
+    run_command(cmd, &program.display().to_string(), PIPE_GRACE, on_line)
+}
+
+fn run_command(
+    mut cmd: Command,
+    program: &str,
+    grace: Duration,
     mut on_line: impl FnMut(&str),
 ) -> std::io::Result<(i32, Vec<String>)> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

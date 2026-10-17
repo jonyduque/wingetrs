@@ -914,6 +914,12 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
 }
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
+    // The elevated helper never touches the disk: no data dir, no log (it runs as admin, and
+    // %LOCALAPPDATA% is the user's to plant junctions in).
+    if let Some(Command::BridgeWorker { pipe, parent }) = &cli.command {
+        return crate::bridge::elevated::run_worker(pipe, *parent)
+            .map_err(|e| anyhow::anyhow!("auxiliar elevado: {e}"));
+    }
     style::init(cli.color);
     let data = DataDir::from_env()?;
     // Start the search before logging, config and runtime setup: it only needs the file.
@@ -943,11 +949,6 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::debug!(target: "wingetrs::startup", stage = "startup.ensure", ms = ensure_ms);
     tracing::debug!(target: "wingetrs::startup", stage = "startup.log", ms = log_ms);
     let after_log = std::time::Instant::now();
-    if let Some(Command::BridgeWorker { pipe, parent }) = &cli.command {
-        let _span = tracing::info_span!("bridge_worker", role = "worker").entered();
-        return crate::bridge::elevated::run_worker(pipe, *parent)
-            .map_err(|e| anyhow::anyhow!("auxiliar elevado: {e}"));
-    }
     let cfg =
         tracing::debug_span!("startup.config").in_scope(|| Config::load(&data.config_path()))?;
     if cli.command.is_none() {

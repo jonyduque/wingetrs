@@ -3,12 +3,13 @@
 use super::elevated::Helper;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use windows::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WIN32_ERROR,
+    ERROR_BROKEN_PIPE, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, ERROR_SUCCESS,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -23,8 +24,11 @@ use windows::Win32::Storage::FileSystem::{
     OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     WriteFile,
 };
+use windows::Win32::Storage::Packaging::Appx::{
+    GetPackagePathByFullName, GetPackagesByPackageFamily,
+};
 use windows::Win32::System::Com::{
-    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
@@ -37,14 +41,16 @@ use windows::Win32::System::Threading::{
     WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-    ShellExecuteExW,
+    FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC,
+    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
 /// Every helper pipe is `PIPE_PREFIX` + 32 lowercase hex digits.
 pub const PIPE_PREFIX: &str = r"\\.\pipe\wingetrs-elevated-";
+/// The helper exits after this long without a request.
+const IDLE_LIMIT: Duration = Duration::from_secs(10 * 60);
 /// How long the helper has to connect once UAC let it start.
 const CONNECT_LIMIT: Duration = Duration::from_secs(30);
 const PIPE_BUFFER: u32 = 64 * 1024;
@@ -85,8 +91,10 @@ fn event() -> std::io::Result<OwnedHandle> {
 }
 
 /// Runs one overlapped operation on `h` to completion; the bytes it moved.
+/// An operation still pending after `limit` is cancelled and fails with `TimedOut`.
 fn overlapped(
     h: HANDLE,
+    limit: Option<Duration>,
     start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
 ) -> std::io::Result<u32> {
     let done = event()?;
@@ -100,21 +108,60 @@ fn overlapped(
         Err(e) => return Err(io_err(&e)),
     }
     let mut n = 0u32;
+    if let Some(limit) = limit {
+        // SAFETY: the event is open for the whole wait.
+        let woke = unsafe { WaitForSingleObject(raw(&done), millis(limit)) };
+        if woke == WAIT_TIMEOUT {
+            // SAFETY: cancels our own operation, then waits until it is over so `ov` can go.
+            let finished = unsafe {
+                let _ = CancelIoEx(h, Some(&ov));
+                GetOverlappedResult(h, &ov, &mut n, true)
+            };
+            // Completed in the meantime: the data is ours.
+            return match finished {
+                Ok(()) => Ok(n),
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "nenhum pedido dentro do prazo",
+                )),
+            };
+        }
+    }
     // SAFETY: `ov` and its event outlive the operation: this waits for it to complete.
     unsafe { GetOverlappedResult(h, &ov, &mut n, true) }.map_err(|e| io_err(&e))?;
     Ok(n)
 }
 
+fn millis(d: Duration) -> u32 {
+    u32::try_from(d.as_millis()).unwrap_or(u32::MAX)
+}
+
 /// Overlapped reads and writes on a pipe end; every call has its own event, so a read and a
 /// write may be under way at once, and a `CancelIoEx` on the handle ends a blocked read.
+/// A read that waits longer than `read_limit` is cancelled and fails with `TimedOut`.
 #[derive(Clone)]
-struct PipeIo(Arc<OwnedHandle>);
+struct PipeIo {
+    handle: Arc<OwnedHandle>,
+    read_limit: Option<Duration>,
+}
+
+impl PipeIo {
+    fn new(handle: Arc<OwnedHandle>) -> PipeIo {
+        PipeIo {
+            handle,
+            read_limit: None,
+        }
+    }
+}
 
 impl Read for PipeIo {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let h = raw(&self.0);
+        let h = raw(&self.handle);
         // SAFETY: `buf` outlives the operation (`overlapped` waits for it).
-        match overlapped(h, |ov| unsafe { ReadFile(h, Some(buf), None, Some(ov)) }) {
+        let read = overlapped(h, self.read_limit, |ov| unsafe {
+            ReadFile(h, Some(buf), None, Some(ov))
+        });
+        match read {
             Ok(n) => Ok(n as usize),
             Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE.0 as i32) => Ok(0),
             Err(e) => Err(e),
@@ -124,9 +171,12 @@ impl Read for PipeIo {
 
 impl Write for PipeIo {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let h = raw(&self.0);
+        let h = raw(&self.handle);
         // SAFETY: `buf` outlives the operation (`overlapped` waits for it).
-        overlapped(h, |ov| unsafe { WriteFile(h, Some(buf), None, Some(ov)) }).map(|n| n as usize)
+        overlapped(h, None, |ov| unsafe {
+            WriteFile(h, Some(buf), None, Some(ov))
+        })
+        .map(|n| n as usize)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -360,7 +410,7 @@ pub fn start(exe: &Path) -> std::io::Result<PipeHelper> {
     accept(&pipe, &process, CONNECT_LIMIT)?;
     let helper = check_client(&pipe, &process)?;
     tracing::info!(pid = helper, "bridge: elevated helper connected");
-    let io = PipeIo(Arc::new(pipe));
+    let io = PipeIo::new(Arc::new(pipe));
     Ok(PipeHelper {
         reader: BufReader::new(io.clone()),
         writer: io,
@@ -458,14 +508,158 @@ pub fn worker_main(pipe: &str, parent: u32) -> std::io::Result<()> {
     tracing::info!(parent, "bridge worker: connected");
     let handle = Arc::new(handle);
     let _watch = ParentWatch::spawn(parent_handle, Arc::clone(&handle))?;
-    let io = PipeIo(handle);
-    let mut reader = BufReader::new(io.clone());
-    let mut writer = io;
-    let result = super::worker::serve(&mut reader, &mut writer, &mut |program, args, on_line| {
-        super::spawn_win::run(program, args, on_line)
+    let io = PipeIo::new(handle);
+    // The helper only waits on a read for the next request: a read that long means idle.
+    let mut reader = BufReader::new(PipeIo {
+        read_limit: Some(IDLE_LIMIT),
+        ..io.clone()
     });
-    tracing::info!(ok = result.is_ok(), "bridge worker: done");
-    result
+    let mut writer = io;
+    super::worker::serve(&mut reader, &mut writer, &mut run_winget)
+}
+
+/// The worker's exec: only `winget`, and only the one Windows installed (see `winget_exe`),
+/// run by absolute path from its own folder; never what `PATH` or an alias would find.
+fn run_winget(
+    program: &str,
+    args: &[String],
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    if program != "winget" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("o auxiliar elevado só roda o winget, não {program}"),
+        ));
+    }
+    let exe = winget_exe()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("winget sem pasta"))?;
+    super::spawn_win::run_in(&exe, args, dir, on_line)
+}
+
+/// Package family of App Installer, which ships `winget.exe`.
+const WINGET_FAMILY: &str = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
+/// Most packages of one family looked at.
+const PACKAGES_MAX: u32 = 64;
+/// Longest package name list or package path read, in UTF-16 units.
+const NAMES_MAX: u32 = 64 * 1024;
+
+/// `<package_dir>\winget.exe` when `package_dir` is an App Installer folder right under
+/// `<program_files>\WindowsApps` (only TrustedInstaller writes there); `None` otherwise.
+fn winget_in(program_files: &Path, package_dir: &Path) -> Option<PathBuf> {
+    let same = |a: &Component<'_>, b: &Component<'_>| {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    };
+    let apps = program_files.join("WindowsApps");
+    let root: Vec<Component<'_>> = apps.components().collect();
+    let dir: Vec<Component<'_>> = package_dir.components().collect();
+    if !program_files.is_absolute()
+        || dir.len() != root.len() + 1
+        || !root.iter().zip(&dir).all(|(a, b)| same(a, b))
+    {
+        return None;
+    }
+    let Some(Component::Normal(name)) = dir.last() else {
+        return None;
+    };
+    let name = name.to_str()?.to_ascii_lowercase();
+    let ours =
+        name.starts_with("microsoft.desktopappinstaller_") && name.ends_with("__8wekyb3d8bbwe");
+    ours.then(|| package_dir.join("winget.exe"))
+}
+
+/// `Program Files` from the known folder, never from an environment variable.
+fn program_files() -> std::io::Result<PathBuf> {
+    // SAFETY: the returned string is freed below with CoTaskMemFree.
+    let p = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
+        .map_err(|e| io_err(&e))?;
+    // SAFETY: a NUL-terminated string from the call above.
+    let text = unsafe { p.to_string() };
+    // SAFETY: allocated by SHGetKnownFolderPath, freed once.
+    unsafe { CoTaskMemFree(Some(p.0 as *const core::ffi::c_void)) };
+    text.map(PathBuf::from)
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Full names of the installed packages of `family`.
+fn family_packages(family: &str) -> std::io::Result<Vec<String>> {
+    let family = HSTRING::from(family);
+    let (mut count, mut len) = (0u32, 0u32);
+    // SAFETY: size query only.
+    let _ = unsafe { GetPackagesByPackageFamily(&family, &mut count, None, &mut len, None) };
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if count > PACKAGES_MAX || len > NAMES_MAX {
+        return Err(std::io::Error::other(format!(
+            "{count} pacotes, {len} caracteres"
+        )));
+    }
+    let mut names = vec![PWSTR::null(); count as usize];
+    let mut buf = vec![0u16; len as usize];
+    // SAFETY: `names` holds `count` pointers and `buf` `len` units, as the call is told.
+    let status = unsafe {
+        GetPackagesByPackageFamily(
+            &family,
+            &mut count,
+            Some(names.as_mut_ptr()),
+            &mut len,
+            Some(PWSTR(buf.as_mut_ptr())),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+    }
+    names
+        .iter()
+        .take(count as usize)
+        // SAFETY: each pointer is a NUL-terminated name inside `buf`, still alive.
+        .map(|n| unsafe { n.to_string() }.map_err(|e| std::io::Error::other(e.to_string())))
+        .collect()
+}
+
+/// Install folder of the package `full_name`.
+fn package_path(full_name: &str) -> std::io::Result<PathBuf> {
+    let name = HSTRING::from(full_name);
+    let mut len = 0u32;
+    // SAFETY: size query only.
+    let _ = unsafe { GetPackagePathByFullName(&name, &mut len, None) };
+    if len == 0 || len > NAMES_MAX {
+        return Err(std::io::Error::other(format!(
+            "caminho com {len} caracteres"
+        )));
+    }
+    let mut buf = vec![0u16; len as usize];
+    // SAFETY: `buf` holds `len` units, as the call is told.
+    let status =
+        unsafe { GetPackagePathByFullName(&name, &mut len, Some(PWSTR(buf.as_mut_ptr()))) };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..end])))
+}
+
+/// `winget.exe` of the App Installer package Windows installed for this user, under
+/// `Program Files\WindowsApps`; `NotFound` when there is none in that place.
+pub fn winget_exe() -> std::io::Result<PathBuf> {
+    let root = program_files()?;
+    for full_name in family_packages(WINGET_FAMILY)? {
+        let found = package_path(&full_name)
+            .ok()
+            .and_then(|dir| winget_in(&root, &dir))
+            .filter(|exe| exe.is_file());
+        if let Some(exe) = found {
+            return Ok(exe);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        r"winget do App Installer não encontrado em Program Files\WindowsApps",
+    ))
 }
 
 #[cfg(test)]
@@ -583,8 +777,8 @@ mod tests {
         assert_eq!(dacl(&server), expected);
         let client = open_client(&name);
         accept(&server, &process(me()), Duration::from_secs(5)).unwrap();
-        let mut s = PipeIo(Arc::new(server));
-        let mut c = BufReader::new(PipeIo(Arc::new(client)));
+        let mut s = PipeIo::new(Arc::new(server));
+        let mut c = BufReader::new(PipeIo::new(Arc::new(client)));
         s.write_all(
             b"ola
 ",
@@ -627,5 +821,89 @@ mod tests {
         let e = accept(&server, &process(me()), Duration::from_millis(50)).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
         assert!(e.to_string().contains("não conectou a tempo"), "{e}");
+    }
+
+    #[test]
+    fn idle_read_times_out_and_data_in_time_is_read() {
+        let (name, server) = new_pipe();
+        let client = open_client(&name);
+        accept(&server, &process(me()), Duration::from_secs(5)).unwrap();
+        let mut s = PipeIo::new(Arc::new(server));
+        let mut c = PipeIo {
+            read_limit: Some(Duration::from_millis(100)),
+            ..PipeIo::new(Arc::new(client))
+        };
+        let mut buf = [0u8; 16];
+        std::thread::scope(|scope| {
+            // Detector: without the limit the read would return this, much later, instead.
+            let late = scope.spawn(|| {
+                std::thread::sleep(Duration::from_secs(3));
+                s.write_all(b"tarde").unwrap();
+            });
+            let e = c.read(&mut buf).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+            if let Err(p) = late.join() {
+                std::panic::resume_unwind(p);
+            }
+        });
+        // Data already there is read within the limit.
+        assert_eq!(c.read(&mut buf).unwrap(), 5);
+        assert_eq!(&buf[..5], b"tarde");
+    }
+
+    #[test]
+    fn winget_only_from_an_app_installer_folder_under_windowsapps() {
+        let pf = Path::new(r"C:\Program Files");
+        let pkg = "Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe";
+        let inside = pf.join("WindowsApps").join(pkg);
+        assert_eq!(winget_in(pf, &inside), Some(inside.join("winget.exe")));
+        let lower = Path::new(r"c:\program files\windowsapps").join(pkg);
+        assert_eq!(winget_in(pf, &lower), Some(lower.join("winget.exe")));
+        for bad in [
+            format!(r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\{pkg}"),
+            format!(r"C:\Program Files\WindowsAppsX\{pkg}"),
+            format!(r"C:\Program Files\WindowsApps\..\{pkg}"),
+            format!(r"C:\Program Files\WindowsApps\{pkg}\.."),
+            format!(r"C:\Program Files\WindowsApps\{pkg}\sub"),
+            format!(r"D:\Program Files\WindowsApps\{pkg}"),
+            format!(r"Program Files\WindowsApps\{pkg}"),
+            r"C:\Program Files\WindowsApps".to_string(),
+            r"C:\Program Files\WindowsApps\Evil.App_1.0.0.0_x64__8wekyb3d8bbwe".to_string(),
+            r"C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.0_x64__outro"
+                .to_string(),
+        ] {
+            assert_eq!(winget_in(pf, Path::new(&bad)), None, "{bad}");
+        }
+        assert_eq!(winget_in(Path::new("Program Files"), &inside), None);
+    }
+
+    /// Resolves the real winget and runs only `--version` with it (no elevation).
+    #[test]
+    #[ignore = "live: winget instalado nesta máquina"]
+    fn live_winget_exe_resolves_and_runs_version() {
+        let exe = winget_exe().unwrap();
+        let dir = exe.parent().unwrap();
+        let mut lines = Vec::new();
+        let version = ["--version".to_string()];
+        let (code, _) = crate::bridge::spawn_win::run_in(&exe, &version, dir, |l: &str| {
+            lines.push(l.to_string())
+        })
+        .unwrap();
+        assert_eq!(code, 0, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with('v')),
+            "{exe:?} {lines:?}"
+        );
+        // Through the worker's exec too, and nothing but winget.
+        let mut seen = Vec::new();
+        let (code, _) =
+            run_winget("winget", &version, &mut |l: &str| seen.push(l.to_string())).unwrap();
+        assert_eq!((code, seen), (0, lines));
+    }
+
+    #[test]
+    fn worker_exec_runs_nothing_but_winget() {
+        let e = run_winget("cmd", &["/c".into(), "exit".into()], &mut |_: &str| {}).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

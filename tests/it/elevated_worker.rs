@@ -537,3 +537,54 @@ fn live_single_uac_for_two_jobs() {
     assert_eq!(starts.load(Ordering::SeqCst), 1, "um UAC para dois jobs");
     assert!(bridge.shutdown(Duration::from_secs(5)), "o auxiliar saiu");
 }
+
+/// The worker runs elevated: it must not create, write or prune anything under
+/// %LOCALAPPDATA%\wingetrs (no data dir, no log), even when it fails.
+#[cfg(windows)]
+#[test]
+fn worker_never_touches_the_data_dir() {
+    let dir = TempDir::new().unwrap();
+    let base = dir.path().join("localappdata");
+    std::fs::create_dir(&base).unwrap();
+    let pipe = format!(r"\.\pipe\wingetrs-elevated-{}", "0".repeat(32));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wingetrs"))
+        .args(["bridge-worker", "--pipe", &pipe, "--parent"])
+        .arg(std::process::id().to_string())
+        .env("LOCALAPPDATA", &base)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("auxiliar elevado"), "{stderr}");
+    let left: Vec<_> = std::fs::read_dir(&base).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// An endless line of `a` (like `std::io::repeat`), with a detector: past four caps it fails
+/// with another kind instead of filling memory, so a missing cap fails rather than hangs.
+struct Endless {
+    served: usize,
+}
+
+impl std::io::Read for Endless {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.served > 4 * LINE_CAP {
+            return Err(std::io::Error::other("lido demais"));
+        }
+        buf.fill(b'a');
+        self.served += buf.len();
+        Ok(buf.len())
+    }
+}
+
+#[test]
+fn read_line_caps_before_buffering_an_endless_line() {
+    let mut reader = BufReader::new(Endless { served: 0 });
+    let e = worker::read_line(&mut reader).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+    assert!(
+        reader.get_ref().served <= 2 * LINE_CAP,
+        "{}",
+        reader.get_ref().served
+    );
+}

@@ -125,6 +125,15 @@ struct Ctx {
     elevated: crate::bridge::elevated::ElevatedBridge,
 }
 
+/// This executable, for the elevated helper. Unknown: logged, and the empty path makes the
+/// first elevation fail (the session then runs unelevated, with the refusal note).
+fn helper_exe() -> std::path::PathBuf {
+    std::env::current_exe().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "bridge: own executable unknown; elevated helper unavailable");
+        std::path::PathBuf::new()
+    })
+}
+
 /// How long the TUI waits at exit for the elevated helper to quit.
 const HELPER_EXIT_LIMIT: Duration = Duration::from_secs(5);
 
@@ -255,9 +264,7 @@ async fn event_loop(
         scoop_root,
         pwsh,
         elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(
-            crate::bridge::elevated::SystemTransport::new(
-                std::env::current_exe().unwrap_or_default(),
-            ),
+            crate::bridge::elevated::SystemTransport::new(helper_exe()),
         )),
     });
     let _helper = HelperShutdown(Arc::clone(&ctx));
