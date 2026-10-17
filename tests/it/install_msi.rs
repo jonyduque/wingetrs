@@ -11,7 +11,7 @@ use std::rc::Rc;
 use msi::{Column, Insert, Package, PackageType, Value};
 use sha2::{Digest, Sha256};
 use wingetrs::install::extract::{
-    DEFAULT_LIMITS, ExtractError, ExtractSource, Limits, extract_all_with,
+    DEFAULT_LIMITS, ExtractError, ExtractSource, Limits, extract_all_with, needs_installer,
 };
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/msi");
@@ -557,4 +557,176 @@ fn continued_cabinet_unsupported() {
     c[f + 8..f + 10].copy_from_slice(&0xFFFDu16.to_le_bytes());
     let m = unsupported(run(&with_cab(&mut tree_spec(), c), None).1);
     assert!(m.contains("continuados"), "{m}");
+}
+
+#[test]
+fn shared_span_extracts_both_files() {
+    // f_c points at f_b's bytes: WiX stores identical files once (pkgconf, yubico-piv-tool).
+    let mut c = cab("three.cab");
+    let (b, cc) = (cffile(&c, 1), cffile(&c, 2));
+    let span: [u8; 8] = c[b..b + 8].try_into().unwrap();
+    c[cc..cc + 8].copy_from_slice(&span);
+    let (d, r) = run(&with_cab(&mut tree_spec(), c), None);
+    r.unwrap();
+    let out = d.path().join("out/Source One");
+    assert_eq!(list(&out.join("Bin")), ["b.bin", "c.txt"]);
+    assert_eq!(sha(&out.join("a.txt")), Sha256::digest(F_A).to_vec());
+    assert_eq!(sha(&out.join("Bin/b.bin")), Sha256::digest(f_b()).to_vec());
+    assert_eq!(sha(&out.join("Bin/c.txt")), Sha256::digest(f_b()).to_vec());
+}
+
+#[test]
+fn partial_and_contained_overlaps_refused() {
+    // f_b spans 7..40967: f_c inside it, then running past its end.
+    for off in [8u32, 40_963] {
+        let mut c = cab("three.cab");
+        let cc = cffile(&c, 2);
+        c[cc + 4..cc + 8].copy_from_slice(&off.to_le_bytes());
+        let (d, r) = run(&with_cab(&mut tree_spec(), c), None);
+        match r {
+            Err(ExtractError::Archive(m)) => assert!(m.contains("sobrepostos"), "{off}: {m}"),
+            other => panic!("{off}: {other:?}"),
+        }
+        assert_eq!(list(d.path()), ["x.msi"], "{off}");
+    }
+}
+
+/// One uncompressed folder holding `data`, with `n` entries all pointed at `span`
+/// (offset, size); each entry is a `File` row under `App`.
+fn shared_span_msi(data: &[u8], n: usize, span: (u32, u32)) -> Vec<u8> {
+    let mut b = cab::CabinetBuilder::new();
+    let folder = b.add_folder(cab::CompressionType::None);
+    for i in 0..n {
+        folder.add_file(format!("k{i:04}"));
+    }
+    let mut w = b.build(Cursor::new(Vec::new())).unwrap();
+    let mut first = true;
+    while let Some(mut f) = w.next_file().unwrap() {
+        if first {
+            f.write_all(data).unwrap();
+            first = false;
+        }
+    }
+    let mut c = w.finish().unwrap().into_inner();
+    for i in 0..n {
+        let at = cffile(&c, i);
+        c[at..at + 4].copy_from_slice(&span.1.to_le_bytes());
+        c[at + 4..at + 8].copy_from_slice(&span.0.to_le_bytes());
+    }
+    let files = (0..n)
+        .map(|i| {
+            let key: &'static str = Box::leak(format!("k{i:04}").into_boxed_str());
+            let name: &'static str = Box::leak(format!("f{i:04}.bin").into_boxed_str());
+            file(key, "C_D", name, i as i32 + 1)
+        })
+        .collect();
+    let mut s = spec(vec![("D", Some("TARGETDIR"), "App")], files);
+    s.media = vec![(1, 10_000, "#cab1")];
+    with_cab(&mut s, c)
+}
+
+const MIB: u32 = 1 << 20;
+
+fn limits_64_mib() -> Limits {
+    Limits {
+        ratio: 1,
+        floor: 64 << 20,
+        ceiling: 64 << 20,
+        ..DEFAULT_LIMITS
+    }
+}
+
+#[test]
+fn many_entries_on_one_span_hit_the_budget() {
+    let data = pseudo_random(MIB as usize);
+    // Control: two entries on the span extract, so `App` would exist.
+    let (d, r) = run_with(&shared_span_msi(&data, 2, (0, MIB)), None, &limits_64_mib());
+    r.unwrap();
+    let app = d.path().join("out/App");
+    assert_eq!(list(&app), ["f0000.bin", "f0001.bin"]);
+    assert_eq!(std::fs::read(app.join("f0001.bin")).unwrap(), data);
+    let (d, r) = run_with(
+        &shared_span_msi(&data, 1000, (0, MIB)),
+        None,
+        &limits_64_mib(),
+    );
+    assert!(
+        matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 64 << 20),
+        "{r:?}"
+    );
+    assert!(!d.path().join("out/App").exists());
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn rereading_a_span_behind_the_reader_is_charged() {
+    // 16 bytes across the boundary of the last two blocks: each entry after the first
+    // seeks back into an earlier block and decodes the folder again from the start.
+    let data = pseudo_random(MIB as usize);
+    let span = (MIB - 0x8000 - 8, 16);
+    let (d, r) = run_with(&shared_span_msi(&data, 2, span), None, &limits_64_mib());
+    r.unwrap();
+    let at = span.0 as usize;
+    assert_eq!(
+        std::fs::read(d.path().join("out/App/f0001.bin")).unwrap(),
+        &data[at..at + 16]
+    );
+    let (d, r) = run_with(&shared_span_msi(&data, 1000, span), None, &limits_64_mib());
+    assert!(
+        matches!(r, Err(ExtractError::TooLarge { limit }) if limit == 64 << 20),
+        "{r:?}"
+    );
+    assert!(!d.path().join("out/App").exists());
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn file_past_folder_data_refused() {
+    // one.cab has one block: at most 32 KiB of data.
+    let mut c = cab("one.cab");
+    let f = cffile(&c, 0);
+    c[f + 4..f + 8].copy_from_slice(&40_000u32.to_le_bytes());
+    let (d, r) = run(&with_cab(&mut one_file_spec(), c), None);
+    match r {
+        Err(ExtractError::Archive(m)) => assert!(m.contains("além dos dados"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn msi_row_limit_needs_installer() {
+    // `msi` reads at most 65536 rows per table; the Windows Installer reads more (rust's
+    // File table). Here `Media`, with an int32 key so no string is needed per row.
+    let mut p = Package::open(Cursor::new(build(&tree_spec()))).unwrap();
+    p.drop_table("Media").unwrap();
+    p.create_table(
+        "Media",
+        vec![
+            Column::build("DiskId").primary_key().int32(),
+            Column::build("LastSequence").int32(),
+            Column::build("Cabinet").nullable().string(255),
+        ],
+    )
+    .unwrap();
+    let mut rows = Insert::into("Media").row(vec![1.into(), 100.into(), "#cab1".into()]);
+    for i in 2..=65_537 {
+        rows = rows.row(vec![i.into(), 0.into(), Value::Null]);
+    }
+    p.insert_rows(rows).unwrap();
+    let (d, r) = run(&p.into_inner().unwrap().into_inner(), None);
+    let e = r.unwrap_err();
+    match &e {
+        ExtractError::Unsupported(m) => {
+            assert_eq!(m, "MSI com mais de 65536 linhas numa tabela");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(needs_installer(&d.path().join("x.msi"), "x.msi", &e));
+    // Any other `msi` error stays an integrity error: a cut package.
+    let whole = build(&tree_spec());
+    let (d, r) = run(&whole[..whole.len() / 2], None);
+    let e = r.unwrap_err();
+    assert!(matches!(e, ExtractError::Archive(_)), "{e:?}");
+    assert!(!needs_installer(&d.path().join("x.msi"), "x.msi", &e));
 }

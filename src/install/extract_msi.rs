@@ -44,7 +44,7 @@ pub(super) fn extract_msi(
     // D4-1: third-party decoder panic becomes an error (spec 2b); the OLE and
     // table parsers of `msi` run inside too.
     let run = crate::install::extract::catch_decoder(|| {
-        let mut pkg = Package::open(src).map_err(|e| ExtractError::Archive(format!("MSI: {e}")))?;
+        let mut pkg = Package::open(src).map_err(|e| msi_error("MSI", e))?;
         extract_package(&mut pkg, root, mapper, limits, &mut budget)
     });
     match run {
@@ -228,8 +228,10 @@ fn drain(data: &mut dyn Read, budget: &mut Budget) -> Result<(), ExtractError> {
     }
 }
 
-/// Bytes the folder decodes outside its files. Refuses overlapping files and
-/// files past the most data the folder's blocks can hold.
+/// Bytes the folder decodes without handing them out. Entries with the same offset
+/// and size share their bytes (WiX stores identical files once): the span counts
+/// once, and each extra entry is charged the rewind it costs. Any other overlap
+/// and files past the most data the folder's blocks can hold are refused.
 fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
     let mut spans: Vec<(u64, u64)> = folder
         .file_entries()
@@ -241,8 +243,17 @@ fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
         })
         .collect();
     spans.sort_unstable();
-    let (mut end, mut in_files) = (0u64, 0u64);
+    let (mut end, mut in_files, mut rewinds) = (0u64, 0u64, 0u64);
+    let mut last = None;
     for (offset, size) in spans {
+        if last == Some((offset, size)) {
+            // Reading the span again seeks back: the folder decodes again from its
+            // start up to `offset`, plus at most the block the span ends in.
+            if size > 0 {
+                rewinds = rewinds.saturating_add(offset + MAX_BLOCK);
+            }
+            continue;
+        }
         if offset < end {
             return Err(ExtractError::Archive(
                 "gabinete com arquivos sobrepostos".to_string(),
@@ -250,13 +261,14 @@ fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
         }
         end = offset + size;
         in_files += size;
+        last = Some((offset, size));
     }
     if end > u64::from(folder.num_data_blocks()) * MAX_BLOCK {
         return Err(ExtractError::Archive(
             "gabinete com arquivos além dos dados da pasta".to_string(),
         ));
     }
-    Ok(end - in_files)
+    Ok((end - in_files).saturating_add(rewinds))
 }
 
 /// Whether the cabinet spans cabinets (header flags or a continued CFFILE),
@@ -314,7 +326,18 @@ fn rows(pkg: &mut Pkg, table: &str) -> Result<Vec<Row>, ExtractError> {
     }
     pkg.select_rows(Select::table(table))
         .map(Iterator::collect)
-        .map_err(|e| ExtractError::Archive(format!("tabela {table} do MSI: {e}")))
+        .map_err(|e| msi_error(&format!("tabela {table} do MSI"), e))
+}
+
+/// An `msi` error: integrity, except its own 65536-row limit per table, which the
+/// Windows Installer does not have (rust's `File` table has 66064 rows).
+fn msi_error(context: &str, e: io::Error) -> ExtractError {
+    if e.kind() == io::ErrorKind::InvalidData
+        && e.to_string().starts_with("Number of rows is too large")
+    {
+        return ExtractError::Unsupported("MSI com mais de 65536 linhas numa tabela".to_string());
+    }
+    ExtractError::Archive(format!("{context}: {e}"))
 }
 
 fn text(row: &Row, column: &str) -> Option<String> {
