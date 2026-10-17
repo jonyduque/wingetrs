@@ -80,3 +80,44 @@ Testes (`tests/it/job_log.rs`, capturando com `crate::spans::Log`):
 - **Task 135 — aplicabilidade antes de oferecer a ponte:** `UpgradeBehavior: deny` no manifesto ⇒ "só pelo editor" (Android Studio, `0x8A150114`); escopo instalado (HKLM × HKCU) sem instalador do mesmo escopo ⇒ "não se aplica" (Anki, `0x8A15002B`).
 - **Task 136 — fonte do winget atrasada (decisão do usuário 2026-10-17: opção 1):** quando a conferência da 134 acusar `sem_efeito` porque o winget escolheu versão mais velha, rodar `winget source update --name winget` uma vez e repetir o upgrade uma vez; logar as duas tentativas.
 - **Elevação única por lote (aguarda decisão do usuário):** hoje cada instalador de escopo máquina pede UAC separado (Docker, Acrobat, CrystalDiskInfo em 2026-10-17).
+
+---
+
+### Task 136: Fonte do winget atrasada: `winget source update` e uma nova tentativa
+
+**Modelo:** sonnet (revisor sonnet).
+
+**Decisão do usuário (2026-10-17):** opção 1 — só quando a conferência da 134 acusar que o winget escolheu versão mais velha; atualizar a fonte e repetir **uma** vez.
+
+#### Where this fits
+
+- `src/tui/jobs.rs` `run_bridge` (~:371–505): depois do exec, `seen_chosen`/`winget_chosen_version` e o ramo `Version::parse(chosen) < Version::parse(available)` que hoje põe `Outcome::NoEffect` e a mensagem "O winget instalou {chosen}, não {available}: ...".
+- `src/bridge/mod.rs` `command` (~:106): monta `winget upgrade --id <id> --exact --source winget ...`; `command_text` (~:144).
+- `src/job_log.rs`: `JobLog` (campos `code`, `after`, `lines`, `installer_log`, `failure`).
+- Testes da ponte com exec falso: `tests/it/job_log.rs` (`stale_winget_source_is_not_success` e vizinhos), `tests/it/tui_jobs.rs`.
+
+#### What binds this task
+
+1. `bridge::winget_source_update() -> (String, Vec<String>)`: `winget source update --name winget --disable-interactivity` (programa e args; nada mais).
+2. Em `run_bridge`, no ramo "escolheu versão mais velha" (só ele): registrar `INFO` `job.retry` com `target`, `chosen`, `available`, `reason="fonte do winget atrasada"`; rodar o comando do item 1 pelo **mesmo** `exec` (ainda segurando o `msi.lock`); se ele sair ≠ 0 ou não iniciar, parar com `sem_efeito` e a mensagem da 134 acrescida de `" (a atualização da fonte do winget falhou: código {code})"`. Se sair 0, repetir o upgrade **uma** vez pelo mesmo caminho (mesmo `on_line`, mesma conferência). Segunda tentativa com versão ≥ `available` ⇒ sucesso com a mensagem normal; ainda mais velha ⇒ `sem_efeito` com a mensagem da 134. Nunca uma terceira execução.
+3. O `job.end` final reflete a última tentativa (`code`, `after`, `lines`), e ganha `attempts=2` quando houve nova tentativa.
+4. O progresso mostra `"atualizando a fonte do winget"` antes do item 1 (`on_line`).
+
+**Files:**
+- Modify: `src/bridge/mod.rs`, `src/tui/jobs.rs`, `src/job_log.rs`
+- Test: `tests/it/job_log.rs`
+
+Testes (`tests/it/job_log.rs`, exec falso que grava as chamadas `(program, args)`):
+1. `stale_source_updates_and_retries_once`: 1ª chamada upgrade sai 0 com `Encontrado Antigravity [Google.Antigravity] Versão 2.23.1`; 2ª é exatamente `winget source update --name winget --disable-interactivity` e sai 0; 3ª upgrade sai 0 com `Versão 2.24.0`; `available = 2.24.0` ⇒ `Ok`; exatamente 3 chamadas na ordem; log com `job.retry` e `job.end` `outcome=ok` `attempts=2`.
+2. `still_stale_after_retry_is_no_effect`: a 3ª ainda mostra 2.23.1 ⇒ `Err` com a mensagem exata da 134; 3 chamadas, nunca 4.
+3. `source_update_failure_stops`: a 2ª sai 1 ⇒ `Err` com o sufixo exato do item 2; só 2 chamadas.
+4. `no_retry_when_version_matches`: 1ª já mostra 2.24.0 ⇒ 1 chamada só.
+5. `no_retry_when_winget_failed`: 1ª sai `0x8A150006` ⇒ 1 chamada só (falha normal, sem `job.retry`).
+
+#### Checks beyond the steps
+
+1. Mutação: permitir segunda nova tentativa (laço sem limite) ⇒ teste 2 **PEGA**.
+2. Mutação: não conferir o código do `source update` ⇒ teste 3 **PEGA**.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(bridge): refresh winget's source and retry once when it picked an older version`
