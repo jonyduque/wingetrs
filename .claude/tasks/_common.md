@@ -20,6 +20,8 @@ Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira c
 - **Código de terceiros que lê dado externo** (abrir **e** ler) fica dentro do `catch_decoder`/`catch_unwind` do D4-1.
 - **"Nada gravado"** é provado olhando uma pasta que existiria se algo tivesse sido gravado, não uma que nunca existe.
 - **Cada braço de `match`/`if`** tem um teste que o alcança, nas duas ordens quando a ordem importa.
+- **Laço de nova tentativa** (Task 136): todo estado por tentativa (resultado, código, linhas, motivo da falha) é zerado no início de cada iteração, e há um teste em que a 2ª tentativa falha por **outro** motivo que a 1ª.
+- **Versão nunca comparada como texto** (Task 134): use `crate::core::version`, com testes "maior", "menor" e "mesma com zeros a mais".
 
 #### Report contract
 
