@@ -151,15 +151,76 @@ impl Closed {
     /// subscriber is process-global (installed once): a per-test `set_default` raced with
     /// other tests of the binary on the callsite interest cache and made spans vanish.
     pub fn install(&self) -> Installed {
-        use tracing_subscriber::layer::SubscriberExt;
-        static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| {
-            let _ = tracing::subscriber::set_global_default(
-                tracing_subscriber::registry().with(Router),
-            );
-        });
+        install_global();
         CURRENT.with(|c| *c.borrow_mut() = Some(self.clone()));
         Installed
+    }
+}
+
+/// The binary's one subscriber: `Router` for spans, plus formatted DEBUG events for the
+/// threads that installed a `Log`.
+fn install_global() {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    static GLOBAL: std::sync::Once = std::sync::Once::new();
+    GLOBAL.call_once(|| {
+        let events = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(|| ThreadLog)
+            .with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                *m.level() <= tracing::Level::DEBUG && LOG.with(|l| l.borrow().is_some())
+            }));
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(Router).with(events),
+        );
+    });
+}
+
+thread_local! {
+    static LOG: std::cell::RefCell<Option<Log>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Formatted tracing output (DEBUG and up) of the threads it is installed on.
+#[derive(Clone, Default)]
+pub struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl Log {
+    /// Records this thread's events into `self` until the guard drops. Same global
+    /// subscriber as `Closed::install`, for the same reason.
+    pub fn install(&self) -> LogInstalled {
+        install_global();
+        LOG.with(|l| *l.borrow_mut() = Some(self.clone()));
+        LogInstalled
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Stops recording events on drop.
+pub struct LogInstalled;
+
+impl Drop for LogInstalled {
+    fn drop(&mut self) {
+        LOG.with(|l| *l.borrow_mut() = None);
+    }
+}
+
+/// Writes into the calling thread's `Log`, if any.
+struct ThreadLog;
+
+impl std::io::Write for ThreadLog {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        LOG.with(|l| {
+            if let Some(log) = l.borrow().as_ref() {
+                log.0.lock().unwrap().extend_from_slice(b);
+            }
+        });
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

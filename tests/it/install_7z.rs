@@ -525,14 +525,13 @@ fn encoded_header_with_huge_unpack_size_refused() {
     // The same header inside a PE is refused by the pre-check, before the library decodes it.
     let mut sfx = mz(4096);
     sfx.extend_from_slice(&a);
-    let log = LogBuf::default();
-    let sub = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(log.clone())
-        .finish();
-    let (_, r) =
-        tracing::subscriber::with_default(sub, || run(&sfx, "sfx.7z", None, &DEFAULT_LIMITS));
+    // The binary's global subscriber, not `with_default`: a scoped one raced with the other
+    // tests hitting the same callsite on the interest cache, and the line went missing.
+    let log = crate::spans::Log::default();
+    let (_, r) = {
+        let _recording = log.install();
+        run(&sfx, "sfx.7z", None, &DEFAULT_LIMITS)
+    };
     assert!(
         matches!(r, Err(ExtractError::Unsupported(ref m)) if m.contains("instalador")),
         "{r:?}"
@@ -544,33 +543,6 @@ fn encoded_header_with_huge_unpack_size_refused() {
         ),
         "{log}"
     );
-}
-
-/// Collects formatted tracing output.
-#[derive(Clone, Default)]
-struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl LogBuf {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
-}
-
-impl std::io::Write for LogBuf {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-    type Writer = LogBuf;
-    fn make_writer(&'a self) -> LogBuf {
-        self.clone()
-    }
 }
 
 #[test]
