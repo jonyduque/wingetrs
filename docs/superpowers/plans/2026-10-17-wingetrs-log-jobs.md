@@ -72,3 +72,11 @@ Testes (`tests/it/job_log.rs`, capturando com `crate::spans::Log`):
 4. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat(log): start and end of every job; winget run that keeps the old version is not a success`
+
+---
+
+## Próximas (a detalhar depois da 134)
+
+- **Task 135 — aplicabilidade antes de oferecer a ponte:** `UpgradeBehavior: deny` no manifesto ⇒ "só pelo editor" (Android Studio, `0x8A150114`); escopo instalado (HKLM × HKCU) sem instalador do mesmo escopo ⇒ "não se aplica" (Anki, `0x8A15002B`).
+- **Task 136 — fonte do winget atrasada (decisão do usuário 2026-10-17: opção 1):** quando a conferência da 134 acusar `sem_efeito` porque o winget escolheu versão mais velha, rodar `winget source update --name winget` uma vez e repetir o upgrade uma vez; logar as duas tentativas.
+- **Elevação única por lote (aguarda decisão do usuário):** hoje cada instalador de escopo máquina pede UAC separado (Docker, Acrobat, CrystalDiskInfo em 2026-10-17).
