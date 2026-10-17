@@ -730,3 +730,40 @@ fn msi_row_limit_needs_installer() {
     assert!(matches!(e, ExtractError::Archive(_)), "{e:?}");
     assert!(!needs_installer(&d.path().join("x.msi"), "x.msi", &e));
 }
+
+/// Room for 100 rewind charges of one 0x8000 block, not of one 0xFFFF block.
+fn limits_5_mb() -> Limits {
+    Limits {
+        ratio: 1,
+        floor: 5_000_000,
+        ceiling: 5_000_000,
+        ..DEFAULT_LIMITS
+    }
+}
+
+#[test]
+fn rewind_charge_covers_the_largest_parsed_block() {
+    // 101 one-byte entries at offset 0: 100 rewinds of up to 0xFFFF bytes each
+    // (`cab` reads `cbUncomp` as a u16, so a block may decode more than 0x8000).
+    let data = pseudo_random(100);
+    let (d, r) = run_with(&shared_span_msi(&data, 101, (0, 1)), None, &limits_5_mb());
+    assert!(
+        matches!(r, Err(ExtractError::TooLarge { limit: 5_000_000 })),
+        "{r:?}"
+    );
+    assert!(!d.path().join("out/App").exists());
+    assert_eq!(list(d.path()), ["x.msi"]);
+}
+
+#[test]
+fn shared_empty_entries_extract_uncharged() {
+    // Empty entries never move the reader back: 101 of them fit the same budget.
+    let data = pseudo_random(100);
+    let (d, r) = run_with(&shared_span_msi(&data, 101, (5, 0)), None, &limits_5_mb());
+    r.unwrap();
+    let app = d.path().join("out/App");
+    assert_eq!(list(&app).len(), 101);
+    for name in ["f0000.bin", "f0001.bin", "f0100.bin"] {
+        assert_eq!(std::fs::read(app.join(name)).unwrap(), b"", "{name}");
+    }
+}

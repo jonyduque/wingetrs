@@ -26,6 +26,8 @@ const WORD_COUNT_COMPRESSED: i32 = 0x2;
 const FILE_NONCOMPRESSED: i32 = 0x2000;
 /// Largest `cbUncomp` of one CFDATA block (MS-CAB).
 const MAX_BLOCK: u64 = 0x8000;
+/// Largest `cbUncomp` the `cab` parser accepts (a `u16`): what one block can decode.
+const PARSED_BLOCK: u64 = 0xFFFF;
 /// CFHEADER flags `cfhdrPREV_CABINET | cfhdrNEXT_CABINET`.
 const CAB_SPANNED: u16 = 0x3;
 /// CFFILE `iFolder` values from 0xFFFD up: continued from or into another cabinet.
@@ -250,7 +252,7 @@ fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
             // Reading the span again seeks back: the folder decodes again from its
             // start up to `offset`, plus at most the block the span ends in.
             if size > 0 {
-                rewinds = rewinds.saturating_add(offset + MAX_BLOCK);
+                rewinds = rewinds.saturating_add(offset + PARSED_BLOCK);
             }
             continue;
         }
@@ -268,7 +270,10 @@ fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
             "gabinete com arquivos além dos dados da pasta".to_string(),
         ));
     }
-    Ok((end - in_files).saturating_add(rewinds))
+    let gaps = end.checked_sub(in_files).ok_or_else(|| {
+        ExtractError::Archive("gabinete com tamanhos de arquivos incoerentes".to_string())
+    })?;
+    Ok(gaps.saturating_add(rewinds))
 }
 
 /// Whether the cabinet spans cabinets (header flags or a continued CFFILE),
