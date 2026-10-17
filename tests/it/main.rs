@@ -15,6 +15,7 @@ mod cli_offline;
 mod cli_parse;
 mod config;
 mod correlate;
+mod elevated_worker;
 mod http;
 mod icons;
 mod index_file;
