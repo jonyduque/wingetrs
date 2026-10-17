@@ -37,6 +37,7 @@ mod install_target;
 mod install_win_effects;
 mod install_win_scan;
 mod installed;
+mod job_log;
 mod normalize;
 mod overrides;
 mod pins;
