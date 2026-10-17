@@ -4051,6 +4051,7 @@ fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
         name: target.into(),
         installed: Some("1".into()),
         available: Some("2".into()),
+        scope: None,
     }
 }
 
@@ -4720,6 +4721,7 @@ fn unchecking_an_apply_group() {
             name: "Git.Git".into(),
             installed: Some("1".into()),
             available: Some("2".into()),
+            scope: None,
         })]
     );
 }

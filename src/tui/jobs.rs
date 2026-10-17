@@ -1,5 +1,6 @@
 //! Install/remove/upgrade jobs of the TUI. Every function takes the `OpsCtx` as a parameter so
 //! tests drive them with fakes; `run.rs` builds the production context.
+use crate::bridge::elevated::ElevatedBridge;
 use crate::bridge::{self, BridgeJob, Tool};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
@@ -356,9 +357,7 @@ pub const WAITING_INSTALLER: &str = "aguardando outro instalador";
 /// Progress text once a queued winget job got `msi.lock`.
 pub const STARTING_WINGET: &str = "iniciando o winget";
 
-/// Runner of a bridge command: `(program, args, on_line)` -> exit code and last lines.
-pub type BridgeExec<'a> =
-    &'a mut dyn FnMut(&str, &[String], &mut dyn FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>;
+pub use crate::bridge::BridgeExec;
 
 /// Upgrades an app through winget or scoop. The target is checked before anything runs; for
 /// scoop, the installed version is read right before and right after the run, since its exit
@@ -376,6 +375,42 @@ pub fn run_bridge(
     exec: BridgeExec<'_>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Done, InstallFail> {
+    run_bridge_as(job, scoop_root, msi_lock, pwsh, exec, false, on_line)
+}
+
+/// `run_bridge` with the exec `bridge` picks: its elevated helper for a winget app installed
+/// for the whole machine, `current` otherwise (see `ElevatedBridge::exec_for`).
+pub fn run_bridge_elevated(
+    bridge: &ElevatedBridge,
+    job: &BridgeJob,
+    scoop_root: Option<&Path>,
+    msi_lock: &Path,
+    pwsh: &str,
+    current: BridgeExec<'_>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Done, InstallFail> {
+    let mut chosen = bridge.exec_for(job, current, on_line);
+    let elevated = chosen.elevated();
+    run_bridge_as(
+        job,
+        scoop_root,
+        msi_lock,
+        pwsh,
+        chosen.exec(),
+        elevated,
+        on_line,
+    )
+}
+
+fn run_bridge_as(
+    job: &BridgeJob,
+    scoop_root: Option<&Path>,
+    msi_lock: &Path,
+    pwsh: &str,
+    exec: BridgeExec<'_>,
+    elevated: bool,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Done, InstallFail> {
     let root = scoop_root.unwrap_or(Path::new(""));
     let (program, args) = bridge::command(job, root, pwsh);
     let mut log = JobLog::start(JobInfo {
@@ -387,6 +422,7 @@ pub fn run_bridge(
         to: job.available.clone(),
         cmd: Some(bridge::command_text(&program, &args)),
     });
+    log.elevated = elevated;
     let result = bridge_run(
         job,
         scoop_root,

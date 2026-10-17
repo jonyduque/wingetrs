@@ -7,10 +7,18 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
+pub mod elevate_win;
+pub mod elevated;
+#[cfg(windows)]
 pub mod spawn_win;
+pub mod worker;
 
 pub const PINNED_NOTE: &str = "versão fixada";
 pub const NOT_OURS_NOTE: &str = "instalado fora do wingetrs";
+
+/// Runner of a bridge command: `(program, args, on_line)` -> exit code and last lines.
+pub type BridgeExec<'a> =
+    &'a mut dyn FnMut(&str, &[String], &mut dyn FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>;
 
 /// Lines kept for the error log.
 pub const TAIL_LINES: usize = 40;
@@ -46,6 +54,8 @@ pub struct BridgeJob {
     pub installed: Option<String>,
     /// Version the catalog offers, for the job log and the winget check.
     pub available: Option<String>,
+    /// Who the app was installed for; a machine-wide winget app upgrades elevated.
+    pub scope: Option<InstallScope>,
 }
 
 /// Whether `r` is upgraded through winget (ARP/MSIX matched in the winget catalog) or scoop
@@ -80,6 +90,7 @@ pub fn bridge_target(r: &ListRow, pins: &BTreeSet<String>) -> Result<BridgeJob, 
         name: r.name.clone(),
         installed: r.installed_version.clone(),
         available,
+        scope: r.scope,
     })
 }
 

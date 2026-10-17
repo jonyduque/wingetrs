@@ -121,6 +121,20 @@ struct Ctx {
     /// Scoop root and PowerShell program of the bridge upgrades (the same the `App` shows).
     scoop_root: Option<std::path::PathBuf>,
     pwsh: String,
+    /// The session's elevated helper for machine-wide winget upgrades (one UAC per session).
+    elevated: crate::bridge::elevated::ElevatedBridge,
+}
+
+/// How long the TUI waits at exit for the elevated helper to quit.
+const HELPER_EXIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// Asks the elevated helper to quit when the event loop ends, on every path.
+struct HelperShutdown(Arc<Ctx>);
+
+impl Drop for HelperShutdown {
+    fn drop(&mut self) {
+        self.0.elevated.shutdown(HELPER_EXIT_LIMIT);
+    }
 }
 
 /// Runs the TUI; builds its own tokio runtime. The terminal is restored on return and on panic.
@@ -240,7 +254,13 @@ async fn event_loop(
         icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
         scoop_root,
         pwsh,
+        elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(
+            crate::bridge::elevated::SystemTransport::new(
+                std::env::current_exe().unwrap_or_default(),
+            ),
+        )),
     });
+    let _helper = HelperShutdown(Arc::clone(&ctx));
     ctx.http
         .set_allow_http_redirect(ctx.cfg.behavior.allow_http_redirect);
     let mut events = EventStream::new();
@@ -1365,14 +1385,16 @@ fn run_tool(
 }
 
 /// Runs a bridge upgrade (no `install.lock`, no ops context; winget jobs queue on `msi.lock`);
-/// each output line becomes the progress text.
+/// each output line becomes the progress text. A winget app installed for the whole machine
+/// runs through the session's elevated helper.
 fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
     spawn_job(ctx, move |c, _| {
         let tx = c.tx.clone();
         let mut on_line = |line: &str| {
             let _ = tx.send(Msg::BridgeLine(line.to_string()));
         };
-        Msg::InstallFinished(jobs::run_bridge(
+        Msg::InstallFinished(jobs::run_bridge_elevated(
+            &c.elevated,
             &job,
             c.scoop_root.as_deref(),
             &c.data.install_layout().msi_lock(),

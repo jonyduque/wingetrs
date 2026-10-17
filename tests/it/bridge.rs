@@ -28,6 +28,22 @@ fn available() -> UpdateState {
 }
 
 #[test]
+fn bridge_target_carries_the_install_scope() {
+    let none = BTreeSet::new();
+    for scope in [
+        Some(wingetrs::installed::correlate::InstallScope::Machine),
+        Some(wingetrs::installed::correlate::InstallScope::User),
+        None,
+    ] {
+        let r = ListRow {
+            scope,
+            ..row("Git", "arp", "winget", available())
+        };
+        assert_eq!(bridge_target(&r, &none).unwrap().scope, scope);
+    }
+}
+
+#[test]
 fn bridge_target_rules() {
     let none = BTreeSet::new();
     let arp = bridge_target(&row("Git", "arp", "winget", available()), &none).unwrap();
@@ -65,6 +81,7 @@ fn job(tool: Tool, target: &str) -> BridgeJob {
         name: target.into(),
         installed: None,
         available: None,
+        scope: None,
     }
 }
 

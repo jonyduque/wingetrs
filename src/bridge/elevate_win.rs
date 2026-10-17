@@ -1,0 +1,631 @@
+//! Win32 side of the elevated bridge helper: the pipe (only the current user may open it), the
+//! UAC launch, the connection deadline and the PID checks on both ends.
+use super::elevated::Helper;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use windows::Win32::Foundation::{
+    ERROR_BROKEN_PIPE, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GENERIC_READ,
+    GENERIC_WRITE, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0, WIN32_ERROR,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
+};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+    WriteFile,
+};
+use windows::Win32::System::Com::{
+    COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetProcessId, INFINITE, OpenProcess,
+    OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, SetEvent,
+    WaitForMultipleObjects, WaitForSingleObject,
+};
+use windows::Win32::UI::Shell::{
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    ShellExecuteExW,
+};
+use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows::core::{HSTRING, PCWSTR, PWSTR, w};
+
+/// Every helper pipe is `PIPE_PREFIX` + 32 lowercase hex digits.
+pub const PIPE_PREFIX: &str = r"\\.\pipe\wingetrs-elevated-";
+/// How long the helper has to connect once UAC let it start.
+const CONNECT_LIMIT: Duration = Duration::from_secs(30);
+const PIPE_BUFFER: u32 = 64 * 1024;
+/// A `TOKEN_USER` is a few dozen bytes; anything bigger is refused before allocating.
+const TOKEN_USER_MAX: u32 = 4096;
+
+fn raw(h: &OwnedHandle) -> HANDLE {
+    HANDLE(h.as_raw_handle())
+}
+
+/// `h` owned; an invalid handle is the thread's last error.
+fn own(h: HANDLE) -> std::io::Result<OwnedHandle> {
+    if h.is_invalid() || h.0.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a valid handle just returned to us, owned by nobody else.
+    Ok(unsafe { OwnedHandle::from_raw_handle(h.0) })
+}
+
+/// A Win32 error as the `io::Error` std would build (so `kind()` works).
+fn io_err(e: &windows::core::Error) -> std::io::Error {
+    let code = e.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        std::io::Error::from_raw_os_error(code as i32)
+    }
+}
+
+fn is(e: &windows::core::Error, code: WIN32_ERROR) -> bool {
+    e.code() == code.to_hresult()
+}
+
+/// A manual-reset event.
+fn event() -> std::io::Result<OwnedHandle> {
+    // SAFETY: no attributes, no name.
+    own(unsafe { CreateEventW(None, true, false, None) }.map_err(|e| io_err(&e))?)
+}
+
+/// Runs one overlapped operation on `h` to completion; the bytes it moved.
+fn overlapped(
+    h: HANDLE,
+    start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+) -> std::io::Result<u32> {
+    let done = event()?;
+    let mut ov = OVERLAPPED {
+        hEvent: raw(&done),
+        ..Default::default()
+    };
+    match start(&mut ov) {
+        Ok(()) => {}
+        Err(e) if is(&e, ERROR_IO_PENDING) => {}
+        Err(e) => return Err(io_err(&e)),
+    }
+    let mut n = 0u32;
+    // SAFETY: `ov` and its event outlive the operation: this waits for it to complete.
+    unsafe { GetOverlappedResult(h, &ov, &mut n, true) }.map_err(|e| io_err(&e))?;
+    Ok(n)
+}
+
+/// Overlapped reads and writes on a pipe end; every call has its own event, so a read and a
+/// write may be under way at once, and a `CancelIoEx` on the handle ends a blocked read.
+#[derive(Clone)]
+struct PipeIo(Arc<OwnedHandle>);
+
+impl Read for PipeIo {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let h = raw(&self.0);
+        // SAFETY: `buf` outlives the operation (`overlapped` waits for it).
+        match overlapped(h, |ov| unsafe { ReadFile(h, Some(buf), None, Some(ov)) }) {
+            Ok(n) => Ok(n as usize),
+            Err(e) if e.raw_os_error() == Some(ERROR_BROKEN_PIPE.0 as i32) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl Write for PipeIo {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let h = raw(&self.0);
+        // SAFETY: `buf` outlives the operation (`overlapped` waits for it).
+        overlapped(h, |ov| unsafe { WriteFile(h, Some(buf), None, Some(ov)) }).map(|n| n as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 16 random bytes from the system RNG, as hex.
+fn random_hex() -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    // SAFETY: the buffer is ours; no algorithm handle with the system-preferred flag.
+    unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+        .ok()
+        .map_err(|e| io_err(&e))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Frees a `LocalAlloc` block on drop.
+struct Local(*mut core::ffi::c_void);
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: allocated by the API that returned it, freed once.
+            unsafe { LocalFree(Some(HLOCAL(self.0))) };
+        }
+    }
+}
+
+/// The SID of the user this process runs as, as `S-1-5-...`.
+fn user_sid() -> std::io::Result<String> {
+    let mut token = HANDLE::default();
+    // SAFETY: the pseudo handle of this process; `token` receives a new handle.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|e| io_err(&e))?;
+    let token = own(token)?;
+    let mut len = 0u32;
+    // SAFETY: size query; fails with ERROR_INSUFFICIENT_BUFFER and sets `len`.
+    let _ = unsafe { GetTokenInformation(raw(&token), TokenUser, None, 0, &mut len) };
+    if len == 0 || len > TOKEN_USER_MAX {
+        return Err(std::io::Error::other(format!("TOKEN_USER com {len} bytes")));
+    }
+    // u64 words: aligned for the pointer inside TOKEN_USER.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `len` bytes.
+    unsafe {
+        GetTokenInformation(
+            raw(&token),
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+    }
+    .map_err(|e| io_err(&e))?;
+    // SAFETY: the call filled a TOKEN_USER at the start of `buf`, which stays alive below.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut text = PWSTR::null();
+    // SAFETY: `sid` points into `buf`; `text` receives a LocalAlloc string.
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(|e| io_err(&e))?;
+    let _free = Local(text.0.cast());
+    // SAFETY: a NUL-terminated string from the call above.
+    unsafe { text.to_string() }.map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Creates the server end of `name`: one instance only (a squatter that created the name first
+/// makes this fail), no remote clients, and only the current user may open it.
+fn create_pipe(name: &str) -> std::io::Result<OwnedHandle> {
+    let sddl = HSTRING::from(format!("D:P(A;;GRGW;;;{})", user_sid()?));
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sd` receives a LocalAlloc descriptor, freed by `_free`.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(&sddl, SDDL_REVISION_1, &mut sd, None)
+    }
+    .map_err(|e| io_err(&e))?;
+    let _free = Local(sd.0);
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: `sa` and its descriptor outlive the call.
+    own(unsafe {
+        CreateNamedPipeW(
+            &HSTRING::from(name),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            PIPE_BUFFER,
+            PIPE_BUFFER,
+            0,
+            Some(&sa),
+        )
+    })
+}
+
+/// Starts `exe args` elevated through UAC (hidden); the process handle. The user saying no is
+/// `ErrorKind::PermissionDenied`.
+fn launch(exe: &Path, args: &str) -> std::io::Result<OwnedHandle> {
+    // ShellExecuteEx wants COM; a thread already in another apartment is fine as it is.
+    // SAFETY: paired with CoUninitialize below when it succeeded.
+    let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+    let file = HSTRING::from(exe.as_os_str());
+    let params = HSTRING::from(args);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    // SAFETY: the strings outlive the call; it blocks until the UAC prompt is answered.
+    let started = unsafe { ShellExecuteExW(&mut info) };
+    if com.is_ok() {
+        // SAFETY: balances the successful CoInitializeEx above.
+        unsafe { CoUninitialize() };
+    }
+    match started {
+        Ok(()) => own(info.hProcess),
+        Err(e) if is(&e, ERROR_CANCELLED) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "elevação recusada",
+        )),
+        Err(e) => Err(io_err(&e)),
+    }
+}
+
+/// Waits for the helper `process` to connect to `pipe`, at most `limit`; it exiting first or
+/// the time running out is an error.
+fn accept(pipe: &OwnedHandle, process: &OwnedHandle, limit: Duration) -> std::io::Result<()> {
+    let done = event()?;
+    let mut ov = OVERLAPPED {
+        hEvent: raw(&done),
+        ..Default::default()
+    };
+    // SAFETY: `ov` lives until the operation is known complete or cancelled below.
+    match unsafe { ConnectNamedPipe(raw(pipe), Some(&mut ov)) } {
+        Ok(()) => return Ok(()),
+        Err(e) if is(&e, ERROR_PIPE_CONNECTED) => return Ok(()),
+        Err(e) if is(&e, ERROR_IO_PENDING) => {}
+        Err(e) => return Err(io_err(&e)),
+    }
+    let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX);
+    // SAFETY: both handles are open for the whole wait.
+    let woke = unsafe { WaitForMultipleObjects(&[raw(&done), raw(process)], false, ms) };
+    let mut n = 0u32;
+    if woke == WAIT_OBJECT_0 {
+        // SAFETY: the event is set: the operation is complete.
+        return unsafe { GetOverlappedResult(raw(pipe), &ov, &mut n, false) }
+            .map_err(|e| io_err(&e));
+    }
+    // SAFETY: cancels our own operation, then waits until it is over so `ov` can go away.
+    unsafe {
+        let _ = CancelIoEx(raw(pipe), Some(&ov));
+        let _ = GetOverlappedResult(raw(pipe), &ov, &mut n, true);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        if woke.0 == WAIT_OBJECT_0.0 + 1 {
+            "o auxiliar elevado saiu sem conectar"
+        } else {
+            "o auxiliar elevado não conectou a tempo"
+        },
+    ))
+}
+
+/// The TUI's side of a connected helper.
+pub struct PipeHelper {
+    reader: BufReader<PipeIo>,
+    writer: PipeIo,
+    process: OwnedHandle,
+}
+
+impl Helper for PipeHelper {
+    fn reader(&mut self) -> &mut dyn BufRead {
+        &mut self.reader
+    }
+
+    fn writer(&mut self) -> &mut dyn Write {
+        &mut self.writer
+    }
+
+    fn wait_exit(&mut self, limit: Duration) -> bool {
+        let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: the process handle is open while `self` lives.
+        let woke = unsafe { WaitForSingleObject(raw(&self.process), ms) };
+        woke == WAIT_OBJECT_0
+    }
+}
+
+/// The PID of `process`, which must be the client connected to `pipe`.
+fn check_client(pipe: &OwnedHandle, process: &OwnedHandle) -> std::io::Result<u32> {
+    let mut client = 0u32;
+    // SAFETY: a connected server end.
+    unsafe { GetNamedPipeClientProcessId(raw(pipe), &mut client) }.map_err(|e| io_err(&e))?;
+    // SAFETY: the process handle is open.
+    let helper = unsafe { GetProcessId(raw(process)) };
+    if helper == 0 || client != helper {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("o pipe foi aberto pelo processo {client}, não pelo auxiliar {helper}"),
+        ));
+    }
+    Ok(helper)
+}
+
+/// Whether the server of the connected client end `pipe` is the process `parent`.
+fn check_server(pipe: &OwnedHandle, parent: u32) -> std::io::Result<()> {
+    let mut server = 0u32;
+    // SAFETY: a connected client end.
+    unsafe { GetNamedPipeServerProcessId(raw(pipe), &mut server) }.map_err(|e| io_err(&e))?;
+    if server != parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("o pipe é servido pelo processo {server}, não por {parent}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Creates the pipe, starts `exe bridge-worker` elevated and accepts its connection, which
+/// must come from that very process.
+pub fn start(exe: &Path) -> std::io::Result<PipeHelper> {
+    let name = format!("{PIPE_PREFIX}{}", random_hex()?);
+    let pipe = create_pipe(&name)?;
+    // SAFETY: no arguments.
+    let me = unsafe { GetCurrentProcessId() };
+    let process = launch(exe, &format!("bridge-worker --pipe {name} --parent {me}"))?;
+    accept(&pipe, &process, CONNECT_LIMIT)?;
+    let helper = check_client(&pipe, &process)?;
+    tracing::info!(pid = helper, "bridge: elevated helper connected");
+    let io = PipeIo(Arc::new(pipe));
+    Ok(PipeHelper {
+        reader: BufReader::new(io.clone()),
+        writer: io,
+        process,
+    })
+}
+
+/// Whether `name` is a pipe name `start` makes.
+fn valid_pipe_name(name: &str) -> bool {
+    name.strip_prefix(PIPE_PREFIX).is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Cancels the pipe's I/O when the parent exits, so a blocked read ends; stopped and joined
+/// on drop, on every path.
+struct ParentWatch {
+    stop: Arc<OwnedHandle>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParentWatch {
+    fn spawn(parent: OwnedHandle, pipe: Arc<OwnedHandle>) -> std::io::Result<ParentWatch> {
+        let stop = Arc::new(event()?);
+        let wait_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            // SAFETY: the handles are owned by this closure (or shared with the guard) for the
+            // whole wait.
+            let woke = unsafe {
+                WaitForMultipleObjects(&[raw(&parent), raw(&wait_stop)], false, INFINITE)
+            };
+            if woke == WAIT_OBJECT_0 {
+                tracing::info!("bridge worker: parent exited; closing");
+                // SAFETY: the pipe stays open while this thread holds its Arc.
+                let _ = unsafe { CancelIoEx(raw(&pipe), None) };
+            }
+        });
+        Ok(ParentWatch {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for ParentWatch {
+    fn drop(&mut self) {
+        // SAFETY: the event is open while the guard lives.
+        let _ = unsafe { SetEvent(raw(&self.stop)) };
+        if let Some(t) = self.thread.take()
+            && let Err(p) = t.join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(p);
+        }
+    }
+}
+
+/// `wingetrs bridge-worker`: connects to `pipe`, checks that its server is `parent`, and serves
+/// it with the real bridge exec until it quits, closes or the parent exits.
+pub fn worker_main(pipe: &str, parent: u32) -> std::io::Result<()> {
+    if !valid_pipe_name(pipe) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nome de pipe inválido",
+        ));
+    }
+    // Opened before the check, so the PID cannot be reused by another process meanwhile.
+    // SAFETY: plain open by PID.
+    let parent_handle = own(unsafe {
+        OpenProcess(
+            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            parent,
+        )
+    }
+    .map_err(|e| io_err(&e))?)?;
+    // Identification only: the server may learn who we are but never act as us.
+    // SAFETY: plain open of a pipe name.
+    let handle = own(unsafe {
+        CreateFileW(
+            &HSTRING::from(pipe),
+            (GENERIC_READ | GENERIC_WRITE).0,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            None,
+        )
+    }
+    .map_err(|e| io_err(&e))?)?;
+    check_server(&handle, parent)?;
+    tracing::info!(parent, "bridge worker: connected");
+    let handle = Arc::new(handle);
+    let _watch = ParentWatch::spawn(parent_handle, Arc::clone(&handle))?;
+    let io = PipeIo(handle);
+    let mut reader = BufReader::new(io.clone());
+    let mut writer = io;
+    let result = super::worker::serve(&mut reader, &mut writer, &mut |program, args, on_line| {
+        super::spawn_win::run(program, args, on_line)
+    });
+    tracing::info!(ok = result.is_ok(), "bridge worker: done");
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The DACL of `h` as SDDL.
+    fn dacl(h: &OwnedHandle) -> String {
+        use windows::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
+        };
+        use windows::Win32::Security::DACL_SECURITY_INFORMATION;
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        let status = unsafe {
+            GetSecurityInfo(
+                raw(h),
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut sd),
+            )
+        };
+        assert_eq!(status.0, 0);
+        let _free = Local(sd.0);
+        let mut text = PWSTR::null();
+        unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                None,
+            )
+        }
+        .unwrap();
+        let _text = Local(text.0.cast());
+        unsafe { text.to_string() }.unwrap()
+    }
+
+    #[test]
+    fn pipe_names_are_only_ours() {
+        let good = format!("{PIPE_PREFIX}{}", "0123456789abcdef".repeat(2));
+        assert!(valid_pipe_name(&good));
+        assert!(!valid_pipe_name(&good.to_uppercase()));
+        assert!(!valid_pipe_name(&format!("{good}0")));
+        assert!(!valid_pipe_name(&good[..good.len() - 1]));
+        assert!(!valid_pipe_name(&good.replace("wingetrs", "outro")));
+        assert!(!valid_pipe_name(&format!(
+            "{PIPE_PREFIX}{}",
+            "g".repeat(32)
+        )));
+    }
+
+    #[test]
+    fn random_names_differ() {
+        let (a, b) = (random_hex().unwrap(), random_hex().unwrap());
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+        assert!(valid_pipe_name(&format!("{PIPE_PREFIX}{a}")));
+    }
+
+    fn open_client(name: &str) -> OwnedHandle {
+        own(unsafe {
+            CreateFileW(
+                &HSTRING::from(name),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                None,
+            )
+        }
+        .unwrap())
+        .unwrap()
+    }
+
+    fn process(pid: u32) -> OwnedHandle {
+        let access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        own(unsafe { OpenProcess(access, false, pid) }.unwrap()).unwrap()
+    }
+
+    fn me() -> u32 {
+        unsafe { GetCurrentProcessId() }
+    }
+
+    /// A handle to a process that already exited, and its PID.
+    fn exited_process() -> (OwnedHandle, u32) {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let handle = process(child.id());
+        child.wait().unwrap();
+        (handle, child.id())
+    }
+
+    fn new_pipe() -> (String, OwnedHandle) {
+        let name = format!("{PIPE_PREFIX}{}", random_hex().unwrap());
+        let server = create_pipe(&name).unwrap();
+        (name, server)
+    }
+
+    /// The DACL and the overlapped I/O over a real pipe, both ends in this process (no UAC).
+    #[test]
+    fn pipe_round_trip_and_dacl() {
+        let (name, server) = new_pipe();
+        // A second instance of the same name is refused (one instance, first-instance flag).
+        assert!(create_pipe(&name).is_err());
+        // GRGW is stored as FILE_GENERIC_READ | FILE_GENERIC_WRITE; protected, nobody else.
+        let expected = format!("D:P(A;;0x12019f;;;{})", user_sid().unwrap());
+        assert_eq!(dacl(&server), expected);
+        let client = open_client(&name);
+        accept(&server, &process(me()), Duration::from_secs(5)).unwrap();
+        let mut s = PipeIo(Arc::new(server));
+        let mut c = BufReader::new(PipeIo(Arc::new(client)));
+        s.write_all(
+            b"ola
+",
+        )
+        .unwrap();
+        let mut line = String::new();
+        c.read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            "ola
+"
+        );
+        // The server end closing reads as the end of the stream.
+        drop(s);
+        line.clear();
+        assert_eq!(c.read_line(&mut line).unwrap(), 0);
+    }
+
+    #[test]
+    fn pid_checks_accept_only_the_expected_process() {
+        let (name, server) = new_pipe();
+        let client = open_client(&name);
+        accept(&server, &process(me()), Duration::from_secs(5)).unwrap();
+        assert_eq!(check_client(&server, &process(me())).unwrap(), me());
+        let (other, other_pid) = exited_process();
+        let e = check_client(&server, &other).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        check_server(&client, me()).unwrap();
+        let e = check_server(&client, other_pid).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn accept_gives_up_when_the_helper_exits_or_never_connects() {
+        let (_, server) = new_pipe();
+        let (dead, _) = exited_process();
+        let e = accept(&server, &dead, Duration::from_secs(30)).unwrap_err();
+        assert!(e.to_string().contains("saiu sem conectar"), "{e}");
+        // The pipe is still usable afterwards; nobody connects within the limit.
+        let e = accept(&server, &process(me()), Duration::from_millis(50)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("não conectou a tempo"), "{e}");
+    }
+}

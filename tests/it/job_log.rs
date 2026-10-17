@@ -20,6 +20,7 @@ fn job(available: Option<&str>) -> BridgeJob {
         name: "Antigravity".into(),
         installed: Some("2.20.0".into()),
         available: available.map(str::to_string),
+        scope: None,
     }
 }
 

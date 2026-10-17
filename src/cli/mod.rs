@@ -286,6 +286,16 @@ pub enum Command {
   wingetrs repair"
     )]
     Repair,
+    /// Auxiliar elevado da ponte do winget (iniciado pela TUI via UAC)
+    #[command(hide = true)]
+    BridgeWorker {
+        /// Pipe da TUI
+        #[arg(long)]
+        pipe: String,
+        /// PID da TUI que serve o pipe
+        #[arg(long)]
+        parent: u32,
+    },
 }
 
 #[derive(Debug, PartialEq, clap::Subcommand)]
@@ -841,6 +851,8 @@ async fn run_async(
             }
         }
         Command::Bucket { action } => run_bucket(action, &data, cfg),
+        // Handled in `run`, before the runtime exists.
+        Command::BridgeWorker { .. } => anyhow::bail!("bridge-worker fora do lugar"),
     }
 }
 
@@ -931,6 +943,11 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::debug!(target: "wingetrs::startup", stage = "startup.ensure", ms = ensure_ms);
     tracing::debug!(target: "wingetrs::startup", stage = "startup.log", ms = log_ms);
     let after_log = std::time::Instant::now();
+    if let Some(Command::BridgeWorker { pipe, parent }) = &cli.command {
+        let _span = tracing::info_span!("bridge_worker", role = "worker").entered();
+        return crate::bridge::elevated::run_worker(pipe, *parent)
+            .map_err(|e| anyhow::anyhow!("auxiliar elevado: {e}"));
+    }
     let cfg =
         tracing::debug_span!("startup.config").in_scope(|| Config::load(&data.config_path()))?;
     if cli.command.is_none() {

@@ -101,6 +101,8 @@ pub struct JobLog {
     pub failure: Outcome,
     /// Runs of the tool; 2 when the job refreshed the source and ran again.
     pub attempts: u32,
+    /// Whether the tool ran through the elevated bridge helper.
+    pub elevated: bool,
 }
 
 impl JobLog {
@@ -126,6 +128,7 @@ impl JobLog {
             installer_log: None,
             failure: Outcome::Failed,
             attempts: 1,
+            elevated: false,
         }
     }
 
@@ -150,6 +153,7 @@ impl JobLog {
                 target: "wingetrs::job",
                 kind = %i.kind, tool = %i.tool, target = %i.target, name = %i.name,
                 outcome = %outcome_text, code = %code, ms, after = %after, attempts = self.attempts,
+                elevated = self.elevated,
                 installer_log = %installer_log, detail = %detail,
                 "job.end"
             );
@@ -159,6 +163,7 @@ impl JobLog {
                 target: "wingetrs::job",
                 kind = %i.kind, tool = %i.tool, target = %i.target, name = %i.name,
                 outcome = %outcome_text, code = %code, ms, after = %after, attempts = self.attempts,
+                elevated = self.elevated,
                 installer_log = %installer_log, detail = %detail, output = %tail,
                 "job.end"
             );
