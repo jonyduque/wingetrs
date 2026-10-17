@@ -51,6 +51,7 @@ mod tui_theme;
 mod tui_view;
 mod update;
 mod version;
+mod winget_applicability;
 mod winget_details;
 mod winget_index;
 mod winget_manifest;
