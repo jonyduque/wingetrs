@@ -258,12 +258,11 @@ pub fn reboot_requested(code: i32, lines: &[String], markers: &[&str]) -> bool {
 /// The version winget picked, from its `<name> [<target>] <word> <version>` line (any
 /// language: the id in brackets and the last word of the line).
 pub fn winget_chosen_version(target: &str, lines: &[String]) -> Option<String> {
-    let id = format!("[{target}]");
+    let id = format!("[{target}]").to_ascii_lowercase();
     lines.iter().find_map(|l| {
         let l = plain(l);
-        let rest = l[l.find(&id)? + id.len()..]
-            .split_whitespace()
-            .collect::<Vec<_>>();
+        let at = l.to_ascii_lowercase().find(&id)?;
+        let rest = l[at + id.len()..].split_whitespace().collect::<Vec<_>>();
         let version = rest.last().filter(|_| rest.len() >= 2)?;
         version
             .starts_with(|c: char| c.is_ascii_digit())

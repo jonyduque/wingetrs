@@ -1295,10 +1295,14 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
                 let _ = tx.send(msg);
             }
         };
+        let logged = action.clone();
         let result = with_ops(c, &progress, |o| {
             handle.block_on(jobs::run_action(o, action))
         })
-        .map_err(InstallFail::Other)
+        .map_err(|e| {
+            jobs::log_not_started(&logged, &e);
+            InstallFail::Other(e)
+        })
         .and_then(|r| r);
         Msg::InstallFinished(result)
     });

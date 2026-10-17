@@ -3,6 +3,7 @@
 use crate::bridge::{self, BridgeJob, Tool};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
+use crate::core::version::Version;
 use crate::install::executor::ExecError;
 use crate::install::msi_queue;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, OpsError, Resolution};
@@ -268,9 +269,10 @@ fn installed(applied: Result<Vec<InstallPlan>, OpsError>) -> Result<Done, Instal
     })
 }
 
-/// Executes a confirmed action (the lock policy is the context's `wait`).
-pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallFail> {
-    let info = match &action {
+/// The `job.start` data of an action run by the own installer; `None` for a bridge job
+/// (`run_bridge` logs it).
+fn action_info(action: &Action) -> Option<JobInfo> {
+    match action {
         Action::Apply(groups) | Action::ApplyMsiexec { groups, .. } => {
             let plans = groups.iter().flatten();
             let kind = JobInfo::plans_kind(plans.clone());
@@ -285,16 +287,43 @@ pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallF
             to: None,
             cmd: None,
         }),
-        // Logged by `run_bridge`.
         Action::Bridge(_) => None,
-    };
-    let log = info.map(JobLog::start);
+    }
+}
+
+/// Outcome and text of a failed job for `job.end`.
+fn fail_log(fail: &InstallFail) -> (Outcome, String) {
+    match fail {
+        InstallFail::Busy => (
+            Outcome::Busy,
+            "outro wingetrs está com o install.lock".to_string(),
+        ),
+        InstallFail::NeedsMsiexec { app, reason, .. } => (
+            Outcome::NeedsConfirmation,
+            format!("{app}: precisa de confirmação para o msiexec /a ({reason})"),
+        ),
+        InstallFail::Other(m) => (Outcome::Failed, m.clone()),
+    }
+}
+
+/// Logs `job.start` and `job.end` of an action whose context could not even be built.
+pub fn log_not_started(action: &Action, error: &str) {
+    if let Some(info) = action_info(action) {
+        JobLog::start(info).finish(Outcome::Failed, error);
+    }
+}
+
+/// Executes a confirmed action (the lock policy is the context's `wait`).
+pub async fn run_action(o: &OpsCtx<'_>, action: Action) -> Result<Done, InstallFail> {
+    let log = action_info(&action).map(JobLog::start);
     let result = run_action_inner(o, action).await;
     if let Some(log) = log {
         match &result {
             Ok(done) => log.finish(Outcome::Ok, &done.summary),
-            Err(InstallFail::Other(m)) => log.finish(Outcome::Failed, m),
-            Err(other) => log.finish(Outcome::Failed, &format!("{other:?}")),
+            Err(fail) => {
+                let (outcome, detail) = fail_log(fail);
+                log.finish(outcome, &detail);
+            }
         }
     }
     result
@@ -369,11 +398,15 @@ pub fn run_bridge(
     );
     match &result {
         Ok(done) => log.finish(Outcome::Ok, &done.summary),
-        Err(InstallFail::Other(m)) => {
-            let outcome = log.failure;
-            log.finish(outcome, m);
+        Err(fail) => {
+            let (outcome, detail) = fail_log(fail);
+            let outcome = if outcome == Outcome::Failed {
+                log.failure
+            } else {
+                outcome
+            };
+            log.finish(outcome, &detail);
         }
-        Err(other) => log.finish(Outcome::Failed, &format!("{other:?}")),
     }
     result
 }
@@ -418,7 +451,14 @@ fn bridge_run(
         Tool::Scoop => None,
     };
     let before = version();
-    let run = exec(program, args, on_line);
+    // The line naming the version winget picked may be older than the tail the exec keeps.
+    let mut seen_chosen: Option<String> = None;
+    let run = exec(program, args, &mut |line: &str| {
+        if job.tool == Tool::Winget && seen_chosen.is_none() {
+            seen_chosen = bridge::winget_chosen_version(&job.target, &[line.to_string()]);
+        }
+        on_line(line);
+    });
     let after = version();
     let (code, lines) = match run {
         Ok(r) => r,
@@ -443,9 +483,9 @@ fn bridge_run(
         Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),
     };
     if updated && job.tool == Tool::Winget {
-        let chosen = bridge::winget_chosen_version(&job.target, &lines);
+        let chosen = seen_chosen.or_else(|| bridge::winget_chosen_version(&job.target, &lines));
         if let (Some(chosen), Some(available)) = (&chosen, &job.available)
-            && chosen != available
+            && Version::parse(chosen) < Version::parse(available)
         {
             updated = false;
             message = format!(

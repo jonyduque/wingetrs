@@ -1519,3 +1519,97 @@ fn installer_launch_is_never_throttled() {
         Some(Msg::InstallerRunning)
     ));
 }
+
+fn log_line<'a>(text: &'a str, what: &str) -> &'a str {
+    text.lines()
+        .find(|l| l.contains(what))
+        .unwrap_or_else(|| panic!("sem {what}: {text}"))
+}
+
+#[tokio::test]
+async fn run_action_logs_start_and_end_of_own_jobs() {
+    let mut w = World::new().await;
+    w.add("leaf").await;
+    let ctx = w.ctx(LockWait::NoWait, &quiet);
+    let log = crate::spans::Log::default();
+    let _installed = log.install();
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    else {
+        panic!("expected Ready");
+    };
+    jobs::run_action(&ctx, action).await.unwrap();
+    let Ok(Planned::Ready { action, .. }) = jobs::plan_remove(&ctx, "leaf", false) else {
+        panic!("expected Ready");
+    };
+    jobs::run_action(&ctx, action).await.unwrap();
+    let text = log.text();
+    let starts: Vec<&str> = text.lines().filter(|l| l.contains("job.start")).collect();
+    let ends: Vec<&str> = text.lines().filter(|l| l.contains("job.end")).collect();
+    assert_eq!(starts.len(), 2, "{text}");
+    assert_eq!(ends.len(), 2, "{text}");
+    assert!(starts[0].contains("kind=install") && starts[0].contains("tool=wingetrs"));
+    assert!(starts[1].contains("kind=remove") && starts[1].contains("name=leaf"));
+    assert!(ends[0].contains("kind=install") && ends[0].contains("outcome=ok"));
+    assert!(ends[1].contains("kind=remove") && ends[1].contains("outcome=ok"));
+}
+
+#[tokio::test]
+async fn busy_and_msiexec_stops_have_their_own_outcome_at_info() {
+    let mut w = World::new().await;
+    w.add("leaf").await;
+    w.add_msi("m").await;
+    let mut ctx = w.ctx(LockWait::NoWait, &quiet);
+    ctx.msiexec = Msiexec {
+        busy: never_busy,
+        launch: fake_admin,
+    };
+    let log = crate::spans::Log::default();
+    let _installed = log.install();
+    let held = UpdateLock::try_acquire(&w.layout.install_lock())
+        .unwrap()
+        .unwrap();
+    let r = jobs::run_action(&ctx, Action::Apply(planned_groups(&ctx, "leaf"))).await;
+    assert_eq!(r.unwrap_err(), InstallFail::Busy);
+    drop(held);
+    let r = jobs::run_action(&ctx, Action::Apply(planned_groups(&ctx, "m"))).await;
+    assert!(matches!(r, Err(InstallFail::NeedsMsiexec { .. })));
+    let text = log.text();
+    let ends: Vec<&str> = text.lines().filter(|l| l.contains("job.end")).collect();
+    assert_eq!(ends.len(), 2, "{text}");
+    assert!(
+        ends[0].contains("INFO") && ends[0].contains("outcome=ocupado"),
+        "{}",
+        ends[0]
+    );
+    assert!(
+        ends[1].contains("INFO") && ends[1].contains("outcome=pede_confirmacao"),
+        "{}",
+        ends[1]
+    );
+    assert!(!ends[1].contains("NeedsMsiexec"), "{}", ends[1]);
+}
+
+#[test]
+fn a_context_that_failed_to_build_still_logs_the_job() {
+    let log = crate::spans::Log::default();
+    let _installed = log.install();
+    let plan = wingetrs::install::plan::UninstallPlan {
+        app: "leaf".into(),
+        version: "1.0".into(),
+        purge: false,
+        artifacts: Vec::new(),
+        path_users: Vec::new(),
+        remove_path_entry: false,
+    };
+    jobs::log_not_started(&Action::Remove(plan), "catálogo ausente");
+    let text = log.text();
+    assert!(
+        log_line(&text, "job.start").contains("kind=remove"),
+        "{text}"
+    );
+    let end = log_line(&text, "job.end");
+    assert!(
+        end.contains("outcome=falhou") && end.contains("catálogo ausente"),
+        "{end}"
+    );
+}

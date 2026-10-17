@@ -164,3 +164,67 @@ fn dropped_job_log_ends_as_cancelled() {
     drop(started);
     assert!(log.text().contains("outcome=cancelado"), "{}", log.text());
 }
+
+#[test]
+fn newer_or_equal_winget_version_is_a_success() {
+    let newer = lines(&["Encontrado Antigravity [Google.Antigravity] Versão 2.25.0"]);
+    let (r, text) = run(&job(Some("2.24.0")), 0, newer);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(text.contains("outcome=ok"), "{text}");
+    let same = lines(&["Encontrado Antigravity [Google.Antigravity] Versão 2.24"]);
+    let (r, _) = run(&job(Some("2.24.0")), 0, same);
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn chosen_version_ignores_id_case() {
+    let l = lines(&["Found Git [git.git] Version 2.55.0.5"]);
+    assert_eq!(
+        bridge::winget_chosen_version("Git.Git", &l).as_deref(),
+        Some("2.55.0.5")
+    );
+}
+
+#[test]
+fn chosen_version_is_taken_from_the_whole_output_not_only_the_tail() {
+    let log = Log::default();
+    let _installed = log.install();
+    let (_dir, lock) = msi_lock();
+    let mut exec = |_: &str, _: &[String], on_line: &mut dyn FnMut(&str)| {
+        on_line("Encontrado Antigravity [Google.Antigravity] Versão 2.23.1");
+        Ok((0, lines(&["so o fim"])))
+    };
+    let r = jobs::run_bridge(
+        &job(Some("2.24.0")),
+        None,
+        &lock,
+        "pwsh",
+        &mut exec,
+        &mut |_: &str| {},
+    );
+    assert!(r.is_err());
+    assert!(log.text().contains("outcome=sem_efeito"), "{}", log.text());
+}
+
+#[test]
+fn panicking_job_ends_as_failed() {
+    let log = Log::default();
+    let _installed = log.install();
+    let r = std::panic::catch_unwind(|| {
+        let _job = wingetrs::job_log::JobLog::start(wingetrs::job_log::JobInfo {
+            kind: "install",
+            tool: "wingetrs",
+            target: "main/x".into(),
+            name: "x".into(),
+            from: None,
+            to: None,
+            cmd: None,
+        });
+        panic!("boom");
+    });
+    assert!(r.is_err());
+    let text = log.text();
+    let end = text.lines().find(|l| l.contains("job.end")).unwrap();
+    assert!(end.contains("outcome=falhou"), "{end}");
+    assert!(end.contains("terminou em pânico"), "{end}");
+}

@@ -14,6 +14,10 @@ pub enum Outcome {
     NoEffect,
     Failed,
     Cancelled,
+    /// Another wingetrs holds `install.lock`; nothing ran.
+    Busy,
+    /// Stopped until the user confirms (an MSI that needs `msiexec /a`).
+    NeedsConfirmation,
 }
 
 impl Outcome {
@@ -23,6 +27,8 @@ impl Outcome {
             Outcome::NoEffect => "sem_efeito",
             Outcome::Failed => "falhou",
             Outcome::Cancelled => "cancelado",
+            Outcome::Busy => "ocupado",
+            Outcome::NeedsConfirmation => "pede_confirmacao",
         }
     }
 }
@@ -133,7 +139,10 @@ impl JobLog {
         let after = dash(&self.after);
         let installer_log = dash(&self.installer_log);
         let outcome_text = outcome.as_str();
-        if outcome == Outcome::Ok {
+        if !matches!(
+            outcome,
+            Outcome::Failed | Outcome::NoEffect | Outcome::Cancelled
+        ) {
             tracing::info!(
                 target: "wingetrs::job",
                 kind = %i.kind, tool = %i.tool, target = %i.target, name = %i.name,
