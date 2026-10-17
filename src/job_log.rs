@@ -99,6 +99,8 @@ pub struct JobLog {
     pub installer_log: Option<String>,
     /// Outcome to use when the job returns an error (default `Failed`).
     pub failure: Outcome,
+    /// Runs of the tool; 2 when the job refreshed the source and ran again.
+    pub attempts: u32,
 }
 
 impl JobLog {
@@ -123,6 +125,7 @@ impl JobLog {
             lines: Vec::new(),
             installer_log: None,
             failure: Outcome::Failed,
+            attempts: 1,
         }
     }
 
@@ -146,7 +149,7 @@ impl JobLog {
             tracing::info!(
                 target: "wingetrs::job",
                 kind = %i.kind, tool = %i.tool, target = %i.target, name = %i.name,
-                outcome = %outcome_text, code = %code, ms, after = %after,
+                outcome = %outcome_text, code = %code, ms, after = %after, attempts = self.attempts,
                 installer_log = %installer_log, detail = %detail,
                 "job.end"
             );
@@ -155,7 +158,7 @@ impl JobLog {
             tracing::warn!(
                 target: "wingetrs::job",
                 kind = %i.kind, tool = %i.tool, target = %i.target, name = %i.name,
-                outcome = %outcome_text, code = %code, ms, after = %after,
+                outcome = %outcome_text, code = %code, ms, after = %after, attempts = self.attempts,
                 installer_log = %installer_log, detail = %detail, output = %tail,
                 "job.end"
             );

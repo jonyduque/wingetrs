@@ -137,6 +137,21 @@ pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<S
     }
 }
 
+/// Program and arguments that refresh winget's own copy of its catalog.
+pub fn winget_source_update() -> (String, Vec<String>) {
+    let args = [
+        "source",
+        "update",
+        "--name",
+        "winget",
+        "--disable-interactivity",
+    ];
+    (
+        "winget".to_string(),
+        args.into_iter().map(str::to_string).collect(),
+    )
+}
+
 /// `s` escaped for a PowerShell single-quoted string: every quote PowerShell reads as `'`
 /// (ASCII and the typographic U+2018..U+201B) is doubled.
 fn ps_single_quoted(s: &str) -> String {

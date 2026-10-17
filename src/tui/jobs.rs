@@ -451,58 +451,97 @@ fn bridge_run(
         Tool::Scoop => None,
     };
     let before = version();
+    let mut retried = false;
+    loop {
+        let (code, lines, seen_chosen) = match exec_once(program, args, exec, on_line, job) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return fail(format!("{} não encontrado", job.tool.name()));
+            }
+            Err(e) => return fail(format!("falha ao iniciar {program}: {e}")),
+        };
+        let after = version();
+        log.code = Some(code);
+        log.after = after.clone();
+        log.installer_log = match job.tool {
+            Tool::Winget => bridge::winget_installer_log(&lines),
+            Tool::Scoop => None,
+        };
+        let (mut updated, mut message) = match job.tool {
+            Tool::Winget if bridge::reboot_requested(code, &lines, &bridge::REBOOT_MARKERS) => {
+                let message = "Atualizado; reinicie o computador para concluir.";
+                tracing::info!(target = %job.target, "{message}");
+                (true, message.to_string())
+            }
+            Tool::Winget => (bridge::winget_updated(code), bridge::winget_message(code)),
+            Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),
+        };
+        let mut stale = None;
+        if updated && job.tool == Tool::Winget {
+            let chosen = seen_chosen.or_else(|| bridge::winget_chosen_version(&job.target, &lines));
+            if let (Some(chosen), Some(available)) = (&chosen, &job.available)
+                && Version::parse(chosen) < Version::parse(available)
+            {
+                updated = false;
+                message = format!(
+                    "O winget instalou {chosen}, não {available}: o catálogo local do winget está mais velho que o do wingetrs. Tente de novo mais tarde."
+                );
+                log.failure = Outcome::NoEffect;
+                stale = Some((chosen.clone(), available.clone()));
+            }
+            log.after = chosen;
+        }
+        log.lines = lines;
+        if let (Some((chosen, available)), false) = (stale, retried) {
+            retried = true;
+            log.attempts = 2;
+            tracing::info!(
+                target: "wingetrs::job",
+                target = %job.target, chosen = %chosen, available = %available,
+                reason = "fonte do winget atrasada",
+                "job.retry"
+            );
+            on_line("atualizando a fonte do winget");
+            let (src_program, src_args) = bridge::winget_source_update();
+            match exec(&src_program, &src_args, &mut |_: &str| {}) {
+                Ok((0, _)) => continue,
+                Ok((code, _)) => {
+                    message.push_str(&format!(
+                        " (a atualização da fonte do winget falhou: código {code})"
+                    ));
+                }
+                Err(e) => {
+                    message.push_str(&format!(" (a atualização da fonte do winget falhou: {e})"));
+                }
+            }
+        }
+        if updated {
+            return Ok(Done {
+                summary: format!("{}: {message}", job.name),
+                residues: None,
+            });
+        }
+        return fail(message);
+    }
+}
+
+/// One run of the bridge command: exit code, last lines and the first version winget named.
+fn exec_once(
+    program: &str,
+    args: &[String],
+    exec: BridgeExec<'_>,
+    on_line: &mut dyn FnMut(&str),
+    job: &BridgeJob,
+) -> std::io::Result<(i32, Vec<String>, Option<String>)> {
     // The line naming the version winget picked may be older than the tail the exec keeps.
     let mut seen_chosen: Option<String> = None;
-    let run = exec(program, args, &mut |line: &str| {
+    let (code, lines) = exec(program, args, &mut |line: &str| {
         if job.tool == Tool::Winget && seen_chosen.is_none() {
             seen_chosen = bridge::winget_chosen_version(&job.target, &[line.to_string()]);
         }
         on_line(line);
-    });
-    let after = version();
-    let (code, lines) = match run {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return fail(format!("{} não encontrado", job.tool.name()));
-        }
-        Err(e) => return fail(format!("falha ao iniciar {program}: {e}")),
-    };
-    log.code = Some(code);
-    log.after = after.clone();
-    log.installer_log = match job.tool {
-        Tool::Winget => bridge::winget_installer_log(&lines),
-        Tool::Scoop => None,
-    };
-    let (mut updated, mut message) = match job.tool {
-        Tool::Winget if bridge::reboot_requested(code, &lines, &bridge::REBOOT_MARKERS) => {
-            let message = "Atualizado; reinicie o computador para concluir.";
-            tracing::info!(target = %job.target, "{message}");
-            (true, message.to_string())
-        }
-        Tool::Winget => (bridge::winget_updated(code), bridge::winget_message(code)),
-        Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),
-    };
-    if updated && job.tool == Tool::Winget {
-        let chosen = seen_chosen.or_else(|| bridge::winget_chosen_version(&job.target, &lines));
-        if let (Some(chosen), Some(available)) = (&chosen, &job.available)
-            && Version::parse(chosen) < Version::parse(available)
-        {
-            updated = false;
-            message = format!(
-                "O winget instalou {chosen}, não {available}: o catálogo local do winget está mais velho que o do wingetrs. Tente de novo mais tarde."
-            );
-            log.failure = Outcome::NoEffect;
-        }
-        log.after = chosen;
-    }
-    log.lines = lines;
-    if updated {
-        return Ok(Done {
-            summary: format!("{}: {message}", job.name),
-            residues: None,
-        });
-    }
-    fail(message)
+    })?;
+    Ok((code, lines, seen_chosen))
 }
 
 /// Removes the chosen residues; returns one message per item that failed.

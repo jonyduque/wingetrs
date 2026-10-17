@@ -228,3 +228,98 @@ fn panicking_job_ends_as_failed() {
     assert!(end.contains("outcome=falhou"), "{end}");
     assert!(end.contains("terminou em pânico"), "{end}");
 }
+
+const STALE: &str = "Encontrado Antigravity [Google.Antigravity] Versão 2.23.1";
+const FRESH: &str = "Encontrado Antigravity [Google.Antigravity] Versão 2.24.0";
+const SOURCE_UPDATE: [&str; 5] = [
+    "source",
+    "update",
+    "--name",
+    "winget",
+    "--disable-interactivity",
+];
+
+type Calls = Vec<(String, Vec<String>)>;
+
+/// Runs the bridge job with a scripted fake winget: call `n` answers `script[n]`.
+fn run_script(script: &[(i32, &str)]) -> (Result<String, InstallFail>, String, Calls) {
+    let log = Log::default();
+    let _installed = log.install();
+    let (_dir, lock) = msi_lock();
+    let mut calls: Calls = Vec::new();
+    let mut exec = |p: &str, a: &[String], _: &mut dyn FnMut(&str)| {
+        let (code, out) = script[calls.len()];
+        calls.push((p.to_string(), a.to_vec()));
+        Ok((code, vec![out.to_string()]))
+    };
+    let r = jobs::run_bridge(
+        &job(Some("2.24.0")),
+        None,
+        &lock,
+        "pwsh",
+        &mut exec,
+        &mut |_: &str| {},
+    );
+    (r.map(|d| d.summary), log.text(), calls)
+}
+
+fn is_source_update(call: &(String, Vec<String>)) -> bool {
+    call.0 == "winget" && call.1 == SOURCE_UPDATE
+}
+
+#[test]
+fn stale_source_updates_and_retries_once() {
+    let (r, text, calls) = run_script(&[(0, STALE), (0, ""), (0, FRESH)]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].1[0], "upgrade");
+    assert!(is_source_update(&calls[1]), "{:?}", calls[1]);
+    assert_eq!(calls[2], calls[0]);
+    assert!(text.contains("job.retry"), "{text}");
+    let end = text.lines().find(|l| l.contains("job.end")).unwrap();
+    assert!(end.contains("outcome=ok"), "{end}");
+    assert!(end.contains("attempts=2"), "{end}");
+    assert!(end.contains("after=2.24.0"), "{end}");
+}
+
+#[test]
+fn still_stale_after_retry_is_no_effect() {
+    let (r, text, calls) = run_script(&[(0, STALE), (0, ""), (0, STALE), (0, STALE)]);
+    assert_eq!(
+        r,
+        Err(InstallFail::Other(
+            "Antigravity: O winget instalou 2.23.1, não 2.24.0: o catálogo local do winget está mais velho que o do wingetrs. Tente de novo mais tarde.".into()
+        ))
+    );
+    assert_eq!(calls.len(), 3);
+    assert!(text.contains("outcome=sem_efeito"), "{text}");
+    assert!(text.contains("attempts=2"), "{text}");
+}
+
+#[test]
+fn source_update_failure_stops() {
+    let (r, _, calls) = run_script(&[(0, STALE), (1, ""), (0, FRESH)]);
+    assert_eq!(
+        r,
+        Err(InstallFail::Other(
+            "Antigravity: O winget instalou 2.23.1, não 2.24.0: o catálogo local do winget está mais velho que o do wingetrs. Tente de novo mais tarde. (a atualização da fonte do winget falhou: código 1)".into()
+        ))
+    );
+    assert_eq!(calls.len(), 2);
+}
+
+#[test]
+fn no_retry_when_version_matches() {
+    let (r, text, calls) = run_script(&[(0, FRESH)]);
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(calls.len(), 1);
+    assert!(!text.contains("job.retry"), "{text}");
+}
+
+#[test]
+fn no_retry_when_winget_failed() {
+    let (r, text, calls) = run_script(&[(0x8A15_0006_u32 as i32, STALE)]);
+    assert!(r.is_err());
+    assert_eq!(calls.len(), 1);
+    assert!(!text.contains("job.retry"), "{text}");
+}
