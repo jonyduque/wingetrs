@@ -49,6 +49,13 @@ pub enum UpdateState {
     Broken,
 }
 
+/// Who an installed app was installed for, from its ARP hive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum InstallScope {
+    Machine,
+    User,
+}
+
 /// Another registry record of the same app name, folded into the main row by `group_duplicates`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct OtherRecord {
@@ -78,6 +85,8 @@ pub struct ListRow {
     pub tiebreak: Option<Tiebreak>,
     /// Where the record lives, readable (`location`).
     pub location: String,
+    /// Machine or user install (`scope`); `None` outside the ARP.
+    pub scope: Option<InstallScope>,
     /// The other records of the same name, in scan order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<OtherRecord>,
@@ -242,6 +251,15 @@ pub fn location(source: &InstallSource) -> &'static str {
     }
 }
 
+/// Install scope of an ARP record (HKLM machine, HKCU user); `None` for MSIX, scoop, wingetrs.
+pub fn scope(source: &InstallSource) -> Option<InstallScope> {
+    match source {
+        InstallSource::Arp(Hive::MachineX64 | Hive::MachineX86) => Some(InstallScope::Machine),
+        InstallSource::Arp(Hive::User) => Some(InstallScope::User),
+        InstallSource::Msix | InstallSource::Scoop | InstallSource::Wingetrs => None,
+    }
+}
+
 /// `+1 registro` / `+N registros`: the hint that a row hides other records of its name.
 pub fn extra_records_label(n: usize) -> String {
     if n == 1 {
@@ -331,6 +349,7 @@ fn row(
         not_in_catalog: false,
         origin: origin(&app.source).to_string(),
         location: location(&app.source).to_string(),
+        scope: scope(&app.source),
         installed_version: app.version.clone(),
         correlation,
         latest,

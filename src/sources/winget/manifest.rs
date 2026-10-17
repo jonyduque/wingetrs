@@ -18,6 +18,10 @@ pub struct MergedManifest {
     pub tags: Vec<String>,
     pub installer_type: Option<String>,
     pub scope: Option<String>,
+    /// `install`, `uninstallPrevious` or `deny`; an installer's own value wins.
+    pub upgrade_behavior: Option<String>,
+    /// Upgraded only when asked for by name, never by "upgrade all"; an installer's own value wins.
+    pub require_explicit_upgrade: Option<bool>,
     #[serde(default)]
     pub installers: Vec<Installer>,
     #[serde(default)]
@@ -64,6 +68,8 @@ pub struct Installer {
     pub architecture: String,
     pub installer_type: Option<String>,
     pub scope: Option<String>,
+    pub upgrade_behavior: Option<String>,
+    pub require_explicit_upgrade: Option<bool>,
     pub installer_url: String,
     pub installer_sha256: String,
 }

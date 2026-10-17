@@ -384,8 +384,10 @@ fn compose<'a>(left: Vec<Span<'a>>, right: Vec<Span<'a>>, width: usize) -> Line<
     Line::from(spans)
 }
 
-fn state_span<'a>(theme: &Theme, g: &Glyphs, row: &ListRow) -> Span<'a> {
+/// `refused`: winget would refuse the upgrade, so it is not shown as pending.
+fn state_span<'a>(theme: &Theme, g: &Glyphs, row: &ListRow, refused: bool) -> Span<'a> {
     match (&row.correlation, &row.state) {
+        (_, UpdateState::Available { .. }) if refused => Span::styled(g.upgrade, theme.muted()),
         (_, UpdateState::Available { .. }) => Span::styled(g.upgrade, theme.warn()),
         (Correlation::Ambiguous { .. }, _) => Span::styled(g.ambiguous, theme.alert()),
         (_, UpdateState::UpToDate) => Span::styled(g.ok, theme.ok()),
@@ -563,16 +565,21 @@ fn list_lines<'a>(
                 left.extend(mark((r.origin.clone(), r.name.clone())));
                 left.extend(name_for(sel, &r.name, &[]));
                 let old = r.installed_version.clone().unwrap_or_default();
+                let refused = app.upgrade_refused(r);
                 let mut right = match (&r.state, app.tab) {
                     (UpdateState::Available { latest }, Tab::Updates) => vec![
                         Span::styled(old, theme.dim()),
                         Span::styled(" → ", theme.fg_dim()),
-                        Span::styled(latest.clone(), theme.ok().add_modifier(Modifier::BOLD)),
+                        if refused {
+                            Span::styled(latest.clone(), theme.muted())
+                        } else {
+                            Span::styled(latest.clone(), theme.ok().add_modifier(Modifier::BOLD))
+                        },
                     ],
                     _ => vec![
                         Span::styled(old, theme.fg_dim()),
                         Span::raw(" "),
-                        state_span(theme, g, r),
+                        state_span(theme, g, r, refused),
                     ],
                 };
                 if !r.others.is_empty() {

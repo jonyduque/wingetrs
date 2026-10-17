@@ -1,7 +1,8 @@
 //! Upgrade bridge: apps installed by winget or scoop are upgraded through their own CLI.
 //! Everything here is pure (rules, command lines, exit codes, output splitting); only
 //! `spawn_win` starts a process.
-use crate::installed::correlate::{Correlation, ListRow, UpdateState};
+use crate::installed::correlate::{Correlation, InstallScope, ListRow, UpdateState};
+use crate::sources::winget::manifest::{Installer, MergedManifest};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -80,6 +81,131 @@ pub fn bridge_target(r: &ListRow, pins: &BTreeSet<String>) -> Result<BridgeJob, 
         installed: r.installed_version.clone(),
         available,
     })
+}
+
+/// Whether winget would take the upgrade to a manifest (`winget_applicability`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applicability {
+    Ok,
+    /// Every installer for this machine says `UpgradeBehavior: deny`.
+    Denied,
+    /// Every installer for this machine installs for the other scope.
+    ScopeMismatch {
+        installed: InstallScope,
+        offered: InstallScope,
+    },
+    /// No installer for this machine's architecture: decided as today.
+    Unknown,
+}
+
+/// `Applicability` plus `RequireExplicitUpgrade`, which keeps the app out of batches only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WingetFit {
+    pub applicability: Applicability,
+    pub explicit_only: bool,
+}
+
+/// winget architecture name of this machine.
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        _ => "x64",
+    }
+}
+
+/// Installer architectures that run on `arch`, as `install::manifest::Arch::preference`
+/// (plus winget's `neutral`).
+fn runs_on(installer: &str, arch: &str) -> bool {
+    let ok: &[&str] = match arch {
+        "x64" => &["x64", "x86"],
+        "x86" => &["x86"],
+        "arm64" => &["arm64", "x64", "x86"],
+        _ => &[],
+    };
+    installer.eq_ignore_ascii_case("neutral")
+        || installer.eq_ignore_ascii_case(arch)
+        || ok.iter().any(|a| installer.eq_ignore_ascii_case(a))
+}
+
+fn parse_scope(s: Option<&str>) -> Option<InstallScope> {
+    match s {
+        Some(s) if s.eq_ignore_ascii_case("machine") => Some(InstallScope::Machine),
+        Some(s) if s.eq_ignore_ascii_case("user") => Some(InstallScope::User),
+        _ => None,
+    }
+}
+
+/// Whether `winget upgrade` would take `manifest` for an app installed with `scope` on an
+/// `arch` machine. Installer fields win over the root ones.
+// Rules of winget-cli src/AppInstallerCLICore/Workflows/UpdateFlow.cpp (deny, explicit
+// upgrade) and src/AppInstallerCLICore/Workflows/ManifestComparator.cpp (installed scope).
+pub fn winget_applicability(
+    manifest: &MergedManifest,
+    scope: Option<InstallScope>,
+    arch: &str,
+) -> WingetFit {
+    let candidates: Vec<_> = manifest
+        .installers
+        .iter()
+        .filter(|i| runs_on(&i.architecture, arch))
+        .collect();
+    let explicit_only = candidates.iter().any(|i| {
+        i.require_explicit_upgrade
+            .or(manifest.require_explicit_upgrade)
+            .unwrap_or(false)
+    });
+    let verdict = |applicability| WingetFit {
+        applicability,
+        explicit_only,
+    };
+    if candidates.is_empty() {
+        return verdict(Applicability::Unknown);
+    }
+    let allowed: Vec<_> = candidates
+        .into_iter()
+        .filter(|i| {
+            !i.upgrade_behavior
+                .as_deref()
+                .or(manifest.upgrade_behavior.as_deref())
+                .is_some_and(|b| b.eq_ignore_ascii_case("deny"))
+        })
+        .collect();
+    if allowed.is_empty() {
+        return verdict(Applicability::Denied);
+    }
+    let offered = |i: &&Installer| parse_scope(i.scope.as_deref().or(manifest.scope.as_deref()));
+    // An installer without a scope fits either.
+    if let Some(installed) = scope
+        && !allowed
+            .iter()
+            .any(|i| offered(i).is_none_or(|s| s == installed))
+        && let Some(offered) = allowed.iter().find_map(offered)
+    {
+        return verdict(Applicability::ScopeMismatch { installed, offered });
+    }
+    verdict(Applicability::Ok)
+}
+
+/// Readable install scope, for the notes.
+pub fn scope_label(s: InstallScope) -> &'static str {
+    match s {
+        InstallScope::Machine => "máquina",
+        InstallScope::User => "usuário",
+    }
+}
+
+/// The note of a disabled "upgrade via winget" item; `None` when winget would take it.
+pub fn applicability_note(a: Applicability) -> Option<String> {
+    match a {
+        Applicability::Denied => Some("o editor não permite atualizar pelo winget".to_string()),
+        Applicability::ScopeMismatch { installed, offered } => Some(format!(
+            "a versão nova só instala para {}; a instalada é para {}",
+            scope_label(offered),
+            scope_label(installed)
+        )),
+        Applicability::Ok | Applicability::Unknown => None,
+    }
 }
 
 /// `^[A-Za-z0-9][A-Za-z0-9._+-]*$`, at most 128 bytes: the target goes into a command line

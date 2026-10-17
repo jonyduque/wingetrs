@@ -11,7 +11,8 @@ use crate::installed::correlate::correlate;
 use crate::installed::normalize::NameNormalizer;
 use crate::installed::scan_all;
 use crate::tui::app::{
-    Action, App, Cmd, IconOutcome, InstallFail, Msg, Planned, run_search, update,
+    Action, App, ApplicabilityQuery, Cmd, IconOutcome, InstallFail, Msg, Planned, run_search,
+    update,
 };
 use crate::tui::jobs;
 use crate::tui::settings::SettingsState;
@@ -34,6 +35,8 @@ const DETAILS_DEBOUNCE: Duration = Duration::from_millis(150);
 const LIST_FETCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// Most list packages whose icon is being fetched at once.
 pub const MAX_LIST_FETCH: usize = 4;
+/// Most manifests fetched at once to check winget's verdict on an upgrade.
+const MAX_APPLICABILITY_FETCH: usize = 4;
 /// Most messages folded into one frame.
 const BATCH_CAP: usize = 256;
 /// A `draw` slower than this (one 60 Hz frame) is logged at debug level.
@@ -107,6 +110,8 @@ struct Ctx {
     details_gen: AtomicU64,
     /// Generation of the newest list icon prefetch; older ones stop starting packages.
     list_fetch_gen: AtomicU64,
+    /// Generation of the newest applicability batch; older ones stop starting manifests.
+    applicability_gen: AtomicU64,
     /// Slots for list packages being fetched, shared by every generation.
     list_fetch_slots: Arc<tokio::sync::Semaphore>,
     /// `<source>/<id>` of the list packages being fetched, by any generation.
@@ -228,6 +233,7 @@ async fn event_loop(
         tx,
         details_gen: AtomicU64::new(0),
         list_fetch_gen: AtomicU64::new(0),
+        applicability_gen: AtomicU64::new(0),
         list_fetch_slots: Arc::new(tokio::sync::Semaphore::new(MAX_LIST_FETCH)),
         list_fetch_running: Arc::default(),
         // After `ratatui::init`, so the pixel size is that of the terminal in use.
@@ -364,6 +370,7 @@ async fn event_loop(
                         )
                     });
                 }
+                Cmd::FetchApplicability { rows } => spawn_applicability(&ctx, rows),
                 Cmd::PlanUpgradeAll { keep } => {
                     spawn_plan(&ctx, move |o| jobs::plan_upgrade_all(o, keep));
                 }
@@ -1015,11 +1022,95 @@ async fn details_icon(
     }
 }
 
-async fn load_details(
+/// winget's verdict on each row's upgrade, at most `MAX_APPLICABILITY_FETCH` manifests at a
+/// time, one `Msg::ApplicabilityLoaded` per row; a newer batch (a rescan) stops this one from
+/// starting more. Every task is awaited; a panic travels to the loop as `Msg::Panicked`.
+/// Leaving the TUI drops the runtime, which cancels what is still running.
+fn spawn_applicability(ctx: &Arc<Ctx>, rows: Vec<ApplicabilityQuery>) {
+    let ctx = Arc::clone(ctx);
+    let generation = ctx.applicability_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    tokio::spawn(async move {
+        let work = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let slots = Arc::new(tokio::sync::Semaphore::new(MAX_APPLICABILITY_FETCH));
+                let mut tasks = tokio::task::JoinSet::new();
+                for q in rows {
+                    let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                        break;
+                    };
+                    if ctx.applicability_gen.load(Ordering::SeqCst) != generation {
+                        break;
+                    }
+                    let ctx = Arc::clone(&ctx);
+                    tasks.spawn(async move {
+                        let result = applicability(&ctx, &q).await.map_err(|e| format!("{e:#}"));
+                        let _ = ctx.tx.send(Msg::ApplicabilityLoaded {
+                            app_key: q.app_key,
+                            latest: q.latest,
+                            result,
+                        });
+                        drop(slot);
+                    });
+                }
+                let mut panic = None;
+                while let Some(done) = tasks.join_next().await {
+                    match done {
+                        Ok(()) => {}
+                        Err(e) if e.is_panic() => {
+                            panic.get_or_insert(e.into_panic());
+                        }
+                        Err(e) => tracing::debug!(error = %e, "applicability task cancelled"),
+                    }
+                }
+                if let Some(p) = panic {
+                    std::panic::resume_unwind(p);
+                }
+            }
+        });
+        match work.await {
+            Ok(()) => {}
+            Err(e) if e.is_panic() => {
+                let _ = ctx.tx.send(Msg::Panicked(e.into_panic()));
+            }
+            Err(e) => tracing::debug!(error = %e, "applicability batch cancelled"),
+        }
+    });
+}
+
+/// The manifest of the row's catalog version, judged for this machine and the row's scope.
+async fn applicability(
+    ctx: &Ctx,
+    q: &ApplicabilityQuery,
+) -> anyhow::Result<crate::bridge::WingetFit> {
+    let pkg = read_package(ctx, "winget", &q.package_id).await?;
+    let hash = pkg
+        .winget_hash
+        .as_deref()
+        .context("pacote winget sem hash de manifesto")?;
+    let blobs = BlobStore::new(ctx.data.blobs_dir());
+    let (manifest, _) = crate::sources::winget::details::merged_manifest(
+        &ctx.http,
+        &blobs,
+        crate::sources::winget::CDN_BASE,
+        &pkg.entry.id,
+        hash,
+        Some(&q.latest),
+    )
+    .await?;
+    Ok(crate::bridge::winget_applicability(
+        &manifest,
+        q.scope,
+        crate::bridge::host_arch(),
+    ))
+}
+
+/// The catalog entry of `source`/`id`, read off the runtime threads.
+async fn read_package(
     ctx: &Ctx,
     source: &str,
     id: &str,
-) -> anyhow::Result<crate::core::PackageDetails> {
+) -> anyhow::Result<crate::catalog::StoredPackage> {
     let (data_path, source, id) = (ctx.data.catalog_path(), source.to_owned(), id.to_owned());
     let read = tokio::task::spawn_blocking(move || {
         jobs::open_catalog_for_reading(&data_path)?.get(&source, &id)
@@ -1033,6 +1124,15 @@ async fn load_details(
         },
     }
     .context("pacote não encontrado no catálogo")?;
+    Ok(pkg)
+}
+
+async fn load_details(
+    ctx: &Ctx,
+    source: &str,
+    id: &str,
+) -> anyhow::Result<crate::core::PackageDetails> {
+    let pkg = read_package(ctx, source, id).await?;
     match pkg.entry.source {
         SourceKind::Winget => winget_details(ctx, &pkg).await,
         SourceKind::Scoop => {

@@ -15,6 +15,19 @@ pub async fn details(
     hash: &[u8],
     version: Option<&str>,
 ) -> Result<PackageDetails, WingetError> {
+    let (merged, versions) = merged_manifest(http, blobs, cdn_base, id, hash, version).await?;
+    Ok(merged.into_details(versions))
+}
+
+/// The merged manifest of `version` (the newest when `None`) and every version, newest first.
+pub async fn merged_manifest(
+    http: &Http,
+    blobs: &BlobStore,
+    cdn_base: &str,
+    id: &str,
+    hash: &[u8],
+    version: Option<&str>,
+) -> Result<(manifest::MergedManifest, Vec<String>), WingetError> {
     // versionData is content-addressed: the catalog's winget_hash is its SHA-256 (probed in
     // Task 70), so it is cached in the verified BlobStore under the full hash.
     let vd_key = hex::encode(hash);
@@ -71,5 +84,5 @@ pub async fn details(
 
     let mut versions: Vec<String> = vd.entries.iter().map(|e| e.version.clone()).collect();
     versions.sort_by(|a, b| Version::parse(b).cmp(&Version::parse(a)));
-    Ok(merged.into_details(versions))
+    Ok((merged, versions))
 }

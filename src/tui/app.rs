@@ -1,12 +1,12 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
-use crate::bridge::{self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, Tool};
+use crate::bridge::{self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, Tool, WingetFit};
 use crate::catalog::search::{SearchHit, SearchIndex};
 use crate::config::{Behavior, Config, ConfirmMode, ResidueMode};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
 use crate::install::target::Candidate;
-use crate::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+use crate::installed::correlate::{Correlation, InstallScope, ListRow, Rule, UpdateState};
 use crate::installed::overrides::Choice;
 use crate::tui::icons::{IconCache, IconProtocol, choose_from_env};
 use crate::tui::layout::{
@@ -19,6 +19,7 @@ use crate::update::{Outcome, SourceReport};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +81,13 @@ pub enum Msg {
     InstalledLoaded(Vec<ListRow>),
     /// Reading or correlating the installed apps failed (a worker panic is re-raised instead).
     InstalledFailed(String),
+    /// Whether winget would take the upgrade of `app_key` to `latest`; `Err` (network, bad
+    /// manifest) leaves the row as it is without a verdict.
+    ApplicabilityLoaded {
+        app_key: String,
+        latest: String,
+        result: Result<WingetFit, String>,
+    },
     DetailsLoaded {
         key: String,
         result: Result<PackageDetails, String>,
@@ -399,6 +407,16 @@ pub enum RowChoice {
     Undo { app_key: String },
 }
 
+/// One row whose winget upgrade is checked (`Cmd::FetchApplicability`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplicabilityQuery {
+    pub app_key: String,
+    pub package_id: String,
+    /// Catalog version whose manifest decides.
+    pub latest: String,
+    pub scope: Option<InstallScope>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Quit,
@@ -448,6 +466,11 @@ pub enum Cmd {
     CleanResidues {
         app: String,
         residues: Vec<Residue>,
+    },
+    /// Fetch the manifest of each row's catalog version and answer, per row, with
+    /// `Msg::ApplicabilityLoaded`.
+    FetchApplicability {
+        rows: Vec<ApplicabilityQuery>,
     },
     /// Write the settings to `config.toml` (`glyphs`: nerd|unicode|ascii, `theme`: dark|light).
     SaveSettings {
@@ -554,6 +577,8 @@ pub struct App {
     search_in_flight: Option<(u64, String, Option<SourceKind>)>,
     pub installed: Vec<ListRow>,
     pub details: HashMap<String, Result<PackageDetails, String>>,
+    /// winget's verdict on upgrading each row (by `app_key`), and the catalog version it is for.
+    pub applicability: HashMap<String, (String, WingetFit)>,
     /// Raw icon bytes, keyed like `details`.
     pub icon_bytes: HashMap<String, Vec<u8>>,
     /// Protocol icons are drawn with; `Off` decodes and draws nothing.
@@ -712,6 +737,7 @@ impl App {
             search_in_flight: None,
             installed: Vec::new(),
             details: HashMap::new(),
+            applicability: HashMap::new(),
             icon_bytes: HashMap::new(),
             icon_protocol: IconProtocol::Off,
             icons: IconCache::default(),
@@ -977,6 +1003,25 @@ impl App {
     /// filter do not count).
     pub fn has_visible_mark(&self) -> bool {
         self.marked_count() > 0 && self.view_keys().iter().any(|k| self.is_marked(k))
+    }
+
+    /// winget's verdict on upgrading `r` to its current catalog version, once it arrived.
+    pub fn winget_fit(&self, r: &ListRow) -> Option<WingetFit> {
+        let UpdateState::Available { latest } = &r.state else {
+            return None;
+        };
+        self.applicability
+            .get(&r.app_key)
+            .filter(|(v, _)| v == latest)
+            .map(|(_, f)| *f)
+    }
+
+    /// The upgrade of `r` is one winget would refuse (`bridge::Applicability`).
+    pub fn upgrade_refused(&self, r: &ListRow) -> bool {
+        bridge::bridge_target(r, &self.pins).is_ok_and(|j| j.tool == Tool::Winget)
+            && self
+                .winget_fit(r)
+                .is_some_and(|f| bridge::applicability_note(f.applicability).is_some())
     }
 
     /// Whether the row `key` of the current tab is marked.
@@ -1439,7 +1484,25 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                 app.selected = i;
             }
             app.clamp();
-            app.details_cmd()
+            let mut cmds = app.details_cmd();
+            cmds.extend(applicability_cmd(app));
+            cmds
+        }
+        Msg::ApplicabilityLoaded {
+            app_key,
+            latest,
+            result,
+        } => {
+            match result {
+                Ok(fit) => {
+                    app.applicability.insert(app_key, (latest, fit));
+                }
+                Err(e) => {
+                    tracing::debug!(%app_key, error = %e, "winget applicability not known");
+                    app.applicability.remove(&app_key);
+                }
+            }
+            Vec::new()
         }
         Msg::InstalledFailed(reason) => {
             app.push_toast(
@@ -2070,10 +2133,10 @@ fn remove_one(app: &mut App) -> Vec<Cmd> {
 /// batch): ours, matched to a catalog package, with a newer version; else, an app winget or
 /// scoop installed, through that tool (`bridge::bridge_target`) when the tool is there.
 /// `Err` carries the reason, as the note of a disabled menu item.
-fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, &'static str> {
+fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, Cow<'static, str>> {
     if r.origin == "wingetrs" {
         if crate::pins::is_pinned(&app.pins, &r.origin, &r.name) {
-            return Err(PINNED_NOTE);
+            return Err(PINNED_NOTE.into());
         }
         return match (&r.correlation, &r.state) {
             (
@@ -2082,19 +2145,46 @@ fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, &'static str> {
                 },
                 UpdateState::Available { .. },
             ) => Ok(Target::Ours(source.clone(), package_id.clone())),
-            _ => Err("sem atualização"),
+            _ => Err("sem atualização".into()),
         };
     }
     let job = bridge::bridge_target(r, &app.pins)?;
+    if job.tool == Tool::Winget
+        && let Some(note) = app
+            .winget_fit(r)
+            .and_then(|f| bridge::applicability_note(f.applicability))
+    {
+        return Err(note.into());
+    }
     let present = match job.tool {
         Tool::Winget => app.tools.winget,
         Tool::Scoop => app.tools.scoop,
     };
     match (present, job.tool) {
-        (Some(false), Tool::Winget) => Err("winget não está instalado"),
-        (Some(false), Tool::Scoop) => Err("scoop não está instalado"),
+        (Some(false), Tool::Winget) => Err("winget não está instalado".into()),
+        (Some(false), Tool::Scoop) => Err("scoop não está instalado".into()),
         _ => Ok(Target::Bridge(Box::new(job))),
     }
+}
+
+/// The rows whose winget upgrade is worth checking: bridged through winget, with a newer
+/// catalog version.
+fn applicability_cmd(app: &App) -> Option<Cmd> {
+    let rows: Vec<ApplicabilityQuery> = app
+        .installed
+        .iter()
+        .filter_map(|r| {
+            let job = bridge::bridge_target(r, &app.pins).ok()?;
+            (job.tool == Tool::Winget).then_some(())?;
+            Some(ApplicabilityQuery {
+                app_key: r.app_key.clone(),
+                package_id: job.target,
+                latest: job.available?,
+                scope: r.scope,
+            })
+        })
+        .collect();
+    (!rows.is_empty()).then_some(Cmd::FetchApplicability { rows })
 }
 
 /// What may happen meanwhile when `tool` runs an upgrade.
@@ -2381,11 +2471,11 @@ fn upgrade_one(app: &mut App) -> Vec<Cmd> {
     match target {
         Ok(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
         Ok(Target::Bridge(job)) => start_bridge(app, *job),
-        Err(PINNED_NOTE) => {
+        Err(note) if note == PINNED_NOTE => {
             app.push_toast(ToastKind::Warning, "versão fixada (desafixe no menu)");
             Vec::new()
         }
-        Err(NOT_OURS_NOTE) => {
+        Err(note) if note == NOT_OURS_NOTE => {
             app.push_toast(ToastKind::Warning, NOT_OURS);
             Vec::new()
         }
@@ -2652,7 +2742,7 @@ fn installed_actions(
                 Ok(Target::Bridge(job)) => format!("Atualizar (via {})", job.tool.name()),
                 _ => "Atualizar".to_string(),
             },
-            upgrade.as_ref().err().map(|n| (*n).to_string()),
+            upgrade.as_ref().err().map(|n| n.to_string()),
             ActionId::Upgrade,
         ),
         (
