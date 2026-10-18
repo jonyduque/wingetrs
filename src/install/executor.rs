@@ -1071,11 +1071,11 @@ fn scan_ps1_file(program: &Path) -> Result<String, String> {
         if !rest.len().is_multiple_of(2) {
             return Err(bad("tem UTF-16 truncado"));
         }
-        let units = rest.chunks_exact(2).map(|c| {
+        let units = rest.as_chunks::<2>().0.iter().map(|c| {
             if be {
-                u16::from_be_bytes([c[0], c[1]])
+                u16::from_be_bytes(*c)
             } else {
-                u16::from_le_bytes([c[0], c[1]])
+                u16::from_le_bytes(*c)
             }
         });
         char::decode_utf16(units)
