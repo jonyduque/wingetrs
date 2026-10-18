@@ -28,7 +28,7 @@ O orquestrador (sessão principal) **não implementa**. Ele despacha, audita e i
 ## Paralelismo
 
 - Tarefas que tocam arquivos disjuntos podem rodar em paralelo; avise cada agente dos arquivos do outro e proíba `git add -A`.
-- Teste novo em `tests/it/<modulo>.rs`: antes de despachar, crie o arquivo vazio e a linha `mod <modulo>;` em `tests/it/main.rs` e faça commit; senão duas tarefas em paralelo dividem o `main.rs`.
+- Teste novo em `tests/it/<modulo>.rs`: antes de despachar, crie o arquivo só com uma linha `//! <assunto> (Task N).` (vazio, o `cargo fmt` acrescenta um CRLF e o gate falha) e a linha `mod <modulo>;` em `tests/it/main.rs` e faça commit; senão duas tarefas em paralelo dividem o `main.rs`.
 - **Tarefas que medem tempo rodam sozinhas** — e nenhuma revisão com `cargo test` em paralelo a um benchmark.
 - Revisor é read-only e pode rodar junto com a próxima implementação se os arquivos não se cruzam.
 
