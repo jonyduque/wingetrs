@@ -883,6 +883,8 @@ Testes (`tests/it/wi_upgrade.rs`):
 4. `cleanup --orphans [--dry-run] [--yes]` (subcomando novo `Cleanup`, help em português com exemplos): sem `--orphans` ⇒ erro `diga o que limpar: --orphans`; lista os órfãos (`Órfão: <nome> — <hive> — falta <caminho>` e `O app pode ter mudado de lugar (ex.: Steam em outra pasta).` e o destino do `.reg`); com terminal e sem `--yes` ⇒ `pick_many` com **todos desmarcados**; `--yes --orphans` ⇒ todos os listados; cada um por `remove_orphan`, imprimindo `Removido: <nome> (backup <arquivo>)` ou o erro; `--dry-run` não exporta nada.
 5. Elevação na CLI: um `ElevatedBridge` por comando (como na 176), `shutdown(5 s)` em todos os caminhos.
 
+**Da revisão da Task 184 (2026-10-18):** `UserFolders` (APPDATA, LOCALAPPDATA, Documents) é montado por `SHGetKnownFolderPath` (FOLDERID_RoamingAppData, FOLDERID_LocalAppData, FOLDERID_Documents), nunca por variável de ambiente; teste que planta `APPDATA` falso no ambiente e confere que não muda nada.
+
 **Files:**
 - Modify: `src/cli/mod.rs`, `src/cli/install_cmd.rs`, `src/cli/winget_cmd.rs`, `src/cli/run_win.rs` (se o contexto precisar das peças nativas)
 - Test: `tests/it/wi_cli.rs` (**já criado pelo orquestrador** com uma linha `//!`; não edite `tests/it/main.rs`)
@@ -932,6 +934,8 @@ Testes (`tests/it/wi_cli.rs`; `Ui` falso que registra `initial` do `pick_many` e
 6. Barra de status: as três fases novas com `phase_status`; `WaitingElevation` mostra o texto do UAC.
 7. `view.rs`: o texto da sobra vira `Sobra provável: o desinstalador {path} não existe. Use "Remover registro órfão" no menu.`
 8. Jobs em `run.rs` com `prod_win::build` (o `ElevatedRunner` é o `Ctx.elevated` da sessão: um UAC por sessão para tudo).
+
+**Da revisão da Task 184 (2026-10-18):** `UserFolders` (APPDATA, LOCALAPPDATA, Documents) é montado por `SHGetKnownFolderPath` (FOLDERID_RoamingAppData, FOLDERID_LocalAppData, FOLDERID_Documents), nunca por variável de ambiente; teste que planta `APPDATA` falso no ambiente e confere que não muda nada.
 
 **Files:**
 - Modify: `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/jobs.rs`, `src/tui/view.rs`, snapshots afetados em `tests/it/snapshots/` (diga quais)
