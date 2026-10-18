@@ -1,1 +1,2 @@
 39739564a4aaf1071b17d163ec332a08b9bcf05c
+Phase 2d (Task 170+): MSIXInstallFlow.cpp does not exist at this commit; MSIX deployment lives in src/AppInstallerCommonCore/Deployment.cpp. ManifestComparator.cpp is under src/AppInstallerCommonCore/Manifest/.

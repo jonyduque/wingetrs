@@ -16,3 +16,4 @@ pub mod pins;
 pub mod sources;
 pub mod tui;
 pub mod update;
+pub mod winget_install;

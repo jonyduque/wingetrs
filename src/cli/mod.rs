@@ -5,6 +5,7 @@ pub mod picker;
 #[cfg(windows)]
 mod run_win;
 pub mod style;
+pub mod winget_cmd;
 
 use crate::cache::{DataDir, now_unix};
 use crate::catalog::Catalog;
