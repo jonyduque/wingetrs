@@ -23,11 +23,11 @@ pub mod orphans_win;
 pub mod plan;
 pub mod post_check;
 pub mod previous;
-pub mod removal;
 #[cfg(windows)]
 pub mod previous_win;
 #[cfg(windows)]
 pub mod prod_win;
+pub mod removal;
 pub mod select;
 pub mod switches;
 pub mod uninstall;
