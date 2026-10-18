@@ -1106,6 +1106,8 @@ Testes (`tests/it/script_host_win.rs`):
 4. Sem `--allow-scripts` e com código de terceiros ⇒ erro (mesmo com `--yes`) `"<app> roda código de terceiros (<o quê>); revise com --dry-run e rode de novo com --allow-scripts"`, sem baixar nada, com a linha literal `if needs_scripts && !f.allow_scripts {`. Com `--allow-scripts`: mostra o bloco e segue a regra do `proceed` (sem terminal e sem `--yes` ⇒ erro existente).
 5. Bloco (também no `--dry-run`): por hook, `Script de terceiro (<hook>), roda com os seus privilégios e pode alterar qualquer arquivo seu`, os flags (`  ! <detail> (linha N)`) e o script numerado (`  1 | ...`); instalador: `Instalador de terceiro: <file> <args>`; `.ps1`: o relatório de `ps1_installer_report`. Nenhum texto contém "segur".
 
+**Da revisão da Task 151 (2026-10-18):** `execute_uninstall` devolve as notas de desinstalador pulado (manifesto gravado ausente/alterado/irresolvível), mas `ops::uninstall` só as registra no log. Esta tarefa (e a 162 na TUI) leva essas notas ao usuário no resultado da remoção, com teste.
+
 **Files:**
 - Modify: `src/cli/mod.rs`, `src/cli/install_cmd.rs`, `src/cli/output.rs`, `src/install/ops.rs`
 - Test: `tests/it/cli_scripts.rs` (**já criado pelo orquestrador**; `TestUi`/contexto como em `tests/it/cli_install.rs`, `FakeHost` em `Arc` com contador)
@@ -1152,6 +1154,8 @@ Testes:
 2. Plano com código de terceiros ⇒ o diálogo aparece **sempre**, mesmo com o ajuste `confirm` que o pularia.
 3. Seção rolável "Scripts de terceiros" no diálogo: por hook o cabeçalho `Script de terceiro (<hook>), roda com os seus privilégios e pode alterar qualquer arquivo seu`, os flags e as linhas numeradas; geometria em `regions.rs` (`confirm_geom` ganha o número de linhas da seção e devolve a área dela); `PgUp`/`PgDn` e a roda do mouse rolam a seção (`confirm_window`). Texto montado uma vez quando o modal abre (guardado no `Modal::Confirm`).
 4. Nenhum texto contém "segur".
+
+**Da revisão da Task 151 (2026-10-18):** `execute_uninstall` devolve as notas de desinstalador pulado (manifesto gravado ausente/alterado/irresolvível), mas `ops::uninstall` só as registra no log. Esta tarefa (e a 162 na TUI) leva essas notas ao usuário no resultado da remoção, com teste.
 
 **Files:**
 - Modify: `src/tui/app.rs`, `src/tui/view.rs`, `src/tui/regions.rs`, `src/tui/jobs.rs`
