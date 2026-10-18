@@ -194,3 +194,78 @@ fn host_current_prints() {
     assert!(h.os[0] >= 10);
     assert!(!h.locale.is_empty());
 }
+
+#[test]
+fn winget_order_locale_then_scope_then_arch() {
+    // preferred scope wins only weakly against an unspecified scope: native arch beats it
+    let weak = [inst("x86", "  Scope: user\n"), inst("x64", "")];
+    assert_eq!(idx(&weak, &host("x64"), PU), 1);
+    // locale is the first comparator: it beats native architecture
+    let l = |a: &str, t: &str| inst(a, &format!("  InstallerLocale: {t}\n"));
+    assert_eq!(
+        idx(&[l("x64", "en-US"), l("x86", "pt-BR")], &host("x64"), PU),
+        1
+    );
+}
+
+#[test]
+fn neutral_is_applicable_and_ranks_between() {
+    let h = host("x64");
+    assert_eq!(idx(&[inst("x86", ""), inst("neutral", "")], &h, PU), 1);
+    assert_eq!(idx(&[inst("neutral", ""), inst("x64", "")], &h, PU), 1);
+    assert_eq!(idx(&[inst("neutral", "")], &host("arm64"), PU), 0);
+}
+
+#[test]
+fn min_os_equal_to_host_with_missing_zero_is_accepted() {
+    let items = [inst("x64", "  MinimumOSVersion: 10.0.22631\n")];
+    assert_eq!(idx(&items, &host("x64"), PU), 0);
+}
+
+#[test]
+fn platform_refusal_and_case_insensitive_desktop() {
+    let h = host("x64");
+    let err = choose(
+        &effs("", &[inst("x64", "  Platform:\n  - Windows.Universal\n")]),
+        &h,
+        PU,
+    )
+    .unwrap_err();
+    assert!(err.0.contains("plataforma"), "{}", err.0);
+    let ok = [inst("x64", "  Platform:\n  - windows.desktop\n")];
+    assert_eq!(idx(&ok, &h, PU), 0);
+}
+
+#[test]
+fn unreadable_min_os_has_its_own_reason() {
+    let bad = [inst("x64", "  MinimumOSVersion: abc\n")];
+    let err = choose(&effs("", &bad), &host("x64"), PU).unwrap_err();
+    assert!(
+        err.0.contains("versão mínima do Windows inválida"),
+        "{}",
+        err.0
+    );
+}
+
+#[test]
+fn each_dependency_list_sends_to_the_bridge() {
+    for dep in [
+        "WindowsFeatures:\n    - NetFx3\n",
+        "WindowsLibraries:\n    - Microsoft.VCLibs\n",
+        "ExternalDependencies:\n    - Something\n",
+    ] {
+        let root = format!("InstallerType: msi\nDependencies:\n  {dep}");
+        match pick_root(&root, &[inst("x64", "")]).verdict {
+            Verdict::Bridge(m) => assert!(m.contains("dependências"), "{dep}: {m}"),
+            v => panic!("{dep}: {v:?}"),
+        }
+    }
+}
+
+#[test]
+fn unknown_named_type_goes_to_the_bridge() {
+    match pick_root("InstallerType: foo\n", &[inst("x64", "")]).verdict {
+        Verdict::Bridge(m) => assert!(m.contains("tipo foo"), "{m}"),
+        v => panic!("{v:?}"),
+    }
+}

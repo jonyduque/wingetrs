@@ -105,12 +105,13 @@ fn parse_os(text: &str) -> Option<[u32; 4]> {
     Some(out)
 }
 
-fn locale_rank(installer: &Option<String>, host: &str) -> u8 {
+/// 2 = same locale, 1 = same language, 0 = other or unspecified.
+fn locale_level(installer: &Option<String>, host: &str) -> u8 {
     let Some(l) = installer.as_deref() else {
-        return 2;
+        return 0;
     };
     if l.eq_ignore_ascii_case(host) {
-        return 0;
+        return 2;
     }
     let lang = |s: &str| {
         s.split(['-', '_'])
@@ -118,11 +119,102 @@ fn locale_rank(installer: &Option<String>, host: &str) -> u8 {
             .unwrap_or("")
             .to_ascii_lowercase()
     };
-    if !lang(l).is_empty() && lang(l) == lang(host) {
-        1
-    } else {
-        3
+    u8::from(!lang(l).is_empty() && lang(l) == lang(host))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cmp {
+    Negative,
+    Weak,
+    Strong,
+}
+
+/// Does `first` beat `second` on locale?
+// LocaleComparator::IsFirstBetter in ManifestComparator.cpp.
+fn locale_cmp(first: &EffectiveInstaller, second: &EffectiveInstaller, host: &str) -> Cmp {
+    let (f, s) = (
+        locale_level(&first.locale, host),
+        locale_level(&second.locale, host),
+    );
+    if f >= 1 || s >= 1 {
+        return if f > s { Cmp::Strong } else { Cmp::Negative };
     }
+    if first.locale.is_none() && second.locale.is_some() {
+        Cmp::Weak
+    } else {
+        Cmp::Negative
+    }
+}
+
+// ScopeComparator::IsFirstBetter in ManifestComparator.cpp.
+fn scope_cmp(first: &EffectiveInstaller, second: &EffectiveInstaller, pref: Scope) -> Cmp {
+    let (f, s) = (parse_scope(&first.scope), parse_scope(&second.scope));
+    if f == Some(pref) && s != Some(pref) {
+        if s.is_none() { Cmp::Weak } else { Cmp::Strong }
+    } else {
+        Cmp::Negative
+    }
+}
+
+// MachineArchitectureComparator::IsFirstBetter in ManifestComparator.cpp.
+fn arch_cmp(first: &EffectiveInstaller, second: &EffectiveInstaller, host_arch: &str) -> Cmp {
+    let (f, s) = (
+        arch_rank(&first.architecture, host_arch),
+        arch_rank(&second.architecture, host_arch),
+    );
+    match (f, s) {
+        // lower rank is better; rank 0 is the native architecture (the strong match)
+        (Some(f), Some(s)) if f < s => {
+            if f == 0 {
+                Cmp::Strong
+            } else {
+                Cmp::Weak
+            }
+        }
+        _ => Cmp::Negative,
+    }
+}
+
+/// winget's `ManifestComparator::IsFirstBetter`: comparators in priority order (locale, scope,
+/// architecture), the first strong result in either direction wins, else the first weak one.
+// ManifestComparator::IsFirstBetter and the comparator order, ManifestComparator.cpp:766-775, 831-895.
+fn is_first_better(
+    first: &EffectiveInstaller,
+    second: &EffectiveInstaller,
+    host: &Host,
+    pref: Scope,
+) -> bool {
+    let rounds = [
+        (
+            locale_cmp(first, second, &host.locale),
+            locale_cmp(second, first, &host.locale),
+        ),
+        (
+            scope_cmp(first, second, pref),
+            scope_cmp(second, first, pref),
+        ),
+        (
+            arch_cmp(first, second, &host.arch),
+            arch_cmp(second, first, &host.arch),
+        ),
+    ];
+    let mut weak = None;
+    for (fwd, rev) in rounds {
+        if fwd == Cmp::Strong {
+            return true;
+        }
+        if rev == Cmp::Strong {
+            return false;
+        }
+        if weak.is_none() {
+            if fwd == Cmp::Weak {
+                weak = Some(true);
+            } else if rev == Cmp::Weak {
+                weak = Some(false);
+            }
+        }
+    }
+    weak.unwrap_or(false)
 }
 
 fn scope_name(s: Scope) -> &'static str {
@@ -152,11 +244,16 @@ pub fn choose(
         )));
     }
 
-    // Platform and minimum OS version; remember the lowest version we turned away.
+    // Platform and minimum OS version; remember why installers were turned away.
     let mut lowest_needed: Option<([u32; 4], String)> = None;
+    let mut bad_version = false;
     let mut by_os = Vec::new();
     for (idx, i) in by_arch {
-        if !(i.platform.is_empty() || i.platform.iter().any(|p| p == "Windows.Desktop")) {
+        if !(i.platform.is_empty()
+            || i.platform
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case("Windows.Desktop")))
+        {
             continue;
         }
         if let Some(text) = &i.minimum_os_version {
@@ -168,7 +265,10 @@ pub fn choose(
                     }
                     continue;
                 }
-                None => continue,
+                None => {
+                    bad_version = true;
+                    continue;
+                }
             }
         }
         by_os.push((idx, i));
@@ -176,6 +276,7 @@ pub fn choose(
     if by_os.is_empty() {
         return Err(Refusal(match lowest_needed {
             Some((_, text)) => format!("exige Windows {text} ou mais novo"),
+            None if bad_version => "versão mínima do Windows inválida no manifesto".to_string(),
             None => "nenhum instalador para a plataforma Windows.Desktop".to_string(),
         }));
     }
@@ -188,14 +289,15 @@ pub fn choose(
         })
         .collect();
 
-    // `min_by_key` keeps the first of equal keys, i.e. the manifest order.
-    let Some((index, installer)) = by_scope.into_iter().min_by_key(|(_, i)| {
-        (
-            scope_rank(&i.scope, pref),
-            arch_rank(&i.architecture, &host.arch),
-            locale_rank(&i.locale, &host.locale),
-        )
-    }) else {
+    // Like winget: walk the manifest order, a later installer replaces the best only when
+    // strictly better, so ties keep the earlier one.
+    let mut best: Option<(usize, &EffectiveInstaller)> = None;
+    for (idx, i) in by_scope {
+        if best.is_none_or(|(_, b)| is_first_better(i, b, host, pref)) {
+            best = Some((idx, i));
+        }
+    }
+    let Some((index, installer)) = best else {
         return Err(Refusal(format!(
             "nenhum instalador para escopo {}",
             scope_name(pref)

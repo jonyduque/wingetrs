@@ -31,6 +31,23 @@ fn locale() -> std::io::Result<String> {
     Ok(name.trim().to_string())
 }
 
+/// Native architecture of the machine, even for an emulated process (an x64 build on ARM64
+/// reports `arm64`; the x64 installers then come from the fallback list).
+fn native_arch() -> Option<&'static str> {
+    use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
+    use windows::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+    let mut process = IMAGE_FILE_MACHINE(0);
+    let mut native = IMAGE_FILE_MACHINE(0);
+    // SAFETY: both out-pointers refer to live locals; the pseudo handle needs no closing.
+    unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, Some(&mut native)) }.ok()?;
+    match native.0 {
+        0xAA64 => Some("arm64"),
+        0x8664 => Some("x64"),
+        0x014c => Some("x86"),
+        _ => None,
+    }
+}
+
 /// This machine's facts; a failed registry read falls back to `[10,0,0,0]` / `en-US`.
 pub fn current() -> Host {
     let os = os_version().unwrap_or_else(|e| {
@@ -42,7 +59,9 @@ pub fn current() -> Host {
         "en-US".to_string()
     });
     Host {
-        arch: crate::bridge::host_arch().to_string(),
+        arch: native_arch()
+            .unwrap_or_else(crate::bridge::host_arch)
+            .to_string(),
         os,
         locale,
     }
