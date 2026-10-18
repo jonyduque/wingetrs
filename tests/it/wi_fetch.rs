@@ -522,15 +522,7 @@ async fn download_stops_mid_body_and_deletes_part() {
     let stopped = || stop.load(Ordering::SeqCst);
     let (r, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::join!(
-            fetch_installer_until(
-                &http,
-                &data,
-                "Pub.App",
-                "1.0",
-                &inst,
-                &progress,
-                &stopped,
-            ),
+            fetch_installer_until(&http, &data, "Pub.App", "1.0", &inst, &progress, &stopped,),
             async {
                 // Ctrl+C once some bytes arrived (the body is still far from its end).
                 while got.load(Ordering::SeqCst) == 0 {
