@@ -1,14 +1,14 @@
 ---
-source: tests/cli_parse.rs
+source: tests/it/cli_parse.rs
 expression: sub.render_long_help().to_string()
 ---
-Remove um app instalado pelo wingetrs
+Remove um app do wingetrs, ou um app do Windows pelo id do winget ou pelo nome
 
 Uso: wingetrs uninstall [OPÇÕES] <ALVO>
 
 Argumentos:
   <ALVO>
-          App a remover
+          App a remover (id do wingetrs, id do winget ou nome na lista do Windows)
 
 Opções:
       --purge
@@ -32,3 +32,5 @@ Opções:
 Exemplos:
   wingetrs uninstall ripgrep
   wingetrs uninstall ripgrep --purge --yes
+  wingetrs uninstall Notepad++.Notepad++ --dry-run
+  wingetrs uninstall "Amazon Kindle"

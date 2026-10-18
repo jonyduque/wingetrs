@@ -1,14 +1,14 @@
 ---
-source: tests/cli_parse.rs
+source: tests/it/cli_parse.rs
 expression: sub.render_long_help().to_string()
 ---
-Atualiza apps instalados pelo wingetrs
+Atualiza apps do wingetrs, ou um app do Windows associado ao winget
 
 Uso: wingetrs upgrade [OPÇÕES] [ALVO]
 
 Argumentos:
   [ALVO]
-          App a atualizar
+          App a atualizar (id do wingetrs, id do winget ou nome na lista do Windows)
 
 Opções:
       --all
@@ -38,4 +38,5 @@ Opções:
 Exemplos:
   wingetrs upgrade               lista o que pode ser atualizado
   wingetrs upgrade ripgrep
-  wingetrs upgrade --all --yes
+  wingetrs upgrade Git.Git --dry-run
+  wingetrs upgrade --all --yes   só apps do wingetrs

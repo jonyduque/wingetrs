@@ -1,5 +1,5 @@
 ---
-source: tests/cli_parse.rs
+source: tests/it/cli_parse.rs
 expression: root.render_long_help().to_string()
 ---
 Gerenciador de pacotes rápido sobre winget e scoop
@@ -12,10 +12,11 @@ Comandos:
   show       Mostra detalhes de um pacote
   list       Lista pacotes instalados
   install    Instala um app de um bucket do Scoop, ou um pacote do winget pelo próprio winget
-  uninstall  Remove um app instalado pelo wingetrs
-  upgrade    Atualiza apps instalados pelo wingetrs
+  uninstall  Remove um app do wingetrs, ou um app do Windows pelo id do winget ou pelo nome
+  upgrade    Atualiza apps do wingetrs, ou um app do Windows associado ao winget
   bucket     Gerencia os buckets do Scoop
   repair     Reconstrói o estado a partir do disco
+  cleanup    Limpa sobras: registros de apps cujo desinstalador sumiu
 
 Opções:
       --glyphs <GLIFOS>

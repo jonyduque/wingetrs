@@ -1,5 +1,6 @@
 //! `install`, `uninstall`, `upgrade` and `repair`: plan, show, confirm, execute.
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
+use super::winget_cmd::{self, CleanupArgs, WingetFlows};
 use super::{Command, output, style};
 use crate::install::executor::LaunchGate;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
@@ -412,13 +413,13 @@ impl Drop for LineProgress {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Flags {
-    pub(super) yes: bool,
-    pub(super) dry_run: bool,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags {
+    pub yes: bool,
+    pub dry_run: bool,
     /// `--allow-msiexec`: an MSI the own extractor refuses may use `msiexec /a`. Never
     /// implied by `--yes`.
-    allow_msiexec: bool,
+    pub allow_msiexec: bool,
 }
 
 impl Flags {
@@ -451,12 +452,13 @@ fn finish_log<T, E: std::fmt::Display>(log: JobLog, result: &Result<T, E>, ok: &
 }
 
 /// Runs one of the operation commands. `interrupts` (Ctrl+C) are listened to only while the
-/// disk changes, deciding through `ctx.launch`.
+/// disk changes, deciding through `ctx.launch`. Apps wingetrs did not install go to `winget`.
 pub async fn execute(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
     cmd: Command,
     interrupts: &mut impl Interrupts,
+    winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
     let stop = Stop {
         interrupts,
@@ -476,7 +478,7 @@ pub async fn execute(
                 dry_run,
                 allow_msiexec,
             };
-            install(ctx, ui, &target, bucket.as_deref(), scope, f, stop).await
+            install(ctx, ui, &target, bucket.as_deref(), scope, f, stop, winget).await
         }
         Command::Uninstall {
             target,
@@ -489,7 +491,7 @@ pub async fn execute(
                 dry_run,
                 allow_msiexec: false,
             };
-            uninstall(ctx, ui, &target, purge, f, stop)
+            uninstall(ctx, ui, &target, purge, f, stop, winget)
         }
         Command::Upgrade {
             target,
@@ -504,25 +506,51 @@ pub async fn execute(
                 dry_run,
                 allow_msiexec,
             };
-            upgrade(ctx, ui, target.as_deref(), all, keep, f, stop).await
+            upgrade(ctx, ui, target.as_deref(), all, keep, f, stop, winget).await
         }
         Command::Repair => {
             anstream::print!("{}", output::repair_text(&ops::repair(ctx)?));
             Ok(())
         }
+        Command::Cleanup {
+            orphans,
+            dry_run,
+            yes,
+        } => {
+            let a = CleanupArgs {
+                orphans,
+                dry_run,
+                yes,
+            };
+            winget_cmd::cleanup(winget, ui, a, &mut stdout_line)
+        }
         _ => bail!("comando não é uma operação de instalação"),
     }
 }
 
+/// One line on stdout (the `Say` of the winget commands).
+fn stdout_line(line: &str) {
+    anstream::println!("{line}");
+}
+
 /// What [`execute`] listens to while the disk changes.
-pub(super) struct Stop<'a, I: Interrupts> {
-    pub(super) interrupts: &'a mut I,
+pub struct Stop<'a, I: Interrupts> {
+    pub interrupts: &'a mut I,
     gate: &'a LaunchGate,
 }
 
-impl<I: Interrupts> Stop<'_, I> {
+impl<'a, I: Interrupts> Stop<'a, I> {
+    /// Listens to `interrupts`; a request cancels through `gate` until something launched.
+    pub fn new(interrupts: &'a mut I, gate: &'a LaunchGate) -> Stop<'a, I> {
+        Stop { interrupts, gate }
+    }
+
     /// [`until_interrupted`], telling the user through `ui` when Ctrl+C cannot stop it.
-    async fn run<T>(&mut self, ui: &dyn Ui, op: impl std::future::Future<Output = T>) -> Option<T> {
+    pub(super) async fn run<T>(
+        &mut self,
+        ui: &dyn Ui,
+        op: impl std::future::Future<Output = T>,
+    ) -> Option<T> {
         let gate = self.gate;
         let refused = || ui.notice(&uncancellable(gate.running().as_deref()));
         until_interrupted(op, self.interrupts, gate, &refused).await
@@ -608,6 +636,7 @@ fn print_terminal_hint(plan: &crate::install::plan::InstallPlan) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
@@ -616,13 +645,14 @@ async fn install(
     scope: Option<crate::bridge::worker::ScopeArg>,
     f: Flags,
     mut stop: Stop<'_, impl Interrupts>,
+    winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
     let Some(cand) = choose(ctx, ui, target, bucket, f.yes)? else {
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     };
     if cand.entry.source == crate::core::SourceKind::Winget {
-        return super::winget_cmd::install_bridge(ctx, ui, &cand, scope, f, stop).await;
+        return winget_cmd::install(winget, ui, &cand, scope, f, stop, &mut stdout_line).await;
     }
     if scope.is_some() {
         bail!("--scope só vale para pacotes do winget");
@@ -671,10 +701,17 @@ fn uninstall(
     purge: bool,
     f: Flags,
     stop: Stop<'_, impl Interrupts>,
+    winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
     // Installed apps are named by id only; accept `bucket/id` too.
     let app = target.rsplit('/').next().unwrap_or(target);
-    let plan = ops::plan_uninstall(ctx, app, purge)?;
+    let plan = match ops::plan_uninstall(ctx, app, purge) {
+        // Not an app of wingetrs: one of the Windows list (ARP, MSIX).
+        Err(ops::OpsError::NotInstalled(_)) => {
+            return winget_cmd::uninstall(winget, ui, target, purge, f, stop, &mut stdout_line);
+        }
+        other => other?,
+    };
     anstream::print!(
         "{}",
         output::uninstall_plan_text(&plan, &ctx.data.install_layout(), ui.glyphs())
@@ -774,6 +811,7 @@ fn clean_residues(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upgrade(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
@@ -782,6 +820,7 @@ async fn upgrade(
     keep: bool,
     f: Flags,
     mut stop: Stop<'_, impl Interrupts>,
+    winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
     let list = ops::upgradable(ctx)?;
     let pins = crate::pins::load(ctx.data);
@@ -805,7 +844,9 @@ async fn upgrade(
                 .collect();
             if found.is_empty() {
                 if state.get(t)?.is_none() {
-                    return Err(ops::OpsError::NotInstalled(t.to_string()).into());
+                    // Not an app of wingetrs: one of the Windows list, matched to winget.
+                    let whole = target.unwrap_or(t);
+                    return winget_cmd::upgrade(winget, ui, whole, f, stop, &mut stdout_line).await;
                 }
                 anstream::println!("{t} já está na versão mais recente.");
                 return Ok(());

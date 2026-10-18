@@ -217,17 +217,19 @@ pub enum Command {
         #[arg(long, value_parser = parse_scope, value_name = "ESCOPO")]
         scope: Option<crate::bridge::worker::ScopeArg>,
     },
-    /// Remove um app instalado pelo wingetrs
+    /// Remove um app do wingetrs, ou um app do Windows pelo id do winget ou pelo nome
     #[command(
         override_usage = "wingetrs uninstall [OPÇÕES] <ALVO>",
         help_template = HELP_TEMPLATE,
         next_help_heading = "Opções",
         after_help = "Exemplos:
   wingetrs uninstall ripgrep
-  wingetrs uninstall ripgrep --purge --yes"
+  wingetrs uninstall ripgrep --purge --yes
+  wingetrs uninstall Notepad++.Notepad++ --dry-run
+  wingetrs uninstall \"Amazon Kindle\""
     )]
     Uninstall {
-        /// App a remover
+        /// App a remover (id do wingetrs, id do winget ou nome na lista do Windows)
         #[arg(help_heading = "Argumentos", value_name = "ALVO")]
         target: String,
         /// Apaga também os dados persistentes do app
@@ -240,7 +242,7 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Atualiza apps instalados pelo wingetrs
+    /// Atualiza apps do wingetrs, ou um app do Windows associado ao winget
     #[command(
         override_usage = "wingetrs upgrade [OPÇÕES] [ALVO]",
         help_template = HELP_TEMPLATE,
@@ -248,10 +250,11 @@ pub enum Command {
         after_help = "Exemplos:
   wingetrs upgrade               lista o que pode ser atualizado
   wingetrs upgrade ripgrep
-  wingetrs upgrade --all --yes"
+  wingetrs upgrade Git.Git --dry-run
+  wingetrs upgrade --all --yes   só apps do wingetrs"
     )]
     Upgrade {
-        /// App a atualizar
+        /// App a atualizar (id do wingetrs, id do winget ou nome na lista do Windows)
         #[arg(
             help_heading = "Argumentos",
             value_name = "ALVO",
@@ -301,6 +304,29 @@ pub enum Command {
   wingetrs repair"
     )]
     Repair,
+    /// Limpa sobras: registros de apps cujo desinstalador sumiu
+    #[command(
+        override_usage = "wingetrs cleanup --orphans [OPÇÕES]",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        after_help = "Exemplos:
+  wingetrs cleanup --orphans --dry-run   só lista
+  wingetrs cleanup --orphans             escolhe quais remover (nenhum vem marcado)
+  wingetrs cleanup --orphans --yes       remove todos os listados
+
+Cada registro é exportado para um .reg (backups) antes de ser apagado."
+    )]
+    Cleanup {
+        /// Registros órfãos (no Painel de Controle, sem desinstalador no disco)
+        #[arg(long)]
+        orphans: bool,
+        /// Mostra o que seria removido e sai, sem alterar nada
+        #[arg(long)]
+        dry_run: bool,
+        /// Não pergunta nada: remove todos os listados
+        #[arg(long)]
+        yes: bool,
+    },
     /// Auxiliar elevado da ponte do winget (iniciado pela TUI via UAC)
     #[command(hide = true)]
     BridgeWorker {
@@ -853,6 +879,7 @@ async fn run_async(
         cmd @ (Command::Install { .. }
         | Command::Uninstall { .. }
         | Command::Upgrade { .. }
+        | Command::Cleanup { .. }
         | Command::Repair) => {
             #[cfg(windows)]
             {
