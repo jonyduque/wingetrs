@@ -1540,6 +1540,7 @@ fn cli_uninstall_of_msi_waits_for_msi_lock() {
                 clock: &NoClock,
                 user_expand: &|_| None,
                 msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+                helper_line: &|_| {},
             };
             let queue = MsiQueue {
                 lock: lock.clone(),

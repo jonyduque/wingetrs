@@ -416,6 +416,65 @@ fn job_active(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<u32> {
     Ok(acct.ActiveProcesses)
 }
 
+/// A `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute list naming `handles` (borrowed: the array
+/// must outlive the list), deleted on drop.
+struct HandleList<'a> {
+    /// The list's storage; `list` points into its heap block, which never moves.
+    _buf: Vec<usize>,
+    list: windows::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST,
+    _handles: &'a [windows::Win32::Foundation::HANDLE],
+}
+
+impl<'a> HandleList<'a> {
+    fn new(handles: &'a [windows::Win32::Foundation::HANDLE]) -> std::io::Result<HandleList<'a>> {
+        use windows::Win32::System::Threading::{
+            InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, UpdateProcThreadAttribute,
+        };
+        let mut size = 0usize;
+        // SAFETY: size query (no list); it fails with ERROR_INSUFFICIENT_BUFFER by design.
+        let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut size) };
+        if size == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr().cast());
+        // SAFETY: `buf` is writable, aligned and at least `size` bytes.
+        unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut size) }
+            .map_err(win_err)?;
+        let this = HandleList {
+            _buf: buf,
+            list,
+            _handles: handles,
+        };
+        // SAFETY: an initialized list; `handles` outlives it (borrowed by `this`).
+        unsafe {
+            UpdateProcThreadAttribute(
+                this.list(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(handles.as_ptr().cast()),
+                std::mem::size_of_val(handles),
+                None,
+                None,
+            )
+        }
+        .map_err(win_err)?;
+        Ok(this)
+    }
+
+    fn list(&self) -> windows::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.list
+    }
+}
+
+impl Drop for HandleList<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the list was initialized in `new` and is deleted once.
+        unsafe { windows::Win32::System::Threading::DeleteProcThreadAttributeList(self.list()) };
+    }
+}
+
 /// How `run_in_job` ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobEnd {
@@ -443,9 +502,9 @@ pub fn run_in_job(
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0};
     use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
     use windows::Win32::System::Threading::{
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE,
-        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
-        WaitForSingleObject,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT,
+        GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
     use windows::core::{HSTRING, PWSTR};
     let shown = program.display().to_string();
@@ -466,13 +525,20 @@ pub fn run_in_job(
     // SAFETY: a valid handle owned by `nul`.
     unsafe { SetHandleInformation(nul_h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
         .map_err(win_err)?;
-    let si = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        dwFlags: STARTF_USESTDHANDLES,
-        hStdInput: nul_h,
-        hStdOutput: nul_h,
-        hStdError: nul_h,
-        ..Default::default()
+    // Only the NUL handle is inherited (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), never the other
+    // inheritable handles of this process.
+    let inherit = [nul_h];
+    let attrs = HandleList::new(&inherit)?;
+    let si = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: nul_h,
+            hStdOutput: nul_h,
+            hStdError: nul_h,
+            ..Default::default()
+        },
+        lpAttributeList: attrs.list(),
     };
     let line = if args.is_empty() {
         format!("\"{shown}\"")
@@ -485,7 +551,8 @@ pub fn run_in_job(
         .collect();
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: every pointer outlives the call; `line` is writable and NUL-terminated; `block`
-    // is a double-NUL-terminated UTF-16 environment.
+    // is a double-NUL-terminated UTF-16 environment; `si` is a STARTUPINFOEXW whose attribute
+    // list (and the handle array it points to) live in `attrs`/`inherit` until after the call.
     unsafe {
         CreateProcessW(
             &HSTRING::from(program.as_os_str()),
@@ -493,14 +560,15 @@ pub fn run_in_job(
             None,
             None,
             true,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
             Some(block.as_ptr().cast()),
             &HSTRING::from(dir.as_os_str()),
-            &si,
+            &si.StartupInfo,
             &mut pi,
         )
     }
     .map_err(win_err)?;
+    drop(attrs);
     drop(nul);
     let process = owned(pi.hProcess);
     let thread = owned(pi.hThread);

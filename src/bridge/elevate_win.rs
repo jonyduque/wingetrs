@@ -623,22 +623,34 @@ fn run_winget(
         ));
     }
     let exe = winget_exe()?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| std::io::Error::other("winget sem pasta"))?;
-    // The environment is built from scratch, `TEMP`/`TMP` in an execution folder of the
-    // staging root: the worker's own environment comes from the user (`HKCU\Environment`).
     let sys = super::staging_win::SystemEnv::query()?;
     let root = super::staging_win::staging_root(&sys.program_files)?;
-    super::staging_win::run_tool(
+    run_winget_at(
         &exe,
         args,
-        dir,
         &root,
         super::staging_win::RUN_SDDL,
         &sys,
         on_line,
     )
+}
+
+/// Runs the winget at `exe` (already resolved by `winget_exe`) from its own folder. The
+/// environment is built from scratch, `TEMP`/`TMP` in an execution folder under `root`
+/// (created with `sddl`): the worker's own environment comes from the user
+/// (`HKCU\Environment`).
+pub fn run_winget_at(
+    exe: &Path,
+    args: &[String],
+    root: &Path,
+    sddl: &str,
+    sys: &super::staging_win::SystemEnv,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    let dir = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("winget sem pasta"))?;
+    super::staging_win::run_tool(exe, args, dir, root, sddl, sys, on_line)
 }
 
 /// Package family of App Installer, which ships `winget.exe`.

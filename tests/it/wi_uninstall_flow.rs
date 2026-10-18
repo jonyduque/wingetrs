@@ -269,6 +269,7 @@ impl World {
             clock: &self.clock,
             user_expand: &user_env,
             msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+            helper_line: &|_| {},
         };
         uninstall(&ctx, plan)
     }
@@ -1048,6 +1049,7 @@ fn run_queued_msi(codes: &[i32]) -> (Result<UninstallStatus, String>, Vec<bool>,
         clock: &w.clock,
         user_expand: &user_env,
         msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+        helper_line: &|_| {},
     };
     let sleeps: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
     let sleep = |d: Duration| sleeps.lock().unwrap().push(d);
@@ -1108,6 +1110,7 @@ fn non_msi_uninstall_takes_no_msi_queue() {
         clock: &w.clock,
         user_expand: &user_env,
         msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+        helper_line: &|_| {},
     };
     let queue = MsiQueue {
         lock: lock.clone(),
@@ -1122,4 +1125,81 @@ fn non_msi_uninstall_takes_no_msi_queue() {
     // An exe uninstaller's 1618 is just an unknown code: one launch, no lock, no retry.
     assert!(uninstall_queued(&ctx, Some(&queue), &p).is_err());
     assert_eq!(*launcher.held.lock().unwrap(), [false]);
+}
+
+/// Task 190: when the elevated helper says it waits for what the uninstaller left running,
+/// the removal shows "aguardando o desinstalador terminar" instead of keeping the UAC text.
+#[test]
+fn helper_wait_line_shows_the_waiting_phase() {
+    use wingetrs::install::progress::{Phase, ProgressEvent};
+    use wingetrs::winget_install::removal::{run_uninstaller, waiting_uninstaller_phase};
+
+    /// `FakeElevated` whose helper reports the wait before the exit code.
+    struct Waiting(FakeElevated);
+    impl ElevatedRunner for Waiting {
+        fn run_installer(
+            &self,
+            _req: &InstallerRequest,
+            _on_line: &mut dyn FnMut(&str),
+        ) -> Result<i32, ElevatedError> {
+            panic!("not used");
+        }
+        fn run_uninstaller_lines(
+            &self,
+            hive: MachineHive,
+            key: &str,
+            rule: Rule,
+            nsis_hint: bool,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<i32, ElevatedError> {
+            on_line(wingetrs::bridge::worker::WAITING_UNINSTALLER);
+            self.0.run_uninstaller(hive, key, rule, nsis_hint)
+        }
+    }
+
+    let d = kindle(Hive::MachineX64, "Kindle", "2.8.3");
+    let p = plan_uninstall(&d, true, &[], true, &known(), &user(), &no_folders).unwrap();
+    assert_eq!(p.elevation, Elevation::Helper);
+    let elevated = Waiting(FakeElevated::default());
+    let launcher = FakeLauncher::new(0);
+    let msix = FakeMsix::default();
+    let clock = FakeClock::default();
+    let gone = |_: Hive, _: &str| false;
+    let seen = Mutex::new(Vec::new());
+    let ctx = UninstallCtx {
+        launcher: &launcher,
+        elevated: &elevated,
+        msix: &msix,
+        key_exists: &gone,
+        clock: &clock,
+        user_expand: &user_env,
+        msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+        helper_line: &|l: &str| seen.lock().unwrap().push(l.to_string()),
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let queue = MsiQueue {
+        lock: dir.path().join("msi.lock"),
+        busy: &|| false,
+        sleep: &|_| {},
+    };
+    let events = Mutex::new(Vec::new());
+    let progress = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
+    let r = run_uninstaller(&ctx, &queue, &p, &progress).unwrap();
+    assert_eq!(r.status, UninstallStatus::Removed);
+    let waiting = waiting_uninstaller_phase(&p.name);
+    assert_eq!(
+        waiting,
+        Phase::Removing {
+            app: format!("{}: aguardando o desinstalador terminar", p.name)
+        }
+    );
+    assert_eq!(
+        events.lock().unwrap().first(),
+        Some(&ProgressEvent::Phase(waiting))
+    );
+    // The caller's own hook still sees the line.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [wingetrs::bridge::worker::WAITING_UNINSTALLER]
+    );
 }

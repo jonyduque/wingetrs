@@ -282,6 +282,20 @@ pub trait ElevatedRunner: Send + Sync {
         ))
     }
 
+    /// `run_uninstaller`, with the helper's progress lines (`worker::WAITING_UNINSTALLER` once
+    /// the uninstaller exited and the helper waits for what it left running) sent to
+    /// `on_line`. By default, no line.
+    fn run_uninstaller_lines(
+        &self,
+        hive: MachineHive,
+        key: &str,
+        rule: Rule,
+        nsis_hint: bool,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        self.run_uninstaller(hive, key, rule, nsis_hint)
+    }
+
     /// Deletes an HKLM ARP key once the helper confirms `reason` again (Task 182).
     fn delete_arp_key(
         &self,
@@ -319,17 +333,28 @@ impl ElevatedRunner for ElevatedBridge {
         rule: Rule,
         nsis_hint: bool,
     ) -> Result<i32, ElevatedError> {
+        self.run_uninstaller_lines(hive, key, rule, nsis_hint, &mut |_| {})
+    }
+
+    /// The helper's lines (waiting for processes the uninstaller left, a folder kept) go to
+    /// the log and to `on_line`.
+    fn run_uninstaller_lines(
+        &self,
+        hive: MachineHive,
+        key: &str,
+        rule: Rule,
+        nsis_hint: bool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
         let request = Request::RunUninstaller {
             hive,
             key: key.to_string(),
             rule,
             nsis_hint,
         };
-        // The helper's lines (waiting for processes the uninstaller left, a folder kept) go to
-        // the log; the caller's `Phase::WaitingElevation` ("...instalador elevado") keeps its
-        // clock meanwhile.
         self.ask_elevated(&request, &mut |l: &str| {
             tracing::info!(line = l, "elevated uninstaller");
+            on_line(l);
         })
     }
 

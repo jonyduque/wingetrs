@@ -668,6 +668,7 @@ impl World {
             clock: &self.clock,
             user_expand: &|_: &str| None,
             msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+            helper_line: &|_| {},
         };
         upgrade(&wctx, &uctx, p, Some(previous)).await
     }

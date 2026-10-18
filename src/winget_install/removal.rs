@@ -79,6 +79,14 @@ pub fn removal_phase(elevated: bool, name: &str) -> Phase {
     }
 }
 
+/// The phase while the elevated helper waits for the processes the uninstaller of `name` left
+/// running after it exited (up to 10 min).
+pub fn waiting_uninstaller_phase(name: &str) -> Phase {
+    Phase::Removing {
+        app: format!("{name}: {}", crate::bridge::worker::WAITING_UNINSTALLER),
+    }
+}
+
 /// The phase while the uninstaller of `plan` runs (the elevated helper: its UAC first).
 pub fn uninstaller_phase(plan: &UninstallPlan) -> Phase {
     if plan.elevation == Elevation::Helper {
@@ -174,8 +182,17 @@ pub fn run_uninstaller(
         }
         (u.key_exists)(hive, key)
     };
+    // The helper waits for what the uninstaller left running (Task 190): say so instead of
+    // keeping the UAC text on screen.
+    let helper_line = |line: &str| {
+        if line == crate::bridge::worker::WAITING_UNINSTALLER {
+            progress(&ProgressEvent::Phase(waiting_uninstaller_phase(&plan.name)));
+        }
+        (u.helper_line)(line)
+    };
     let watched = UninstallCtx {
         key_exists: &key_watched,
+        helper_line: &helper_line,
         ..*u
     };
     uninstall_queued(&watched, Some(queue), plan)

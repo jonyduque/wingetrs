@@ -307,8 +307,7 @@ pub fn run_uninstaller(
 /// uninstaller itself exited.
 pub const UNINSTALL_LINGER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Line sent while the helper waits for those processes.
-pub const WAITING_UNINSTALLER: &str = "aguardando o desinstalador terminar";
+pub use super::worker::WAITING_UNINSTALLER;
 
 /// Runs `program args` from `dir` in a job object (see `spawn_win::run_in_job`) with
 /// `installer_env`, `TEMP` in a fresh execution folder under `root` (created with `sddl`).
@@ -350,9 +349,12 @@ pub fn run_waiting(
     Ok(end.code)
 }
 
-/// Owner and DACL of the folder `path` as SDDL, opened without following a reparse point;
-/// `None` when unreadable or a reparse point (then nothing is an orphan there).
+/// Owner and DACL of the folder `path` as SDDL. Every folder from the volume root down to it is
+/// opened without following a reparse point (and held while the descriptor is read), so a
+/// junction anywhere on the way cannot point the check at another folder; `None` when one is a
+/// reparse point or anything is unreadable (then nothing is an orphan there).
 pub fn folder_sddl(path: &Path) -> Option<String> {
+    let _above = super::staging_win::hold_plain_folders(path).ok()?;
     let file = std::fs::OpenOptions::new()
         .access_mode(READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)
         .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)

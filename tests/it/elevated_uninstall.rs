@@ -1451,6 +1451,50 @@ mod job {
     /// `RUN_SDDL` plus the owner (the unelevated test user), who may then write inside.
     const TEST_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
 
+    /// Task 190 review: a junction above the nearest existing folder cannot make an entry an
+    /// orphan. `App` is a junction to `real` (which has `sub`): read through it, the folder
+    /// gives no descriptor, so the entry is not an orphan; through the plain path it is.
+    #[test]
+    fn orphan_through_junction_in_middle_is_not_orphan() {
+        use super::{ADMIN_SDDL, entry, kf};
+        use wingetrs::bridge::arp_ops_win::{exists, folder_sddl};
+        use wingetrs::installed::Hive;
+        use wingetrs::winget_install::elevated_rules::still_orphan;
+        use wingetrs::winget_install::uninstall_cmd::ArpDetails;
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let link = dir.path().join("App");
+        let ok = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "mklink /J");
+        let through = link.join("sub");
+        assert!(through.is_dir(), "the junction resolves");
+        assert!(
+            folder_sddl(&real.join("sub")).is_some(),
+            "plain folder readable"
+        );
+        assert_eq!(folder_sddl(&through), None);
+        // The folder counts as administrator-only whenever its descriptor can be read, so only
+        // the junction decides.
+        let admin_if_read = |p: &Path| folder_sddl(p).map(|_| ADMIN_SDDL.to_string());
+        let orphan = |folder: &Path| {
+            let d = ArpDetails {
+                uninstall_string: Some(format!("\"{}\" /S", folder.join("gone.exe").display())),
+                ..entry(Hive::MachineX64, "x")
+            };
+            still_orphan(&d, &kf(), exists, admin_if_read)
+        };
+        assert!(orphan(&real.join("sub")), "control: plain path");
+        assert!(!orphan(&through), "junction in the middle");
+    }
+
     /// `uninst.cmd` (exits 3 at once) starting `child.cmd`, which waits for `release` to exist
     /// (at most ~`pings` s), then records whether its `TEMP` still exists in `marker` and exits 5.
     fn scripts(dir: &Path, release: &Path, marker: &Path, pings: u32) -> PathBuf {

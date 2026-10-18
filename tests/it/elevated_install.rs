@@ -1288,10 +1288,10 @@ mod win {
         }
         let my_temp = std::env::var("TEMP").unwrap();
         let mut lines = Vec::new();
-        let (code, _) = staging_win::run_tool(
+        // Through the helper's own winget entry point (only the exe lookup is left out).
+        let (code, _) = wingetrs::bridge::elevate_win::run_winget_at(
             &script,
             &[],
-            dir.path(),
             &root,
             TEST_SDDL,
             &sys,

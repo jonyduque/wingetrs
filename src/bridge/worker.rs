@@ -561,6 +561,10 @@ pub trait WorkerOps {
     }
 }
 
+/// Line the helper sends while it waits for the processes an uninstaller left running after
+/// it exited (Task 190).
+pub const WAITING_UNINSTALLER: &str = "aguardando o desinstalador terminar";
+
 /// Decides, from the values read through the open key, a file-existence check and a folder's
 /// owner and DACL as SDDL (`None` when unreadable), whether the key may be deleted.
 pub type DeleteCheck<'a> = &'a mut dyn FnMut(

@@ -247,7 +247,7 @@ fn hex(bytes: &[u8]) -> String {
 /// Opens every folder above `path`, from the volume root down, without following a reparse
 /// point (one is refused) and without delete sharing, so none can be renamed or swapped for a
 /// junction while the handles live. Each open resolves through the folders already held.
-fn hold_plain_folders(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
+pub(super) fn hold_plain_folders(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
     let mut dirs: Vec<&Path> = path
         .ancestors()
         .skip(1)

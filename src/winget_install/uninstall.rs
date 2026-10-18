@@ -353,6 +353,9 @@ pub struct UninstallCtx<'a> {
     pub user_expand: &'a dyn Fn(&str) -> Option<String>,
     /// `System32\msiexec.exe` (`launch_win::msiexec_path`), never from PATH.
     pub msiexec: &'a Path,
+    /// Each progress line of the elevated helper while it runs an uninstaller
+    /// (`worker::WAITING_UNINSTALLER`, Task 190).
+    pub helper_line: &'a dyn Fn(&str),
 }
 
 /// How the uninstall ended.
@@ -479,7 +482,9 @@ fn launch_once(
             let h = machine_hive(hive)
                 .ok_or_else(|| "registro do usuário nunca roda elevado".to_string())?;
             ctx.elevated
-                .run_uninstaller(h, key, c.rule, c.rule == Rule::Nsis)
+                .run_uninstaller_lines(h, key, c.rule, c.rule == Rule::Nsis, &mut |l: &str| {
+                    (ctx.helper_line)(l)
+                })
                 .map_err(|e| e.to_string())
         }
     }
