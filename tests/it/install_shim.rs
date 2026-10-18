@@ -130,7 +130,7 @@ fn script_wrappers_and_remove() {
     assert_eq!(
         std::fs::read_to_string(shims.join("p.ps1")).unwrap(),
         format!(
-            "$path = '{}'\r\n$shimArgs = @()\r\n& $path @shimArgs @args\r\n",
+            "\u{feff}$path = '{}'\r\n$shimArgs = @()\r\n& $path @shimArgs @args\r\n",
             ps1.display()
         )
     );
@@ -307,7 +307,7 @@ fn wrappers_with_args_exact_text() {
     let p = ps1.display();
     assert_eq!(
         std::fs::read_to_string(shims.join("p.ps1")).unwrap(),
-        format!("$path = '{p}'\r\n$shimArgs = @('-a', 'b')\r\n& $path @shimArgs @args\r\n")
+        format!("\u{feff}$path = '{p}'\r\n$shimArgs = @('-a', 'b')\r\n& $path @shimArgs @args\r\n")
     );
     assert_eq!(
         std::fs::read_to_string(shims.join("p.cmd")).unwrap(),
@@ -373,7 +373,7 @@ fn ps1_shim_uses_literal_array() {
     let args = r#"--flag "C:\Program Files\x" -b"#;
     create_shim(&layout, &spec("p", &ps1, Some(args), ShimKind::Ps1)).unwrap();
     let want = format!(
-        "$path = '{}'\r\n$shimArgs = @('--flag', 'C:\\Program Files\\x', '-b')\r\n& $path @shimArgs @args\r\n",
+        "\u{feff}$path = '{}'\r\n$shimArgs = @('--flag', 'C:\\Program Files\\x', '-b')\r\n& $path @shimArgs @args\r\n",
         ps1.display().to_string().replace('\'', "''")
     );
     assert_eq!(
@@ -474,5 +474,86 @@ fn shim_args_dir_with_ampersand_stays_inert() {
     assert!(
         matches!(r, Err(wingetrs::install::planner::PlanError::UnsafeArgs(_))),
         "{r:?}"
+    );
+}
+/// Task 191 review: PowerShell reads U+2018-U+201B as single quotes too. A `’` in the target,
+/// in the arguments or in our folders is doubled in the `.ps1` shim, and the file has a BOM so
+/// PowerShell 5.1 does not read UTF-8 bytes (`ő` = C5 91) as CP1252 quotes.
+#[test]
+fn ps1_shim_typographic_quotes_and_bom() {
+    let (t, layout) = setup();
+    let dir = t.path().join("a\u{2019};calc;\u{2019}b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ps1 = dir.join("x.ps1");
+    create_shim(
+        &layout,
+        &spec("p", &ps1, Some("\u{2018};calc;\u{201B}"), ShimKind::Ps1),
+    )
+    .unwrap();
+    let bytes = std::fs::read(layout.shims().join("p.ps1")).unwrap();
+    assert_eq!(&bytes[..3], b"\xEF\xBB\xBF");
+    let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
+    let target = ps1
+        .display()
+        .to_string()
+        .replace('\u{2019}', "\u{2019}\u{2019}");
+    assert_eq!(
+        text,
+        format!(
+            "$path = '{target}'\r\n$shimArgs = @('\u{2018}\u{2018};calc;\u{201B}\u{201B}')\r\n& $path @shimArgs @args\r\n"
+        )
+    );
+}
+
+/// The same through planning: `$dir` under a profile with `’` and `ő` reaches the `.ps1` as a
+/// literal (quotes doubled, UTF-8 kept behind a BOM) and the `.cmd` inside double quotes.
+#[test]
+fn ps1_shim_dir_with_typographic_quote_and_o_double_acute() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("Jo\u{2019}\u{0151}");
+    let spec = plan_shim(&root, "1.0", r"--data $dir\data").unwrap();
+    let data = format!(
+        r"{}\data",
+        root.join("apps").join("app").join("current").display()
+    );
+    assert_eq!(
+        spec.args.as_deref(),
+        Some(format!(r#"--data "{data}""#).as_str())
+    );
+    let layout = Layout::new(&root);
+    create_shim(&layout, &spec).unwrap();
+    let bytes = std::fs::read(layout.shims().join("t.ps1")).unwrap();
+    assert_eq!(&bytes[..3], b"\xEF\xBB\xBF");
+    assert!(bytes.windows(2).any(|w| w == [0xC5, 0x91]), "ő stays UTF-8");
+    let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
+    let doubled = data.replace('\u{2019}', "\u{2019}\u{2019}");
+    assert!(
+        text.contains(&format!("$shimArgs = @('--data', '{doubled}')")),
+        "{text}"
+    );
+}
+
+/// Task 191 review: a quoted argument ending in `\` gets its trailing backslashes doubled, or
+/// the C runtime would read `\"` as a literal quote and merge the next arguments.
+#[test]
+fn shim_args_trailing_backslash_doubled() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("r");
+    let spec = plan_shim(&root, "1.0", r#"--out "$dir\" -q"#).unwrap();
+    let dir = root.join("apps").join("app").join("current");
+    assert_eq!(
+        spec.args.as_deref(),
+        Some(format!(r#"--out "{}\\" -q"#, dir.display()).as_str())
+    );
+    // The `.ps1` reads the same text back by the C runtime rules: one backslash.
+    let layout = Layout::new(&root);
+    create_shim(&layout, &spec).unwrap();
+    let ps1 = std::fs::read_to_string(layout.shims().join("t.ps1")).unwrap();
+    assert!(
+        ps1.contains(&format!(
+            r"$shimArgs = @('--out', '{}\', '-q')",
+            dir.display()
+        )),
+        "{ps1}"
     );
 }

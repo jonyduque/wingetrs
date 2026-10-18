@@ -838,7 +838,6 @@ fn removal_consent_order_matches_executor() {
             "script post_uninstall, na remoção",
         ]
     );
-    // The same order inside an install plan's consent (its removal code, read back).
 }
 
 /// The consent covers the manifest the user read: a different hash under `install.lock`

@@ -1172,3 +1172,19 @@ async fn shim_effect_args_under_non_ascii_profile() {
         "{ps1}"
     );
 }
+
+/// Task 191 review: the trusted folder must end at a separator: `…\root2\x` is not under
+/// `…\root`, so the whole argument goes through the allowlist (and `ã` fails it).
+#[tokio::test]
+async fn shim_effect_args_trusted_prefix_ends_at_separator() {
+    let w = setup_at(r"João Silva\root").await;
+    let sibling = w.base().join("João Silva").join("root2").join("x");
+    let path = w.layout.version_dir("app", "1.0").join("t.cmd");
+    let effect = serde_json::json!({"op": "shim", "path": path, "name": "tc", "args": sibling});
+    let e = install_with_effects(&w, &[effect], || {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("argumentos inseguros"), "{e}");
+    assert!(!w.layout.shims().join("tc.cmd").exists());
+}

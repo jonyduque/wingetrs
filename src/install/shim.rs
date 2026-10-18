@@ -234,21 +234,69 @@ pub fn cmd_args(tokens: &[(String, bool)]) -> Result<String, String> {
         if !quoted && !t.is_empty() && t.chars().all(plain) {
             out.push(t.clone());
         } else {
-            out.push(format!("\"{t}\""));
+            // Trailing backslashes doubled: the C runtime reads `\"` as a literal quote.
+            let tail = t.len() - t.trim_end_matches('\\').len();
+            out.push(format!("\"{t}{}\"", "\\".repeat(tail)));
         }
     }
     Ok(out.join(" "))
 }
 
-/// A PowerShell single-quoted literal: nothing inside it expands.
+/// A PowerShell single-quoted literal: nothing inside it expands. Every quote PowerShell reads
+/// as a single quote (`'` and U+2018-U+201B) is doubled (ARMADILHAS, Task 158).
 fn ps_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    crate::install::runner::ps_single_quoted(s)
+}
+
+/// `args` as written by [`cmd_args`], split by the C runtime rules the `.cmd`/`.shim` side
+/// uses: `2n` backslashes before `"` are `n` backslashes and a quote toggle, `2n+1` are `n`
+/// and a literal `"` (never produced: quotes inside arguments are refused).
+fn split_crt(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    let mut chars = args.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let mut n = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    n += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    cur.push_str(&"\\".repeat(n / 2));
+                    if n % 2 == 1 {
+                        chars.next();
+                        cur.push('"');
+                    }
+                } else {
+                    cur.push_str(&"\\".repeat(n));
+                }
+            }
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            ' ' | '\t' if !quoted => {
+                if any || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                any = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// The `.ps1` shim: the target and the arguments as literals, never interpolated.
 fn ps1_text(target: &str, args: Option<&str>) -> String {
     let list: Vec<String> = args
-        .map(split_args)
+        .map(split_crt)
         .unwrap_or_default()
         .iter()
         .map(|a| ps_literal(a))
@@ -324,7 +372,10 @@ pub fn create_shim(layout: &Layout, spec: &ShimSpec) -> Result<Vec<PathBuf>, Shi
         ShimKind::Ps1 => {
             let ps1 = dir.join(format!("{}.ps1", spec.name));
             let cmd = dir.join(format!("{}.cmd", spec.name));
-            write_text(&ps1, &ps1_text(&target, args))?;
+            // With a BOM: PowerShell 5.1 reads a BOM-less file as ANSI, where UTF-8 bytes
+            // 0x91/0x92 (e.g. the second byte of `ő`) become typographic quotes.
+            let text = ps1_text(&target, args);
+            fs::write(&ps1, [b"\xEF\xBB\xBF", text.as_bytes()].concat()).map_err(io)?;
             let cmd_text = format!(
                 "@rem {target}\r\n@echo off\r\nwhere /q pwsh.exe\r\nif %errorlevel% equ 0 (\r\n    pwsh.exe -noprofile -ex unrestricted -file \"{target}\"{args_sp} %*\r\n) else (\r\n    powershell.exe -noprofile -ex unrestricted -file \"{target}\"{args_sp} %*\r\n)\r\n"
             );
