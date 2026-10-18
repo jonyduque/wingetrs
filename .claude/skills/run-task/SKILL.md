@@ -39,3 +39,11 @@ O orquestrador (sessão principal) **não implementa**. Ele despacha, audita e i
 - Gate vermelho após duas rodadas de correção.
 - Qualquer mudança de escopo da spec, dependência nova não prevista, ou meta que não fecha (apresente opções com vantagens, desvantagens e recomendação).
 - Encerrar processo que não foi iniciado pela tarefa corrente.
+
+## Lote grande em paralelo (fases 2c/2d, 2026-10-18)
+
+- Até ~6–7 agentes compilando ao mesmo tempo; acima disso o checkout passa mais tempo sem compilar do que trabalhando.
+- Antes de despachar, cruze a lista Files com a de tudo que está rodando (tarefas e correções de revisão). Correção de revisão que toca arquivo de outra tarefa em andamento espera.
+- O gate completo só fica verde com o checkout parado: faça checkpoints (pare de despachar, deixe terminar, rode `verify.ps1`, registre o lote no ledger, retome).
+- Plano grande: um agente opus redige o rascunho no scratchpad a partir da spec e das sondas; o orquestrador revisa, responde as questões abertas que forem dele e cola no plano.
+- Revisor opus para tudo que toca código elevado, código de terceiros ou recusa de segurança; sonnet só para transcrição pura.
