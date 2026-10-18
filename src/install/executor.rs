@@ -1979,6 +1979,62 @@ fn resolve_existing(p: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Our folders a hook's shim argument may start with, as written (`C:\…`) and resolved (links
+/// followed, without the `\\?\` prefix); longest first.
+fn trusted_prefixes(dirs: &[&Path]) -> Vec<String> {
+    let mut out = Vec::new();
+    for d in dirs {
+        out.push(d.display().to_string());
+        if let Ok(real) = fs::canonicalize(d) {
+            let real = real.display().to_string();
+            out.push(real.strip_prefix(r"\\?\").unwrap_or(&real).to_string());
+        }
+    }
+    out.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    out.dedup();
+    out
+}
+
+/// The arguments of a hook's `shim` effect as the shim text gets them (Task 191). They are
+/// split on spaces (control characters refused); an argument may start with one of our
+/// folders (`trusted`, ignoring case, followed by the end, a separator or a space), which
+/// may hold any character but `"`, `%` and `!` (refused by [`shim::cmd_args`]). The rest goes
+/// through
+/// [`shim::check_args`], with no quotes at all. Arguments are written back quoted as needed.
+fn effect_shim_args(args: &str, trusted: &[String]) -> Result<String, String> {
+    if let Some(c) = args.chars().find(|c| c.is_control()) {
+        return Err(format!("{c:?} não é aceito nos argumentos de um comando"));
+    }
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let rest = &args[i..];
+        if rest.starts_with(' ') {
+            i += 1;
+            continue;
+        }
+        // A trusted folder at the start of this argument.
+        let prefix = trusted.iter().map(String::as_str).find(|p| {
+            args.get(i..i + p.len())
+                .is_some_and(|s| s.to_lowercase() == p.to_lowercase())
+                && args[i + p.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| matches!(c, '\\' | '/' | ' '))
+        });
+        let start = i + prefix.map_or(0, str::len);
+        let end = args[start..].find(' ').map_or(args.len(), |k| start + k);
+        let tail = &args[start..end];
+        if tail.contains('"') {
+            return Err("aspas não são aceitas".into());
+        }
+        shim::check_args(tail)?;
+        tokens.push((args[i..end].to_string(), false));
+        i = end;
+    }
+    shim::cmd_args(&tokens)
+}
+
 /// `path` is `base` or under it, components compared ignoring case (Windows paths).
 fn starts_with_ci(path: &Path, base: &Path) -> bool {
     let lower = |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
@@ -2223,20 +2279,20 @@ fn apply_effect(
                     "o script tentou criar o comando {name} para {path} (fora da pasta do app)"
                 ));
             }
-            // Written raw into the `.shim`/`.cmd`/`.ps1` text: the manifest `bin` rule, and
-            // no quotes at all (a hook's shim never needed them).
-            if let Some(a) = args.as_deref() {
-                let why = match shim::check_args(a) {
-                    Err(why) => Some(why),
-                    Ok(()) if a.contains('"') => Some("aspas não são aceitas".to_string()),
-                    Ok(()) => None,
-                };
-                if let Some(why) = why {
-                    return Err(format!(
-                        "o script tentou criar o comando {name} com argumentos inseguros: {a:?} ({why})"
-                    ));
-                }
-            }
+            // The shim text gets them: the manifest `bin` allowlist (no quotes at all), except
+            // a leading folder of ours (the user profile may hold `João` or spaces).
+            let trusted = trusted_prefixes(&[&app_dir, &persist_dir, layout.root()]);
+            let args = args
+                .as_deref()
+                .map(|a| {
+                    effect_shim_args(a, &trusted).map_err(|why| {
+                        format!(
+                            "o script tentou criar o comando {name} com argumentos inseguros: {a:?} ({why})"
+                        )
+                    })
+                })
+                .transpose()?
+                .filter(|a| !a.is_empty());
             resolves_inside(&path, &[&app_dir])
                 .map_err(|m| format!("o script tentou criar o comando {name} para {path}: {m}"))?;
             let spec = ShimSpec {

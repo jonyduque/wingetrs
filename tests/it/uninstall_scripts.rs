@@ -323,9 +323,14 @@ impl World {
 }
 
 async fn setup() -> World {
+    setup_at("root").await
+}
+
+/// [`setup`] with the wingetrs root at `<tempdir>\<root>`.
+async fn setup_at(root: &str) -> World {
     let server = MockServer::start().await;
     let t = tempfile::tempdir().unwrap();
-    let root = t.path().join("root");
+    let root = t.path().join(root);
     let layout = Layout::new(&root);
     std::fs::create_dir_all(layout.launcher().parent().unwrap()).unwrap();
     std::fs::write(layout.launcher(), fake_pe(3)).unwrap();
@@ -1135,4 +1140,35 @@ async fn shim_args_with_cmd_syntax_refused() {
     install_with_effects(&w, &[shim_with_args(&w, "--flag x")], || {})
         .await
         .unwrap();
+}
+
+/// Task 191: a hook's shim argument may start with our own folder even when the user profile
+/// holds `João` and a space; it reaches both shims quoted. What follows the folder still
+/// passes the allowlist.
+#[tokio::test]
+async fn shim_effect_args_under_non_ascii_profile() {
+    let w = setup_at(r"João Silva\root").await;
+    let vdir = w.layout.version_dir("app", "1.0").display().to_string();
+    let data = format!(r"{vdir}\data");
+    let args = format!("--data {data} -q");
+    let shim_to = |file: &str, name: &str, args: &str| {
+        let path = w.layout.version_dir("app", "1.0").join(file);
+        serde_json::json!({"op": "shim", "path": path, "name": name, "args": args})
+    };
+    let bad = format!(r"{data}\x & calc");
+    let e = install_with_effects(&w, &[shim_to("t.cmd", "tc", &bad)], || {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("argumentos inseguros"), "{e}");
+    assert!(!w.layout.app_dir("app").exists(), "rolled back: {e}");
+    let effects = [shim_to("t.cmd", "tc", &args), shim_to("t.ps1", "tp", &args)];
+    install_with_effects(&w, &effects, || {}).await.unwrap();
+    let cmd = std::fs::read_to_string(w.layout.shims().join("tc.cmd")).unwrap();
+    assert!(cmd.contains(&format!("--data \"{data}\" -q %*")), "{cmd}");
+    let ps1 = std::fs::read_to_string(w.layout.shims().join("tp.ps1")).unwrap();
+    assert!(
+        ps1.contains(&format!("$shimArgs = @('--data', '{data}', '-q')")),
+        "{ps1}"
+    );
 }
