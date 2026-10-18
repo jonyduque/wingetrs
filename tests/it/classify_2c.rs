@@ -197,6 +197,17 @@ fn braced_variables_and_while_are_not_commands() {
 }
 
 #[test]
+fn typographic_quotes_close_strings_like_pwsh() {
+    // Measured in pwsh 7: this runs `Write-Output HIDDEN`.
+    let s = "'abc\u{2019}; Write-Output HIDDEN; \u{2018}x'";
+    assert_eq!(commands_in(s), vec!["Write-Output"]);
+    let s = "\u{201C}a\u{201D}; Get-Thing; \u{201E}b\"";
+    assert_eq!(commands_in(s), vec!["Get-Thing"]);
+    let s = "$t = @\u{2018}\nHidden-One\n\u{2019}@\nShown-One";
+    assert_eq!(commands_in(s), vec!["Shown-One"]);
+}
+
+#[test]
 fn hash_glued_to_a_word_is_not_a_comment() {
     // pwsh: `a#b` is one word; `=#` opens a comment, so `@'` there is no here-string.
     assert_eq!(commands_in("Foo a#b; Baz"), vec!["Foo", "Baz"]);

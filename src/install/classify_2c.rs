@@ -173,6 +173,21 @@ pub fn commands_in(script: &str) -> Vec<String> {
     lex.finish()
 }
 
+/// The script with typographic quotes mapped to their ASCII equivalents. pwsh accepts
+/// U+2018/U+2019/U+201A/U+201B as `'` and U+201C/U+201D/U+201E as `"`, in strings and
+/// here-strings, and any one closes any other (measured with pwsh 7 on 2026-10-18).
+/// One char for one char, so char offsets and line numbers are unchanged.
+pub fn normalize_quotes(script: &str) -> String {
+    script
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' => '"',
+            c => c,
+        })
+        .collect()
+}
+
 /// PowerShell keywords: never reported as commands.
 const KEYWORDS: [&str; 27] = [
     "begin",
@@ -235,7 +250,7 @@ const MAX_NEST: usize = 32;
 
 impl Lexer {
     fn script(&mut self, text: &str) {
-        let chars: Vec<char> = text.chars().collect();
+        let chars: Vec<char> = normalize_quotes(text).chars().collect();
         self.code(&chars, 0, false);
     }
 

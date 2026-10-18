@@ -597,6 +597,32 @@ fn set_environment_variable_target_decides() {
 }
 
 #[test]
+fn typographic_quotes_delimit_like_pwsh() {
+    // pwsh closes the `@'` here-string at `’@` (U+2019), so the RunAs line runs.
+    let s = "$t = @'\nx\n\u{2019}@\nStart-Process \"$dir\\x.exe\" -Verb RunAs\n'@'";
+    let r = scan(s, SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", kinds(&r));
+    let f = r
+        .flags
+        .iter()
+        .find(|f| f.kind == FlagKind::Elevation)
+        .unwrap();
+    assert_eq!(f.line, 4);
+    // `’` closes the `'` string: the Scoop function call between them is code.
+    let s = "Write-Output 'abc\u{2019}; Expand-DarkArchive a b; \u{2018}x'";
+    let r = scan(s, SUP);
+    assert!(has(&r, FlagKind::UnknownScoopFunction), "{:?}", kinds(&r));
+    // Double typographic quotes (U+201C/U+201D/U+201E) too.
+    let s = "$t = @\"\nx\n\u{201D}@\nStart-Process x -Verb RunAs\n\u{201E}@\u{201C}";
+    let r = scan(s, SUP);
+    assert!(has(&r, FlagKind::Elevation), "{:?}", kinds(&r));
+    assert!(!has(&r, FlagKind::HiddenCode), "{:?}", kinds(&r));
+    // Variable names inside `env_var_names` too.
+    let got = env_var_names("Set-EnvVar \u{201A}JAVA_HOME\u{201B} 'v'");
+    assert!(got.contains("JAVA_HOME"), "{got:?}");
+}
+
+#[test]
 fn variables_lowercase_without_dollar() {
     let r = scan(r#"Copy-Item "$Dir\x" "$env:APPDATA\y" $Persist_Dir"#, SUP);
     let want: BTreeSet<String> = ["dir", "env:appdata", "persist_dir"]

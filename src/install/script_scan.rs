@@ -6,7 +6,7 @@
 //! The same report feeds the dry-run, the confirmation dialog, `show` and the oracle.
 use std::collections::BTreeSet;
 
-use super::classify_2c::commands_in;
+use super::classify_2c::{commands_in, normalize_quotes};
 use super::manifest::{HookKind, InstallerSpec, Resolved};
 use super::prelude::PRELUDE_FUNCTIONS;
 
@@ -431,6 +431,8 @@ const D_HIDDEN: &str = "possível código escondido em comentário ou here-strin
 /// Scans one script. `supported` lists the Scoop functions the wingetrs prelude implements
 /// (compared case-insensitively); any other name of [`SCOOP_FUNCTIONS`] is refused.
 pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
+    // Typographic quotes are string delimiters to pwsh (see `normalize_quotes`).
+    let script = &normalize_quotes(script);
     let text = strip_here_strings(&strip_comments(script));
     // Backticks are dropped before matching: `Run`As` and `HK`LM:` mean the same to pwsh.
     let lines: Vec<String> = text
@@ -743,6 +745,7 @@ pub fn scan_manifest(m: &Resolved, supported: &[&str]) -> Vec<(HookKind, ScriptR
 /// First literal argument (positional or `-Name`) of each `Get-EnvVar`/`Set-EnvVar` call,
 /// case preserved. Arguments that are variables or expressions are skipped.
 pub fn env_var_names(script: &str) -> BTreeSet<String> {
+    let script = &normalize_quotes(script);
     let cleaned = strip_here_strings(&strip_comments(script));
     let chars: Vec<char> = cleaned.chars().collect();
     let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
