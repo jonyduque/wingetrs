@@ -1088,3 +1088,124 @@ Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) tirar o `env_clear()`
 3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `fix(bridge): phase review of the elevated side (log quoting, winget env, orphan DACL, reparse, job wait)`
+
+
+### Task 193: CLI do winget igual à TUI (revisão de fase da 2d)
+
+**Modelo:** opus (revisor opus). Origem: revisão de fase dos fluxos nativos da 2d em 2026-10-18 (orquestrador), sobre o HEAD f71ac10.
+
+#### Where this fits
+
+- `src/cli/winget_cmd.rs` ~:282 com `src/winget_install/ops.rs` ~:218,298: `stop.run` faz poll de um future que bloqueia a thread (`lock_msi`, esperas do `run_queued` e retentativas de 1618, `launcher.run` são síncronos dentro de `install_locked`); enquanto bloqueia, `interrupts.next()` nunca é lido. Ctrl+C esperando outro instalador não faz nada nem imprime nada; Ctrl+C durante o instalador nunca mostra "não pode ser interrompido".
+- `src/cli/run_win.rs` ~:256 × `src/tui/run.rs` ~:1867: o plano da remoção de um upgrade `uninstallPrevious` passa `nsis = kind == Nullsoft` na TUI e sempre `false` na CLI.
+- `src/cli/run_win.rs` ~:246–250 × `src/tui/run.rs` ~:1229: em linhas MSIX, a CLI usa fatos padrão (sem filtro de tipo); a TUI põe `kind: Msix`.
+- `src/cli/winget_cmd.rs` ~:464–479: Kindle (D6) incompleto na CLI: `plan.shared` imprime "copie antes de remover", mas a CLI nunca chama `backup_folders` nem oferece "só o registro"; a TUI faz as duas coisas (`src/tui/jobs.rs` ~:780–799, ~:703).
+- `src/cli/winget_cmd.rs` ~:469–479 com `run_win.rs` ~:215: a desinstalação nativa na CLI não tem progresso (`UninstallCtx` sem progresso): nenhuma fase, spinner ou relógio enquanto o desinstalador roda, durante a espera do UAC para HKLM e durante a espera de até 120 s pela chave sumir; Ctrl+C é segurado em silêncio; não toma o `install.lock` (a TUI toma em `jobs.rs` ~:697).
+
+#### What binds this task
+
+1. **Ctrl+C na CLI:** a operação roda em `spawn_blocking` (como a TUI) e o laço da CLI continua lendo as interrupções: antes do lançamento cancela e diz isso; depois do lançamento imprime uma vez "o instalador já começou e não pode ser interrompido; aguarde" (texto igual ao da TUI) e espera. Handle do `spawn_blocking` sempre aguardado.
+2. **Uma função só para os fatos e o plano de remoção do upgrade:** `previous_plan(...)` e a montagem de `InstalledFacts` vivem em `src/winget_install/` e são chamadas pela CLI e pela TUI (tire as cópias de `run_win.rs` e `tui/run.rs`). Teste de equivalência: mesmas entradas ⇒ mesmo plano na CLI e na TUI, para nullsoft e MSIX.
+3. **Kindle na CLI:** se `plan.shared` não está vazio, a CLI pergunta como a TUI (copiar as pastas e remover / só o registro / cancelar) usando as mesmas funções (`backup_folders` etc.; se estiverem em `tui/`, mova para `src/winget_install/` sem mudar o comportamento da TUI). Com `--yes` e `shared` não vazio: recusa com a mensagem "este app compartilha dados com outros; rode sem --yes para escolher". `--yes` nunca escolhe pelo usuário.
+4. **Progresso da desinstalação na CLI:** fases `Removing`/`WaitingElevation`/"conferindo a remoção" com spinner e relógio (mesma infraestrutura da Task 141), aviso de Ctrl+C como no item 1, e `lock_install` antes de rodar.
+
+#### Tests (literais)
+
+- `cli_ctrl_c_while_waiting_cancels` e `cli_ctrl_c_after_launch_prints_notice_once` (lançador falso que bloqueia; prazo curto com `tokio::time::timeout`).
+- `upgrade_previous_plan_same_in_cli_and_tui` (nullsoft e MSIX).
+- `cli_kindle_yes_refused` e `cli_kindle_backup_then_remove` (pastas em tempdir).
+- `cli_uninstall_shows_phases` (saída capturada contém a fase e o relógio).
+
+Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) CLI volta a passar `nsis = false`; (b) `--yes` com `shared` não vazio prossegue.
+
+**Files:**
+- Modify: `src/cli/winget_cmd.rs`, `src/cli/run_win.rs`, `src/tui/run.rs`, `src/winget_install/` (só arquivos novos ou os que receberem as funções movidas; **não** `engine.rs`, `uninstall.rs`, `codes.rs`, `plan.rs`, `post_check.rs`, `launch_win.rs`, `ops.rs`, `select.rs`, `host_win.rs`, `switches.rs`, `elevated_rules.rs`, que são de outras tarefas em paralelo)
+- Test: módulos existentes em `tests/it/` da CLI do winget.
+
+#### Checks beyond the steps
+
+1. `src/tui/jobs.rs` está sendo editado pela Task 191: se precisar mover algo de lá, faça só a remoção da função movida e a nova chamada, e avise no relatório.
+2. Testes nunca rodam instalador real, `runas` nem tocam ARP real.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(cli): winget native flows match the TUI (Ctrl+C, previous plan, Kindle, progress)`
+
+### Task 194: Motor nativo — ordem do uninstallPrevious, códigos de saída e conferência (revisão de fase da 2d)
+
+**Modelo:** opus (revisor opus). Origem: a mesma revisão da Task 193.
+
+#### Where this fits
+
+- `src/winget_install/engine.rs` ~:256–265: no `uninstallPrevious`, o app antigo é removido **antes** de baixar o novo (`install_locked` chama `fetch_installer` depois de `uninstall`), e a remoção nunca chama `gate.try_launch()`. Download que falha ou Ctrl+C no meio ⇒ usuário sem app. `tests/it/wi_upgrade.rs` ~:514 trava a ordem `[uninstall, wait_key, install]`.
+- `src/winget_install/uninstall.rs` ~:462 com `codes.rs` ~:150: `classify_uninstall` aceita 3010/1641 só para `Rule::Msi`; Burn (VC++ redist, .NET runtime) com 3010 vira "código desconhecido" antes de olhar a chave do ARP.
+- `src/winget_install/uninstall.rs` ~:442–460: `msiexec /x` sem `msi.lock` e sem retentativa de 1618 (a instalação tem).
+- `src/winget_install/plan.rs` ~:205–254: a confirmação nunca diz que o `uninstallPrevious` remove a versão instalada antes, nem que esse desinstalador pode ser interativo ou pedir UAC.
+- `src/winget_install/post_check.rs` ~:25: depois de um upgrade, não compara a versão instalada; "Atualizado: X <nova>" aparece mesmo se o instalador saiu 0 sem mudar nada.
+- `src/winget_install/launch_win.rs` ~:102 com `ops.rs` ~:370: UAC recusado de um exe que se eleva sozinho (ERROR_CANCELLED/1223) vira `WingetOpsError::Launch` (Failed); a spec diz Cancelled/`UacRefused`.
+
+#### What binds this task
+
+1. **Baixar e conferir antes de remover:** no `uninstallPrevious`, `fetch_installer` + hash vêm primeiro (como o winget), o arquivo fica aberto/conferido, depois `gate.try_launch()` e só então a remoção e a instalação. Falha no download ⇒ a versão antiga continua instalada. Ajuste o teste de ordem para `[fetch, launch_gate, uninstall, wait_key, install]`.
+2. **Burn com reinício:** 3010/1641 de `Rule::Burn` (e de `QuietUninstallString` de bundle) seguem o caminho do msiexec: confere se a chave sumiu antes de declarar falha; sumiu ⇒ sucesso com "reinício necessário".
+3. **`msiexec /x` na fila:** toma o `msi.lock` e repete em 1618 como a instalação (mesma função).
+4. **Confirmação diz o que o upgrade faz:** com `upgrade_route == UninstallFirst`, uma linha "remove a versão instalada antes (o desinstalador pode abrir janela ou pedir permissão de administrador)".
+5. **Conferência da versão:** depois do upgrade, `found.version` diferente de `plan.version` ⇒ aviso "o instalador terminou, mas a versão instalada continua <x>"; comparação por `crate::core::version`.
+6. **UAC recusado:** `PermissionDenied`/1223 no lançamento ⇒ `UacRefused` (Cancelled), não `Launch`.
+
+#### Tests (literais)
+
+- `upgrade_previous_download_failure_keeps_old` (fetch falha ⇒ 0 chamadas de uninstall) e `upgrade_previous_order` (`[fetch, launch_gate, uninstall, wait_key, install]`).
+- `burn_uninstall_3010_key_gone_is_success` e `burn_uninstall_3010_key_present_is_failure`.
+- `msiexec_uninstall_retries_1618`.
+- `upgrade_previous_confirmation_mentions_removal`.
+- `upgrade_same_version_after_warns` (versões `1.10` × `1.9` e `1.0` × `1.0.0`).
+- `self_elevating_uac_refused_is_cancelled`.
+
+Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) voltar a remover antes do fetch; (b) Burn fora do caminho do 3010.
+
+**Files:**
+- Modify: `src/winget_install/engine.rs`, `src/winget_install/uninstall.rs`, `src/winget_install/codes.rs`, `src/winget_install/plan.rs`, `src/winget_install/post_check.rs`, `src/winget_install/launch_win.rs`, `src/winget_install/ops.rs`
+- Test: `tests/it/wi_upgrade.rs` e os módulos existentes desses arquivos.
+
+#### Checks beyond the steps
+
+1. Arquivos de outras tarefas em paralelo: `src/cli/*`, `src/tui/*` (Tasks 191/193), `src/winget_install/{switches,elevated_rules,select,host_win}.rs`, `src/bridge/*` (Tasks 190/195): não edite.
+2. Testes nunca rodam instalador, msiexec nem `runas` reais.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(winget-install): download before removing, burn reboot codes, msi queue on uninstall, version check`
+
+### Task 195: Escolha do instalador — idiomas preferidos e arquiteturas não suportadas (revisão de fase da 2d)
+
+**Modelo:** sonnet (revisor opus). Origem: a mesma revisão da Task 193.
+
+#### Where this fits
+
+- `src/winget_install/host_win.rs` ~:25: o idioma vem de `Control Panel\International\LocaleName` (formato regional), um valor só; o winget usa a lista de idiomas de interface preferidos do usuário.
+- `src/winget_install/select.rs` ~:109 (pontuação de locale) e ~:235–282 (filtro de arquitetura): `UnsupportedOSArchitectures` não é lido.
+- Referência: `docs/reference/winget-cli/` (filtros de arquitetura e locale do winget; cite o arquivo de origem em comentário de uma linha).
+
+#### What binds this task
+
+1. `host_win` lê a lista `GetUserPreferredUILanguages` (MUI_LANGUAGE_NAME) e entrega `Vec<String>` em ordem; `select` pontua o locale do instalador contra a lista (primeiro idioma vale mais; correspondência só de idioma, `pt` × `pt-BR`, vale menos que exata), como o winget.
+2. `select` descarta instaladores cujo `UnsupportedOSArchitectures` contém a arquitetura do sistema.
+
+#### Tests (literais)
+
+- `locale_prefers_ui_language_list` (lista `[en-US, pt-BR]`, instaladores `pt-BR` e `en-US` ⇒ `en-US`).
+- `locale_language_only_match_ranks_below_exact`.
+- `unsupported_os_architecture_excluded` (arm64 com x64 marcado não suportado ⇒ outro instalador ou nenhum, com motivo).
+
+Mutação obrigatória: ignorar `UnsupportedOSArchitectures` ⇒ teste PEGA.
+
+**Files:**
+- Modify: `src/winget_install/host_win.rs`, `src/winget_install/select.rs`
+- Test: módulos existentes de `select`.
+
+#### Checks beyond the steps
+
+1. Outras tarefas em paralelo editam `src/winget_install/*` restantes, `src/cli/*`, `src/tui/*`, `src/bridge/*`, `src/install/*`: não edite.
+2. O teste de equivalência nativo × ponte (Task 185) continua passando.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(winget-install): preferred UI languages and unsupported architectures in installer selection`
