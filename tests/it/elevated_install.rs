@@ -10,8 +10,10 @@ use wingetrs::bridge::elevated::{
     ElevatedBridge, ElevatedError, ElevatedRunner, Helper, Transport,
 };
 use wingetrs::bridge::worker::{
-    self, ElevatedKind, INSTALLER_LINE_MAX, INSTALLER_LINES, InstallerRequest, Reply, Request,
-    ScopeArg, WorkerOps, exe_params_allowed, msi_params_allowed, msi_params_allowed_in,
+    self, ElevatedKind,
+    ElevatedKind::{Burn, Exe, Inno, Nullsoft},
+    INSTALLER_LINE_MAX, INSTALLER_LINES, InstallerRequest, Reply, Request, ScopeArg, WorkerOps,
+    exe_params_allowed, msi_params_allowed, msi_params_allowed_in,
 };
 use wingetrs::bridge::{self, BridgeJob, BridgeOp, Tool};
 use wingetrs::installed::correlate::InstallScope;
@@ -325,44 +327,86 @@ fn msi_params_allowlist() {
 
 #[test]
 fn exe_params_allowlist() {
-    for ok in [
-        r#"/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="<LOGPATH>""#,
-        "/S",
-        r"/S /D=C:\Program Files\My App",
-        r#"/VERYSILENT /DIR="C:\Program Files (x86)\App""#,
-        r#"-quiet -norestart -log "<LOGPATH>""#,
-        "/TYPE:full /COMPONENTS=\"a,b\" /TASKS=!desktopicon",
-        "",
-    ] {
-        assert!(exe_params_allowed(ok, &roots()), "{ok}");
+    let ok = [
+        (
+            Inno,
+            r#"/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="<LOGPATH>""#,
+        ),
+        (
+            Inno,
+            r#"/silent /closeapplications /nocancel /allusers /DIR="C:\Program Files (x86)\App""#,
+        ),
+        (Inno, "/CURRENTUSER /LOG=<LOGPATH>"),
+        (Nullsoft, "/S"),
+        (Nullsoft, r"/S /D=C:\Program Files\My App"),
+        (Burn, r#"/quiet /norestart /log "<LOGPATH>""#),
+        (Burn, r#"-passive -log "<LOGPATH>""#),
+        (
+            Exe,
+            r#"/silent --install -q /mode=unattended /TYPE:full /log "<LOGPATH>""#,
+        ),
+        (
+            Exe,
+            r#"/COMPONENTS="a,b" /TASKS=!desktopicon /out=<LOGPATH>"#,
+        ),
+        (Inno, ""),
+    ];
+    for (kind, params) in ok {
+        assert!(
+            exe_params_allowed(kind, params, &roots()),
+            "{kind:?} {params}"
+        );
     }
-    for bad in [
-        r#"/LOADINF="a.inf""#,
-        "/loadinf=a.inf",
-        r"/SAVEINF=a.inf",
-        "-LOADINF a.inf",
-        r"/DIR=C:\Users\u\App",
-        r#"/DIR="C:\Program Files""#,
-        r"/S /D=C:\Users\u\App",
-        r"/S /D=C:\Program Files\..\Users\u",
-        r"/LOG=C:\t.log",
-        r#"/LOG="C:\t.log""#,
-        r"/f1C:\x.iss",
-        r"-config=\x.ini",
-        "-config=/x.ini",
-        r"\h\s\x",
-        r"\x.ini",
-        r"..\x.ini",
-        r"/LOG=..\x.log",
-        r"D:x",
-        r#"/S "unclosed"#,
-    ] {
-        assert!(!exe_params_allowed(bad, &roots()), "{bad}");
+    let bad = [
+        // Unknown switches and loose positional arguments.
+        (Inno, "/VERYSILENT /TYPE=full"),
+        (Inno, "/VERYSILENT setup.iss"),
+        (Nullsoft, "/S /NCRC"),
+        (Nullsoft, "/s"),
+        (Burn, "/quiet /layout x"),
+        (Burn, "/quiet extra"),
+        (Exe, "loose"),
+        (Exe, r#"/silent "<LOGPATH>" "<LOGPATH>""#),
+        // Paths outside the execution folder or Program Files.
+        (Exe, "//server/share/x"),
+        (Exe, "/LOG=//s/x"),
+        (Exe, r"/f1C:\x.iss"),
+        (Exe, "/config=a/b"),
+        (Exe, r"/config=a\b"),
+        (Exe, "/config=..x"),
+        (Exe, "/config=c:x"),
+        (Exe, r#"/config="a\b""#),
+        (Exe, r"\\h\s\x"),
+        (Inno, "/LOG=//s/x"),
+        (Inno, r"/LOG=C:\t.log"),
+        (Inno, "/DIR=C:/Users/x"),
+        (Inno, "/DIR=C:/Program Files/x"),
+        (Inno, r"/DIR=C:\Users\u\App"),
+        (Inno, r#"/DIR="C:\Program Files""#),
+        (Nullsoft, r"/S /D=C:\Users\u\App"),
+        (Nullsoft, r"/S /D=C:\Program Files\..\Users\u"),
+        (Nullsoft, "/S /D=//s/Program Files/x"),
+        (Burn, r#"/log "C:\t.log""#),
+        (Burn, "/log //s/x"),
+        // Configuration files.
+        (Exe, "/LOADINF=a.inf"),
+        (Exe, "-saveinf=a.inf"),
+        (Inno, r#"/LOADINF="a.inf""#),
+        (Inno, r#"/S "unclosed"#),
+    ];
+    for (kind, params) in bad {
+        assert!(
+            !exe_params_allowed(kind, params, &roots()),
+            "{kind:?} {params}"
+        );
     }
     // Without the known folders no install folder passes.
-    assert!(!exe_params_allowed(r"/S /D=C:\Program Files\App", &[]));
+    assert!(!exe_params_allowed(
+        Nullsoft,
+        r"/S /D=C:\Program Files\App",
+        &[]
+    ));
 }
-
 /// `serve` stops at `bad` without running it nor the valid request after it.
 fn stops_at(bad: &str) {
     let input = format!("{bad}\n{}", line(&request(&valid())));
@@ -961,7 +1005,7 @@ mod win {
             // `!CMDCMDLINE!` (delayed expansion) is the command line as started, quotes and all.
             r#"/v /c (echo !CMDCMDLINE!& set TEMP& set TMP& cd& set USERNAME& set PATH)> "<LOGPATH>""#,
         );
-        req.check(&[]).unwrap();
+        // Staging is tested here, not validation: `cmd` needs free parameters.
         let sys = staging_win::SystemEnv::query().unwrap();
         let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
         let run = staged.run_dir().to_path_buf();

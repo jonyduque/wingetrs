@@ -129,7 +129,7 @@ impl InstallerRequest {
         let allowed = if self.kind.is_msi() {
             msi_params_allowed_in(&self.params, program_files)
         } else {
-            exe_params_allowed(&self.params, program_files)
+            exe_params_allowed(self.kind, &self.params, program_files)
         };
         if !allowed {
             return Err("parâmetros do instalador fora da lista permitida");
@@ -154,6 +154,8 @@ fn under_program_files(value: &str, program_files: &[String]) -> bool {
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .unwrap_or(value);
+    // A `/` cannot lead out: `X:/` fails `valid_source`, and right after the root it fails the
+    // `\` check below.
     if value.contains('"') || !valid_source(value) {
         return false;
     }
@@ -167,62 +169,116 @@ fn under_program_files(value: &str, program_files: &[String]) -> bool {
     })
 }
 
-/// Whether `s` names a path outside the execution folder: a drive (`X:`), a UNC or rooted
-/// path, a parent folder, or a value that starts a path after `=`.
-fn names_path(s: &str) -> bool {
-    let b = s.as_bytes();
-    // A lone letter (at the start or after a non-alphanumeric) before `:`; `/TYPE:full` is not.
-    let drive = (0..b.len().saturating_sub(1)).any(|i| {
-        b[i].is_ascii_alphabetic()
-            && b[i + 1] == b':'
-            && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
-    });
-    drive
-        || s.contains("\\\\")
-        || s.contains("..")
-        || s.starts_with('\\')
-        || s.contains("=\\")
-        || s.contains(":\\")
-        || s.contains(":/")
-        || s.contains("=/")
-}
-
 /// Switches that load or save a configuration file (Inno `/LOADINF`, `/SAVEINF`).
 const CONFIG_SWITCHES: [&str; 2] = ["loadinf", "saveinf"];
 
-/// Whether `params` for an exe installer (burn, inno, nullsoft, exe) names no path outside
-/// the execution folder (`<LOGPATH>` is inside it), loads no configuration file, and gives
-/// `/DIR=`/`/D=` only a folder inside `program_files`.
-pub fn exe_params_allowed(params: &str, program_files: &[String]) -> bool {
+/// Inno Setup switches without a value the helper passes (any case).
+const INNO_FLAGS: [&str; 9] = [
+    "/verysilent",
+    "/silent",
+    "/suppressmsgboxes",
+    "/norestart",
+    "/sp-",
+    "/closeapplications",
+    "/nocancel",
+    "/allusers",
+    "/currentuser",
+];
+
+/// Burn switches without a value the helper passes (`/` or `-`, any case).
+const BURN_FLAGS: [&str; 3] = ["quiet", "passive", "norestart"];
+
+/// `v` is the log placeholder, bare or quoted (it becomes a file in the execution folder).
+fn is_log(v: &str) -> bool {
+    let token = crate::winget_install::switches::LOG_TOKEN;
+    v == token || v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) == Some(token)
+}
+
+/// A value of a plain exe switch: no `\`, no `/`, no `:`, no `..`, no quote inside a quoted
+/// run (so it cannot name any path).
+fn plain_value(v: &str) -> bool {
+    let inner = v
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(v);
+    !inner.contains(['\\', '/', ':', '"']) && !inner.contains("..")
+}
+
+/// Whether `params` for an exe-type installer holds only the switches the helper allows for
+/// `kind` (an allowlist; any other token, positional ones included, is refused):
+/// - inno: `INNO_FLAGS`, `/LOG=<LOGPATH>`, `/DIR=<folder in program_files>`;
+/// - nullsoft: `/S`, and `/D=<folder in program_files>` last (the rest of the line);
+/// - burn: `BURN_FLAGS` and `/log <LOGPATH>` (`/` or `-`);
+/// - exe: `/key`, `-key`, `/key=value` or `/key:value` with `plain_value`, or a key followed by
+///   `<LOGPATH>`; never `/LOADINF`/`/SAVEINF`.
+pub fn exe_params_allowed(kind: ElevatedKind, params: &str, program_files: &[String]) -> bool {
     let Some(tokens) = msi_tokens(params) else {
         return false;
     };
-    for t in tokens {
+    let mut tokens = tokens.into_iter().peekable();
+    while let Some(t) = tokens.next() {
         let lower = t.to_ascii_lowercase();
-        let switch = lower.trim_start_matches(['/', '-']);
-        if CONFIG_SWITCHES.iter().any(|c| switch.starts_with(c)) {
-            return false;
-        }
-        if lower.starts_with("/d=") {
-            // Nullsoft: `/D=` is the last parameter and its folder is never quoted, spaces
-            // and all: the value is the rest of the line.
-            let at = t.as_ptr() as usize - params.as_ptr() as usize;
-            return under_program_files(params[at + 3..].trim_end(), program_files);
-        }
-        if lower.starts_with("/dir=") {
-            if !under_program_files(&t[5..], program_files) {
-                return false;
+        let ok = match kind {
+            ElevatedKind::Inno => {
+                INNO_FLAGS.contains(&lower.as_str())
+                    || lower.strip_prefix("/log=").is_some() && is_log(&t[5..])
+                    || lower.strip_prefix("/dir=").is_some()
+                        && under_program_files(&t[5..], program_files)
             }
-            continue;
-        }
-        let rest = t
-            .replace(crate::winget_install::switches::LOG_TOKEN, "")
-            .replace('"', "");
-        if names_path(&rest) {
+            ElevatedKind::Nullsoft => {
+                if let Some(rest) = t.strip_prefix("/D=") {
+                    // `/D=` is the last parameter and its folder is never quoted, spaces and
+                    // all: the value is the rest of the line.
+                    let at = rest.as_ptr() as usize - params.as_ptr() as usize;
+                    return under_program_files(params[at..].trim_end(), program_files);
+                }
+                t == "/S"
+            }
+            ElevatedKind::Burn => {
+                let key = lower.strip_prefix(['/', '-']).unwrap_or("");
+                BURN_FLAGS.contains(&key) || key == "log" && tokens.next().is_some_and(is_log)
+            }
+            ElevatedKind::Exe => exe_switch(t, &mut tokens),
+            ElevatedKind::Msi | ElevatedKind::Wix => false,
+        };
+        if !ok {
             return false;
         }
     }
     true
+}
+
+/// One switch `t` of a plain exe installer; a following
+/// `<LOGPATH>` token is taken as its value.
+fn exe_switch<'a>(
+    t: &str,
+    tokens: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+) -> bool {
+    let Some(body) = t.strip_prefix(['/', '-']) else {
+        return false;
+    };
+    let body = body.trim_start_matches('-');
+    let (key, value) = match body.find(['=', ':']) {
+        Some(i) => (body[..i].to_ascii_lowercase(), Some(&body[i + 1..])),
+        None => (body.to_ascii_lowercase(), None),
+    };
+    let key_ok = !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'!'))
+        && !CONFIG_SWITCHES.iter().any(|c| key.starts_with(c));
+    if !key_ok {
+        return false;
+    }
+    match value {
+        Some(v) => is_log(v) || plain_value(v),
+        None => {
+            if tokens.peek().is_some_and(|n| is_log(n)) {
+                tokens.next();
+            }
+            true
+        }
+    }
 }
 
 /// `X:\...`: a drive letter, no `..` or device-name component, no `\\?\` or UNC prefix, no
