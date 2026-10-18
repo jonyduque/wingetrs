@@ -16,6 +16,7 @@ use wingetrs::cache::DataDir;
 use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
 use wingetrs::cli::Cli;
 use wingetrs::cli::install_cmd::{self, Flags, Interrupts, Stop, Ui};
+use wingetrs::cli::output::ThirdParty;
 use wingetrs::cli::winget_cmd::WingetFlows;
 use wingetrs::config::Behavior;
 use wingetrs::core::SourceKind;
@@ -154,6 +155,14 @@ impl WingetFlows for NoWinget {
 
 // ---- world ----
 
+/// Installer files the fake installer runner was asked to run (only one test installs one).
+static INSTALLER_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+fn count_installer(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    INSTALLER_RUNS.fetch_add(1, Ordering::SeqCst);
+    Ok((0, Vec::new()))
+}
+
 fn fake_pe() -> Vec<u8> {
     let mut b = vec![0u8; 0x80 + 24 + 96];
     b[0] = b'M';
@@ -282,6 +291,7 @@ impl World {
             launch: Default::default(),
             runners: Runners {
                 scripts: Some(scripts),
+                installer: Some(count_installer),
                 ..Runners::disabled()
             },
         }
@@ -639,5 +649,93 @@ async fn uninstall_shows_skipped_uninstaller_note() {
     assert!(
         err.contains("aviso: o desinstalador do app não rodou: manifesto gravado foi alterado"),
         "{err}"
+    );
+}
+
+/// Review of Task 161: the installer runner is masked too (the only guard on the TUI path).
+#[tokio::test(flavor = "multi_thread")]
+async fn ops_masks_installer_runner_without_consent() {
+    let mut w = World::new().await;
+    w.publish(
+        "1.0",
+        serde_json::json!({ "installer": { "file": "x.exe", "args": ["/S"] } }),
+    )
+    .await;
+    let ctx = w.ctx();
+    let cand = match ops::resolve_target(&ctx, "x", None).unwrap() {
+        ops::Resolution::One(c) => c,
+        other => panic!("{other:?}"),
+    };
+    let plans = ops::plan_for(&ctx, &cand, false).unwrap();
+    assert!(
+        plans[0]
+            .steps
+            .iter()
+            .any(|s| matches!(s, wingetrs::install::plan::Step::RunInstaller { .. }))
+    );
+    let r = ops::apply_with(&ctx, &plans, &Allow::default()).await;
+    assert!(
+        matches!(
+            r,
+            Err(OpsError::Exec(ExecError::NeedsScriptConsent { ref app, .. })) if app == "x"
+        ),
+        "{r:?}"
+    );
+    assert_eq!(INSTALLER_RUNS.load(Ordering::SeqCst), 0);
+    assert_eq!(w.installed(), None);
+}
+
+/// Review of Task 161: escape sequences and hidden bidi/zero-width characters ("Trojan
+/// Source") are shown, never interpreted.
+#[test]
+fn printable_shows_control_and_hidden_format_characters() {
+    use wingetrs::install::script_scan::printable;
+    assert_eq!(
+        printable("a\u{202E}b\u{1b}[2Jc\td\u{200B}e\u{2066}f\u{FEFF}"),
+        "a\\u{202e}b\\u{001b}[2Jc\td\\u{200b}e\\u{2066}f\\u{feff}"
+    );
+    assert_eq!(printable("Write-Host 'olá'"), "Write-Host 'olá'");
+    let script = "Write-Host 'a'\u{202E} # }";
+    let block = wingetrs::cli::output::third_party_block(&[ThirdParty::Script {
+        hook: "post_install".into(),
+        script: script.into(),
+        report: wingetrs::install::script_scan::scan(script, &[]),
+    }]);
+    assert!(
+        block.contains("  1 | Write-Host 'a'\\u{202e} # }"),
+        "{block}"
+    );
+    assert!(!block.contains('\u{202E}'), "{block}");
+}
+
+/// Review of Task 161: installers are told apart by the step kind, not the file extension.
+#[tokio::test(flavor = "multi_thread")]
+async fn installer_kind_follows_the_step() {
+    use wingetrs::install::plan::Step;
+    let mut w = World::new().await;
+    w.publish("1.0", serde_json::json!({})).await;
+    let ctx = w.ctx();
+    let cand = match ops::resolve_target(&ctx, "x", None).unwrap() {
+        ops::Resolution::One(c) => c,
+        other => panic!("{other:?}"),
+    };
+    let mut plan = ops::plan_for(&ctx, &cand, false).unwrap().remove(0);
+    plan.steps.push(Step::RunInstaller {
+        file: "a.ps1".into(),
+        args: Vec::new(),
+        keep: false,
+    });
+    plan.steps.push(Step::RunPs1Installer {
+        file: "b.exe".into(),
+        args: Vec::new(),
+    });
+    let items = wingetrs::cli::output::plan_third_party(&plan);
+    assert!(
+        matches!(
+            items.as_slice(),
+            [ThirdParty::Program { file: a, .. }, ThirdParty::Ps1 { file: b, .. }]
+                if a == "a.ps1" && b == "b.exe"
+        ),
+        "{items:?}"
     );
 }

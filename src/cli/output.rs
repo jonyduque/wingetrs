@@ -8,7 +8,7 @@ use crate::install::msiexec_log::LogTail;
 use crate::install::plan::{InstallPlan, Step};
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
-use crate::install::script_scan::{self, ScriptReport, Verdict};
+use crate::install::script_scan::{self, ScriptReport, Verdict, printable};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 use std::collections::VecDeque;
@@ -582,20 +582,30 @@ fn script_item(hook: String, script: &str) -> ThirdParty {
     }
 }
 
-fn file_item(uninstaller: bool, file: &str, args: &[String]) -> ThirdParty {
+fn ps1_item(uninstaller: bool, file: &str, args: &[String]) -> ThirdParty {
+    ThirdParty::Ps1 {
+        uninstaller,
+        file: file.to_string(),
+        args: args.to_vec(),
+        report: script_scan::ps1_installer_report(file),
+    }
+}
+
+fn program_item(uninstaller: bool, file: &str, args: &[String]) -> ThirdParty {
+    ThirdParty::Program {
+        uninstaller,
+        file: file.to_string(),
+        args: args.to_vec(),
+    }
+}
+
+/// An `uninstaller.file`: the executor runs a `.ps1` through the script host and anything
+/// else directly (for installers the planner's step kind already decided).
+fn uninstaller_item(file: &str, args: &[String]) -> ThirdParty {
     if file.to_lowercase().ends_with(".ps1") {
-        ThirdParty::Ps1 {
-            uninstaller,
-            file: file.to_string(),
-            args: args.to_vec(),
-            report: script_scan::ps1_installer_report(file),
-        }
+        ps1_item(true, file, args)
     } else {
-        ThirdParty::Program {
-            uninstaller,
-            file: file.to_string(),
-            args: args.to_vec(),
-        }
+        program_item(true, file, args)
     }
 }
 
@@ -612,7 +622,7 @@ pub fn removal_third_party(m: &Resolved, suffix: &str) -> Vec<ThirdParty> {
             out.push(script_item(name(HookKind::UninstallerScript), s));
         }
         if let Some(f) = &u.file {
-            out.push(file_item(true, f, &u.args));
+            out.push(uninstaller_item(f, &u.args));
         }
     }
     if let Some(s) = &m.hooks.post_uninstall {
@@ -632,10 +642,9 @@ pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
                 let hook = format!("{} da versão instalada", kind.key());
                 out.push(script_item(hook, script));
             }
-            Step::RunInstaller { file, args, .. } | Step::RunPs1Installer { file, args } => {
-                out.push(file_item(false, file, args));
-            }
-            Step::UpgradeRunUninstaller { file, args } => out.push(file_item(true, file, args)),
+            Step::RunInstaller { file, args, .. } => out.push(program_item(false, file, args)),
+            Step::RunPs1Installer { file, args } => out.push(ps1_item(false, file, args)),
+            Step::UpgradeRunUninstaller { file, args } => out.push(uninstaller_item(file, args)),
             _ => {}
         }
     }
@@ -658,20 +667,6 @@ pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
         out.extend(later);
     }
     out
-}
-
-/// Third-party text made safe for the terminal: control characters (escape sequences
-/// included) are replaced; tabs are kept.
-fn printable(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_control() && c != '\t' {
-                '\u{FFFD}'
-            } else {
-                c
-            }
-        })
-        .collect()
 }
 
 const PRIVILEGES: &str = "roda com os seus privilégios e pode alterar qualquer arquivo seu";

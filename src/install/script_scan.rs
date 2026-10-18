@@ -708,6 +708,38 @@ fn set_environment_variable(l: &str) -> Option<bool> {
     Some(persistent)
 }
 
+/// Invisible characters that reorder or hide text on screen (Unicode `Cf`: bidi embeddings,
+/// overrides and isolates, zero-width marks, BOM): "Trojan Source".
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
+/// Third-party text (a manifest script, file name, argument) made safe to show: control
+/// characters (escape sequences) and hidden format characters become a visible `\u{..}`;
+/// tabs are kept. Shared by the CLI confirmation and the TUI.
+pub fn printable(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if (c.is_control() && c != '\t') || is_hidden_format(c) {
+            out.push_str(&format!("\\u{{{:04x}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Gate report of an `installer.file` ending in `.ps1`: its content is not in the manifest, so
 /// the plan cannot scan it (the executor scans the real file before running it).
 pub fn ps1_installer_report(file: &str) -> ScriptReport {
