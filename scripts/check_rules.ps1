@@ -80,6 +80,36 @@ foreach ($f in (Get-ChildItem -Recurse -File -Path $clockRoots -Filter *.rs)) {
         }
     }
 }
+# Task 160: the real PowerShell host runs third-party code. In src/ it is named only where it is
+# built and wired; in tests/ the real one (`PwshHost::locate`) only in the live file, where every
+# test carries `#[ignore = "live: ...` right below its attribute (`with_program(<fake>)` is free).
+$pwshRoots = @($Path)
+if ($Path -eq 'src' -and (Test-Path 'tests')) { $pwshRoots += 'tests' }
+$pwshWired = '^src[\\/]install[\\/](script_host_win|prod_win)\.rs$'
+$pwshLive = '^tests[\\/]it[\\/]script_host_live\.rs$'
+foreach ($f in (Get-ChildItem -Recurse -File -Path $pwshRoots -Filter *.rs)) {
+    $rel = [IO.Path]::GetRelativePath($root, $f.FullName)
+    $isTest = $rel -match '^tests[\\/]'
+    $lines = @(Get-Content $f.FullName)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i]
+        if ($line -match '^\s*//') { continue }
+        if ($isTest) {
+            if ($line -match '\bPwshHost\s*::\s*locate\b' -and $rel -notmatch $pwshLive) {
+                $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'PwshHost real fora do teste ao vivo', $line.Trim()
+            }
+        } elseif ($line -match '\bPwshHost\b' -and $rel -notmatch $pwshWired) {
+            $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'PwshHost fora de script_host_win/prod_win', $line.Trim()
+        }
+        if ($rel -match $pwshLive -and $line -match '^\s*#\[(tokio::)?test\b') {
+            $j = $i + 1
+            while ($j -lt $lines.Count -and $lines[$j] -match '^\s*$') { $j++ }
+            if ($j -ge $lines.Count -or $lines[$j] -notmatch '^\s*#\[ignore\s*=\s*"live:') {
+                $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'teste do PwshHost sem ignore live', $line.Trim()
+            }
+        }
+    }
+}
 # Task 133: tests/it/ is one binary; a file there without `mod <stem>;` in main.rs is never
 # compiled nor run, and nothing else would say so.
 if (-not $ItDir -and $Path -eq 'src') { $ItDir = 'tests/it' }

@@ -2,6 +2,7 @@
 //! With `WINGETRS_TEST_ENV_KEY` / `WINGETRS_TEST_SHORTCUT_DIR` set, nothing real is touched
 //! (and the residue scan reads neither Desktop, Start Menu nor AppData).
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::cache::DataDir;
 use crate::catalog::Catalog;
@@ -13,6 +14,7 @@ use crate::install::fs_win;
 use crate::install::msiexec_win;
 use crate::install::ops::{OpsCtx, ResidueScan, installed_by_scoop};
 use crate::install::registry_win::RegScanner;
+use crate::install::script_host_win::PwshHost;
 use crate::install::shortcut_win::{self, ComShortcuts};
 use crate::install::traits::{EffectError, Effects};
 use crate::install::trash_win::ShellTrash;
@@ -75,8 +77,8 @@ pub fn build_ctx<'a>(
             Runners {
                 innounp: inno_win::run,
                 installer: Some(installer_win::run),
-                // No production path grants consent to scripts before Task 161.
-                scripts: None,
+                // Consent is still withheld per install by `ops::exec_ctx` until Task 161.
+                scripts: Some(Arc::new(PwshHost::locate())),
             },
         )
     };
