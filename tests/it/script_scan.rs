@@ -905,6 +905,17 @@ fn global_block_only_in_statement_position() {
         format!("f | g if ($global) {{ {HKLM} }}"),
         format!("f a, if ($global) {{ {HKLM} }}"),
         format!(". if ($global) {{ {HKLM} }}"),
+        // Line continuation: `if` on the next line is still an argument.
+        format!("& {{ param($a,$b,$c) & $c }} `\nif ($global) {{ {HKLM} }}"),
+        format!("& {{ param($a,$b,$c) & $c }} `\r\n  if ($global) {{ {HKLM} }}"),
+        format!("& {{ param($a,$b,$c) & $c }} `  \nif ($global) {{ {HKLM} }}"),
+        format!("f a,\nif ($global) {{ {HKLM} }}"),
+        format!("f |\nif ($global) {{ {HKLM} }}"),
+        // A backtick in a comment is no continuation to pwsh, but on doubt: fail closed.
+        format!("& {{ param($a,$b,$c) & $c }} # x `\nif ($global) {{ {HKLM} }}"),
+        format!("<# x #> if ($global) {{ {HKLM} }}"),
+        // A comment after a continuing comma hides it from the raw text.
+        format!("f a, # c\nif ($global) {{ {HKLM} }}"),
     ] {
         let r = scan(&s, SUP);
         assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
@@ -914,6 +925,9 @@ fn global_block_only_in_statement_position() {
         format!("$a = 1; if ($global) {{ {HKLM} }}"),
         format!("$a = 1\n  if ($global) {{ {HKLM} }}"),
         format!("& {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a = 1 # note\nif ($global) {{ {HKLM} }}"),
+        // A continuation onto an empty line ends there.
+        format!("$a = `\n\nif ($global) {{ {HKLM} }}"),
     ] {
         let r = scan(&s, SUP);
         assert!(informational(&r), "{s}: {:?}", r.flags);

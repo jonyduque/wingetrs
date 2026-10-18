@@ -1167,6 +1167,8 @@ fn split_by_mask(src: &str, mask: &[bool]) -> (String, String) {
 /// or `elseif ($global) { ... }` whose bounds are certain (see [`global_block`]).
 fn global_dead_mask(script: &str) -> Vec<bool> {
     let chars: Vec<char> = script.chars().collect();
+    // Same length as `chars` (`blank` maps char to char).
+    let uncommented: Vec<char> = strip_comments(script).chars().collect();
     let n = chars.len();
     let mut mask = vec![false; n];
     let mut last_close: Option<usize> = None;
@@ -1222,8 +1224,13 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
                 let before = (0..i)
                     .rev()
                     .find(|&k| !matches!(chars[k], ' ' | '\t' | '\r'));
+                // Checked on the raw text and on the comment-blanked text; both must agree
+                // (a backtick inside a comment is no continuation to pwsh, but on doubt the
+                // block stays live).
                 let statement = match keyword {
-                    Some("if") => before.is_none_or(|k| matches!(chars[k], '\n' | ';' | '{')),
+                    Some("if") => {
+                        statement_position(&chars, i) && statement_position(&uncommented, i)
+                    }
                     // `elseif` only right after the `}` of a block this mask covers.
                     Some(_) => before.is_some() && before == last_close,
                     None => false,
@@ -1451,4 +1458,27 @@ fn own_global_lines(text: &str) -> Vec<usize> {
         i = word_end.max(i + 1);
     }
     out
+}
+
+/// Whether a keyword at `i` of `view` starts a statement: the previous char (blanks and CR
+/// skipped) is the start, `;`, `{`, or a newline that does not continue the line before it
+/// (backtick continuation, or a trailing `,`, `|`, `=`, `(`, `&`, `.`, `[` or operator char
+/// that lets pwsh read on: fail closed).
+fn statement_position(view: &[char], i: usize) -> bool {
+    let prev_sig = |end: usize| {
+        (0..end.min(view.len()))
+            .rev()
+            .find(|&k| !matches!(view[k], ' ' | '\t' | '\r'))
+    };
+    match prev_sig(i) {
+        None => true,
+        Some(k) if matches!(view[k], ';' | '{') => true,
+        Some(k) if view[k] == '\n' => prev_sig(k).is_none_or(|j| {
+            !matches!(
+                view[j],
+                '`' | ',' | '|' | '=' | '(' | '&' | '.' | '[' | '+' | '-' | '*' | '/' | '%' | '!'
+            )
+        }),
+        Some(_) => false,
+    }
 }
