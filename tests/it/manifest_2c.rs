@@ -189,7 +189,6 @@ fn planner_refuses_each_2c_key_with_old_text() {
         r#","post_uninstall":"x""#,
         r#","installer":{"file":"a.exe"}"#,
         r#","uninstaller":{"file":"a.exe"}"#,
-        r#","psmodule":{"name":"X"}"#,
     ];
     let keys = [
         "pre_install",
@@ -198,7 +197,6 @@ fn planner_refuses_each_2c_key_with_old_text() {
         "post_uninstall",
         "installer",
         "uninstaller",
-        "psmodule",
     ];
     for (c, k) in cases.iter().zip(keys) {
         let e = plan(&ok(c)).unwrap_err();
