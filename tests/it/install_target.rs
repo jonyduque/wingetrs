@@ -165,12 +165,13 @@ fn moniker_and_name_match_exactly() {
 }
 
 #[test]
-fn winget_only_candidate_is_not_selectable() {
+fn winget_only_candidate_is_selectable() {
+    // Task 176: winget packages install through the bridge.
     let c = catalog();
     let r = resolve(&c, "microsoft.only", None).unwrap();
     assert_eq!(r.len(), 1);
-    assert!(!r[0].selectable);
-    assert_eq!(r[0].note.as_deref(), Some("instalação na fase 2d"));
+    assert!(r[0].selectable);
+    assert_eq!(r[0].note, None);
 }
 
 #[test]

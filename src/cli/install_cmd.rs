@@ -409,9 +409,9 @@ impl Drop for LineProgress {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Flags {
-    yes: bool,
-    dry_run: bool,
+pub(super) struct Flags {
+    pub(super) yes: bool,
+    pub(super) dry_run: bool,
     /// `--allow-msiexec`: an MSI the own extractor refuses may use `msiexec /a`. Never
     /// implied by `--yes`.
     allow_msiexec: bool,
@@ -428,7 +428,7 @@ impl Flags {
 }
 
 /// Asks to proceed: `--yes` skips, no terminal without `--yes` is an error.
-fn proceed(ui: &dyn Ui, f: Flags) -> anyhow::Result<bool> {
+pub(super) fn proceed(ui: &dyn Ui, f: Flags) -> anyhow::Result<bool> {
     if f.yes {
         return Ok(true);
     }
@@ -465,13 +465,14 @@ pub async fn execute(
             dry_run,
             yes,
             allow_msiexec,
+            scope,
         } => {
             let f = Flags {
                 yes,
                 dry_run,
                 allow_msiexec,
             };
-            install(ctx, ui, &target, bucket.as_deref(), f, stop).await
+            install(ctx, ui, &target, bucket.as_deref(), scope, f, stop).await
         }
         Command::Uninstall {
             target,
@@ -510,8 +511,8 @@ pub async fn execute(
 }
 
 /// What [`execute`] listens to while the disk changes.
-struct Stop<'a, I: Interrupts> {
-    interrupts: &'a mut I,
+pub(super) struct Stop<'a, I: Interrupts> {
+    pub(super) interrupts: &'a mut I,
     gate: &'a LaunchGate,
 }
 
@@ -606,6 +607,7 @@ async fn install(
     ui: &dyn Ui,
     target: &str,
     bucket: Option<&str>,
+    scope: Option<crate::bridge::worker::ScopeArg>,
     f: Flags,
     mut stop: Stop<'_, impl Interrupts>,
 ) -> anyhow::Result<()> {
@@ -613,6 +615,12 @@ async fn install(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     };
+    if cand.entry.source == crate::core::SourceKind::Winget {
+        return super::winget_cmd::install_bridge(ctx, ui, &cand, scope, f, stop).await;
+    }
+    if scope.is_some() {
+        bail!("--scope só vale para pacotes do winget");
+    }
     let plans = ops::plan_for(ctx, &cand, false)?;
     print_plans(ctx, ui, &plans, f);
     if f.dry_run {

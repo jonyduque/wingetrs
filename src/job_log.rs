@@ -106,6 +106,29 @@ pub struct JobLog {
 }
 
 impl JobLog {
+    /// `start` of a job whose license agreements were accepted: the same `job.start` line plus
+    /// `agreements` (`<label> <url>` joined by `; `, or `-`).
+    pub fn start_accepting(info: JobInfo, agreements: &[String]) -> JobLog {
+        let listed = if agreements.is_empty() {
+            "-".to_string()
+        } else {
+            agreements.join("; ")
+        };
+        tracing::info!(
+            target: "wingetrs::job",
+            kind = %info.kind,
+            tool = %info.tool,
+            target = %info.target,
+            name = %info.name,
+            from = %dash(&info.from),
+            to = %dash(&info.to),
+            cmd = %dash(&info.cmd),
+            agreements = %listed,
+            "job.start"
+        );
+        JobLog::started(info)
+    }
+
     pub fn start(info: JobInfo) -> JobLog {
         tracing::info!(
             target: "wingetrs::job",
@@ -118,6 +141,10 @@ impl JobLog {
             cmd = %dash(&info.cmd),
             "job.start"
         );
+        JobLog::started(info)
+    }
+
+    fn started(info: JobInfo) -> JobLog {
         JobLog {
             info,
             started: Instant::now(),

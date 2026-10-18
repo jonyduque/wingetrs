@@ -962,6 +962,7 @@ use wingetrs::tui::app::Done;
 
 fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
     BridgeJob {
+        op: wingetrs::bridge::BridgeOp::Upgrade,
         tool,
         target: target.into(),
         name: format!("App {target}"),

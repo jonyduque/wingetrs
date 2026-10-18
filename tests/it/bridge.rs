@@ -76,6 +76,7 @@ fn bridge_target_rules() {
 
 fn job(tool: Tool, target: &str) -> BridgeJob {
     BridgeJob {
+        op: wingetrs::bridge::BridgeOp::Upgrade,
         tool,
         target: target.into(),
         name: target.into(),

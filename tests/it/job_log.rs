@@ -15,6 +15,7 @@ fn lines(v: &[&str]) -> Vec<String> {
 
 fn job(available: Option<&str>) -> BridgeJob {
     BridgeJob {
+        op: wingetrs::bridge::BridgeOp::Upgrade,
         tool: Tool::Winget,
         target: "Google.Antigravity".into(),
         name: "Antigravity".into(),

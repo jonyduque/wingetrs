@@ -386,13 +386,19 @@ fn i_on_scoop_plans_and_planned_opens_confirm() {
 }
 
 #[test]
-fn i_on_winget_does_not_open_anything_and_says_why() {
+fn i_on_winget_plans_the_bridge_install() {
+    // Task 176: winget packages install through the bridge.
     let mut a = app();
     select_source(&mut a, SourceKind::Winget);
     let cmds = update(&mut a, key(KeyCode::Char('i')));
-    assert!(cmds.is_empty(), "{cmds:?}");
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanWingetInstall {
+            id: "Microsoft.PowerToys".into()
+        }]
+    );
     assert!(a.modal.is_none());
-    assert!(a.toasts[0].text.contains("fase 2d"));
+    assert!(a.toasts.is_empty());
 }
 
 #[test]
@@ -3719,14 +3725,16 @@ fn marked_winget_hits_are_skipped_and_named() {
         "{cmds:?}"
     );
     update(&mut a, Msg::BatchPlanned(vec![ready_apply("ripgrep")]));
-    // Said by the confirmation; a toast only when there is none.
-    assert!(confirm_text(&a).contains("2 itens ficaram de fora"));
+    // Task 176: winget packages install one at a time through the bridge, so a marked batch
+    // skips them by name instead of counting them as rows the action does not apply to.
+    assert!(!confirm_text(&a).contains("ficaram de fora"));
+    assert!(has_toast(&a, "pulados: PowerToys, Zeal"), "{:?}", a.toasts);
     let mut b = app();
     b.settings.behavior.confirm = ConfirmMode::Never;
     mark_all(&mut b);
     update(&mut b, key(KeyCode::Enter));
     update(&mut b, Msg::BatchPlanned(vec![ready_apply("ripgrep")]));
-    assert!(has_toast(&b, "2 itens ficaram de fora"), "{:?}", b.toasts);
+    assert!(has_toast(&b, "pulados: PowerToys, Zeal"), "{:?}", b.toasts);
 }
 
 #[test]
@@ -4032,6 +4040,7 @@ use wingetrs::tui::app::{BRIDGE_WAITING, Running};
 
 fn bridge_job(tool: Tool, target: &str) -> BridgeJob {
     BridgeJob {
+        op: wingetrs::bridge::BridgeOp::Upgrade,
         tool,
         target: target.into(),
         name: target.into(),
@@ -4703,6 +4712,7 @@ fn unchecking_an_apply_group() {
         queued,
         vec![Action::Bridge(BridgeJob {
             tool: Tool::Winget,
+            op: wingetrs::bridge::BridgeOp::Upgrade,
             target: "Git.Git".into(),
             name: "Git.Git".into(),
             installed: Some("1".into()),

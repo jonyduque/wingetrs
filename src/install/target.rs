@@ -1,7 +1,7 @@
 //! Install target resolution: user text -> candidates from the catalog (never by fuzzy match).
 use crate::catalog::search::SearchIndex;
 use crate::catalog::{Catalog, CatalogError};
-use crate::core::{PackageEntry, SourceKind};
+use crate::core::PackageEntry;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
@@ -21,7 +21,6 @@ pub enum TargetError {
     },
 }
 
-const WINGET_NOTE: &str = "instalação na fase 2d";
 const MAX_SUGGESTIONS: usize = 5;
 const MIN_PREFIX: usize = 3;
 
@@ -33,12 +32,13 @@ fn split_bucket(query: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Every catalog package is selectable: scoop ones install through the own installer, winget
+/// ones through the bridge (`winget install`).
 pub(crate) fn candidate(entry: &PackageEntry) -> Candidate {
-    let scoop = entry.source == SourceKind::Scoop;
     Candidate {
         entry: entry.clone(),
-        selectable: scoop,
-        note: (!scoop).then(|| WINGET_NOTE.to_owned()),
+        selectable: true,
+        note: None,
     }
 }
 

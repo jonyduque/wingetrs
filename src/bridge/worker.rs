@@ -1,7 +1,8 @@
 //! Protocol and loop of the elevated bridge helper (`wingetrs bridge-worker`): one JSON object
-//! per line each way. The helper only ever runs `bridge::command` of a winget job with a valid
-//! id, or `bridge::winget_source_update`; anything else closes the channel.
-use super::{BridgeExec, BridgeJob, Tool};
+//! per line each way. The helper only ever runs `bridge::command` of a winget upgrade or install
+//! with a valid id, or `bridge::winget_source_update`; anything else closes the channel.
+use super::{BridgeExec, BridgeJob, BridgeOp, Tool};
+use crate::installed::correlate::InstallScope;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Write};
@@ -16,12 +17,43 @@ pub const LINE_CAP: usize = 64 * 1024;
 pub enum Request {
     /// `winget upgrade --id <target> ...` (the fixed command of `bridge::command`).
     Upgrade { target: String },
+    /// `winget install --id <target> ...`, plus `--scope <scope>` when given.
+    Install {
+        target: String,
+        scope: Option<ScopeArg>,
+    },
     /// `winget source update --name winget ...`.
     // Struct variants, not unit ones: serde lets extra fields through on a unit variant of an
     // internally tagged enum even with `deny_unknown_fields`.
     SourceUpdate {},
     /// Ends the helper.
     Quit {},
+}
+
+/// The `--scope` of a winget install: a closed set, never free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeArg {
+    User,
+    Machine,
+}
+
+impl From<ScopeArg> for InstallScope {
+    fn from(s: ScopeArg) -> InstallScope {
+        match s {
+            ScopeArg::User => InstallScope::User,
+            ScopeArg::Machine => InstallScope::Machine,
+        }
+    }
+}
+
+impl From<InstallScope> for ScopeArg {
+    fn from(s: InstallScope) -> ScopeArg {
+        match s {
+            InstallScope::User => ScopeArg::User,
+            InstallScope::Machine => ScopeArg::Machine,
+        }
+    }
 }
 
 /// What the helper answers: any number of `Line`, then one `End` or `Error`.
@@ -98,23 +130,37 @@ pub fn serve(
         let request: Request = decode(&line).inspect_err(|e| {
             tracing::warn!(error = %e, "bridge worker: invalid request; closing");
         })?;
-        let (program, args) = match request {
+        let request = match request {
             Request::Quit {} => return Ok(()),
-            Request::SourceUpdate {} => super::winget_source_update(),
-            Request::Upgrade { target } => {
-                if !super::valid_target(Tool::Winget, &target) {
-                    tracing::warn!(len = target.len(), "bridge worker: invalid target refused");
-                    send(
-                        writer,
-                        &Reply::Error {
-                            message: "identificador inválido".to_string(),
-                            not_found: false,
-                        },
-                    )?;
-                    continue;
-                }
+            Request::SourceUpdate {} => {
+                let (program, args) = super::winget_source_update();
+                run(writer, exec, &program, &args)?;
+                continue;
+            }
+            Request::Upgrade { target } => (target, BridgeOp::Upgrade),
+            Request::Install { target, scope } => (
+                target,
+                BridgeOp::Install {
+                    scope: scope.map(InstallScope::from),
+                },
+            ),
+        };
+        let (program, args) = match request {
+            (target, _) if !super::valid_target(Tool::Winget, &target) => {
+                tracing::warn!(len = target.len(), "bridge worker: invalid target refused");
+                send(
+                    writer,
+                    &Reply::Error {
+                        message: "identificador inválido".to_string(),
+                        not_found: false,
+                    },
+                )?;
+                continue;
+            }
+            (target, op) => {
                 let job = BridgeJob {
                     tool: Tool::Winget,
+                    op,
                     name: target.clone(),
                     target,
                     installed: None,
@@ -124,35 +170,45 @@ pub fn serve(
                 super::command(&job, Path::new(""), "")
             }
         };
-        tracing::info!(
-            cmd = %super::command_text(&program, &args),
-            "bridge worker: running"
-        );
-        // A broken channel does not stop the tool; the first write error ends the loop after it.
-        let mut broken: Option<std::io::Error> = None;
-        let result = exec(&program, &args, &mut |text: &str| {
-            if broken.is_none()
-                && let Err(e) = send(
-                    writer,
-                    &Reply::Line {
-                        text: text.to_string(),
-                    },
-                )
-            {
-                broken = Some(e);
-            }
-        });
-        if let Some(e) = broken {
-            return Err(e);
-        }
-        let reply = match result {
-            Ok((code, _)) => Reply::End { code },
-            Err(e) => Reply::Error {
-                message: e.to_string(),
-                not_found: e.kind() == std::io::ErrorKind::NotFound,
-            },
-        };
-        send(writer, &reply)?;
+        run(writer, exec, &program, &args)?;
     }
     Ok(())
+}
+
+/// Runs one accepted command, relaying its lines and its end to `writer`.
+fn run(
+    writer: &mut dyn Write,
+    exec: BridgeExec<'_>,
+    program: &str,
+    args: &[String],
+) -> std::io::Result<()> {
+    tracing::info!(
+        cmd = %super::command_text(program, args),
+        "bridge worker: running"
+    );
+    // A broken channel does not stop the tool; the first write error ends the loop after it.
+    let mut broken: Option<std::io::Error> = None;
+    let result = exec(program, args, &mut |text: &str| {
+        if broken.is_none()
+            && let Err(e) = send(
+                writer,
+                &Reply::Line {
+                    text: text.to_string(),
+                },
+            )
+        {
+            broken = Some(e);
+        }
+    });
+    if let Some(e) = broken {
+        return Err(e);
+    }
+    let reply = match result {
+        Ok((code, _)) => Reply::End { code },
+        Err(e) => Reply::Error {
+            message: e.to_string(),
+            not_found: e.kind() == std::io::ErrorKind::NotFound,
+        },
+    };
+    send(writer, &reply)
 }

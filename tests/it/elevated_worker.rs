@@ -23,6 +23,7 @@ type Served = (std::io::Result<()>, Vec<Call>, Vec<Reply>);
 
 fn job(tool: Tool, target: &str, scope: Option<InstallScope>) -> BridgeJob {
     BridgeJob {
+        op: wingetrs::bridge::BridgeOp::Upgrade,
         tool,
         target: target.into(),
         name: format!("App {target}"),

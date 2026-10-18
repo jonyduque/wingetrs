@@ -1,5 +1,5 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
-use crate::bridge::{self, BridgeJob, NOT_OURS_NOTE, PINNED_NOTE, Tool, WingetFit};
+use crate::bridge::{self, BridgeJob, BridgeOp, NOT_OURS_NOTE, PINNED_NOTE, Tool, WingetFit};
 use crate::catalog::search::{SearchHit, SearchIndex};
 use crate::config::{Behavior, Config, ConfirmMode, ResidueMode};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
@@ -137,6 +137,9 @@ pub enum Msg {
     SettingsSaved(Result<(), String>),
     /// Result of planning an install, upgrade or removal.
     Planned(Result<Planned, String>),
+    /// Result of `Cmd::PlanWingetInstall`: the bridge job and one note per license agreement
+    /// (`Licença: <label> — <url>`).
+    WingetPlanned(Result<(BridgeJob, Vec<String>), String>),
     /// Results of a `Cmd::PlanBatch`, in the order of its items.
     BatchPlanned(Vec<Result<Planned, String>>),
     /// Download/extract progress of the running operation.
@@ -214,7 +217,14 @@ impl Action {
                 format!("Instalando {} (Windows Installer)", apps.join(", "))
             }
             Action::Remove(p) => format!("Removendo {}", p.app),
-            Action::Bridge(job) => format!("Atualizando {} via {}", job.name, job.tool.name()),
+            Action::Bridge(job) => match job.op {
+                BridgeOp::Install { .. } => {
+                    format!("Instalando {} via {}", job.name, job.tool.name())
+                }
+                BridgeOp::Upgrade => {
+                    format!("Atualizando {} via {}", job.name, job.tool.name())
+                }
+            },
         }
     }
 }
@@ -460,6 +470,11 @@ pub enum Cmd {
         source_name: String,
         id: String,
         keep: bool,
+    },
+    /// Read the manifest of winget package `id` and build its install through the bridge;
+    /// answers with `Msg::WingetPlanned`.
+    PlanWingetInstall {
+        id: String,
     },
     /// `purge`: also delete the app's persistent data (setting at key time).
     PlanRemove {
@@ -1716,6 +1731,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Planned(result) => on_planned(app, result),
+        Msg::WingetPlanned(result) => on_winget_planned(app, result),
         Msg::BatchPlanned(results) => on_batch_planned(app, results),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
@@ -2110,7 +2126,8 @@ fn start_planning(app: &mut App, cmd: Cmd) -> Vec<Cmd> {
     vec![cmd]
 }
 
-/// `i`: plan installing the selected package (scoop only).
+/// `i`: plan installing the selected package (scoop by the own installer, winget through the
+/// bridge).
 fn install_selected(app: &mut App) -> Vec<Cmd> {
     if marked_rows(app).is_some() {
         return run_button(app, ActionId::Install);
@@ -2127,8 +2144,8 @@ fn install_one(app: &mut App) -> Vec<Cmd> {
         return Vec::new();
     };
     if e.source != SourceKind::Scoop {
-        app.push_toast(ToastKind::Warning, "instalação na fase 2d");
-        return Vec::new();
+        let cmd = Cmd::PlanWingetInstall { id: e.id.clone() };
+        return start_planning(app, cmd);
     }
     // A new package has no old version to keep.
     let cmd = Cmd::PlanInstall {
@@ -2305,6 +2322,16 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                 manager: "wingetrs",
                 checked: true,
             }),
+            Action::Bridge(job) if matches!(job.op, BridgeOp::Install { .. }) => {
+                items.push(ConfirmItem {
+                    name: job.name.clone(),
+                    key: Some((job.tool.name().to_string(), job.target.clone())),
+                    from: None,
+                    to: job.available.clone(),
+                    manager: job.tool.name(),
+                    checked: true,
+                });
+            }
             Action::Bridge(job) => {
                 let r = bridged(job);
                 items.push(ConfirmItem {
@@ -2745,16 +2772,17 @@ fn mark_item(marked: bool) -> (String, Option<String>, ActionId) {
 
 /// `actions_for` of a Search row.
 fn search_actions(app: &App, row: usize, marked: bool) -> Vec<(String, Option<String>, ActionId)> {
-    let Some(e) = app
+    // Scoop packages install through the own installer, winget ones through the bridge.
+    if app
         .hits
         .get(row)
         .and_then(|h| app.search.entries().get(h.index))
-    else {
+        .is_none()
+    {
         return Vec::new();
-    };
-    let note = (e.source != SourceKind::Scoop).then(|| "instalação na fase 2d".to_string());
+    }
     vec![
-        ("Instalar".to_string(), note, ActionId::Install),
+        ("Instalar".to_string(), None, ActionId::Install),
         mark_item(marked),
     ]
 }
@@ -3463,6 +3491,29 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
     Vec::new()
 }
 
+/// The winget install planned by `Cmd::PlanWingetInstall`: confirmed (always, when the package
+/// has license agreements to show), then queued as a bridge job.
+fn on_winget_planned(app: &mut App, result: Result<(BridgeJob, Vec<String>), String>) -> Vec<Cmd> {
+    app.planning = false;
+    app.status = None;
+    let confirm = app
+        .planning_confirm
+        .take()
+        .unwrap_or(app.settings.behavior.confirm);
+    match result {
+        Ok((job, agreements)) => {
+            let action = Action::Bridge(job);
+            if agreements.is_empty() && !needs_confirm(confirm, &action) {
+                return enqueue(app, action);
+            }
+            let modal = confirm_modal(app, vec![action], agreements, None);
+            open_modal(app, modal);
+        }
+        Err(message) => app.push_toast(ToastKind::Error, message),
+    }
+    Vec::new()
+}
+
 /// Results of a batch plan: one confirmation for all the plans, then everything is queued.
 fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec<Cmd> {
     app.planning = false;
@@ -3810,6 +3861,12 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             }
             PickOutcome::Cancelled => Vec::new(),
             PickOutcome::Picked(chosen) => match chosen.first().and_then(|&i| candidates.get(i)) {
+                Some(c) if c.selectable && c.entry.source == SourceKind::Winget => {
+                    let cmd = Cmd::PlanWingetInstall {
+                        id: c.entry.id.clone(),
+                    };
+                    start_planning(app, cmd)
+                }
                 Some(c) if c.selectable => {
                     let cmd = Cmd::PlanInstall {
                         source_name: c.entry.source_name.clone(),

@@ -177,7 +177,8 @@ fn install_flags_parse() {
             bucket: None,
             dry_run: true,
             yes: true,
-            allow_msiexec: false
+            allow_msiexec: false,
+            scope: None
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--bucket", "main"]).unwrap();
@@ -188,7 +189,8 @@ fn install_flags_parse() {
             bucket: Some("main".into()),
             dry_run: false,
             yes: false,
-            allow_msiexec: false
+            allow_msiexec: false,
+            scope: None
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--allow-msiexec"]).unwrap();

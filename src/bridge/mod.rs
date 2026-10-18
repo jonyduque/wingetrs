@@ -2,7 +2,7 @@
 //! Everything here is pure (rules, command lines, exit codes, output splitting); only
 //! `spawn_win` starts a process.
 use crate::installed::correlate::{Correlation, InstallScope, ListRow, UpdateState};
-use crate::sources::winget::manifest::{Installer, MergedManifest};
+use crate::sources::winget::manifest::{Agreement, Installer, MergedManifest};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -42,10 +42,20 @@ impl Tool {
     }
 }
 
-/// One upgrade run by the tool that installed the app.
+/// What a bridge job asks of the tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeOp {
+    /// Upgrade an installed app (winget or scoop).
+    Upgrade,
+    /// Install a winget package; `scope` becomes `--scope` only when it is `Some`.
+    Install { scope: Option<InstallScope> },
+}
+
+/// One upgrade (or winget install) run by the tool that installed (or installs) the app.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BridgeJob {
     pub tool: Tool,
+    pub op: BridgeOp,
     /// winget package id, or scoop app name.
     pub target: String,
     /// Name of the list row.
@@ -54,7 +64,8 @@ pub struct BridgeJob {
     pub installed: Option<String>,
     /// Version the catalog offers, for the job log and the winget check.
     pub available: Option<String>,
-    /// Who the app was installed for; a machine-wide winget app upgrades elevated.
+    /// Who the app was installed for; a machine-wide winget app upgrades elevated. For an
+    /// install, `Some(Machine)` means it runs elevated (see `install_job`).
     pub scope: Option<InstallScope>,
 }
 
@@ -86,6 +97,7 @@ pub fn bridge_target(r: &ListRow, pins: &BTreeSet<String>) -> Result<BridgeJob, 
     };
     Ok(BridgeJob {
         tool,
+        op: BridgeOp::Upgrade,
         target,
         name: r.name.clone(),
         installed: r.installed_version.clone(),
@@ -145,6 +157,100 @@ fn parse_scope(s: Option<&str>) -> Option<InstallScope> {
         Some(s) if s.eq_ignore_ascii_case("user") => Some(InstallScope::User),
         _ => None,
     }
+}
+
+/// winget's `APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER` (raised in winget-cli
+/// src/AppInstallerCLICore/Workflows/InstallFlow.cpp, value from AppInstallerErrors.h).
+pub const NO_APPLICABLE_INSTALLER: u32 = 0x8A15_0010;
+
+/// Progress line of an install retried without `--scope machine` (the Settings default) after
+/// winget found no installer for that scope.
+pub const SCOPE_FALLBACK_NOTE: &str = "sem instalador para máquina; instalando para o usuário";
+
+/// The bridge job installing winget package `id` (catalog version `version`) with `scope`
+/// (`--scope`, `None` to let winget pick). It runs elevated (`scope == Some(Machine)`) when
+/// `--scope machine` is passed or when every installer for an `arch` machine installs for the
+/// whole machine; `--scope user` never does.
+pub fn install_job(
+    id: &str,
+    name: &str,
+    version: &str,
+    manifest: &MergedManifest,
+    scope: Option<InstallScope>,
+    arch: &str,
+) -> BridgeJob {
+    let fit: Vec<_> = manifest
+        .effective()
+        .into_iter()
+        .filter(|i| runs_on(&i.architecture, arch))
+        .collect();
+    let machine_only = !fit.is_empty()
+        && fit
+            .iter()
+            .all(|i| parse_scope(i.scope.as_deref()) == Some(InstallScope::Machine));
+    BridgeJob {
+        tool: Tool::Winget,
+        op: BridgeOp::Install { scope },
+        target: id.to_string(),
+        name: name.to_string(),
+        installed: None,
+        available: Some(version.to_string()),
+        scope: scope.or(machine_only.then_some(InstallScope::Machine)),
+    }
+}
+
+/// The `--scope` the Settings default asks for: `machine` only when the user changed it.
+pub fn default_scope(d: crate::config::DefaultScope) -> Option<InstallScope> {
+    match d {
+        crate::config::DefaultScope::Machine => Some(InstallScope::Machine),
+        crate::config::DefaultScope::User => None,
+    }
+}
+
+/// Longest agreement text shown when it has no URL, in characters.
+pub const AGREEMENT_TEXT_MAX: usize = 200;
+
+/// `(label, url)` of an agreement: `Licença` without a label, the agreement text (cut at
+/// `AGREEMENT_TEXT_MAX` characters) without a URL.
+pub fn agreement_parts(a: &Agreement) -> (String, String) {
+    let label = a
+        .agreement_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or("Licença")
+        .to_string();
+    let url = match a.agreement_url.as_deref().map(str::trim) {
+        Some(u) if !u.is_empty() => u.to_string(),
+        _ => a
+            .agreement
+            .as_deref()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(AGREEMENT_TEXT_MAX)
+            .collect(),
+    };
+    (label, url)
+}
+
+/// `Licença: <label> — <url>`, or `Licença aceita: …` once accepted.
+pub fn agreement_line(a: &Agreement, accepted: bool) -> String {
+    let (label, url) = agreement_parts(a);
+    let head = if accepted {
+        "Licença aceita"
+    } else {
+        "Licença"
+    };
+    format!("{head}: {label} — {url}")
+}
+
+/// `<label> <url>`, as the job log lists accepted agreements.
+pub fn agreement_log(a: &Agreement) -> String {
+    let (label, url) = agreement_parts(a);
+    format!("{label} {url}")
 }
 
 /// Whether `winget upgrade` would take `manifest` for an app installed with `scope` on an
@@ -239,12 +345,16 @@ pub fn scoop_ps1(scoop_root: &Path) -> PathBuf {
         .join("scoop.ps1")
 }
 
-/// Program and arguments of the upgrade (task 105 probe, §4.1).
+/// Program and arguments of the upgrade (task 105 probe, §4.1), or of the winget install.
 pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<String>) {
     match job.tool {
         Tool::Winget => {
+            let verb = match job.op {
+                BridgeOp::Upgrade => "upgrade",
+                BridgeOp::Install { .. } => "install",
+            };
             let args = [
-                "upgrade",
+                verb,
                 "--id",
                 &job.target,
                 "--exact",
@@ -255,10 +365,18 @@ pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<S
                 "--accept-package-agreements",
                 "--accept-source-agreements",
             ];
-            (
-                "winget".to_string(),
-                args.into_iter().map(str::to_string).collect(),
-            )
+            let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            if let BridgeOp::Install { scope: Some(s) } = job.op {
+                args.push("--scope".to_string());
+                args.push(
+                    match s {
+                        InstallScope::User => "user",
+                        InstallScope::Machine => "machine",
+                    }
+                    .to_string(),
+                );
+            }
+            ("winget".to_string(), args)
         }
         Tool::Scoop => {
             let ps1 = ps_single_quoted(&scoop_ps1(scoop_root).display().to_string());
@@ -445,6 +563,7 @@ pub fn winget_installer_log(lines: &[String]) -> Option<String> {
 pub fn winget_message(code: i32) -> String {
     let text = match code as u32 {
         0 => "Atualizado.",
+        NO_APPLICABLE_INSTALLER => "Nenhum instalador do pacote serve para esta máquina.",
         0x8A15_002B => "Nenhuma atualização aplicável para este pacote.",
         0x8A15_0014 => "O winget não encontrou este pacote instalado.",
         0x8A15_0114 => {

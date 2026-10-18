@@ -11,7 +11,7 @@ Comandos:
   search     Busca pacotes
   show       Mostra detalhes de um pacote
   list       Lista pacotes instalados
-  install    Instala um app de um bucket do Scoop
+  install    Instala um app de um bucket do Scoop, ou um pacote do winget pelo próprio winget
   uninstall  Remove um app instalado pelo wingetrs
   upgrade    Atualiza apps instalados pelo wingetrs
   bucket     Gerencia os buckets do Scoop

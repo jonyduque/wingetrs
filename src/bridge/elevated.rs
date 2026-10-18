@@ -2,7 +2,7 @@
 //! for UAC once and starts `wingetrs bridge-worker`; later ones reuse it. A refusal is final
 //! for the session (the jobs run unelevated, as before). The Win32 side is `elevate_win`.
 use super::worker::{self, Reply, Request};
-use super::{BridgeExec, BridgeJob, Tail, Tool};
+use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
 use crate::installed::correlate::InstallScope;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -209,12 +209,18 @@ impl ElevatedBridge {
     }
 }
 
-/// The request for `program args`, which must be one of the two commands of `job`.
-fn request_for(job: &BridgeJob, program: &str, args: &[String]) -> std::io::Result<Request> {
+/// The request for `program args`, which must be one of the two commands of `job` (its
+/// upgrade or install, or the source update); anything else is `PermissionDenied`.
+pub fn request_for(job: &BridgeJob, program: &str, args: &[String]) -> std::io::Result<Request> {
     let is = |(p, a): (String, Vec<String>)| p == program && a == args;
-    if is(super::command(job, Path::new(""), "")) {
-        return Ok(Request::Upgrade {
-            target: job.target.clone(),
+    if job.tool == Tool::Winget && is(super::command(job, Path::new(""), "")) {
+        let target = job.target.clone();
+        return Ok(match job.op {
+            BridgeOp::Upgrade => Request::Upgrade { target },
+            BridgeOp::Install { scope } => Request::Install {
+                target,
+                scope: scope.map(Into::into),
+            },
         });
     }
     if is(super::winget_source_update()) {

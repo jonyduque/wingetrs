@@ -123,6 +123,9 @@ struct Ctx {
     pwsh: String,
     /// The session's elevated helper for machine-wide winget upgrades (one UAC per session).
     elevated: crate::bridge::elevated::ElevatedBridge,
+    /// License agreements (`<label> <url>`) of each planned winget install, by package id:
+    /// shown in its confirmation, logged in `job.start` when it runs.
+    winget_agreements: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// This executable, for the elevated helper. Unknown: logged, and the empty path makes the
@@ -266,6 +269,7 @@ async fn event_loop(
         elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(
             crate::bridge::elevated::SystemTransport::new(helper_exe()),
         )),
+        winget_agreements: std::sync::Mutex::default(),
     });
     let _helper = HelperShutdown(Arc::clone(&ctx));
     ctx.http
@@ -386,6 +390,7 @@ async fn event_loop(
                         jobs::plan_install(o, &source_name, &id, keep)
                     });
                 }
+                Cmd::PlanWingetInstall { id } => spawn_winget_plan(&ctx, id),
                 Cmd::PlanRemove { app, purge } => {
                     spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app, purge));
                 }
@@ -1132,6 +1137,76 @@ async fn applicability(
     ))
 }
 
+/// Plans a winget install through the bridge off the event loop (`Msg::WingetPlanned`).
+fn spawn_winget_plan(ctx: &Arc<Ctx>, id: String) {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        let c = Arc::clone(&ctx);
+        let work = tokio::spawn(async move { plan_winget_install(&c, &id).await });
+        let msg = match work.await {
+            Ok(r) => Msg::WingetPlanned(r.map_err(|e| format!("{e:#}"))),
+            Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
+            Err(e) => Msg::WingetPlanned(Err(e.to_string())),
+        };
+        let _ = ctx.tx.send(msg);
+    });
+}
+
+/// The bridge install of winget package `id`: its catalog version's manifest decides the
+/// elevation, the Settings default the `--scope`; its agreements become confirmation notes
+/// (and are kept for the job log).
+async fn plan_winget_install(
+    ctx: &Ctx,
+    id: &str,
+) -> anyhow::Result<(crate::bridge::BridgeJob, Vec<String>)> {
+    let pkg = read_package(ctx, "winget", id).await?;
+    let hash = pkg
+        .winget_hash
+        .as_deref()
+        .context("pacote winget sem hash de manifesto")?;
+    let blobs = BlobStore::new(ctx.data.blobs_dir());
+    let (manifest, _) = crate::sources::winget::details::merged_manifest(
+        &ctx.http,
+        &blobs,
+        crate::sources::winget::CDN_BASE,
+        &pkg.entry.id,
+        hash,
+        Some(&pkg.entry.version),
+    )
+    .await?;
+    // Read now: the Settings tab may have changed the default since the TUI started.
+    let behavior = match Config::load(&ctx.data.config_path()) {
+        Ok(cfg) => cfg.behavior,
+        Err(e) => {
+            tracing::warn!(error = %e, "config unreadable; using the startup settings");
+            ctx.cfg.behavior
+        }
+    };
+    let job = crate::bridge::install_job(
+        &pkg.entry.id,
+        &pkg.entry.name,
+        &pkg.entry.version,
+        &manifest,
+        crate::bridge::default_scope(behavior.default_scope),
+        crate::bridge::host_arch(),
+    );
+    let notes = manifest
+        .agreements
+        .iter()
+        .map(|a| crate::bridge::agreement_line(a, false))
+        .collect();
+    let logged = manifest
+        .agreements
+        .iter()
+        .map(crate::bridge::agreement_log)
+        .collect();
+    ctx.winget_agreements
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(job.target.clone(), logged);
+    Ok((job, notes))
+}
+
 /// The catalog entry of `source`/`id`, read off the runtime threads.
 async fn read_package(
     ctx: &Ctx,
@@ -1393,22 +1468,47 @@ fn run_tool(
 
 /// Runs a bridge upgrade (no `install.lock`, no ops context; winget jobs queue on `msi.lock`);
 /// each output line becomes the progress text. A winget app installed for the whole machine
-/// runs through the session's elevated helper.
+/// runs through the session's elevated helper; so does a winget install whose installers are
+/// all machine-wide (or with `--scope machine` from the Settings default).
 fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
+    use crate::bridge::BridgeOp;
+    use crate::installed::correlate::InstallScope;
     spawn_job(ctx, move |c, _| {
         let tx = c.tx.clone();
         let mut on_line = |line: &str| {
             let _ = tx.send(Msg::BridgeLine(line.to_string()));
         };
-        Msg::InstallFinished(jobs::run_bridge_elevated(
-            &c.elevated,
-            &job,
-            c.scoop_root.as_deref(),
-            &c.data.install_layout().msi_lock(),
-            &c.pwsh,
-            &mut run_tool,
-            &mut on_line,
-        ))
+        let msi_lock = c.data.install_layout().msi_lock();
+        Msg::InstallFinished(match job.op {
+            BridgeOp::Upgrade => jobs::run_bridge_elevated(
+                &c.elevated,
+                &job,
+                c.scoop_root.as_deref(),
+                &msi_lock,
+                &c.pwsh,
+                &mut run_tool,
+                &mut on_line,
+            ),
+            BridgeOp::Install { scope } => {
+                let agreements = c
+                    .winget_agreements
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&job.target)
+                    .unwrap_or_default();
+                // The TUI has no `--scope`: a machine scope came from the Settings default.
+                let from_settings = scope == Some(InstallScope::Machine);
+                jobs::run_bridge_install(
+                    &c.elevated,
+                    &job,
+                    &agreements,
+                    from_settings,
+                    &msi_lock,
+                    &mut run_tool,
+                    &mut on_line,
+                )
+            }
+        })
     });
 }
 

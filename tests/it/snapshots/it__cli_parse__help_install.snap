@@ -2,7 +2,7 @@
 source: tests/cli_parse.rs
 expression: sub.render_long_help().to_string()
 ---
-Instala um app de um bucket do Scoop
+Instala um app de um bucket do Scoop, ou um pacote do winget pelo próprio winget
 
 Uso: wingetrs install [OPÇÕES] <ALVO>
 
@@ -26,6 +26,9 @@ Opções:
       --allow-msiexec
           Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
 
+      --scope <ESCOPO>
+          Escopo de um pacote do winget: user ou machine
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 
@@ -36,3 +39,4 @@ Exemplos:
   wingetrs install ripgrep
   wingetrs install extras/vscode --dry-run
   wingetrs install git --bucket main --yes
+  wingetrs install Git.Git --scope machine

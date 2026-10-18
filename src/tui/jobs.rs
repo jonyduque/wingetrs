@@ -1,7 +1,7 @@
 //! Install/remove/upgrade jobs of the TUI. Every function takes the `OpsCtx` as a parameter so
 //! tests drive them with fakes; `run.rs` builds the production context.
 use crate::bridge::elevated::ElevatedBridge;
-use crate::bridge::{self, BridgeJob, Tool};
+use crate::bridge::{self, BridgeJob, BridgeOp, Tool};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::PackageEntry;
 use crate::core::version::Version;
@@ -12,6 +12,7 @@ use crate::install::plan::InstallPlan;
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
+use crate::installed::correlate::InstallScope;
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use std::collections::BTreeMap;
@@ -380,7 +381,22 @@ pub fn run_bridge(
     exec: BridgeExec<'_>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Done, InstallFail> {
-    run_bridge_as(job, scoop_root, msi_lock, pwsh, exec, false, on_line)
+    let env = BridgeEnv {
+        scoop_root,
+        msi_lock,
+        pwsh,
+        agreements: &[],
+    };
+    run_bridge_as(job, &env, exec, false, on_line).0
+}
+
+/// Where a bridge job runs and what the user accepted for it.
+struct BridgeEnv<'a> {
+    scoop_root: Option<&'a Path>,
+    msi_lock: &'a Path,
+    pwsh: &'a str,
+    /// License agreements accepted for an install (`<label> <url>`), for `job.start`.
+    agreements: &'a [String],
 }
 
 /// `run_bridge` with the exec `bridge` picks: its elevated helper for a winget app installed
@@ -394,39 +410,101 @@ pub fn run_bridge_elevated(
     current: BridgeExec<'_>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Done, InstallFail> {
-    let mut chosen = bridge.exec_for(job, current, on_line);
-    let elevated = chosen.elevated();
-    run_bridge_as(
-        job,
+    let env = BridgeEnv {
         scoop_root,
         msi_lock,
         pwsh,
-        chosen.exec(),
-        elevated,
-        on_line,
-    )
+        agreements: &[],
+    };
+    run_elevated_as(bridge, job, &env, current, on_line).0
 }
 
+/// Installs a winget package through the bridge (`job.op` is `Install`), elevated when
+/// `job.scope` is `Some(Machine)` (see `run_bridge_elevated`). `agreements` (`<label> <url>`)
+/// were accepted and go to `job.start`. `scope_fallback`: the `--scope machine` came from the
+/// Settings default, so when winget finds no installer for it (`NO_APPLICABLE_INSTALLER`) the
+/// install runs once more without `--scope`, unelevated, saying so on `on_line`.
+pub fn run_bridge_install(
+    bridge: &ElevatedBridge,
+    job: &BridgeJob,
+    agreements: &[String],
+    scope_fallback: bool,
+    msi_lock: &Path,
+    current: BridgeExec<'_>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Done, InstallFail> {
+    let env = BridgeEnv {
+        scoop_root: None,
+        msi_lock,
+        pwsh: "",
+        agreements,
+    };
+    let (result, code) = run_elevated_as(bridge, job, &env, &mut *current, on_line);
+    let no_installer = code.is_some_and(|c| c as u32 == bridge::NO_APPLICABLE_INSTALLER);
+    let from_settings = matches!(
+        job.op,
+        BridgeOp::Install {
+            scope: Some(InstallScope::Machine)
+        }
+    ) && scope_fallback;
+    if result.is_ok() || !no_installer || !from_settings {
+        return result;
+    }
+    tracing::info!(target = %job.target, "{}", bridge::SCOPE_FALLBACK_NOTE);
+    on_line(bridge::SCOPE_FALLBACK_NOTE);
+    let retry = BridgeJob {
+        op: BridgeOp::Install { scope: None },
+        scope: None,
+        ..job.clone()
+    };
+    run_elevated_as(bridge, &retry, &env, current, on_line).0
+}
+
+/// `run_bridge_as` with the exec `bridge` picks for `job`.
+fn run_elevated_as(
+    bridge: &ElevatedBridge,
+    job: &BridgeJob,
+    env: &BridgeEnv<'_>,
+    current: BridgeExec<'_>,
+    on_line: &mut dyn FnMut(&str),
+) -> (Result<Done, InstallFail>, Option<i32>) {
+    let mut chosen = bridge.exec_for(job, current, on_line);
+    let elevated = chosen.elevated();
+    run_bridge_as(job, env, chosen.exec(), elevated, on_line)
+}
+
+/// Runs `job` once with its own `job.start`/`job.end`; also returns the tool's last exit code.
 fn run_bridge_as(
     job: &BridgeJob,
-    scoop_root: Option<&Path>,
-    msi_lock: &Path,
-    pwsh: &str,
+    env: &BridgeEnv<'_>,
     exec: BridgeExec<'_>,
     elevated: bool,
     on_line: &mut dyn FnMut(&str),
-) -> Result<Done, InstallFail> {
+) -> (Result<Done, InstallFail>, Option<i32>) {
+    let BridgeEnv {
+        scoop_root,
+        msi_lock,
+        pwsh,
+        agreements,
+    } = *env;
     let root = scoop_root.unwrap_or(Path::new(""));
     let (program, args) = bridge::command(job, root, pwsh);
-    let mut log = JobLog::start(JobInfo {
-        kind: "bridge",
+    let info = JobInfo {
+        kind: match job.op {
+            BridgeOp::Upgrade => "bridge",
+            BridgeOp::Install { .. } => "install",
+        },
         tool: job.tool.name(),
         target: job.target.clone(),
         name: job.name.clone(),
         from: job.installed.clone(),
         to: job.available.clone(),
         cmd: Some(bridge::command_text(&program, &args)),
-    });
+    };
+    let mut log = match job.op {
+        BridgeOp::Upgrade => JobLog::start(info),
+        BridgeOp::Install { .. } => JobLog::start_accepting(info, agreements),
+    };
     log.elevated = elevated;
     let result = bridge_run(
         job,
@@ -437,6 +515,7 @@ fn run_bridge_as(
         on_line,
         &mut log,
     );
+    let code = log.code;
     match &result {
         Ok(done) => log.finish(Outcome::Ok, &done.summary),
         Err(fail) => {
@@ -449,7 +528,7 @@ fn run_bridge_as(
             log.finish(outcome, &detail);
         }
     }
-    result
+    (result, code)
 }
 
 fn bridge_run(
@@ -464,6 +543,10 @@ fn bridge_run(
     let fail = |message: String| Err(InstallFail::Other(format!("{}: {message}", job.name)));
     if !bridge::valid_target(job.tool, &job.target) {
         return fail(format!("identificador inválido: {}", job.target));
+    }
+    let install = matches!(job.op, BridgeOp::Install { .. });
+    if install && job.tool != Tool::Winget {
+        return fail(format!("instalação via {} pela ponte", job.tool.name()));
     }
     let scoop_root = match (job.tool, scoop_root) {
         (Tool::Scoop, None) => return fail("scoop não encontrado".to_string()),
@@ -513,9 +596,16 @@ fn bridge_run(
         };
         let (mut updated, mut message) = match job.tool {
             Tool::Winget if bridge::reboot_requested(code, &lines, &bridge::REBOOT_MARKERS) => {
-                let message = "Atualizado; reinicie o computador para concluir.";
+                let message = if install {
+                    "instalado via winget; reinicie o computador para concluir"
+                } else {
+                    "Atualizado; reinicie o computador para concluir."
+                };
                 tracing::info!(target = %job.target, "{message}");
                 (true, message.to_string())
+            }
+            Tool::Winget if install && bridge::winget_updated(code) => {
+                (true, "instalado via winget".to_string())
             }
             Tool::Winget => (bridge::winget_updated(code), bridge::winget_message(code)),
             Tool::Scoop => bridge::scoop_message(code, before.as_deref(), after.as_deref(), &lines),

@@ -27,6 +27,16 @@ fn parse_source(s: &str) -> Result<SourceKind, String> {
     SourceKind::from_str(s)
 }
 
+/// `--scope` of `install`: `user` or `machine`.
+fn parse_scope(s: &str) -> Result<crate::bridge::worker::ScopeArg, String> {
+    use crate::bridge::worker::ScopeArg;
+    match s.to_ascii_lowercase().as_str() {
+        "user" => Ok(ScopeArg::User),
+        "machine" => Ok(ScopeArg::Machine),
+        _ => Err(format!("escopo inválido '{s}': use user ou machine")),
+    }
+}
+
 const HELP_TEMPLATE: &str = "{about-with-newline}
 Uso: {usage}
 
@@ -176,7 +186,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Instala um app de um bucket do Scoop
+    /// Instala um app de um bucket do Scoop, ou um pacote do winget pelo próprio winget
     #[command(
         override_usage = "wingetrs install [OPÇÕES] <ALVO>",
         help_template = HELP_TEMPLATE,
@@ -184,7 +194,8 @@ pub enum Command {
         after_help = "Exemplos:
   wingetrs install ripgrep
   wingetrs install extras/vscode --dry-run
-  wingetrs install git --bucket main --yes"
+  wingetrs install git --bucket main --yes
+  wingetrs install Git.Git --scope machine"
     )]
     Install {
         /// App a instalar (id, ou bucket/id)
@@ -202,6 +213,9 @@ pub enum Command {
         /// Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
         #[arg(long)]
         allow_msiexec: bool,
+        /// Escopo de um pacote do winget: user ou machine
+        #[arg(long, value_parser = parse_scope, value_name = "ESCOPO")]
+        scope: Option<crate::bridge::worker::ScopeArg>,
     },
     /// Remove um app instalado pelo wingetrs
     #[command(
