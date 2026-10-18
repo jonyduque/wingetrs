@@ -1210,9 +1210,9 @@ fn read_effects(path: &Path) -> Result<Vec<ScriptEffect>, String> {
     script_effects::parse_effects(&text).map_err(|e| e.to_string())
 }
 
-/// Variables a script may never set with `Set-EnvVar`/`env` (exact name, any case): the
-/// PATH and `PSModulePath` only change entry by entry (`Add-Path`), and the rest are read by
-/// Windows, the shells or a language runtime at startup.
+/// Variables a script may never set (exact name, any case), even if a manifest uses them:
+/// read by Windows, the shells, a language runtime or a downloader at startup (proxy, CA
+/// bundle, package index), or owned by one toolchain installer.
 const DENIED_ENV: &[&str] = &[
     "PATHEXT",
     "ComSpec",
@@ -1233,10 +1233,22 @@ const DENIED_ENV: &[&str] = &[
     "JDK_JAVA_OPTIONS",
     "BASH_ENV",
     "ENV",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "PHPRC",
+    "CLASSPATH",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GRADLE_USER_HOME",
 ];
 
 /// Families refused by prefix (any case): loader, profiler and runtime hooks (.NET, Node,
-/// Python, Perl, Ruby, git, the dynamic linker), `PSModule*` and the processor variables.
+/// Python, Perl, Ruby, Lua, git, the dynamic linker), `PSModule*`, the processor variables,
+/// wingetrs' and Scoop's own, CA files and package-manager settings.
 const DENIED_ENV_PREFIXES: &[&str] = &[
     "COR_",
     "CORECLR_",
@@ -1250,34 +1262,241 @@ const DENIED_ENV_PREFIXES: &[&str] = &[
     "LD_",
     "PSMODULE",
     "PROCESSOR_",
+    "WINGETRS_",
+    "SCOOP",
+    "SSL_CERT_",
+    "PIP_",
+    "NPM_CONFIG_",
+    "LUA_INIT",
 ];
 
-/// Harmless names real manifests set that a prefix family would catch; `<APP>_HOME` is
-/// accepted the same way (never an exact name of [`DENIED_ENV`]).
+/// The only variables a script may set: the names the Scoop buckets set (`env_set` and
+/// `Set-EnvVar`/`env` in hooks, measured over 4705 manifests in Task 157) minus the refused
+/// ones, plus `JAVA_HOME`, `GOPATH` and `ANDROID_SDK_ROOT` (buckets not in the sample).
 const ALLOWED_ENV: &[&str] = &[
-    "JAVA_HOME",
-    "GOPATH",
-    "GOROOT",
+    "AIDER_DESK_DATA_DIR",
+    "ALLURE_HOME",
     "ANDROID_HOME",
     "ANDROID_SDK_ROOT",
+    "ANDROID_USER_HOME",
+    "ANT_HOME",
+    "ARCADEDB_HOME",
+    "ATAC_MAIN_DIR",
+    "AzureCLIPath",
+    "AZURE_CLI_PATH",
+    "BAT_CONFIG_DIR",
+    "BAZEL_SH",
+    "Boost_INCLUDE_DIR",
+    "BOOST_ROOT",
+    "BUN_INSTALL",
+    "BUN_INSTALL_BIN",
+    "BUN_INSTALL_GLOBAL_DIR",
+    "CABAL_DIR",
+    "CANGJIE_HOME",
+    "CATALINA_BASE",
+    "CATALINA_HOME",
+    "CC65_HOME",
+    "CCNET_CONF_DIR",
+    "CHEAT_CONFIG_PATH",
+    "CHROME_EXECUTABLE",
+    "CLINK_DIR",
+    "CMAKE_PREFIX_PATH",
+    "CMDER_ROOT",
+    "CODER_CONFIG_DIR",
+    "CODEX_CLI_PATH",
+    "CODEX_SPARKLE_ENABLED",
+    "COMPOSER_CACHE_DIR",
+    "COMPOSER_HOME",
+    "ConEmuDir",
+    "COQBIN",
+    "CORMANLISP_HOME",
+    "COURSIER_BIN_DIR",
+    "COURSIER_CACHE",
+    "CPLUS_INCLUDE_PATH",
+    "CUDA_PATH",
+    "CURSOR_CONFIG_DIR",
+    "CURSOR_DATA_DIR",
+    "C_INCLUDE_PATH",
+    "DBX_DATA_DIR",
+    "DEEPSTREAM_CONFIG_DIRECTORY",
+    "EC2_HOME",
+    "ELAN_HOME",
+    "ERLANG_HOME",
+    "ESPEAK_DATA_PATH",
+    "FFMPEG_DIR",
+    "FLUTTER_ROOT",
+    "FNM_DIR",
+    "FOLDER_MARKER_DIR",
+    "FORKGITINSTANCE",
+    "FVM_CACHE_PATH",
+    "GAUGE_HOME",
+    "GEM_HOME",
+    "GEM_PATH",
+    "GHCUP_INSTALL_BASE_PREFIX",
+    "GHCUP_MSYS2",
+    "GHIDRA_INSTALL_DIR",
+    "GLFW_ROOT",
+    "GONAVI_DATA_ROOT",
+    "GONAVI_LOG_DIR",
+    "GOOGLE_WORKSPACE_CLI_CONFIG_DIR",
+    "GOPATH",
+    "GOROOT",
+    "GRAILS_HOME",
+    "GRAMPSHOME",
+    "GRAMPS_DIR",
+    "GROOVY_HOME",
+    "G_EXPERIMENTAL",
+    "G_HOME",
+    "HADOOP_HOME",
+    "HAPI_HOME",
+    "HASHLINKPATH",
+    "HAXEPATH",
+    "IBMCLOUD_HOME",
+    "INBUCKET_SMTP_TLSCERT",
+    "INBUCKET_SMTP_TLSPRIVKEY",
+    "INBUCKET_WEB_GREETINGFILE",
+    "INBUCKET_WEB_UIDIR",
+    "INCLUDE",
+    "IPOPTWINDIR",
+    "JABBA_HOME",
+    "JANET_PATH",
+    "JAVA_HOME",
+    "JJUI_CONFIG_DIR",
+    "JMETER_HOME",
+    "JRUBY_HOME",
+    "K9S_CONFIG_DIR",
+    "K9S_LOGS_DIR",
+    "KOTLIN_HOME",
+    "KREW_ROOT",
+    "KURRENTDB_DB",
+    "LARKSUITE_CLI_CONFIG_DIR",
+    "LazarusDir",
+    "LazDir",
+    "LD65_CFG",
+    "LD65_LIB",
+    "LIB",
+    "LIBCLANG_PATH",
+    "LLVM_LIB_DIR",
+    "LUAROCKS_CONFIG",
+    "LUA_DEV",
+    "LUNARVIM_BASE_DIR",
+    "LUNARVIM_CACHE_DIR",
+    "LUNARVIM_CONFIG_DIR",
+    "LUNARVIM_RUNTIME_DIR",
+    "MAESTRO_HOME",
+    "MAGICK_CODER_MODULE_PATH",
+    "MAGICK_CONFIGURE_PATH",
+    "MAGICK_HOME",
+    "MICRONAUT_HOME",
+    "MSBuildSDKsPath",
+    "MSB_HOME",
+    "NAVI_CONFIG",
+    "NEKO_INSTPATH",
+    "NGINX_HOME",
+    "NO_MISTAKES_NO_UPDATE_CHECK",
+    "NRFUTIL_HOME",
+    "NSISDIR",
+    "NULLCLAW_HOME",
+    "NVM_HOME",
+    "NVS_HOME",
+    "OCI_LIB64",
+    "OPENCV_DIR",
+    "OPENSSL_CONF",
+    "OPENSSL_INCLUDE_DIR",
+    "OPENSSL_LIB_DIR",
+    "OPENSSL_MODULES",
+    "OPENSSL_ROOT_DIR",
+    "PGDATA",
+    "PG_INCLUDE_DIR",
+    "PG_LIB_DIR",
+    "PHP_INI_SCAN_DIR",
+    "PICOCLAW_HOME",
+    "PKG_CONFIG_PATH",
+    "PNPM_HOME",
+    "PODMAN_CONNECTIONS_CONF",
+    "PODMAN_DESKTOP_HOME_DIR",
+    "POSH_THEMES_PATH",
+    "PROTO_HOME",
+    "PROTO_VERSION_CHECK",
+    "PROXYCHAINS_CONF_FILE",
+    "PSCOMPLETIONS_DATA_DIR",
+    "PURPLEHOME",
+    "PYENV",
+    "PYENV_HOME",
+    "PYENV_ROOT",
+    "RABBITMQ_SERVER",
+    "RIPCORD_ALLOW_UPDATES",
+    "RUSTIC_HOME",
+    "RYE_HOME",
+    "SBCL_HOME",
+    "SBT_HOME",
+    "SCALA_HOME",
+    "SCROLLVIEW_PATH",
+    "SDKROOT",
+    "SNDCPY_APK",
+    "SPARK_HOME",
+    "STEAMGUARD_CLI_MAFILES",
+    "SUMO_HOME",
+    "TABBY_ROOT",
+    "TEALDEER_CONFIG_DIR",
+    "TELEGRAF_CONFIG_PATH",
+    "TESSDATA_PREFIX",
+    "THINKRAIL_DATA_DIR",
+    "THONNY_USER_DIR",
+    "TLRC_CONFIG",
+    "TL_PATH",
+    "TNS_ADMIN",
+    "TRILIUM_DATA_DIR",
+    "TurboJPEG_ROOT",
+    "UV_CACHE_DIR",
+    "UV_PYTHON_BIN_DIR",
+    "UV_PYTHON_INSTALL_DIR",
+    "UV_TOOL_BIN_DIR",
+    "UV_TOOL_DIR",
+    "VCPKG_ROOT",
+    "VK_SDK_PATH",
+    "VLC",
+    "VOLTA_HOME",
+    "VULKAN_SDK",
+    "WASMER_CACHE_DIR",
+    "WASMER_DIR",
+    "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+    "WINSSHTERM_EXE_DISALLOW_AUTO_UPDATE",
+    "WIRESHARK_CONFIG_DIR",
+    "WIRESHARK_DATA_DIR",
+    "YARR_DB",
+    "YARR_LOGFILE",
 ];
 
 fn env_denied(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    if DENIED_ENV.iter().any(|d| d.eq_ignore_ascii_case(name)) {
-        return true;
-    }
-    if ALLOWED_ENV.iter().any(|a| a.eq_ignore_ascii_case(name)) || upper.ends_with("_HOME") {
-        return false;
-    }
-    DENIED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+    DENIED_ENV.iter().any(|d| d.eq_ignore_ascii_case(name))
+        || DENIED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
+/// A variable whose value is a folder or a list of folders.
+fn env_is_path(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["_HOME", "_ROOT", "_PATH", "_DIR", "_DIRECTORY", "_PREFIX"]
+        .iter()
+        .any(|s| upper.ends_with(s))
+        || [
+            "GOPATH",
+            "GOROOT",
+            "SDKROOT",
+            "INCLUDE",
+            "LIB",
+            "HAXEPATH",
+            "HASHLINKPATH",
+        ]
+        .contains(&upper.as_str())
 }
 
 /// Longest `Remove-Path` pattern accepted (the match is quadratic in the worst case).
 const MAX_PATTERN_CHARS: usize = 1024;
 
-/// Name a script may set: `[A-Za-z_][A-Za-z0-9_]*`, at most 255 characters, not the PATH and
-/// not refused by [`env_denied`].
+/// Name a script may set: `[A-Za-z_][A-Za-z0-9_]*`, at most 255 characters, not the PATH,
+/// not refused by [`env_denied`] and listed in [`ALLOWED_ENV`].
 fn check_env_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let valid = name.len() <= 255
@@ -1293,6 +1512,11 @@ fn check_env_name(name: &str) -> Result<(), String> {
     }
     if env_denied(name) {
         return Err(format!("a variável {name} não pode ser gravada por script"));
+    }
+    if !ALLOWED_ENV.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+        return Err(format!(
+            "a variável {name} não está entre as que um script pode gravar"
+        ));
     }
     Ok(())
 }
@@ -1416,25 +1640,32 @@ fn apply_effect(
     match effect {
         ScriptEffect::SetEnv { name, value } => {
             check_env_name(&name)?;
+            // A folder (by name, or a value that looks like a path) must be inside the app.
+            if let Some(v) = &value
+                && (env_is_path(&name) || v.contains(['\\', '/', ':']))
+            {
+                for part in v.split(';').filter(|p| !p.is_empty()) {
+                    if !is_inside(part, &app_dir) && !is_inside(part, &persist_dir) {
+                        return Err(format!(
+                            "o script tentou gravar {name}={part} (fora da pasta do app)"
+                        ));
+                    }
+                }
+            }
             set_env(run, env, &name, value.as_deref())
         }
         ScriptEffect::AddPath { var, entries, .. } => {
-            let psmodule = var.eq_ignore_ascii_case(PSMODULE_VAR);
-            if !psmodule && !var.eq_ignore_ascii_case(PATH_VAR) {
+            // `PSModulePath` changes only through the psmodule step.
+            if !var.eq_ignore_ascii_case(PATH_VAR) {
                 return Err(format!("Add-Path em {var} não suportado"));
             }
-            let label = if psmodule { PSMODULE_VAR } else { "PATH" };
             for entry in entries {
                 if !is_inside(&entry, &app_dir) && !is_inside(&entry, &persist_dir) {
                     return Err(format!(
-                        "o script tentou pôr {entry} no {label} (fora da pasta do app)"
+                        "o script tentou pôr {entry} no PATH (fora da pasta do app)"
                     ));
                 }
-                if psmodule {
-                    psmodulepath_prepend(run, env, &entry)?;
-                } else {
-                    add_path(run, env, &entry)?;
-                }
+                add_path(run, env, &entry)?;
             }
             Ok(())
         }

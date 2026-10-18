@@ -452,14 +452,14 @@ async fn set_env_applied_restored_on_rollback() {
     let w = setup().await;
     w.env
         .set(
-            "X",
+            "PROTO_VERSION_CHECK",
             &EnvValue {
                 value: "antigo".into(),
                 expand: false,
             },
         )
         .unwrap();
-    let host = FakeHost::writing(&[set_env("X", Some("v"))]);
+    let host = FakeHost::writing(&[set_env("PROTO_VERSION_CHECK", Some("v"))]);
     let plan = w.plan();
     let hook_at = plan
         .steps
@@ -474,25 +474,37 @@ async fn set_env_applied_restored_on_rollback() {
         .unwrap_err();
     drop(ctx);
     assert!(err.to_string().contains("injected"), "{err}");
-    assert_eq!(w.var("X").as_deref(), Some("antigo"));
+    assert_eq!(w.var("PROTO_VERSION_CHECK").as_deref(), Some("antigo"));
 }
 
 #[tokio::test]
 async fn set_env_applied_recorded_and_removed() {
     let w = setup().await;
-    let host = FakeHost::writing(&[set_env("X", Some("v")), set_env("TOOL_HOME", None)]);
+    w.env
+        .set(
+            "RIPCORD_ALLOW_UPDATES",
+            &EnvValue {
+                value: "1".into(),
+                expand: false,
+            },
+        )
+        .unwrap();
+    let host = FakeHost::writing(&[
+        set_env("PROTO_VERSION_CHECK", Some("v")),
+        set_env("RIPCORD_ALLOW_UPDATES", None),
+    ]);
     w.run(&w.plan(), &host).await.unwrap();
-    assert_eq!(w.var("X").as_deref(), Some("v"));
-    assert_eq!(w.var("TOOL_HOME"), None);
+    assert_eq!(w.var("PROTO_VERSION_CHECK").as_deref(), Some("v"));
+    assert_eq!(w.var("RIPCORD_ALLOW_UPDATES"), None);
     let arts = w.artifacts();
     let envs: Vec<&Artifact> = arts
         .iter()
         .filter(|a| a.kind == ArtifactKind::Env)
         .collect();
-    assert_eq!(envs.len(), 2, "{envs:?}");
+    assert_eq!(envs.len(), 3, "{envs:?}");
     w.uninstall();
-    assert_eq!(w.var("X"), None);
-    assert_eq!(w.var("TOOL_HOME"), None);
+    assert_eq!(w.var("PROTO_VERSION_CHECK"), None);
+    assert_eq!(w.var("RIPCORD_ALLOW_UPDATES").as_deref(), Some("1"));
 }
 
 #[tokio::test]
@@ -541,6 +553,17 @@ async fn set_env_denied_exact_names_refused() {
         "JDK_JAVA_OPTIONS",
         "BASH_ENV",
         "env",
+        "HTTP_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "PHPRC",
+        "CLASSPATH",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "GRADLE_USER_HOME",
     ] {
         refused(
             &w,
@@ -570,6 +593,17 @@ async fn set_env_denied_families_refused() {
         "LD_PRELOAD",
         "PSModuleAnalysisCachePath",
         "PROCESSOR_ARCHITECTURE",
+        "WINGETRS_TEST_ENV_KEY",
+        "SCOOP",
+        "scoop_global",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "PIP_INDEX_URL",
+        "NPM_CONFIG_REGISTRY",
+        "LUA_INIT",
+        "LUA_INIT_5_4",
+        "GIT_INSTALL_ROOT",
+        "NODE_PATH",
     ] {
         refused(
             &w,
@@ -581,25 +615,54 @@ async fn set_env_denied_families_refused() {
 }
 
 #[tokio::test]
-async fn set_env_allowed_exceptions_applied() {
+async fn set_env_allowed_names_applied() {
     let w = setup().await;
-    // `NODE_HOME`/`PYTHON_HOME` fall in a family but `<APP>_HOME` is an exception.
+    let inside = format!(r"{}\jdk", w.vdir());
     let names = [
-        "JAVA_HOME",
-        "GOPATH",
-        "GOROOT",
-        "ANDROID_HOME",
-        "ANDROID_SDK_ROOT",
-        "NODE_HOME",
-        "PYTHON_HOME",
-        "CARGO_HOME",
-        "PKG_CONFIG_PATH",
+        ("JAVA_HOME", inside.clone()),
+        ("GOPATH", inside.clone()),
+        ("ANDROID_SDK_ROOT", inside.clone()),
+        ("PKG_CONFIG_PATH", format!(r"{inside};{}\lib", w.vdir())),
+        (
+            "OPENSSL_CONF",
+            format!(r"{}\ssl.cnf", w.layout.persist_dir("app").display()),
+        ),
+        ("PROTO_VERSION_CHECK", "false".to_string()),
+        ("codex_sparkle_enabled", "0".to_string()),
     ];
-    let lines: Vec<serde_json::Value> = names.iter().map(|n| set_env(n, Some("v"))).collect();
+    let lines: Vec<serde_json::Value> = names.iter().map(|(n, v)| set_env(n, Some(v))).collect();
     let host = FakeHost::writing(&lines);
     w.run(&w.plan(), &host).await.unwrap();
-    for n in names {
-        assert_eq!(w.var(n).as_deref(), Some("v"), "{n}");
+    for (n, v) in &names {
+        assert_eq!(w.var(n).as_deref(), Some(v.as_str()), "{n}");
+    }
+}
+
+#[tokio::test]
+async fn set_env_unlisted_name_refused() {
+    let w = setup().await;
+    for name in ["X", "VLC_X", "MY_TOOL_HOME", "TOOL_HOME"] {
+        refused(
+            &w,
+            &[set_env(name, Some("v"))],
+            &format!("a variável {name} não está entre as que um script pode gravar"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn set_env_path_value_outside_app_refused() {
+    let w = setup().await;
+    let inside = format!(r"{}\jdk", w.vdir());
+    for (name, value) in [
+        ("JAVA_HOME", r"C:\qualquer".to_string()),
+        ("JAVA_HOME", "jdk".to_string()),
+        ("PKG_CONFIG_PATH", format!(r"{inside};C:\qualquer")),
+        ("PROTO_VERSION_CHECK", r"C:\qualquer".to_string()),
+        ("PROTO_VERSION_CHECK", "//server/share".to_string()),
+    ] {
+        refused(&w, &[set_env(name, Some(&value))], "fora da pasta do app").await;
     }
 }
 
@@ -612,35 +675,13 @@ async fn set_env_bad_name_refused() {
 }
 
 #[tokio::test]
-async fn psmodulepath_add_path() {
-    let w = setup().await;
-    w.env
-        .set(
-            "PSModulePath",
-            &EnvValue {
-                value: r"C:\Mods".into(),
-                expand: false,
-            },
-        )
-        .unwrap();
-    let entry = format!(r"{}\current\modules", w.app_dir());
-    let host = FakeHost::writing(&[add_path("PSModulePath", &[&entry])]);
-    w.run(&w.plan(), &host).await.unwrap();
-    assert_eq!(w.var("PSModulePath").unwrap(), format!(r"{entry};C:\Mods"));
-    assert!(!w.path_var().contains(&entry));
-}
-
-#[tokio::test]
-async fn psmodulepath_add_path_rolls_back_and_refuses_outside() {
+async fn psmodulepath_add_path_refused() {
     let w = setup().await;
     let entry = format!(r"{}\current\modules", w.app_dir());
     refused(
         &w,
-        &[
-            add_path("PSModulePath", &[&entry]),
-            add_path("PSModulePath", &["C:\\Mods"]),
-        ],
-        "fora da pasta do app",
+        &[add_path("PSModulePath", &[&entry])],
+        "Add-Path em PSModulePath não suportado",
     )
     .await;
     assert_eq!(w.var("PSModulePath"), None);
@@ -919,7 +960,7 @@ async fn effects_not_utf8_rolls_back() {
 }
 
 #[tokio::test]
-async fn effects_over_64_mib_refused_before_reading() {
+async fn effects_over_64_mib_refused_by_size_check_and_bounded_read() {
     let w = setup().await;
     let host = Arc::new(FakeHost {
         effects: vec![vec![b'\n'; 64 * 1024 * 1024 + 1]],
@@ -940,7 +981,7 @@ async fn refusal_after_applied_effects_restores_everything() {
     refused(
         &w,
         &[
-            set_env("X", Some("v")),
+            set_env("PROTO_VERSION_CHECK", Some("v")),
             add_path("PATH", &[&entry]),
             shim(&target, "setup2"),
             shortcut(&target, "S", None),
@@ -963,7 +1004,7 @@ async fn failure_at_each_step_with_effects() {
         let target = format!(r"{}\setup.exe", s.vdir());
         let host = FakeHost::writing(&[
             add_path("PATH", &[&entry]),
-            set_env("X", Some("v")),
+            set_env("PROTO_VERSION_CHECK", Some("v")),
             shim(&target, "setup2"),
         ]);
         let before_fs = s.snapshot();
