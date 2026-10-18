@@ -1,8 +1,14 @@
 //! Text rendering for CLI commands; colored through `style::paint` when color is on.
-use super::style::{DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, paint};
+use super::style::{
+    DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, WARN, paint,
+};
 use crate::core::{PackageDetails, PackageEntry};
+use crate::install::manifest::{self, Arch, HookKind, Resolved};
 use crate::install::msiexec_log::LogTail;
+use crate::install::plan::{InstallPlan, Step};
+use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
+use crate::install::script_scan::{self, ScriptReport, Verdict};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 use std::collections::VecDeque;
@@ -517,6 +523,265 @@ pub fn upgrades_text(rows: &[(String, String, String)]) -> String {
         ));
     }
     s
+}
+
+/// One piece of third-party code an operation runs, as the confirmation shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThirdParty {
+    /// A manifest script; `hook` names it (`post_install`, `pre_uninstall da versão instalada`).
+    Script {
+        hook: String,
+        script: String,
+        report: ScriptReport,
+    },
+    /// An `installer.file`/`uninstaller.file` run directly (no PowerShell).
+    Program {
+        uninstaller: bool,
+        file: String,
+        args: Vec<String>,
+    },
+    /// A `.ps1` installer/uninstaller file: its content is not in the manifest.
+    Ps1 {
+        uninstaller: bool,
+        file: String,
+        args: Vec<String>,
+        report: ScriptReport,
+    },
+    /// The plan says its manifest has uninstall code, but the manifest could not be read back.
+    Unknown { what: String },
+}
+
+impl ThirdParty {
+    /// Short name for the refusal message (`script post_install`, `instalador setup.exe`).
+    pub fn label(&self) -> String {
+        match self {
+            ThirdParty::Script { hook, .. } => format!("script {}", printable(hook)),
+            ThirdParty::Program {
+                uninstaller, file, ..
+            }
+            | ThirdParty::Ps1 {
+                uninstaller, file, ..
+            } => {
+                let kind = if *uninstaller {
+                    "desinstalador"
+                } else {
+                    "instalador"
+                };
+                format!("{kind} {}", printable(file))
+            }
+            ThirdParty::Unknown { what } => what.clone(),
+        }
+    }
+}
+
+fn script_item(hook: String, script: &str) -> ThirdParty {
+    ThirdParty::Script {
+        hook,
+        script: script.to_string(),
+        report: script_scan::scan(script, PRELUDE_FUNCTIONS),
+    }
+}
+
+fn file_item(uninstaller: bool, file: &str, args: &[String]) -> ThirdParty {
+    if file.to_lowercase().ends_with(".ps1") {
+        ThirdParty::Ps1 {
+            uninstaller,
+            file: file.to_string(),
+            args: args.to_vec(),
+            report: script_scan::ps1_installer_report(file),
+        }
+    } else {
+        ThirdParty::Program {
+            uninstaller,
+            file: file.to_string(),
+            args: args.to_vec(),
+        }
+    }
+}
+
+/// The third-party code removing an app of manifest `m` runs, in the executor's order;
+/// `suffix` is appended to each script name (`, na remoção`).
+pub fn removal_third_party(m: &Resolved, suffix: &str) -> Vec<ThirdParty> {
+    let name = |k: HookKind| format!("{}{suffix}", k.key());
+    let mut out = Vec::new();
+    if let Some(s) = &m.hooks.pre_uninstall {
+        out.push(script_item(name(HookKind::PreUninstall), s));
+    }
+    if let Some(u) = &m.uninstaller {
+        if let Some(s) = &u.script {
+            out.push(script_item(name(HookKind::UninstallerScript), s));
+        }
+        if let Some(f) = &u.file {
+            out.push(file_item(true, f, &u.args));
+        }
+    }
+    if let Some(s) = &m.hooks.post_uninstall {
+        out.push(script_item(name(HookKind::PostUninstall), s));
+    }
+    out
+}
+
+/// The third-party code `plan` runs now, then the one its manifest runs at removal time
+/// (installing it already needs the consent: Tasks 151 and 159).
+pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
+    let mut out = Vec::new();
+    for step in &plan.steps {
+        match step {
+            Step::Hook { kind, script } => out.push(script_item(kind.key().to_string(), script)),
+            Step::UpgradeUninstallHook { kind, script } => {
+                let hook = format!("{} da versão instalada", kind.key());
+                out.push(script_item(hook, script));
+            }
+            Step::RunInstaller { file, args, .. } | Step::RunPs1Installer { file, args } => {
+                out.push(file_item(false, file, args));
+            }
+            Step::UpgradeRunUninstaller { file, args } => out.push(file_item(true, file, args)),
+            _ => {}
+        }
+    }
+    if plan.third_party_uninstaller || plan.has_uninstall_scripts {
+        // The same text and architecture `ops::plan_for` resolved.
+        let later = plan
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                Step::WriteManifest { json } => manifest::resolve(json, Arch::host()).ok(),
+                _ => None,
+            })
+            .map(|m| removal_third_party(&m, ", na remoção"))
+            .unwrap_or_default();
+        if later.is_empty() {
+            out.push(ThirdParty::Unknown {
+                what: "desinstalador do manifesto".into(),
+            });
+        }
+        out.extend(later);
+    }
+    out
+}
+
+/// Third-party text made safe for the terminal: control characters (escape sequences
+/// included) are replaced; tabs are kept.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+const PRIVILEGES: &str = "roda com os seus privilégios e pode alterar qualquer arquivo seu";
+
+fn verdict_text(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Confirm => "pede confirmação",
+        Verdict::ConfirmStrong => "pede atenção redobrada; revise antes de permitir",
+        Verdict::Refuse => "recusado",
+    }
+}
+
+fn push_report(s: &mut String, r: &ScriptReport) {
+    s.push_str(&format!("  Análise: {}\n", verdict_text(r.verdict)));
+    for f in &r.flags {
+        let flag = format!("  ! {} (linha {})", printable(&f.detail), f.line);
+        s.push_str(&paint(WARN, &flag));
+        s.push('\n');
+    }
+}
+
+fn push_title(s: &mut String, title: &str) {
+    s.push_str(&paint(HEADER, title));
+    s.push('\n');
+}
+
+fn command_line(file: &str, args: &[String]) -> String {
+    std::iter::once(file)
+        .chain(args.iter().map(String::as_str))
+        .map(printable)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn program_title(uninstaller: bool) -> &'static str {
+    if uninstaller {
+        "Desinstalador de terceiro"
+    } else {
+        "Instalador de terceiro"
+    }
+}
+
+/// What the user permits with `--allow-scripts`: per script the header, the gate's verdict
+/// and flags, and the script numbered; per installer its command line.
+pub fn third_party_block(items: &[ThirdParty]) -> String {
+    let mut s = String::new();
+    for item in items {
+        match item {
+            ThirdParty::Script {
+                hook,
+                script,
+                report,
+            } => {
+                let title = format!("Script de terceiro ({}), {PRIVILEGES}", printable(hook));
+                push_title(&mut s, &title);
+                push_report(&mut s, report);
+                let width = script.lines().count().max(1).to_string().len();
+                for (i, line) in script.lines().enumerate() {
+                    let n = format!("{:>width$}", i + 1);
+                    s.push_str(&format!("  {} | {}\n", paint(DIM, &n), printable(line)));
+                }
+            }
+            ThirdParty::Program {
+                uninstaller,
+                file,
+                args,
+            } => {
+                let title = format!(
+                    "{}: {}",
+                    program_title(*uninstaller),
+                    command_line(file, args)
+                );
+                push_title(&mut s, &title);
+                s.push_str(&format!("  {PRIVILEGES}\n"));
+            }
+            ThirdParty::Ps1 {
+                uninstaller,
+                file,
+                args,
+                report,
+            } => {
+                let title = format!(
+                    "{}: {}",
+                    program_title(*uninstaller),
+                    command_line(file, args)
+                );
+                push_title(&mut s, &title);
+                s.push_str(&format!("  {PRIVILEGES}\n"));
+                push_report(&mut s, report);
+            }
+            ThirdParty::Unknown { what } => {
+                push_title(&mut s, &format!("Código de terceiro: {what}"));
+                s.push_str(&format!("  {PRIVILEGES}\n"));
+            }
+        }
+    }
+    s
+}
+
+/// The refusal without `--allow-scripts` (even with `--yes`).
+pub fn third_party_refusal<'a>(
+    apps: &[&str],
+    items: impl Iterator<Item = &'a ThirdParty>,
+) -> String {
+    let what: Vec<String> = items.map(ThirdParty::label).collect();
+    format!(
+        "{} roda código de terceiros ({}); revise com --dry-run e rode de novo com --allow-scripts",
+        apps.join(", "),
+        what.join(", ")
+    )
 }
 
 pub fn repair_text(r: &crate::install::ops::RepairReport) -> String {

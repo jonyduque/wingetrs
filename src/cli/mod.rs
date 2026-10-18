@@ -213,6 +213,9 @@ pub enum Command {
         /// Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
         #[arg(long)]
         allow_msiexec: bool,
+        /// Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
+        #[arg(long)]
+        allow_scripts: bool,
         /// Escopo de um pacote do winget: user ou machine
         #[arg(long, value_parser = parse_scope, value_name = "ESCOPO")]
         scope: Option<crate::bridge::worker::ScopeArg>,
@@ -241,6 +244,9 @@ pub enum Command {
         /// Não pergunta nada (limpa só resíduos de confiança alta)
         #[arg(long)]
         yes: bool,
+        /// Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
+        #[arg(long)]
+        allow_scripts: bool,
     },
     /// Atualiza apps do wingetrs, ou um app do Windows associado ao winget
     #[command(
@@ -276,6 +282,9 @@ pub enum Command {
         /// Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
         #[arg(long)]
         allow_msiexec: bool,
+        /// Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
+        #[arg(long)]
+        allow_scripts: bool,
     },
     /// Gerencia os buckets do Scoop
     #[command(

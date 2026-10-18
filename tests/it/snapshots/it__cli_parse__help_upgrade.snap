@@ -29,6 +29,9 @@ Opções:
       --allow-msiexec
           Permite usar o Windows Installer (msiexec /a) num MSI que o extrator não suporta
 
+      --allow-scripts
+          Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

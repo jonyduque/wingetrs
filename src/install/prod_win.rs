@@ -77,7 +77,7 @@ pub fn build_ctx<'a>(
             Runners {
                 innounp: inno_win::run,
                 installer: Some(installer_win::run),
-                // Consent is still withheld per install by `ops::exec_ctx` until Task 161.
+                // Masked by `ops::exec_ctx` unless the user consented (`--allow-scripts`).
                 scripts: Some(Arc::new(PwshHost::locate())),
             },
         )

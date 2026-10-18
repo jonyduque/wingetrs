@@ -178,6 +178,7 @@ fn install_flags_parse() {
             dry_run: true,
             yes: true,
             allow_msiexec: false,
+            allow_scripts: false,
             scope: None
         })
     );
@@ -190,6 +191,7 @@ fn install_flags_parse() {
             dry_run: false,
             yes: false,
             allow_msiexec: false,
+            allow_scripts: false,
             scope: None
         })
     );
@@ -215,7 +217,8 @@ fn uninstall_flags_parse() {
             target: "x".into(),
             purge: true,
             dry_run: true,
-            yes: false
+            yes: false,
+            allow_scripts: false
         })
     );
 }
@@ -232,7 +235,8 @@ fn upgrade_flags_parse_and_all_excludes_a_target() {
             keep: true,
             dry_run: false,
             yes: true,
-            allow_msiexec: false
+            allow_msiexec: false,
+            allow_scripts: false
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "upgrade", "x"]).unwrap();
@@ -244,7 +248,8 @@ fn upgrade_flags_parse_and_all_excludes_a_target() {
             keep: false,
             dry_run: false,
             yes: false,
-            allow_msiexec: false
+            allow_msiexec: false,
+            allow_scripts: false
         })
     );
     assert!(Cli::try_parse_from(["wingetrs", "upgrade", "x", "--all"]).is_err());

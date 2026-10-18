@@ -140,6 +140,23 @@ pub enum AllowMsiexec {
     App(String),
 }
 
+/// What the user authorized for one `apply`/`uninstall`: the `msiexec /a` fallback and
+/// third-party code of the manifest (hooks, `installer`/`uninstaller` files). CLI:
+/// `--allow-msiexec` and `--allow-scripts`, never implied by `--yes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Allow {
+    pub msiexec: AllowMsiexec,
+    pub scripts: bool,
+}
+
+/// What [`uninstall_with`] returns: the residues to offer and the notes for the user (e.g.
+/// the app's uninstaller did not run because its written manifest was altered).
+#[derive(Debug, Default)]
+pub struct Uninstalled {
+    pub residues: Vec<Residue>,
+    pub notes: Vec<String>,
+}
+
 impl AllowMsiexec {
     pub fn allows(&self, app: &str) -> bool {
         match self {
@@ -273,6 +290,7 @@ fn exec_ctx<'a>(
     layout: &'a Layout,
     state: &'a mut StateDb,
     msiexec: Option<Msiexec>,
+    allow: &Allow,
 ) -> ExecCtx<'a> {
     ExecCtx {
         layout,
@@ -285,10 +303,18 @@ fn exec_ctx<'a>(
         in_use: ctx.in_use,
         msiexec,
         launch: ctx.launch.clone(),
-        // No production path grants consent to third-party code before Task 161.
+        // Third-party code runs only with the user's consent (`--allow-scripts`).
         runners: executor::Runners {
-            installer: None,
-            scripts: None,
+            installer: if allow.scripts {
+                ctx.runners.installer
+            } else {
+                None
+            },
+            scripts: if allow.scripts {
+                ctx.runners.scripts.clone()
+            } else {
+                None
+            },
             ..ctx.runners.clone()
         },
     }
@@ -661,11 +687,25 @@ pub async fn apply(ctx: &OpsCtx<'_>, plans: &[InstallPlan]) -> Result<(), OpsErr
     apply_allowing(ctx, plans, &AllowMsiexec::No).await
 }
 
-/// [`apply`] where the apps `allow` names may fall back to `msiexec /a`.
+/// [`apply`] where the apps `allow` names may fall back to `msiexec /a` (no third-party code).
 pub async fn apply_allowing(
     ctx: &OpsCtx<'_>,
     plans: &[InstallPlan],
     allow: &AllowMsiexec,
+) -> Result<(), OpsError> {
+    let allow = Allow {
+        msiexec: allow.clone(),
+        scripts: false,
+    };
+    apply_with(ctx, plans, &allow).await
+}
+
+/// [`apply`] with what the user authorized; without `allow.scripts` a plan running
+/// third-party code fails with `NeedsScriptConsent` before any step.
+pub async fn apply_with(
+    ctx: &OpsCtx<'_>,
+    plans: &[InstallPlan],
+    allow: &Allow,
 ) -> Result<(), OpsError> {
     let targets = plans
         .last()
@@ -695,11 +735,25 @@ pub async fn apply_groups(
     apply_groups_allowing(ctx, groups, &AllowMsiexec::No).await
 }
 
-/// [`apply_groups`] where the apps `allow` names may fall back to `msiexec /a`.
+/// [`apply_groups`] where the apps `allow` names may fall back to `msiexec /a` (no
+/// third-party code).
 pub async fn apply_groups_allowing(
     ctx: &OpsCtx<'_>,
     groups: Vec<Vec<InstallPlan>>,
     allow: &AllowMsiexec,
+) -> Result<Vec<InstallPlan>, OpsError> {
+    let allow = Allow {
+        msiexec: allow.clone(),
+        scripts: false,
+    };
+    apply_groups_with(ctx, groups, &allow).await
+}
+
+/// [`apply_groups`] with what the user authorized (see [`apply_with`]).
+pub async fn apply_groups_with(
+    ctx: &OpsCtx<'_>,
+    groups: Vec<Vec<InstallPlan>>,
+    allow: &Allow,
 ) -> Result<Vec<InstallPlan>, OpsError> {
     let targets = groups
         .iter()
@@ -743,7 +797,7 @@ async fn apply_with_targets(
     ctx: &OpsCtx<'_>,
     plans: &[InstallPlan],
     targets: &std::collections::HashSet<String>,
-    allow: &AllowMsiexec,
+    allow: &Allow,
 ) -> Result<(), OpsError> {
     // A live line from the first instant: the lock wait and the cache checks are silent.
     (ctx.progress)(&ProgressEvent::Phase(Phase::Preparing));
@@ -770,8 +824,8 @@ async fn apply_with_targets(
     let mut result = Ok(());
     let mut applied: Vec<String> = Vec::new();
     for plan in plans {
-        let msiexec = allow.allows(&plan.app).then_some(ctx.msiexec);
-        let mut exec = exec_ctx(ctx, &layout, &mut state, msiexec);
+        let msiexec = allow.msiexec.allows(&plan.app).then_some(ctx.msiexec);
+        let mut exec = exec_ctx(ctx, &layout, &mut state, msiexec, allow);
         let step_span = tracing::debug_span!("install.execute", app = %plan.app);
         if let Err(e) = executor::execute_install(plan, &mut exec)
             .instrument(step_span)
@@ -858,29 +912,59 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
     let plan = UninstallPlan::from_state(&state, app, purge)?
         .ok_or_else(|| OpsError::NotInstalled(app.to_string()))?;
     refuse_if_needed(ctx, &state, &plan.app)?;
-    if let Some((rec, _)) = state.get(&plan.app)? {
-        let layout = layout(ctx);
-        // An altered written manifest does not stop the removal: no script runs (the executor
-        // says so in a note), so there is nothing to scan.
-        let raw = state::installed_manifest(&layout, &plan.app, &rec.version, &rec.manifest_sha256)
-            .ok()
-            .flatten();
-        let arch = rec
-            .arch
-            .as_deref()
-            .and_then(executor::arch_of_key)
-            .unwrap_or_else(Arch::host);
-        if let Some(m) = raw.and_then(|raw| manifest::resolve(&raw, arch).ok()) {
-            planner::check_uninstall_scripts(&m)?;
-        }
+    if let Some(m) = recorded_manifest(ctx, &state, &plan.app)? {
+        planner::check_uninstall_scripts(&m)?;
     }
     Ok(plan)
+}
+
+/// The written manifest of the installed `app`: `None` when it is absent, altered or
+/// unresolvable. An altered one does not stop the removal: no script runs (the executor says
+/// so in a note), so there is nothing to scan or to consent to.
+fn recorded_manifest(
+    ctx: &OpsCtx<'_>,
+    state: &StateDb,
+    app: &str,
+) -> Result<Option<Resolved>, OpsError> {
+    let Some((rec, _)) = state.get(app)? else {
+        return Ok(None);
+    };
+    let layout = layout(ctx);
+    let raw = state::installed_manifest(&layout, app, &rec.version, &rec.manifest_sha256)
+        .ok()
+        .flatten();
+    let arch = rec
+        .arch
+        .as_deref()
+        .and_then(executor::arch_of_key)
+        .unwrap_or_else(Arch::host);
+    Ok(raw.and_then(|raw| manifest::resolve(&raw, arch).ok()))
+}
+
+/// The written manifest of `plan`'s app (see [`recorded_manifest`]): its removal runs the
+/// third-party code in it (`pre_uninstall`, `uninstaller`, `post_uninstall`).
+pub fn uninstall_manifest(
+    ctx: &OpsCtx<'_>,
+    plan: &UninstallPlan,
+) -> Result<Option<Resolved>, OpsError> {
+    let state = read_state(&layout(ctx))?;
+    recorded_manifest(ctx, &state, &plan.app)
 }
 
 /// Uninstalls under `install.lock` (dependents are checked here and files in use by the
 /// executor, both before anything changes), broadcasts the environment change once, and returns the
 /// classified residues; the caller confirms and calls `residue::clean`.
 pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>, OpsError> {
+    Ok(uninstall_with(ctx, plan, false)?.residues)
+}
+
+/// [`uninstall`] where `scripts` grants consent to the app's uninstall code (hooks,
+/// `uninstaller`); also returns the executor's notes for the user.
+pub fn uninstall_with(
+    ctx: &OpsCtx<'_>,
+    plan: &UninstallPlan,
+    scripts: bool,
+) -> Result<Uninstalled, OpsError> {
     // Deleting a large app folder takes a while: a live line from the lock wait on.
     (ctx.progress)(&ProgressEvent::Phase(Phase::Removing {
         app: plan.app.clone(),
@@ -903,18 +987,24 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     let env = ctx.effects.env;
     let before = env_snapshot(env, &names)?;
     let result = {
-        let mut exec = exec_ctx(ctx, &layout, &mut state, None);
+        let allow = Allow {
+            msiexec: AllowMsiexec::No,
+            scripts,
+        };
+        let mut exec = exec_ctx(ctx, &layout, &mut state, None, &allow);
         tracing::debug_span!("uninstall.execute")
             .in_scope(|| executor::execute_uninstall(plan, &mut exec))
     };
     tracing::debug_span!("uninstall.broadcast")
         .in_scope(|| broadcast_if_changed(env, &names, &before));
-    for note in result? {
+    let notes = result?;
+    for note in &notes {
         tracing::warn!("{}: {note}", plan.app);
     }
     (ctx.progress)(&ProgressEvent::Phase(Phase::Scanning));
-    Ok(tracing::debug_span!("uninstall.residue_scan")
-        .in_scope(|| scan_residues(ctx, &app_dir, &plan.app, homepage.as_deref())))
+    let residues = tracing::debug_span!("uninstall.residue_scan")
+        .in_scope(|| scan_residues(ctx, &app_dir, &plan.app, homepage.as_deref()));
+    Ok(Uninstalled { residues, notes })
 }
 
 fn homepage_of(catalog: &Catalog, rec: &AppRecord) -> Result<Option<String>, OpsError> {

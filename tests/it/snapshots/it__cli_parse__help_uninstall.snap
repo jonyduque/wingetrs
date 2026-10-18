@@ -23,6 +23,9 @@ Opções:
       --yes
           Não pergunta nada (limpa só resíduos de confiança alta)
 
+      --allow-scripts
+          Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

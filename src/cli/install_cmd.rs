@@ -11,7 +11,7 @@ use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::picker::PickerItem;
 use crate::tui::theme::Glyphs;
 use anyhow::bail;
-use output::Phases;
+use output::{Phases, ThirdParty};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -420,16 +420,55 @@ pub struct Flags {
     /// `--allow-msiexec`: an MSI the own extractor refuses may use `msiexec /a`. Never
     /// implied by `--yes`.
     pub allow_msiexec: bool,
+    /// `--allow-scripts`: the manifest's third-party code (hooks, installer and uninstaller
+    /// files) may run, after being shown. Never implied by `--yes`.
+    pub allow_scripts: bool,
 }
 
 impl Flags {
-    fn allow(self) -> AllowMsiexec {
-        if self.allow_msiexec {
-            AllowMsiexec::All
-        } else {
-            AllowMsiexec::No
+    fn allow(self) -> ops::Allow {
+        ops::Allow {
+            msiexec: if self.allow_msiexec {
+                AllowMsiexec::All
+            } else {
+                AllowMsiexec::No
+            },
+            scripts: self.allow_scripts,
         }
     }
+}
+
+/// Shows the operation's third-party code (with `--dry-run` or `--allow-scripts`) and,
+/// unless it is a dry run, refuses it without `--allow-scripts`, even with `--yes`.
+fn third_party_gate(code: &[(String, Vec<ThirdParty>)], f: Flags) -> anyhow::Result<()> {
+    let needs_scripts = !code.is_empty();
+    if needs_scripts && (f.dry_run || f.allow_scripts) {
+        for (app, items) in code {
+            if code.len() > 1 {
+                anstream::println!("{}:", style::paint(style::NAME, app));
+            }
+            anstream::print!("{}", output::third_party_block(items));
+        }
+    }
+    if f.dry_run {
+        return Ok(());
+    }
+    if needs_scripts && !f.allow_scripts {
+        let apps: Vec<&str> = code.iter().map(|(app, _)| app.as_str()).collect();
+        let items = code.iter().flat_map(|(_, items)| items);
+        bail!("{}", output::third_party_refusal(&apps, items));
+    }
+    Ok(())
+}
+
+/// The plans that run third-party code, with that code.
+fn plans_code<'a>(
+    plans: impl Iterator<Item = &'a crate::install::plan::InstallPlan>,
+) -> Vec<(String, Vec<ThirdParty>)> {
+    plans
+        .map(|p| (p.app.clone(), output::plan_third_party(p)))
+        .filter(|(_, items)| !items.is_empty())
+        .collect()
 }
 
 /// Asks to proceed: `--yes` skips, no terminal without `--yes` is an error.
@@ -471,12 +510,14 @@ pub async fn execute(
             dry_run,
             yes,
             allow_msiexec,
+            allow_scripts,
             scope,
         } => {
             let f = Flags {
                 yes,
                 dry_run,
                 allow_msiexec,
+                allow_scripts,
             };
             install(ctx, ui, &target, bucket.as_deref(), scope, f, stop, winget).await
         }
@@ -485,11 +526,13 @@ pub async fn execute(
             purge,
             dry_run,
             yes,
+            allow_scripts,
         } => {
             let f = Flags {
                 yes,
                 dry_run,
                 allow_msiexec: false,
+                allow_scripts,
             };
             uninstall(ctx, ui, &target, purge, f, stop, winget)
         }
@@ -500,11 +543,13 @@ pub async fn execute(
             dry_run,
             yes,
             allow_msiexec,
+            allow_scripts,
         } => {
             let f = Flags {
                 yes,
                 dry_run,
                 allow_msiexec,
+                allow_scripts,
             };
             upgrade(ctx, ui, target.as_deref(), all, keep, f, stop, winget).await
         }
@@ -659,6 +704,7 @@ async fn install(
     }
     let plans = ops::plan_for(ctx, &cand, false)?;
     print_plans(ctx, ui, &plans, f);
+    third_party_gate(&plans_code(plans.iter()), f)?;
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
@@ -670,9 +716,7 @@ async fn install(
     // Held from before `job.start` until after `job.end`: the log always gets its end.
     stop.interrupts.hold();
     let log = JobLog::start(JobInfo::for_plans("install", &plans));
-    let applied = stop
-        .run(ui, ops::apply_allowing(ctx, &plans, &f.allow()))
-        .await;
+    let applied = stop.run(ui, ops::apply_with(ctx, &plans, &f.allow())).await;
     ui.end_progress();
     let Some(applied) = applied else {
         let r = cancelled(log);
@@ -716,6 +760,13 @@ fn uninstall(
         "{}",
         output::uninstall_plan_text(&plan, &ctx.data.install_layout(), ui.glyphs())
     );
+    let code: Vec<_> = ops::uninstall_manifest(ctx, &plan)?
+        .map(|m| output::removal_third_party(&m, ""))
+        .filter(|items| !items.is_empty())
+        .map(|items| (plan.app.clone(), items))
+        .into_iter()
+        .collect();
+    third_party_gate(&code, f)?;
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
@@ -736,18 +787,21 @@ fn uninstall(
         to: None,
         cmd: None,
     });
-    let removed = ops::uninstall(ctx, &plan);
+    let removed = ops::uninstall_with(ctx, &plan, f.allow_scripts);
     ui.end_progress();
     finish_log(log, &removed, "removido");
     stop.interrupts.release();
-    let residues = removed?;
+    let removed = removed?;
     anstream::println!(
         "{} {} {}",
         style::paint(style::OK, "Desinstalado:"),
         plan.app,
         plan.version
     );
-    clean_residues(ctx, ui, &plan.app, &residues, f.yes)
+    for note in &removed.notes {
+        anstream::eprintln!("{} {note}", style::paint(style::WARN, "aviso:"));
+    }
+    clean_residues(ctx, ui, &plan.app, &removed.residues, f.yes)
 }
 
 fn clean_residues(
@@ -893,6 +947,7 @@ async fn upgrade(
     for g in &groups {
         print_plans(ctx, ui, g, f);
     }
+    third_party_gate(&plans_code(groups.iter().flatten()), f)?;
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
@@ -904,7 +959,7 @@ async fn upgrade(
     stop.interrupts.hold();
     let log = JobLog::start(JobInfo::for_plans("upgrade", groups.iter().flatten()));
     let applied = stop
-        .run(ui, ops::apply_groups_allowing(ctx, groups, &f.allow()))
+        .run(ui, ops::apply_groups_with(ctx, groups, &f.allow()))
         .await;
     ui.end_progress();
     let Some(applied) = applied else {
