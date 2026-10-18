@@ -28,7 +28,7 @@ O orquestrador (sessão principal) **não implementa**. Ele despacha, audita e i
 ## Paralelismo
 
 - Tarefas que tocam arquivos disjuntos podem rodar em paralelo; avise cada agente dos arquivos do outro e proíba `git add -A`.
-- Teste novo em `tests/it/<modulo>.rs`: antes de despachar, crie o arquivo só com uma linha `//! <assunto> (Task N).` (vazio, o `cargo fmt` acrescenta um CRLF e o gate falha) e a linha `mod <modulo>;` em `tests/it/main.rs` e faça commit; senão duas tarefas em paralelo dividem o `main.rs`. Para registrar `mod`, insira depois de uma âncora; nunca reordene um bloco que tem atributos (`#[cfg(windows)]`, `#[allow]` do `spans`, `pub(crate) mod`): o atributo passa para a linha errada (aconteceu duas vezes em 2026-10-18).
+- Teste novo em `tests/it/<modulo>.rs`: antes de despachar, crie o arquivo com `#![allow(clippy::unwrap_used, clippy::expect_used)]` e uma linha `//! <assunto> (Task N).` (sem o allow, todo agente tropeça no clippy com `unwrap` em teste) (vazio, o `cargo fmt` acrescenta um CRLF e o gate falha) e a linha `mod <modulo>;` em `tests/it/main.rs` e faça commit; senão duas tarefas em paralelo dividem o `main.rs`. Para registrar `mod`, insira depois de uma âncora; nunca reordene um bloco que tem atributos (`#[cfg(windows)]`, `#[allow]` do `spans`, `pub(crate) mod`): o atributo passa para a linha errada (aconteceu duas vezes em 2026-10-18).
 - **Tarefas que medem tempo rodam sozinhas** — e nenhuma revisão com `cargo test` em paralelo a um benchmark.
 - Revisor é read-only e pode rodar junto com a próxima implementação se os arquivos não se cruzam.
 
