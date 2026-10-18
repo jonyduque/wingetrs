@@ -28,8 +28,9 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateDirectoryW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_TYPE_DISK, GetFileType,
-    SECURITY_IDENTIFICATION,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType, SECURITY_IDENTIFICATION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::{
@@ -236,10 +237,47 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// Opens the user's file `src` for reading as admin: the last component is never followed if
-/// it is a reparse point (refused), a server on the other end of a named pipe or device may only
-/// identify us, and anything but a disk file is refused.
+/// Opens every folder above `path`, from the volume root down, without following a reparse
+/// point (one is refused) and without delete sharing, so none can be renamed or swapped for a
+/// junction while the handles live. Each open resolves through the folders already held.
+fn hold_plain_folders(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    let mut dirs: Vec<&Path> = path
+        .ancestors()
+        .skip(1)
+        .filter(|d| !d.as_os_str().is_empty())
+        .collect();
+    dirs.reverse();
+    let mut held = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let f = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(dir)?;
+        let meta = f.metadata()?;
+        if meta.file_attributes() & REPARSE != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} é um ponto de reanálise", dir.display()),
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(std::io::Error::other(format!(
+                "{} não é uma pasta",
+                dir.display()
+            )));
+        }
+        held.push(f);
+    }
+    Ok(held)
+}
+
+/// Opens the user's file `src` for reading as admin: no component of the path is followed if
+/// it is a reparse point (refused; the folders are held while the file opens), a server on the
+/// other end of a named pipe or device may only identify us, anything but a disk file is
+/// refused, and so is a file with another hard link (it may be a name of a file elsewhere).
 pub fn open_source(src: &Path) -> std::io::Result<std::fs::File> {
+    let _folders = hold_plain_folders(src)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
@@ -257,6 +295,16 @@ pub fn open_source(src: &Path) -> std::io::Result<std::fs::File> {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "o instalador não é um arquivo em disco",
+        ));
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: a valid handle owned by `file` and an output structure.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(|e| io_err(&e))?;
+    if info.nNumberOfLinks > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "o instalador tem outro vínculo físico (hard link)",
         ));
     }
     Ok(file)
@@ -552,6 +600,26 @@ pub fn run_staged(
         Err(e) => on_line(&format!("log do instalador ilegível: {e}")),
     }
     Ok(code)
+}
+
+/// Runs the helper's fixed tool (winget) at the absolute path `program` from `dir` with
+/// `installer_env` and `TEMP`/`TMP` in a fresh execution folder under `root` (created with
+/// `sddl`, removed after): nothing comes from this process's (the user's) environment.
+pub fn run_tool(
+    program: &Path,
+    args: &[String],
+    dir: &Path,
+    root: &Path,
+    sddl: &str,
+    sys: &SystemEnv,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    let run = RunDir::create(root, sddl)?;
+    let tmp = run.path().join(TMP_NAME);
+    create_dir_with(&tmp, sddl)?;
+    let out = super::spawn_win::run_in_env(program, args, dir, &installer_env(sys, &tmp), on_line);
+    drop(run);
+    out
 }
 
 /// The helper's `RunInstaller`: stages `req` under the production root (from the known folder)

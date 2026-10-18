@@ -107,13 +107,54 @@ pub fn install_args(
     if upgrade {
         parts.extend(present(&sw.upgrade));
     }
-    let args = parts.join(" ");
+    let mut args = parts.join(" ");
+    if matches!(kind, InstallerKind::Inno) {
+        args = dedupe_tokens(&args);
+    }
     validate(&args)?;
     let program = match kind {
         InstallerKind::Msi | InstallerKind::Wix => Program::Msiexec,
         _ => Program::Installer,
     };
     Ok(CommandLine { program, args })
+}
+
+/// `args` without the tokens (split on spaces outside quotes) already seen earlier, compared
+/// without case: a manifest that repeats an Inno switch (`/CurrentUser ... /CURRENTUSER`) keeps
+/// the first. Inno switches are single tokens, so no value is left behind.
+fn dedupe_tokens(args: &str) -> String {
+    let mut tokens: Vec<&str> = Vec::new();
+    let mut start = None;
+    let mut quoted = false;
+    for (i, c) in args.char_indices() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                start.get_or_insert(i);
+            }
+            ' ' | '\t' if !quoted => {
+                if let Some(s) = start.take() {
+                    tokens.push(&args[s..i]);
+                }
+            }
+            _ => {
+                start.get_or_insert(i);
+            }
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&args[s..]);
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for t in tokens {
+        let low = t.to_lowercase();
+        if !seen.contains(&low) {
+            seen.push(low);
+            kept.push(t);
+        }
+    }
+    kept.join(" ")
 }
 
 pub fn fill_log(args: &str, log: &Path) -> Result<String, ArgsError> {
@@ -127,7 +168,23 @@ pub fn fill_log(args: &str, log: &Path) -> Result<String, ArgsError> {
             "caminho de log termina em barra invertida",
         ));
     }
-    Ok(args.replace(LOG_TOKEN, &p))
+    // A bare placeholder gets its own quotes: the log folder may hold a space
+    // (`C:\Program Files\wingetrs\staging\...`) and the path must stay one argument.
+    let mut out = String::with_capacity(args.len() + p.len() + 2);
+    let mut rest = args;
+    while let Some(i) = rest.find(LOG_TOKEN) {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + LOG_TOKEN.len()..];
+        if out.ends_with('"') && rest.starts_with('"') {
+            out.push_str(&p);
+        } else {
+            out.push('"');
+            out.push_str(&p);
+            out.push('"');
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 pub fn msiexec_params(file: &Path, args: &str) -> String {

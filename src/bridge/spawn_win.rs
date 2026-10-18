@@ -199,6 +199,35 @@ pub fn run_in(
     )
 }
 
+/// `run_in` with the whole environment given by `env` (`env_clear` first: nothing comes from
+/// this process's environment). For the elevated helper's winget (Task 190).
+pub fn run_in_env(
+    program: &Path,
+    args: &[String],
+    dir: &Path,
+    env: &[(OsString, OsString)],
+    on_line: impl FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    if !program.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "caminho do programa precisa ser absoluto",
+        ));
+    }
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(dir)
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k, v)));
+    run_command(
+        cmd,
+        &program.display().to_string(),
+        PIPE_GRACE,
+        utf8_lossy,
+        on_line,
+    )
+}
+
 /// Everything `run_spec` needs: an absolute program, its arguments and working dir, the
 /// environment changes (applied over the inherited one), the line decoder and the pipe grace.
 pub struct RunSpec<'a> {
@@ -315,6 +344,252 @@ fn run_command(
         None => child.wait()?.code().unwrap_or(-1),
     };
     Ok((code, tail.lines()))
+}
+
+/// How often `run_in_job` looks at the job while it waits.
+const JOB_POLL: Duration = Duration::from_millis(50);
+/// Most process ids read from the job in one look.
+const JOB_PIDS_MAX: usize = 256;
+
+/// `h` owned (closed on drop).
+fn owned(h: windows::Win32::Foundation::HANDLE) -> std::os::windows::io::OwnedHandle {
+    use std::os::windows::io::FromRawHandle;
+    // SAFETY: `h` is a fresh handle this process owns and closes only through the result.
+    unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(h.0) }
+}
+
+fn handle(h: &std::os::windows::io::OwnedHandle) -> windows::Win32::Foundation::HANDLE {
+    windows::Win32::Foundation::HANDLE(h.as_raw_handle())
+}
+
+fn win_err(e: windows::core::Error) -> std::io::Error {
+    let code = e.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        std::io::Error::other(e.to_string())
+    }
+}
+
+/// `env` as a `CREATE_UNICODE_ENVIRONMENT` block, sorted by name without case.
+fn env_block(env: &[(OsString, OsString)]) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut pairs: Vec<&(OsString, OsString)> = env.iter().collect();
+    pairs.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
+    let mut block = Vec::new();
+    for (k, v) in pairs {
+        let (k, v): (Vec<u16>, Vec<u16>) = (k.encode_wide().collect(), v.encode_wide().collect());
+        if k.is_empty() || k.contains(&0) || k[1..].contains(&u16::from(b'=')) || v.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "variável de ambiente inválida",
+            ));
+        }
+        block.extend(k);
+        block.push(u16::from(b'='));
+        block.extend(v);
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
+}
+
+/// Active processes of `job` and the ids it lists (at most `JOB_PIDS_MAX`; best effort).
+fn job_state(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<(u32, Vec<u32>)> {
+    use windows::Win32::System::JobObjects::{
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+        JobObjectBasicProcessIdList, QueryInformationJobObject,
+    };
+    let mut acct = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: `acct` is the structure of this class, with its size.
+    unsafe {
+        QueryInformationJobObject(
+            Some(handle(job)),
+            JobObjectBasicAccountingInformation,
+            (&raw mut acct).cast(),
+            std::mem::size_of_val(&acct) as u32,
+            None,
+        )
+    }
+    .map_err(win_err)?;
+    // Header (two u32) then the ids, `usize` each.
+    let head = 8usize.div_ceil(std::mem::size_of::<usize>());
+    let mut buf = vec![0usize; head + JOB_PIDS_MAX];
+    // SAFETY: `buf` is writable and aligned for JOBOBJECT_BASIC_PROCESS_ID_LIST, with its size.
+    let listed = unsafe {
+        QueryInformationJobObject(
+            Some(handle(job)),
+            JobObjectBasicProcessIdList,
+            buf.as_mut_ptr().cast(),
+            (buf.len() * std::mem::size_of::<usize>()) as u32,
+            None,
+        )
+    };
+    let pids = match listed {
+        Ok(()) => {
+            // SAFETY: the second u32 of the header, written by the call.
+            let n = unsafe { *buf.as_ptr().cast::<u32>().add(1) } as usize;
+            buf.iter()
+                .skip(head)
+                .take(n.min(JOB_PIDS_MAX))
+                .map(|&p| p as u32)
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    Ok((acct.ActiveProcesses, pids))
+}
+
+/// When `h` exited (100 ns units) and its exit code.
+fn exit_of(h: &std::os::windows::io::OwnedHandle) -> Option<(u64, u32)> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes};
+    let (mut c, mut e, mut k, mut u) = Default::default();
+    // SAFETY: valid handle and four FILETIME outputs.
+    unsafe { GetProcessTimes(handle(h), &mut c, &mut e, &mut k, &mut u) }.ok()?;
+    let mut code = 0u32;
+    // SAFETY: valid handle and a u32 output.
+    unsafe { GetExitCodeProcess(handle(h), &mut code) }.ok()?;
+    let e: FILETIME = e;
+    Some((
+        (u64::from(e.dwHighDateTime) << 32) | u64::from(e.dwLowDateTime),
+        code,
+    ))
+}
+
+/// Runs `"<program>" <args>` from `dir` with exactly `env`, stdin/stdout/stderr on `NUL`, inside
+/// a new job object (created suspended, assigned, then resumed, so no child escapes it), and
+/// waits until **every** process of the job ended: an NSIS/Inno uninstaller that copies itself
+/// to `TEMP` and exits is waited for through its copy. The exit code is the one of the
+/// process of the job that ended last (the copy, for those uninstallers; the program itself
+/// when it was alone), as `u32` bits in an `i32`.
+pub fn run_in_job(
+    program: &Path,
+    args: &str,
+    dir: &Path,
+    env: &[(OsString, OsString)],
+) -> std::io::Result<i32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    };
+    use windows::Win32::System::Threading::{
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, OpenProcess,
+        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOW, TerminateProcess,
+    };
+    use windows::core::{HSTRING, PWSTR};
+    let shown = program.display().to_string();
+    if !program.is_absolute() || shown.contains('"') || args.contains('\0') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "programa ou argumentos inválidos",
+        ));
+    }
+    let block = env_block(env)?;
+    // SAFETY: an unnamed job with default security.
+    let job = owned(unsafe { CreateJobObjectW(None, &HSTRING::new()) }.map_err(win_err)?);
+    let nul = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")?;
+    let nul_h = windows::Win32::Foundation::HANDLE(nul.as_raw_handle());
+    // SAFETY: a valid handle owned by `nul`.
+    unsafe { SetHandleInformation(nul_h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .map_err(win_err)?;
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdInput: nul_h,
+        hStdOutput: nul_h,
+        hStdError: nul_h,
+        ..Default::default()
+    };
+    let line = if args.is_empty() {
+        format!("\"{shown}\"")
+    } else {
+        format!("\"{shown}\" {args}")
+    };
+    let mut line: Vec<u16> = std::ffi::OsStr::new(&line)
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut pi = PROCESS_INFORMATION::default();
+    // SAFETY: every pointer outlives the call; `line` is writable and NUL-terminated; `block`
+    // is a double-NUL-terminated UTF-16 environment.
+    unsafe {
+        CreateProcessW(
+            &HSTRING::from(program.as_os_str()),
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            true,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            Some(block.as_ptr().cast()),
+            &HSTRING::from(dir.as_os_str()),
+            &si,
+            &mut pi,
+        )
+    }
+    .map_err(win_err)?;
+    drop(nul);
+    let process = owned(pi.hProcess);
+    let thread = owned(pi.hThread);
+    let kill = |e: std::io::Error| {
+        // SAFETY: valid handle; the suspended process never ran.
+        let _ = unsafe { TerminateProcess(handle(&process), 1) };
+        e
+    };
+    // SAFETY: valid job and process handles.
+    unsafe { AssignProcessToJobObject(handle(&job), handle(&process)) }
+        .map_err(|e| kill(win_err(e)))?;
+    // SAFETY: valid thread handle.
+    if unsafe { ResumeThread(handle(&thread)) } == u32::MAX {
+        return Err(kill(std::io::Error::last_os_error()));
+    }
+    drop(thread);
+    let mut seen = vec![process];
+    let mut pids = std::collections::HashSet::new();
+    pids.insert(pi.dwProcessId);
+    loop {
+        let (active, listed) = job_state(&job)?;
+        for pid in listed {
+            if !pids.insert(pid) {
+                continue;
+            }
+            // SAFETY: plain open by id; the handle is checked to be in the job below.
+            let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
+            else {
+                continue;
+            };
+            let h = owned(h);
+            let mut inside = windows::core::BOOL(0);
+            // SAFETY: valid handles and a BOOL output.
+            if unsafe { IsProcessInJob(handle(&h), Some(handle(&job)), &mut inside) }.is_ok()
+                && inside.as_bool()
+            {
+                seen.push(h);
+            }
+        }
+        if active == 0 {
+            break;
+        }
+        std::thread::sleep(JOB_POLL);
+    }
+    let mut last: Option<(u64, u32)> = None;
+    for h in &seen {
+        if let Some((at, code)) = exit_of(h)
+            && last.is_none_or(|(t, _)| at >= t)
+        {
+            last = Some((at, code));
+        }
+    }
+    let (_, code) = last.ok_or_else(|| std::io::Error::other("código de saída ilegível"))?;
+    Ok(code as i32)
 }
 
 #[cfg(test)]

@@ -176,3 +176,71 @@ fn no_command_line_types() {
         );
     }
 }
+
+/// Task 190: a bare `<LOGPATH>` gets its own quotes, so a log path with a space stays one
+/// argument; an already quoted one is not quoted twice.
+#[test]
+fn bare_log_placeholder_refused_or_quoted() {
+    let log = Path::new(r"C:\Program Files\wingetrs\staging\ab\install.log");
+    let cases = [
+        (
+            "/LOG=<LOGPATH>",
+            r#"/LOG="C:\Program Files\wingetrs\staging\ab\install.log""#,
+        ),
+        (
+            "/log <LOGPATH>",
+            r#"/log "C:\Program Files\wingetrs\staging\ab\install.log""#,
+        ),
+        (
+            "/out:<LOGPATH> /S",
+            r#"/out:"C:\Program Files\wingetrs\staging\ab\install.log" /S"#,
+        ),
+        (
+            r#"/LOG="<LOGPATH>""#,
+            r#"/LOG="C:\Program Files\wingetrs\staging\ab\install.log""#,
+        ),
+        (
+            r#"/a "<LOGPATH>" /b <LOGPATH>"#,
+            r#"/a "C:\Program Files\wingetrs\staging\ab\install.log" /b "C:\Program Files\wingetrs\staging\ab\install.log""#,
+        ),
+        ("/S", "/S"),
+    ];
+    for (args, want) in cases {
+        assert_eq!(fill_log(args, log).unwrap(), want, "{args}");
+    }
+    // A bare placeholder at the end still refuses a trailing backslash (it would escape the
+    // closing quote added).
+    assert!(fill_log("/LOG=<LOGPATH>", Path::new(r"C:\logs\")).is_err());
+}
+
+/// Task 190 addendum: an Inno switch repeated by the manifest (any case) is passed once, the
+/// first spelling kept; other kinds are left as they are.
+#[test]
+fn inno_repeated_switch_passed_once() {
+    let s = InstallerSwitches {
+        silent: Some("/VERYSILENT /CurrentUser".into()),
+        custom: Some("/CURRENTUSER /MERGETASKS=!desktopicon".into()),
+        ..sw()
+    };
+    assert_eq!(
+        args(&InstallerKind::Inno, &s, Mode::Silent, false).args,
+        r#"/VERYSILENT /CurrentUser /LOG="<LOGPATH>" /MERGETASKS=!desktopicon"#
+    );
+    let all = InstallerSwitches {
+        custom: Some("/ALLUSERS /AllUsers".into()),
+        ..sw()
+    };
+    assert_eq!(
+        args(&InstallerKind::Inno, &all, Mode::Silent, false).args,
+        r#"/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="<LOGPATH>" /ALLUSERS"#
+    );
+    let exe = InstallerSwitches {
+        silent: Some("/S".into()),
+        custom: Some("/x /X".into()),
+        ..sw()
+    };
+    assert_eq!(
+        args(&InstallerKind::Exe, &exe, Mode::Silent, false).args,
+        "/S /x /X"
+    );
+}

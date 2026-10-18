@@ -26,6 +26,14 @@ fn kf() -> KnownFolders {
     }
 }
 
+/// Owner SYSTEM, full access for SYSTEM and Administrators only (`sddl_admin_only` passes).
+const ADMIN_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+/// Every folder is administrator-only (the DACL injection point of `still_orphan`).
+fn admin_sddl(_: &Path) -> Option<String> {
+    Some(ADMIN_SDDL.to_string())
+}
+
 fn entry(hive: Hive, key: &str) -> ArpDetails {
     ArpDetails {
         hive,
@@ -155,7 +163,7 @@ impl WorkerOps for FakeOps {
             return Ok(ArpDelete::Missing);
         };
         let files = self.files.clone();
-        if !confirm(&d, &|p: &Path| files.iter().any(|f| f == p)) {
+        if !confirm(&d, &|p: &Path| files.iter().any(|f| f == p), &admin_sddl) {
             return Ok(ArpDelete::Kept);
         }
         self.deleted.push((hive, key.to_string()));
@@ -285,14 +293,27 @@ fn still_orphan_and_duplicate_rules() {
         uninstall_string: Some(r#""%ProgramFiles%\gone\u.exe" /S"#.into()),
         ..entry(Hive::MachineX86, "gone")
     };
-    assert!(still_orphan(&d, &k, |_| false));
-    assert!(!still_orphan(&d, &k, |p| p == Path::new(r"C:\PF\gone\u.exe")));
+    assert!(still_orphan(&d, &k, |_| false, admin_sddl));
+    assert!(!still_orphan(
+        &d,
+        &k,
+        |p| p == Path::new(r"C:\PF\gone\u.exe"),
+        admin_sddl
+    ));
     let user_var = ArpDetails {
         uninstall_string: Some(r"%LOCALAPPDATA%\gone\u.exe".into()),
         ..entry(Hive::MachineX86, "gone")
     };
-    assert!(!still_orphan(&user_var, &k, |_| false), "unknown variable");
-    assert!(!still_orphan(&entry(Hive::MachineX86, "x"), &k, |_| false));
+    assert!(
+        !still_orphan(&user_var, &k, |_| false, admin_sddl),
+        "unknown variable"
+    );
+    assert!(!still_orphan(
+        &entry(Hive::MachineX86, "x"),
+        &k,
+        |_| false,
+        admin_sddl
+    ));
 
     let me = named(Hive::MachineX86, "Kindle", "Amazon Kindle");
     assert!(!is_duplicate(&me, std::slice::from_ref(&me)), "itself");
@@ -780,6 +801,48 @@ fn live_delete_test_key() {
     assert!(bridge.shutdown(std::time::Duration::from_secs(5)));
     assert_eq!(r, Ok(()));
     assert!(read_details(Hive::MachineX86, key).unwrap().is_none());
+}
+
+/// Task 190: a missing uninstaller is an orphan only when the nearest existing folder above it
+/// is administrator-only; a folder another SID may write (or an unreadable DACL) is not.
+#[test]
+fn orphan_in_user_folder_is_not_orphan() {
+    let k = kf();
+    let d = ArpDetails {
+        uninstall_string: Some(r#""%ProgramFiles%\gone\sub\u.exe" /S"#.into()),
+        ..entry(Hive::MachineX86, "gone")
+    };
+    let user_writable = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)";
+    // `C:\PF` exists, `C:\PF\gone` does not: `C:\PF` is the folder checked.
+    let exists = |p: &Path| p == Path::new(r"C:\PF") || p == Path::new(r"C:\");
+    let seen = std::cell::RefCell::new(Vec::new());
+    let only_pf_admin = |p: &Path| {
+        seen.borrow_mut().push(p.to_path_buf());
+        let s = if p == Path::new(r"C:\PF") {
+            ADMIN_SDDL
+        } else {
+            user_writable
+        };
+        Some(s.to_string())
+    };
+    assert!(still_orphan(&d, &k, exists, only_pf_admin));
+    assert_eq!(*seen.borrow(), [PathBuf::from(r"C:\PF")]);
+    let pf_user = |p: &Path| {
+        let s = if p == Path::new(r"C:\PF") {
+            user_writable
+        } else {
+            ADMIN_SDDL
+        };
+        Some(s.to_string())
+    };
+    assert!(
+        !still_orphan(&d, &k, exists, pf_user),
+        "user-writable folder"
+    );
+    assert!(!still_orphan(&d, &k, exists, |_| None), "unreadable DACL");
+    // The nearest existing folder decides: with `C:\PF\gone` present, its DACL counts.
+    let gone_exists = |p: &Path| p == Path::new(r"C:\PF\gone") || p == Path::new(r"C:\PF");
+    assert!(!still_orphan(&d, &k, gone_exists, only_pf_admin));
 }
 
 /// Real descriptors read on this machine (Task 182 review), plus synthetic edge cases.
@@ -1344,4 +1407,56 @@ fn acl_trustees_no_user_holds() {
     assert!(sddl_admin_only(read_only, AclLevel::Parent));
     let full = r#"O:SYD:AI(XA;OICIID;FA;;;BU;(WIN://SYSAPPID Contains "x"))(A;ID;FA;;;SY)"#;
     assert!(!sddl_admin_only(full, AclLevel::Parent));
+}
+
+/// Task 190: an uninstaller that starts a copy of itself and exits is waited for through the
+/// job: the execution folder goes only after the copy ended, and the code is the copy's.
+#[cfg(windows)]
+mod job {
+    use tempfile::TempDir;
+    use wingetrs::bridge::arp_ops_win::run_waiting;
+    use wingetrs::bridge::staging_win::SystemEnv;
+
+    /// `RUN_SDDL` plus the owner (the unelevated test user), who may then write inside.
+    const TEST_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
+
+    #[test]
+    fn job_waits_for_copied_uninstaller() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let marker = dir.path().join("child-done.txt");
+        let child = dir.path().join("child.cmd");
+        // Sleeps ~1 s (two loopback pings), then records whether its TEMP still exists.
+        std::fs::write(
+            &child,
+            format!(
+                "@echo off\r\nping -n 2 127.0.0.1 >nul\r\n\
+                 if exist \"%TEMP%\\\" (echo tmp> \"{m}\") else (echo sem-tmp> \"{m}\")\r\n\
+                 exit /b 5\r\n",
+                m = marker.display()
+            ),
+        )
+        .unwrap();
+        let parent = dir.path().join("uninst.cmd");
+        std::fs::write(
+            &parent,
+            format!(
+                "@echo off\r\nstart \"\" /b cmd /d /c \"{}\"\r\nexit /b 3\r\n",
+                child.display()
+            ),
+        )
+        .unwrap();
+        let sys = SystemEnv::query().unwrap();
+        let cmd = sys.system32.join("cmd.exe");
+        let args = format!("/d /c \"{}\"", parent.display());
+        let code = run_waiting(&cmd, &args, dir.path(), &root, TEST_SDDL, &sys).unwrap();
+        let done = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(done.trim(), "tmp", "the copy ended before the folder went");
+        assert_eq!(code, 5, "the code of the process that ended last");
+        assert!(
+            std::fs::read_dir(&root).unwrap().next().is_none(),
+            "execution folder removed"
+        );
+    }
 }

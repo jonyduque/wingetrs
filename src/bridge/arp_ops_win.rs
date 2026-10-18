@@ -14,9 +14,7 @@ use std::io;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
@@ -27,7 +25,7 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetLongPathNameW, READ_CONTROL,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetLongPathNameW, READ_CONTROL,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_UserProfiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
@@ -157,7 +155,7 @@ pub fn delete_key(hive: MachineHive, key: &str, confirm: DeleteCheck<'_>) -> io:
         ));
     }
     let d = details_of(&child, hive, key);
-    if !confirm(&d, &exists) {
+    if !confirm(&d, &exists, &folder_sddl) {
         return Ok(ArpDelete::Kept);
     }
     child.delete_subkey_all("")?;
@@ -286,22 +284,45 @@ pub fn run_uninstaller(program: &Path, args: &str, also_checked: &[PathBuf]) -> 
         .parent()
         .ok_or_else(|| io::Error::other("desinstalador sem pasta"))?;
     let root = staging_root(&sys.program_files)?;
-    let run = RunDir::create(&root, RUN_SDDL)?;
+    let code = run_waiting(program, args, dir, &root, RUN_SDDL, &sys);
+    drop(held);
+    code
+}
+
+/// Runs `program args` from `dir` in a job object (see `spawn_win::run_in_job`) with
+/// `installer_env`, `TEMP` in a fresh execution folder under `root` (created with `sddl`). The
+/// folder is removed only after every process of the job ended: an uninstaller that copies
+/// itself to `TEMP` and exits keeps running from there. The exit code of the last process.
+pub fn run_waiting(
+    program: &Path,
+    args: &str,
+    dir: &Path,
+    root: &Path,
+    sddl: &str,
+    sys: &SystemEnv,
+) -> io::Result<i32> {
+    let run = RunDir::create(root, sddl)?;
     let tmp = run.path().join(TMP_NAME);
     std::fs::create_dir(&tmp)?;
-    let status = Command::new(program)
-        .raw_arg(args)
-        .current_dir(dir)
-        .env_clear()
-        .envs(installer_env(&sys, &tmp))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    drop(held);
-    status
-        .code()
-        .ok_or_else(|| io::Error::other("o desinstalador terminou sem código de saída"))
+    let code = super::spawn_win::run_in_job(program, args, dir, &installer_env(sys, &tmp));
+    drop(run);
+    code
+}
+
+/// Owner and DACL of the folder `path` as SDDL, opened without following a reparse point;
+/// `None` when unreadable or a reparse point (then nothing is an orphan there).
+pub fn folder_sddl(path: &Path) -> Option<String> {
+    let file = std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if meta.file_attributes() & REPARSE != 0 || !meta.is_dir() {
+        return None;
+    }
+    handle_sddl(&file).ok()
 }
 
 #[cfg(test)]

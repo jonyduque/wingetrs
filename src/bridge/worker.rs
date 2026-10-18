@@ -257,6 +257,10 @@ fn inno_names(v: &str) -> bool {
 /// Burn switches without a value the helper passes (`/` or `-`, any case).
 const BURN_FLAGS: [&str; 3] = ["quiet", "passive", "norestart"];
 
+/// Burn bundle variables the helper passes, each an exact literal (any case): the whole
+/// `Name=value` token, never a free value (Python's machine scope, `InstallAllUsers=1`).
+const BURN_PROPERTIES: [&str; 1] = ["installallusers=1"];
+
 /// `v` is the log placeholder, bare or quoted (it becomes a file in the execution folder).
 fn is_log(v: &str) -> bool {
     let token = crate::winget_install::switches::LOG_TOKEN;
@@ -264,21 +268,21 @@ fn is_log(v: &str) -> bool {
 }
 
 /// A value of a plain exe switch: no `\`, no `/`, no `:`, no `..`, no quote inside a quoted
-/// run (so it cannot name any path).
+/// run, no `<`/`>` (so it cannot name any path, nor carry `<LOGPATH>` inside other text).
 fn plain_value(v: &str) -> bool {
     let inner = v
         .strip_prefix('"')
         .and_then(|v| v.strip_suffix('"'))
         .unwrap_or(v);
-    !inner.contains(['\\', '/', ':', '"']) && !inner.contains("..")
+    !inner.contains(['\\', '/', ':', '"', '<', '>']) && !inner.contains("..")
 }
 
 /// Whether `params` for an exe-type installer holds only the switches the helper allows for
 /// `kind` (an allowlist; any other token, positional ones included, is refused):
 /// - inno: `INNO_FLAGS`, `INNO_LIST_SWITCHES` with `inno_names`, `/LOG=<LOGPATH>`,
 ///   `/DIR=<folder in program_files>`;
-/// - nullsoft: `/S`, and `/D=<folder in program_files>` last (the rest of the line);
-/// - burn: `BURN_FLAGS` and `/log <LOGPATH>` (`/` or `-`);
+/// - nullsoft: `/S`, `/norestart` (any case), and `/D=<folder in program_files>` last (the rest of the line);
+/// - burn: `BURN_FLAGS`, `BURN_PROPERTIES` and `/log <LOGPATH>` (`/` or `-`);
 /// - exe: `/key`, `-key`, `/key=value` or `/key:value` with `plain_value`, or a key followed by
 ///   `<LOGPATH>`; never `/LOADINF`/`/SAVEINF`.
 pub fn exe_params_allowed(kind: ElevatedKind, params: &str, program_files: &[String]) -> bool {
@@ -305,11 +309,13 @@ pub fn exe_params_allowed(kind: ElevatedKind, params: &str, program_files: &[Str
                     let at = rest.as_ptr() as usize - params.as_ptr() as usize;
                     return under_program_files(params[at..].trim_end(), program_files);
                 }
-                t == "/S"
+                t == "/S" || lower == "/norestart"
             }
             ElevatedKind::Burn => {
                 let key = lower.strip_prefix(['/', '-']).unwrap_or("");
-                BURN_FLAGS.contains(&key) || key == "log" && tokens.next().is_some_and(is_log)
+                BURN_FLAGS.contains(&key)
+                    || BURN_PROPERTIES.contains(&lower.as_str())
+                    || key == "log" && tokens.next().is_some_and(is_log)
             }
             ElevatedKind::Exe => exe_switch(t, &mut tokens),
             ElevatedKind::Msi | ElevatedKind::Wix => false,
@@ -553,12 +559,17 @@ pub trait WorkerOps {
     }
 }
 
-/// Decides, from the values read through the open key and a file-existence check, whether the
-/// key may be deleted.
-pub type DeleteCheck<'a> = &'a mut dyn FnMut(&ArpDetails, &dyn Fn(&Path) -> bool) -> bool;
+/// Decides, from the values read through the open key, a file-existence check and a folder's
+/// owner and DACL as SDDL (`None` when unreadable), whether the key may be deleted.
+pub type DeleteCheck<'a> = &'a mut dyn FnMut(
+    &ArpDetails,
+    &dyn Fn(&Path) -> bool,
+    &dyn Fn(&Path) -> Option<String>,
+) -> bool;
 
 /// An owned `DeleteCheck`.
-type OwnedCheck = Box<dyn FnMut(&ArpDetails, &dyn Fn(&Path) -> bool) -> bool>;
+type OwnedCheck =
+    Box<dyn FnMut(&ArpDetails, &dyn Fn(&Path) -> bool, &dyn Fn(&Path) -> Option<String>) -> bool>;
 
 /// What `WorkerOps::delete_arp_key` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1105,11 +1116,11 @@ fn delete_checked(
     let mut check: OwnedCheck = match reason {
         DeleteReason::Orphan => {
             let k = ops.known_folders().map_err(|e| failure(&e))?;
-            Box::new(move |d, exists| still_orphan(d, &k, exists))
+            Box::new(move |d, exists, sddl_of| still_orphan(d, &k, exists, sddl_of))
         }
         DeleteReason::Duplicate => {
             let all = ops.arp_entries().map_err(|e| failure(&e))?;
-            Box::new(move |d, _| elevated_duplicate(d, &all))
+            Box::new(move |d, _, _| elevated_duplicate(d, &all))
         }
     };
     tracing::info!(

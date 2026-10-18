@@ -407,6 +407,40 @@ fn exe_params_allowlist() {
         &[]
     ));
 }
+/// Task 190 addendum: `/norestart` for nullsoft (GPXSee) and Burn's exact
+/// `InstallAllUsers=1` (Python, machine scope) pass; nothing near them does.
+#[test]
+fn norestart_and_install_all_users_pass_as_exact_literals() {
+    for (kind, params) in [
+        (Nullsoft, "/S /norestart"),
+        (Nullsoft, r"/S /NORESTART /D=C:\Program Files\App"),
+        (Burn, "/quiet InstallAllUsers=1"),
+        (Burn, r#"/passive installallusers=1 /log "<LOGPATH>""#),
+    ] {
+        assert!(
+            exe_params_allowed(kind, params, &roots()),
+            "{kind:?} {params}"
+        );
+    }
+    for (kind, params) in [
+        (Nullsoft, "/S /norestartx"),
+        (Nullsoft, "/S norestart"),
+        (Burn, "/quiet InstallAllUsers=0"),
+        (Burn, "/quiet InstallAllUsers=1x"),
+        (Burn, r"/quiet TargetDir=C:\x"),
+        (Burn, "/quiet PrependPath=1"),
+        (Inno, "/VERYSILENT InstallAllUsers=1"),
+        // `<LOGPATH>` only as a whole value, never inside other text.
+        (Exe, "/out=x<LOGPATH>"),
+        (Exe, r#"/out="<LOGPATH>x""#),
+    ] {
+        assert!(
+            !exe_params_allowed(kind, params, &roots()),
+            "{kind:?} {params}"
+        );
+    }
+}
+
 /// `serve` stops at `bad` without running it nor the valid request after it.
 fn stops_at(bad: &str) {
     let input = format!("{bad}\n{}", line(&request(&valid())));
@@ -1150,5 +1184,184 @@ mod win {
         let root = PathBuf::from(r"C:\Program Files\wingetrs\staging");
         let left: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// A command line split the way the C runtime splits `argv` (quotes group, `\"` is a
+    /// quote, backslashes before a quote halve).
+    fn split_command(line: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut cur = String::new();
+        let mut in_arg = false;
+        let mut quoted = false;
+        let mut slashes = 0usize;
+        for c in line.chars() {
+            match c {
+                '\\' => {
+                    slashes += 1;
+                    in_arg = true;
+                    continue;
+                }
+                '"' => {
+                    cur.extend(std::iter::repeat_n('\\', slashes / 2));
+                    if slashes % 2 == 1 {
+                        cur.push('"');
+                    } else {
+                        quoted = !quoted;
+                    }
+                    in_arg = true;
+                }
+                ' ' | '\t' if !quoted => {
+                    cur.extend(std::iter::repeat_n('\\', slashes));
+                    if in_arg {
+                        args.push(std::mem::take(&mut cur));
+                    }
+                    in_arg = false;
+                }
+                _ => {
+                    cur.extend(std::iter::repeat_n('\\', slashes));
+                    cur.push(c);
+                    in_arg = true;
+                }
+            }
+            slashes = 0;
+        }
+        cur.extend(std::iter::repeat_n('\\', slashes));
+        if in_arg {
+            args.push(cur);
+        }
+        args
+    }
+
+    /// Task 190: with a staging folder holding a space, the log path reaches Inno, Burn and
+    /// exe installers as one argument, whether the manifest quoted `<LOGPATH>` or not.
+    #[test]
+    fn log_placeholder_with_space_stays_one_argument() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("Program Files").join("staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = blob(dir.path(), b"MZ t190");
+        let cases = [
+            (Inno, r#"/VERYSILENT /LOG="<LOGPATH>""#, "/LOG="),
+            (Inno, "/VERYSILENT /LOG=<LOGPATH>", "/LOG="),
+            (Burn, r#"/quiet /log "<LOGPATH>""#, ""),
+            (Burn, "/quiet /log <LOGPATH>", ""),
+            (Exe, "/S /out=<LOGPATH>", "/out="),
+            (Exe, "/S /key:<LOGPATH>", "/key:"),
+            (Exe, "/S /log <LOGPATH>", ""),
+        ];
+        for (kind, params, prefix) in cases {
+            let req = InstallerRequest {
+                kind,
+                ..exe_request(&source, params)
+            };
+            let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
+            let log = staged.run_dir().join(staging_win::LOG_NAME);
+            assert!(log.to_str().unwrap().contains(' '), "{}", log.display());
+            let (_, line) =
+                staging_win::command_for(&staged, &req, Path::new(r"C:\nao-usado\msiexec.exe"))
+                    .unwrap();
+            let args = split_command(&line);
+            let want = format!("{prefix}{}", log.display());
+            assert_eq!(
+                args.iter().filter(|a| **a == want).count(),
+                1,
+                "{kind:?} {params}: {args:?}"
+            );
+        }
+    }
+
+    /// Task 190: the elevated winget gets an environment built from scratch: a variable planted
+    /// in this process does not reach it, and its `TEMP` is inside a fresh execution folder,
+    /// removed afterwards.
+    #[test]
+    fn winget_env_is_built_from_scratch() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let planted_temp = dir.path().join("planted-temp");
+        std::fs::create_dir(&planted_temp).unwrap();
+        let script = dir.path().join("winget.cmd");
+        std::fs::write(&script, "@echo off\r\nset\r\n").unwrap();
+        let sys = staging_win::SystemEnv::query().unwrap();
+        let old_temp = std::env::var_os("TEMP");
+        // SAFETY: test-only; `TEMP` is read by `temp_dir` only when `TMP` is missing, and the
+        // planted name is used by no other test.
+        unsafe {
+            std::env::set_var("WINGETRS_TEST_PLANTED", "1");
+            std::env::set_var("TEMP", &planted_temp);
+        }
+        let mut lines = Vec::new();
+        let r = staging_win::run_tool(
+            &script,
+            &[],
+            dir.path(),
+            &root,
+            TEST_SDDL,
+            &sys,
+            &mut |l: &str| lines.push(l.to_string()),
+        );
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("WINGETRS_TEST_PLANTED");
+            match old_temp {
+                Some(t) => std::env::set_var("TEMP", t),
+                None => std::env::remove_var("TEMP"),
+            }
+        }
+        let (code, _) = r.unwrap();
+        assert_eq!(code, 0, "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.to_uppercase().starts_with("WINGETRS_TEST_PLANTED=")),
+            "{lines:?}"
+        );
+        let temp = lines
+            .iter()
+            .find_map(|l| l.strip_prefix("TEMP="))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        let temp = Path::new(temp);
+        assert_eq!(temp.file_name().unwrap(), staging_win::TMP_NAME);
+        let run = temp.parent().unwrap();
+        assert_eq!(run.parent().unwrap(), root.as_path(), "{lines:?}");
+        assert_eq!(run.file_name().unwrap().len(), 32);
+        assert!(entries(&root).is_empty(), "execution folder removed");
+    }
+
+    /// Task 190: a junction in the middle of `source` (not only at its last component) is
+    /// refused.
+    #[test]
+    fn source_with_junction_in_middle_refused() {
+        let dir = TempDir::new().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let file = blob(&real, b"t190");
+        junction(&dir.path().join("link"), &real);
+        let via = dir
+            .path()
+            .join("link")
+            .join("blobs")
+            .join(file.file_name().unwrap());
+        assert!(via.is_file(), "the junction resolves");
+        let e = staging_win::open_source(&via).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("reanálise"), "{e}");
+        staging_win::open_source(&file).unwrap();
+    }
+
+    /// Task 190: a source with another hard link is refused (through either name).
+    #[test]
+    fn source_hard_link_refused() {
+        let dir = TempDir::new().unwrap();
+        let file = blob(dir.path(), b"t190 link");
+        let twin = dir.path().join("twin");
+        std::fs::hard_link(&file, &twin).unwrap();
+        for p in [&file, &twin] {
+            let e = staging_win::open_source(p).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            assert!(e.to_string().contains("hard link"), "{e}");
+        }
+        std::fs::remove_file(&twin).unwrap();
+        staging_win::open_source(&file).unwrap();
     }
 }

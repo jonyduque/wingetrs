@@ -409,12 +409,42 @@ pub fn in_admin_folder(p: &Path, k: &KnownFolders) -> bool {
 }
 
 /// Whether the entry's `UninstallString` still names an absolute uninstaller that does not
-/// exist (expanded with the known folders only).
-pub fn still_orphan(d: &ArpDetails, k: &KnownFolders, exists: impl Fn(&Path) -> bool) -> bool {
+/// exist (expanded with the known folders only), and the nearest existing folder above it is
+/// administrator-only (`sddl_of` gives its owner and DACL as SDDL, checked with
+/// `sddl_admin_only` at the `Parent` level). In a folder another SID may write, the user
+/// decides whether the file exists, so the entry is not an orphan.
+pub fn still_orphan(
+    d: &ArpDetails,
+    k: &KnownFolders,
+    exists: impl Fn(&Path) -> bool,
+    sddl_of: impl Fn(&Path) -> Option<String>,
+) -> bool {
     let Some(cmd) = d.uninstall_string.as_deref() else {
         return false;
     };
-    missing_uninstaller(cmd, |name: &str| known_var(name, k), exists).is_some()
+    let Some(missing) = missing_uninstaller(cmd, |name: &str| known_var(name, k), &exists) else {
+        return false;
+    };
+    // The volume root counts as existing (`missing_uninstaller` only returns `X:\...`).
+    let Some(folder) = missing
+        .ancestors()
+        .skip(1)
+        .find(|a| a.parent().is_none() || exists(a))
+    else {
+        tracing::info!(path = %missing.display(), "orphan: no existing folder above the uninstaller");
+        return false;
+    };
+    match sddl_of(folder) {
+        Some(sddl) if sddl_admin_only(&sddl, AclLevel::Parent) => true,
+        Some(sddl) => {
+            tracing::info!(folder = %folder.display(), sddl, "orphan: folder not admin-only, not an orphan");
+            false
+        }
+        None => {
+            tracing::info!(folder = %folder.display(), "orphan: folder DACL unreadable, not an orphan");
+            false
+        }
+    }
 }
 
 /// Whether another record (another key or hive) has the same trimmed, case-insensitive
