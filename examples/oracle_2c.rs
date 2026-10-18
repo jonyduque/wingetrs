@@ -276,6 +276,308 @@ const SCOOP_FUNCTIONS: &[&str] = &[
     "Write-DownloadProgress",
     "Write-ManifestToUserCache",
 ];
+/// Approved verbs (`Get-Verb`, PowerShell 7.6.7): `Verb-Noun` with one of them counts as a
+/// cmdlet when it is not a Scoop function.
+const APPROVED_VERBS: &[&str] = &[
+    "Add",
+    "Approve",
+    "Assert",
+    "Backup",
+    "Block",
+    "Build",
+    "Checkpoint",
+    "Clear",
+    "Close",
+    "Compare",
+    "Complete",
+    "Compress",
+    "Confirm",
+    "Connect",
+    "Convert",
+    "ConvertFrom",
+    "ConvertTo",
+    "Copy",
+    "Debug",
+    "Deny",
+    "Deploy",
+    "Disable",
+    "Disconnect",
+    "Dismount",
+    "Edit",
+    "Enable",
+    "Enter",
+    "Exit",
+    "Expand",
+    "Export",
+    "Find",
+    "Format",
+    "Get",
+    "Grant",
+    "Group",
+    "Hide",
+    "Import",
+    "Initialize",
+    "Install",
+    "Invoke",
+    "Join",
+    "Limit",
+    "Lock",
+    "Measure",
+    "Merge",
+    "Mount",
+    "Move",
+    "New",
+    "Open",
+    "Optimize",
+    "Out",
+    "Ping",
+    "Pop",
+    "Protect",
+    "Publish",
+    "Push",
+    "Read",
+    "Receive",
+    "Redo",
+    "Register",
+    "Remove",
+    "Rename",
+    "Repair",
+    "Request",
+    "Reset",
+    "Resize",
+    "Resolve",
+    "Restart",
+    "Restore",
+    "Resume",
+    "Revoke",
+    "Save",
+    "Search",
+    "Select",
+    "Send",
+    "Set",
+    "Show",
+    "Skip",
+    "Split",
+    "Start",
+    "Step",
+    "Stop",
+    "Submit",
+    "Suspend",
+    "Switch",
+    "Sync",
+    "Test",
+    "Trace",
+    "Unblock",
+    "Undo",
+    "Uninstall",
+    "Unlock",
+    "Unprotect",
+    "Unpublish",
+    "Unregister",
+    "Update",
+    "Use",
+    "Wait",
+    "Watch",
+    "Write",
+];
+
+/// Built-in aliases (`pwsh -NoProfile`, `Get-Alias`, PowerShell 7.6.7) and built-in
+/// functions without a module (`Get-Command -CommandType Function`).
+const PWSH_BUILTINS: &[&str] = &[
+    "?",
+    "%",
+    "ac",
+    "cat",
+    "cd",
+    "chdir",
+    "clc",
+    "clear",
+    "clhy",
+    "cli",
+    "clp",
+    "cls",
+    "clv",
+    "cnsn",
+    "compare",
+    "copy",
+    "cp",
+    "cpi",
+    "cpp",
+    "cvpa",
+    "dbp",
+    "del",
+    "diff",
+    "dir",
+    "dnsn",
+    "ebp",
+    "echo",
+    "epal",
+    "epcsv",
+    "erase",
+    "etsn",
+    "exsn",
+    "fc",
+    "fhx",
+    "fl",
+    "foreach",
+    "ft",
+    "fw",
+    "gal",
+    "gbp",
+    "gc",
+    "gci",
+    "gcm",
+    "gcs",
+    "gdr",
+    "gerr",
+    "ghy",
+    "gi",
+    "gjb",
+    "gl",
+    "gm",
+    "gmo",
+    "gp",
+    "gps",
+    "gpv",
+    "group",
+    "gsn",
+    "gsv",
+    "gu",
+    "gv",
+    "h",
+    "history",
+    "icm",
+    "iex",
+    "ihy",
+    "ii",
+    "ipal",
+    "ipcsv",
+    "ipmo",
+    "irm",
+    "iwr",
+    "kill",
+    "ls",
+    "man",
+    "md",
+    "measure",
+    "mi",
+    "mount",
+    "move",
+    "mp",
+    "mv",
+    "nal",
+    "ndr",
+    "ni",
+    "nmo",
+    "nsn",
+    "nv",
+    "ogv",
+    "oh",
+    "popd",
+    "ps",
+    "pushd",
+    "pwd",
+    "r",
+    "rbp",
+    "rcjb",
+    "rcsn",
+    "rd",
+    "rdr",
+    "ren",
+    "ri",
+    "rjb",
+    "rm",
+    "rmdir",
+    "rmo",
+    "rni",
+    "rnp",
+    "rp",
+    "rsn",
+    "rv",
+    "rvpa",
+    "sajb",
+    "sal",
+    "saps",
+    "sasv",
+    "sbp",
+    "select",
+    "set",
+    "shcm",
+    "si",
+    "sl",
+    "sleep",
+    "sls",
+    "sort",
+    "sp",
+    "spjb",
+    "spps",
+    "spsv",
+    "start",
+    "sv",
+    "tee",
+    "type",
+    "where",
+    "wjb",
+    "write",
+    "cd..",
+    "Clear-Host",
+    "help",
+    "mkdir",
+    "oss",
+    "Pause",
+    "prompt",
+    "TabExpansion2",
+];
+
+/// Cmdlets of the `Microsoft.PowerShell.*` modules whose verb is not approved
+/// (`Get-Command -Module Microsoft.PowerShell.*`, PowerShell 7.6.7).
+const UNAPPROVED_CMDLETS: &[&str] = &[
+    "ForEach-Object",
+    "Sort-Object",
+    "Tee-Object",
+    "Where-Object",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Scoop,
+    Cmdlet,
+    External,
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Scoop => "função do Scoop",
+            Kind::Cmdlet => "cmdlet",
+            Kind::External => "externo ou definido no script",
+        }
+    }
+}
+
+/// Kind of a lowercase command name: Scoop function first, then pwsh builtin alias /
+/// function or `Verb-Noun` with an approved verb, else external program (or a function
+/// defined outside the manifest's scripts).
+fn kind(lower: &str, scoop_fns: &HashSet<String>) -> Kind {
+    if scoop_fns.contains(lower) {
+        return Kind::Scoop;
+    }
+    if PWSH_BUILTINS
+        .iter()
+        .chain(UNAPPROVED_CMDLETS)
+        .any(|b| b.eq_ignore_ascii_case(lower))
+    {
+        return Kind::Cmdlet;
+    }
+    match lower.split_once('-') {
+        Some((verb, noun))
+            if !noun.is_empty() && APPROVED_VERBS.iter().any(|v| v.eq_ignore_ascii_case(verb)) =>
+        {
+            Kind::Cmdlet
+        }
+        _ => Kind::External,
+    }
+}
 
 #[derive(Default)]
 struct Bucket {
@@ -428,67 +730,100 @@ fn main() -> anyhow::Result<()> {
 
     let mut ranked: Vec<(&String, &(String, usize))> = ranking.iter().collect();
     ranked.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(b.0)));
-    let is_scoop = |lower: &str| scoop_fns.contains(lower);
-    let n_scoop = ranked.iter().filter(|(k, _)| is_scoop(k)).count();
+    let kind_of = |lower: &str| kind(lower, &scoop_fns);
+    let count_kind = |k: Kind| ranked.iter().filter(|(c, _)| kind_of(c) == k).count();
     println!(
-        "\n## Comandos chamados pelos scripts\n\n{} manifestos S-hook/S-ps1; {} comandos distintos, {} deles funções do Scoop (lista de {} funções).\n",
+        "\n## Comandos chamados pelos scripts\n\n{} manifestos S-hook/S-ps1; {} comandos distintos: {} funções do Scoop (lista de {}), {} cmdlets, {} externos ou definidos fora do manifesto. Funções definidas pelo próprio manifesto (`function`/`filter`) não entram.\n",
         scripted.len(),
         ranked.len(),
-        n_scoop,
-        SCOOP_FUNCTIONS.len()
+        count_kind(Kind::Scoop),
+        SCOOP_FUNCTIONS.len(),
+        count_kind(Kind::Cmdlet),
+        count_kind(Kind::External),
     );
     println!("| # | comando | manifestos | tipo |");
     println!("|---:|---|---:|---|");
     for (i, (k, (shown, n))) in ranked.iter().enumerate().take(80) {
-        let kind = if is_scoop(k) {
-            "função do Scoop"
-        } else {
-            "cmdlet/outro"
-        };
-        println!("| {} | `{shown}` | {n} | {kind} |", i + 1);
+        println!("| {} | `{shown}` | {n} | {} |", i + 1, kind_of(k).label());
     }
-    let used_scoop: Vec<String> = ranked
-        .iter()
-        .filter(|(k, _)| is_scoop(k))
-        .map(|(_, (shown, n))| format!("`{shown}` ({n})"))
-        .collect();
+    let list = |k: Kind| -> String {
+        ranked
+            .iter()
+            .filter(|(c, _)| kind_of(c) == k)
+            .map(|(_, (shown, n))| format!("`{shown}` ({n})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("\nTodas as funções do Scoop usadas: {}.", list(Kind::Scoop));
     println!(
-        "\nTodas as funções do Scoop usadas: {}.",
-        used_scoop.join(", ")
+        "\nTodos os externos ou definidos fora do manifesto: {}.",
+        list(Kind::External)
     );
 
-    let covered = |allowed: &BTreeSet<&str>| {
-        scripted
-            .iter()
-            .filter(|m| !m.has_ps1 && m.commands.iter().all(|c| allowed.contains(c.as_str())))
-            .count()
-    };
+    // Metric B (decision D1 = B): own prelude for Scoop functions; cmdlets and native
+    // commands run in the real pwsh. A manifest is covered when the Scoop functions it
+    // calls are all among the N most used ones. S-ps1 is never covered.
     let scoop_ranked: Vec<&str> = ranked
         .iter()
-        .filter(|(k, _)| is_scoop(k))
-        .map(|(k, _)| k.as_str())
+        .filter(|(c, _)| kind_of(c) == Kind::Scoop)
+        .map(|(c, _)| c.as_str())
         .collect();
-    let all_ranked: Vec<&str> = ranked.iter().map(|(k, _)| k.as_str()).collect();
+    let uses_scoop = |m: &ScriptManifest| m.commands.iter().any(|c| c == "scoop");
+    let n_uses_scoop = scripted.iter().filter(|m| uses_scoop(m)).count();
+    let without_scoop: Vec<&ScriptManifest> = scripted.iter().filter(|m| !uses_scoop(m)).collect();
+    let covered_b = |set: &[&ScriptManifest], top: &BTreeSet<&str>| {
+        set.iter()
+            .filter(|m| {
+                !m.has_ps1
+                    && m.commands
+                        .iter()
+                        .filter(|c| scoop_fns.contains(c.as_str()))
+                        .all(|c| top.contains(c.as_str()))
+            })
+            .count()
+    };
+    let all_refs: Vec<&ScriptManifest> = scripted.iter().collect();
     println!(
-        "\n## Cobertura acumulada\n\nManifesto coberto = sem S-ps1 (o conteúdo do `.ps1` não está no manifesto) e todos os comandos dos seus scripts no conjunto implementado. Denominador: {} manifestos S-hook/S-ps1 ({} com S-ps1). Coluna 2: as N funções do Scoop mais usadas. Coluna 3: os N comandos mais usados de qualquer tipo (funções do Scoop + cmdlets e programas).\n",
+        "\n## Cobertura acumulada (métrica B: prelúdio próprio com as funções do Scoop; cmdlets e comandos nativos rodam no pwsh real)\n\nManifesto coberto = sem S-ps1 (o conteúdo do `.ps1` não está no manifesto) e todas as funções do Scoop que os seus scripts chamam estão entre as N mais usadas; o que não é função do Scoop é ignorado. Denominador: {} manifestos S-hook/S-ps1 ({} com S-ps1). Usam `scoop` como comando externo: {} manifestos; a última coluna os exclui do denominador.\n",
         scripted.len(),
-        scripted.iter().filter(|m| m.has_ps1).count()
+        scripted.iter().filter(|m| m.has_ps1).count(),
+        n_uses_scoop
     );
-    println!("| N | só funções do Scoop | qualquer comando |");
+    println!("| N funções do Scoop | cobertos | cobertos sem os que usam `scoop` |");
     println!("|---|---:|---:|");
-    for n in [5usize, 10, 20, 30, 50, 100, usize::MAX] {
+    for n in [5usize, 10, 20, usize::MAX] {
         let label = if n == usize::MAX {
-            "todas".to_string()
+            format!("todas ({})", scoop_ranked.len())
         } else {
             n.to_string()
         };
-        let fns: BTreeSet<&str> = scoop_ranked.iter().take(n).copied().collect();
-        let any: BTreeSet<&str> = all_ranked.iter().take(n).copied().collect();
+        let top: BTreeSet<&str> = scoop_ranked.iter().take(n).copied().collect();
         println!(
             "| {label} | {} | {} |",
-            pct(covered(&fns), scripted.len()),
-            pct(covered(&any), scripted.len())
+            pct(covered_b(&all_refs, &top), all_refs.len()),
+            pct(covered_b(&without_scoop, &top), without_scoop.len())
         );
+    }
+
+    // Floor: every command (of any kind) must be in the set of the N most used.
+    let all_ranked: Vec<&str> = ranked.iter().map(|(c, _)| c.as_str()).collect();
+    let covered_floor = |top: &BTreeSet<&str>| {
+        scripted
+            .iter()
+            .filter(|m| !m.has_ps1 && m.commands.iter().all(|c| top.contains(c.as_str())))
+            .count()
+    };
+    println!("\n## Piso: implementar os N comandos mais usados de qualquer tipo (sem pwsh real)\n");
+    println!("| N comandos | cobertos |");
+    println!("|---|---:|");
+    for n in [5usize, 10, 20, 30, 50, 100, usize::MAX] {
+        let label = if n == usize::MAX {
+            format!("todos ({})", all_ranked.len())
+        } else {
+            n.to_string()
+        };
+        let top: BTreeSet<&str> = all_ranked.iter().take(n).copied().collect();
+        println!("| {label} | {} |", pct(covered_floor(&top), scripted.len()));
     }
     Ok(())
 }

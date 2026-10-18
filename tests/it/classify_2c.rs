@@ -144,3 +144,52 @@ fn invalid_json_is_err() {
     assert!(classify("{not json").is_err());
     assert!(script_commands("{not json").is_empty());
 }
+
+#[test]
+fn installer_file_ps1_case_path_and_trailing_space() {
+    for file in [r"bin\SETUP.PS1", "x.ps1 "] {
+        let raw = serde_json::json!({ "installer": { "file": file } }).to_string();
+        let c = class(&raw).unwrap_or_else(|| panic!("{file}: expected S-ps1"));
+        assert_eq!(c.cases, set(&[SubCase::Ps1]), "{file}");
+    }
+}
+
+#[test]
+fn commands_inside_subexpressions() {
+    let script = [
+        r#"Write-Host "dir: $(appdir x) and `$(not-this)""#,
+        "$v = $(versiondir y)",
+        "$t = @\"",
+        "path=$(currentdir z)",
+        "\"@",
+        "'$(literal q)'",
+    ];
+    let raw = serde_json::json!({ "post_install": script }).to_string();
+    assert_eq!(
+        script_commands(&raw),
+        vec!["Write-Host", "appdir", "versiondir", "currentdir"]
+    );
+    // Deep nesting is capped, never a stack overflow.
+    let deep = format!("\"{}\"", "$(\"".repeat(10_000));
+    let raw = serde_json::json!({ "post_install": deep }).to_string();
+    assert!(script_commands(&raw).is_empty());
+}
+
+#[test]
+fn functions_defined_in_scripts_are_not_commands() {
+    let raw = serde_json::json!({
+        "pre_install": ["function CreateFile($n) { New-Item $n }", "CreateFile 'a'"],
+        "post_install": ["createfile 'b'", "filter global:Pick { $_ }", "1 | Pick | Out-Null"],
+    })
+    .to_string();
+    assert_eq!(script_commands(&raw), vec!["New-Item", "Out-Null"]);
+}
+
+#[test]
+fn braced_variables_and_while_are_not_commands() {
+    let raw = serde_json::json!({
+        "post_install": ["${Env:ProgramFiles}/x | Out-Null", "while ($i) { Start-Sleep 1 }"],
+    })
+    .to_string();
+    assert_eq!(script_commands(&raw), vec!["Out-Null", "Start-Sleep"]);
+}
