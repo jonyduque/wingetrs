@@ -37,6 +37,12 @@ pub fn redirect_allowed(prev: &reqwest::Url, next: &reqwest::Url, allow_http: bo
     allow_http || !(prev.scheme() == "https" && next.scheme() == "http")
 }
 
+/// Strict policy for installer downloads: only https -> https, whatever the global setting;
+/// a plain-http origin (loopback only, see `winget_install::fetch`) follows no redirect.
+pub fn strict_redirect_allowed(prev: &reqwest::Url, next: &reqwest::Url) -> bool {
+    prev.scheme() == "https" && next.scheme() == "https"
+}
+
 /// Same hop limit as reqwest's default policy.
 const MAX_REDIRECTS: usize = 10;
 
@@ -52,12 +58,20 @@ impl std::fmt::Display for InsecureRedirectError {
 impl std::error::Error for InsecureRedirectError {}
 
 fn redirect_policy(allow_http: Arc<AtomicBool>) -> reqwest::redirect::Policy {
+    checked_policy(move |prev, next| {
+        redirect_allowed(prev, next, allow_http.load(Ordering::Relaxed))
+    })
+}
+
+fn checked_policy(
+    allowed: impl Fn(&reqwest::Url, &reqwest::Url) -> bool + Send + Sync + 'static,
+) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > MAX_REDIRECTS {
             return attempt.error("too many redirects");
         }
         let allowed = match attempt.previous().last() {
-            Some(prev) => redirect_allowed(prev, attempt.url(), allow_http.load(Ordering::Relaxed)),
+            Some(prev) => allowed(prev, attempt.url()),
             None => true,
         };
         if allowed {
@@ -90,6 +104,7 @@ pub struct Http {
     /// No total timeout (big downloads); stalls are caught by `chunk_timeout`.
     dl_client: reqwest::Client,
     chunk_timeout: Duration,
+    connect_timeout: Duration,
     allow_http_redirect: Arc<AtomicBool>,
 }
 
@@ -117,6 +132,7 @@ impl Http {
             client,
             dl_client,
             chunk_timeout: Duration::from_secs(30),
+            connect_timeout: connect,
             allow_http_redirect,
         })
     }
@@ -124,6 +140,21 @@ impl Http {
     /// Whether redirects from https to http are followed (shared by all clones).
     pub fn set_allow_http_redirect(&self, allow: bool) {
         self.allow_http_redirect.store(allow, Ordering::Relaxed);
+    }
+
+    /// A copy whose downloads (`get_to_file`) follow only https -> https redirects, ignoring
+    /// `allow_http_redirect` (see [`strict_redirect_allowed`]). Other requests are unchanged.
+    pub fn with_strict_download_redirects(&self) -> Result<Http, HttpError> {
+        let dl_client = reqwest::Client::builder()
+            .redirect(checked_policy(strict_redirect_allowed))
+            .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(self.connect_timeout)
+            .build()
+            .map_err(|e| HttpError::Network(e.to_string()))?;
+        Ok(Http {
+            dl_client,
+            ..self.clone()
+        })
     }
 
     /// Max idle time waiting for headers or the next body chunk in `get_to_file`.

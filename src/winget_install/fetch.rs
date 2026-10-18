@@ -45,10 +45,15 @@ pub fn extension(kind: &InstallerKind) -> &'static str {
 
 /// An installer linked (or copied) out of the blob cache; dropping it removes the file and
 /// the `<ver>` folder when empty. The blob stays in the cache.
+///
+/// Drop order: the share-deny handle from [`Materialized::verify`] is closed **before** the
+/// file is deleted (it denies delete, so the other order would leave the file behind).
 #[derive(Debug)]
 pub struct Materialized {
     path: PathBuf,
     sha256: String,
+    #[cfg(windows)]
+    verified: Option<super::verified_win::VerifiedFile>,
 }
 
 impl Materialized {
@@ -59,10 +64,20 @@ impl Materialized {
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
+    /// Opens the file share-deny and checks its SHA-256 through that handle; the handle lives
+    /// as long as `self` (reopening replaces it).
+    #[cfg(windows)]
+    pub fn verify(&mut self) -> Result<&super::verified_win::VerifiedFile, FetchError> {
+        self.verified = None;
+        let v = super::verified_win::VerifiedFile::open(&self.path, &self.sha256)?;
+        Ok(self.verified.insert(v))
+    }
 }
 
 impl Drop for Materialized {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        drop(self.verified.take());
         if let Err(e) = std::fs::remove_file(&self.path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -148,7 +163,9 @@ pub async fn fetch_installer(
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(FetchError::BadSha);
     }
-    if !valid_target(Tool::Winget, id) {
+    // The id also names the `installers\<id>` folder: one safe component (no `NUL`, no
+    // trailing dot that would collide with the id without it).
+    if !valid_target(Tool::Winget, id) || !one_component(id) {
         return Err(FetchError::BadId(id.to_string()));
     }
     let ver = sanitize_version(version);
@@ -167,7 +184,10 @@ pub async fn fetch_installer(
         extract_dir: None,
         extract_to: None,
     };
-    let blob = download::fetch_all(http, data, std::slice::from_ref(&source), progress)
+    let http = http
+        .with_strict_download_redirects()
+        .map_err(|e| FetchError::Download(DownloadError::Http(e)))?;
+    let blob = download::fetch_all(&http, data, std::slice::from_ref(&source), progress)
         .await?
         .into_iter()
         .next()
@@ -189,6 +209,8 @@ pub async fn fetch_installer(
     Ok(Materialized {
         path: target,
         sha256: sha,
+        #[cfg(windows)]
+        verified: None,
     })
 }
 

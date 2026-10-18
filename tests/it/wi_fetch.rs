@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use wingetrs::cache::{DataDir, sha256_hex};
-use wingetrs::http::Http;
+use wingetrs::http::{Http, HttpError, strict_redirect_allowed};
 use wingetrs::install::download::DownloadError;
 use wingetrs::install::progress::ProgressEvent;
 use wingetrs::sources::winget::manifest::{self, EffectiveInstaller, InstallerKind};
@@ -120,6 +120,7 @@ async fn http_url_refused_without_request() {
         "http://example.com/x.exe".to_string(),
         "http://127.0.0.1.evil.com/".to_string(),
         "http://localhost@evil.com/".to_string(),
+        format!("http://localhost.:{port}/setup.exe"),
         format!("ftp://127.0.0.1:{port}/setup.exe"),
         "not a url".to_string(),
     ] {
@@ -208,6 +209,16 @@ async fn bad_sha_and_bad_id_refused() {
     let good = installer(&url, &sha, "exe");
     let r = fetch_installer(&http, &data, "../x", "1.0", &good, &noop).await;
     assert!(matches!(r, Err(FetchError::BadId(_))), "{:?}", r.err());
+
+    // Pass the command-line charset but are not usable as the `installers\<id>` folder.
+    for id in ["Pub.App.", "NUL", "CON", "com1.App"] {
+        let r = fetch_installer(&http, &data, id, "1.0", &good, &noop).await;
+        assert!(
+            matches!(r, Err(FetchError::BadId(_))),
+            "{id}: {:?}",
+            r.err()
+        );
+    }
     server.verify().await;
 }
 
@@ -268,8 +279,8 @@ async fn unusable_version_is_refused_without_request() {
     let server = serve(bytes, 0).await;
     let inst = installer(&format!("{}/setup.exe", server.uri()), &sha, "exe");
     let http = Http::new().unwrap();
-    for ver in ["", "..", "1.0."] {
-        let r = fetch_installer(&http, &data, "Pub.App", ver, &inst, &noop).await;
+    for ver in [String::new(), "..".into(), "1.0.".into(), "1".repeat(129)] {
+        let r = fetch_installer(&http, &data, "Pub.App", &ver, &inst, &noop).await;
         assert!(
             matches!(r, Err(FetchError::BadId(_))),
             "{ver:?}: {:?}",
@@ -328,10 +339,14 @@ async fn verified_handle_blocks_writers_and_rename() {
         .unwrap();
     let p = m.path().to_path_buf();
     let moved = p.with_extension("moved");
+    let blob = data.root().join("blobs").join(&sha);
     let v = VerifiedFile::open(&p, &sha).unwrap();
 
     let w = std::fs::OpenOptions::new().write(true).open(&p);
     assert_eq!(w.err().and_then(|e| e.raw_os_error()), Some(32));
+    // The materialized file is a hard link: the blob is the same file and is locked too.
+    let wb = std::fs::OpenOptions::new().write(true).open(&blob);
+    assert_eq!(wb.err().and_then(|e| e.raw_os_error()), Some(32));
     assert!(std::fs::remove_file(&p).is_err());
     assert!(std::fs::rename(&p, &moved).is_err());
     assert!(p.is_file());
@@ -362,4 +377,111 @@ async fn materialized_drop_removes_link_keeps_blob() {
     assert!(!ver_dir.exists(), "empty version folder left behind");
     let blob = data.root().join("blobs").join(&sha);
     assert_eq!(std::fs::read(blob).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn longest_version_is_accepted() {
+    let data_tmp = tempfile::tempdir().unwrap();
+    let data = DataDir::new(data_tmp.path());
+    let bytes = body(1024);
+    let sha = sha256_hex(&bytes);
+    let server = serve(bytes, 1).await;
+    let inst = installer(&format!("{}/setup.exe", server.uri()), &sha, "exe");
+    let ver = "1".repeat(128);
+    let m = fetch_installer(&Http::new().unwrap(), &data, "Pub.App", &ver, &inst, &noop)
+        .await
+        .unwrap();
+    assert!(m.path().is_file());
+}
+
+/// Serves `/setup.exe` as a 302 to `location` and `/real.exe` with `bytes`.
+async fn serve_redirect(bytes: Vec<u8>, location: impl Fn(u16) -> String) -> MockServer {
+    let server = MockServer::start().await;
+    let port = server.address().port();
+    Mock::given(method("GET"))
+        .and(path("/setup.exe"))
+        .respond_with(ResponseTemplate::new(302).insert_header("Location", location(port)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/real.exe"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .expect(0)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn loopback_http_follows_no_redirect_even_when_allowed_globally() {
+    let data_tmp = tempfile::tempdir().unwrap();
+    let data = DataDir::new(data_tmp.path());
+    let bytes = body(1024);
+    let sha = sha256_hex(&bytes);
+    let http = Http::new().unwrap();
+    http.set_allow_http_redirect(true);
+    // Another host name (same server) and the same host: both refused, nothing served.
+    for to in [
+        |p: u16| format!("http://localhost:{p}/real.exe"),
+        |p: u16| format!("http://127.0.0.1:{p}/real.exe"),
+    ] {
+        let server = serve_redirect(bytes.clone(), to).await;
+        let inst = installer(&format!("{}/setup.exe", server.uri()), &sha, "exe");
+        let r = fetch_installer(&http, &data, "Pub.App", "1.0", &inst, &noop).await;
+        assert!(
+            matches!(
+                r,
+                Err(FetchError::Download(DownloadError::Http(
+                    HttpError::InsecureRedirect(_)
+                )))
+            ),
+            "{:?}",
+            r.err()
+        );
+        server.verify().await;
+    }
+    assert!(!data.root().join("blobs").join(&sha).exists());
+}
+
+#[test]
+fn strict_redirects_are_https_to_https_only() {
+    let u = |s: &str| reqwest::Url::parse(s).unwrap();
+    assert!(strict_redirect_allowed(
+        &u("https://a/x"),
+        &u("https://b/y")
+    ));
+    assert!(!strict_redirect_allowed(
+        &u("https://a/x"),
+        &u("http://b/y")
+    ));
+    assert!(!strict_redirect_allowed(
+        &u("http://127.0.0.1/x"),
+        &u("https://b/y")
+    ));
+    assert!(!strict_redirect_allowed(
+        &u("http://127.0.0.1/x"),
+        &u("http://127.0.0.1/y")
+    ));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn materialized_closes_its_verified_handle_before_deleting() {
+    let data_tmp = tempfile::tempdir().unwrap();
+    let data = DataDir::new(data_tmp.path());
+    let bytes = body(4096);
+    let sha = sha256_hex(&bytes);
+    let server = serve(bytes, 1).await;
+    let inst = installer(&format!("{}/setup.exe", server.uri()), &sha, "exe");
+    let mut m = fetch_installer(&Http::new().unwrap(), &data, "Pub.App", "1.0", &inst, &noop)
+        .await
+        .unwrap();
+    let p = m.path().to_path_buf();
+    assert_eq!(m.verify().unwrap().path(), p);
+    // The handle held by `m` denies writers.
+    let w = std::fs::OpenOptions::new().write(true).open(&p);
+    assert_eq!(w.err().and_then(|e| e.raw_os_error()), Some(32));
+    drop(m);
+    assert!(!p.exists(), "materialized file left behind");
+    assert!(!p.parent().unwrap().exists());
 }
