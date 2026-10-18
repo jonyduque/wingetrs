@@ -336,6 +336,8 @@ pub fn plan_summary(
     plan: &crate::install::plan::InstallPlan,
     layout: &crate::install::layout::Layout,
     glyphs: &crate::tui::theme::Glyphs,
+    user_path: Option<&str>,
+    allow_msiexec: bool,
 ) -> String {
     use crate::install::archive::ArchiveKind;
     use crate::install::plan::Step;
@@ -374,6 +376,9 @@ pub fn plan_summary(
             _ => None,
         })
         .collect();
+    // Folders the user PATH already has need no line.
+    let on_path =
+        |dir: &str| user_path.is_some_and(|p| crate::install::path_edit::path_contains(p, dir));
     let (mut shims_done, mut persists_done) = (false, false);
     let mut lines: Vec<String> = Vec::new();
     for step in &plan.steps {
@@ -396,16 +401,20 @@ pub fn plan_summary(
             Step::EnvSet { name, value } => {
                 lines.push(format!("Variável de usuário {name} = {value}"));
             }
-            Step::EnvAddPath { entry } => lines.push(format!(
-                "PATH do usuário {} {}",
-                glyphs.arrow,
-                entry.display()
-            )),
-            Step::EnsureShimsOnPath => lines.push(format!(
-                "PATH do usuário {} {}",
-                glyphs.arrow,
-                layout.shims().display()
-            )),
+            Step::EnvAddPath { entry } if !on_path(&entry.display().to_string()) => {
+                lines.push(format!(
+                    "PATH do usuário {} {}",
+                    glyphs.arrow,
+                    entry.display()
+                ));
+            }
+            Step::EnsureShimsOnPath if !on_path(&layout.shims().display().to_string()) => {
+                lines.push(format!(
+                    "PATH do usuário {} {}",
+                    glyphs.arrow,
+                    layout.shims().display()
+                ));
+            }
             Step::RemoveOldVersion { version } => {
                 lines.push(format!("Remove a versão {version}"));
             }
@@ -423,7 +432,11 @@ pub fn plan_summary(
     if has_msi {
         s.push_str(&paint(
             DIM,
-            "  Se o extrator não suportar este MSI, pede --allow-msiexec\n",
+            if allow_msiexec {
+                "  Se o extrator recusar este MSI, usa o Windows Installer (msiexec /a)\n"
+            } else {
+                "  Se o extrator não suportar este MSI, pede --allow-msiexec\n"
+            },
         ));
     }
     s
@@ -459,7 +472,12 @@ pub fn new_terminal_hint(
             _ => None,
         })
         .collect();
-    (missing && !names.is_empty()).then(|| {
+    if !missing {
+        return None;
+    }
+    Some(if names.is_empty() {
+        paint(DIM, "Abra um terminal novo para o PATH novo valer.")
+    } else {
         format!(
             "{} {}",
             paint(DIM, "Abra um terminal novo para usar:"),

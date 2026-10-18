@@ -54,7 +54,7 @@ fn plan(steps: Vec<Step>) -> InstallPlan {
 
 fn summary(p: &InstallPlan) -> String {
     style::with_enabled(false, || {
-        output::plan_summary(p, &Layout::new(p.root.clone()), ascii())
+        output::plan_summary(p, &Layout::new(p.root.clone()), ascii(), None, false)
     })
 }
 
@@ -147,13 +147,50 @@ fn summary_msi_note() {
     };
     assert!(with("setup.msi").contains("pede --allow-msiexec"));
     assert!(!with("setup.zip").contains("--allow-msiexec"));
+    let p = plan(vec![Step::Download {
+        index: 0,
+        source: source("setup.msi"),
+    }]);
+    let allowed = style::with_enabled(false, || {
+        output::plan_summary(&p, &Layout::new(p.root.clone()), ascii(), None, true)
+    });
+    assert!(
+        allowed.contains("usa o Windows Installer (msiexec /a)"),
+        "{allowed}"
+    );
+    assert!(!allowed.contains("pede --allow-msiexec"), "{allowed}");
+}
+
+#[test]
+fn summary_omits_path_lines_already_on_the_user_path() {
+    let p = plan(vec![
+        Step::EnsureShimsOnPath,
+        Step::EnvAddPath {
+            entry: PathBuf::from(r"C:\R\apps\app\current\bin"),
+        },
+    ]);
+    let with = |path: Option<&str>| {
+        style::with_enabled(false, || {
+            output::plan_summary(&p, &Layout::new(p.root.clone()), ascii(), path, false)
+        })
+    };
+    let absent = with(Some(r"C:\Windows"));
+    assert!(absent.contains(r"-> C:\R\shims"), "{absent}");
+    assert!(absent.contains(r"-> C:\R\apps\app\current\bin"), "{absent}");
+    let only_shims = with(Some(r"C:\Windows;c:\r\SHIMS\"));
+    assert!(!only_shims.contains(r"C:\R\shims"), "{only_shims}");
+    assert!(only_shims.contains(r"current\bin"), "{only_shims}");
+    let both = with(Some(r"C:\R\shims;C:\R\apps\app\current\bin"));
+    assert_eq!(both.lines().count(), 1, "{both}");
 }
 
 #[test]
 fn bold_numbers_when_colored() {
     let p = plan(vec![shim("a")]);
     let layout = Layout::new(p.root.clone());
-    let on = style::with_enabled(true, || output::plan_summary(&p, &layout, ascii()));
+    let on = style::with_enabled(true, || {
+        output::plan_summary(&p, &layout, ascii(), None, false)
+    });
     assert!(on.contains(&style::paint_raw(style::NAME, "1")), "{on:?}");
     let off = summary(&p);
     assert!(!off.contains('\x1b'), "{off:?}");
@@ -228,6 +265,7 @@ fn uplan(purge: bool, remove_path: bool) -> UninstallPlan {
             art(ArtifactKind::Shim, "b"),
             art(ArtifactKind::Shortcut, r"C:\SM\App Tool.lnk"),
             art(ArtifactKind::Path, r"C:\R\shims"),
+            art(ArtifactKind::Env, "APP_HOME"),
             art(ArtifactKind::Persist, "data"),
         ],
         path_users: vec![],
@@ -250,7 +288,8 @@ fn uninstall_summary() {
         "  2. Comandos: a, b",
         "  3. Atalho no Menu Iniciar: App Tool",
         r"  4. PATH do usuário -> remove C:\R\shims",
-        "  5. Dados mantidos: data (use --purge para apagar)",
+        "  5. Variável de usuário APP_HOME volta ao valor anterior",
+        "  6. Dados mantidos: data (use --purge para apagar)",
     ];
     assert_eq!(t.lines().collect::<Vec<_>>(), want, "{t}");
     let t = utext(&uplan(true, true));
@@ -284,4 +323,18 @@ fn new_terminal_hint_only_when_folder_missing_from_path() {
     let present = std::ffi::OsString::from(r"C:\Windows;c:\r\SHIMS\");
     assert!(output::new_terminal_hint(&p, &l, Some(&present)).is_none());
     assert!(output::new_terminal_hint(&plan(vec![shim("a")]), &l, None).is_none());
+}
+
+#[test]
+fn new_terminal_hint_without_commands_still_warns_about_path() {
+    let p = plan(vec![Step::EnvAddPath {
+        entry: PathBuf::from(r"C:\R\apps\app\current\bin"),
+    }]);
+    let l = Layout::new(r"C:\R");
+    let path = std::ffi::OsString::from(r"C:\Windows");
+    let hint = output::new_terminal_hint(&p, &l, Some(&path)).unwrap();
+    assert!(
+        hint.contains("Abra um terminal novo para o PATH novo valer."),
+        "{hint}"
+    );
 }

@@ -111,7 +111,7 @@ pub enum ExecError {
 }
 
 /// User environment variable holding the PATH.
-const PATH_VAR: &str = "Path";
+pub(crate) const PATH_VAR: &str = "Path";
 
 /// One change to revert, in the order it was made.
 enum Undo {

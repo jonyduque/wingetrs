@@ -115,15 +115,16 @@ impl Ui for TtyUi {
     }
 }
 
-/// Width every progress line is padded to, so a shorter one fully overwrites a longer one.
-const LINE_WIDTH: usize = 79;
 const TICK: Duration = Duration::from_millis(120);
 
 struct ProgressState {
     glyphs: &'static Glyphs,
     phases: Mutex<Phases>,
     frame: AtomicUsize,
-    drawn: AtomicBool,
+    /// Chars of the line on screen (0 = none): the next draw pads to it, the erase clears it.
+    drawn: AtomicUsize,
+    /// Set by `finish`: nothing is drawn afterwards.
+    closed: AtomicBool,
 }
 
 impl ProgressState {
@@ -135,10 +136,16 @@ impl ProgressState {
         };
         let Some(line) = line else { return };
         let mut err = std::io::stderr().lock();
+        // `finish` sets `closed` before erasing under this same lock, so no late redraw.
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let len = line.chars().count();
+        let width = len.max(self.drawn.load(Ordering::Relaxed));
         // Progress is cosmetic: a broken stderr must not fail the install.
-        let _ = write!(err, "\r{line:<LINE_WIDTH$}");
+        let _ = write!(err, "\r{line:<width$}");
         let _ = err.flush();
-        self.drawn.store(true, Ordering::Relaxed);
+        self.drawn.store(len, Ordering::Relaxed);
     }
 }
 
@@ -164,14 +171,15 @@ impl LineProgress {
                 glyphs,
                 phases: Mutex::new(Phases::new()),
                 frame: AtomicUsize::new(0),
-                drawn: AtomicBool::new(false),
+                drawn: AtomicUsize::new(0),
+                closed: AtomicBool::new(false),
             }),
             animation: Mutex::new(None),
         }
     }
 
     pub fn update(&self, label: &str, done: u64, total: Option<u64>) {
-        if !self.enabled {
+        if !self.enabled || self.state.closed.load(Ordering::Relaxed) {
             return;
         }
         self.state
@@ -185,7 +193,7 @@ impl LineProgress {
 
     fn start_animation(&self) {
         let mut slot = self.animation.lock().unwrap_or_else(|p| p.into_inner());
-        if slot.is_some() {
+        if slot.is_some() || self.state.closed.load(Ordering::Relaxed) {
             return;
         }
         let (stop, rx) = mpsc::channel::<()>();
@@ -202,6 +210,8 @@ impl LineProgress {
 
     /// Stops and joins the animation thread, then erases the line.
     pub fn finish(&self) {
+        // Closed for good: `finish` runs once per command (`end_progress`), not between plans.
+        self.state.closed.store(true, Ordering::Relaxed);
         let animation = self
             .animation
             .lock()
@@ -216,13 +226,12 @@ impl LineProgress {
                 }
             }
         }
-        if self.state.drawn.swap(false, Ordering::Relaxed) {
+        let width = self.state.drawn.swap(0, Ordering::Relaxed);
+        if width > 0 {
             let mut err = std::io::stderr().lock();
-            let _ = write!(err, "\r{:<LINE_WIDTH$}\r", "");
+            let _ = write!(err, "\r{:<width$}\r", "");
             let _ = err.flush();
         }
-        // Next phase list starts clean (several plans run through one `LineProgress`).
-        *self.state.phases.lock().unwrap_or_else(|p| p.into_inner()) = Phases::new();
     }
 }
 
@@ -363,13 +372,32 @@ fn choose(
 }
 
 /// `--dry-run` prints every step; otherwise the short summary.
-fn print_plans(ui: &dyn Ui, plans: &[crate::install::plan::InstallPlan], full: bool) {
+fn print_plans(
+    ctx: &OpsCtx<'_>,
+    ui: &dyn Ui,
+    plans: &[crate::install::plan::InstallPlan],
+    f: Flags,
+) {
+    // Read once: the user PATH decides whether a PATH line is news.
+    let user_path = match ctx.effects.env.get(crate::install::executor::PATH_VAR) {
+        Ok(Some(v)) => Some(v.value),
+        _ => None,
+    };
     for p in plans {
-        if full {
+        if f.dry_run {
             anstream::println!("{p}");
         } else {
             let layout = crate::install::layout::Layout::new(p.root.clone());
-            anstream::print!("{}", output::plan_summary(p, &layout, ui.glyphs()));
+            anstream::print!(
+                "{}",
+                output::plan_summary(
+                    p,
+                    &layout,
+                    ui.glyphs(),
+                    user_path.as_deref(),
+                    f.allow_msiexec
+                )
+            );
         }
     }
 }
@@ -395,7 +423,7 @@ async fn install(
         return Ok(());
     };
     let plans = ops::plan_for(ctx, &cand, false)?;
-    print_plans(ui, &plans, f.dry_run);
+    print_plans(ctx, ui, &plans, f);
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
@@ -600,7 +628,7 @@ async fn upgrade(
         groups.push(ops::plan_for(ctx, &cand, keep)?);
     }
     for g in &groups {
-        print_plans(ui, g, f.dry_run);
+        print_plans(ctx, ui, g, f);
     }
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
