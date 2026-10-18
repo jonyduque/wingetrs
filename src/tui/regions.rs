@@ -1,7 +1,7 @@
 //! The one screen geometry: drawing and mouse hit-testing both read it from here.
 use crate::tui::app::{
-    ActionId, App, CONFIRM_BUTTONS, ConfirmButton, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal, Tab,
-    buttons, items_in_rows,
+    ActionId, App, CONFIRM_BUTTONS, ConfirmButton, HELP_BAR_MIN_HEIGHT, ITEM_ROWS, Modal,
+    ScriptLine, ScriptLineKind, Tab, buttons, items_in_rows,
 };
 use crate::tui::layout::{
     BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X, inset, split_with_gutter,
@@ -41,6 +41,7 @@ pub struct Regions {
     /// The confirmation dialog, its item list and its buttons (when it is open).
     pub confirm: Rect,
     pub confirm_list: Rect,
+    pub confirm_scripts: Rect,
     pub confirm_buttons: Vec<(Rect, ConfirmButton)>,
 }
 
@@ -146,14 +147,24 @@ pub fn regions(app: &App, area: Rect) -> Regions {
             })
             .collect();
     }
-    if let Some(Modal::Confirm { items, notes, .. }) = &app.modal {
-        let g = confirm_geom(items.len(), notes, area);
+    if let Some(Modal::Confirm {
+        items,
+        notes,
+        scripts,
+        ..
+    }) = &app.modal
+    {
+        let g = confirm_geom(items.len(), notes, scripts.lines.len(), area);
         r.confirm = g.dialog;
         r.confirm_list = g.list;
+        r.confirm_scripts = g.scripts;
         r.confirm_buttons = g.buttons;
     }
     r
 }
+
+/// Rows the scripts section keeps for itself (title included) while the notes yield.
+const SCRIPT_MIN_ROWS: usize = 4;
 
 /// Share of the screen the confirmation may take, per side.
 const CONFIRM_SCREEN_PERCENT: u16 = 80;
@@ -166,12 +177,22 @@ pub struct ConfirmGeom {
     pub notes: Vec<String>,
     pub notes_area: Rect,
     pub list: Rect,
+    /// The third-party scripts section: its title row, then the scrolling lines (empty when
+    /// the plan has no third-party code).
+    pub scripts: Rect,
     pub buttons: Vec<(Rect, ConfirmButton)>,
 }
 
-/// Lays out a confirmation of `items` packages and `notes`: at most 80% of `area` per side;
-/// buttons at the foot, the notes on top, the list gets the rows in between.
-pub fn confirm_geom(items: usize, notes: &[String], area: Rect) -> ConfirmGeom {
+/// Lays out a confirmation of `items` packages, `notes` and `script_lines` lines of
+/// third-party scripts: at most 80% of `area` per side; buttons at the foot, the notes on top,
+/// then the list and the scripts section share the rows in between (the list keeps at least
+/// one item, half of the rows when it has more).
+pub fn confirm_geom(
+    items: usize,
+    notes: &[String],
+    script_lines: usize,
+    area: Rect,
+) -> ConfirmGeom {
     let mut g = ConfirmGeom::default();
     let chrome_w = 2 * (BORDER + DIALOG_PAD_X);
     let chrome_h = 2 * (BORDER + DIALOG_PAD_Y);
@@ -185,8 +206,14 @@ pub fn confirm_geom(items: usize, notes: &[String], area: Rect) -> ConfirmGeom {
     } else {
         wrapped.len() + 1
     };
-    // Notes (and a gap), the list, a gap and the button row.
-    let wanted = chrome_h as usize + note_rows + list_rows + 2;
+    // The section: a title row, its lines and a gap.
+    let script_rows = if script_lines == 0 {
+        0
+    } else {
+        script_lines + 2
+    };
+    // Notes (and a gap), the list, the scripts, a gap and the button row.
+    let wanted = chrome_h as usize + note_rows + list_rows + script_rows + 2;
     let h = u16::try_from(wanted)
         .unwrap_or(u16::MAX)
         .min(pct(area.height).unwrap_or(area.height));
@@ -201,18 +228,39 @@ pub fn confirm_geom(items: usize, notes: &[String], area: Rect) -> ConfirmGeom {
         return g;
     }
     let body = inner.height.saturating_sub(2);
-    // The notes yield to at least one item.
-    let room = usize::from(body).saturating_sub(ITEM_ROWS + 1);
+    // The notes yield to at least one item (and a few rows of scripts).
+    let script_min = if script_lines == 0 {
+        0
+    } else {
+        SCRIPT_MIN_ROWS + 1
+    };
+    let room = usize::from(body).saturating_sub(ITEM_ROWS + 1 + script_min);
     g.notes = wrapped.into_iter().take(room).collect();
     let notes_h = u16::try_from(g.notes.len()).unwrap_or(0);
     g.notes_area = Rect::new(inner.x, inner.y, inner.width, notes_h);
     let gap = u16::from(notes_h > 0);
-    g.list = Rect::new(
-        inner.x,
-        inner.y + notes_h + gap,
-        inner.width,
-        body.saturating_sub(notes_h + gap),
-    );
+    let free = body.saturating_sub(notes_h + gap);
+    let mut list_h = free;
+    if script_lines > 0 {
+        // Half of the rows for the list (at least one item), the rest for the scripts.
+        let half = (free.saturating_sub(1) / 2).max(ITEM_ROWS as u16);
+        list_h = u16::try_from(list_rows)
+            .unwrap_or(u16::MAX)
+            .min(half)
+            .min(free);
+        let left = free.saturating_sub(list_h + 1);
+        let want = u16::try_from(script_lines + 1).unwrap_or(u16::MAX);
+        let h = want.min(left);
+        if h > 0 {
+            g.scripts = Rect::new(
+                inner.x,
+                inner.y + notes_h + gap + list_h + 1,
+                inner.width,
+                h,
+            );
+        }
+    }
+    g.list = Rect::new(inner.x, inner.y + notes_h + gap, inner.width, list_h);
     let y = inner.bottom() - 1;
     let mut x = inner.x;
     for (label, button) in CONFIRM_BUTTONS {
@@ -231,6 +279,67 @@ pub fn confirm_geom(items: usize, notes: &[String], area: Rect) -> ConfirmGeom {
 pub fn confirm_window(scroll: usize, len: usize, rows: usize) -> std::ops::Range<usize> {
     let start = scroll.min(len.saturating_sub(rows));
     start..(start + rows).min(len)
+}
+
+/// Rows a line of the scripts section takes at `width` cells: code is cut (one row), the
+/// rest (headers, analysis, flags) wraps.
+pub fn script_line_rows(line: &ScriptLine, width: usize) -> usize {
+    if line.kind == ScriptLineKind::Code {
+        return 1;
+    }
+    wrap(&line.text, width).len().max(1)
+}
+
+/// Rows of `line` as drawn (see [`script_line_rows`]).
+pub fn script_line_chunks(line: &ScriptLine, width: usize) -> Vec<String> {
+    if line.kind == ScriptLineKind::Code {
+        return vec![line.text.clone()];
+    }
+    let chunks = wrap(&line.text, width);
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+/// How many lines from `start` fit whole in `rows` rows (at least one when there is any).
+pub fn script_fit(lines: &[ScriptLine], start: usize, rows: usize, width: usize) -> usize {
+    let mut used = 0;
+    let mut n = 0;
+    for l in lines.iter().skip(start) {
+        used += script_line_rows(l, width);
+        if used > rows && n > 0 {
+            break;
+        }
+        n += 1;
+        if used >= rows {
+            break;
+        }
+    }
+    n
+}
+
+/// How many lines ending just before `end` fit whole in `rows` rows (at least one when there is any).
+pub fn script_fit_back(lines: &[ScriptLine], end: usize, rows: usize, width: usize) -> usize {
+    let mut used = 0;
+    let mut n = 0;
+    for l in lines[..end.min(lines.len())].iter().rev() {
+        used += script_line_rows(l, width);
+        if used > rows && n > 0 {
+            break;
+        }
+        n += 1;
+        if used >= rows {
+            break;
+        }
+    }
+    n
+}
+
+/// Largest first line of the section that still fills the window.
+pub fn script_max_scroll(lines: &[ScriptLine], rows: usize, width: usize) -> usize {
+    lines.len() - script_fit_back(lines, lines.len(), rows, width)
 }
 
 /// Greedy word wrap of `text` to `width` cells; a word longer than a line is cut when drawn.

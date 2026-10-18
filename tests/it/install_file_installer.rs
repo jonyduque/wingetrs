@@ -392,7 +392,7 @@ async fn no_consent_fails_before_anything() {
     assert!(matches!(e, ExecError::NeedsScriptConsent { .. }), "{e}");
     // The flag does not exist yet: the text must not point at it.
     assert!(!e.to_string().contains("--allow-scripts"), "{e}");
-    assert!(e.to_string().contains("Task 161"), "{e}");
+    assert!(e.to_string().contains("precisa da sua confirmação"), "{e}");
     assert_eq!(s.server.received_requests().await.unwrap().len(), 0);
     assert!(!s.layout.app_dir("app").exists());
 }

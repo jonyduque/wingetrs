@@ -249,7 +249,7 @@ pub enum ExecError {
         reason: String,
     },
     /// The plan (or the installed app) runs third-party code and no consent was given.
-    #[error("{app}: precisa da sua confirmação para rodar {what} (fase 2c, Task 161)")]
+    #[error("{app}: precisa da sua confirmação para rodar {what}")]
     NeedsScriptConsent { app: String, what: String },
 }
 

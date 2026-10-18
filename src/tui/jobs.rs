@@ -3,12 +3,13 @@
 use crate::bridge::elevated::ElevatedBridge;
 use crate::bridge::{self, BridgeJob, BridgeOp, Tool};
 use crate::catalog::{Catalog, CatalogError};
+use crate::cli::output::removal_third_party;
 use crate::core::PackageEntry;
 use crate::core::version::Version;
 use crate::install::executor::ExecError;
 use crate::install::msi_queue;
-use crate::install::ops::{self, AllowMsiexec, OpsCtx, OpsError, Resolution};
-use crate::install::plan::InstallPlan;
+use crate::install::ops::{self, Allow, AllowMsiexec, OpsCtx, OpsError, Resolution};
+use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
@@ -278,10 +279,16 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
     } else {
         "Os dados persistentes do app são mantidos.\n"
     });
-    Ok(Planned::Ready {
-        text,
-        action: Action::Remove(plan),
-    })
+    // The removal runs the code of the manifest written at install time: it goes to the user.
+    let code = ops::uninstall_manifest(c, &plan)
+        .map_err(|e| e.to_string())?
+        .map(|m| removal_third_party(&m, ""))
+        .unwrap_or_default();
+    let action = Action::Remove(plan);
+    if code.is_empty() {
+        return Ok(Planned::Ready { text, action });
+    }
+    Ok(Planned::ReadyScripts { text, action, code })
 }
 
 /// Plans upgrading every upgradable app; `keep` keeps the old versions.
@@ -347,6 +354,26 @@ fn fail(e: OpsError) -> InstallFail {
     }
 }
 
+/// Removes `plan`; `scripts` is the user's consent to the app's uninstall code. The notes of
+/// what did not happen (a skipped uninstaller) go in the summary the user reads.
+fn removed(o: &OpsCtx<'_>, plan: UninstallPlan, scripts: bool) -> Result<Done, InstallFail> {
+    let done = ops::uninstall_with(o, &plan, scripts).map_err(fail)?;
+    Ok(Done {
+        summary: removed_summary(&plan.app, &done.notes),
+        residues: Some((plan.app, done.residues)),
+    })
+}
+
+/// `<app> removido`, followed by the notes of the removal.
+pub fn removed_summary(app: &str, notes: &[String]) -> String {
+    let mut summary = format!("{app} removido");
+    for note in notes {
+        summary.push_str(". ");
+        summary.push_str(note);
+    }
+    summary
+}
+
 fn installed(applied: Result<Vec<InstallPlan>, OpsError>) -> Result<Done, InstallFail> {
     let names: Vec<String> = applied.map_err(fail)?.into_iter().map(|p| p.app).collect();
     Ok(Done {
@@ -359,12 +386,14 @@ fn installed(applied: Result<Vec<InstallPlan>, OpsError>) -> Result<Done, Instal
 /// (`run_bridge` logs it).
 fn action_info(action: &Action) -> Option<JobInfo> {
     match action {
-        Action::Apply(groups) | Action::ApplyMsiexec { groups, .. } => {
+        Action::Apply(groups)
+        | Action::ApplyMsiexec { groups, .. }
+        | Action::ApplyScripts { groups } => {
             let plans = groups.iter().flatten();
             let kind = JobInfo::plans_kind(plans.clone());
             Some(JobInfo::for_plans(kind, plans))
         }
-        Action::Remove(plan) => Some(JobInfo {
+        Action::Remove(plan) | Action::RemoveScripts(plan) => Some(JobInfo {
             kind: "remove",
             tool: "wingetrs",
             target: plan.app.clone(),
@@ -463,13 +492,15 @@ async fn run_action_inner(o: &OpsCtx<'_>, action: Action) -> Result<Done, Instal
         Action::ApplyMsiexec { groups, app } => {
             installed(ops::apply_groups_allowing(o, groups, &AllowMsiexec::App(app)).await)
         }
-        Action::Remove(plan) => {
-            let residues = ops::uninstall(o, &plan).map_err(fail)?;
-            Ok(Done {
-                summary: format!("{} removido", plan.app),
-                residues: Some((plan.app, residues)),
-            })
+        Action::ApplyScripts { groups } => {
+            let allow = Allow {
+                msiexec: AllowMsiexec::No,
+                scripts: true,
+            };
+            installed(ops::apply_groups_with(o, groups, &allow).await)
         }
+        Action::Remove(plan) => removed(o, plan, false),
+        Action::RemoveScripts(plan) => removed(o, plan, true),
         // Runs outside `install.lock` and the ops context: see `run_bridge`.
         Action::Bridge(job) => Err(InstallFail::Other(format!(
             "{}: atualização via {} fora do executor da ponte",

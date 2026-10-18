@@ -1,10 +1,12 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
 use crate::bridge::{self, BridgeJob, BridgeOp, NOT_OURS_NOTE, PINNED_NOTE, Tool, WingetFit};
 use crate::catalog::search::{SearchHit, SearchIndex};
+use crate::cli::output::{ThirdParty, plan_third_party};
 use crate::config::{Behavior, Config, ConfirmMode, ResidueMode, WingetEngine};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
+use crate::install::script_scan::{ScriptReport, Verdict, printable};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, InstallScope, ListRow, Rule, UpdateState};
 use crate::installed::overrides::Choice;
@@ -210,6 +212,12 @@ pub enum Planned {
         text: String,
         action: Action,
     },
+    /// A removal whose app runs third-party code (read from its recorded manifest).
+    ReadyScripts {
+        text: String,
+        action: Action,
+        code: Vec<ThirdParty>,
+    },
     /// The text matched more than one package.
     Choose(Vec<Candidate>),
 }
@@ -229,6 +237,13 @@ pub enum Action {
         groups: Vec<Vec<InstallPlan>>,
         app: String,
     },
+    /// Like `Apply`, after the user read the third-party code of the plans in the
+    /// confirmation and allowed it. Built only by that confirmation.
+    ApplyScripts {
+        groups: Vec<Vec<InstallPlan>>,
+    },
+    /// Like `Remove`, after the user allowed the app's uninstall code (hooks, uninstaller).
+    RemoveScripts(UninstallPlan),
     /// Native install of a winget package.
     WingetInstall(WingetPlan),
     /// Native uninstall of an ARP or MSIX record (with the folder backup when
@@ -256,7 +271,11 @@ impl Action {
                 let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
                 format!("Instalando {} (Windows Installer)", apps.join(", "))
             }
-            Action::Remove(p) => format!("Removendo {}", p.app),
+            Action::ApplyScripts { groups } => {
+                let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
+                format!("Instalando {}", apps.join(", "))
+            }
+            Action::Remove(p) | Action::RemoveScripts(p) => format!("Removendo {}", p.app),
             Action::Bridge(job) => match job.op {
                 BridgeOp::Install { .. } => {
                     format!("Instalando {} via {}", job.name, job.tool.name())
@@ -403,6 +422,35 @@ pub const CONFIRM_BUTTONS: [(&str, ConfirmButton); 2] = [
     ("Cancelar (esc)", ConfirmButton::Cancel),
 ];
 
+/// How the view paints a line of the scripts section (theme tokens only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptLineKind {
+    /// The app the code below belongs to.
+    App,
+    Header,
+    Info,
+    Flag,
+    Code,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptLine {
+    pub kind: ScriptLineKind,
+    pub text: String,
+}
+
+/// The scrollable third-party scripts of a confirmation, built once when it opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptSection {
+    pub lines: Vec<ScriptLine>,
+    /// First line on screen.
+    pub scroll: usize,
+    /// Lowercase apps that run third-party code.
+    pub apps: Vec<String>,
+    /// Lowercase apps with a script the gate refuses (never run).
+    pub refused: Vec<String>,
+}
+
 /// The dialog on top of the screen; it takes every key until it closes.
 pub enum Modal {
     Confirm {
@@ -417,6 +465,8 @@ pub enum Modal {
         actions: Vec<Action>,
         /// Tab whose marks are cleared once the actions are queued.
         clear_marks: Option<Tab>,
+        /// The third-party code of the plans, shown once; empty when there is none.
+        scripts: ScriptSection,
     },
     /// Quitting with work in progress or queued: Enter drops the queue and quits once the
     /// operation in progress ends.
@@ -731,6 +781,8 @@ pub struct App {
     /// `confirm` setting when the plan key was pressed (a later change does not skip the dialog);
     /// `None` = no plan key pending, the current setting applies.
     pub planning_confirm: Option<ConfirmMode>,
+    /// Third-party code of the removals planned and not yet confirmed, by lowercase app.
+    pub removal_code: HashMap<String, Vec<ThirdParty>>,
     /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
     pub now: Instant,
     /// Toasts on screen, newest first.
@@ -877,6 +929,7 @@ impl App {
             planning: false,
             planning_keep: false,
             planning_confirm: None,
+            removal_code: HashMap::new(),
             now: Instant::now(),
             toasts: Vec::new(),
             refresh_forced: false,
@@ -2491,7 +2544,7 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
     let mut items = Vec::new();
     for action in actions {
         match action {
-            Action::Apply(groups) => {
+            Action::Apply(groups) | Action::ApplyScripts { groups } => {
                 // The target of a group is its last plan; the others are its dependencies.
                 items.extend(groups.iter().filter_map(|g| g.last()).map(|p| ConfirmItem {
                     name: p.app.clone(),
@@ -2516,7 +2569,7 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     checked: true,
                 });
             }
-            Action::Remove(p) => items.push(ConfirmItem {
+            Action::Remove(p) | Action::RemoveScripts(p) => items.push(ConfirmItem {
                 name: p.app.clone(),
                 key: ours(&p.app).and_then(row_key),
                 from: Some(p.version.clone()),
@@ -2618,7 +2671,9 @@ fn uninstall_options(p: &WingetUninstallPlan) -> (bool, bool) {
 /// How many confirmation items `action` has (an `Apply` has one per non-empty group).
 fn item_count(action: &Action) -> usize {
     match action {
-        Action::Apply(groups) => groups.iter().filter(|g| !g.is_empty()).count(),
+        Action::Apply(groups) | Action::ApplyScripts { groups } => {
+            groups.iter().filter(|g| !g.is_empty()).count()
+        }
         Action::WingetUninstall(p) => {
             let (backup, registry_only) = uninstall_options(p);
             1 + usize::from(backup) + usize::from(registry_only)
@@ -2639,7 +2694,7 @@ fn action_notes(app: &App, action: &Action) -> Vec<String> {
     match action {
         Action::Bridge(job) => vec![bridge_note(job.tool).to_string()],
         Action::ApplyMsiexec { .. } => vec![MSIEXEC_NOTE.to_string()],
-        Action::Remove(p) if p.purge => vec![format!(
+        Action::Remove(p) | Action::RemoveScripts(p) if p.purge => vec![format!(
             "Os dados persistentes de {} serão APAGADOS (purge).",
             p.app
         )],
@@ -2672,6 +2727,7 @@ fn confirm_modal(
         }
     }
     all.extend(notes);
+    let scripts = script_section(&actions_code(app, &actions));
     Modal::Confirm {
         items: confirm_items(app, &actions),
         notes: all,
@@ -2679,7 +2735,181 @@ fn confirm_modal(
         cursor: 0,
         actions,
         clear_marks,
+        scripts,
     }
+}
+
+/// The third-party code each `Apply`/`Remove` of `actions` runs, by app (one entry per app).
+fn actions_code(app: &App, actions: &[Action]) -> Vec<(String, Vec<ThirdParty>)> {
+    let mut out: Vec<(String, Vec<ThirdParty>)> = Vec::new();
+    let mut add = |name: &str, code: Vec<ThirdParty>| {
+        if !code.is_empty() && !out.iter().any(|(a, _)| a.eq_ignore_ascii_case(name)) {
+            out.push((name.to_string(), code));
+        }
+    };
+    for action in actions {
+        match action {
+            Action::Apply(groups) => {
+                for p in groups.iter().flatten() {
+                    add(&p.app, plan_third_party(p));
+                }
+            }
+            Action::Remove(p) => {
+                let code = app.removal_code.get(&p.app.to_lowercase());
+                add(&p.app, code.cloned().unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether confirming `actions` would let third-party code run: the dialog then opens whatever
+/// the `confirm` setting says.
+fn has_third_party_code(app: &App, actions: &[Action]) -> bool {
+    !actions_code(app, actions).is_empty()
+}
+
+const PRIVILEGES: &str = "roda com os seus privilégios e pode alterar qualquer arquivo seu";
+
+fn verdict_text(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Confirm => "pede confirmação",
+        Verdict::ConfirmStrong => "pede atenção redobrada; revise antes de permitir",
+        Verdict::Refuse => "recusado: não roda",
+    }
+}
+
+fn push_report(lines: &mut Vec<ScriptLine>, r: &ScriptReport) {
+    let line = |kind, text: String| ScriptLine { kind, text };
+    lines.push(line(
+        ScriptLineKind::Info,
+        format!("  Análise: {}", verdict_text(r.verdict)),
+    ));
+    for f in &r.flags {
+        lines.push(line(
+            ScriptLineKind::Flag,
+            format!("  ! {} (linha {})", printable(&f.detail), f.line),
+        ));
+    }
+}
+
+fn command_line(file: &str, args: &[String]) -> String {
+    std::iter::once(file)
+        .chain(args.iter().map(String::as_str))
+        .map(printable)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The scripts section of a confirmation: per piece of code its header, the gate's verdict and
+/// flags, and the script's lines numbered. Built once, when the dialog opens.
+fn script_section(code: &[(String, Vec<ThirdParty>)]) -> ScriptSection {
+    let mut sec = ScriptSection::default();
+    let line = |kind, text: String| ScriptLine { kind, text };
+    for (name, items) in code {
+        sec.apps.push(name.to_lowercase());
+        if code.len() > 1 {
+            let text = format!("{}:", printable(name));
+            sec.lines.push(line(ScriptLineKind::App, text));
+        }
+        for item in items {
+            let report = match item {
+                ThirdParty::Script { report, .. } | ThirdParty::Ps1 { report, .. } => Some(report),
+                _ => None,
+            };
+            if report.is_some_and(|r| r.verdict == Verdict::Refuse) {
+                sec.refused.push(name.to_lowercase());
+            }
+            let program = |uninstaller: &bool, file: &str, args: &[String]| {
+                let what = if *uninstaller {
+                    "Desinstalador"
+                } else {
+                    "Instalador"
+                };
+                format!("{what} de terceiro: {}", command_line(file, args))
+            };
+            match item {
+                ThirdParty::Script {
+                    hook,
+                    script,
+                    report,
+                } => {
+                    let title = format!("Script de terceiro ({}), {PRIVILEGES}", printable(hook));
+                    sec.lines.push(line(ScriptLineKind::Header, title));
+                    push_report(&mut sec.lines, report);
+                    let width = script.lines().count().max(1).to_string().len();
+                    for (i, l) in script.lines().enumerate() {
+                        let text = format!("  {:>width$} | {}", i + 1, printable(l));
+                        sec.lines.push(line(ScriptLineKind::Code, text));
+                    }
+                }
+                ThirdParty::Program {
+                    uninstaller,
+                    file,
+                    args,
+                } => {
+                    let title = program(uninstaller, file, args);
+                    sec.lines.push(line(ScriptLineKind::Header, title));
+                    sec.lines
+                        .push(line(ScriptLineKind::Info, format!("  {PRIVILEGES}")));
+                }
+                ThirdParty::Ps1 {
+                    uninstaller,
+                    file,
+                    args,
+                    report,
+                } => {
+                    let title = program(uninstaller, file, args);
+                    sec.lines.push(line(ScriptLineKind::Header, title));
+                    sec.lines
+                        .push(line(ScriptLineKind::Info, format!("  {PRIVILEGES}")));
+                    push_report(&mut sec.lines, report);
+                }
+                ThirdParty::Unknown { what } => {
+                    let title = format!("Código de terceiro: {}", printable(what));
+                    sec.lines.push(line(ScriptLineKind::Header, title));
+                    sec.lines
+                        .push(line(ScriptLineKind::Info, format!("  {PRIVILEGES}")));
+                }
+            }
+        }
+    }
+    sec
+}
+
+/// `actions` as the user allowed them: an `Apply`/`Remove` whose app runs third-party code
+/// (shown in the dialog) becomes `ApplyScripts`/`RemoveScripts`. `Err(app)` when one of them
+/// has a script the gate refuses: that never runs.
+fn authorize_scripts(sec: &ScriptSection, actions: Vec<Action>) -> Result<Vec<Action>, String> {
+    let code = |name: &str| sec.apps.iter().any(|a| a.eq_ignore_ascii_case(name));
+    let mut out = Vec::new();
+    for action in actions {
+        let (names, converted): (Vec<String>, Action) = match action {
+            Action::Apply(groups) => {
+                let names: Vec<String> = groups.iter().flatten().map(|p| p.app.clone()).collect();
+                if names.iter().any(|n| code(n)) {
+                    (names, Action::ApplyScripts { groups })
+                } else {
+                    out.push(Action::Apply(groups));
+                    continue;
+                }
+            }
+            Action::Remove(p) if code(&p.app) => (vec![p.app.clone()], Action::RemoveScripts(p)),
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        if let Some(n) = names
+            .iter()
+            .find(|n| sec.refused.iter().any(|r| r.eq_ignore_ascii_case(n)))
+        {
+            return Err(n.clone());
+        }
+        out.push(converted);
+    }
+    Ok(out)
 }
 
 /// Middle of the note of an unchecked package that a checked one still installs.
@@ -2986,7 +3216,7 @@ fn confirm_batch(
         toast_left_out(app, left_out);
         return Vec::new();
     }
-    if actions.iter().any(|a| needs_confirm(confirm, a)) {
+    if has_third_party_code(app, &actions) || actions.iter().any(|a| needs_confirm(confirm, a)) {
         let notes = (left_out > 0).then(|| left_out_note(left_out));
         let modal = confirm_modal(app, actions, notes.into_iter().collect(), Some(tab));
         open_modal(app, modal);
@@ -3903,11 +4133,16 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
         .unwrap_or(app.settings.behavior.confirm);
     match result {
         Ok(Planned::Ready { action, .. }) => {
-            if !needs_confirm(confirm, &action) {
-                return enqueue(app, action);
+            if let Action::Remove(p) = &action {
+                app.removal_code.remove(&p.app.to_lowercase());
             }
-            let modal = confirm_modal(app, vec![action], Vec::new(), None);
-            open_modal(app, modal);
+            return ready_one(app, action, confirm);
+        }
+        Ok(Planned::ReadyScripts { action, code, .. }) => {
+            if let Action::Remove(p) = &action {
+                app.removal_code.insert(p.app.to_lowercase(), code);
+            }
+            return ready_one(app, action, confirm);
         }
         Ok(Planned::Choose(candidates)) => {
             let items = candidates.iter().map(candidate_item).collect();
@@ -3923,6 +4158,17 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
         }
         Err(message) => app.push_toast(ToastKind::Error, message),
     }
+    Vec::new()
+}
+
+/// A ready plan: confirmed per the `confirm` setting, and always when it runs third-party code.
+fn ready_one(app: &mut App, action: Action, confirm: ConfirmMode) -> Vec<Cmd> {
+    let actions = vec![action];
+    if !needs_confirm(confirm, &actions[0]) && !has_third_party_code(app, &actions) {
+        return actions.into_iter().flat_map(|a| enqueue(app, a)).collect();
+    }
+    let modal = confirm_modal(app, actions, Vec::new(), None);
+    open_modal(app, modal);
     Vec::new()
 }
 
@@ -4046,8 +4292,19 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
         match result {
             Ok(Planned::Ready { action, .. }) => match action {
                 Action::Apply(g) => groups.extend(g),
-                other => removals.push(other),
+                other => {
+                    if let Action::Remove(p) = &other {
+                        app.removal_code.remove(&p.app.to_lowercase());
+                    }
+                    removals.push(other);
+                }
             },
+            Ok(Planned::ReadyScripts { action, code, .. }) => {
+                if let Action::Remove(p) = &action {
+                    app.removal_code.insert(p.app.to_lowercase(), code);
+                }
+                removals.push(action);
+            }
             Ok(Planned::Choose(_)) => ambiguous.push(label),
             Err(message) => app.push_toast(ToastKind::Error, format!("{label}: {message}")),
         }
@@ -4216,24 +4473,51 @@ fn handle_residues(app: &mut App, name: String, residues: Vec<Residue>) -> Vec<C
 
 /// Items of the open confirmation that fit on screen (at least one).
 fn confirm_rows(app: &App) -> usize {
-    let Some(Modal::Confirm { items, notes, .. }) = &app.modal else {
+    let Some(Modal::Confirm {
+        items,
+        notes,
+        scripts,
+        ..
+    }) = &app.modal
+    else {
         return 1;
     };
     let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
-    let list = crate::tui::regions::confirm_geom(items.len(), notes, area).list;
-    (usize::from(list.height) / ITEM_ROWS).max(1)
+    let geom = crate::tui::regions::confirm_geom(items.len(), notes, scripts.lines.len(), area);
+    (usize::from(geom.list.height) / ITEM_ROWS).max(1)
+}
+
+/// `(rows, width)` the scripts section draws its lines in (at least one row).
+fn script_rows(app: &App) -> (usize, usize) {
+    let Some(Modal::Confirm {
+        items,
+        notes,
+        scripts,
+        ..
+    }) = &app.modal
+    else {
+        return (1, 1);
+    };
+    let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
+    let geom = crate::tui::regions::confirm_geom(items.len(), notes, scripts.lines.len(), area);
+    (
+        usize::from(geom.scripts.height.saturating_sub(1)).max(1),
+        usize::from(geom.scripts.width).max(1),
+    )
 }
 
 /// Keys of the confirmation: arrows move the cursor (the list scrolls to keep it on screen),
 /// `Espaço` toggles the item, `Enter` continues, `Esc` cancels.
 fn confirm_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     let rows = confirm_rows(app);
+    let (page_rows, page_width) = script_rows(app);
     let Some(Modal::Confirm {
         items,
         notes,
         scroll,
         cursor,
         actions,
+        scripts,
         ..
     }) = &mut app.modal
     else {
@@ -4242,6 +4526,24 @@ fn confirm_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     match key.code {
         KeyCode::Enter => return continue_confirm(app),
         KeyCode::Esc => return cancel_confirm(app),
+        KeyCode::PageDown => {
+            use crate::tui::regions::{script_fit, script_max_scroll};
+            let lines = &scripts.lines;
+            let page = script_fit(lines, scripts.scroll, page_rows, page_width);
+            let last = script_max_scroll(lines, page_rows, page_width);
+            scripts.scroll = (scripts.scroll + page).min(last);
+            return Vec::new();
+        }
+        KeyCode::PageUp => {
+            let back = crate::tui::regions::script_fit_back(
+                &scripts.lines,
+                scripts.scroll,
+                page_rows,
+                page_width,
+            );
+            scripts.scroll = scripts.scroll.saturating_sub(back);
+            return Vec::new();
+        }
         KeyCode::Up => *cursor = cursor.saturating_sub(1),
         KeyCode::Down => *cursor = (*cursor + 1).min(items.len().saturating_sub(1)),
         KeyCode::Char(' ') => toggle_confirm_item(items, actions, notes, *cursor),
@@ -4258,17 +4560,39 @@ fn continue_confirm(app: &mut App) -> Vec<Cmd> {
     if !any {
         return Vec::new();
     }
+    let refused = match &app.modal {
+        Some(Modal::Confirm {
+            items,
+            actions,
+            scripts,
+            ..
+        }) => authorize_scripts(scripts, checked_actions(items, actions.clone())).err(),
+        _ => None,
+    };
+    if let Some(name) = refused {
+        // A refused script never runs: the dialog stays so the item can be unchecked.
+        app.push_toast(
+            ToastKind::Error,
+            format!("{name}: um script foi recusado pela análise e não roda"),
+        );
+        return Vec::new();
+    }
     let Some(Modal::Confirm {
         items,
         actions,
         clear_marks,
+        scripts,
         ..
     }) = app.modal.take()
     else {
         return Vec::new();
     };
+    let checked = checked_actions(&items, actions);
+    let Ok(authorized) = authorize_scripts(&scripts, checked) else {
+        return Vec::new();
+    };
     let mut cmds = Vec::new();
-    for action in checked_actions(&items, actions) {
+    for action in authorized {
         cmds.extend(enqueue(app, action));
     }
     if let Some(tab) = clear_marks {
@@ -4292,17 +4616,36 @@ fn confirm_mouse(app: &mut App, ev: MouseEvent) -> Vec<Cmd> {
         };
     }
     let rows = usize::from(r.confirm_list.height) / ITEM_ROWS;
+    let script_page = (
+        usize::from(r.confirm_scripts.height.saturating_sub(1)).max(1),
+        usize::from(r.confirm_scripts.width).max(1),
+    );
     let Some(Modal::Confirm {
         items,
         notes,
         scroll,
         cursor,
         actions,
+        scripts,
         ..
     }) = &mut app.modal
     else {
         return Vec::new();
     };
+    if matches!(
+        ev.kind,
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+    ) && inside(r.confirm_scripts)
+    {
+        let last =
+            crate::tui::regions::script_max_scroll(&scripts.lines, script_page.0, script_page.1);
+        scripts.scroll = if ev.kind == MouseEventKind::ScrollDown {
+            (scripts.scroll + WHEEL_ITEMS).min(last)
+        } else {
+            scripts.scroll.saturating_sub(WHEEL_ITEMS)
+        };
+        return Vec::new();
+    }
     let shown = crate::tui::regions::confirm_window(*scroll, items.len(), rows);
     match ev.kind {
         MouseEventKind::Down(MouseButton::Left) if inside(r.confirm_list) => {

@@ -4,7 +4,7 @@ use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{
     ActionId, App, CONFIRM_BUTTONS, ConfirmButton, ConfirmItem, ITEM_ROWS, Modal, RunProgress,
-    ShowFilter, SourceFilter, Tab, buttons, queue_rows,
+    ScriptLineKind, ScriptSection, ShowFilter, SourceFilter, Tab, buttons, queue_rows,
 };
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
@@ -13,7 +13,10 @@ use crate::tui::layout::{
     DIALOG_PAD_Y, ITEM_GAP, LIST_ICON_COLS, LIST_ICON_GAP, PICKER_FOOTER_SLACK, inset, split_icon,
 };
 use crate::tui::picker::{Picker, window};
-use crate::tui::regions::{confirm_geom, confirm_window, list_visible, regions};
+use crate::tui::regions::{
+    confirm_geom, confirm_window, list_visible, regions, script_fit, script_line_chunks,
+    script_max_scroll,
+};
 use crate::tui::settings::{ORDER, SettingId};
 use crate::tui::tabs::{TabLabel, draw_tabs};
 use crate::tui::theme::{GlyphSet, Glyphs, Theme};
@@ -1186,8 +1189,18 @@ fn draw_modal<'a>(
             notes,
             scroll,
             cursor,
+            scripts,
             ..
-        } => return draw_confirm(app, items, notes, (*scroll, *cursor), theme, frame, area),
+        } => {
+            return draw_confirm(
+                app,
+                (items, notes, scripts),
+                (*scroll, *cursor),
+                theme,
+                frame,
+                area,
+            );
+        }
         Modal::ConfirmQuit { text } => {
             let mut lines: Vec<Line> = text
                 .lines()
@@ -1298,14 +1311,13 @@ fn confirm_text(app: &App, item: &ConfirmItem) -> String {
 /// buttons, all inside the box `confirm_geom` lays out.
 fn draw_confirm<'a>(
     app: &'a App,
-    items: &[ConfirmItem],
-    notes: &[String],
+    (items, notes, scripts): (&[ConfirmItem], &[String], &ScriptSection),
     (scroll, cursor): (usize, usize),
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
 ) -> IconPlaces<'a> {
-    let geom = confirm_geom(items.len(), notes, area);
+    let geom = confirm_geom(items.len(), notes, scripts.lines.len(), area);
     frame.render_widget(Clear, geom.dialog);
     frame.render_widget(modal_block(theme, "Confirmar"), geom.dialog);
     let line = |frame: &mut Frame, rect: Rect, text: &str, style| {
@@ -1369,6 +1381,7 @@ fn draw_confirm<'a>(
             None => {}
         }
     }
+    draw_scripts(scripts, geom.scripts, theme, frame);
     let ready = items.iter().any(|i| i.checked);
     for ((rect, button), (label, _)) in geom.buttons.iter().zip(CONFIRM_BUTTONS) {
         let style = if *button == ConfirmButton::Continue && !ready {
@@ -1379,6 +1392,53 @@ fn draw_confirm<'a>(
         line(frame, *rect, &format!(" {label} "), style);
     }
     places
+}
+
+/// The third-party scripts section of the confirmation: a title, then the lines from
+/// `scripts.scroll`, each in the style of its kind (theme tokens only).
+fn draw_scripts(scripts: &ScriptSection, area: Rect, theme: &Theme, frame: &mut Frame) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let rows = usize::from(area.height) - 1;
+    let width = usize::from(area.width);
+    let total = scripts.lines.len();
+    let start = scripts
+        .scroll
+        .min(script_max_scroll(&scripts.lines, rows, width));
+    let fit = script_fit(&scripts.lines, start, rows, width);
+    let title = format!(
+        "Scripts de terceiros ({}-{} de {total}) · PgUp/PgDn rolam",
+        start + 1,
+        start + fit
+    );
+    let line = |frame: &mut Frame, y: u16, text: &str, style| {
+        let rect = Rect::new(area.x, y, area.width, 1);
+        frame.render_widget(Paragraph::new(Span::styled(clip(text, width), style)), rect);
+    };
+    line(
+        frame,
+        area.y,
+        &title,
+        theme.accent().add_modifier(Modifier::BOLD),
+    );
+    let mut y = area.y + 1;
+    'lines: for l in scripts.lines.iter().skip(start) {
+        let style = match l.kind {
+            ScriptLineKind::App => theme.accent(),
+            ScriptLineKind::Header => theme.warn().add_modifier(Modifier::BOLD),
+            ScriptLineKind::Info => theme.muted(),
+            ScriptLineKind::Flag => theme.warn(),
+            ScriptLineKind::Code => theme.fg(),
+        };
+        for chunk in script_line_chunks(l, width) {
+            if y >= area.bottom() {
+                break 'lines;
+            }
+            line(frame, y, &chunk, style);
+            y += 1;
+        }
+    }
 }
 
 /// Status bar text of the operation in progress (or of the queue waiting for the lock).
