@@ -1269,3 +1269,77 @@ Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) trocar `Constant,AllS
 3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat(scripts): constant $global and informational if ($global) blocks`
+
+
+### Task 191: Correções da revisão de fase da 2c (executor, consentimento, efeitos)
+
+**Modelo:** opus (revisor opus). Origem: revisão de fase inteira da 2c em 2026-10-18 (orquestrador), sobre o HEAD f71ac10.
+
+#### Where this fits
+
+- `src/install/installer_win.rs` (~:14 `run`) e `src/install/inno_win.rs` (~:12): rodam `installer.file`/`uninstaller.file` e o innounp **sem** `refuse_if_elevated`; só o `PwshHost::run` checa (`script_host_win.rs` ~:91). Chamadores: `src/install/executor.rs` ~:2307 (instalar/atualizar) e ~:3496 (remover).
+- `src/cli/output.rs` ~:620–627 `removal_third_party`: lista o desinstalador só quando `uninstaller.file` existe; o executor (`planner::uninstaller_command`, `planner.rs` ~:299) também roda o primeiro download quando só `args` existe; a ordem mostrada (script, depois arquivo) é a inversa da executada (arquivo, depois script).
+- `src/install/executor.rs` ~:2159–2172 (efeito `Shim`): `args` vindo do `effects.jsonl` não é checado; o planner recusa caracteres de controle no `bin` do manifesto (`planner.rs` ~:428); `shim.rs` ~:210/217/219 grava `args` cru no texto do `.cmd`/`.ps1`.
+- `src/install/executor.rs` ~:1912 `is_inside`: checagem só léxica; uma junção `$dir\x` criada pelo hook faz `Add-Path "$dir\x"` pôr qualquer pasta no PATH.
+- `src/install/executor.rs` ~:3472–3510 com ~:3347: efeitos de remoção aplicados sem desfazer; se um passo seguinte falha, o erro não avisa que os scripts de desinstalação já rodaram.
+- `src/tui/jobs.rs` ~:375 `check_shown_manifest` e `src/install/ops.rs` ~:976 `uninstall_with`: o sha mostrado é comparado antes do `install.lock`; `uninstall_with` só compara a versão; a CLI não compara sha.
+
+#### What binds this task
+
+1. **Nunca elevado:** `installer_win::run` e o lançamento do innounp chamam `refuse_if_elevated(is_elevated()?)` (mesmo erro e texto do `PwshHost`), com o `elevated` injetável já usado nos testes do host.
+2. **Consentimento mostra o que roda, na ordem em que roda:** `removal_third_party` monta a lista a partir de `planner::uninstaller_command` (o mesmo que o executor usa), na ordem do executor.
+3. **`args` de shim vindo de efeito:** `apply_effect` recusa em `args` caracteres de controle e `"` (mesma regra do `bin`), com motivo.
+4. **Sem fuga por junção:** antes de aplicar `AddPath`/`Shim`/`Shortcut`, o caminho é canonicalizado e comparado com a pasta do app/persist canonicalizada; reparse point no caminho ⇒ recusa com motivo.
+5. **Remoção que falha depois dos scripts:** o erro diz "os scripts de desinstalação já rodaram e alteraram: <lista dos efeitos aplicados>", como o `OLD_HOOKS_RAN` da atualização.
+6. **sha sob a trava:** `uninstall_with` recebe o `manifest_sha256` mostrado (TUI e CLI) e compara **sob** o `install.lock`; diferente ⇒ recusa sem rodar nada.
+
+#### Tests (literais)
+
+- `file_installer_refused_when_elevated` e `innounp_refused_when_elevated` (elevated injetado = true ⇒ erro, corredor falso com 0 chamadas).
+- `removal_consent_lists_args_only_uninstaller`: `uninstaller: {args: "/S"}` ⇒ a lista mostrada contém o programa; e `removal_consent_order_matches_executor`.
+- `shim_effect_args_with_control_char_refused` e `shim_effect_args_with_quote_refused`.
+- `effect_path_through_junction_refused` (junção em tempdir).
+- `removal_failure_after_scripts_mentions_effects`.
+- `uninstall_with_sha_mismatch_runs_nothing` (sha diferente sob a trava ⇒ 0 chamadas ao corredor).
+
+Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) tirar o `refuse_if_elevated` do `installer_win::run`; (b) `removal_third_party` voltar a olhar só `uninstaller.file`; (c) tirar a canonicalização do item 4.
+
+**Files:**
+- Modify: `src/install/installer_win.rs`, `src/install/inno_win.rs`, `src/install/executor.rs`, `src/install/ops.rs`, `src/install/shim.rs` (só se preciso), `src/cli/output.rs`, `src/cli/` (passar o sha), `src/tui/jobs.rs`
+- Test: módulos existentes em `tests/it/` desses arquivos.
+
+#### Checks beyond the steps
+
+1. Outro agente edita `src/install/{runner.rs,script_scan.rs,prelude.ps1}` (Task 164) e outro `src/bridge/*` e `src/winget_install/{switches,elevated_rules}.rs` (Task 190): não toque nesses arquivos.
+2. Testes nunca rodam pwsh, innounp nem instalador reais.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(install): phase 2c review (no elevation for file installers, consent order, effect paths, sha under lock)`
+
+### Task 192: Portão — código puxado de arquivo e apelidos (revisão de fase da 2c)
+
+**Modelo:** opus (revisor opus). Depois da Task 164 (mesmo arquivo).
+
+#### Where this fits
+
+- `src/install/script_scan.rs` ~:911 `invokes_variable`: `& "$dir\setup.ps1"` e `. "$bucketsdir\extras\scripts\foo.ps1"` (aspas entre `&`/`.` e `$`) não geram flag; o arquivo chamado roda sem análise e sem ser mostrado. O mesmo vale para `.ps1` que um `installer.file` analisado dot-source de `$PSScriptRoot`.
+- `src/install/script_scan.rs` ~:592–605: regras `PreludeInternal`/`PreludeRedefinition` contornáveis por `Set-Alias shim Out-Null`, `New-Item alias:Add-Path`, `Set-Variable ('__w'+'r_effects')`, `Add-Content .\effects.jsonl`. Sem impacto hoje (o Rust revalida cada efeito por lista branca), mas recusas do lado do prelúdio não são fronteira.
+
+#### What binds this task
+
+1. `&` ou `.` seguido de string (aspas simples ou duplas) ou de caminho ⇒ `Flag` `ConfirmStrong` "roda um arquivo que não é mostrado: <alvo>".
+2. Alvo literal resolvível (`$dir\<nome>.ps1`, `$bucketsdir\<bucket>\scripts\<nome>.ps1` com `<nome>` passando por `safepath`): o arquivo é lido (bucket guardado pela Task 149; `$dir` só se já extraído no momento da análise), analisado pelo mesmo `scan` (o pior veredito vence) e incluído no texto mostrado na confirmação. Não resolvível ⇒ fica no `ConfirmStrong` do item 1.
+3. `Set-Alias`, `New-Alias`, `alias:` ⇒ `ConfirmStrong` "redefine comando por apelido".
+4. Comentário no topo do `prelude.ps1` e na seção do portão do código: recusas do prelúdio são conveniência, não fronteira; a fronteira é a revalidação dos efeitos no Rust.
+
+#### Tests (literais)
+
+- `call_quoted_path_is_confirm_strong` (`& "$dir\setup.ps1"`), `dot_source_bucket_script_scanned` (arquivo de `scripts/` com `HKLM:` ⇒ `Refuse` do hook que o chama), `unresolvable_target_confirm_strong`, `alias_redefinition_confirm_strong`.
+
+Mutação obrigatória: tirar a regra do item 1 ⇒ `call_quoted_path_is_confirm_strong` PEGA.
+
+**Files:**
+- Modify: `src/install/script_scan.rs`, `src/install/prelude.ps1` (só o comentário), e onde a confirmação monta o texto mostrado (CLI `src/cli/output.rs`, TUI pela mesma função)
+- Test: `tests/it/script_scan.rs`, testes de confirmação existentes.
+
+**Commit:** `fix(scripts): gate follows called script files and flags aliases`
