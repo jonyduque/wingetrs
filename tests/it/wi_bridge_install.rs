@@ -26,7 +26,10 @@ type Call = (String, Vec<String>);
 fn install(target: &str, scope: Option<InstallScope>) -> BridgeJob {
     BridgeJob {
         tool: Tool::Winget,
-        op: BridgeOp::Install { scope },
+        op: BridgeOp::Install {
+            scope,
+            agreements: Vec::new(),
+        },
         target: target.into(),
         name: format!("App {target}"),
         installed: None,
@@ -241,7 +244,10 @@ fn machine_only_manifest_goes_elevated_user_never() {
     assert_eq!(job.scope, Some(InstallScope::Machine));
     assert_eq!(
         job.op,
-        BridgeOp::Install { scope: None },
+        BridgeOp::Install {
+            scope: None,
+            agreements: Vec::new()
+        },
         "no --scope added"
     );
     assert_eq!(elevates(&job), (true, 1));
@@ -254,6 +260,12 @@ fn machine_only_manifest_goes_elevated_user_never() {
     let mixed = manifest(&[("x64", "user"), ("x64", "machine")]);
     let job = bridge::install_job("Git.Git", "Git", "2.0", &mixed, None, "x64");
     assert_eq!(job.scope, None);
+
+    // No installer for this machine at all: nothing says machine-wide, so no elevation.
+    let foreign = manifest(&[("arm64", "machine")]);
+    let job = bridge::install_job("Git.Git", "Git", "2.0", &foreign, None, "x64");
+    assert_eq!(job.scope, None);
+    assert_eq!(elevates(&job), (false, 0));
 
     // Only installers for this machine count: an arm64 user installer does not run on x64.
     let other_arch = manifest(&[("x64", "machine"), ("arm64", "user")]);
@@ -473,15 +485,10 @@ impl Script {
             on_line(&line);
             Ok((code, vec![line]))
         };
-        let r = jobs::run_bridge_install(
-            &bridge,
-            job,
-            &[],
-            fallback,
-            &lock,
-            &mut exec,
-            &mut |l: &str| seen.push(l.to_string()),
-        );
+        let r =
+            jobs::run_bridge_install(&bridge, job, fallback, &lock, &mut exec, &mut |l: &str| {
+                seen.push(l.to_string())
+            });
         (r.map(|d| d.summary), seen)
     }
 }
@@ -638,6 +645,10 @@ fn tui_search_install_winget_enabled() {
                 notes.contains(&"Licença: EULA — https://x/eula".to_string()),
                 "{notes:?}"
             );
+            assert!(
+                notes.iter().any(|n| n.contains("pedido do UAC")),
+                "{notes:?}"
+            );
             assert_eq!(
                 actions,
                 &vec![wingetrs::tui::app::Action::Bridge(job.clone())]
@@ -653,7 +664,7 @@ fn tui_search_install_winget_enabled() {
     assert!(
         cmds.iter().any(|c| matches!(
             c,
-            Cmd::Execute(wingetrs::tui::app::Action::Bridge(j)) if j.op == BridgeOp::Install { scope: None }
+            Cmd::Execute(wingetrs::tui::app::Action::Bridge(j)) if j.op == job.op
         )),
         "{cmds:?}"
     );
@@ -668,4 +679,252 @@ fn tui_winget_plan_error_toasts() {
     update(&mut a, Msg::WingetPlanned(Err("sem rede".into())));
     assert!(a.modal.is_none());
     assert!(a.toasts.iter().any(|t| t.text.contains("sem rede")));
+}
+/// A helper process played by a thread running `serve`; its winget answers `code`.
+struct ServingHelper {
+    reader: BufReader<std::io::PipeReader>,
+    writer: Option<std::io::PipeWriter>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    sink: std::io::Sink,
+}
+
+impl ServingHelper {
+    fn spawn(code: i32, calls: Arc<std::sync::Mutex<Vec<Call>>>) -> ServingHelper {
+        let (req_r, req_w) = std::io::pipe().unwrap();
+        let (resp_r, mut resp_w) = std::io::pipe().unwrap();
+        let thread = std::thread::spawn(move || {
+            let mut req_r = BufReader::new(req_r);
+            let mut exec = |p: &str, a: &[String], _: &mut dyn FnMut(&str)| {
+                calls.lock().unwrap().push((p.to_string(), a.to_vec()));
+                Ok((code, Vec::new()))
+            };
+            let _ = worker::serve(&mut req_r, &mut resp_w, &mut exec);
+        });
+        ServingHelper {
+            reader: BufReader::new(resp_r),
+            writer: Some(req_w),
+            thread: Some(thread),
+            sink: std::io::sink(),
+        }
+    }
+}
+
+impl Helper for ServingHelper {
+    fn reader(&mut self) -> &mut dyn std::io::BufRead {
+        &mut self.reader
+    }
+    fn writer(&mut self) -> &mut dyn std::io::Write {
+        match &mut self.writer {
+            Some(w) => w,
+            None => &mut self.sink,
+        }
+    }
+    fn wait_exit(&mut self, _limit: Duration) -> bool {
+        true
+    }
+    fn alive(&mut self) -> bool {
+        true
+    }
+}
+
+impl Drop for ServingHelper {
+    fn drop(&mut self) {
+        // Closing the request pipe ends `serve`.
+        self.writer = None;
+        if let Some(t) = self.thread.take()
+            && let Err(p) = t.join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(p);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ServingTransport {
+    starts: Arc<AtomicUsize>,
+    calls: Arc<std::sync::Mutex<Vec<Call>>>,
+}
+
+impl Transport for ServingTransport {
+    fn start(&self) -> Result<Box<dyn Helper>, String> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(ServingHelper::spawn(
+            NO_INSTALLER,
+            Arc::clone(&self.calls),
+        )))
+    }
+}
+
+#[test]
+fn settings_fallback_runs_unelevated() {
+    let (_dir, lock) = msi_lock();
+    let t = ServingTransport::default();
+    let bridge = ElevatedBridge::new(Box::new(t.clone()));
+    let machine = install("Git.Git", Some(InstallScope::Machine));
+    let mut local: Vec<Call> = Vec::new();
+    let mut exec = |p: &str, a: &[String], on_line: &mut dyn FnMut(&str)| {
+        local.push((p.to_string(), a.to_vec()));
+        on_line("Found Git [Git.Git] Version 2.0");
+        Ok((0, Vec::new()))
+    };
+    let r = jobs::run_bridge_install(&bridge, &machine, true, &lock, &mut exec, &mut |_: &str| {});
+    assert_eq!(r.unwrap().summary, "App Git.Git: instalado via winget");
+    assert_eq!(t.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *t.calls.lock().unwrap(),
+        vec![("winget".to_string(), base_with(&["--scope", "machine"]))],
+        "only the first run goes through the helper"
+    );
+    assert_eq!(
+        local,
+        vec![("winget".to_string(), base_with(&[]))],
+        "the retry runs here, without --scope"
+    );
+    bridge.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn agreements_travel_with_the_job() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use wingetrs::tui::app::{Action, update};
+    let with = |agreements: &[&str]| BridgeJob {
+        op: BridgeOp::Install {
+            scope: None,
+            agreements: strings(agreements),
+        },
+        ..install("Git.Git", None)
+    };
+    let key = |c| Msg::Key(KeyEvent::new(c, KeyModifiers::NONE));
+    let mut a = tui_app();
+    // A first plan of the id, cancelled.
+    update(
+        &mut a,
+        Msg::WingetPlanned(Ok((with(&["A https://a"]), vec!["n".into()]))),
+    );
+    update(&mut a, key(KeyCode::Esc));
+    assert!(a.modal.is_none());
+    // A second plan of the same id: only its own agreements run.
+    update(
+        &mut a,
+        Msg::WingetPlanned(Ok((with(&["B https://b"]), vec!["n".into()]))),
+    );
+    let cmds = update(&mut a, key(KeyCode::Enter));
+    let ran: Vec<&BridgeJob> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Cmd::Execute(Action::Bridge(j)) => Some(j),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ran, vec![&with(&["B https://b"])]);
+
+    // And they reach `job.start` from the job itself.
+    let log = crate::spans::Log::default();
+    let _installed = log.install();
+    let (_dir, lock) = msi_lock();
+    let bridge = ElevatedBridge::new(Box::new(Refusing));
+    let mut exec = |_: &str, _: &[String], on_line: &mut dyn FnMut(&str)| {
+        on_line("Found Git [Git.Git] Version 2.0");
+        Ok((0, Vec::new()))
+    };
+    jobs::run_bridge_install(
+        &bridge,
+        &with(&["B https://b"]),
+        false,
+        &lock,
+        &mut exec,
+        &mut |_: &str| {},
+    )
+    .unwrap();
+    let text = log.text();
+    let start = text.lines().find(|l| l.contains("job.start")).unwrap();
+    assert!(start.contains("agreements=B https://b"), "{text}");
+}
+
+const VD: &[u8] = include_bytes!("../fixtures/winget/powertoys.versionData.mszyml");
+const PT_MANIFEST: &[u8] = include_bytes!("../fixtures/winget/powertoys-0.101.2362.0.merged.yaml");
+const PT_HASH_HEX: &str = "d193b67ac71ce5d456c10f6731447abb6df68ae12ef8691c92af8ed82659e720";
+
+#[tokio::test]
+async fn plan_is_one_sequence_for_cli_and_tui() {
+    use wingetrs::config::{Behavior, DefaultScope};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/packages/Microsoft.PowerToys/d193b67a/versionData.mszyml",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(VD.to_vec()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/manifests/m/Microsoft/PowerToys/0.101.2362.0/509b"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(PT_MANIFEST.to_vec()))
+        .mount(&server)
+        .await;
+    let dir = TempDir::new().unwrap();
+    let blobs = wingetrs::cache::BlobStore::new(dir.path().join("blobs"));
+    let http = wingetrs::http::Http::new().unwrap();
+    let pkg = wingetrs::catalog::StoredPackage {
+        entry: wingetrs::core::PackageEntry {
+            source: wingetrs::core::SourceKind::Winget,
+            source_name: "winget".into(),
+            id: "Microsoft.PowerToys".into(),
+            name: "PowerToys".into(),
+            moniker: None,
+            version: "0.101.2362.0".into(),
+            publisher: None,
+            description: None,
+            tags: vec![],
+            commands: vec![],
+        },
+        arp_min_version: None,
+        arp_max_version: None,
+        winget_hash: Some(hex::decode(PT_HASH_HEX).unwrap()),
+        raw: None,
+    };
+    let base = format!("{}/", server.uri());
+    let config = dir.path().join("config.toml");
+    let user = Behavior::default();
+    let machine = Behavior {
+        default_scope: DefaultScope::Machine,
+        ..user
+    };
+    let plan = async |explicit: Option<InstallScope>, loaded: Behavior| {
+        jobs::plan_winget_install(&http, &blobs, &base, &pkg, &config, loaded, explicit)
+            .await
+            .unwrap()
+    };
+    // Default settings: no --scope, no fallback.
+    let p = plan(None, user).await;
+    assert!(matches!(p.job.op, BridgeOp::Install { scope: None, .. }));
+    assert!(!p.scope_fallback);
+    let none_cmd = cmd(&p.job);
+    assert!(!none_cmd.1.contains(&"--scope".to_string()), "{none_cmd:?}");
+
+    // `machine` in config.toml (what both front ends read): the same command as an explicit
+    // `--scope machine`, but only that one may fall back.
+    std::fs::write(&config, "[behavior]\ndefault_scope = \"machine\"\n").unwrap();
+    let from_settings = plan(None, user).await;
+    let explicit = plan(Some(InstallScope::Machine), user).await;
+    assert_eq!(cmd(&from_settings.job), cmd(&explicit.job));
+    assert_eq!(
+        cmd(&from_settings.job).1.last().map(String::as_str),
+        Some("machine")
+    );
+    assert!(from_settings.scope_fallback && !explicit.scope_fallback);
+    assert_eq!(from_settings.job.scope, Some(InstallScope::Machine));
+    // An explicit scope ignores the settings.
+    let explicit_user = plan(Some(InstallScope::User), machine).await;
+    assert_eq!(
+        cmd(&explicit_user.job).1.last().map(String::as_str),
+        Some("user")
+    );
+
+    // A config that does not load: the settings already loaded stand in.
+    std::fs::write(&config, "[behavior\n").unwrap();
+    assert_eq!(cmd(&plan(None, machine).await.job), cmd(&explicit.job));
+    assert_eq!(cmd(&plan(None, user).await.job), none_cmd);
 }

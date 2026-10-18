@@ -123,9 +123,6 @@ struct Ctx {
     pwsh: String,
     /// The session's elevated helper for machine-wide winget upgrades (one UAC per session).
     elevated: crate::bridge::elevated::ElevatedBridge,
-    /// License agreements (`<label> <url>`) of each planned winget install, by package id:
-    /// shown in its confirmation, logged in `job.start` when it runs.
-    winget_agreements: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// This executable, for the elevated helper. Unknown: logged, and the empty path makes the
@@ -269,7 +266,6 @@ async fn event_loop(
         elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(
             crate::bridge::elevated::SystemTransport::new(helper_exe()),
         )),
-        winget_agreements: std::sync::Mutex::default(),
     });
     let _helper = HelperShutdown(Arc::clone(&ctx));
     ctx.http
@@ -1152,59 +1148,31 @@ fn spawn_winget_plan(ctx: &Arc<Ctx>, id: String) {
     });
 }
 
-/// The bridge install of winget package `id`: its catalog version's manifest decides the
-/// elevation, the Settings default the `--scope`; its agreements become confirmation notes
-/// (and are kept for the job log).
+/// The bridge install of winget package `id` (`jobs::plan_winget_install`, shared with the
+/// CLI); its agreements become confirmation notes. The TUI has no `--scope`.
 async fn plan_winget_install(
     ctx: &Ctx,
     id: &str,
 ) -> anyhow::Result<(crate::bridge::BridgeJob, Vec<String>)> {
     let pkg = read_package(ctx, "winget", id).await?;
-    let hash = pkg
-        .winget_hash
-        .as_deref()
-        .context("pacote winget sem hash de manifesto")?;
     let blobs = BlobStore::new(ctx.data.blobs_dir());
-    let (manifest, _) = crate::sources::winget::details::merged_manifest(
+    let plan = jobs::plan_winget_install(
         &ctx.http,
         &blobs,
         crate::sources::winget::CDN_BASE,
-        &pkg.entry.id,
-        hash,
-        Some(&pkg.entry.version),
+        &pkg,
+        &ctx.data.config_path(),
+        ctx.cfg.behavior,
+        None,
     )
-    .await?;
-    // Read now: the Settings tab may have changed the default since the TUI started.
-    let behavior = match Config::load(&ctx.data.config_path()) {
-        Ok(cfg) => cfg.behavior,
-        Err(e) => {
-            tracing::warn!(error = %e, "config unreadable; using the startup settings");
-            ctx.cfg.behavior
-        }
-    };
-    let job = crate::bridge::install_job(
-        &pkg.entry.id,
-        &pkg.entry.name,
-        &pkg.entry.version,
-        &manifest,
-        crate::bridge::default_scope(behavior.default_scope),
-        crate::bridge::host_arch(),
-    );
-    let notes = manifest
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let notes = plan
         .agreements
         .iter()
         .map(|a| crate::bridge::agreement_line(a, false))
         .collect();
-    let logged = manifest
-        .agreements
-        .iter()
-        .map(crate::bridge::agreement_log)
-        .collect();
-    ctx.winget_agreements
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(job.target.clone(), logged);
-    Ok((job, notes))
+    Ok((plan.job, notes))
 }
 
 /// The catalog entry of `source`/`id`, read off the runtime threads.
@@ -1489,19 +1457,12 @@ fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
                 &mut run_tool,
                 &mut on_line,
             ),
-            BridgeOp::Install { scope } => {
-                let agreements = c
-                    .winget_agreements
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&job.target)
-                    .unwrap_or_default();
+            BridgeOp::Install { scope, .. } => {
                 // The TUI has no `--scope`: a machine scope came from the Settings default.
                 let from_settings = scope == Some(InstallScope::Machine);
                 jobs::run_bridge_install(
                     &c.elevated,
                     &job,
-                    &agreements,
                     from_settings,
                     &msi_lock,
                     &mut run_tool,

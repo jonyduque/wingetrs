@@ -162,6 +162,72 @@ pub fn plan_batch(c: &OpsCtx<'_>, items: &[Cmd]) -> Vec<Result<Planned, String>>
         .collect()
 }
 
+/// A winget install planned for the bridge (the CLI and the TUI share this one sequence).
+#[derive(Debug, Clone)]
+pub struct WingetPlan {
+    pub job: BridgeJob,
+    /// The manifest's license agreements, for the confirmation and the CLI lines.
+    pub agreements: Vec<crate::sources::winget::manifest::Agreement>,
+    /// The `--scope machine` came from the Settings default: `run_bridge_install` drops it once
+    /// when winget finds no installer for it.
+    pub scope_fallback: bool,
+}
+
+/// Plans installing winget package `pkg` (its catalog version) through the bridge: reads the
+/// manifest by the catalog's hash, takes `explicit` (`--scope`) or else the Settings default
+/// from `config_path`, read now; a config that does not load falls back to `loaded` (the
+/// settings already loaded), with a warning.
+pub async fn plan_winget_install(
+    http: &crate::http::Http,
+    blobs: &crate::cache::BlobStore,
+    cdn_base: &str,
+    pkg: &crate::catalog::StoredPackage,
+    config_path: &Path,
+    loaded: crate::config::Behavior,
+    explicit: Option<InstallScope>,
+) -> Result<WingetPlan, String> {
+    let hash = pkg
+        .winget_hash
+        .as_deref()
+        .ok_or_else(|| "pacote winget sem hash de manifesto".to_string())?;
+    let (manifest, _) = crate::sources::winget::details::merged_manifest(
+        http,
+        blobs,
+        cdn_base,
+        &pkg.entry.id,
+        hash,
+        Some(&pkg.entry.version),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let from_settings = match explicit {
+        Some(_) => None,
+        None => {
+            let behavior = match crate::config::Config::load(config_path) {
+                Ok(cfg) => cfg.behavior,
+                Err(e) => {
+                    tracing::warn!(error = %e, "config unreadable; using the settings already loaded");
+                    loaded
+                }
+            };
+            bridge::default_scope(behavior.default_scope)
+        }
+    };
+    let job = bridge::install_job(
+        &pkg.entry.id,
+        &pkg.entry.name,
+        &pkg.entry.version,
+        &manifest,
+        explicit.or(from_settings),
+        bridge::host_arch(),
+    );
+    Ok(WingetPlan {
+        job,
+        agreements: manifest.agreements,
+        scope_fallback: from_settings.is_some(),
+    })
+}
+
 /// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`; `keep` keeps
 /// the old version on an upgrade.
 pub fn plan_install(
@@ -385,18 +451,15 @@ pub fn run_bridge(
         scoop_root,
         msi_lock,
         pwsh,
-        agreements: &[],
     };
     run_bridge_as(job, &env, exec, false, on_line).0
 }
 
-/// Where a bridge job runs and what the user accepted for it.
+/// Where a bridge job runs.
 struct BridgeEnv<'a> {
     scoop_root: Option<&'a Path>,
     msi_lock: &'a Path,
     pwsh: &'a str,
-    /// License agreements accepted for an install (`<label> <url>`), for `job.start`.
-    agreements: &'a [String],
 }
 
 /// `run_bridge` with the exec `bridge` picks: its elevated helper for a winget app installed
@@ -414,20 +477,18 @@ pub fn run_bridge_elevated(
         scoop_root,
         msi_lock,
         pwsh,
-        agreements: &[],
     };
     run_elevated_as(bridge, job, &env, current, on_line).0
 }
 
 /// Installs a winget package through the bridge (`job.op` is `Install`), elevated when
-/// `job.scope` is `Some(Machine)` (see `run_bridge_elevated`). `agreements` (`<label> <url>`)
-/// were accepted and go to `job.start`. `scope_fallback`: the `--scope machine` came from the
+/// `job.scope` is `Some(Machine)` (see `run_bridge_elevated`). The agreements of `job.op` were
+/// accepted and go to `job.start`. `scope_fallback`: the `--scope machine` came from the
 /// Settings default, so when winget finds no installer for it (`NO_APPLICABLE_INSTALLER`) the
 /// install runs once more without `--scope`, unelevated, saying so on `on_line`.
 pub fn run_bridge_install(
     bridge: &ElevatedBridge,
     job: &BridgeJob,
-    agreements: &[String],
     scope_fallback: bool,
     msi_lock: &Path,
     current: BridgeExec<'_>,
@@ -437,14 +498,14 @@ pub fn run_bridge_install(
         scoop_root: None,
         msi_lock,
         pwsh: "",
-        agreements,
     };
     let (result, code) = run_elevated_as(bridge, job, &env, &mut *current, on_line);
     let no_installer = code.is_some_and(|c| c as u32 == bridge::NO_APPLICABLE_INSTALLER);
     let from_settings = matches!(
         job.op,
         BridgeOp::Install {
-            scope: Some(InstallScope::Machine)
+            scope: Some(InstallScope::Machine),
+            ..
         }
     ) && scope_fallback;
     if result.is_ok() || !no_installer || !from_settings {
@@ -452,8 +513,16 @@ pub fn run_bridge_install(
     }
     tracing::info!(target = %job.target, "{}", bridge::SCOPE_FALLBACK_NOTE);
     on_line(bridge::SCOPE_FALLBACK_NOTE);
+    let agreements = match &job.op {
+        BridgeOp::Install { agreements, .. } => agreements.clone(),
+        BridgeOp::Upgrade => Vec::new(),
+    };
+    // Never elevated: winget found no machine-wide installer, so the user one runs as the user.
     let retry = BridgeJob {
-        op: BridgeOp::Install { scope: None },
+        op: BridgeOp::Install {
+            scope: None,
+            agreements,
+        },
         scope: None,
         ..job.clone()
     };
@@ -485,7 +554,6 @@ fn run_bridge_as(
         scoop_root,
         msi_lock,
         pwsh,
-        agreements,
     } = *env;
     let root = scoop_root.unwrap_or(Path::new(""));
     let (program, args) = bridge::command(job, root, pwsh);
@@ -501,9 +569,9 @@ fn run_bridge_as(
         to: job.available.clone(),
         cmd: Some(bridge::command_text(&program, &args)),
     };
-    let mut log = match job.op {
+    let mut log = match &job.op {
         BridgeOp::Upgrade => JobLog::start(info),
-        BridgeOp::Install { .. } => JobLog::start_accepting(info, agreements),
+        BridgeOp::Install { agreements, .. } => JobLog::start_accepting(info, agreements),
     };
     log.elevated = elevated;
     let result = bridge_run(

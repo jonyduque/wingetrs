@@ -43,12 +43,17 @@ impl Tool {
 }
 
 /// What a bridge job asks of the tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeOp {
     /// Upgrade an installed app (winget or scoop).
     Upgrade,
     /// Install a winget package; `scope` becomes `--scope` only when it is `Some`.
-    Install { scope: Option<InstallScope> },
+    /// `agreements` (`<label> <url>`, see `agreement_log`) are the license agreements the
+    /// user accepts by confirming this job; they go to its `job.start`, never to winget.
+    Install {
+        scope: Option<InstallScope>,
+        agreements: Vec<String>,
+    },
 }
 
 /// One upgrade (or winget install) run by the tool that installed (or installs) the app.
@@ -190,7 +195,10 @@ pub fn install_job(
             .all(|i| parse_scope(i.scope.as_deref()) == Some(InstallScope::Machine));
     BridgeJob {
         tool: Tool::Winget,
-        op: BridgeOp::Install { scope },
+        op: BridgeOp::Install {
+            scope,
+            agreements: manifest.agreements.iter().map(agreement_log).collect(),
+        },
         target: id.to_string(),
         name: name.to_string(),
         installed: None,
@@ -349,7 +357,7 @@ pub fn scoop_ps1(scoop_root: &Path) -> PathBuf {
 pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<String>) {
     match job.tool {
         Tool::Winget => {
-            let verb = match job.op {
+            let verb = match &job.op {
                 BridgeOp::Upgrade => "upgrade",
                 BridgeOp::Install { .. } => "install",
             };
@@ -366,7 +374,7 @@ pub fn command(job: &BridgeJob, scoop_root: &Path, pwsh: &str) -> (String, Vec<S
                 "--accept-source-agreements",
             ];
             let mut args: Vec<String> = args.into_iter().map(str::to_string).collect();
-            if let BridgeOp::Install { scope: Some(s) } = job.op {
+            if let BridgeOp::Install { scope: Some(s), .. } = &job.op {
                 args.push("--scope".to_string());
                 args.push(
                     match s {

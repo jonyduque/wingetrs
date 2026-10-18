@@ -215,9 +215,9 @@ pub fn request_for(job: &BridgeJob, program: &str, args: &[String]) -> std::io::
     let is = |(p, a): (String, Vec<String>)| p == program && a == args;
     if job.tool == Tool::Winget && is(super::command(job, Path::new(""), "")) {
         let target = job.target.clone();
-        return Ok(match job.op {
+        return Ok(match &job.op {
             BridgeOp::Upgrade => Request::Upgrade { target },
-            BridgeOp::Install { scope } => Request::Install {
+            BridgeOp::Install { scope, .. } => Request::Install {
                 target,
                 scope: scope.map(Into::into),
             },

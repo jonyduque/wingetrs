@@ -142,6 +142,7 @@ pub fn serve(
                 target,
                 BridgeOp::Install {
                     scope: scope.map(InstallScope::from),
+                    agreements: Vec::new(),
                 },
             ),
         };

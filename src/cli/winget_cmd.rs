@@ -5,7 +5,6 @@ use crate::bridge::elevated::{ElevatedBridge, SystemTransport};
 use crate::bridge::worker::ScopeArg;
 use crate::bridge::{self, BridgeExec};
 use crate::cache::BlobStore;
-use crate::config::Config;
 use crate::install::ops::OpsCtx;
 use crate::install::target::Candidate;
 use crate::installed::correlate::InstallScope;
@@ -74,41 +73,29 @@ pub(super) async fn install_bridge(
         .catalog
         .get(&entry.source_name, &entry.id)?
         .context("pacote não encontrado no catálogo")?;
-    let hash = pkg
-        .winget_hash
-        .as_deref()
-        .context("pacote winget sem hash de manifesto")?;
     let blobs = BlobStore::new(ctx.data.blobs_dir());
     let version = pkg.entry.version.clone();
-    let (manifest, _) = crate::sources::winget::details::merged_manifest(
+    // The startup already loaded `config.toml` (the command stops when it cannot): the
+    // defaults stand in only if it broke since.
+    let plan = crate::tui::jobs::plan_winget_install(
         ctx.http,
         &blobs,
         crate::sources::winget::CDN_BASE,
-        &pkg.entry.id,
-        hash,
-        Some(&version),
+        &pkg,
+        &ctx.data.config_path(),
+        crate::config::Behavior::default(),
+        scope.map(InstallScope::from),
     )
-    .await?;
-    let explicit = scope.map(InstallScope::from);
-    let from_settings = match explicit {
-        Some(_) => None,
-        None => bridge::default_scope(
-            Config::load(&ctx.data.config_path())?
-                .behavior
-                .default_scope,
-        ),
-    };
-    let job = bridge::install_job(
-        &pkg.entry.id,
-        &pkg.entry.name,
-        &version,
-        &manifest,
-        explicit.or(from_settings),
-        bridge::host_arch(),
-    );
+    .await
+    .map_err(anyhow::Error::msg)?;
+    let crate::tui::jobs::WingetPlan {
+        job,
+        agreements,
+        scope_fallback,
+    } = plan;
     anstream::println!("{} {version} (winget) via winget", job.name);
     if !f.yes || f.dry_run {
-        for line in agreement_lines(&manifest.agreements, false) {
+        for line in agreement_lines(&agreements, false) {
             anstream::println!("{line}");
         }
     }
@@ -123,15 +110,10 @@ pub(super) async fn install_bridge(
         return Ok(());
     }
     if f.yes {
-        for line in agreement_lines(&manifest.agreements, true) {
+        for line in agreement_lines(&agreements, true) {
             anstream::println!("{line}");
         }
     }
-    let accepted: Vec<String> = manifest
-        .agreements
-        .iter()
-        .map(bridge::agreement_log)
-        .collect();
     let exe = std::env::current_exe().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "bridge: own executable unknown; elevated helper unavailable");
         std::path::PathBuf::new()
@@ -144,8 +126,7 @@ pub(super) async fn install_bridge(
     let result = crate::tui::jobs::run_bridge_install(
         &helper.0,
         &job,
-        &accepted,
-        from_settings.is_some(),
+        scope_fallback,
         &msi_lock,
         exec,
         &mut |line: &str| anstream::println!("  {line}"),
