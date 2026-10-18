@@ -64,6 +64,17 @@ Sub-casos, em ordem de risco:
 - **D1 = B: prelúdio próprio.** Nada da lib do Scoop é baixado nem carregado. O runner dot-source um prelúdio do wingetrs que implementa em PowerShell (ou intercepta como efeito em `effects.jsonl`) **só as funções do Scoop que os manifestos reais chamam**, medidas pelo oráculo (P1). Função do Scoop que o prelúdio não tem ⇒ o portão (P9) recusa com o nome dela e o motivo "função do Scoop ainda não suportada". Consequências: a sonda D2 e a P10 ("Lib do Scoop fixada") saem; entra a **P10' Prelúdio próprio** (lista medida, uma função por vez, teste por função com pwsh falso ou script sintético); o risco "substituições desatualizadas" vira "manifesto usa função que não temos" (recusa clara + contagem no oráculo); a variável `$scoopdir` e afins são definidas pelo prelúdio apontando para a nossa raiz.
 - **D2–D8:** como recomendado (D2 = 1, D3 = 1, D4 = 1, D5 = 1, D6 = 1, D7 = 1, D8 = 1).
 
+### Emenda pós-sondas (2026-10-18, `docs/superpowers/reports/2026-10-18-sondas-2c.md`)
+
+- **Prelúdio (D1 = B):** a lib do Scoop (commit `e6aa3b3`) tem 263 funções; os manifestos chamam **42** (3270 hooks medidos). O prelúdio implementa essas 42 (ou intercepta como efeito); o resto é recusado pelo portão. `scoop` chamado como comando externo dentro de hook (367 manifestos do nerd-fonts, 18 do Main, 34 do Extras) é tratado à parte: recusado com motivo claro, ou mapeado para operações do wingetrs só se o oráculo mostrar que vale.
+- **`$cmd`** vem por escopo dinâmico do `exec`; no upgrade, os hooks de **instalação da versão nova** também veem `'update'`.
+- **`$dir`:** no `post_install` é a junção `current`, e `$original_dir` é a pasta da versão. Nos hooks de desinstalação durante o upgrade, `$version` é a versão **nova** e `$manifest` o **antigo**. O runner reproduz isso (teste por hook).
+- **`installer`:** o Scoop roda `installer.file/args` **e depois** `installer.script` (não um ou outro).
+- **`$modulesdir`** só existe como função (`modulesdir`).
+- **innounp:** sai com código 0 e **zero arquivos** quando o filtro `-c{app}\<sub>` não casa ⇒ `ExtractInno` conta os arquivos extraídos e trata zero como erro (`MissingExtractDir`). Saída em OEM CP850 com CRLF.
+- **Política de execução:** bloqueia `.ps1` em disco (`-File` e dot-source), não `-Command`/`iex`; `-ExecutionPolicy Bypass` no processo filho resolve, exceto sob GPO (não reproduzido; mensagem documentada).
+- **`scripts/` dos buckets (D6):** Main 15 arquivos / 11,9 KB; Extras 98 / 195 KB. Custo no `update` não medido (medir na tarefa da P8).
+
 **Texto proposto para o CLAUDE.md (D2-1):**
 
 > **Exceção da fase 2c (código de terceiros).** Os scripts de manifesto e os instaladores de `installer.file` são código de terceiros que roda com os privilégios do usuário e pode gravar em qualquer lugar que o usuário pode. O **código do wingetrs** continua limitado aos lugares da 2a. As funções do Scoop que mexem em PATH, variáveis, shims, atalhos e `PSModulePath` são interceptadas e aplicadas pelo wingetrs, que as registra na state.db. O wingetrs nunca roda script sem a confirmação que mostra o script e a análise, nunca roda script com o processo elevado e nunca roda script de manifesto real em teste. Os testes usam pwsh falso ou scripts sintéticos numa raiz temporária. Agentes nunca executam scripts de manifesto reais nem o innounp sobre instaladores reais sem pedido do usuário.
