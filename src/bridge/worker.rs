@@ -107,24 +107,122 @@ pub const INSTALLER_LINE_MAX: usize = LINE_CAP / 8;
 
 impl InstallerRequest {
     /// Checks every field before anything touches the disk; the refusal reason otherwise.
-    pub fn check(&self) -> Result<(), &'static str> {
+    /// `program_files` are the folders (from the known folders) an install folder may be in.
+    pub fn check(&self, program_files: &[String]) -> Result<(), &'static str> {
         if !valid_source(&self.source) {
             return Err("caminho do instalador inválido");
         }
         if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("hash do instalador inválido");
         }
+        if !source_is_blob(&self.source, &self.sha256) {
+            return Err("o instalador não está no cache de downloads");
+        }
         if !valid_file_name(&self.file_name, self.kind) {
             return Err("nome do instalador inválido");
         }
-        if crate::winget_install::switches::validate(&self.params).is_err() {
+        if crate::winget_install::switches::validate(&self.params).is_err()
+            || self.params.contains("\\\"")
+        {
             return Err("parâmetros do instalador inválidos");
         }
-        if self.kind.is_msi() && !msi_params_allowed(&self.params) {
-            return Err("parâmetros do msiexec fora da lista permitida");
+        let allowed = if self.kind.is_msi() {
+            msi_params_allowed_in(&self.params, program_files)
+        } else {
+            exe_params_allowed(&self.params, program_files)
+        };
+        if !allowed {
+            return Err("parâmetros do instalador fora da lista permitida");
         }
         Ok(())
     }
+}
+
+/// `...\blobs\<sha256 in lowercase>`: the download cache's name for the file.
+fn source_is_blob(source: &str, sha256: &str) -> bool {
+    let mut parts = source.rsplit('\\');
+    parts.next() == Some(sha256.to_ascii_lowercase().as_str())
+        && parts
+            .next()
+            .is_some_and(|p| p.eq_ignore_ascii_case("blobs"))
+}
+
+/// `value` (quotes around it removed) is an absolute path strictly inside one of
+/// `program_files` (case-insensitive), with no `..`, device name or stream.
+fn under_program_files(value: &str, program_files: &[String]) -> bool {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    if value.contains('"') || !valid_source(value) {
+        return false;
+    }
+    let value = value.trim_end_matches('\\').to_ascii_lowercase();
+    program_files.iter().any(|root| {
+        let root = root.trim_end_matches('\\').to_ascii_lowercase();
+        !root.is_empty()
+            && value
+                .strip_prefix(&root)
+                .is_some_and(|rest| rest.len() > 1 && rest.starts_with('\\'))
+    })
+}
+
+/// Whether `s` names a path outside the execution folder: a drive (`X:`), a UNC or rooted
+/// path, a parent folder, or a value that starts a path after `=`.
+fn names_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    // A lone letter (at the start or after a non-alphanumeric) before `:`; `/TYPE:full` is not.
+    let drive = (0..b.len().saturating_sub(1)).any(|i| {
+        b[i].is_ascii_alphabetic()
+            && b[i + 1] == b':'
+            && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+    });
+    drive
+        || s.contains("\\\\")
+        || s.contains("..")
+        || s.starts_with('\\')
+        || s.contains("=\\")
+        || s.contains(":\\")
+        || s.contains(":/")
+        || s.contains("=/")
+}
+
+/// Switches that load or save a configuration file (Inno `/LOADINF`, `/SAVEINF`).
+const CONFIG_SWITCHES: [&str; 2] = ["loadinf", "saveinf"];
+
+/// Whether `params` for an exe installer (burn, inno, nullsoft, exe) names no path outside
+/// the execution folder (`<LOGPATH>` is inside it), loads no configuration file, and gives
+/// `/DIR=`/`/D=` only a folder inside `program_files`.
+pub fn exe_params_allowed(params: &str, program_files: &[String]) -> bool {
+    let Some(tokens) = msi_tokens(params) else {
+        return false;
+    };
+    for t in tokens {
+        let lower = t.to_ascii_lowercase();
+        let switch = lower.trim_start_matches(['/', '-']);
+        if CONFIG_SWITCHES.iter().any(|c| switch.starts_with(c)) {
+            return false;
+        }
+        if lower.starts_with("/d=") {
+            // Nullsoft: `/D=` is the last parameter and its folder is never quoted, spaces
+            // and all: the value is the rest of the line.
+            let at = t.as_ptr() as usize - params.as_ptr() as usize;
+            return under_program_files(params[at + 3..].trim_end(), program_files);
+        }
+        if lower.starts_with("/dir=") {
+            if !under_program_files(&t[5..], program_files) {
+                return false;
+            }
+            continue;
+        }
+        let rest = t
+            .replace(crate::winget_install::switches::LOG_TOKEN, "")
+            .replace('"', "");
+        if names_path(&rest) {
+            return false;
+        }
+    }
+    true
 }
 
 /// `X:\...`: a drive letter, no `..` or device-name component, no `\\?\` or UNC prefix, no
@@ -174,7 +272,7 @@ fn msi_tokens(params: &str) -> Option<Vec<&str>> {
                 quoted = !quoted;
                 start.get_or_insert(i);
             }
-            ' ' if !quoted => {
+            ' ' | '\t' if !quoted => {
                 if let Some(s) = start.take() {
                     tokens.push(&params[s..i]);
                 }
@@ -193,30 +291,49 @@ fn msi_tokens(params: &str) -> Option<Vec<&str>> {
     Some(tokens)
 }
 
-/// `NAME=value`: name `[A-Z_][A-Z0-9_.]*` (any case); value bare without quotes, or one quoted
-/// run without quotes inside.
-fn msi_property(token: &str) -> bool {
+/// `NAME=value` with a name of a closed list (any case) and a value it allows: `ALLUSERS`
+/// (empty, 1, 2), `MSIINSTALLPERUSER` (empty, 1), `REBOOT` (`ReallySuppress`, `Suppress`,
+/// `Force` or their initials), `ADDLOCAL` (feature names and commas), `INSTALLDIR`/`TARGETDIR`
+/// (a folder inside `program_files`). The value is bare without quotes, or one quoted run
+/// without quotes inside. `TRANSFORMS`, `PATCH`, `ACTION`, `REINSTALL`... are refused.
+fn msi_property(token: &str, program_files: &[String]) -> bool {
     let Some((name, value)) = token.split_once('=') else {
         return false;
     };
-    let mut chars = name.chars();
-    let name_ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
-    let value_ok = match value.strip_prefix('"') {
-        Some(rest) => rest
-            .strip_suffix('"')
-            .is_some_and(|inner| !inner.contains('"')),
-        None => !value.contains('"'),
+    let value = match value.strip_prefix('"') {
+        Some(rest) => match rest.strip_suffix('"') {
+            Some(inner) if !inner.contains('"') => inner,
+            _ => return false,
+        },
+        None if value.contains('"') => return false,
+        None => value,
     };
-    name_ok && value_ok
+    let one_of = |allowed: &[&str]| allowed.iter().any(|a| a.eq_ignore_ascii_case(value));
+    match name.to_ascii_uppercase().as_str() {
+        "ALLUSERS" => one_of(&["", "1", "2"]),
+        "MSIINSTALLPERUSER" => one_of(&["", "1"]),
+        "REBOOT" => one_of(&["ReallySuppress", "Suppress", "Force", "R", "S", "F"]),
+        "ADDLOCAL" => {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b','))
+        }
+        "INSTALLDIR" | "TARGETDIR" => under_program_files(value, program_files),
+        _ => false,
+    }
+}
+
+/// `msi_params_allowed_in` with no install folder allowed (`INSTALLDIR`/`TARGETDIR` refused).
+pub fn msi_params_allowed(params: &str) -> bool {
+    msi_params_allowed_in(params, &[])
 }
 
 /// Whether `params` for `msiexec /i` only holds the switches the helper allows: `/quiet`,
-/// `/passive`, `/qn`, `/qb`, `/norestart`, `/promptrestart`, `/log "<LOGPATH>"` and
-/// `PROPERTY=value`. Any other switch (`/i`, `/x`, `/a`, `/p`, `/f*`, `/j*`, `/l*`...) is refused.
-pub fn msi_params_allowed(params: &str) -> bool {
+/// `/passive`, `/qn`, `/qb`, `/norestart`, `/promptrestart`, `/log "<LOGPATH>"` and the
+/// properties of `msi_property`. Any other switch (`/i`, `/x`, `/a`, `/p`, `/f*`, `/j*`,
+/// `/l*`...) is refused.
+pub fn msi_params_allowed_in(params: &str, program_files: &[String]) -> bool {
     let Some(tokens) = msi_tokens(params) else {
         return false;
     };
@@ -228,7 +345,7 @@ pub fn msi_params_allowed(params: &str) -> bool {
             "/quiet" | "/passive" | "/qn" | "/qb" | "/norestart" | "/promptrestart" => true,
             "/log" => tokens.next() == Some(log.as_str()),
             // A switch never passes: a property name starts with a letter or `_`.
-            _ => msi_property(t),
+            _ => msi_property(t, program_files),
         };
         if !ok {
             return false;
@@ -247,6 +364,11 @@ pub trait WorkerOps {
         args: &[String],
         on_line: &mut dyn FnMut(&str),
     ) -> std::io::Result<(i32, Vec<String>)>;
+    /// Folders an install folder (`INSTALLDIR`, `/DIR=`, `/D=`) may be in: `Program Files`
+    /// from the known folders. None by default (those parameters are then refused).
+    fn program_files(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Runs the verified copy of an installer; `on_line` gets the end of its log.
     fn run_installer(
         &mut self,
@@ -438,7 +560,7 @@ fn run_installer(
     ops: &mut dyn WorkerOps,
     req: &InstallerRequest,
 ) -> std::io::Result<()> {
-    if let Err(reason) = req.check() {
+    if let Err(reason) = req.check(&ops.program_files()) {
         tracing::warn!(reason, "bridge worker: installer request refused");
         return send(
             writer,

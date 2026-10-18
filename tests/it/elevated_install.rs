@@ -11,16 +11,21 @@ use wingetrs::bridge::elevated::{
 };
 use wingetrs::bridge::worker::{
     self, ElevatedKind, INSTALLER_LINE_MAX, INSTALLER_LINES, InstallerRequest, Reply, Request,
-    ScopeArg, WorkerOps, msi_params_allowed,
+    ScopeArg, WorkerOps, exe_params_allowed, msi_params_allowed, msi_params_allowed_in,
 };
 use wingetrs::bridge::{self, BridgeJob, BridgeOp, Tool};
 use wingetrs::installed::correlate::InstallScope;
 
 const SHA: &str = "0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789abcdef";
 
+/// The `Program Files` folders the fake helper allows install folders in.
+fn roots() -> Vec<String> {
+    vec![r"C:\Program Files".into(), r"C:\Program Files (x86)".into()]
+}
+
 fn valid() -> InstallerRequest {
     InstallerRequest {
-        source: r"C:\U\blobs\a".into(),
+        source: format!(r"C:\U\blobs\{}", SHA.to_ascii_lowercase()),
         sha256: SHA.into(),
         file_name: "App-1.0.msi".into(),
         kind: ElevatedKind::Msi,
@@ -73,6 +78,10 @@ impl WorkerOps for FakeOps {
             on_line(l);
         }
         Ok(self.code)
+    }
+
+    fn program_files(&self) -> Vec<String> {
+        roots()
     }
 }
 
@@ -153,6 +162,14 @@ fn bad_fields_never_reach_ops() {
             r.file_name = name.clone();
         })
     };
+    let exe_params = |params: &str| {
+        let params = params.to_string();
+        with(&move |r| {
+            r.kind = ElevatedKind::Inno;
+            r.file_name = "setup.exe".into();
+            r.params = params.clone();
+        })
+    };
     let bad = [
         with(&|r| r.source = r"U\blobs\a".into()),
         with(&|r| r.source = r"C:\U\..\Windows\a".into()),
@@ -161,7 +178,17 @@ fn bad_fields_never_reach_ops() {
         with(&|r| r.source = r"\\?\C:\a".into()),
         with(&|r| r.source = r"C:\U\a:ads".into()),
         with(&|r| r.source = r"C:\U\CON".into()),
-        with(&|r| r.source = format!(r"C:\{}", "a".repeat(32_765))),
+        with(&|r| {
+            r.source = format!(
+                r"C:\{}\blobs\{}",
+                "a".repeat(32_694),
+                r.sha256.to_ascii_lowercase()
+            )
+        }),
+        with(&|r| r.source = r"C:\U\blobs\a".into()),
+        with(&|r| r.source = format!(r"C:\U\cache\{}", r.sha256.to_ascii_lowercase())),
+        with(&|r| r.source = format!(r"C:\U\blobs\{SHA}")),
+        with(&|r| r.source = format!(r"C:\U\{}", r.sha256.to_ascii_lowercase())),
         with(&|r| r.sha256 = SHA[..63].into()),
         with(&|r| r.sha256 = format!("g{}", &SHA[1..])),
         with(&|r| r.file_name = r"..\a.msi".into()),
@@ -173,6 +200,12 @@ fn bad_fields_never_reach_ops() {
         exe("a.exe.txt"),
         with(&|r| r.params = "/quiet\n/norestart".into()),
         with(&|r| r.params = "/x {G}".into()),
+        with(&|r| r.params = r"TRANSFORMS=C:\x.mst".into()),
+        with(&|r| r.params = r#"INSTALLDIR="C:\Program Files\App\""#.into()),
+        exe_params(r#"/LOADINF="a.inf""#),
+        exe_params(r"/DIR=C:\Users\u\App"),
+        exe_params(r"/S /D=C:\Users\u\App"),
+        exe_params(r"/LOG=C:\t.log"),
     ];
     let mut input: String = bad.iter().map(|r| line(&request(r))).collect();
     // Control: the last line is valid at every limit and does run.
@@ -180,10 +213,16 @@ fn bad_fields_never_reach_ops() {
         r.kind = ElevatedKind::Exe;
         r.params = "/S".into();
         r.file_name = format!("{}.exe", "a".repeat(128));
-        r.source = format!(r"C:\{}", "a".repeat(32_764));
+        r.source = format!(
+            r"C:\{}\blobs\{}",
+            "a".repeat(32_693),
+            r.sha256.to_ascii_lowercase()
+        );
+        r.sha256 = r.sha256.to_ascii_uppercase();
     });
     input.push_str(&line(&request(&edge)));
     let mut ops = FakeOps::default();
+    assert_eq!(edge.source.len(), worker::SOURCE_MAX);
     let (r, replies) = serve_with(&input, &mut ops);
     r.unwrap();
     assert_eq!(ops.installers, vec![edge], "only the control ran");
@@ -201,7 +240,7 @@ fn bad_fields_never_reach_ops() {
         );
     }
     for req in &bad {
-        assert!(req.check().is_err(), "{req:?}");
+        assert!(req.check(&roots()).is_err(), "{req:?}");
     }
 }
 
@@ -212,9 +251,27 @@ fn msi_params_allowlist() {
         "ALLUSERS=1 ADDLOCAL=ALL",
         "/passive",
         "",
-        r##"/QN /qb /promptrestart INSTALLDIR="C:\Program Files\App" my.prop="""##,
+        r#"/QN /qb /promptrestart REBOOT=ReallySuppress MSIINSTALLPERUSER="" allusers="2""#,
     ] {
         assert!(msi_params_allowed(ok), "{ok}");
+    }
+    // Install folders: only inside Program Files (from the known folders).
+    for ok in [
+        r#"INSTALLDIR="C:\Program Files\App""#,
+        r#"TARGETDIR="c:\program files (x86)\App\sub""#,
+    ] {
+        assert!(msi_params_allowed_in(ok, &roots()), "{ok}");
+        assert!(!msi_params_allowed(ok), "no roots: {ok}");
+    }
+    for bad in [
+        r#"INSTALLDIR="C:\Program Files""#,
+        r"INSTALLDIR=C:\Program Files Evil\x",
+        r"INSTALLDIR=C:\Program Files\..\Users\x",
+        r"INSTALLDIR=C:\Users\u\App",
+        r"TARGETDIR=\h\s\App",
+        r"INSTALLDIR=App",
+    ] {
+        assert!(!msi_params_allowed_in(bad, &roots()), "{bad}");
     }
     for bad in [
         r#"/i "C:\x.msi""#,
@@ -242,14 +299,68 @@ fn msi_params_allowlist() {
         "/update x",
         "-x {G}",
         "1A=1",
-        r#"A="x"y""#,
-        r#"A=x"y"#,
-        r#"A=x"y""#,
-        r#"A="x"y"z""#,
+        r#"ALLUSERS="1"2""#,
+        r#"ALLUSERS=1"2"#,
+        r#"ALLUSERS=1"""#,
+        r#"ADDLOCAL="a"b"c""#,
+        // Property names outside the closed list.
+        r"TRANSFORMS=C:\x.mst",
+        r"PATCH=C:\p.msp",
+        "ACTION=ADMIN",
+        "REINSTALL=ALL",
+        "TRANSFORMS=:x",
+        "my.prop=1",
+        // Values outside each property's list.
+        "ALLUSERS=3",
+        "MSIINSTALLPERUSER=2",
+        "REBOOT=Now",
+        r"ADDLOCAL=C:\x",
+        "ADDLOCAL=",
+        "/quiet\t/x",
         "/quiet /log \"<LOGPATH>\" /qn \"<LOGPATH>\"",
     ] {
         assert!(!msi_params_allowed(bad), "{bad}");
     }
+}
+
+#[test]
+fn exe_params_allowlist() {
+    for ok in [
+        r#"/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="<LOGPATH>""#,
+        "/S",
+        r"/S /D=C:\Program Files\My App",
+        r#"/VERYSILENT /DIR="C:\Program Files (x86)\App""#,
+        r#"-quiet -norestart -log "<LOGPATH>""#,
+        "/TYPE:full /COMPONENTS=\"a,b\" /TASKS=!desktopicon",
+        "",
+    ] {
+        assert!(exe_params_allowed(ok, &roots()), "{ok}");
+    }
+    for bad in [
+        r#"/LOADINF="a.inf""#,
+        "/loadinf=a.inf",
+        r"/SAVEINF=a.inf",
+        "-LOADINF a.inf",
+        r"/DIR=C:\Users\u\App",
+        r#"/DIR="C:\Program Files""#,
+        r"/S /D=C:\Users\u\App",
+        r"/S /D=C:\Program Files\..\Users\u",
+        r"/LOG=C:\t.log",
+        r#"/LOG="C:\t.log""#,
+        r"/f1C:\x.iss",
+        r"-config=\x.ini",
+        "-config=/x.ini",
+        r"\h\s\x",
+        r"\x.ini",
+        r"..\x.ini",
+        r"/LOG=..\x.log",
+        r"D:x",
+        r#"/S "unclosed"#,
+    ] {
+        assert!(!exe_params_allowed(bad, &roots()), "{bad}");
+    }
+    // Without the known folders no install folder passes.
+    assert!(!exe_params_allowed(r"/S /D=C:\Program Files\App", &[]));
 }
 
 /// `serve` stops at `bad` without running it nor the valid request after it.
@@ -477,6 +588,23 @@ mod win {
             .collect()
     }
 
+    /// `bytes` saved as the download cache does: `<dir>\blobs\<sha256>`.
+    fn blob(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let sha: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let path = blobs.join(sha);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn system32() -> PathBuf {
+        staging_win::SystemEnv::query().unwrap().system32
+    }
+
     fn exe_request(source: &Path, params: &str) -> InstallerRequest {
         InstallerRequest {
             source: source.to_str().unwrap().into(),
@@ -523,8 +651,7 @@ mod win {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        let source = dir.path().join("blob");
-        std::fs::write(&source, b"MZ instalador falso").unwrap();
+        let source = blob(dir.path(), b"MZ instalador falso");
         let mut req = exe_request(&source, "/S");
         let right = req.sha256.clone();
         let other = dir.path().join("other");
@@ -676,29 +803,114 @@ mod win {
         assert!(file.is_file());
     }
 
-    #[test]
-    fn installer_env_replaces_user_temp() {
-        let inherited = [
-            ("Temp", r"C:\Users\u\AppData\Local\Temp"),
-            ("tmp", r"C:\Users\u\AppData\Local\Temp"),
-            ("PATH", r"C:\Windows"),
-            ("=C:", r"C:\x"),
-            ("TEMPLATE", "keep"),
-        ]
-        .map(|(k, v)| (k.into(), v.into()));
-        let tmp = Path::new(r"C:\Program Files\wingetrs\staging\ab\tmp");
-        let env = staging_win::installer_env(inherited, tmp);
-        let expect: Vec<(std::ffi::OsString, std::ffi::OsString)> = [
-            ("PATH", r"C:\Windows"),
-            ("TEMPLATE", "keep"),
-            ("TEMP", r"C:\Program Files\wingetrs\staging\ab\tmp"),
-            ("TMP", r"C:\Program Files\wingetrs\staging\ab\tmp"),
-        ]
-        .map(|(k, v)| (k.into(), v.into()))
-        .to_vec();
-        assert_eq!(env, expect);
+    fn fake_system() -> staging_win::SystemEnv {
+        let p = |s: &str| PathBuf::from(s);
+        staging_win::SystemEnv {
+            windows: p(r"C:\Windows"),
+            system32: p(r"C:\Windows\System32"),
+            program_files: p(r"C:\Program Files"),
+            program_files_x86: p(r"C:\Program Files (x86)"),
+            program_w6432: p(r"C:\Program Files"),
+            common_files: p(r"C:\Program Files\Common Files"),
+            common_files_x86: p(r"C:\Program Files (x86)\Common Files"),
+            common_w6432: p(r"C:\Program Files\Common Files"),
+            program_data: p(r"C:\ProgramData"),
+            public: p(r"C:\Users\Public"),
+            profile: p(r"C:\Users\u"),
+            app_data: p(r"C:\Users\u\AppData\Roaming"),
+            local_app_data: p(r"C:\Users\u\AppData\Local"),
+            architecture: "AMD64".into(),
+            level: 6,
+            revision: 0x9e0a,
+            processors: 8,
+        }
     }
 
+    #[test]
+    fn installer_env_is_a_closed_list() {
+        let tmp = Path::new(r"C:\Program Files\wingetrs\staging\ab\tmp");
+        let env = staging_win::installer_env(&fake_system(), tmp);
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n.to_str() == Some(k))
+                .map(|(_, v)| v.to_str().unwrap().to_string())
+        };
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.to_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            [
+                "SystemRoot",
+                "windir",
+                "SystemDrive",
+                "ComSpec",
+                "PATH",
+                "PATHEXT",
+                "PSModulePath",
+                "ProgramFiles",
+                "ProgramFiles(x86)",
+                "ProgramW6432",
+                "CommonProgramFiles",
+                "CommonProgramFiles(x86)",
+                "CommonProgramW6432",
+                "ProgramData",
+                "ALLUSERSPROFILE",
+                "PUBLIC",
+                "OS",
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_LEVEL",
+                "PROCESSOR_REVISION",
+                "NUMBER_OF_PROCESSORS",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "TEMP",
+                "TMP",
+            ]
+        );
+        assert_eq!(
+            get("PATH").unwrap(),
+            r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0"
+        );
+        assert_eq!(get("ComSpec").unwrap(), r"C:\Windows\System32\cmd.exe");
+        assert_eq!(get("SystemDrive").unwrap(), "C:");
+        assert_eq!(
+            get("PSModulePath").unwrap(),
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+        );
+        assert_eq!(get("PROCESSOR_REVISION").unwrap(), "9e0a");
+        assert_eq!(get("TEMP").unwrap(), tmp.to_str().unwrap());
+        assert_eq!(get("TMP").unwrap(), tmp.to_str().unwrap());
+        // Nothing of this process's environment leaks in (it has USERNAME, a user PATH...).
+        for (k, _) in std::env::vars_os() {
+            let k = k.to_string_lossy();
+            if !keys.iter().any(|n| n.eq_ignore_ascii_case(&k)) {
+                assert!(get(&k).is_none(), "{k}");
+            }
+        }
+        assert!(get("HTTP_PROXY").is_none() && get("USERNAME").is_none());
+    }
+
+    #[test]
+    fn open_source_refuses_devices_and_reparse_points() {
+        // A device is never read (here the open itself fails on the null device).
+        assert!(staging_win::open_source(Path::new(r"\\.\NUL")).is_err());
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        junction(&dir.path().join("link"), &target);
+        assert!(staging_win::open_source(&dir.path().join("link")).is_err());
+        let file = blob(dir.path(), b"x");
+        let link = dir.path().join("file-link");
+        // A file symlink needs Developer Mode or the privilege; checked when available.
+        if std::os::windows::fs::symlink_file(&file, &link).is_ok() {
+            let e = staging_win::open_source(&link).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            assert!(e.to_string().contains("reanálise"), "{e}");
+        } else {
+            eprintln!("symlink_file indisponível: só a junção foi conferida");
+        }
+        staging_win::open_source(&file).unwrap();
+    }
     #[test]
     fn log_lines_read_utf16_and_cut_the_partial_first_line() {
         let dir = TempDir::new().unwrap();
@@ -739,17 +951,18 @@ mod win {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir(&src).unwrap();
-        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let source = src.join("cmd.exe");
-        std::fs::copy(system.join("cmd.exe"), &source).unwrap();
+        let source = blob(
+            dir.path(),
+            &std::fs::read(system32().join("cmd.exe")).unwrap(),
+        );
+        let src = source.parent().unwrap().to_path_buf();
         let req = exe_request(
             &source,
             // `!CMDCMDLINE!` (delayed expansion) is the command line as started, quotes and all.
-            r#"/v:on /c (echo !CMDCMDLINE!& set TEMP& set TMP& cd)> "<LOGPATH>""#,
+            r#"/v /c (echo !CMDCMDLINE!& set TEMP& set TMP& cd& set USERNAME& set PATH)> "<LOGPATH>""#,
         );
-        req.check().unwrap();
+        req.check(&[]).unwrap();
+        let sys = staging_win::SystemEnv::query().unwrap();
         let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
         let run = staged.run_dir().to_path_buf();
         let copy = staged.file().to_path_buf();
@@ -758,6 +971,7 @@ mod win {
             &staged,
             &req,
             Path::new(r"C:\nao-usado\msiexec.exe"),
+            &sys,
             &mut |l: &str| lines.push(l.to_string()),
         )
         .unwrap();
@@ -786,6 +1000,20 @@ mod win {
             lines.iter().any(|l| low(l) == low(run.to_str().unwrap())),
             "working folder: {lines:?}"
         );
+        // Only the closed list reached it: no USERNAME, and the system PATH alone.
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.to_uppercase().starts_with("USERNAME=")),
+            "{lines:?}"
+        );
+        let path = staging_win::installer_env(&sys, &tmp)
+            .into_iter()
+            .find(|(k, _)| k == "PATH")
+            .unwrap()
+            .1;
+        let want_path = format!("PATH={}", path.to_str().unwrap());
+        assert!(lines.iter().any(|l| low(l) == low(&want_path)), "{lines:?}");
         drop(staged);
         assert!(entries(&root).is_empty());
     }
@@ -795,9 +1023,10 @@ mod win {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        let system = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let source = dir.path().join("cmd.exe");
-        std::fs::copy(system.join("cmd.exe"), &source).unwrap();
+        let source = blob(
+            dir.path(),
+            &std::fs::read(system32().join("cmd.exe")).unwrap(),
+        );
         let req = exe_request(
             &source,
             r#"/c (for /l %i in (1,1,50) do @echo linha%i)> "<LOGPATH>" & exit /b 5"#,
@@ -808,6 +1037,7 @@ mod win {
             &staged,
             &req,
             Path::new(r"C:\nao-usado\msiexec.exe"),
+            &staging_win::SystemEnv::query().unwrap(),
             &mut |l: &str| lines.push(l.trim().to_string()),
         )
         .unwrap();
@@ -821,8 +1051,7 @@ mod win {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        let source = dir.path().join("blob");
-        std::fs::write(&source, b"OLE falso").unwrap();
+        let source = blob(dir.path(), b"OLE falso");
         let req = InstallerRequest {
             source: source.to_str().unwrap().into(),
             sha256: sha_of(&source),
@@ -830,7 +1059,7 @@ mod win {
             kind: ElevatedKind::Wix,
             params: r#"/quiet /norestart /log "<LOGPATH>""#.into(),
         };
-        req.check().unwrap();
+        req.check(&[]).unwrap();
         let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
         let msiexec = Path::new(r"C:\Windows\System32\msiexec.exe");
         let (program, params) = staging_win::command_for(&staged, &req, msiexec).unwrap();
@@ -854,6 +1083,9 @@ mod win {
             std::env::var_os("WINGETRS_TEST_MSI")
                 .expect("WINGETRS_TEST_MSI=<caminho de um MSI pequeno>"),
         );
+        // The helper only reads `...\blobs\<sha256>`, as the download cache names it.
+        let cache = TempDir::new().unwrap();
+        let msi = blob(cache.path(), &std::fs::read(&msi).unwrap());
         let transport = wingetrs::bridge::elevated::SystemTransport::new(PathBuf::from(env!(
             "CARGO_BIN_EXE_wingetrs"
         )));

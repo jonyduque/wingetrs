@@ -539,6 +539,16 @@ impl super::worker::WorkerOps for SystemOps {
         run_winget(program, args, on_line)
     }
 
+    fn program_files(&self) -> Vec<String> {
+        match super::staging_win::SystemEnv::query() {
+            Ok(sys) => sys.program_files_roots(),
+            Err(e) => {
+                tracing::warn!(error = %e, "bridge worker: known folders unavailable");
+                Vec::new()
+            }
+        }
+    }
+
     fn run_installer(
         &mut self,
         req: &super::worker::InstallerRequest,

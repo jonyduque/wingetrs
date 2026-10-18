@@ -12,12 +12,13 @@ use crate::winget_install::verified_win::VerifiedFile;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
-use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
@@ -26,8 +27,22 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
-use windows::Win32::Storage::FileSystem::CreateDirectoryW;
-use windows::core::{HSTRING, PWSTR};
+use windows::Win32::Storage::FileSystem::{
+    CreateDirectoryW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_TYPE_DISK, GetFileType,
+    SECURITY_IDENTIFICATION,
+};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::SystemInformation::{
+    GetNativeSystemInfo, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM64,
+    PROCESSOR_ARCHITECTURE_INTEL, SYSTEM_INFO,
+};
+use windows::Win32::UI::Shell::{
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+    FOLDERID_ProgramFilesCommon, FOLDERID_ProgramFilesCommonX64, FOLDERID_ProgramFilesCommonX86,
+    FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_RoamingAppData,
+    FOLDERID_System, FOLDERID_Windows, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+};
+use windows::core::{GUID, HSTRING, PWSTR};
 
 /// DACL of an execution folder: SYSTEM and Administrators, inherited by what is inside, and
 /// nothing inherited from above.
@@ -221,10 +236,36 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Opens the user's file `src` for reading as admin: the last component is never followed if
+/// it is a reparse point (refused), a server on the other end of a named pipe or device may only
+/// identify us, and anything but a disk file is refused.
+pub fn open_source(src: &Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+        .security_qos_flags(SECURITY_IDENTIFICATION.0)
+        .open(src)?;
+    if file.metadata()?.file_attributes() & REPARSE != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "o instalador é um ponto de reanálise",
+        ));
+    }
+    // SAFETY: a valid handle owned by `file` for the whole call.
+    let kind = unsafe { GetFileType(HANDLE(file.as_raw_handle())) };
+    if kind != FILE_TYPE_DISK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "o instalador não é um arquivo em disco",
+        ));
+    }
+    Ok(file)
+}
+
 /// Copies `src` to the new file `dst` in a stream, at most `max` bytes, and checks its SHA-256
 /// against `sha256` (hex, any case).
 pub fn copy_hashed(src: &Path, dst: &Path, sha256: &str, max: u64) -> std::io::Result<()> {
-    let mut input = std::fs::File::open(src)
+    let mut input = open_source(src)
         .map_err(|e| std::io::Error::new(e.kind(), format!("instalador ilegível: {e}")))?;
     let mut out = std::fs::OpenOptions::new()
         .write(true)
@@ -287,25 +328,145 @@ pub fn stage(root: &Path, sddl: &str, req: &InstallerRequest) -> std::io::Result
     Ok(Staged { file, run })
 }
 
-/// The installer's environment: `inherited` without the user's `TEMP`/`TMP` (any case) nor the
-/// hidden `=X:` entries, plus `TEMP` and `TMP` set to `tmp`.
-pub fn installer_env(
-    inherited: impl IntoIterator<Item = (OsString, OsString)>,
-    tmp: &Path,
-) -> Vec<(OsString, OsString)> {
-    let mut env: Vec<(OsString, OsString)> = inherited
-        .into_iter()
-        .filter(|(k, _)| {
-            let k = k.to_string_lossy();
-            !k.is_empty()
-                && !k.starts_with('=')
-                && !k.eq_ignore_ascii_case("TEMP")
-                && !k.eq_ignore_ascii_case("TMP")
+/// The system folders and processor facts the installer's environment is built from, all from
+/// the known folders and `GetNativeSystemInfo` (never from this process's environment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemEnv {
+    pub windows: PathBuf,
+    pub system32: PathBuf,
+    pub program_files: PathBuf,
+    pub program_files_x86: PathBuf,
+    pub program_w6432: PathBuf,
+    pub common_files: PathBuf,
+    pub common_files_x86: PathBuf,
+    pub common_w6432: PathBuf,
+    pub program_data: PathBuf,
+    pub public: PathBuf,
+    pub profile: PathBuf,
+    pub app_data: PathBuf,
+    pub local_app_data: PathBuf,
+    /// `PROCESSOR_ARCHITECTURE` (`AMD64`, `ARM64`, `x86`).
+    pub architecture: String,
+    pub level: u16,
+    pub revision: u16,
+    pub processors: u32,
+}
+
+/// A known folder's path.
+fn known(id: &GUID) -> std::io::Result<PathBuf> {
+    // SAFETY: the returned string is freed below with CoTaskMemFree.
+    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.map_err(|e| io_err(&e))?;
+    // SAFETY: a NUL-terminated string from the call above.
+    let text = unsafe { p.to_string() };
+    // SAFETY: allocated by SHGetKnownFolderPath, freed once.
+    unsafe { CoTaskMemFree(Some(p.0 as *const core::ffi::c_void)) };
+    text.map(PathBuf::from)
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+impl SystemEnv {
+    pub fn query() -> std::io::Result<SystemEnv> {
+        let mut info = SYSTEM_INFO::default();
+        // SAFETY: `info` is a SYSTEM_INFO the call fills.
+        unsafe { GetNativeSystemInfo(&mut info) };
+        // SAFETY: the union's struct member is what GetNativeSystemInfo fills.
+        let arch = unsafe { info.Anonymous.Anonymous.wProcessorArchitecture };
+        let architecture = match arch {
+            PROCESSOR_ARCHITECTURE_AMD64 => "AMD64",
+            PROCESSOR_ARCHITECTURE_ARM64 => "ARM64",
+            PROCESSOR_ARCHITECTURE_INTEL => "x86",
+            _ => "UNKNOWN",
+        };
+        Ok(SystemEnv {
+            windows: known(&FOLDERID_Windows)?,
+            system32: known(&FOLDERID_System)?,
+            program_files: known(&FOLDERID_ProgramFiles)?,
+            program_files_x86: known(&FOLDERID_ProgramFilesX86)?,
+            program_w6432: known(&FOLDERID_ProgramFilesX64)?,
+            common_files: known(&FOLDERID_ProgramFilesCommon)?,
+            common_files_x86: known(&FOLDERID_ProgramFilesCommonX86)?,
+            common_w6432: known(&FOLDERID_ProgramFilesCommonX64)?,
+            program_data: known(&FOLDERID_ProgramData)?,
+            public: known(&FOLDERID_Public)?,
+            profile: known(&FOLDERID_Profile)?,
+            app_data: known(&FOLDERID_RoamingAppData)?,
+            local_app_data: known(&FOLDERID_LocalAppData)?,
+            architecture: architecture.to_string(),
+            level: info.wProcessorLevel,
+            revision: info.wProcessorRevision,
+            processors: info.dwNumberOfProcessors,
         })
-        .collect();
-    env.push(("TEMP".into(), tmp.as_os_str().to_owned()));
-    env.push(("TMP".into(), tmp.as_os_str().to_owned()));
-    env
+    }
+
+    /// Folders an install folder may be in (`Program Files` and `Program Files (x86)`).
+    pub fn program_files_roots(&self) -> Vec<String> {
+        [&self.program_files, &self.program_files_x86]
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+/// `PATHEXT` of a clean Windows install.
+pub const PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+
+/// The installer's whole environment: a closed list built from `sys` and constants, with
+/// `TEMP`/`TMP` set to `tmp`. Nothing comes from this process's (the user's) environment: no
+/// user `PATH` entry, no proxy, no planted variable.
+pub fn installer_env(sys: &SystemEnv, tmp: &Path) -> Vec<(OsString, OsString)> {
+    let s32 = &sys.system32;
+    let path = [
+        s32.clone(),
+        sys.windows.clone(),
+        s32.join("Wbem"),
+        s32.join("WindowsPowerShell").join("v1.0"),
+    ]
+    .iter()
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect::<Vec<_>>()
+    .join(";");
+    let drive: String = sys.windows.to_string_lossy().chars().take(2).collect();
+    let p = |p: &Path| p.as_os_str().to_owned();
+    vec![
+        ("SystemRoot".into(), p(&sys.windows)),
+        ("windir".into(), p(&sys.windows)),
+        ("SystemDrive".into(), drive.into()),
+        ("ComSpec".into(), p(&s32.join("cmd.exe"))),
+        ("PATH".into(), path.into()),
+        ("PATHEXT".into(), PATHEXT.into()),
+        (
+            "PSModulePath".into(),
+            p(&s32.join("WindowsPowerShell").join("v1.0").join("Modules")),
+        ),
+        ("ProgramFiles".into(), p(&sys.program_files)),
+        ("ProgramFiles(x86)".into(), p(&sys.program_files_x86)),
+        ("ProgramW6432".into(), p(&sys.program_w6432)),
+        ("CommonProgramFiles".into(), p(&sys.common_files)),
+        ("CommonProgramFiles(x86)".into(), p(&sys.common_files_x86)),
+        ("CommonProgramW6432".into(), p(&sys.common_w6432)),
+        ("ProgramData".into(), p(&sys.program_data)),
+        ("ALLUSERSPROFILE".into(), p(&sys.program_data)),
+        ("PUBLIC".into(), p(&sys.public)),
+        ("OS".into(), "Windows_NT".into()),
+        (
+            "PROCESSOR_ARCHITECTURE".into(),
+            sys.architecture.clone().into(),
+        ),
+        ("PROCESSOR_LEVEL".into(), sys.level.to_string().into()),
+        (
+            "PROCESSOR_REVISION".into(),
+            format!("{:04x}", sys.revision).into(),
+        ),
+        (
+            "NUMBER_OF_PROCESSORS".into(),
+            sys.processors.to_string().into(),
+        ),
+        ("USERPROFILE".into(), p(&sys.profile)),
+        ("APPDATA".into(), p(&sys.app_data)),
+        ("LOCALAPPDATA".into(), p(&sys.local_app_data)),
+        ("TEMP".into(), p(tmp)),
+        ("TMP".into(), p(tmp)),
+    ]
 }
 
 /// The last lines of the log at `path` (UTF-16 with a BOM, as `msiexec` writes, or else
@@ -369,6 +530,7 @@ pub fn run_staged(
     staged: &Staged,
     req: &InstallerRequest,
     msiexec: &Path,
+    sys: &SystemEnv,
     on_line: &mut dyn FnMut(&str),
 ) -> std::io::Result<i32> {
     let (program, params) = command_for(staged, req, msiexec)?;
@@ -377,7 +539,7 @@ pub fn run_staged(
         .raw_arg(&params)
         .current_dir(run)
         .env_clear()
-        .envs(installer_env(std::env::vars_os(), &run.join(TMP_NAME)))
+        .envs(installer_env(sys, &run.join(TMP_NAME)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -398,12 +560,13 @@ pub fn run_installer(
     req: &InstallerRequest,
     on_line: &mut dyn FnMut(&str),
 ) -> std::io::Result<i32> {
-    req.check()
+    let sys = SystemEnv::query()?;
+    req.check(&sys.program_files_roots())
         .map_err(|r| std::io::Error::new(std::io::ErrorKind::InvalidInput, r))?;
-    let root = staging_root(&super::elevate_win::program_files()?)?;
-    let msiexec = crate::winget_install::launch_win::msiexec_path()?;
+    let root = staging_root(&sys.program_files)?;
+    let msiexec = sys.system32.join("msiexec.exe");
     let staged = stage(&root, RUN_SDDL, req)?;
-    run_staged(&staged, req, &msiexec, on_line)
+    run_staged(&staged, req, &msiexec, &sys, on_line)
 }
 
 /// Whether `name` is an execution folder name (32 lowercase hex).
