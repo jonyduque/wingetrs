@@ -88,7 +88,7 @@ pub fn backup_file(backups: &Path, ts: &str, o: &Orphan) -> PathBuf {
 }
 
 /// A backup path nobody wrote yet (so a stale file never stands in for a failed export).
-fn fresh_backup_file(backups: &Path, ts: &str, o: &Orphan) -> Result<PathBuf, String> {
+pub(crate) fn fresh_backup_file(backups: &Path, ts: &str, o: &Orphan) -> Result<PathBuf, String> {
     let first = backup_file(backups, ts, o);
     let dir = first
         .parent()

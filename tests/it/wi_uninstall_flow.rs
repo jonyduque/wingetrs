@@ -14,9 +14,9 @@ use wingetrs::winget_install::launch::{Elevation, LaunchSpec, Launcher, Show};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::orphans::ArpRegistry;
 use wingetrs::winget_install::uninstall::{
-    Clock, UninstallCtx, UninstallPlan, UninstallStatus, UninstallTarget, UserFolders,
-    backup_folders, plan_uninstall, plan_uninstall_among, remove_registry_only, target_of,
-    uninstall,
+    BackupLimits, Clock, FolderSize, MAX_BACKUP_BYTES, UninstallCtx, UninstallPlan,
+    UninstallStatus, UninstallTarget, UserFolders, backup_folders, human_size, measure_folders,
+    plan_uninstall, remove_registry_only, target_of, uninstall,
 };
 use wingetrs::winget_install::uninstall_cmd::{ArpDetails, Rule};
 
@@ -40,7 +40,13 @@ fn user() -> UserFolders {
         local_app_data: PathBuf::from(LOCAL),
         app_data: PathBuf::from(ROAMING),
         documents: PathBuf::from(DOCS),
+        wingetrs_root: PathBuf::from(format!(r"{LOCAL}\wingetrs")),
     }
+}
+
+/// Another record of the app that the helper accepts as newer (HKLM, greater version).
+fn newer() -> Vec<ArpDetails> {
+    vec![kindle(Hive::MachineX64, "Kindle", "9.9")]
 }
 
 fn user_env(name: &str) -> Option<String> {
@@ -96,7 +102,7 @@ fn no_folders(_: &str) -> bool {
 }
 
 fn plan(d: &ArpDetails) -> UninstallPlan {
-    plan_uninstall(d, false, false, true, &known(), &user(), &no_folders).unwrap()
+    plan_uninstall(d, false, &[], true, &known(), &user(), &no_folders).unwrap()
 }
 
 struct FakeLauncher {
@@ -361,7 +367,7 @@ fn hklm_msi_goes_helper() {
 fn hklm64_helper_and_nsis_hint_pass_through() {
     let w = World::new(0, &[false]);
     let d = kindle(Hive::MachineX64, "Kindle", "2.8.3");
-    let p = plan_uninstall(&d, true, false, true, &known(), &user(), &no_folders).unwrap();
+    let p = plan_uninstall(&d, true, &[], true, &known(), &user(), &no_folders).unwrap();
     assert_eq!(p.elevation, Elevation::Helper);
     w.run(&p).unwrap();
     assert_eq!(
@@ -424,7 +430,7 @@ fn kindle_folders_only_existing() {
         asked.lock().unwrap().push(p.to_string());
         p == roaming_amazon
     };
-    let p = plan_uninstall(&d, true, true, false, &known(), &user(), &exists).unwrap();
+    let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &exists).unwrap();
     let shared = p.shared.unwrap();
     assert_eq!(shared.folders, vec![PathBuf::from(&roaming_amazon)]);
     let asked = asked.lock().unwrap().clone();
@@ -450,7 +456,7 @@ fn unsafe_names_are_ignored_for_folders() {
             asked.lock().unwrap().push(p.to_string());
             true
         };
-        let p = plan_uninstall(&d, true, true, false, &known(), &user(), &all).unwrap();
+        let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &all).unwrap();
         assert_eq!(p.shared.unwrap().folders, Vec::<PathBuf>::new());
         assert!(asked.lock().unwrap().is_empty());
     }
@@ -460,14 +466,14 @@ fn unsafe_names_are_ignored_for_folders() {
 fn no_others_no_shared() {
     let d = kindle(Hive::User, "K", "1");
     let all = |_: &str| true;
-    let p = plan_uninstall(&d, true, false, false, &known(), &user(), &all).unwrap();
+    let p = plan_uninstall(&d, true, &[], false, &known(), &user(), &all).unwrap();
     assert_eq!(p.shared, None);
 }
 
 #[test]
 fn no_command_is_an_error() {
     let d = details(Hive::User, "App");
-    let e = plan_uninstall(&d, false, false, true, &known(), &user(), &no_folders).unwrap_err();
+    let e = plan_uninstall(&d, false, &[], true, &known(), &user(), &no_folders).unwrap_err();
     assert!(e.contains("sem desinstalador registrado"), "{e}");
 }
 
@@ -526,7 +532,7 @@ fn registry_only_offered_only_when_not_main() {
     let d = kindle(Hive::MachineX86, "Kindle", "2.8.3");
     let content = utf16le(&reg_text("HKEY_LOCAL_MACHINE", "Kindle"));
 
-    let main = plan_uninstall(&d, true, true, true, &known(), &user(), &no_folders).unwrap();
+    let main = plan_uninstall(&d, true, &newer(), true, &known(), &user(), &no_folders).unwrap();
     assert!(!main.shared.as_ref().unwrap().registry_only_allowed);
     let reg = FakeReg::new(Some(content.clone()));
     let el = FakeElevated::default();
@@ -534,7 +540,7 @@ fn registry_only_offered_only_when_not_main() {
     assert_eq!(reg.exports.lock().unwrap().len(), 0);
     assert_eq!(el.count(), 0);
 
-    let other = plan_uninstall(&d, true, true, false, &known(), &user(), &no_folders).unwrap();
+    let other = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
     assert!(other.shared.as_ref().unwrap().registry_only_allowed);
     let reg = FakeReg::new(Some(content));
     let el = FakeElevated::default();
@@ -560,7 +566,7 @@ fn registry_only_checks_export_before_deleting() {
         (Hive::User, "HKEY_LOCAL_MACHINE"),
     ] {
         let d = kindle(hive, "Kindle", "2.8.3");
-        let p = plan_uninstall(&d, true, true, false, &known(), &user(), &no_folders).unwrap();
+        let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
         // The export names the key under the other root: not this key's backup.
         let reg = FakeReg::new(Some(utf16le(&reg_text(root, "Kindle"))));
         let el = FakeElevated::default();
@@ -575,7 +581,7 @@ fn registry_only_checks_export_before_deleting() {
 fn registry_only_hkcu_deletes_in_process() {
     let dir = tempfile::tempdir().unwrap();
     let d = kindle(Hive::User, "Kindle", "2.9.1");
-    let p = plan_uninstall(&d, true, true, false, &known(), &user(), &no_folders).unwrap();
+    let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
     let reg = FakeReg::new(Some(utf16le(&reg_text("HKEY_CURRENT_USER", "Kindle"))));
     let el = FakeElevated::default();
     remove_registry_only(&p, &reg, &el, dir.path(), "ts").unwrap();
@@ -593,7 +599,7 @@ fn kindle_hklm_old_hkcu_new_offers_uninstaller_only() {
     let new = kindle(Hive::User, "Kindle", "2.9.1");
     let roaming_amazon = format!(r"{ROAMING}\Amazon");
     let exists = |p: &str| p == roaming_amazon;
-    let p = plan_uninstall_among(&old, true, &[new], false, &known(), &user(), &exists).unwrap();
+    let p = plan_uninstall(&old, true, &[new], false, &known(), &user(), &exists).unwrap();
     assert_eq!(p.command.as_ref().unwrap().rule, Rule::Nsis);
     assert_eq!(p.elevation, Elevation::Helper);
     let shared = p.shared.as_ref().unwrap();
@@ -625,8 +631,8 @@ fn kindle_newer_hklm_allows_registry_only() {
     ];
     for (other, allowed) in cases {
         let v = other.display_version.clone();
-        let p = plan_uninstall_among(&old, true, &[other], false, &known(), &user(), &no_folders)
-            .unwrap();
+        let p =
+            plan_uninstall(&old, true, &[other], false, &known(), &user(), &no_folders).unwrap();
         assert_eq!(
             p.shared.as_ref().unwrap().registry_only_allowed,
             allowed,
@@ -639,7 +645,7 @@ fn kindle_newer_hklm_allows_registry_only() {
         );
     }
     // The principal record never offers it, whatever the others say.
-    let p = plan_uninstall_among(
+    let p = plan_uninstall(
         &old,
         true,
         &[kindle(Hive::MachineX64, "Kindle", "3.0")],
@@ -656,11 +662,194 @@ fn kindle_newer_hklm_allows_registry_only() {
 fn kindle_hkcu_old_allows_registry_only() {
     let old = kindle(Hive::User, "Kindle", "2.8.3");
     let new = kindle(Hive::MachineX86, "Kindle", "2.9.1");
-    let p =
-        plan_uninstall_among(&old, true, &[new], false, &known(), &user(), &no_folders).unwrap();
+    let p = plan_uninstall(&old, true, &[new], false, &known(), &user(), &no_folders).unwrap();
     assert!(p.shared.unwrap().registry_only_allowed);
 }
 
+fn plenty(_: &Path) -> Option<u64> {
+    Some(u64::MAX)
+}
+
+fn roomy() -> BackupLimits<'static> {
+    BackupLimits::standard(&plenty)
+}
+
+/// `Amazon` with 3 files of 10 bytes in a temp dir.
+fn three_files(dir: &Path) -> PathBuf {
+    let src = dir.join("Amazon");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    for f in ["a.txt", "b.txt", r"sub\c.txt"] {
+        std::fs::write(src.join(f), [b'x'; 10]).unwrap();
+    }
+    src
+}
+
+#[test]
+fn backup_passes_when_it_fits() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = three_files(dir.path());
+    let dest = dir.path().join("dest");
+    assert_eq!(
+        measure_folders(std::slice::from_ref(&src)).unwrap(),
+        FolderSize {
+            bytes: 30,
+            entries: 4
+        }
+    );
+    let free = |_: &Path| Some(30);
+    let limits = BackupLimits {
+        max_bytes: 30,
+        free_space: &free,
+    };
+    let notes = backup_folders(std::slice::from_ref(&src), &dest, &limits).unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    assert!(dest.join("1-Amazon").join("sub").join("c.txt").is_file());
+}
+
+#[test]
+fn backup_refuses_over_the_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = three_files(dir.path());
+    let dest = dir.path().join("dest");
+    let limits = BackupLimits {
+        max_bytes: 29,
+        free_space: &plenty,
+    };
+    let e = backup_folders(std::slice::from_ref(&src), &dest, &limits).unwrap_err();
+    assert!(e.contains("acima do limite"), "{e}");
+    assert!(!dest.exists());
+    assert_eq!(MAX_BACKUP_BYTES, 2 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn backup_refuses_without_free_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = three_files(dir.path());
+    let dest = dir.path().join("dest");
+    let small = |_: &Path| Some(29);
+    let e = backup_folders(
+        std::slice::from_ref(&src),
+        &dest,
+        &BackupLimits::standard(&small),
+    )
+    .unwrap_err();
+    assert!(e.contains("espaço livre insuficiente"), "{e}");
+    let unknown = |_: &Path| None;
+    let e = backup_folders(
+        std::slice::from_ref(&src),
+        &dest,
+        &BackupLimits::standard(&unknown),
+    )
+    .unwrap_err();
+    assert!(e.contains("espaço livre"), "{e}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn backup_refuses_a_folder_that_contains_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = three_files(dir.path());
+    let dest = PathBuf::from(src.to_string_lossy().to_uppercase()).join("backups");
+    let e = backup_folders(std::slice::from_ref(&src), &dest, &roomy()).unwrap_err();
+    assert!(e.contains("contém o destino"), "{e}");
+    assert!(!dest.exists());
+}
+
+#[test]
+fn generic_names_are_never_offered() {
+    for (publisher, name) in [
+        ("Microsoft", "Temp"),
+        ("google", "packages"),
+        ("NVIDIA", "Programs"),
+        ("Intel", "Windows"),
+        ("Adobe", "Mozilla"),
+        ("Apple", "WINGETRS"),
+    ] {
+        let mut d = kindle(Hive::User, "K", "1");
+        d.publisher = Some(publisher.to_string());
+        d.display_name = Some(name.to_string());
+        let asked = Mutex::new(Vec::new());
+        let all = |p: &str| {
+            asked.lock().unwrap().push(p.to_string());
+            true
+        };
+        let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &all).unwrap();
+        assert_eq!(
+            p.shared.unwrap().folders,
+            Vec::<PathBuf>::new(),
+            "{publisher}/{name}"
+        );
+        assert!(asked.lock().unwrap().is_empty(), "{publisher}/{name}");
+    }
+}
+
+#[test]
+fn folder_containing_the_wingetrs_root_is_not_offered() {
+    let d = kindle(Hive::User, "K", "1");
+    let mut u = user();
+    u.wingetrs_root = PathBuf::from(format!(r"{LOCAL}\AMAZON\x\wingetrs"));
+    let all = |_: &str| true;
+    let p = plan_uninstall(&d, true, &newer(), false, &known(), &u, &all).unwrap();
+    let folders = p.shared.unwrap().folders;
+    assert!(
+        !folders.contains(&PathBuf::from(format!(r"{LOCAL}\Amazon"))),
+        "{folders:?}"
+    );
+    assert!(
+        folders.contains(&PathBuf::from(format!(r"{ROAMING}\Amazon"))),
+        "{folders:?}"
+    );
+}
+
+#[test]
+fn valid_publisher_with_bad_name_offers_only_publisher_folders() {
+    for name in ["NUL", "Pub.", "a/b"] {
+        let mut d = kindle(Hive::User, "K", "1");
+        d.publisher = Some("Amazon".to_string());
+        d.display_name = Some(name.to_string());
+        let all = |_: &str| true;
+        let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &all).unwrap();
+        assert_eq!(
+            p.shared.unwrap().folders,
+            vec![
+                PathBuf::from(format!(r"{LOCAL}\Amazon")),
+                PathBuf::from(format!(r"{ROAMING}\Amazon")),
+            ],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn plan_shows_the_backup_size() {
+    let d = kindle(Hive::User, "K", "1");
+    let mut p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
+    assert!(!p.to_string().contains("tamanho"), "{p}");
+    p.shared.as_mut().unwrap().size = Some(FolderSize {
+        bytes: 3 << 29,
+        entries: 7,
+    });
+    assert!(
+        p.to_string()
+            .contains("tamanho da cópia: 1,5 GiB em 7 itens"),
+        "{p}"
+    );
+    assert_eq!(human_size(12), "12 B");
+    assert_eq!(human_size(20 << 20), "20,0 MiB");
+}
+
+#[cfg(windows)]
+#[test]
+fn measure_skips_reparse_points() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = three_files(dir.path());
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("big.bin"), vec![0u8; 4096]).unwrap();
+    junction::create(&other, src.join("link")).unwrap();
+    let size = measure_folders(std::slice::from_ref(&src)).unwrap();
+    assert_eq!(size.bytes, 30);
+}
 #[cfg(windows)]
 #[test]
 fn backup_copies_and_skips_reparse() {
@@ -675,7 +864,7 @@ fn backup_copies_and_skips_reparse() {
     junction::create(&other, src.join("link")).unwrap();
     let dest = dir.path().join("backups").join("ts").join("Kindle");
 
-    let notes = backup_folders(std::slice::from_ref(&src), &dest);
+    let notes = backup_folders(std::slice::from_ref(&src), &dest, &roomy()).unwrap();
 
     let copy = dest.join("1-Amazon");
     assert_eq!(std::fs::read(copy.join("a.txt")).unwrap(), b"a");
@@ -695,7 +884,7 @@ fn backup_numbers_each_folder_and_reports_missing() {
     std::fs::write(a.join("x.txt"), b"x").unwrap();
     let gone = dir.path().join("src2").join("Gone");
     let dest = dir.path().join("dest");
-    let notes = backup_folders(&[a, gone], &dest);
+    let notes = backup_folders(&[a, gone], &dest, &roomy()).unwrap();
     assert!(dest.join("1-Amazon").join("x.txt").is_file());
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("Gone"), "{notes:?}");
@@ -769,6 +958,6 @@ fn plan_text_matches_confirmation() {
     assert!(!text.contains("Outra instalação"), "{text}");
 
     let d = kindle(Hive::User, "K", "1");
-    let p = plan_uninstall(&d, true, true, false, &known(), &user(), &no_folders).unwrap();
+    let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
     assert!(p.to_string().contains("Outra instalação"), "{p}");
 }

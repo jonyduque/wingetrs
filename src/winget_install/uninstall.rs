@@ -6,7 +6,7 @@ use super::codes::{self, Outcome};
 use super::elevated_rules::{KnownFolders, elevated_duplicate, expand_known, in_admin_folder};
 use super::launch::{Elevation, LaunchSpec, Launcher, Show, uninstall_elevation};
 use super::msix::{self, MsixOps};
-use super::orphans::{ArpRegistry, Orphan, backup_file, check_export_in, export_args};
+use super::orphans::{ArpRegistry, Orphan, check_export_in, export_args, fresh_backup_file};
 use super::uninstall_cmd::{ArpDetails, Rule, UninstallCommand, uninstall_command, valid_arp_key};
 use crate::bridge::elevated::ElevatedRunner;
 use crate::bridge::worker::{DeleteReason, MachineHive};
@@ -23,8 +23,6 @@ const POLL_EVERY: Duration = Duration::from_millis(500);
 /// How long the key may stay before the run counts as without effect (NSIS copies itself to
 /// `%TEMP%` and exits before it finishes).
 const POLL_FOR: Duration = Duration::from_secs(120);
-/// Numbered names tried when the `.reg` backup name is already taken.
-const MAX_BACKUP_SUFFIX: u32 = 100;
 /// Entries copied per folder backup at most (a profile folder is not a disk).
 const MAX_BACKUP_ENTRIES: usize = 200_000;
 
@@ -58,12 +56,21 @@ pub fn target_of(app_key: &str) -> Option<UninstallTarget> {
     })
 }
 
-/// The user's own folders where an app may keep its data (the caller's known folders).
+/// The user's own folders where an app may keep its data (the caller's known folders), and
+/// the wingetrs data root (a candidate that contains it is never offered).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserFolders {
     pub local_app_data: PathBuf,
     pub app_data: PathBuf,
     pub documents: PathBuf,
+    pub wingetrs_root: PathBuf,
+}
+
+/// Size of a folder tree, counted without following reparse points.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderSize {
+    pub bytes: u64,
+    pub entries: usize,
 }
 
 /// Another installation of the same app shares the data folders (spec D6).
@@ -71,6 +78,8 @@ pub struct UserFolders {
 pub struct SharedData {
     /// The candidate data folders that exist (offered for backup before removing).
     pub folders: Vec<PathBuf>,
+    /// Their total size (`measure_folders`), once measured; shown in the plan.
+    pub size: Option<FolderSize>,
     /// Whether "remove only the registry record" (option C) is offered.
     pub registry_only_allowed: bool,
     /// Why option C is not offered, when the record is not the principal one but the elevated
@@ -87,6 +96,18 @@ pub struct UninstallPlan {
     pub command: Option<UninstallCommand>,
     pub elevation: Elevation,
     pub shared: Option<SharedData>,
+}
+
+/// `1,5 GiB`, `20,0 MiB`, `3,2 KiB`, `12 B`.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")];
+    for (unit, name) in UNITS {
+        if bytes >= unit {
+            let tenths = bytes.saturating_mul(10) / unit;
+            return format!("{},{} {name}", tenths / 10, tenths % 10);
+        }
+    }
+    format!("{bytes} B")
 }
 
 impl fmt::Display for UninstallPlan {
@@ -121,6 +142,14 @@ impl fmt::Display for UninstallPlan {
             for p in &s.folders {
                 writeln!(f, "    pasta: {}", p.display())?;
             }
+            if let Some(size) = s.size {
+                writeln!(
+                    f,
+                    "    tamanho da cópia: {} em {} itens",
+                    human_size(size.bytes),
+                    size.entries
+                )?;
+            }
             if s.registry_only_allowed {
                 writeln!(
                     f,
@@ -146,11 +175,50 @@ fn one_component(name: &str) -> Option<&str> {
     }
 }
 
+/// Folder names that hold whole vendor or system trees, never one app's data (compared
+/// without case).
+const GENERIC_NAMES: [&str; 12] = [
+    "Microsoft",
+    "Google",
+    "Apple",
+    "Adobe",
+    "Mozilla",
+    "Temp",
+    "Packages",
+    "Programs",
+    "Windows",
+    "Intel",
+    "NVIDIA",
+    "wingetrs",
+];
+
+fn is_generic(name: &str) -> bool {
+    GENERIC_NAMES.iter().any(|g| g.eq_ignore_ascii_case(name))
+}
+
+/// The components of `p`, lowercased, for a case-insensitive containment test.
+fn lower_components(p: &Path) -> Vec<String> {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect()
+}
+
+/// Whether `inner` is `outer` or lies below it (case-insensitive, by component).
+fn contains_path(outer: &Path, inner: &Path) -> bool {
+    lower_components(inner).starts_with(&lower_components(outer))
+}
+
 /// The existing data folders among `%LOCALAPPDATA%\<Publisher>`, `%APPDATA%\<Publisher>`,
-/// `%LOCALAPPDATA%\<Name>`, `%APPDATA%\<Name>` and `Documents\<Name>`.
+/// `%LOCALAPPDATA%\<Name>`, `%APPDATA%\<Name>` and `Documents\<Name>`; never a generic vendor or
+/// system name, nor a folder that contains the wingetrs root.
 fn data_folders(d: &ArpDetails, u: &UserFolders, exists: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
-    let publisher = non_blank(&d.publisher).and_then(one_component);
-    let name = non_blank(&d.display_name).and_then(one_component);
+    let usable = |s: &str| !is_generic(s);
+    let publisher = non_blank(&d.publisher)
+        .and_then(one_component)
+        .filter(|s| usable(s));
+    let name = non_blank(&d.display_name)
+        .and_then(one_component)
+        .filter(|s| usable(s));
     let mut candidates: Vec<(&Path, &str)> = Vec::new();
     if let Some(p) = publisher {
         candidates.push((&u.local_app_data, p));
@@ -164,7 +232,7 @@ fn data_folders(d: &ArpDetails, u: &UserFolders, exists: &dyn Fn(&str) -> bool) 
     let mut out: Vec<PathBuf> = Vec::new();
     for (base, comp) in candidates {
         let p = base.join(comp);
-        if p.parent() != Some(base) || out.contains(&p) {
+        if p.parent() != Some(base) || out.contains(&p) || contains_path(&p, &u.wingetrs_root) {
             continue;
         }
         if exists(&p.to_string_lossy()) {
@@ -174,12 +242,19 @@ fn data_folders(d: &ArpDetails, u: &UserFolders, exists: &dyn Fn(&str) -> bool) 
     out
 }
 
-/// The plan for one ARP entry: its command (`uninstall_command`), who runs it, and the shared
-/// data warning when `has_others` (option C only for a record that is not the principal one).
+const REGISTRY_ONLY_REFUSED: &str = "o auxiliar de administrador só apaga um registro HKLM \
+     quando outro registro HKLM do mesmo app tem versão maior, e a outra instalação está em \
+     HKCU (que o usuário controla) ou não é mais nova; rode o desinstalador desta instalação";
+
+/// The plan for one ARP entry: its command (`uninstall_command`), who runs it, and, when
+/// `others` (the other records of the same app) is not empty, the shared data warning. Option C
+/// (registry only) is offered for a record that is not the principal one, and for an HKLM
+/// record only when the elevated helper will accept it (`elevated_duplicate`: another HKLM
+/// record with a strictly greater version; HKCU records never count).
 pub fn plan_uninstall(
     d: &ArpDetails,
     nsis_hint: bool,
-    has_others: bool,
+    others: &[ArpDetails],
     is_main: bool,
     k: &KnownFolders,
     u: &UserFolders,
@@ -195,10 +270,15 @@ pub fn plan_uninstall(
     let admin =
         expand_known(&command.program, k).is_some_and(|p| in_admin_folder(Path::new(&p), k));
     let elevation = uninstall_elevation(d.hive, msiexec, admin);
-    let shared = has_others.then(|| SharedData {
-        folders: data_folders(d, u, folders),
-        registry_only_allowed: !is_main,
-        registry_only_refused: None,
+    let shared = (!others.is_empty()).then(|| {
+        let helper_refuses = d.hive != Hive::User && !elevated_duplicate(d, others);
+        SharedData {
+            folders: data_folders(d, u, folders),
+            size: None,
+            registry_only_allowed: !is_main && !helper_refuses,
+            registry_only_refused: (!is_main && helper_refuses)
+                .then(|| REGISTRY_ONLY_REFUSED.to_string()),
+        }
     });
     let name = non_blank(&d.display_name).unwrap_or(&d.key).to_string();
     Ok(UninstallPlan {
@@ -212,35 +292,6 @@ pub fn plan_uninstall(
         elevation,
         shared,
     })
-}
-
-/// `plan_uninstall` knowing the other records of the app: option C for an HKLM record is
-/// offered only when the elevated helper will accept it (`elevated_duplicate`: another HKLM
-/// record with a strictly greater version; HKCU records never count).
-pub fn plan_uninstall_among(
-    d: &ArpDetails,
-    nsis_hint: bool,
-    others: &[ArpDetails],
-    is_main: bool,
-    k: &KnownFolders,
-    u: &UserFolders,
-    folders: &dyn Fn(&str) -> bool,
-) -> Result<UninstallPlan, String> {
-    let mut plan = plan_uninstall(d, nsis_hint, !others.is_empty(), is_main, k, u, folders)?;
-    if let Some(s) = plan.shared.as_mut()
-        && s.registry_only_allowed
-        && d.hive != Hive::User
-        && !elevated_duplicate(d, others)
-    {
-        s.registry_only_allowed = false;
-        s.registry_only_refused = Some(
-            "o auxiliar de administrador só apaga um registro HKLM quando outro registro HKLM \
-             do mesmo app tem versão maior, e a outra instalação está em HKCU (que o usuário \
-             controla) ou não é mais nova; rode o desinstalador desta instalação"
-                .to_string(),
-        );
-    }
-    Ok(plan)
 }
 
 /// Time source of the wait for the key (a fake in tests: no real waits).
@@ -445,9 +496,77 @@ fn is_reparse(m: &std::fs::Metadata) -> bool {
     m.file_type().is_symlink() || reparse_attribute(m)
 }
 
-/// Copies `src` into `dst` (a new folder), never following reparse points; each skip and
-/// error goes to `notes`.
-fn copy_tree(src: &Path, dst: &Path, notes: &mut Vec<String>) {
+fn reparse_note(p: &Path) -> String {
+    tracing::warn!(path = %p.display(), "backup: reparse point skipped");
+    format!(
+        "pulado (ponto de reanálise: link, junção ou arquivo só na nuvem do OneDrive): {}",
+        p.display()
+    )
+}
+
+/// Largest folder backup (all folders of one uninstall together).
+pub const MAX_BACKUP_BYTES: u64 = 2 << 30;
+
+/// Limits of a folder backup: the size cap and the free space at the destination.
+pub struct BackupLimits<'a> {
+    pub max_bytes: u64,
+    /// Free bytes on the volume of the path (`None` when it cannot be read).
+    pub free_space: &'a dyn Fn(&Path) -> Option<u64>,
+}
+
+impl<'a> BackupLimits<'a> {
+    /// `MAX_BACKUP_BYTES` and the caller's free-space reader.
+    pub fn standard(free_space: &'a dyn Fn(&Path) -> Option<u64>) -> BackupLimits<'a> {
+        BackupLimits {
+            max_bytes: MAX_BACKUP_BYTES,
+            free_space,
+        }
+    }
+}
+
+/// The total size of the folders, without following reparse points (they are not counted,
+/// as the copy skips them). Unreadable entries count as empty; past `MAX_BACKUP_ENTRIES`
+/// entries it is an error.
+pub fn measure_folders(folders: &[PathBuf]) -> Result<FolderSize, String> {
+    let mut size = FolderSize::default();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    for f in folders {
+        match std::fs::symlink_metadata(f) {
+            Ok(m) if !is_reparse(&m) && m.is_dir() => stack.push(f.clone()),
+            _ => {}
+        }
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            size.entries += 1;
+            if size.entries > MAX_BACKUP_ENTRIES {
+                return Err(format!(
+                    "as pastas têm mais de {MAX_BACKUP_ENTRIES} itens: cópia recusada"
+                ));
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if is_reparse(&meta) {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(path);
+            } else {
+                size.bytes = size.bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(size)
+}
+
+/// Copies `src` into `dst` (a new folder), never following reparse points and stopping past
+/// `budget` bytes; each skip and error goes to `notes`.
+fn copy_tree(src: &Path, dst: &Path, budget: &mut u64, notes: &mut Vec<String>) {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
     let mut copied = 0usize;
     while let Some((from, to)) = stack.pop() {
@@ -488,26 +607,64 @@ fn copy_tree(src: &Path, dst: &Path, notes: &mut Vec<String>) {
                 }
             };
             if is_reparse(&meta) {
-                tracing::warn!(path = %path.display(), "backup: reparse point skipped");
-                notes.push(format!(
-                    "pulado (link ou junção, não seguido): {}",
-                    path.display()
-                ));
+                notes.push(reparse_note(&path));
                 continue;
             }
             let target = to.join(entry.file_name());
             if meta.is_dir() {
                 stack.push((path, target));
-            } else if let Err(e) = std::fs::copy(&path, &target) {
+                continue;
+            }
+            // The tree grew after it was measured: stop instead of passing the cap.
+            let Some(left) = budget.checked_sub(meta.len()) else {
+                notes.push(format!(
+                    "cópia interrompida: a pasta cresceu além do medido: {}",
+                    src.display()
+                ));
+                return;
+            };
+            *budget = left;
+            if let Err(e) = std::fs::copy(&path, &target) {
                 notes.push(format!("falha ao copiar {}: {e}", path.display()));
             }
         }
     }
 }
 
-/// Copies each folder to `dest\<n>-<folder name>` (recursive, never following reparse points);
-/// returns the skips and errors.
-pub fn backup_folders(folders: &[PathBuf], dest: &Path) -> Vec<String> {
+/// Copies each folder to `dest\<n>-<folder name>` (recursive, never following reparse points).
+/// Measured first: refused (nothing copied) when a folder contains `dest`, when the total
+/// passes `limits.max_bytes` or when the destination has less free space than the total.
+/// Returns the skips and errors of the copy.
+pub fn backup_folders(
+    folders: &[PathBuf],
+    dest: &Path,
+    limits: &BackupLimits<'_>,
+) -> Result<Vec<String>, String> {
+    if let Some(f) = folders.iter().find(|f| contains_path(f, dest)) {
+        return Err(format!(
+            "a pasta {} contém o destino da cópia: cópia recusada",
+            f.display()
+        ));
+    }
+    let size = measure_folders(folders)?;
+    if size.bytes > limits.max_bytes {
+        return Err(format!(
+            "as pastas somam {}, acima do limite de {}: copie à mão",
+            human_size(size.bytes),
+            human_size(limits.max_bytes)
+        ));
+    }
+    let free = (limits.free_space)(dest)
+        .ok_or_else(|| format!("não foi possível ler o espaço livre em {}", dest.display()))?;
+    if free < size.bytes {
+        return Err(format!(
+            "espaço livre insuficiente em {}: {} livres, a cópia precisa de {}",
+            dest.display(),
+            human_size(free),
+            human_size(size.bytes)
+        ));
+    }
+    let mut budget = size.bytes;
     let mut notes = Vec::new();
     for (i, folder) in folders.iter().enumerate() {
         let name = folder.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -521,44 +678,13 @@ pub fn backup_folders(folders: &[PathBuf], dest: &Path) -> Vec<String> {
             continue;
         }
         match std::fs::symlink_metadata(folder) {
-            Ok(m) if is_reparse(&m) => {
-                tracing::warn!(path = %folder.display(), "backup: reparse point skipped");
-                notes.push(format!(
-                    "pulado (link ou junção, não seguido): {}",
-                    folder.display()
-                ));
-            }
-            Ok(m) if m.is_dir() => copy_tree(folder, &target, &mut notes),
+            Ok(m) if is_reparse(&m) => notes.push(reparse_note(folder)),
+            Ok(m) if m.is_dir() => copy_tree(folder, &target, &mut budget, &mut notes),
             Ok(_) => notes.push(format!("não é uma pasta: {}", folder.display())),
             Err(e) => notes.push(format!("pasta ilegível {}: {e}", folder.display())),
         }
     }
-    notes
-}
-
-/// A `.reg` backup path nobody wrote yet (so a stale file never stands in for a failed export).
-fn fresh_backup_file(backups: &Path, ts: &str, o: &Orphan) -> Result<PathBuf, String> {
-    let first = backup_file(backups, ts, o);
-    let dir = first
-        .parent()
-        .ok_or_else(|| "pasta de backup inválida".to_string())?
-        .to_path_buf();
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("não foi possível criar {}: {e}", dir.display()))?;
-    let stem = first
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let candidates = std::iter::once(first)
-        .chain((2..=MAX_BACKUP_SUFFIX).map(|n| dir.join(format!("{stem}-{n}.reg"))));
-    for c in candidates {
-        match std::fs::symlink_metadata(&c) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(c),
-            Err(e) => return Err(format!("não foi possível conferir {}: {e}", c.display())),
-            Ok(_) => continue,
-        }
-    }
-    Err(format!("nomes de backup esgotados em {}", dir.display()))
+    Ok(notes)
 }
 
 /// Option C: removes only the registry record of an installation that is not the principal
