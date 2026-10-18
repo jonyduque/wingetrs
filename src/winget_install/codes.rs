@@ -147,15 +147,26 @@ pub fn classify_install(
     }
 }
 
+/// 3010 (reboot required) and 1641 (reboot initiated): the Windows Installer codes, also
+/// returned by Burn bundles; the caller confirms the removal by the ARP key.
+pub fn reboot_code(code: i32) -> Option<Outcome> {
+    match code as u32 {
+        3010 => Some(Outcome::OkReboot { initiated: false }),
+        1641 => Some(Outcome::OkReboot { initiated: true }),
+        _ => None,
+    }
+}
+
 pub fn classify_uninstall(msiexec: bool, code: i32) -> Outcome {
+    if msiexec && let Some(o) = reboot_code(code) {
+        return o;
+    }
     let code = code as u32;
     if code == 0 {
         return Outcome::Ok;
     }
     if msiexec {
         match code {
-            3010 => return Outcome::OkReboot { initiated: false },
-            1641 => return Outcome::OkReboot { initiated: true },
             1618 => return from_category(C::InstallInProgress, code),
             1602 => return from_category(C::CancelledByUser, code),
             _ => {}

@@ -39,12 +39,17 @@ struct FakeLauncher {
     codes: Mutex<VecDeque<i32>>,
     /// Gate to try to cancel while "running", and what `try_cancel` answered.
     cancel_during_run: Mutex<Option<(LaunchGate, Option<bool>)>>,
+    /// When set, the next launch fails with this OS error (nothing runs).
+    os_error: Mutex<Option<i32>>,
 }
 
 impl Launcher for FakeLauncher {
     fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32> {
         self.calls.lock().unwrap().push(spec.clone());
         self.count.fetch_add(1, Ordering::SeqCst);
+        if let Some(code) = self.os_error.lock().unwrap().take() {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
         if let Some((gate, answer)) = self.cancel_during_run.lock().unwrap().as_mut() {
             *answer = Some(gate.try_cancel());
         }
@@ -488,6 +493,25 @@ async fn msi_retry_then_other_failure_reports_the_second() {
         other => panic!("{other:?}"),
     }
     assert_eq!(env.launcher.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn self_elevating_uac_refused_is_cancelled() {
+    // An unelevated exe that asks for UAC by itself: the user says no (ERROR_CANCELLED).
+    let env = Env::new();
+    *env.launcher.os_error.lock().unwrap() = Some(1223);
+    let (_s, p, _) = served_plan("inno", Some("user"), Scope::User, "", "").await;
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::UacRefused), "{e:?}");
+    assert_eq!(e.to_string(), UAC_REFUSED);
+
+    // Any other launch failure stays a launch failure.
+    let env = Env::new();
+    *env.launcher.os_error.lock().unwrap() = Some(2);
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::Launch(_)), "{e:?}");
 }
 
 #[tokio::test]

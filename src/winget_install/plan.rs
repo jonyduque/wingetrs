@@ -74,6 +74,8 @@ pub fn plan(
     {
         return Ok(PlanOrBridge::Bridge(why));
     }
+    // MSIX is deployed by the package manager: no installer window, whatever the mode.
+    let interactive = command.is_some() && (interactive || mode == Mode::Interactive);
     let name = manifest
         .package_name
         .as_deref()
@@ -91,7 +93,7 @@ pub fn plan(
         mode,
         command,
         elevation,
-        interactive: interactive || mode == Mode::Interactive,
+        interactive,
         agreements: manifest.agreements.clone(),
         upgrade_from,
     }))
@@ -233,6 +235,16 @@ impl std::fmt::Display for WingetPlan {
         }
         if self.interactive {
             write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;
+        }
+        if self.upgrade_from.is_some()
+            && super::engine::upgrade_route(&self.installer)
+                == super::engine::UpgradeRoute::UninstallFirst
+        {
+            write!(
+                f,
+                "\nremove a versão instalada antes (o desinstalador pode abrir janela ou pedir \
+                 permissão de administrador)"
+            )?;
         }
         for a in &self.agreements {
             let label = a

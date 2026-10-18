@@ -14,8 +14,8 @@ use wingetrs::config::{DefaultScope, WingetEngine};
 use wingetrs::http::Http;
 use wingetrs::install::executor::LaunchGate;
 use wingetrs::install::progress::ProgressEvent;
-use wingetrs::installed::Hive;
 use wingetrs::installed::correlate::{InstallScope, ListRow, UpdateState};
+use wingetrs::installed::{Hive, InstallSource, InstalledApp};
 use wingetrs::sources::winget::manifest::{self, MergedManifest};
 use wingetrs::update::LockWait;
 use wingetrs::winget_install::elevated_rules::KnownFolders;
@@ -25,7 +25,7 @@ use wingetrs::winget_install::engine::{
 };
 use wingetrs::winget_install::launch::{LaunchSpec, Launcher};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
-use wingetrs::winget_install::ops::WingetCtx;
+use wingetrs::winget_install::ops::{InstallReport, WingetCtx, WingetOpsError};
 use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
 use wingetrs::winget_install::select::{Host, Refusal, Scope, ScopeWanted};
 use wingetrs::winget_install::uninstall::{
@@ -290,10 +290,22 @@ struct FakeLauncher {
     /// `install.lock` path: each launch records whether another taker would be turned away.
     lock_path: PathBuf,
     lock_held: Mutex<Vec<bool>>,
+    /// When set, records `launch_gate` before its label if the gate was already taken.
+    gate: Option<LaunchGate>,
+    /// When set, the launch fails with this OS error instead of running.
+    os_error: Option<i32>,
 }
 
 impl Launcher for FakeLauncher {
     fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32> {
+        if let Some(code) = self.os_error {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
+        if let Some(g) = &self.gate
+            && g.running().is_some()
+        {
+            self.events.lock().unwrap().push("launch_gate".to_string());
+        }
         self.events.lock().unwrap().push(self.label.to_string());
         self.params.lock().unwrap().push(spec.params.clone());
         let other = UpdateLock::try_acquire(&self.lock_path).unwrap();
@@ -414,6 +426,22 @@ struct World {
     /// Whether the ARP key is still there after the uninstaller ran.
     key_stays: bool,
     manifest: MergedManifest,
+    gate: LaunchGate,
+    /// Version of the app the post-install scan finds (`None`: the scan finds nothing).
+    found_version: Option<String>,
+}
+
+/// Serves the installer and records `fetch` for each request.
+struct Served {
+    events: Events,
+    bytes: Vec<u8>,
+}
+
+impl wiremock::Respond for Served {
+    fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+        self.events.lock().unwrap().push("fetch".to_string());
+        ResponseTemplate::new(200).set_body_bytes(self.bytes.clone())
+    }
 }
 
 impl World {
@@ -423,9 +451,13 @@ impl World {
         let bytes = body();
         let sha = sha256_hex(&bytes);
         let server = MockServer::start().await;
+        let events: Events = Arc::default();
         Mock::given(method("GET"))
             .and(path("/setup"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .respond_with(Served {
+                events: events.clone(),
+                bytes,
+            })
             .mount(&server)
             .await;
         let manifest = manifest_with(
@@ -435,18 +467,20 @@ impl World {
             &sha,
             extra,
         );
-        let events: Events = Arc::default();
-        let launcher = |label| FakeLauncher {
+        let gate = LaunchGate::default();
+        let launcher = |label, gate| FakeLauncher {
             label,
             events: events.clone(),
             params: Mutex::new(Vec::new()),
             code: 0,
             lock_path: data.install_layout().install_lock(),
             lock_held: Mutex::new(Vec::new()),
+            gate,
+            os_error: None,
         };
         World {
-            install: launcher("install"),
-            uninstall: launcher("uninstall"),
+            install: launcher("install", None),
+            uninstall: launcher("uninstall", Some(gate.clone())),
             events: events.clone(),
             _tmp: tmp,
             _server: server,
@@ -455,6 +489,8 @@ impl World {
             clock: FakeClock::default(),
             key_stays,
             manifest,
+            gate,
+            found_version: None,
         }
     }
 
@@ -467,17 +503,41 @@ impl World {
     }
 
     async fn run_with(&self, p: &WingetPlan, previous: &UninstallPlan) -> Result<(), UpgradeError> {
+        self.run_report(p, previous).await.map(|_| ())
+    }
+
+    async fn run_report(
+        &self,
+        p: &WingetPlan,
+        previous: &UninstallPlan,
+    ) -> Result<InstallReport, UpgradeError> {
+        let found = self.found_version.clone();
+        let scan = move || match &found {
+            Some(v) => vec![InstalledApp {
+                source: InstallSource::Arp(Hive::User),
+                key: "App".to_string(),
+                name: "Contoso App".to_string(),
+                publisher: Some("Contoso".to_string()),
+                version: Some(v.clone()),
+                product_code: None,
+                upgrade_code: None,
+                family_name: None,
+                scoop_bucket: None,
+                stale: None,
+            }],
+            None => Vec::new(),
+        };
         let msiexec = self._tmp.path().join("msiexec.exe");
         let wctx = WingetCtx {
             data: &self.data,
             http: &self.http,
             wait: LockWait::Block(Duration::from_secs(30)),
             progress: &|_: &ProgressEvent| {},
-            gate: LaunchGate::default(),
+            gate: self.gate.clone(),
             launcher: &self.install,
             elevated: &NoElevated,
             msix: &NoMsix,
-            scan: &Vec::new,
+            scan: &scan,
             msiexec: msiexec.clone(),
             busy: &|| false,
             sleep: &|_: Duration| {},
@@ -498,7 +558,7 @@ impl World {
             user_expand: &|_: &str| None,
             msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
         };
-        upgrade(&wctx, &uctx, p, Some(previous)).await.map(|_| ())
+        upgrade(&wctx, &uctx, p, Some(previous)).await
     }
 
     fn events(&self) -> Vec<String> {
@@ -507,18 +567,24 @@ impl World {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn uninstall_previous_order() {
+async fn upgrade_previous_order() {
     let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
     let p = w.plan(Some("0.9"));
     w.run(&p).await.unwrap();
-    assert_eq!(w.events(), ["uninstall", "wait_key", "install"]);
+    assert_eq!(
+        w.events(),
+        ["fetch", "launch_gate", "uninstall", "wait_key", "install"]
+    );
 
     // The key stays: the uninstaller said success without effect; no install.
     let w = World::new("inno", Some("uninstallPrevious"), "", true).await;
     let p = w.plan(Some("0.9"));
     let err = w.run(&p).await.unwrap_err();
     assert!(matches!(err, UpgradeError::NotRemoved(_)), "{err}");
-    assert_eq!(w.events(), ["uninstall", "wait_key"]);
+    assert_eq!(
+        w.events(),
+        ["fetch", "launch_gate", "uninstall", "wait_key"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -536,7 +602,7 @@ async fn in_place_uses_upgrade_switch() {
     let w = World::new("msi", None, extra, false).await;
     let p = w.plan(Some("0.9"));
     w.run(&p).await.unwrap();
-    assert_eq!(w.events(), ["install"]);
+    assert_eq!(w.events(), ["fetch", "install"]);
     let params = w.install.params.lock().unwrap().clone();
     assert!(params[0].ends_with("REINSTALL=ALL"), "{params:?}");
 
@@ -556,7 +622,10 @@ async fn uninstall_first_install_has_no_upgrade_switch() {
     let p = w.plan(Some("0.9"));
     assert!(p.command.as_ref().unwrap().args.contains("REINSTALL=ALL"));
     w.run(&p).await.unwrap();
-    assert_eq!(w.events(), ["uninstall", "wait_key", "install"]);
+    assert_eq!(
+        w.events(),
+        ["fetch", "launch_gate", "uninstall", "wait_key", "install"]
+    );
     let params = w.install.params.lock().unwrap().clone();
     assert!(!params[0].contains("REINSTALL"), "{params:?}");
 }
@@ -603,7 +672,10 @@ async fn install_failing_after_removal_says_so() {
             .starts_with("a versão anterior foi removida e a nova não instalou: "),
         "{err}"
     );
-    assert_eq!(w.events(), ["uninstall", "wait_key", "install"]);
+    assert_eq!(
+        w.events(),
+        ["fetch", "launch_gate", "uninstall", "wait_key", "install"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -630,7 +702,108 @@ async fn uninstall_error_stops_before_install() {
     prev.command = None;
     let err = w.run_with(&p, &prev).await.unwrap_err();
     assert!(matches!(err, UpgradeError::Uninstall(_)), "{err}");
-    assert!(w.events().is_empty());
+    assert_eq!(w.events(), ["fetch"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_previous_download_failure_keeps_old() {
+    let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    w._server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/setup"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&w._server)
+        .await;
+    let p = w.plan(Some("0.9"));
+    let err = w.run(&p).await.unwrap_err();
+    assert!(
+        matches!(err, UpgradeError::Install(WingetOpsError::Fetch(_))),
+        "{err}"
+    );
+    // The old version is untouched: no uninstaller, no wait for its key, no install.
+    assert!(w.events().is_empty(), "{:?}", w.events());
+    assert!(w.uninstall.params.lock().unwrap().is_empty());
+
+    // A download that does not match the manifest's hash removes nothing either.
+    let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    w._server.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/setup"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"other bytes".to_vec()))
+        .mount(&w._server)
+        .await;
+    let err = w.run(&p).await.unwrap_err();
+    assert!(
+        matches!(err, UpgradeError::Install(WingetOpsError::Fetch(_))),
+        "{err}"
+    );
+    assert!(w.events().is_empty(), "{:?}", w.events());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_previous_cancel_before_removal_keeps_old() {
+    let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    // Ctrl+C came first: the download may finish, the removal never starts.
+    assert!(w.gate.try_cancel());
+    let p = w.plan(Some("0.9"));
+    let err = w.run(&p).await.unwrap_err();
+    assert!(
+        matches!(err, UpgradeError::Install(WingetOpsError::Cancelled)),
+        "{err}"
+    );
+    assert_eq!(w.events(), ["fetch"]);
+}
+
+#[test]
+fn upgrade_previous_confirmation_mentions_removal() {
+    const LINE: &str = "remove a versão instalada antes (o desinstalador pode abrir janela ou pedir permissão de administrador)";
+    let m = manifest_with(
+        "inno",
+        &[(Some("user"), Some("uninstallPrevious"))],
+        URL,
+        SHA,
+        "",
+    );
+    let text = native(&m, ScopeWanted::Only(Scope::User), Some("0.9")).to_string();
+    assert!(text.contains(LINE), "{text}");
+    // A fresh install of the same package removes nothing.
+    let text = native(&m, ScopeWanted::Only(Scope::User), None).to_string();
+    assert!(!text.contains("remove a versão instalada"), "{text}");
+    // An in-place upgrade neither.
+    let m = manifest_with("inno", &[(Some("user"), Some("install"))], URL, SHA, "");
+    let text = native(&m, ScopeWanted::Only(Scope::User), Some("0.9")).to_string();
+    assert!(!text.contains("remove a versão instalada"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_same_version_after_warns() {
+    // (version offered, version found after the installer, warns)
+    for (offered, found, warns) in [
+        ("1.10", "1.9", true),
+        ("1.0", "1.0.0", false),
+        ("1.0", "1.0", false),
+        ("1.0", "0.9", true),
+        // Newer than the catalog (the installer brought a later build): updated, no warning.
+        ("1.0", "1.1", false),
+    ] {
+        for behavior in [None, Some("uninstallPrevious")] {
+            let mut w = World::new("inno", behavior, "", false).await;
+            w.found_version = Some(found.to_string());
+            let mut p = w.plan(Some("0.9"));
+            p.version = offered.to_string();
+            let r = w.run_report(&p, &previous_plan()).await.unwrap();
+            let want = format!("o instalador terminou, mas a versão instalada continua {found}");
+            if warns {
+                assert_eq!(
+                    r.warning.as_deref(),
+                    Some(want.as_str()),
+                    "{offered} {found}"
+                );
+            } else {
+                assert_eq!(r.warning, None, "{offered} {found} {behavior:?}");
+            }
+        }
+    }
 }
 
 fn arp(hive: Hive, key: &str, msi: bool) -> ArpDetails {
@@ -730,4 +903,77 @@ fn deny_is_judged_among_installers_that_run_here() {
     assert!(r.unwrap_err().0.contains("não permite atualizar"));
     let fit = winget_applicability(&m, None, "x64").applicability;
     assert_eq!(fit, Applicability::Denied);
+}
+
+#[test]
+fn msix_plan_never_says_installer_window() {
+    // NanaZip, WinDbg: MSIX has no silent switch, but the package manager deploys it without
+    // an installer window.
+    for kind in ["msix", "appx"] {
+        let m = manifest_with(kind, &[(Some("user"), None)], URL, SHA, "");
+        let p = native(&m, ScopeWanted::Only(Scope::User), None);
+        assert!(!p.interactive, "{kind}");
+        assert!(!p.to_string().contains("abre a janela"), "{p}");
+    }
+    // An exe with no silent mode still says it.
+    let m = manifest_with("exe", &[(Some("user"), None)], URL, SHA, "");
+    let p = native(&m, ScopeWanted::Only(Scope::User), None);
+    assert!(p.to_string().contains("abre a janela do instalador"), "{p}");
+}
+
+/// The ARP record of a .NET runtime bundle (Burn): always in the 32-bit view.
+fn dotnet_runtime(major: &str, arch: &str) -> ArpDetails {
+    let mut d = arp(
+        Hive::MachineX86,
+        "{0DDB00D8-AAAA-BBBB-CCCC-DDDDDDDDDDDD}",
+        false,
+    );
+    d.display_name = Some(format!(
+        "Microsoft Windows Desktop Runtime - {major}.0.11 ({arch})"
+    ));
+    d.quiet_uninstall_string = None;
+    d.uninstall_string = Some(format!(
+        r#""C:\ProgramData\Package Cache\{{0DDB00D8}}\windowsdesktop-runtime-{major}.0.11-win-{arch}.exe"  /uninstall"#
+    ));
+    d.bundle_cache_path = Some(format!(
+        r"C:\ProgramData\Package Cache\{{0DDB00D8}}\windowsdesktop-runtime-{major}.0.11-win-{arch}.exe"
+    ));
+    d.bundle_upgrade_code = Some("{C0C0C0C0-1111-2222-3333-444444444444}".to_string());
+    d
+}
+
+#[test]
+fn burn_bundle_arch_is_not_the_registry_view() {
+    let m = multi(&[
+        ("x86", "burn", None),
+        ("x64", "burn", None),
+        ("arm64", "burn", None),
+    ]);
+    for major in ["8", "10"] {
+        let x64 = installed_facts(&dotnet_runtime(major, "x64"));
+        assert_eq!(x64.arch, Some("x64"), "{major}");
+        assert!(
+            upgrade_url(&m, &x64).unwrap().ends_with("/x64-burn"),
+            "{major}"
+        );
+        // A real x86 runtime stays x86.
+        let x86 = installed_facts(&dotnet_runtime(major, "x86"));
+        assert_eq!(x86.arch, Some("x86"));
+        assert!(upgrade_url(&m, &x86).unwrap().ends_with("/x86-burn"));
+    }
+    // No hint in the name or the cache: unknown, the system architecture wins.
+    let mut d = dotnet_runtime("8", "x64");
+    d.display_name = Some("Microsoft Windows Desktop Runtime - 8.0.11".to_string());
+    d.bundle_cache_path = Some(r"C:\ProgramData\Package Cache\{X}\setup.exe".to_string());
+    let f = installed_facts(&d);
+    assert_eq!(f.arch, None);
+    assert!(upgrade_url(&m, &f).unwrap().ends_with("/x64-burn"));
+    // A bundle known only by its upgrade code is still a bundle.
+    d.bundle_cache_path = None;
+    assert_eq!(installed_facts(&d).arch, None);
+    // Not a bundle: the 32-bit view still means x86.
+    assert_eq!(
+        installed_facts(&arp(Hive::MachineX86, "App_is1", false)).arch,
+        Some("x86")
+    );
 }

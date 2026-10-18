@@ -14,9 +14,9 @@ use wingetrs::winget_install::launch::{Elevation, LaunchSpec, Launcher, Show};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::orphans::ArpRegistry;
 use wingetrs::winget_install::uninstall::{
-    BackupLimits, Clock, FolderSize, MAX_BACKUP_BYTES, UninstallCtx, UninstallPlan,
+    BackupLimits, Clock, FolderSize, MAX_BACKUP_BYTES, MsiQueue, UninstallCtx, UninstallPlan,
     UninstallStatus, UninstallTarget, UserFolders, backup_folders, human_size, measure_folders,
-    plan_uninstall, remove_registry_only, target_of, uninstall,
+    plan_uninstall, remove_registry_only, target_of, uninstall, uninstall_queued,
 };
 use wingetrs::winget_install::uninstall_cmd::{ArpDetails, Rule};
 
@@ -960,4 +960,166 @@ fn plan_text_matches_confirmation() {
     let d = kindle(Hive::User, "K", "1");
     let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
     assert!(p.to_string().contains("Outra instalação"), "{p}");
+}
+
+// ---- Task 194: Burn reboot codes and the Windows Installer queue ----
+
+fn burn(hive: Hive) -> ArpDetails {
+    let mut d = details(hive, "{B0B0B0B0-1111-2222-3333-444444444444}");
+    d.uninstall_string = Some(
+        r#""C:\Users\t\AppData\Local\Package Cache\{B0B0}\vc_redist.exe" /uninstall"#.to_string(),
+    );
+    d.bundle_upgrade_code = Some("{C0C0C0C0-1111-2222-3333-444444444444}".to_string());
+    d
+}
+
+#[test]
+fn burn_uninstall_3010_key_gone_is_success() {
+    for (code, initiated) in [(3010, false), (1641, true)] {
+        let w = World::new(code, &[true, false]);
+        let p = plan(&burn(Hive::User));
+        assert_eq!(p.command.as_ref().unwrap().rule, Rule::Burn);
+        let r = w.run(&p).unwrap();
+        assert_eq!(r.status, UninstallStatus::Removed, "{code}");
+        assert_eq!(r.warning, None);
+        assert_eq!(r.reboot, Some(initiated));
+        assert_eq!(w.keys.count(), 2);
+    }
+    // QuietUninstallString of a bundle (Burn writes one) follows the same path.
+    let mut d = burn(Hive::User);
+    d.quiet_uninstall_string = Some(
+        r#""C:\Users\t\AppData\Local\Package Cache\{B0B0}\vc_redist.exe" /uninstall /quiet"#
+            .to_string(),
+    );
+    let w = World::new(3010, &[false]);
+    let p = plan(&d);
+    assert_eq!(p.command.as_ref().unwrap().rule, Rule::Quiet);
+    let r = w.run(&p).unwrap();
+    assert_eq!(r.status, UninstallStatus::Removed);
+    assert_eq!(r.reboot, Some(false));
+}
+
+#[test]
+fn burn_uninstall_3010_key_present_is_failure() {
+    let w = World::new(3010, &[true]);
+    let p = plan(&burn(Hive::User));
+    let e = w.run(&p).unwrap_err();
+    assert!(e.contains("3010"), "{e}");
+    assert!(e.contains("registro continua"), "{e}");
+    // It waited for the key before declaring the failure.
+    assert!(w.clock.now() >= Duration::from_secs(120));
+    // Another code is still a failure at once, without waiting for the key.
+    let w = World::new(1603, &[false]);
+    let e = w.run(&p).unwrap_err();
+    assert!(e.contains("1603"), "{e}");
+    assert_eq!(w.keys.count(), 0);
+}
+
+/// Answers each launch with the next code; records whether `msi.lock` was held meanwhile.
+struct SeqLauncher {
+    codes: Mutex<VecDeque<i32>>,
+    lock: PathBuf,
+    held: Mutex<Vec<bool>>,
+}
+
+impl Launcher for SeqLauncher {
+    fn run(&self, _spec: &LaunchSpec) -> std::io::Result<i32> {
+        let other = wingetrs::cache::UpdateLock::try_acquire(&self.lock).unwrap();
+        self.held.lock().unwrap().push(other.is_none());
+        Ok(self.codes.lock().unwrap().pop_front().unwrap_or(0))
+    }
+}
+
+fn run_queued_msi(codes: &[i32]) -> (Result<UninstallStatus, String>, Vec<bool>, Vec<Duration>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = tmp.path().join("msi.lock");
+    let launcher = SeqLauncher {
+        codes: Mutex::new(codes.iter().copied().collect()),
+        lock: lock.clone(),
+        held: Mutex::new(Vec::new()),
+    };
+    let w = World::new(0, &[false]);
+    let key_exists = |h: Hive, k: &str| w.keys.exists(h, k);
+    let ctx = UninstallCtx {
+        launcher: &launcher,
+        elevated: &w.elevated,
+        msix: &w.msix,
+        key_exists: &key_exists,
+        clock: &w.clock,
+        user_expand: &user_env,
+        msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+    };
+    let sleeps: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
+    let sleep = |d: Duration| sleeps.lock().unwrap().push(d);
+    let queue = MsiQueue {
+        lock: lock.clone(),
+        busy: &|| false,
+        sleep: &sleep,
+    };
+    let r = uninstall_queued(&ctx, Some(&queue), &plan(&msi(Hive::User))).map(|r| r.status);
+    // Released at the end.
+    assert!(
+        wingetrs::cache::UpdateLock::try_acquire(&lock)
+            .unwrap()
+            .is_some()
+    );
+    let held = launcher.held.lock().unwrap().clone();
+    let slept = sleeps.lock().unwrap().clone();
+    (r, held, slept)
+}
+
+#[test]
+fn msiexec_uninstall_retries_1618() {
+    let (r, held, slept) = run_queued_msi(&[1618, 0]);
+    assert_eq!(r, Ok(UninstallStatus::Removed));
+    assert_eq!(held, [true, true]);
+    assert_eq!(slept, [Duration::from_secs(5)]);
+
+    // The second attempt fails for another reason: that one is reported, not the 1618.
+    let (r, held, _) = run_queued_msi(&[1618, 1603]);
+    let e = r.unwrap_err();
+    assert!(e.contains("1603"), "{e}");
+    assert_eq!(held.len(), 2);
+
+    // 1618 every time: the retries run out and the last 1618 is the failure.
+    let (r, held, slept) = run_queued_msi(&[1618, 1618, 1618, 1618, 1618]);
+    let e = r.unwrap_err();
+    assert!(e.contains("outro instalador"), "{e}");
+    assert_eq!(held.len(), 4);
+    assert_eq!(slept.len(), 3);
+}
+
+#[test]
+fn non_msi_uninstall_takes_no_msi_queue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = tmp.path().join("msi.lock");
+    let launcher = SeqLauncher {
+        codes: Mutex::new([1618].into_iter().collect()),
+        lock: lock.clone(),
+        held: Mutex::new(Vec::new()),
+    };
+    let w = World::new(0, &[false]);
+    let key_exists = |h: Hive, k: &str| w.keys.exists(h, k);
+    let ctx = UninstallCtx {
+        launcher: &launcher,
+        elevated: &w.elevated,
+        msix: &w.msix,
+        key_exists: &key_exists,
+        clock: &w.clock,
+        user_expand: &user_env,
+        msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+    };
+    let queue = MsiQueue {
+        lock: lock.clone(),
+        busy: &|| true,
+        sleep: &|_: Duration| panic!("no wait for a non-MSI uninstaller"),
+    };
+    let p = plan(&quiet(
+        Hive::User,
+        "App",
+        r#""C:\Users\t\AppData\Local\App\u.exe" /S"#,
+    ));
+    // An exe uninstaller's 1618 is just an unknown code: one launch, no lock, no retry.
+    assert!(uninstall_queued(&ctx, Some(&queue), &p).is_err());
+    assert_eq!(*launcher.held.lock().unwrap(), [false]);
 }

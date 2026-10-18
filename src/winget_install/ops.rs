@@ -198,9 +198,18 @@ pub async fn install(
 pub async fn install_locked(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
-    _install_lock: &UpdateLock,
+    install_lock: &UpdateLock,
 ) -> Result<InstallReport, WingetOpsError> {
-    let layout = ctx.data.install_layout();
+    let file = fetch_verified(ctx, plan).await?;
+    install_fetched(ctx, plan, file, install_lock)
+}
+
+/// Downloads the plan's installer and hashes it again through a handle that denies write,
+/// delete and rename while the returned file lives (nothing is launched).
+pub async fn fetch_verified(
+    ctx: &WingetCtx<'_>,
+    plan: &WingetPlan,
+) -> Result<Materialized, WingetOpsError> {
     phase(ctx, Phase::Preparing);
     let mut file = fetch_installer(
         ctx.http,
@@ -212,7 +221,18 @@ pub async fn install_locked(
     )
     .await?;
     verify(&mut file)?;
+    Ok(file)
+}
 
+/// The rest of [`install_locked`] for a file [`fetch_verified`] returned: `msi.lock`, launch
+/// gate, launch, classification, post-check and record.
+pub fn install_fetched(
+    ctx: &WingetCtx<'_>,
+    plan: &WingetPlan,
+    file: Materialized,
+    _install_lock: &UpdateLock,
+) -> Result<InstallReport, WingetOpsError> {
+    let layout = ctx.data.install_layout();
     let (outcome, log, extra) = match &plan.command {
         Some(cmd) => {
             let _msi_lock = msi_queue::lock_msi(&layout.msi_lock(), &mut |_| {
@@ -365,9 +385,13 @@ fn run_command(
             let name = name.clone();
             let run = move |_: &mut Vec<String>| -> Result<i32, WingetOpsError> {
                 phase(ctx, Phase::RunningInstaller { name: name.clone() });
-                ctx.launcher
-                    .run(&spec)
-                    .map_err(|e| WingetOpsError::Launch(e.to_string()))
+                ctx.launcher.run(&spec).map_err(|e| {
+                    if uac_refused(&e) {
+                        WingetOpsError::UacRefused
+                    } else {
+                        WingetOpsError::Launch(e.to_string())
+                    }
+                })
             };
             (Some(log), Box::new(run))
         }
@@ -382,44 +406,15 @@ fn run_command(
     };
 
     let code = if queued(&plan.installer.kind) {
-        // Per-attempt state, reset at the start of every attempt.
-        let mut last: Option<Result<i32, WingetOpsError>> = None;
-        let r = msi_queue::run_queued(
-            &msi_queue::POLICY,
-            &mut || (ctx.busy)(),
-            &mut || {
-                last = None;
-                match attempt(&mut lines) {
-                    Ok(1618) => {
-                        last = Some(Ok(1618));
-                        Ok(Attempt::Busy1618)
-                    }
-                    Ok(c) => {
-                        last = Some(Ok(c));
-                        Ok(Attempt::Done)
-                    }
-                    Err(e) => {
-                        let text = e.to_string();
-                        last = Some(Err(e));
-                        Err(std::io::Error::other(text))
-                    }
-                }
-            },
-            &mut |d| (ctx.sleep)(d),
-            &mut |s| match s {
-                Status::WaitingLock | Status::WaitingInstaller | Status::Retrying { .. } => {
-                    phase(ctx, Phase::WaitingInstaller)
-                }
-                // The launch itself reports its phase.
-                Status::Running { .. } => {}
-            },
-        );
-        match (r, last) {
-            (_, Some(Err(e))) => return Err(e),
-            // Done, or 1618 after the last retry: classified below like any other code.
-            (Ok(()) | Err(MsiQueueError::InstallerBusy), Some(Ok(c))) => c,
-            (Err(e), _) => return Err(WingetOpsError::Queue(e.to_string())),
-            (Ok(()), None) => return Err(WingetOpsError::Queue("o instalador não rodou".into())),
+        match retry_1618(
+            ctx.busy,
+            ctx.sleep,
+            &mut || phase(ctx, Phase::WaitingInstaller),
+            &mut || attempt(&mut lines),
+        ) {
+            Ok(c) => c,
+            Err(Queued::Attempt(e)) => return Err(e),
+            Err(Queued::Queue(text)) => return Err(WingetOpsError::Queue(text)),
         }
     } else {
         attempt(&mut lines)?
@@ -437,6 +432,71 @@ fn run_command(
         }
     };
     Ok(Ran { code, log, tail })
+}
+
+/// `ERROR_CANCELLED`: the user said no to the UAC prompt of a program that elevates itself.
+const ERROR_CANCELLED: i32 = 1223;
+
+/// Whether a launch failed because the user refused the UAC prompt (`launch_win` reports
+/// `ERROR_CANCELLED` as that raw OS error).
+pub fn uac_refused(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_CANCELLED)
+}
+
+/// Why [`retry_1618`] gave no exit code.
+pub enum Queued<E> {
+    /// The attempt itself failed (launch, UAC, helper).
+    Attempt(E),
+    /// The queue gave up (mutex held too long, I/O).
+    Queue(String),
+}
+
+/// Runs `attempt` through the Windows Installer queue (installs and `msiexec /x` alike): waits
+/// while the mutex is held, retries 1618, and returns the last exit code (a 1618 after the
+/// last retry included, for the caller to classify). `waiting` is told each time it waits.
+pub fn retry_1618<E: std::fmt::Display>(
+    busy: &dyn Fn() -> bool,
+    sleep: &dyn Fn(Duration),
+    waiting: &mut dyn FnMut(),
+    attempt: &mut dyn FnMut() -> Result<i32, E>,
+) -> Result<i32, Queued<E>> {
+    // Per-attempt state, reset at the start of every attempt.
+    let mut last: Option<Result<i32, E>> = None;
+    let r = msi_queue::run_queued(
+        &msi_queue::POLICY,
+        &mut || busy(),
+        &mut || {
+            last = None;
+            match attempt() {
+                Ok(1618) => {
+                    last = Some(Ok(1618));
+                    Ok(Attempt::Busy1618)
+                }
+                Ok(c) => {
+                    last = Some(Ok(c));
+                    Ok(Attempt::Done)
+                }
+                Err(e) => {
+                    let text = e.to_string();
+                    last = Some(Err(e));
+                    Err(std::io::Error::other(text))
+                }
+            }
+        },
+        &mut |d| sleep(d),
+        &mut |s| match s {
+            Status::WaitingLock | Status::WaitingInstaller | Status::Retrying { .. } => waiting(),
+            // The launch itself reports its phase.
+            Status::Running { .. } => {}
+        },
+    );
+    match (r, last) {
+        (_, Some(Err(e))) => Err(Queued::Attempt(e)),
+        // Done, or 1618 after the last retry: classified by the caller like any other code.
+        (Ok(()) | Err(MsiQueueError::InstallerBusy), Some(Ok(c))) => Ok(c),
+        (Err(e), _) => Err(Queued::Queue(e.to_string())),
+        (Ok(()), None) => Err(Queued::Queue("o instalador não rodou".into())),
+    }
 }
 
 /// The end of the installer log, empty when unreadable.

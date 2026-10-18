@@ -99,11 +99,10 @@ fn shell_run(spec: &LaunchSpec) -> std::io::Result<i32> {
     // SAFETY: the strings outlive the call.
     match unsafe { ShellExecuteExW(&mut info) } {
         Ok(()) => {}
+        // UAC refused for a program that elevates itself: the raw code, which
+        // `ops::uac_refused` turns into a cancellation.
         Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "o usuário cancelou a execução",
-            ));
+            return Err(std::io::Error::from_raw_os_error(ERROR_CANCELLED.0 as i32));
         }
         Err(e) => return Err(io_err(&e)),
     }

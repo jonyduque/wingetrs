@@ -1,6 +1,7 @@
 //! After the installer: which installed app is the one just installed (Task 181). Pure.
 
 use super::plan::WingetPlan;
+use crate::core::version::Version;
 use crate::installed::normalize::NameNormalizer;
 use crate::installed::{InstallSource, InstalledApp};
 use crate::sources::winget::manifest::InstallerKind;
@@ -93,4 +94,17 @@ fn by_name_and_publisher<'a>(
                 .iter()
                 .any(|(n, p)| *n == k.name && *p == k.publisher)
     })
+}
+
+/// After an upgrade: the warning when the app found is still below the version offered (the
+/// installer exited 0 without changing it). A later version than the catalog's counts as
+/// updated; an unknown version says nothing.
+pub fn version_warning(offered: &str, found: Option<&InstalledApp>) -> Option<String> {
+    let have = found?
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    (Version::parse(have) < Version::parse(offered))
+        .then(|| format!("o instalador terminou, mas a versão instalada continua {have}"))
 }

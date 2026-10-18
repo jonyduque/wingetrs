@@ -5,11 +5,15 @@
 
 use std::collections::BTreeSet;
 
-use super::ops::{InstallReport, WingetCtx, WingetOpsError, install, install_locked, lock_install};
+use super::ops::{
+    InstallReport, WingetCtx, WingetOpsError, fetch_verified, install, install_fetched,
+    lock_install,
+};
 use super::plan::{PlanOrBridge, WingetPlan, plan};
+use super::post_check::version_warning;
 use super::select::{Host, Refusal, Scope, ScopeWanted, arch_rank};
 use super::switches::install_args;
-use super::uninstall::{UninstallCtx, UninstallPlan, UninstallStatus, uninstall};
+use super::uninstall::{MsiQueue, UninstallCtx, UninstallPlan, UninstallStatus, uninstall_queued};
 use super::uninstall_cmd::ArpDetails;
 use crate::config::{DefaultScope, WingetEngine};
 use crate::core::version::Version;
@@ -117,12 +121,43 @@ pub fn installed_facts(d: &ArpDetails) -> InstalledFacts {
     } else {
         None
     };
-    let arch = match d.hive {
-        Hive::MachineX86 => Some("x86"),
-        Hive::MachineX64 => Some("x64"),
-        Hive::User => None,
+    let bundle = [&d.bundle_cache_path, &d.bundle_upgrade_code]
+        .iter()
+        .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()));
+    let arch = if bundle {
+        // Burn bundles always register in the 32-bit view: the view says nothing.
+        bundle_arch(d)
+    } else {
+        match d.hive {
+            Hive::MachineX86 => Some("x86"),
+            Hive::MachineX64 => Some("x64"),
+            Hive::User => None,
+        }
     };
     InstalledFacts { arch, kind }
+}
+
+/// The architecture a Burn bundle names in its `DisplayName` (`… (x64)`) or cached file name
+/// (`…-win-x64.exe`); unknown otherwise (selection then follows the system).
+fn bundle_arch(d: &ArpDetails) -> Option<&'static str> {
+    let texts = [&d.display_name, &d.bundle_cache_path];
+    for t in texts.iter().filter_map(|t| t.as_deref()) {
+        let lower = t.to_ascii_lowercase();
+        let tokens: Vec<&str> = lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for (arch, names) in [
+            ("arm64", &["arm64"][..]),
+            ("x64", &["x64", "amd64"][..]),
+            ("x86", &["x86"][..]),
+        ] {
+            if tokens.iter().any(|tok| names.contains(tok)) {
+                return Some(arch);
+            }
+        }
+    }
+    None
 }
 
 /// The plan for an upgrade of `installed` to `manifest`. Like winget, installers that say
@@ -231,8 +266,8 @@ pub async fn upgrade(
             installed: installed.to_string(),
         });
     }
-    match route {
-        UpgradeRoute::Denied | UpgradeRoute::InPlace => Ok(install(wctx, plan).await?),
+    let mut report = match route {
+        UpgradeRoute::Denied | UpgradeRoute::InPlace => install(wctx, plan).await?,
         UpgradeRoute::UninstallFirst => {
             let previous = previous.ok_or(UpgradeError::NoUninstallPlan)?;
             // A fresh install after the removal: no `Upgrade` switch (built before removing
@@ -254,19 +289,29 @@ pub async fn upgrade(
             }
             // Removal and install under one `install.lock`: nothing runs in between.
             let lock = lock_install(&wctx.data.install_layout(), wctx.wait).await?;
-            let report = uninstall(uctx, previous).map_err(UpgradeError::Uninstall)?;
-            if report.status != UninstallStatus::Removed || report.warning.is_some() {
+            // Like winget: the new installer is downloaded and verified (and kept open, so it
+            // cannot change) before the old version goes; a failed download removes nothing.
+            let file = fetch_verified(wctx, &fresh).await?;
+            // The removal cannot be undone: Ctrl+C counts only until here.
+            if !wctx.gate.try_launch() {
+                return Err(WingetOpsError::Cancelled.into());
+            }
+            let removed = uninstall_queued(uctx, Some(&MsiQueue::of(wctx)), previous)
+                .map_err(UpgradeError::Uninstall)?;
+            if removed.status != UninstallStatus::Removed || removed.warning.is_some() {
                 return Err(UpgradeError::NotRemoved(
-                    report
+                    removed
                         .warning
                         .unwrap_or_else(|| "o registro continua".to_string()),
                 ));
             }
-            install_locked(wctx, &fresh, &lock)
-                .await
-                .map_err(UpgradeError::InstallAfterRemoval)
+            install_fetched(wctx, &fresh, file, &lock).map_err(UpgradeError::InstallAfterRemoval)?
         }
+    };
+    if report.warning.is_none() {
+        report.warning = version_warning(&plan.version, report.found.as_ref());
     }
+    Ok(report)
 }
 
 /// The rows "upgrade all" takes: with an update, not pinned, not `RequireExplicitUpgrade`.

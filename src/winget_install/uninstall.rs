@@ -6,10 +6,12 @@ use super::codes::{self, Outcome};
 use super::elevated_rules::{KnownFolders, elevated_duplicate, expand_known, in_admin_folder};
 use super::launch::{Elevation, LaunchSpec, Launcher, Show, uninstall_elevation};
 use super::msix::{self, MsixOps};
+use super::ops::{Queued, WingetCtx, retry_1618, uac_refused};
 use super::orphans::{ArpRegistry, Orphan, check_export_in, export_args, fresh_backup_file};
 use super::uninstall_cmd::{ArpDetails, Rule, UninstallCommand, uninstall_command, valid_arp_key};
 use crate::bridge::elevated::ElevatedRunner;
 use crate::bridge::worker::{DeleteReason, MachineHive};
+use crate::install::msi_queue;
 use crate::install::safepath::safe_components;
 use crate::installed::Hive;
 use crate::installed::arp::expand_vars;
@@ -410,9 +412,75 @@ fn reboot_of(o: &Outcome) -> Option<bool> {
     }
 }
 
-/// Runs the plan: HKCU and user-folder uninstallers in this (unelevated) process, the others
-/// through the elevated helper, MSIX through `remove`; then waits for the ARP key to go.
+/// The Windows Installer queue an `msiexec /x` goes through, as installs do: `msi.lock`, the
+/// mutex and the 1618 retries (`ops::retry_1618`).
+pub struct MsiQueue<'a> {
+    /// `Layout::msi_lock()`.
+    pub lock: PathBuf,
+    /// Whether the Windows Installer mutex is held (`Global\_MSIExecute`).
+    pub busy: &'a (dyn Fn() -> bool + Send + Sync),
+    pub sleep: &'a (dyn Fn(Duration) + Send + Sync),
+}
+
+impl<'a> MsiQueue<'a> {
+    /// The queue of an install context (same lock, mutex check and sleep).
+    pub fn of(w: &WingetCtx<'a>) -> MsiQueue<'a> {
+        MsiQueue {
+            lock: w.data.install_layout().msi_lock(),
+            busy: w.busy,
+            sleep: w.sleep,
+        }
+    }
+}
+
+/// [`uninstall_queued`] without `msi.lock` and without the mutex check; an `msiexec /x` that
+/// answers 1618 is still retried (sleeping on `ctx.clock`).
 pub fn uninstall(ctx: &UninstallCtx<'_>, plan: &UninstallPlan) -> Result<UninstallReport, String> {
+    uninstall_queued(ctx, None, plan)
+}
+
+/// One launch of the uninstaller (unelevated or through the helper); its exit code.
+fn launch_once(
+    ctx: &UninstallCtx<'_>,
+    plan: &UninstallPlan,
+    c: &UninstallCommand,
+    hive: Hive,
+    key: &str,
+) -> Result<i32, String> {
+    match plan.elevation {
+        Elevation::Never => {
+            let spec = LaunchSpec {
+                program: unelevated_program(ctx, c)?,
+                params: c.args.clone(),
+                dir: None,
+                show: Show::Normal,
+            };
+            ctx.launcher.run(&spec).map_err(|e| {
+                if uac_refused(&e) {
+                    codes::UAC_REFUSED.to_string()
+                } else {
+                    format!("falha ao iniciar o desinstalador: {e}")
+                }
+            })
+        }
+        Elevation::Helper => {
+            let h = machine_hive(hive)
+                .ok_or_else(|| "registro do usuário nunca roda elevado".to_string())?;
+            ctx.elevated
+                .run_uninstaller(h, key, c.rule, c.rule == Rule::Nsis)
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// Runs the plan: HKCU and user-folder uninstallers in this (unelevated) process, the others
+/// through the elevated helper, MSIX through `remove`; then waits for the ARP key to go. An
+/// `msiexec /x` goes through `queue` (`msi.lock`, mutex, 1618 retried) like an install.
+pub fn uninstall_queued(
+    ctx: &UninstallCtx<'_>,
+    queue: Option<&MsiQueue<'_>>,
+    plan: &UninstallPlan,
+) -> Result<UninstallReport, String> {
     let (hive, key) = match &plan.target {
         UninstallTarget::Msix { family } => {
             return match ctx.msix.remove(family) {
@@ -439,27 +507,41 @@ pub fn uninstall(ctx: &UninstallCtx<'_>, plan: &UninstallPlan) -> Result<Uninsta
         .as_ref()
         .ok_or_else(|| "sem desinstalador registrado".to_string())?;
     let msiexec = c.rule == Rule::Msi;
-    let code = match plan.elevation {
-        Elevation::Never => {
-            let spec = LaunchSpec {
-                program: unelevated_program(ctx, c)?,
-                params: c.args.clone(),
-                dir: None,
-                show: Show::Normal,
-            };
-            ctx.launcher
-                .run(&spec)
-                .map_err(|e| format!("falha ao iniciar o desinstalador: {e}"))?
+    let code = if msiexec {
+        let _msi_lock = match queue {
+            Some(q) => Some(
+                msi_queue::lock_msi(&q.lock, &mut |_| {})
+                    .map_err(|e| format!("fila do msiexec: {e}"))?,
+            ),
+            None => None,
+        };
+        let no_mutex = || false;
+        let clock_sleep = |d: Duration| ctx.clock.sleep(d);
+        let (busy, sleep): (&dyn Fn() -> bool, &dyn Fn(Duration)) = match queue {
+            Some(q) => (q.busy, q.sleep),
+            None => (&no_mutex, &clock_sleep),
+        };
+        match retry_1618(busy, sleep, &mut || {}, &mut || {
+            launch_once(ctx, plan, c, hive, key)
+        }) {
+            Ok(code) => code,
+            Err(Queued::Attempt(e) | Queued::Queue(e)) => return Err(e),
         }
-        Elevation::Helper => {
-            let h = machine_hive(hive)
-                .ok_or_else(|| "registro do usuário nunca roda elevado".to_string())?;
-            ctx.elevated
-                .run_uninstaller(h, key, c.rule, c.rule == Rule::Nsis)
-                .map_err(|e| e.to_string())?
-        }
+    } else {
+        launch_once(ctx, plan, c, hive, key)?
     };
     let outcome = codes::classify_uninstall(msiexec, code);
+    // A Burn bundle (or its QuietUninstallString) asking for a reboot: removed only if its
+    // key goes, as with msiexec; otherwise the code is the failure.
+    let (outcome, key_must_go) = match outcome {
+        Outcome::Failed { .. } if matches!(c.rule, Rule::Burn | Rule::Quiet) => {
+            match codes::reboot_code(code) {
+                Some(o) => (o, true),
+                None => (outcome, false),
+            }
+        }
+        o => (o, false),
+    };
     if let Outcome::Failed { message, .. } = &outcome {
         return Err(message.clone());
     }
@@ -470,6 +552,11 @@ pub fn uninstall(ctx: &UninstallCtx<'_>, plan: &UninstallPlan) -> Result<Uninsta
             warning: None,
             reboot,
         })
+    } else if key_must_go {
+        Err(format!(
+            "o desinstalador pediu reinício (código {}), mas o registro continua",
+            code as u32
+        ))
     } else {
         Ok(UninstallReport {
             status: UninstallStatus::NoEffect,
