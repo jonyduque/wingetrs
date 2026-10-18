@@ -142,7 +142,7 @@ fn vars_update_install_hooks_cmd_update() {
     c.old_version = Some("0.9".into());
     let v = script_vars(HookKind::PreInstall, &c);
     assert_eq!(get(&v, "cmd"), Some(&VarValue::Str("update".into())));
-    assert_eq!(get(&v, "old_version"), None);
+    assert_eq!(get(&v, "old_version"), Some(&VarValue::Str("0.9".into())));
 }
 
 #[test]
@@ -216,6 +216,13 @@ fn bad_var_name_err() {
     let vars = vec![("a b".to_string(), VarValue::Null)];
     let r = hook_runner(&vars, Path::new(r"C:\p.ps1"), Path::new(r"C:\h.ps1"));
     assert!(matches!(r, Err(RunnerError::BadName(_))));
+    for bad in ["1a", ""] {
+        let vars = vec![(bad.to_string(), VarValue::Null)];
+        let r = hook_runner(&vars, Path::new(r"C:\p.ps1"), Path::new(r"C:\h.ps1"));
+        assert_eq!(r, Err(RunnerError::BadName(bad.to_string())));
+    }
+    let ok = vec![("_a1".to_string(), VarValue::Null)];
+    assert!(hook_runner(&ok, Path::new(r"C:\p.ps1"), Path::new(r"C:\h.ps1")).is_ok());
 }
 
 fn run_pwsh(dir: &Path, runner: &str) -> std::io::Result<(i32, String)> {
@@ -230,7 +237,13 @@ fn run_pwsh(dir: &Path, runner: &str) -> std::io::Result<(i32, String)> {
             "-File",
         ])
         .arg(&file)
-        .output()?;
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("pwsh nao encontrado ou nao executou: {e}"),
+            )
+        })?;
     Ok((
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -238,6 +251,7 @@ fn run_pwsh(dir: &Path, runner: &str) -> std::io::Result<(i32, String)> {
 }
 
 #[test]
+#[ignore = "live: roda pwsh real"]
 fn end_to_end_pwsh() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

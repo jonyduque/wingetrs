@@ -125,7 +125,9 @@ pub fn script_vars(kind: HookKind, cx: &ScriptContext) -> Vec<(String, VarValue)
     // instead of %ProgramData%\scoop (never an empty path that resolves to "\").
     put("globaldir", path_str(&cx.root.join("global")));
     put("cachedir", path_str(&cx.root.join("cache")));
-    if let (ScriptOp::Update, false, Some(old)) = (cx.op, install_hook, &cx.old_version) {
+    // scoop-update.ps1:262 defines it inside update(), which calls install_app
+    // (:389), so dynamic scope exposes it to the new version's install hooks too.
+    if let (ScriptOp::Update, Some(old)) = (cx.op, &cx.old_version) {
         put("old_version", VarValue::Str(old.clone()));
     }
     match kind {
@@ -190,6 +192,7 @@ const CATCH: &str = "catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }
 
 /// Text of runner.ps1. No `$ErrorActionPreference` (decision R1: Scoop does not
 /// set `Stop`, so non-terminating errors do not fail the hook).
+/// Whoever writes the file must use UTF-8 with BOM (powershell 5.1 reads BOM-less files as ANSI).
 pub fn runner_ps1(input: &RunnerInput<'_>) -> Result<String, RunnerError> {
     let mut s = String::new();
     s.push_str("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n");
