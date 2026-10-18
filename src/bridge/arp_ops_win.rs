@@ -274,7 +274,12 @@ fn hold_admin_chain(program: &Path) -> io::Result<Vec<File>> {
 /// file of `also_checked`, a DLL it loads, with its folders) are administrator-only by their real owner and DACL, holding them open until it ends; from the
 /// program's folder, with `installer_env` (built from the known folders; `TEMP` in a fresh
 /// execution folder under the staging root). The exit code. Nothing is written in user folders.
-pub fn run_uninstaller(program: &Path, args: &str, also_checked: &[PathBuf]) -> io::Result<i32> {
+pub fn run_uninstaller(
+    program: &Path,
+    args: &str,
+    also_checked: &[PathBuf],
+    on_line: &mut dyn FnMut(&str),
+) -> io::Result<i32> {
     let mut held = hold_admin_chain(program)?;
     for dll in also_checked {
         held.extend(hold_admin_chain(dll)?);
@@ -284,15 +289,35 @@ pub fn run_uninstaller(program: &Path, args: &str, also_checked: &[PathBuf]) -> 
         .parent()
         .ok_or_else(|| io::Error::other("desinstalador sem pasta"))?;
     let root = staging_root(&sys.program_files)?;
-    let code = run_waiting(program, args, dir, &root, RUN_SDDL, &sys);
+    let code = run_waiting(
+        program,
+        args,
+        dir,
+        &root,
+        RUN_SDDL,
+        &sys,
+        UNINSTALL_LINGER,
+        on_line,
+    );
     drop(held);
     code
 }
 
+/// How long the helper waits for the processes an uninstaller left in its job after the
+/// uninstaller itself exited.
+pub const UNINSTALL_LINGER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Line sent while the helper waits for those processes.
+pub const WAITING_UNINSTALLER: &str = "aguardando o desinstalador terminar";
+
 /// Runs `program args` from `dir` in a job object (see `spawn_win::run_in_job`) with
-/// `installer_env`, `TEMP` in a fresh execution folder under `root` (created with `sddl`). The
-/// folder is removed only after every process of the job ended: an uninstaller that copies
-/// itself to `TEMP` and exits keeps running from there. The exit code of the last process.
+/// `installer_env`, `TEMP` in a fresh execution folder under `root` (created with `sddl`).
+/// After the program exits, the other processes of the job (an uninstaller that copied itself
+/// to `TEMP`) are waited for up to `linger`, with `WAITING_UNINSTALLER` sent to `on_line`. The
+/// folder is removed once they all ended; when some still run at the deadline they are left
+/// alone and so is the folder (the helper's 24 h `prune` removes it), which `on_line` reports.
+/// The exit code of the program started.
+#[allow(clippy::too_many_arguments)]
 pub fn run_waiting(
     program: &Path,
     args: &str,
@@ -300,13 +325,29 @@ pub fn run_waiting(
     root: &Path,
     sddl: &str,
     sys: &SystemEnv,
+    linger: std::time::Duration,
+    on_line: &mut dyn FnMut(&str),
 ) -> io::Result<i32> {
     let run = RunDir::create(root, sddl)?;
     let tmp = run.path().join(TMP_NAME);
     std::fs::create_dir(&tmp)?;
-    let code = super::spawn_win::run_in_job(program, args, dir, &installer_env(sys, &tmp));
-    drop(run);
-    code
+    let end = super::spawn_win::run_in_job(
+        program,
+        args,
+        dir,
+        &installer_env(sys, &tmp),
+        linger,
+        &mut || on_line(WAITING_UNINSTALLER),
+    )?;
+    if !end.all_ended {
+        let kept = run.keep();
+        tracing::warn!(folder = %kept.display(), "arp: uninstaller left processes running; folder kept for prune");
+        on_line(&format!(
+            "o desinstalador deixou processos rodando após {} min; a pasta de execução fica para a limpeza de 24 h",
+            linger.as_secs() / 60
+        ));
+    }
+    Ok(end.code)
 }
 
 /// Owner and DACL of the folder `path` as SDDL, opened without following a reparse point;

@@ -538,11 +538,13 @@ pub trait WorkerOps {
     /// Runs an uninstaller the helper already checked, once `program` and every file in
     /// `also_checked` (a DLL it loads) and all their folders pass the real owner/DACL check and
     /// are held; its exit code.
+    /// `on_line` gets the helper's progress lines (`WAITING_UNINSTALLER`, a folder kept).
     fn run_uninstaller(
         &mut self,
         _program: &Path,
         _args: &str,
         _also_checked: &[PathBuf],
+        _on_line: &mut dyn FnMut(&str),
     ) -> std::io::Result<i32> {
         Err(unsupported())
     }
@@ -1096,7 +1098,28 @@ fn serve_uninstaller(
         }
     };
     tracing::info!(?hive, ?rule, program = %plan.program.display(), "bridge worker: running uninstaller");
-    let reply = match ops.run_uninstaller(&plan.program, &plan.args, &plan.also_checked) {
+    let mut broken = None;
+    let result = ops.run_uninstaller(
+        &plan.program,
+        &plan.args,
+        &plan.also_checked,
+        &mut |text: &str| {
+            if broken.is_none()
+                && let Err(e) = send(
+                    writer,
+                    &Reply::Line {
+                        text: clip(text).to_string(),
+                    },
+                )
+            {
+                broken = Some(e);
+            }
+        },
+    );
+    if let Some(e) = broken {
+        return Err(e);
+    }
+    let reply = match result {
         Ok(code) => Reply::End { code },
         Err(e) => failure(&e),
     };

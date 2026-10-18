@@ -196,6 +196,13 @@ impl RunDir {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Leaves the folder in place (a process may still use it); `prune` removes it after
+    /// `STALE_AFTER`. Its path.
+    pub fn keep(self) -> PathBuf {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.path.clone()
+    }
 }
 
 impl Drop for RunDir {

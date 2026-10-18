@@ -594,8 +594,9 @@ impl super::worker::WorkerOps for SystemOps {
         program: &Path,
         args: &str,
         also_checked: &[PathBuf],
+        on_line: &mut dyn FnMut(&str),
     ) -> std::io::Result<i32> {
-        super::arp_ops_win::run_uninstaller(program, args, also_checked)
+        super::arp_ops_win::run_uninstaller(program, args, also_checked, on_line)
     }
 
     fn delete_arp_key(

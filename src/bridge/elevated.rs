@@ -325,7 +325,12 @@ impl ElevatedRunner for ElevatedBridge {
             rule,
             nsis_hint,
         };
-        self.ask_elevated(&request, &mut |_| {})
+        // The helper's lines (waiting for processes the uninstaller left, a folder kept) go to
+        // the log; the caller's `Phase::WaitingElevation` ("...instalador elevado") keeps its
+        // clock meanwhile.
+        self.ask_elevated(&request, &mut |l: &str| {
+            tracing::info!(line = l, "elevated uninstaller");
+        })
     }
 
     fn delete_arp_key(

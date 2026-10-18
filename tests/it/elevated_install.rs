@@ -1270,28 +1270,25 @@ mod win {
         }
     }
 
-    /// Task 190: the elevated winget gets an environment built from scratch: a variable planted
-    /// in this process does not reach it, and its `TEMP` is inside a fresh execution folder,
-    /// removed afterwards.
+    /// Task 190: the elevated winget gets an environment built from scratch: variables this
+    /// process already has (cargo's `CARGO_PKG_NAME`, the user's `USERNAME`, its `TEMP`) do not
+    /// reach it, and its `TEMP` is inside a fresh execution folder, removed afterwards. The
+    /// process environment is only read, never changed (tests run in parallel).
     #[test]
     fn winget_env_is_built_from_scratch() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        let planted_temp = dir.path().join("planted-temp");
-        std::fs::create_dir(&planted_temp).unwrap();
         let script = dir.path().join("winget.cmd");
         std::fs::write(&script, "@echo off\r\nset\r\n").unwrap();
         let sys = staging_win::SystemEnv::query().unwrap();
-        let old_temp = std::env::var_os("TEMP");
-        // SAFETY: test-only; `TEMP` is read by `temp_dir` only when `TMP` is missing, and the
-        // planted name is used by no other test.
-        unsafe {
-            std::env::set_var("WINGETRS_TEST_PLANTED", "1");
-            std::env::set_var("TEMP", &planted_temp);
+        let inherited = ["CARGO_PKG_NAME", "USERNAME"];
+        for name in inherited {
+            assert!(std::env::var_os(name).is_some(), "{name} missing here");
         }
+        let my_temp = std::env::var("TEMP").unwrap();
         let mut lines = Vec::new();
-        let r = staging_win::run_tool(
+        let (code, _) = staging_win::run_tool(
             &script,
             &[],
             dir.path(),
@@ -1299,27 +1296,21 @@ mod win {
             TEST_SDDL,
             &sys,
             &mut |l: &str| lines.push(l.to_string()),
-        );
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("WINGETRS_TEST_PLANTED");
-            match old_temp {
-                Some(t) => std::env::set_var("TEMP", t),
-                None => std::env::remove_var("TEMP"),
-            }
-        }
-        let (code, _) = r.unwrap();
+        )
+        .unwrap();
         assert_eq!(code, 0, "{lines:?}");
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.to_uppercase().starts_with("WINGETRS_TEST_PLANTED=")),
-            "{lines:?}"
-        );
+        for name in inherited {
+            let prefix = format!("{name}=");
+            assert!(
+                !lines.iter().any(|l| l.to_uppercase().starts_with(&prefix)),
+                "{name} reached the tool: {lines:?}"
+            );
+        }
         let temp = lines
             .iter()
             .find_map(|l| l.strip_prefix("TEMP="))
             .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(!temp.eq_ignore_ascii_case(&my_temp), "{temp}");
         let temp = Path::new(temp);
         assert_eq!(temp.file_name().unwrap(), staging_win::TMP_NAME);
         let run = temp.parent().unwrap();

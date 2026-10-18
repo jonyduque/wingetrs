@@ -348,8 +348,6 @@ fn run_command(
 
 /// How often `run_in_job` looks at the job while it waits.
 const JOB_POLL: Duration = Duration::from_millis(50);
-/// Most process ids read from the job in one look.
-const JOB_PIDS_MAX: usize = 256;
 
 /// `h` owned (closed on drop).
 fn owned(h: windows::Win32::Foundation::HANDLE) -> std::os::windows::io::OwnedHandle {
@@ -397,11 +395,11 @@ fn env_block(env: &[(OsString, OsString)]) -> std::io::Result<Vec<u16>> {
     Ok(block)
 }
 
-/// Active processes of `job` and the ids it lists (at most `JOB_PIDS_MAX`; best effort).
-fn job_state(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<(u32, Vec<u32>)> {
+/// Processes of `job` still running.
+fn job_active(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<u32> {
     use windows::Win32::System::JobObjects::{
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
-        JobObjectBasicProcessIdList, QueryInformationJobObject,
+        QueryInformationJobObject,
     };
     let mut acct = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
     // SAFETY: `acct` is the structure of this class, with its size.
@@ -415,72 +413,39 @@ fn job_state(job: &std::os::windows::io::OwnedHandle) -> std::io::Result<(u32, V
         )
     }
     .map_err(win_err)?;
-    // Header (two u32) then the ids, `usize` each.
-    let head = 8usize.div_ceil(std::mem::size_of::<usize>());
-    let mut buf = vec![0usize; head + JOB_PIDS_MAX];
-    // SAFETY: `buf` is writable and aligned for JOBOBJECT_BASIC_PROCESS_ID_LIST, with its size.
-    let listed = unsafe {
-        QueryInformationJobObject(
-            Some(handle(job)),
-            JobObjectBasicProcessIdList,
-            buf.as_mut_ptr().cast(),
-            (buf.len() * std::mem::size_of::<usize>()) as u32,
-            None,
-        )
-    };
-    let pids = match listed {
-        Ok(()) => {
-            // SAFETY: the second u32 of the header, written by the call.
-            let n = unsafe { *buf.as_ptr().cast::<u32>().add(1) } as usize;
-            buf.iter()
-                .skip(head)
-                .take(n.min(JOB_PIDS_MAX))
-                .map(|&p| p as u32)
-                .collect()
-        }
-        Err(_) => Vec::new(),
-    };
-    Ok((acct.ActiveProcesses, pids))
+    Ok(acct.ActiveProcesses)
 }
 
-/// When `h` exited (100 ns units) and its exit code.
-fn exit_of(h: &std::os::windows::io::OwnedHandle) -> Option<(u64, u32)> {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes};
-    let (mut c, mut e, mut k, mut u) = Default::default();
-    // SAFETY: valid handle and four FILETIME outputs.
-    unsafe { GetProcessTimes(handle(h), &mut c, &mut e, &mut k, &mut u) }.ok()?;
-    let mut code = 0u32;
-    // SAFETY: valid handle and a u32 output.
-    unsafe { GetExitCodeProcess(handle(h), &mut code) }.ok()?;
-    let e: FILETIME = e;
-    Some((
-        (u64::from(e.dwHighDateTime) << 32) | u64::from(e.dwLowDateTime),
-        code,
-    ))
+/// How `run_in_job` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobEnd {
+    /// Exit code of the process started (`u32` bits in an `i32`).
+    pub code: i32,
+    /// Every process of the job ended; `false` when some still ran at the deadline.
+    pub all_ended: bool,
 }
 
 /// Runs `"<program>" <args>` from `dir` with exactly `env`, stdin/stdout/stderr on `NUL`, inside
-/// a new job object (created suspended, assigned, then resumed, so no child escapes it), and
-/// waits until **every** process of the job ended: an NSIS/Inno uninstaller that copies itself
-/// to `TEMP` and exits is waited for through its copy. The exit code is the one of the
-/// process of the job that ended last (the copy, for those uninstallers; the program itself
-/// when it was alone), as `u32` bits in an `i32`.
+/// a new job object (created suspended, assigned, then resumed, so no child escapes it). Waits
+/// for the program itself with no limit, then for the other processes of the job (an NSIS/Inno
+/// uninstaller that copies itself to `TEMP` and exits) for at most `linger`; `on_wait` is
+/// called once when that second wait starts. What still runs at the deadline is left running
+/// (an uninstaller may reopen the app, a browser or an updater). The code is the program's.
 pub fn run_in_job(
     program: &Path,
     args: &str,
     dir: &Path,
     env: &[(OsString, OsString)],
-) -> std::io::Result<i32> {
+    linger: Duration,
+    on_wait: &mut dyn FnMut(),
+) -> std::io::Result<JobEnd> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-    use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-    };
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0};
+    use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
     use windows::Win32::System::Threading::{
-        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, OpenProcess,
-        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-        STARTUPINFOW, TerminateProcess,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, GetExitCodeProcess, INFINITE,
+        PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+        WaitForSingleObject,
     };
     use windows::core::{HSTRING, PWSTR};
     let shown = program.display().to_string();
@@ -552,44 +517,31 @@ pub fn run_in_job(
         return Err(kill(std::io::Error::last_os_error()));
     }
     drop(thread);
-    let mut seen = vec![process];
-    let mut pids = std::collections::HashSet::new();
-    pids.insert(pi.dwProcessId);
+    // SAFETY: valid process handle.
+    if unsafe { WaitForSingleObject(handle(&process), INFINITE) } != WAIT_OBJECT_0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut code = 0u32;
+    // SAFETY: valid handle and a u32 output.
+    unsafe { GetExitCodeProcess(handle(&process), &mut code) }.map_err(win_err)?;
+    let end = |all_ended| JobEnd {
+        code: code as i32,
+        all_ended,
+    };
+    if job_active(&job)? == 0 {
+        return Ok(end(true));
+    }
+    on_wait();
+    let start = Instant::now();
     loop {
-        let (active, listed) = job_state(&job)?;
-        for pid in listed {
-            if !pids.insert(pid) {
-                continue;
-            }
-            // SAFETY: plain open by id; the handle is checked to be in the job below.
-            let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) })
-            else {
-                continue;
-            };
-            let h = owned(h);
-            let mut inside = windows::core::BOOL(0);
-            // SAFETY: valid handles and a BOOL output.
-            if unsafe { IsProcessInJob(handle(&h), Some(handle(&job)), &mut inside) }.is_ok()
-                && inside.as_bool()
-            {
-                seen.push(h);
-            }
+        if job_active(&job)? == 0 {
+            return Ok(end(true));
         }
-        if active == 0 {
-            break;
+        if start.elapsed() >= linger {
+            return Ok(end(false));
         }
         std::thread::sleep(JOB_POLL);
     }
-    let mut last: Option<(u64, u32)> = None;
-    for h in &seen {
-        if let Some((at, code)) = exit_of(h)
-            && last.is_none_or(|(t, _)| at >= t)
-        {
-            last = Some((at, code));
-        }
-    }
-    let (_, code) = last.ok_or_else(|| std::io::Error::other("código de saída ilegível"))?;
-    Ok(code as i32)
 }
 
 #[cfg(test)]

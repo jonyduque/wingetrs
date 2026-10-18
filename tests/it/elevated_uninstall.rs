@@ -78,6 +78,8 @@ struct FakeOps {
     /// 8.3 name -> long name; other paths are their own long name when they exist.
     longs: Vec<(PathBuf, PathBuf)>,
     deleted: Vec<(MachineHive, String)>,
+    /// Progress lines the fake uninstaller run reports.
+    lines: Vec<String>,
 }
 
 impl WorkerOps for FakeOps {
@@ -138,7 +140,9 @@ impl WorkerOps for FakeOps {
         program: &Path,
         args: &str,
         also_checked: &[PathBuf],
+        on_line: &mut dyn FnMut(&str),
     ) -> std::io::Result<i32> {
+        self.lines.iter().for_each(|l| on_line(l));
         self.held.push(also_checked.to_vec());
         self.launched
             .push((program.to_path_buf(), args.to_string()));
@@ -354,6 +358,30 @@ fn run_uninstaller_runs_checked_admin_program() {
     assert_eq!(
         ops.launched,
         vec![(PathBuf::from(r"C:\PF\A\u.exe"), "/S".to_string())]
+    );
+}
+
+/// Task 190: the helper's progress lines (waiting for leftover processes) reach the client
+/// before the exit code.
+#[test]
+fn run_uninstaller_relays_progress_lines() {
+    let mut ops = FakeOps {
+        entries: vec![quiet(Hive::MachineX86, "app", r#""C:\PF\A\u.exe" /S"#)],
+        files: vec![PathBuf::from(r"C:\PF\A\u.exe")],
+        lines: vec!["aguardando o desinstalador terminar".into()],
+        ..FakeOps::default()
+    };
+    let req = uninstall(MachineHive::Hklm32, "app", Rule::Quiet);
+    let (r, replies) = serve_lines(&worker::encode(&req).unwrap(), &mut ops);
+    r.unwrap();
+    assert_eq!(
+        replies,
+        vec![
+            Reply::Line {
+                text: "aguardando o desinstalador terminar".into()
+            },
+            Reply::End { code: 7 }
+        ]
     );
 }
 
@@ -1410,35 +1438,37 @@ fn acl_trustees_no_user_holds() {
 }
 
 /// Task 190: an uninstaller that starts a copy of itself and exits is waited for through the
-/// job: the execution folder goes only after the copy ended, and the code is the copy's.
+/// job (up to a deadline): the execution folder goes only after the copy ended; a copy that
+/// outlives the deadline is left running and so is the folder.
 #[cfg(windows)]
 mod job {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
     use tempfile::TempDir;
-    use wingetrs::bridge::arp_ops_win::run_waiting;
+    use wingetrs::bridge::arp_ops_win::{WAITING_UNINSTALLER, run_waiting};
     use wingetrs::bridge::staging_win::SystemEnv;
 
     /// `RUN_SDDL` plus the owner (the unelevated test user), who may then write inside.
     const TEST_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;OW)";
 
-    #[test]
-    fn job_waits_for_copied_uninstaller() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let marker = dir.path().join("child-done.txt");
-        let child = dir.path().join("child.cmd");
-        // Sleeps ~1 s (two loopback pings), then records whether its TEMP still exists.
+    /// `uninst.cmd` (exits 3 at once) starting `child.cmd`, which waits for `release` to exist
+    /// (at most ~`pings` s), then records whether its `TEMP` still exists in `marker` and exits 5.
+    fn scripts(dir: &Path, release: &Path, marker: &Path, pings: u32) -> PathBuf {
+        let child = dir.join("child.cmd");
         std::fs::write(
             &child,
             format!(
-                "@echo off\r\nping -n 2 127.0.0.1 >nul\r\n\
+                "@echo off\r\nfor /l %%i in (1,1,{pings}) do (\r\n\
+                 if exist \"{r}\" goto done\r\n\
+                 ping -n 2 127.0.0.1 >nul\r\n)\r\n:done\r\n\
                  if exist \"%TEMP%\\\" (echo tmp> \"{m}\") else (echo sem-tmp> \"{m}\")\r\n\
                  exit /b 5\r\n",
+                r = release.display(),
                 m = marker.display()
             ),
         )
         .unwrap();
-        let parent = dir.path().join("uninst.cmd");
+        let parent = dir.join("uninst.cmd");
         std::fs::write(
             &parent,
             format!(
@@ -1447,16 +1477,96 @@ mod job {
             ),
         )
         .unwrap();
+        parent
+    }
+
+    fn run(
+        dir: &Path,
+        root: &Path,
+        parent: &Path,
+        linger: Duration,
+        lines: &mut Vec<String>,
+    ) -> i32 {
         let sys = SystemEnv::query().unwrap();
         let cmd = sys.system32.join("cmd.exe");
         let args = format!("/d /c \"{}\"", parent.display());
-        let code = run_waiting(&cmd, &args, dir.path(), &root, TEST_SDDL, &sys).unwrap();
+        run_waiting(
+            &cmd,
+            &args,
+            dir,
+            root,
+            TEST_SDDL,
+            &sys,
+            linger,
+            &mut |l: &str| lines.push(l.to_string()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn job_waits_for_copied_uninstaller() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let marker = dir.path().join("child-done.txt");
+        // Never released: the child sleeps ~1 s (one loop turn) and ends.
+        let parent = scripts(dir.path(), &dir.path().join("never"), &marker, 1);
+        let mut lines = Vec::new();
+        let code = run(
+            dir.path(),
+            &root,
+            &parent,
+            Duration::from_secs(600),
+            &mut lines,
+        );
         let done = std::fs::read_to_string(&marker).unwrap_or_default();
         assert_eq!(done.trim(), "tmp", "the copy ended before the folder went");
-        assert_eq!(code, 5, "the code of the process that ended last");
+        assert_eq!(code, 3, "the code of the program started");
+        assert_eq!(lines, [WAITING_UNINSTALLER]);
         assert!(
             std::fs::read_dir(&root).unwrap().next().is_none(),
             "execution folder removed"
         );
+    }
+
+    /// Task 190: past the deadline the helper returns with the program's code, leaves the
+    /// copy running (not killed) and keeps the execution folder for the 24 h prune.
+    #[test]
+    fn job_deadline_leaves_the_copy_and_keeps_the_folder() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let marker = dir.path().join("child-done.txt");
+        let release = dir.path().join("release");
+        // Up to ~60 s, released by the test once the helper returned.
+        let parent = scripts(dir.path(), &release, &marker, 60);
+        let mut lines = Vec::new();
+        let code = run(
+            dir.path(),
+            &root,
+            &parent,
+            Duration::from_millis(300),
+            &mut lines,
+        );
+        assert_eq!(code, 3);
+        assert!(!marker.exists(), "returned while the copy still ran");
+        let kept: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
+        assert_eq!(kept.len(), 1, "execution folder kept");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], WAITING_UNINSTALLER);
+        assert!(lines[1].contains("limpeza de 24 h"), "{lines:?}");
+        // Not killed: once released, the copy finishes and finds its TEMP still there.
+        std::fs::write(&release, b"").unwrap();
+        // Polled until complete (the child may still be writing it).
+        let start = std::time::Instant::now();
+        loop {
+            let done = std::fs::read_to_string(&marker).unwrap_or_default();
+            if done.trim() == "tmp" {
+                break;
+            }
+            // Safety cap only (a broken child fails instead of hanging): clock-ok
+            assert!(start.elapsed() < Duration::from_secs(120), "{done:?}"); // clock-ok
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
