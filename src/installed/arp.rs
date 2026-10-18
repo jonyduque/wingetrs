@@ -89,7 +89,7 @@ const GENERIC_LAUNCHERS: [&str; 6] = [
 ];
 
 /// Expands `%VAR%` with `expand`; `None` when a variable is unknown or unbalanced.
-fn expand_vars(s: &str, expand: &impl Fn(&str) -> Option<String>) -> Option<String> {
+pub fn expand_vars(s: &str, expand: &impl Fn(&str) -> Option<String>) -> Option<String> {
     let mut out = String::new();
     let mut rest = s;
     while let Some(i) = rest.find('%') {
@@ -103,6 +103,27 @@ fn expand_vars(s: &str, expand: &impl Fn(&str) -> Option<String>) -> Option<Stri
     Some(out)
 }
 
+/// Splits a command line into (program without expansion, trimmed rest): the quoted program, or
+/// up to the first `.exe` that closes a token (a name like foo.exe.d is not cut).
+pub fn split_command(cmd: &str) -> Option<(String, String)> {
+    let cmd = cmd.trim();
+    if let Some(rest) = cmd.strip_prefix('"') {
+        let close = rest.find('"')?;
+        return Some((
+            rest[..close].to_string(),
+            rest[close + 1..].trim().to_string(),
+        ));
+    }
+    let lower = cmd.to_ascii_lowercase();
+    let end = lower.match_indices(".exe").find_map(|(i, m)| {
+        let end = i + m.len();
+        let next = cmd[end..].chars().next();
+        next.is_none_or(|c| c.is_whitespace() || c == '/')
+            .then_some(end)
+    })?;
+    Some((cmd[..end].to_string(), cmd[end..].trim().to_string()))
+}
+
 /// The executable path of an uninstall command when it is absolute, not a generic launcher
 /// and does not exist; `None` whenever nothing can be claimed.
 pub fn missing_uninstaller(
@@ -110,21 +131,8 @@ pub fn missing_uninstaller(
     expand: impl Fn(&str) -> Option<String>,
     exists: impl Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    let cmd = cmd.trim();
-    let raw = if let Some(rest) = cmd.strip_prefix('"') {
-        &rest[..rest.find('"')?]
-    } else {
-        // The first `.exe` that ends a token: a name like foo.exe.d is not cut.
-        let lower = cmd.to_ascii_lowercase();
-        let end = lower.match_indices(".exe").find_map(|(i, m)| {
-            let end = i + m.len();
-            let next = cmd[end..].chars().next();
-            next.is_none_or(|c| c.is_whitespace() || c == '/')
-                .then_some(end)
-        })?;
-        &cmd[..end]
-    };
-    let expanded = expand_vars(raw, &expand)?;
+    let (raw, _) = split_command(cmd)?;
+    let expanded = expand_vars(&raw, &expand)?;
     let b = expanded.as_bytes();
     if b.len() < 3 || !b[0].is_ascii_alphabetic() || b[1] != b':' || b[2] != b'\\' {
         return None;
