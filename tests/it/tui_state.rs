@@ -305,6 +305,7 @@ fn plan(app: &str) -> InstallPlan {
         upgrade_from: None,
         root: PathBuf::from("C:/w"),
         manifest_sha256: "x".into(),
+        third_party_uninstaller: false,
         steps: vec![],
     }
 }

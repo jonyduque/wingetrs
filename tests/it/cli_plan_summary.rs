@@ -48,6 +48,7 @@ fn plan(steps: Vec<Step>) -> InstallPlan {
         upgrade_from: None,
         root: PathBuf::from(r"C:\R"),
         manifest_sha256: "00".into(),
+        third_party_uninstaller: false,
         steps,
     }
 }

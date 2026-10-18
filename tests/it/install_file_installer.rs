@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use wingetrs::cache::DataDir;
 use wingetrs::http::Http;
 use wingetrs::install::executor::{
-    ExecCtx, ExecError, NoHook, Runners, ToolRun, execute_install, execute_uninstall,
+    ExecCtx, ExecError, NoHook, Runners, StepHook, ToolRun, execute_install, execute_uninstall,
 };
 use wingetrs::install::installer_args::installer_args;
 use wingetrs::install::layout::Layout;
@@ -148,6 +148,10 @@ impl World {
     }
 
     fn ctx(&self, installer: Option<ToolRun>) -> ExecCtx<'_> {
+        self.ctx_hook(installer, &NoHook)
+    }
+
+    fn ctx_hook<'a>(&'a self, installer: Option<ToolRun>, hook: &'a dyn StepHook) -> ExecCtx<'a> {
         let state: &mut StateDb = Box::leak(Box::new(StateDb::open(&self.state_path).unwrap()));
         ExecCtx {
             layout: &self.layout,
@@ -160,7 +164,7 @@ impl World {
                 registry: &self.registry,
             },
             state,
-            hook: &NoHook,
+            hook,
             progress: &no_progress,
             in_use: &nothing_in_use,
             msiexec: None,
@@ -292,6 +296,20 @@ fn ps1_or_script_still_refused_with_old_text() {
 }
 
 #[test]
+fn unsafe_default_file_or_empty_file_is_unsafe_path() {
+    // `file` defaults to the download name, here taken from the URL fragment.
+    let mut m = exe_manifest(serde_json::json!({"args": ["/S"]}));
+    m["url"] = "https://example.invalid/a.zip#/..\\x.exe".into();
+    let r = plan_for(&m);
+    assert!(
+        matches!(r, Err(PlanError::UnsafePath(_))),
+        "fragment: {r:?}"
+    );
+    let r = plan_for(&exe_manifest(serde_json::json!({"file": ""})));
+    assert!(matches!(r, Err(PlanError::UnsafePath(_))), "empty: {r:?}");
+}
+
+#[test]
 fn unsafe_installer_file_is_a_manifest_error() {
     let m = exe_manifest(serde_json::json!({"file": "..\\x.exe"}));
     assert!(resolve(&m.to_string(), Arch::X64).is_err());
@@ -362,12 +380,6 @@ async fn exit_3_rolls_back_with_warning() {
     assert!(s.state.get("app").unwrap().is_none());
 }
 
-static CALLS: AtomicUsize = AtomicUsize::new(0);
-fn fake_count(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
-    CALLS.fetch_add(1, Ordering::SeqCst);
-    Ok((0, Vec::new()))
-}
-
 #[tokio::test]
 async fn no_consent_fails_before_anything() {
     let s = setup().await;
@@ -378,9 +390,10 @@ async fn no_consent_fails_before_anything() {
     let mut ctx = s.ctx(None);
     let e = execute_install(&plan, &mut ctx).await.unwrap_err();
     assert!(matches!(e, ExecError::NeedsScriptConsent { .. }), "{e}");
-    assert!(e.to_string().contains("--allow-scripts"), "{e}");
+    // The flag does not exist yet: the text must not point at it.
+    assert!(!e.to_string().contains("--allow-scripts"), "{e}");
+    assert!(e.to_string().contains("Task 161"), "{e}");
     assert_eq!(s.server.received_requests().await.unwrap().len(), 0);
-    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
     assert!(!s.layout.app_dir("app").exists());
 }
 
@@ -404,14 +417,169 @@ async fn installer_outside_version_dir_refused() {
                 keep: true,
             },
         );
-        let mut ctx = s.ctx(Some(fake_count));
+        // Had it run, the fake would answer "código 3": the message tells which check refused.
+        let mut ctx = s.ctx(Some(fake_exit3));
         let e = execute_install(&p, &mut ctx).await.unwrap_err();
+        let text = e.to_string();
         assert!(matches!(e, ExecError::Failed { .. }), "{file}: {e}");
+        assert!(
+            text.contains("inseguro") || text.contains("não existe"),
+            "{file}: {text}"
+        );
         assert!(!s.layout.app_dir("app").exists());
     }
-    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
 }
 
+/// Creates the junction `<vdir>\sub` -> `target` right before the installer step.
+struct JunctionBefore {
+    link: PathBuf,
+    target: PathBuf,
+}
+impl StepHook for JunctionBefore {
+    fn before(&self, _: usize, step: &Step) -> Result<(), ExecError> {
+        if matches!(step, Step::RunInstaller { .. }) {
+            wingetrs::install::link::create(&self.target, &self.link)
+                .map_err(|e| ExecError::Hook(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn installer_through_junction_out_of_version_dir_refused() {
+    let s = setup().await;
+    let m = s
+        .manifest(serde_json::json!({"installer": {"file": "sub\\x.exe"}}))
+        .await;
+    let plan = s.plan(&m);
+    let outside = s._t.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("x.exe"), fake_pe(3)).unwrap();
+    let hook = JunctionBefore {
+        link: s.layout.version_dir("app", "1.0").join("sub"),
+        target: outside.clone(),
+    };
+    let mut ctx = s.ctx_hook(Some(fake_exit3), &hook);
+    let e = execute_install(&plan, &mut ctx).await.unwrap_err();
+    assert!(e.to_string().contains("fora da pasta da versão"), "{e}");
+    assert!(
+        outside.join("x.exe").exists(),
+        "the outside file is untouched"
+    );
+    assert!(!s.layout.app_dir("app").exists());
+}
+
+#[tokio::test]
+async fn uninstaller_alone_needs_consent_to_install() {
+    let s = setup().await;
+    let m = s
+        .manifest(serde_json::json!({"uninstaller": {"file": "unins.exe"}}))
+        .await;
+    let plan = s.plan(&m);
+    assert!(plan.third_party_uninstaller);
+    assert!(
+        !plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::RunInstaller { .. }))
+    );
+    let mut ctx = s.ctx(None);
+    let e = execute_install(&plan, &mut ctx).await.unwrap_err();
+    assert!(matches!(e, ExecError::NeedsScriptConsent { .. }), "{e}");
+    assert_eq!(s.server.received_requests().await.unwrap().len(), 0);
+    assert!(!s.layout.app_dir("app").exists());
+}
+
+fn fake_zero(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    Ok((0, Vec::new()))
+}
+
+static MARKER: AtomicUsize = AtomicUsize::new(0);
+fn fake_marker(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    MARKER.fetch_add(1, Ordering::SeqCst);
+    Ok((0, Vec::new()))
+}
+
+const SKIPPED: &str = "o desinstalador do app não rodou: ";
+const LEFT_BEHIND: &str = "o que ele instalou fora da pasta pode ter ficado";
+/// Installs an app with an uninstaller, applies `on_plan` to the plan and `after_install` to
+/// the stored manifest (`m` is the original text), removes the app and returns the notes.
+async fn removal_notes(
+    on_plan: fn(&mut InstallPlan),
+    after_install: fn(&Path, &str),
+) -> Vec<String> {
+    let s = setup().await;
+    let m = s
+        .manifest(serde_json::json!({"uninstaller": {"file": "unins.exe"}}))
+        .await;
+    let mut plan = s.plan(&m);
+    on_plan(&mut plan);
+    let mut ctx = s.ctx(Some(fake_zero));
+    execute_install(&plan, &mut ctx).await.unwrap();
+    drop(ctx);
+    after_install(
+        &s.layout.version_dir("app", "1.0").join("manifest.json"),
+        &m,
+    );
+    let up = UninstallPlan::from_state(&s.state, "app", false)
+        .unwrap()
+        .unwrap();
+    let before = MARKER.load(Ordering::SeqCst);
+    let mut ctx = s.ctx(Some(fake_marker));
+    let notes = execute_uninstall(&up, &mut ctx).unwrap();
+    assert_eq!(MARKER.load(Ordering::SeqCst), before, "no uninstaller ran");
+    assert!(!s.layout.app_dir("app").exists(), "removal went on");
+    notes
+}
+
+#[tokio::test]
+async fn skipped_uninstaller_note_when_manifest_is_gone() {
+    let notes = removal_notes(|_| {}, |p, _| std::fs::remove_file(p).unwrap()).await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(SKIPPED) && notes[0].contains("não existe"),
+        "{notes:?}"
+    );
+    assert!(notes[0].ends_with(LEFT_BEHIND), "{notes:?}");
+}
+
+#[tokio::test]
+async fn skipped_uninstaller_note_when_manifest_was_altered() {
+    let notes = removal_notes(
+        |_| {},
+        |p, m| std::fs::write(p, m.replace("unins.exe", "evil.exe")).unwrap(),
+    )
+    .await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(SKIPPED) && notes[0].contains("alterado"),
+        "{notes:?}"
+    );
+    assert!(notes[0].ends_with(LEFT_BEHIND), "{notes:?}");
+}
+
+#[tokio::test]
+async fn skipped_uninstaller_note_when_manifest_does_not_resolve() {
+    let notes = removal_notes(
+        |plan| {
+            // A written manifest whose hash matches the record but that `resolve` refuses.
+            plan.manifest_sha256 = sha256_hex(b"{}");
+            for st in &mut plan.steps {
+                if let Step::WriteManifest { json } = st {
+                    *json = "{}".to_string();
+                }
+            }
+        },
+        |_, _| {},
+    )
+    .await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(SKIPPED) && notes[0].contains("não pôde ser lido"),
+        "{notes:?}"
+    );
+    assert!(notes[0].ends_with(LEFT_BEHIND), "{notes:?}");
+}
 static UN_CODE: AtomicUsize = AtomicUsize::new(1);
 static UN_SEEN: Mutex<Vec<(PathBuf, Vec<String>)>> = Mutex::new(Vec::new());
 
@@ -466,4 +634,35 @@ async fn uninstaller_runs_before_removal() {
     let seen = UN_SEEN.lock().unwrap().clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].1, strs(&["/x", &vdir.display().to_string()]));
+}
+/// `installer_win::run` with a fake `.cmd`: exit code, cwd, the fixed PATH and the arguments.
+#[cfg(windows)]
+#[test]
+fn installer_win_runs_a_cmd_with_fixed_path_cwd_and_args() {
+    let t = tempfile::tempdir().unwrap();
+    let app = t.path().join("app dir");
+    let work = t.path().join("work");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let exe = app.join("fake.cmd");
+    std::fs::write(
+        &exe,
+        "@echo off\r\necho cwd=%CD%\r\necho path=%PATH%\r\necho a1=%1\r\necho a2=%2\r\nexit /b 3\r\n",
+    )
+    .unwrap();
+    let (code, lines) =
+        wingetrs::install::installer_win::run(&exe, &strs(&["/S", "x y"]), &work).unwrap();
+    assert_eq!(code, 3, "{lines:?}");
+    let find = |p: &str| {
+        lines
+            .iter()
+            .find_map(|l| l.trim().strip_prefix(p).map(str::to_string))
+            .unwrap_or_else(|| panic!("no {p} line in {lines:?}"))
+    };
+    assert!(find("cwd=").eq_ignore_ascii_case(&work.display().to_string()));
+    let root = std::env::var("SystemRoot").unwrap();
+    let want = format!(r"{root}\System32;{}", app.display());
+    assert!(find("path=").eq_ignore_ascii_case(&want), "{lines:?}");
+    assert_eq!(find("a1="), "/S");
+    assert_eq!(find("a2="), "\"x y\"");
 }

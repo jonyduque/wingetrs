@@ -384,6 +384,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         upgrade_from,
         root: layout.root().to_path_buf(),
         manifest_sha256: input.manifest_sha256.to_string(),
+        third_party_uninstaller: m.uninstaller.is_some(),
         steps,
     })
 }

@@ -108,6 +108,9 @@ pub struct InstallPlan {
     pub root: PathBuf,
     /// SHA-256 (hex) of the manifest JSON the plan was built from; recorded in `state.db`.
     pub manifest_sha256: String,
+    /// The manifest has an `uninstaller` that will run third-party code at removal time:
+    /// installing it needs the same consent as running an installer (Task 151).
+    pub third_party_uninstaller: bool,
     pub steps: Vec<Step>,
 }
 

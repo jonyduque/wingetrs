@@ -220,6 +220,7 @@ async fn setup() -> World {
             upgrade_from: None,
             root: PathBuf::new(),
             manifest_sha256: String::new(),
+            third_party_uninstaller: false,
             steps: Vec::new(),
         },
         v1_manifest: String::new(),

@@ -186,7 +186,7 @@ pub enum ExecError {
         reason: String,
     },
     /// The plan (or the installed app) runs third-party code and no consent was given.
-    #[error("{app}: roda código de terceiros ({what}); é preciso confirmar com --allow-scripts")]
+    #[error("{app}: precisa da sua confirmação para rodar {what} (fase 2c, Task 161)")]
     NeedsScriptConsent { app: String, what: String },
 }
 
@@ -546,14 +546,15 @@ pub async fn execute_install_with(
     check_component("app", &plan.app).map_err(fail_early)?;
     check_component("versão", &plan.version).map_err(fail_early)?;
     check_order(&plan.steps).map_err(fail_early)?;
-    let needs_consent = plan
-        .steps
-        .iter()
-        .any(|s| matches!(s, Step::RunInstaller { .. }));
+    let needs_consent = plan.third_party_uninstaller
+        || plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::RunInstaller { .. }));
     if needs_consent && ctx.runners.installer.is_none() {
         return Err(ExecError::NeedsScriptConsent {
             app: plan.app.clone(),
-            what: "instalador do manifesto".into(),
+            what: "o instalador do manifesto".into(),
         });
     }
     for s in &plan.steps {
@@ -1805,7 +1806,13 @@ fn remove_artifact(
 ///
 /// Never broadcasts the environment change: the caller calls `effects.env.broadcast()` once
 /// after a successful uninstall.
-pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<(), ExecError> {
+///
+/// Returns notes for the user: what did not happen although the app might have wanted it
+/// (the uninstaller skipped because the installed manifest could not be trusted).
+pub fn execute_uninstall(
+    plan: &UninstallPlan,
+    ctx: &mut ExecCtx<'_>,
+) -> Result<Vec<String>, ExecError> {
     let fail = |index: usize, step: String, message: String| ExecError::Failed {
         index,
         step,
@@ -1818,10 +1825,13 @@ pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<
     if let Some(p) = (ctx.in_use)(&app_dir).first() {
         return Err(ExecError::InUse(p.display().to_string()));
     }
-    run_uninstaller(ctx, &plan.app).map_err(|e| match e {
-        UninstallerError::Consent(e) => e,
-        UninstallerError::Failed(m) => fail(0, "rodar desinstalador".into(), m),
-    })?;
+    let notes = run_uninstaller(ctx, &plan.app)
+        .map_err(|e| match e {
+            UninstallerError::Consent(e) => e,
+            UninstallerError::Failed(m) => fail(0, "rodar desinstalador".into(), m),
+        })?
+        .into_iter()
+        .collect();
     for (i, a) in plan.artifacts.iter().enumerate() {
         if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry, false)
         {
@@ -1836,7 +1846,8 @@ pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<
     }
     ctx.state
         .remove(&plan.app)
-        .map_err(|e| fail(n + 2, "registro".into(), e.to_string()))
+        .map_err(|e| fail(n + 2, "registro".into(), e.to_string()))?;
+    Ok(notes)
 }
 
 enum UninstallerError {
@@ -1854,18 +1865,25 @@ fn arch_of_key(key: &str) -> Option<Arch> {
 /// Runs `uninstaller.file` of the installed manifest, if it has one, before anything is
 /// removed. A manifest that is missing, altered (hash differs from the record) or not
 /// resolvable runs nothing: the removal goes on as before, with a warning.
-fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<(), UninstallerError> {
+fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<Option<String>, UninstallerError> {
     let failed = |m: String| UninstallerError::Failed(m);
+    let skipped = |why: String| {
+        tracing::warn!("{app}: desinstalador não rodou: {why}");
+        Ok(Some(format!(
+            "o desinstalador do app não rodou: {why}; o que ele instalou fora da pasta pode ter ficado"
+        )))
+    };
     let Some((rec, _)) = ctx.state.get(app).map_err(|e| failed(e.to_string()))? else {
-        return Ok(());
+        return Ok(None);
     };
     check_component("versão", &rec.version).map_err(failed)?;
     let raw = match state::installed_manifest(ctx.layout, app, &rec.version, &rec.manifest_sha256) {
         Ok(Some(raw)) => raw,
-        Ok(None) => return Ok(()),
+        Ok(None) => return skipped("o manifesto instalado não existe".into()),
         Err(e) => {
-            tracing::warn!("{app}: manifesto instalado ignorado: {e}");
-            return Ok(());
+            return skipped(format!(
+                "o manifesto instalado foi alterado ou está ilegível ({e})"
+            ));
         }
     };
     let arch = rec
@@ -1875,22 +1893,19 @@ fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<(), UninstallerEr
         .unwrap_or_else(Arch::host);
     let manifest = match manifest::resolve(&raw, arch) {
         Ok(m) => m,
-        Err(e) => {
-            tracing::warn!("{app}: manifesto instalado ignorado: {e}");
-            return Ok(());
-        }
+        Err(e) => return skipped(format!("o manifesto instalado não pôde ser lido ({e})")),
     };
     let Some(spec) = manifest.uninstaller else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(file) = spec.file.as_deref().filter(|_| spec.script.is_none()) else {
         tracing::warn!("{app}: uninstaller sem file (ou com script): nada a rodar");
-        return Ok(());
+        return Ok(None);
     };
     let Some(runner) = ctx.runners.installer else {
         return Err(UninstallerError::Consent(ExecError::NeedsScriptConsent {
             app: app.to_string(),
-            what: "desinstalador do manifesto".into(),
+            what: "o desinstalador do manifesto".into(),
         }));
     };
     let vdir = ctx.layout.version_dir(app, &rec.version);
@@ -1898,5 +1913,6 @@ fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<(), UninstallerEr
         .map_err(|e| failed(e.to_string()))?;
     let program = installer_program(&vdir, file).map_err(failed)?;
     tracing::info!("rodando o desinstalador {file}");
-    check_installer_exit(runner(&program, &args, &vdir)).map_err(failed)
+    check_installer_exit(runner(&program, &args, &vdir)).map_err(failed)?;
+    Ok(None)
 }

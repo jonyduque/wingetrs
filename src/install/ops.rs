@@ -863,7 +863,9 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     };
     tracing::debug_span!("uninstall.broadcast")
         .in_scope(|| broadcast_if_changed(env, &names, &before));
-    result?;
+    for note in result? {
+        tracing::warn!("{}: {note}", plan.app);
+    }
     (ctx.progress)(&ProgressEvent::Phase(Phase::Scanning));
     Ok(tracing::debug_span!("uninstall.residue_scan")
         .in_scope(|| scan_residues(ctx, &app_dir, &plan.app, homepage.as_deref())))
