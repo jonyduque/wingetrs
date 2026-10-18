@@ -288,6 +288,7 @@ fn exec_ctx<'a>(
         // No production path grants consent to third-party code before Task 161.
         runners: executor::Runners {
             installer: None,
+            scripts: None,
             ..ctx.runners.clone()
         },
     }

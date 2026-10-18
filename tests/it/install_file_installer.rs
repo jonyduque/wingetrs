@@ -279,16 +279,13 @@ fn msi_file_refused() {
 }
 
 #[test]
-fn ps1_or_script_still_refused_with_old_text() {
+fn ps1_still_refused_with_old_text() {
     const OLD: &str =
         "não suportado: usa installer (PowerShell/instalador próprio): suportado na fase 2c";
-    for installer in [
-        serde_json::json!({"file": "x.ps1"}),
-        serde_json::json!({"script": "a"}),
-    ] {
-        let e = plan_for(&exe_manifest(installer)).unwrap_err();
-        assert_eq!(e.to_string(), OLD);
-    }
+    let e = plan_for(&exe_manifest(serde_json::json!({"file": "x.ps1"}))).unwrap_err();
+    assert_eq!(e.to_string(), OLD);
+    // `installer.script` runs through the script host since Task 156.
+    assert!(plan_for(&exe_manifest(serde_json::json!({"script": "a"}))).is_ok());
     let mut m = exe_manifest(serde_json::json!({"file": "x.ps1"}));
     m["uninstaller"] = m["installer"].take();
     let e = plan_for(&m).unwrap_err();

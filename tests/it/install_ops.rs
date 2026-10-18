@@ -357,14 +357,14 @@ async fn phase_2c_target_is_refused_before_its_dependencies() {
     let mut w = World::new().await;
     let raw = serde_json::json!({
         "version": "1.0", "url": "https://x/a.zip", "hash": "aa",
-        "depends": "ghost", "pre_install": "x",
+        "depends": "ghost", "pre_uninstall": "x",
     })
     .to_string();
     w.put_raw("top", "1.0", raw);
     let e = w.plans("top").unwrap_err();
     assert_eq!(
         e.to_string(),
-        "não suportado: usa pre_install (PowerShell/instalador próprio): suportado na fase 2c"
+        "não suportado: usa pre_uninstall (PowerShell/instalador próprio): suportado na fase 2c"
     );
 }
 

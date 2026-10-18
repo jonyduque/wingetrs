@@ -42,6 +42,8 @@ pub enum VarValue {
     Bool(bool),
     StrArray(Vec<String>),
     JsonFile(PathBuf),
+    /// Hashtable of strings (`@{'k'='v'}`), e.g. `$__wr_helpers` (Task 156).
+    Table(Vec<(String, String)>),
     Null,
 }
 
@@ -180,6 +182,13 @@ fn literal(value: &VarValue) -> String {
         VarValue::StrArray(items) => {
             let parts: Vec<String> = items.iter().map(|s| ps_single_quoted(s)).collect();
             format!("@({})", parts.join(","))
+        }
+        VarValue::Table(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|(k, v)| format!("{}={}", ps_single_quoted(k), ps_single_quoted(v)))
+                .collect();
+            format!("@{{{}}}", parts.join(";"))
         }
         VarValue::JsonFile(p) => format!(
             "(Get-Content -LiteralPath {} -Raw -Encoding UTF8 | ConvertFrom-Json)",

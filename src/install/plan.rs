@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::install::archive::ArchiveKind;
 use crate::install::layout::Layout;
-use crate::install::manifest::{Arch, HashAlgo, Source};
+use crate::install::manifest::{Arch, HashAlgo, HookKind, Source};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ShimKind {
@@ -70,6 +70,12 @@ pub enum Step {
         file: String,
         args: Vec<String>,
         keep: bool,
+    },
+    /// Runs a manifest hook (`pre_install`, `installer.script`, `post_install`) through the
+    /// script host (Task 156).
+    Hook {
+        kind: HookKind,
+        script: String,
     },
     Persist(PersistSpec),
     LinkCurrent,
@@ -303,6 +309,9 @@ impl InstallPlan {
                     program.display(),
                     args.join(" ")
                 )
+            }
+            Step::Hook { kind, .. } => {
+                format!("Rodar o script {} do manifesto (PowerShell)", kind.key())
             }
             Step::Persist(p) => {
                 let what = match p.kind {

@@ -183,16 +183,12 @@ fn raw_json_kept_verbatim() {
 #[test]
 fn planner_refuses_each_2c_key_with_old_text() {
     let cases = [
-        r#","pre_install":"x""#,
-        r#","post_install":"x""#,
         r#","pre_uninstall":"x""#,
         r#","post_uninstall":"x""#,
         r#","installer":{"file":"a.ps1"}"#,
         r#","uninstaller":{"file":"a.ps1"}"#,
     ];
     let keys = [
-        "pre_install",
-        "post_install",
         "pre_uninstall",
         "post_uninstall",
         "installer",
@@ -206,7 +202,10 @@ fn planner_refuses_each_2c_key_with_old_text() {
             format!("não suportado: usa {k} (PowerShell/instalador próprio): suportado na fase 2c")
         );
     }
-    // `innosetup` is planned since Task 147 (extracted through innounp).
+    // `innosetup` is planned since Task 147 (extracted through innounp), the install hooks since
+    // Task 156 (script host).
+    assert!(plan(&ok(r#","pre_install":"x""#)).is_ok());
+    assert!(plan(&ok(r#","post_install":"x""#)).is_ok());
     assert!(plan(&ok(r#","innosetup":true"#)).is_ok());
 }
 

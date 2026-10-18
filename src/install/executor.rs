@@ -2,6 +2,7 @@
 //! every change, and rolls everything back in reverse order on any failure. `current`
 //! only moves at `LinkCurrent`, so the previous version keeps working until then.
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,15 +18,19 @@ use crate::http::Http;
 use crate::install::download::{self, Progress};
 use crate::install::installer_args;
 use crate::install::layout::Layout;
-use crate::install::manifest::{self, Arch, Source};
+use crate::install::manifest::{self, Arch, HookKind, Source};
 use crate::install::msi_queue::{self, Attempt};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimSpec, ShortcutSpec, Step, UninstallPlan,
 };
+use crate::install::prelude::{CONTRACT_VARS, PRELUDE};
 use crate::install::progress::{Phase, ProgressEvent};
+use crate::install::runner::{
+    RunnerInput, ScriptBody, ScriptContext, ScriptOp, VarValue, runner_ps1, script_vars,
+};
 use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
-use crate::install::{extract, inno, link, path_edit, safepath, shim, state};
+use crate::install::{extract, inno, link, path_edit, safepath, script_scan, shim, state};
 
 pub trait StepHook: Send + Sync {
     fn before(&self, index: usize, step: &Step) -> Result<(), ExecError>;
@@ -77,13 +82,50 @@ impl Msiexec {
 /// `(exe, args, dir)` → exit code and decoded output lines.
 pub type ToolRun = fn(&Path, &[String], &Path) -> io::Result<(i32, Vec<String>)>;
 
-/// External tools the executor runs, injected like [`Msiexec`]. Production: `inno_win::run`.
+/// One manifest hook to run: `runner` (inside `workdir`) defines the Scoop variables,
+/// dot-sources the prelude and runs the hook; `env` is added to the process environment.
 #[derive(Debug, Clone)]
+pub struct ScriptJob {
+    pub app: String,
+    pub hook: HookKind,
+    pub workdir: PathBuf,
+    pub runner: PathBuf,
+    pub env: Vec<(OsString, OsString)>,
+}
+
+/// Exit code and decoded output lines of a hook.
+#[derive(Debug, Clone)]
+pub struct ScriptOutcome {
+    pub code: i32,
+    pub lines: Vec<String>,
+}
+
+/// Runs manifest scripts (third-party code). Tests inject a fake; nothing runs PowerShell
+/// without the user's consent.
+pub trait ScriptHost: Send + Sync {
+    fn run(&self, job: &ScriptJob) -> io::Result<ScriptOutcome>;
+}
+
+/// External tools the executor runs, injected like [`Msiexec`]. Production: `inno_win::run`.
+#[derive(Clone)]
 pub struct Runners {
     pub innounp: ToolRun,
     /// Runs `installer.file`/`uninstaller.file` (third-party code). `None` = the user gave no
     /// consent: a plan with a `RunInstaller` fails before any step.
     pub installer: Option<ToolRun>,
+    /// Runs manifest hooks (third-party code). `None` = the user gave no consent: a plan with
+    /// a `Step::Hook` fails before any step.
+    pub scripts: Option<Arc<dyn ScriptHost>>,
+}
+
+impl std::fmt::Debug for Runners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Runners")
+            .field("innounp", &self.innounp)
+            .field("installer", &self.installer)
+            .field("scripts", &self.scripts.as_ref().map(|_| "ScriptHost"))
+            .finish()
+    }
 }
 
 fn refuse_innounp(_: &Path, _: &[String], _: &Path) -> io::Result<(i32, Vec<String>)> {
@@ -96,6 +138,7 @@ impl Runners {
         Runners {
             innounp: refuse_innounp,
             installer: None,
+            scripts: None,
         }
     }
 }
@@ -306,6 +349,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::ExtractInno { .. } => "extract_inno",
         Step::Promote => "promote",
         Step::RunInstaller { .. } => "installer",
+        Step::Hook { .. } => "hook",
         Step::Persist(_) => "persist",
         Step::LinkCurrent => "link",
         Step::Shim(_) => "shim",
@@ -341,6 +385,10 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
             _ => None,
         }),
         Step::Promote | Step::RunInstaller { .. } | Step::Persist(_) => Some(Phase::Placing),
+        Step::Hook { kind, .. } => match kind {
+            HookKind::PostInstall => Some(Phase::Linking),
+            _ => Some(Phase::Placing),
+        },
         Step::LinkCurrent
         | Step::Shim(_)
         | Step::Shortcut(_)
@@ -360,6 +408,7 @@ fn step_label(step: &Step) -> String {
         Step::ExtractInno { index } => format!("extrair [{}] (Inno Setup)", index + 1),
         Step::Promote => "promover versão".into(),
         Step::RunInstaller { file, .. } => format!("rodar instalador {file}"),
+        Step::Hook { kind, .. } => format!("script {}", kind.key()),
         Step::Persist(p) => format!("persistir {}", p.in_version.display()),
         Step::LinkCurrent => "apontar current".into(),
         Step::Shim(s) => format!("comando {}", s.name),
@@ -555,6 +604,13 @@ pub async fn execute_install_with(
         return Err(ExecError::NeedsScriptConsent {
             app: plan.app.clone(),
             what: "o instalador do manifesto".into(),
+        });
+    }
+    let has_hooks = plan.steps.iter().any(|s| matches!(s, Step::Hook { .. }));
+    if has_hooks && ctx.runners.scripts.is_none() {
+        return Err(ExecError::NeedsScriptConsent {
+            app: plan.app.clone(),
+            what: "os scripts do manifesto".into(),
         });
     }
     for s in &plan.steps {
@@ -839,6 +895,266 @@ fn installer_program(vdir: &Path, file: &str) -> Result<PathBuf, String> {
     Ok(program)
 }
 
+static SCRIPT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Helpers a hook may call through the prelude (`$__wr_helpers`): Scoop app and its exe.
+const SCRIPT_HELPERS: &[(&str, &str)] = &[
+    ("7zip", "7z.exe"),
+    ("lessmsi", "lessmsi.exe"),
+    ("innounp", "innounp.exe"),
+    ("dark", "dark.exe"),
+];
+
+/// Output lines of a failed hook quoted in its message.
+const SCRIPT_TAIL_LINES: usize = 5;
+
+/// Names seeded into `env.json`: `Path`, `PSModulePath` and those the script names literally,
+/// deduplicated ignoring case (PowerShell 5.1 refuses JSON keys that differ only in case).
+fn script_env_names(script: &str) -> Vec<String> {
+    let mut names = vec![PATH_VAR.to_string(), "PSModulePath".to_string()];
+    for n in script_scan::env_var_names(script) {
+        if !names.iter().any(|m| m.eq_ignore_ascii_case(&n)) {
+            names.push(n);
+        }
+    }
+    names
+}
+
+type EnvSnapshot = Vec<(String, Option<String>)>;
+
+fn env_values(env: &dyn EnvStore, names: &[String]) -> Result<EnvSnapshot, String> {
+    names
+        .iter()
+        .map(|n| {
+            let v = env.get(n).map_err(|e| format!("{n}: {e}"))?;
+            Ok((n.clone(), v.map(|v| v.value)))
+        })
+        .collect()
+}
+
+fn env_seed_json(values: &EnvSnapshot) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = values
+        .iter()
+        .map(|(k, v)| {
+            let v = v
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String);
+            (k.clone(), v)
+        })
+        .collect();
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Seeded names whose value differs now (D5: what a failed script left behind).
+fn changed_env(env: &dyn EnvStore, before: &EnvSnapshot) -> Vec<String> {
+    before
+        .iter()
+        .filter(|(name, old)| match env.get(name) {
+            Ok(now) => now.map(|v| v.value) != *old,
+            Err(e) => {
+                tracing::warn!("{name}: {e}");
+                false
+            }
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// `$__wr_helpers`: the helpers installed at `<root>\apps\<helper>\current\<exe>`.
+fn script_helpers(layout: &Layout) -> Vec<(String, String)> {
+    SCRIPT_HELPERS
+        .iter()
+        .filter_map(|(helper, exe)| {
+            let p = layout.current(helper).join(exe);
+            p.is_file()
+                .then(|| (helper.to_string(), p.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+/// The prelude's contract variables, in [`CONTRACT_VARS`] order; one without a value is a bug.
+fn contract_vars(values: Vec<(&str, VarValue)>) -> Result<Vec<(String, VarValue)>, String> {
+    CONTRACT_VARS
+        .iter()
+        .map(|name| {
+            values
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| (name.to_string(), v.clone()))
+                .ok_or_else(|| format!("erro interno: variável {name} do prelúdio sem valor"))
+        })
+        .collect()
+}
+
+/// A fresh `<root>\tmp\script-<app>-<hook>-<n>` (`app` already checked as one component).
+fn fresh_script_dir(
+    run: &mut Run<'_>,
+    layout: &Layout,
+    app: &str,
+    kind: HookKind,
+) -> Result<PathBuf, String> {
+    let tmp = layout.root().join("tmp");
+    run.ensure_dirs(&tmp)?;
+    let hook = kind.key().replace('.', "-");
+    for _ in 0..ASIDE_TRIES {
+        let n = SCRIPT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = tmp.join(format!("script-{app}-{hook}-{n}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io_msg(&dir, e)),
+        }
+    }
+    Err(format!("nenhuma pasta livre para o script {}", kind.key()))
+}
+
+/// `Step::Hook`: writes the hook, the prelude, the manifest, the environment seed and the
+/// runner into a fresh folder (removed on every path out), then runs it through the host.
+async fn run_hook(
+    run: &mut Run<'_>,
+    ctx: &mut ExecCtx<'_>,
+    kind: HookKind,
+    script: &str,
+) -> Result<(), String> {
+    let Some(host) = ctx.runners.scripts.clone() else {
+        return Err("sem consentimento para rodar os scripts do manifesto".into());
+    };
+    let plan = run.plan;
+    let layout = ctx.layout;
+    let (app, version) = (plan.app.as_str(), plan.version.as_str());
+    let hook = kind.key();
+    let manifest_json = plan
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::WriteManifest { json } => Some(json.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| "erro interno: plano com script e sem manifesto".to_string())?;
+    let work = fresh_script_dir(run, layout, app, kind)?;
+    let _remove = RemoveWork(work.clone());
+    let write = |name: &str, bytes: &[u8]| -> Result<PathBuf, String> {
+        let p = work.join(name);
+        fs::write(&p, bytes).map_err(|e| io_msg(&p, e))?;
+        Ok(p)
+    };
+    let prelude = write("prelude.ps1", PRELUDE.as_bytes())?;
+    let hook_file = write("hook.ps1", script.as_bytes())?;
+    let manifest_path = write("manifest.json", manifest_json.as_bytes())?;
+    let before = env_values(ctx.effects.env, &script_env_names(script))?;
+    let seed = env_seed_json(&before);
+    write("env.json", seed.as_bytes())?;
+    let effects = write("effects.jsonl", b"")?;
+    let root = layout.root().to_path_buf();
+    let cx = ScriptContext {
+        op: match plan.upgrade_from {
+            Some(_) => ScriptOp::Update,
+            None => ScriptOp::Install,
+        },
+        app: app.to_string(),
+        version: version.to_string(),
+        old_version: plan.upgrade_from.clone(),
+        bucket: Some(plan.bucket.clone()),
+        arch: plan.arch,
+        root: root.clone(),
+        version_dir: layout.version_dir(app, version),
+        current: layout.current(app),
+        persist_dir: layout.persist_dir(app),
+        fnames: plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Download { source, .. } => Some(source.file_name.clone()),
+                _ => None,
+            })
+            .collect(),
+        purge: false,
+        manifest_path,
+        bucketsdir: root.join("buckets"),
+    };
+    let path_str = |p: &Path| VarValue::Str(p.to_string_lossy().into_owned());
+    let contract = contract_vars(vec![
+        ("__wr_root", path_str(&root)),
+        ("__wr_effects", path_str(&effects)),
+        ("__wr_env_seed", VarValue::Str(seed)),
+        ("__wr_helpers", VarValue::Table(script_helpers(layout))),
+        (
+            "__wr_shortcut_root",
+            path_str(&ctx.effects.shortcuts.root()),
+        ),
+    ])?;
+    let vars = script_vars(kind, &cx);
+    let text = runner_ps1(&RunnerInput {
+        contract: &contract,
+        vars: &vars,
+        prelude_path: &prelude,
+        body: ScriptBody::Hook {
+            script_path: &hook_file,
+        },
+    })
+    .map_err(|e| format!("erro interno: {e}"))?;
+    // powershell 5.1 reads a BOM-less file as ANSI.
+    let mut bytes = b"\xEF\xBB\xBF".to_vec();
+    bytes.extend_from_slice(text.as_bytes());
+    let runner = write("runner.ps1", &bytes)?;
+    let job = ScriptJob {
+        app: app.to_string(),
+        hook: kind,
+        workdir: work.clone(),
+        runner,
+        env: vec![
+            ("SCOOP".into(), root.clone().into_os_string()),
+            (
+                "SCOOP_GLOBAL".into(),
+                root.join(".global-disabled").into_os_string(),
+            ),
+            ("SCOOP_CACHE".into(), root.join("cache").into_os_string()),
+        ],
+    };
+    tracing::info!("rodando o script {hook} de {app}");
+    let worker = AwaitWorker::spawn(move || host.run(&job), work.clone(), ctx.launch.clone());
+    let result = match worker.join().await {
+        Ok(r) => r,
+        Err(e) => match e.try_into_panic() {
+            // Re-raised by `execute_install` once the install is rolled back.
+            Ok(p) => {
+                run.panic = Some(p);
+                return Err(format!("pânico ao rodar o script {hook}"));
+            }
+            Err(e) => return Err(e.to_string()),
+        },
+    };
+    let failure = match result {
+        Ok(ScriptOutcome { code: 0, .. }) => None,
+        Ok(ScriptOutcome { code, lines }) => {
+            let tail = &lines[lines.len().saturating_sub(SCRIPT_TAIL_LINES)..];
+            Some(format!(
+                "o script {hook} saiu com código {code}: {}",
+                tail.join(" | ")
+            ))
+        }
+        Err(e) => Some(format!("não consegui rodar o script {hook}: {e}")),
+    };
+    if let Some(mut message) = failure {
+        let changed = changed_env(ctx.effects.env, &before);
+        if !changed.is_empty() {
+            message.push_str(&format!(
+                "; variáveis alteradas pelo script e não desfeitas: {}",
+                changed.join(", ")
+            ));
+        }
+        return Err(message);
+    }
+    // Applying the effects comes with the next task of the lane; until then any is refused.
+    let written = fs::metadata(&effects)
+        .map_err(|e| io_msg(&effects, e))?
+        .len();
+    if written > 0 {
+        return Err("efeitos de script ainda não suportados".into());
+    }
+    Ok(())
+}
+
 /// Runs innounp on `installer` into the fresh folder `tmp` (inside the staging folder) and
 /// moves what it wrote into `<staging>\<extract_to>`. The caller removes `tmp` on error.
 fn inno_extract(
@@ -1104,6 +1420,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             }
             Ok(())
         }
+        Step::Hook { kind, script } => run_hook(run, ctx, *kind, script).await,
         Step::Persist(spec) => persist(run, spec, layout),
         Step::LinkCurrent => {
             let current = layout.current(app);
@@ -1226,8 +1543,8 @@ enum Refused {
 /// Suffix of the sibling of the staging folder where `msiexec /a` works.
 const MSIEXEC_SUFFIX: &str = ".msiexec";
 
-/// Removes the `msiexec` work folder on every path out of [`extract_with_msiexec`]; `msiexec`
-/// has always exited by then.
+/// Removes a work folder on every path out (the `msiexec` one of [`extract_with_msiexec`], a
+/// hook's `tmp\script-*`); whatever wrote into it has always exited by then.
 struct RemoveWork(PathBuf);
 
 impl Drop for RemoveWork {

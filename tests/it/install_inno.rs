@@ -312,6 +312,7 @@ impl World {
             runners: Runners {
                 innounp,
                 installer: None,
+                scripts: None,
             },
         };
         wingetrs::install::executor::execute_install(&self.plan, &mut ctx).await

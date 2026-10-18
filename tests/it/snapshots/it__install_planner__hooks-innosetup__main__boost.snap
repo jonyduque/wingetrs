@@ -1,0 +1,16 @@
+---
+source: tests/it/install_planner.rs
+expression: p.to_string()
+---
+Instalar app 1.92.0 (bucket main, 64bit)
+  1. Instalar o lançador de comandos em C:\W\shims\.launcher\shim.exe
+  2. Baixar [1] https://downloads.sourceforge.net/project/boost/boost-binaries/1.92.0/boost_1_92_0-msvc-14.5-64.exe (boost_1_92_0-msvc-14.5-64.exe, sha1 cd1cba6f384004e94d33c92ddd4e8c7298556a89)
+  3. Extrair [1] boost_1_92_0-msvc-14.5-64.exe (Inno Setup, com o innounp) para C:\W\apps\app\.staging-1.92.0
+  4. Mover C:\W\apps\app\.staging-1.92.0 para C:\W\apps\app\1.92.0
+  5. Rodar o script pre_install do manifesto (PowerShell)
+  6. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.92.0 (junção)
+  7. Definir variável de usuário BOOST_ROOT = C:\W\apps\app\current
+  8. Definir variável de usuário Boost_INCLUDE_DIR = C:\W\apps\app\current\boost
+  9. Garantir C:\W\shims no PATH do usuário
+ 10. gravar C:\W\apps\app\1.92.0\manifest.json
+ 11. Registrar app 1.92.0 (main) em C:\W\state.db

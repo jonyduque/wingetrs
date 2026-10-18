@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 
 use crate::install::installer_args::installer_args;
 use crate::install::layout::Layout;
-use crate::install::manifest::{Arch, InstallerSpec, Resolved};
+use crate::install::manifest::{Arch, HookKind, InstallerSpec, Resolved};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimKind, ShimSpec, ShortcutSpec, Step,
 };
+use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::safepath;
+use crate::install::script_scan::{self, Verdict};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledInfo {
@@ -42,6 +44,8 @@ pub enum PlanError {
     UnsafeArgs(String),
     #[error("não suportado: {0}")]
     Unsupported(String),
+    #[error("o script {hook} foi recusado: {}", .reasons.join("; "))]
+    ScriptRefused { hook: String, reasons: Vec<String> },
 }
 
 /// Replaces scoop manifest variables (`$dir`, `$persist_dir`, `$version`, `$app`,
@@ -197,20 +201,15 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
             "usa {k} (PowerShell/instalador próprio): suportado na fase 2c"
         )))
     };
-    if m.hooks.pre_install.is_some() {
-        return refuse("pre_install");
-    }
-    if m.hooks.post_install.is_some() {
-        return refuse("post_install");
-    }
     if m.hooks.pre_uninstall.is_some() {
         return refuse("pre_uninstall");
     }
     if m.hooks.post_uninstall.is_some() {
         return refuse("post_uninstall");
     }
-    // `.ps1` and `script` need PowerShell; a plain file runs through Task 151.
-    if m.installer.as_ref().is_some_and(needs_powershell) {
+    // A `.ps1` file needs PowerShell; a plain file runs through Task 151 and `installer.script`
+    // through the script host (Task 156).
+    if m.installer.as_ref().is_some_and(runs_ps1_file) {
         return refuse("installer");
     }
     if m.uninstaller.as_ref().is_some_and(needs_powershell) {
@@ -219,12 +218,35 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
     Ok(())
 }
 
+fn runs_ps1_file(spec: &InstallerSpec) -> bool {
+    spec.file
+        .as_deref()
+        .is_some_and(|f| f.to_lowercase().ends_with(".ps1"))
+}
+
 fn needs_powershell(spec: &InstallerSpec) -> bool {
-    spec.script.is_some()
-        || spec
-            .file
-            .as_deref()
-            .is_some_and(|f| f.to_lowercase().ends_with(".ps1"))
+    spec.script.is_some() || runs_ps1_file(spec)
+}
+
+/// `Step::Hook` for a manifest script, refused at planning when the scanner refuses it.
+fn hook_step(kind: HookKind, script: &str) -> Result<Step, PlanError> {
+    let report = script_scan::scan(script, PRELUDE_FUNCTIONS);
+    if report.verdict == Verdict::Refuse {
+        let reasons = report
+            .flags
+            .into_iter()
+            .filter(|f| f.verdict == Verdict::Refuse)
+            .map(|f| f.detail)
+            .collect();
+        return Err(PlanError::ScriptRefused {
+            hook: kind.key().to_string(),
+            reasons,
+        });
+    }
+    Ok(Step::Hook {
+        kind,
+        script: script.to_string(),
+    })
 }
 
 /// `Step::RunInstaller` for `installer` (Scoop `Invoke-Installer`): the file defaults to the
@@ -291,8 +313,17 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         });
     }
     steps.push(Step::Promote);
+    if let Some(script) = &m.hooks.pre_install {
+        steps.push(hook_step(HookKind::PreInstall, script)?);
+    }
     if let Some(spec) = &m.installer {
-        steps.push(installer_step(m, spec, &layout.version_dir(app, version))?);
+        // install.ps1 Invoke-Installer: the file runs only with `file` or `args`, then the script.
+        if spec.file.is_some() || !spec.args.is_empty() {
+            steps.push(installer_step(m, spec, &layout.version_dir(app, version))?);
+        }
+        if let Some(script) = &spec.script {
+            steps.push(hook_step(HookKind::InstallerScript, script)?);
+        }
     }
     for p in &m.persist {
         steps.push(Step::Persist(PersistSpec {
@@ -364,6 +395,9 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         }
     }
     steps.push(Step::EnsureShimsOnPath);
+    if let Some(script) = &m.hooks.post_install {
+        steps.push(hook_step(HookKind::PostInstall, script)?);
+    }
     steps.push(Step::WriteManifest {
         json: m.raw_json.clone(),
     });

@@ -75,6 +75,8 @@ pub fn build_ctx<'a>(
             Runners {
                 innounp: inno_win::run,
                 installer: Some(installer_win::run),
+                // No production path grants consent to scripts before Task 161.
+                scripts: None,
             },
         )
     };

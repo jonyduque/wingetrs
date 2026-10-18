@@ -107,9 +107,10 @@ fn env_and_depends() {
 #[test]
 fn unsupported_manifests_say_why() {
     let reason = |f: &str| refusal(&fx(f)).unwrap_or_else(|| panic!("{f}: not refused"));
-    assert!(reason("unsup-script__main__7zip.json").contains("post_install"));
-    let r = reason("unsup-innosetup__main__boost.json");
-    assert!(r.contains("innosetup") || r.contains("pre_install"), "{r}");
+    // `post_install` runs through the script host since Task 156; its `uninstaller.script` does not yet.
+    assert!(reason("unsup-script__main__7zip.json").contains("uninstaller"));
+    // `innosetup` (Task 147) and `pre_install` (Task 156) are both planned now.
+    assert_eq!(refusal(&fx("hooks-innosetup__main__boost.json")), None);
     let nohash = r#"{"version":"1","url":"https://x/a.zip"}"#;
     assert!(
         matches!(resolve(nohash, Arch::X64), Err(ManifestError::Unsupported { reason }) if reason.contains("sem hash"))
@@ -167,8 +168,6 @@ fn hash_count_mismatch() {
 #[test]
 fn support_keys_inside_architecture_variant() {
     for (k, v) in [
-        ("pre_install", r#""x""#),
-        ("post_install", r#""x""#),
         ("pre_uninstall", r#""x""#),
         ("post_uninstall", r#""x""#),
         ("installer", r#"{"file":"a.ps1"}"#),
