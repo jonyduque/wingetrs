@@ -33,6 +33,7 @@ mod install_msi_live;
 mod install_msi_queue;
 mod install_ops;
 mod install_planner;
+mod install_progress;
 mod install_residue;
 mod install_shim;
 mod install_state;

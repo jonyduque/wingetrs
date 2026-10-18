@@ -130,3 +130,62 @@ Testes (`tests/it/cli_cancel.rs`, sem sinal real: injete o "Ctrl+C" como um futu
 4. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `fix(cli): Ctrl+C cancels an install before msiexec starts and waits once it runs`
+
+---
+
+### Task 141: Progresso tipado por fase e sinais de vida (nunca uma tela parada)
+
+**Modelo:** opus (revisor opus). Roda **antes** da Task 140 (a 140 passa a usar a fase tipada do Windows Installer).
+
+**Pedido do usuário (2026-10-17):** "Melhore o feedback para o usuário. Pq precisa ter um spinner, com algum aviso de demora, ou outra coisa que faça com que o usuário saiba que não travou e que está acontecendo alguma coisa."
+
+**Medido na prova da 2b:** `install main/rust --allow-msiexec` com o MSI em cache: nenhum evento de download, a extração própria (que recusa o MSI) não emite nada, e o `msiexec /a` levou 7 min sem nenhum sinal na tela. O log `/l*v` do `msiexec` (UTF-16LE com BOM `FF FE`) cresceu até 142 MB, com uma linha `File: <caminho>\SourceDir\<relativo>;	To be installed;…` por arquivo copiado.
+
+#### Where this fits
+
+- `src/install/download.rs:89`: `pub type Progress<'a> = &'a (dyn Fn(&str, u64, Option<u64>) + Send + Sync)`; download chama `progress(url, done, total)` (~:215).
+- `src/install/executor.rs`: `ExecCtx.progress` (~:81); passos `Download`/`Extract`/`Promote`/`Shim`/…; `INSTALLER_RUNNING` (~:868) mandado pelo mesmo callback (~:709); `extract_with_msiexec` (~:891) sabe o caminho do log (`layout.msiexec_log(app, attempt)`) e do `SourceDir`.
+- `src/install/msiexec_win.rs`: `msiexec_admin` (laço de `try_wait` a cada 250 ms; `WARN_AFTER` 600 s só no log).
+- Consumidores: `src/cli/run_win.rs` + `cli/install_cmd.rs` (`LineProgress`, Task 139) + `cli/output.rs` (`Phases`); `src/tui/jobs.rs` (`progress_msg`, `ProgressThrottle`, `Msg::InstallerRunning`/`InstallProgress`) + `tui/view.rs` (`progress_text`). `grep -rn "progress" src/cli src/tui src/install` antes de mudar.
+- Armadilha: `docs/ARMADILHAS.md`, "Rótulo especial no callback de progresso só tratado num consumidor".
+
+#### What binds this task
+
+1. **Evento tipado** no lugar do rótulo texto: `Progress` passa a receber `&ProgressEvent` (`install::progress` ou `download.rs`):
+   - `Download { url, done, total }`;
+   - `Phase(Phase)` com `Phase::{Preparing, Extracting { file, engine }, Installer { log: PathBuf }, Placing, Linking, Recording}` (nomes livres, um por passo do executor que pode demorar); o executor emite a fase **ao começar** cada passo, inclusive quando o download veio do cache;
+   - `INSTALLER_RUNNING` some (vira `Phase::Installer`). Todo consumidor faz `match` exaustivo (sem `_ =>`), para o compilador apontar o consumidor esquecido.
+2. **Linha sempre viva no CLI** (TTY): do primeiro instante da operação até o fim há uma linha com spinner animado e o relógio da fase atual (`mm:ss`):
+   - `⠋ Baixando [#####-----] 45%  12.3 / 27.0 MiB · 3.1 MiB/s · ~6 s` (velocidade média dos últimos ~3 s, estimativa só com total conhecido);
+   - download sem bytes novos há 10 s: a linha ganha `· sem dados há 12 s` (em estilo de aviso);
+   - `⠋ Extraindo rust-…msi (MSI) · 00:04`, `⠋ Colocando os arquivos · 00:01`, `⠋ Criando comandos`, `⠋ Registrando`;
+   - Windows Installer: `⠋ Windows Installer · 03:12 · 18.304 arquivos · share/doc/rust/html/…/constant._MM_FROUND_FLOOR.html` — o contador e o arquivo atual vêm do **fim** do log do `msiexec` (ler só os últimos ~8 KiB a cada ~1 s, decodificar UTF-16LE alinhado em par, achar a última linha `File: …;	To be installed`; contador = aumento estimado pelo número dessas linhas desde a última leitura, ou omitido se não der para contar sem ler o arquivo todo — diga o que fez). Caminho cortado pela esquerda para caber em 100 colunas.
+   - Windows Installer sem crescimento do log há 60 s: `· sem atividade há 1 min; o Windows Installer pode estar esperando outro instalador`.
+   - Primeira vez que o Windows Installer passa de 30 s: uma linha fixa (não redesenhada) acima da animação: `O Windows Installer pode levar vários minutos em pacotes grandes; não feche o terminal.`
+3. **TUI:** a barra de status mostra a mesma fase e relógio (reaproveitando a função pura de texto da fase do CLI, sem ANSI), com o throttle atual; o `Msg::InstallerRunning` continua bloqueando o cancelamento como hoje.
+4. **Não TTY:** nenhuma animação; uma linha simples por mudança de fase (`Baixando…`, `Extraindo…`, `Windows Installer…`), para logs redirecionados mostrarem o andamento.
+5. **Leitura do log é só leitura**, no processo do wingetrs (não elevado), arquivo aberto com compartilhamento de leitura/escrita (o serviço do Windows Installer continua gravando); erro de leitura ⇒ a linha mostra só fase e relógio.
+
+**Files:**
+- Modify: `src/install/download.rs`, `src/install/executor.rs`, `src/install/ops.rs`, `src/cli/run_win.rs`, `src/cli/install_cmd.rs`, `src/cli/output.rs`, `src/tui/jobs.rs`, `src/tui/run.rs`, `src/tui/view.rs`, testes que constroem `Progress`/`ExecCtx`
+- Create: `src/install/msiexec_log.rs` (tail UTF-16LE, pura sobre `Read + Seek`)
+- Test: `tests/it/install_progress.rs` (**já criado pelo orquestrador** com uma linha `//!`; não edite `tests/it/main.rs`)
+
+Testes (`tests/it/install_progress.rs`):
+1. `cached_install_emits_phases_in_order`: execução com download em cache (ctx falso) ⇒ eventos `Phase` na ordem dos passos, sem nenhum `Download`, primeiro evento antes da extração.
+2. `phase_line_has_spinner_and_clock`: o formatador puro com relógio injetado (`Instant` de base + agora) ⇒ `Extraindo … · 00:04`.
+3. `download_line_speed_eta_and_stall`: amostras injetadas (tempo + bytes) ⇒ velocidade e estimativa; 12 s sem bytes ⇒ `sem dados há 12 s`.
+4. `msiexec_log_tail_reads_last_file`: log UTF-16LE com BOM gerado no teste (várias linhas `File: C:\x\SourceDir\a\b.txt;	To be installed;…`), lido por `Cursor` ⇒ arquivo atual `a\b.txt`; início do trecho caindo no meio de um caractere (offset ímpar) ⇒ ainda decodifica.
+5. `installer_idle_warning_after_60s`: tamanho do log parado por 61 s (relógio injetado) ⇒ aviso de sem atividade.
+6. `not_a_tty_prints_one_line_per_phase`: modo não TTY ⇒ uma linha por fase, sem `\r` e sem ANSI.
+7. `tui_status_shows_phase_and_clock`: estado sintético da TUI com `Phase::Installer` ⇒ texto da barra de status com relógio.
+
+#### Checks beyond the steps
+
+1. Mutação: o executor deixar de emitir a fase quando o download vem do cache ⇒ teste 1 **PEGA**.
+2. Mutação: decodificar o log sem alinhar em par ⇒ teste 4 **PEGA**.
+3. Mutação: tirar o aviso de 60 s ⇒ teste 5 **PEGA**.
+4. Rode `install main/fastfetch` e `uninstall` reais (raiz real autorizada para esse app) e cole a saída não TTY. A prova TTY com o `rust` é feita pelo orquestrador com o usuário.
+5. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(install): typed progress phases with live signs in the CLI and the TUI`
