@@ -1171,7 +1171,14 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
     let uncommented: Vec<char> = strip_comments(script).chars().collect();
     let n = chars.len();
     let mut mask = vec![false; n];
+    if global_named_outside_conditions(&uncommented) {
+        return mask;
+    }
     let mut last_close: Option<usize> = None;
+    // Brace depth in code: only top-level blocks are masked. A block nested in any `{}`
+    // may be a scriptblock run elsewhere (`Start-Job`, `pwsh -c`), where `$global` is
+    // not the runner's constant.
+    let mut depth = 0usize;
     let mut i = 0;
     // Same tokenizing as `blank`: the keyword counts only in code.
     while i < n {
@@ -1207,6 +1214,14 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
                     i += 1;
                 }
             }
+            '{' => {
+                depth += 1;
+                i += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
             _ => {
                 let starts_word = prev.is_none_or(|p| !continues_word(p) && p != '$');
                 let keyword = ["if", "elseif"].into_iter().find(|k| {
@@ -1235,7 +1250,7 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
                     Some(_) => before.is_some() && before == last_close,
                     None => false,
                 };
-                match keyword.filter(|_| starts_word && statement) {
+                match keyword.filter(|_| starts_word && statement && depth == 0) {
                     Some(k) => match global_block(&chars, i + k.len()) {
                         Some((open, close)) => {
                             mask[open + 1..close].iter_mut().for_each(|m| *m = true);
@@ -1295,22 +1310,8 @@ fn global_block(chars: &[char], j: usize) -> Option<(usize, usize)> {
     let close_paren = (j + 1..n)
         .take_while(|&k| chars[k] != '\n')
         .find(|&k| chars[k] == ')')?;
-    let cond: String = chars[j + 1..close_paren]
-        .iter()
-        .collect::<String>()
-        .trim()
-        .to_ascii_lowercase();
-    let rest = cond.strip_prefix("$global")?;
-    let and = rest
-        .strip_prefix(char::is_whitespace)
-        .map(str::trim_start)
-        .and_then(|r| r.strip_prefix("-and"))
-        .is_some_and(|r| r.starts_with(char::is_whitespace));
-    if !(rest.is_empty() || and) {
-        return None;
-    }
-    let banned = ['(', '!', '\'', '"', '`', '|', ';', '{', '}', '#', '@'];
-    if cond.contains(banned) || ["-or", "-xor", "-not"].iter().any(|op| cond.contains(op)) {
+    let cond: String = chars[j + 1..close_paren].iter().collect();
+    if !global_condition(&cond) {
         return None;
     }
     let mut k = skip_blank(close_paren + 1);
@@ -1481,4 +1482,98 @@ fn statement_position(view: &[char], i: usize) -> bool {
         }),
         Some(_) => false,
     }
+}
+/// Allowlist of `if`/`elseif` conditions that are false with the constant `$global`:
+/// ASCII only, exactly `$global` or `$global -and $<identifier>` (blanks between). pwsh
+/// also reads U+2013..U+2015 as operator dashes (`$global -and $x –or $true` runs), so
+/// anything else, any non-ASCII char included, is not a dead condition.
+fn global_condition(cond: &str) -> bool {
+    if !cond.is_ascii() {
+        return false;
+    }
+    let parts: Vec<String> = cond
+        .split([' ', '\t'])
+        .filter(|p| !p.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let ident = |p: &str| {
+        p.strip_prefix('$').is_some_and(|r| {
+            !r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    match parts.as_slice() {
+        [g] => g == "$global",
+        [g, and, x] => g == "$global" && and == "-and" && ident(x),
+        _ => false,
+    }
+}
+
+/// Whether `view` (comments blanked) has a `global` word that is neither inside an
+/// `if (...)`/`elseif (...)` condition nor part of the exact `-Global:$global` passthrough.
+/// `$global` is constant only in the runner's runspace: a script that names it elsewhere
+/// (`$global = $true` inside `Start-Job`, `pwsh -c`, a parameter...) gets no masking.
+fn global_named_outside_conditions(view: &[char]) -> bool {
+    let n = view.len();
+    let lower: Vec<char> = view.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let at = |k: usize, s: &str| {
+        let s: Vec<char> = s.chars().collect();
+        k + s.len() <= n && lower[k..k + s.len()] == s[..]
+    };
+    // Condition ranges `(` .. `)` of every `if`/`elseif` (same line).
+    let mut conditions: Vec<(usize, usize)> = Vec::new();
+    for k in 0..n {
+        if k.checked_sub(1)
+            .is_some_and(|p| word(lower[p]) || matches!(lower[p], '$' | '-'))
+        {
+            continue;
+        }
+        let kw = if at(k, "elseif") {
+            6
+        } else if at(k, "if") {
+            2
+        } else {
+            continue;
+        };
+        if lower.get(k + kw).is_some_and(|c| word(*c)) {
+            continue;
+        }
+        let mut j = k + kw;
+        while j < n && matches!(lower[j], ' ' | '\t') {
+            j += 1;
+        }
+        if lower.get(j) != Some(&'(') {
+            continue;
+        }
+        let mut depth = 0usize;
+        for (m, &c) in lower.iter().enumerate().skip(j) {
+            match c {
+                '\n' => break,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        conditions.push((j, m));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (0..n).any(|k| {
+        let token = at(k, "global")
+            && k.checked_sub(1).is_none_or(|p| !word(lower[p]))
+            && lower.get(k + 6).is_none_or(|c| !word(*c));
+        if !token {
+            return false;
+        }
+        let in_condition = conditions.iter().any(|&(a, b)| a < k && k < b);
+        let passthrough =
+            (k >= 1 && at(k - 1, "-global:$global") && lower.get(k + 14).is_none_or(|c| !word(*c)))
+                || (k >= 9
+                    && at(k - 9, "-global:$global")
+                    && lower.get(k + 6).is_none_or(|c| !word(*c)));
+        !(in_condition || passthrough)
+    })
 }

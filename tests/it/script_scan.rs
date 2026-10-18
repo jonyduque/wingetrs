@@ -739,7 +739,7 @@ fn global_block_forms_that_are_informational() {
         format!("if (  $GLOBAL  ) {{ {HKLM} }}"),
         format!("if ($global) {{ $y = 1 }} elseif ($global) {{ {HKLM} }}"),
         format!("if ($global)\n{{\n    {HKLM}\n}}"),
-        format!("if ($global -and   $x -eq 1) {{ {HKLM} }}"),
+        format!("if ($global -and   $x_1) {{ {HKLM} }}"),
         format!("if ($global) {{\n    # machine-wide\n    {HKLM}\n}}"),
         format!("if ($global) {{ $h = @{{ a = 1 }}; {HKLM} }}"),
         format!("if ($global) {{ if ($x) {{ {HKLM} }} }}"),
@@ -755,6 +755,9 @@ fn global_block_doubts_fail_closed() {
     for s in [
         // Conditions other than `$global` / `$global -and ...`.
         format!("if (($global)) {{ {HKLM} }}"),
+        format!("if ($global -and   $x -eq 1) {{ {HKLM} }}"),
+        format!("if ($global -and $x.y) {{ {HKLM} }}"),
+        format!("if ($global -and $x $y) {{ {HKLM} }}"),
         format!("if ($global -and (Test-Path $x)) {{ {HKLM} }}"),
         format!("if (-not $global) {{ {HKLM} }}"),
         format!("if ($global -and -not $x) {{ {HKLM} }}"),
@@ -905,6 +908,7 @@ fn global_block_only_in_statement_position() {
         format!("f | g if ($global) {{ {HKLM} }}"),
         format!("f a, if ($global) {{ {HKLM} }}"),
         format!(". if ($global) {{ {HKLM} }}"),
+        format!("& {{ if ($global) {{ {HKLM} }} }}"),
         // Line continuation: `if` on the next line is still an argument.
         format!("& {{ param($a,$b,$c) & $c }} `\nif ($global) {{ {HKLM} }}"),
         format!("& {{ param($a,$b,$c) & $c }} `\r\n  if ($global) {{ {HKLM} }}"),
@@ -924,10 +928,65 @@ fn global_block_only_in_statement_position() {
     for s in [
         format!("$a = 1; if ($global) {{ {HKLM} }}"),
         format!("$a = 1\n  if ($global) {{ {HKLM} }}"),
-        format!("& {{ if ($global) {{ {HKLM} }} }}"),
         format!("$a = 1 # note\nif ($global) {{ {HKLM} }}"),
         // A continuation onto an empty line ends there.
         format!("$a = `\n\nif ($global) {{ {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert!(informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+#[test]
+fn global_condition_unicode_dashes_fail_closed() {
+    // pwsh reads U+2013, U+2014 and U+2015 as operator dashes: `-or $true` runs the body.
+    for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
+        let s = format!("if ($global -and $x {dash}or $true) {{ {HKLM} }}");
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        let s = format!("if ($global {dash}and $x) {{ {HKLM} }}");
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn global_block_in_another_runspace_fails_closed() {
+    for s in [
+        // `$global` is the runner's constant only in its own runspace.
+        format!("Start-Job {{ $global = $true; if ($global) {{ {HKLM} }} }}"),
+        format!("pwsh -c {{ $global = $true; if ($global) {{ {HKLM} }} }}"),
+        // Nested in any `{}`: never masked.
+        format!("foreach ($a in $b) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("foreach ($a in $b) {{\n    if ($global) {{\n        {HKLM}\n    }}\n}}"),
+        format!("function f {{ if ($global) {{ {HKLM} }} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn global_named_elsewhere_disables_masking() {
+    for s in [
+        format!("$global = $true\nif ($global) {{ {HKLM} }}"),
+        format!("appdir $app $global\nif ($global) {{ {HKLM} }}"),
+        format!("Start-Job {{ $global = $true }}\nif ($global) {{ {HKLM} }}"),
+        format!("$x = \"$global\"\nif ($global) {{ {HKLM} }}"),
+        format!("Add-Path x -Global\nif ($global) {{ {HKLM} }}"),
+        format!("$global:y = 1\nif ($global) {{ {HKLM} }}"),
+        format!("if ($global) {{ Add-Path x -Global; {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+    }
+    // In conditions and in the exact `-Global:$global` passthrough it does not count.
+    for s in [
+        format!("if (!$global) {{ $a = 1 }}\nif ($global) {{ {HKLM} }}"),
+        format!("Get-Thing x -Global:$global\nif ($global) {{ {HKLM} }}"),
+        format!("# $global = $true\nif ($global) {{ {HKLM} }}"),
+        format!("$globaldir = 1\nif ($global) {{ {HKLM} }}"),
     ] {
         let r = scan(&s, SUP);
         assert!(informational(&r), "{s}: {:?}", r.flags);

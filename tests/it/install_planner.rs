@@ -265,31 +265,10 @@ fn display_snapshots_for_every_supported_fixture() {
 
 #[test]
 fn scanner_refusal_of_a_real_manifest_script_stops_the_plan() {
-    // The 7zip bucket manifest rewrites HKCU to HKLM in `post_install`, only inside
-    // `if ($global) { ... }`: informational since Task 164, so it plans.
-    plan("refused-script__main__7zip.json", None, false).unwrap();
-    // The same script without the guard is refused at planning.
-    let guarded = "if ($global) { $content = $content -replace 'HKEY_CURRENT_USER(?=.+Classes)', 'HKEY_LOCAL_MACHINE' }";
-    let raw = fx("refused-script__main__7zip.json");
-    assert!(raw.contains(guarded));
-    let unguarded = raw.replace(
-        guarded,
-        "$content = $content -replace 'HKEY_CURRENT_USER(?=.+Classes)', 'HKEY_LOCAL_MACHINE'",
-    );
-    let m = resolve(&unguarded, Arch::X64).unwrap();
-    let l = root();
-    let e = plan_install(&PlanInput {
-        app: "app",
-        bucket: "main",
-        manifest: &m,
-        layout: &l,
-        shortcut_root: Path::new(SC),
-        installed: None,
-        launcher_present: false,
-        keep_old: false,
-        manifest_sha256: "",
-    })
-    .unwrap_err();
+    // The 7zip bucket manifest rewrites HKCU to HKLM in `post_install`: refused at planning.
+    // The rewrite sits in `if ($global)`, but nested in a `ForEach-Object { }` scriptblock,
+    // which the gate never masks (Task 164).
+    let e = plan("refused-script__main__7zip.json", None, false).unwrap_err();
     assert!(
         matches!(&e, PlanError::ScriptRefused { hook, .. } if hook == "post_install"),
         "{e:?}"
