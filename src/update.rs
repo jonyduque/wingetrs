@@ -130,6 +130,8 @@ struct Job<'a> {
     source: String,
     kind: SourceKind,
     url: &'a str,
+    /// Bucket name, for scoop jobs.
+    bucket: Option<&'a str>,
 }
 
 async fn fetch_one(
@@ -205,17 +207,26 @@ pub async fn run_update(
         source: SOURCE_NAME.to_string(),
         kind: SourceKind::Winget,
         url: &endpoints.winget_index,
+        bucket: None,
     }];
     for (b, url) in &endpoints.scoop {
         jobs.push(Job {
             source: source_name(b),
             kind: SourceKind::Scoop,
             url,
+            bucket: Some(b),
         });
     }
 
     let fetches = jobs.iter().map(|job| {
-        let prev = state.get(job.url).cloned();
+        let mut prev = state.get(job.url).cloned();
+        // Without the marker the stored `scripts/` is missing or incomplete: refetch the tarball.
+        if let Some(dir) = job.bucket.and_then(|b| bucket_dir(data, b)) {
+            let marker = dir.join(".scripts-ok");
+            if !marker.exists() {
+                prev = None;
+            }
+        }
         let skip = !force && !needs_refresh(&state, &[job.url], now);
         let span = tracing::debug_span!("update.fetch", source = %job.source);
         async move {
@@ -253,16 +264,19 @@ pub async fn run_update(
                 None => no_catalog(),
             },
             Some(Ok(Fetched::Scoop(imp, entry))) => match catalog.as_mut() {
-                Some(c) => apply(
-                    c,
-                    &mut state,
-                    job,
-                    entry,
-                    now,
-                    &imp.packages,
-                    &WingetMaps::default(),
-                    imp.skipped.len(),
-                ),
+                Some(c) => {
+                    store_scripts(data, job, &imp.scripts);
+                    apply(
+                        c,
+                        &mut state,
+                        job,
+                        entry,
+                        now,
+                        &imp.packages,
+                        &WingetMaps::default(),
+                        imp.skipped.len(),
+                    )
+                }
                 None => no_catalog(),
             },
         };
@@ -291,6 +305,29 @@ pub async fn run_update(
     tracing::debug_span!("update.blob_prune").in_scope(|| prune_blobs(data));
     saved?;
     Ok(reports)
+}
+
+/// `<root>\buckets\<bucket>` when the name is one safe path component.
+fn bucket_dir(data: &DataDir, bucket: &str) -> Option<std::path::PathBuf> {
+    match crate::install::safepath::safe_components(bucket) {
+        Some(p) if p.len() == 1 => Some(data.buckets_dir().join(&p[0])),
+        _ => None,
+    }
+}
+
+/// Stores the bucket's `scripts/` folder; a failure only costs the scripts (the marker is
+/// dropped so the next update refetches unconditionally) and never fails the update.
+fn store_scripts(data: &DataDir, job: &Job<'_>, scripts: &[(String, Vec<u8>)]) {
+    let Some(dir) = job.bucket.and_then(|b| bucket_dir(data, b)) else {
+        return;
+    };
+    let tag = std::process::id().to_string();
+    let res = tracing::debug_span!("update.scripts")
+        .in_scope(|| crate::sources::scoop::bucket::write_scripts(&dir, scripts, &tag));
+    if let Err(e) = res {
+        tracing::warn!(source = %job.source, error = %e, "could not store the bucket scripts");
+        let _ = std::fs::remove_file(dir.join(".scripts-ok"));
+    }
 }
 
 /// Best-effort blob cleanup under the install lock; never fails the update.
@@ -407,6 +444,7 @@ mod tests {
             BucketImport {
                 packages: vec![],
                 skipped: vec![],
+                scripts: vec![],
             },
             HttpEntry::default(),
         )))];

@@ -207,6 +207,13 @@ pub fn remove_and_cleanup(
             }
         }
     }
+    if crate::install::safepath::safe_components(name).is_some_and(|p| p.len() == 1) {
+        let dir = data.buckets_dir().join(name);
+        if dir.exists() {
+            crate::fs_retry::retry("apagar", &dir, || std::fs::remove_dir_all(&dir))
+                .map_err(|e| BucketError::State(e.to_string()))?;
+        }
+    }
     if let Some(repo) = repo {
         let path = data.http_state_path();
         let mut state = crate::cache::HttpState::load(&path);

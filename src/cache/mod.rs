@@ -89,6 +89,10 @@ impl DataDir {
     pub fn config_path(&self) -> PathBuf {
         self.root.join("config.toml")
     }
+    /// `<root>\buckets`: per-bucket data kept next to the catalog (`scripts/` folders).
+    pub fn buckets_dir(&self) -> PathBuf {
+        self.root.join("buckets")
+    }
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
     }
