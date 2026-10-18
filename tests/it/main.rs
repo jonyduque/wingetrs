@@ -9,6 +9,7 @@ mod bridge;
 mod buckets;
 mod cache;
 mod catalog;
+mod classify_2c;
 mod cli_cancel;
 mod cli_color;
 mod cli_install;
