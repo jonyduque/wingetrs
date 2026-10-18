@@ -1452,9 +1452,7 @@ fn successful_save_is_remembered_and_announced() {
 fn forced_glyphs_cannot_be_changed() {
     let mut a = on_settings();
     a.settings.glyphs_forced = true;
-    for _ in 0..7 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::Glyphs);
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert!(cmds.is_empty());
     assert_eq!(a.glyphs, GlyphSet::Nerd);
@@ -1470,9 +1468,7 @@ fn letters_do_not_type_in_settings() {
 #[test]
 fn theme_setting_flips_dark() {
     let mut a = on_settings();
-    for _ in 0..11 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::Theme);
     update(&mut a, key(KeyCode::Enter));
     assert!(!a.dark);
 }
@@ -1517,9 +1513,7 @@ fn forced_glyphs_are_not_written_when_another_setting_changes() {
 #[test]
 fn changed_glyphs_are_written() {
     let mut a = on_settings();
-    for _ in 0..7 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::Glyphs);
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert!(matches!(
         cmds.as_slice(),
@@ -2095,9 +2089,7 @@ fn list_encodes_only_cached_icons() {
 #[test]
 fn icons_setting_cycles_and_saves() {
     let mut a = on_settings();
-    for _ in 0..8 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::Icons);
     let mut seen = Vec::new();
     for _ in 0..4 {
         let cmds = update(&mut a, key(KeyCode::Enter));
@@ -2141,11 +2133,9 @@ fn icon_encoded_for_an_old_protocol_is_discarded() {
         cmds.as_slice(),
         [Cmd::EncodeIcon { generation: 0, .. }]
     ));
-    // Switch to Sixel (Ícones is the 9th row) while that encode is in flight.
+    // Switch to Sixel while that encode is in flight.
     a.tab = Tab::Settings;
-    for _ in 0..8 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::Icons);
     let cmds = update(&mut a, key(KeyCode::Enter));
     assert_eq!(a.icon_protocol, IconProtocol::Sixel);
     assert_eq!(a.icon_gen, 1);
@@ -2736,9 +2726,7 @@ fn shrinking_never_reemits() {
 fn list_icons_setting_cycles_saves_and_applies() {
     let mut a = icon_app(50, 10);
     a.tab = Tab::Settings;
-    for _ in 0..9 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::ListIcons);
     assert_eq!(a.settings.current_id().label(), "Ícones da lista");
     assert!(a.list_icons_visible);
     let cmds = update(&mut a, key(KeyCode::Enter));
@@ -2772,9 +2760,7 @@ fn list_icons_setting_cycles_saves_and_applies() {
 
 fn on_list_icons_row() -> App {
     let mut a = on_settings();
-    for _ in 0..9 {
-        update(&mut a, key(KeyCode::Down));
-    }
+    select_setting(&mut a, wingetrs::tui::settings::SettingId::ListIcons);
     a
 }
 

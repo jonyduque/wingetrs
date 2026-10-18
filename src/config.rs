@@ -1,4 +1,5 @@
 //! User configuration (`config.toml`).
+use serde::Deserialize;
 use std::path::Path;
 
 /// A user-added GitHub bucket (`[[buckets]]` in `config.toml`).
@@ -60,9 +61,36 @@ pub struct Behavior {
     /// Capture the terminal mouse (click, wheel); off leaves text selection to the terminal.
     pub mouse: bool,
     /// Who installs and removes winget packages.
+    #[serde(deserialize_with = "lenient_engine")]
     pub winget_engine: WingetEngine,
     /// Preferred scope when a winget package offers both.
+    #[serde(deserialize_with = "lenient_scope")]
     pub default_scope: DefaultScope,
+}
+
+/// Unknown values fall back to the default (a typo must not stop the TUI from opening).
+fn lenient_engine<'de, D: serde::Deserializer<'de>>(d: D) -> Result<WingetEngine, D::Error> {
+    let text = String::deserialize(d)?;
+    Ok(match text.as_str() {
+        "wingetrs" => WingetEngine::Wingetrs,
+        "winget" => WingetEngine::Winget,
+        other => {
+            tracing::warn!(winget_engine = %other, "unknown winget_engine setting, using wingetrs");
+            WingetEngine::default()
+        }
+    })
+}
+
+fn lenient_scope<'de, D: serde::Deserializer<'de>>(d: D) -> Result<DefaultScope, D::Error> {
+    let text = String::deserialize(d)?;
+    Ok(match text.as_str() {
+        "user" => DefaultScope::User,
+        "machine" => DefaultScope::Machine,
+        other => {
+            tracing::warn!(default_scope = %other, "unknown default_scope setting, using user");
+            DefaultScope::default()
+        }
+    })
 }
 
 impl Default for Behavior {

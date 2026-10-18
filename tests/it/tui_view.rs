@@ -1336,6 +1336,15 @@ fn settings_screen_snapshot() {
 }
 
 #[test]
+fn settings_screen_scrolls_to_the_last_row_in_24_lines() {
+    let mut a = App::new(entries(), GlyphSet::Ascii);
+    a.tab = wingetrs::tui::app::Tab::Settings;
+    a.buckets_summary = "main, extras".into();
+    a.settings.selected = wingetrs::tui::settings::ORDER.len() - 1;
+    insta::assert_snapshot!(render(&a, 100, 24));
+}
+
+#[test]
 fn split_icon_leaves_a_gap() {
     use ratatui::layout::Rect;
     use wingetrs::tui::layout::split_icon;
@@ -1759,9 +1768,10 @@ fn turning_icons_off_clears_the_cache_and_the_indent() {
     );
     assert!(!a.icons.is_empty());
     a.tab = Tab::Settings;
-    for _ in 0..8 {
-        key(&mut a, KeyCode::Down);
-    }
+    a.settings.selected = wingetrs::tui::settings::ORDER
+        .iter()
+        .position(|id| *id == wingetrs::tui::settings::SettingId::Icons)
+        .unwrap();
     key(&mut a, KeyCode::Enter);
     assert_eq!(a.settings.icons, "off");
     assert_eq!(a.icon_protocol, IconProtocol::Off);

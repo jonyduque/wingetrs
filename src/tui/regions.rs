@@ -52,6 +52,24 @@ pub fn setting_line(i: usize) -> usize {
     if i < 4 { 1 + i } else { 3 + i }
 }
 
+/// Number of lines of the settings body: the settings plus the blank line, heading and
+/// buckets line of the read-only section.
+pub fn settings_body_lines() -> usize {
+    setting_line(ORDER.len() - 1) + 4
+}
+
+/// First body line shown when `body_h` lines fit and setting `selected` must stay visible;
+/// the last setting also pulls the read-only section below it into view.
+pub fn settings_scroll(selected: usize, body_h: usize) -> usize {
+    let last = ORDER.len() - 1;
+    let target = if selected >= last {
+        settings_body_lines() - 1
+    } else {
+        setting_line(selected)
+    };
+    (target + 1).saturating_sub(body_h)
+}
+
 /// Splits `area` as `draw_screen` paints it.
 pub fn regions(app: &App, area: Rect) -> Regions {
     let mut r = Regions::default();
@@ -111,14 +129,19 @@ pub fn regions(app: &App, area: Rect) -> Regions {
     }
     if r.settings.width > 0 && r.settings.height > 0 {
         let body_h = usize::from(r.settings.height.saturating_sub(2));
+        let scroll = settings_scroll(app.settings.selected, body_h);
+        // Index-aligned with `ORDER`; a setting scrolled off the top gets an empty rect.
         r.setting_rows = (0..ORDER.len())
             .map(setting_line)
-            .take_while(|line| *line < body_h)
+            .take_while(|line| *line < body_h + scroll)
             .map(|line| {
+                if line < scroll {
+                    return Rect::default();
+                }
                 let y = r
                     .settings
                     .y
-                    .saturating_add(u16::try_from(line).unwrap_or(0));
+                    .saturating_add(u16::try_from(line - scroll).unwrap_or(0));
                 Rect::new(r.settings.x, y, r.settings.width, 1)
             })
             .collect();

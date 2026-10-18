@@ -49,8 +49,38 @@ fn old_config_without_fields_loads() {
 }
 
 #[test]
-fn invalid_engine_is_parse_error() {
-    let r = load_text("[behavior]\nwinget_engine = \"x\"\n");
+fn invalid_engine_falls_back_to_default() {
+    let cfg = load_text(
+        "[behavior]
+winget_engine = \"x\"
+default_scope = \"machine\"
+",
+    )
+    .unwrap();
+    assert_eq!(cfg.behavior.winget_engine, WingetEngine::Wingetrs);
+    assert_eq!(cfg.behavior.default_scope, DefaultScope::Machine);
+}
+
+#[test]
+fn invalid_scope_falls_back_to_default() {
+    let cfg = load_text(
+        "[behavior]
+winget_engine = \"winget\"
+default_scope = \"x\"
+",
+    )
+    .unwrap();
+    assert_eq!(cfg.behavior.winget_engine, WingetEngine::Winget);
+    assert_eq!(cfg.behavior.default_scope, DefaultScope::User);
+}
+
+#[test]
+fn wrong_type_is_still_a_parse_error() {
+    let r = load_text(
+        "[behavior]
+winget_engine = 3
+",
+    );
     assert!(matches!(r, Err(ConfigError::Parse { .. })));
 }
 

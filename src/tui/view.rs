@@ -288,7 +288,11 @@ fn draw_settings(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: 
     ]));
     let body_h = area.height.saturating_sub(2);
     let body = Rect::new(area.x, area.y, area.width, body_h.min(area.height));
-    frame.render_widget(Paragraph::new(lines), body);
+    let scroll = crate::tui::regions::settings_scroll(st.selected, usize::from(body_h));
+    frame.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(0), 0)),
+        body,
+    );
     if area.height >= 2 {
         let desc = Rect::new(area.x, area.bottom() - 1, area.width, 1);
         frame.render_widget(
