@@ -34,6 +34,8 @@ pub struct Glyphs {
     /// Next to the state of a row whose version is pinned.
     pub pin: &'static str,
     pub spinner: &'static [&'static str],
+    /// Between an old and a new value (`1.0 -> 2.0`).
+    pub arrow: &'static str,
     pub tab_search: &'static str,
     pub tab_installed: &'static str,
     pub tab_updates: &'static str,
@@ -69,6 +71,7 @@ static NERD: Glyphs = Glyphs {
     mark: "\u{f00c}",
     pin: "\u{f08d}",
     spinner: BRAILLE,
+    arrow: "\u{f061}",
     tab_search: "\u{f002}",
     tab_installed: "\u{f0a0}",
     tab_updates: "\u{f06b0}",
@@ -99,6 +102,7 @@ static UNICODE: Glyphs = Glyphs {
     mark: "✓",
     pin: "⚲",
     spinner: BRAILLE,
+    arrow: "→",
     tab_search: "⌕",
     tab_installed: "▤",
     tab_updates: "↑",
@@ -129,6 +133,7 @@ static ASCII: Glyphs = Glyphs {
     mark: "*",
     pin: "!",
     spinner: ASCII_SPINNER,
+    arrow: "->",
     tab_search: "",
     tab_installed: "",
     tab_updates: "",

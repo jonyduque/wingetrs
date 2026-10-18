@@ -261,29 +261,212 @@ pub fn not_found_text(query: &str, suggestions: &[String]) -> String {
     }
 }
 
+/// `  N. text` with the number in bold.
+fn numbered(n: usize, text: &str) -> String {
+    format!("  {}. {text}\n", paint(NAME, &n.to_string()))
+}
+
+/// File name without directory and `.lnk`.
+fn shortcut_name(link: &str) -> &str {
+    let file = link.rsplit(['\\', '/']).next().unwrap_or(link);
+    file.strip_suffix(".lnk").unwrap_or(file)
+}
+
 /// What `uninstall` is about to do, one numbered line per action.
 pub fn uninstall_plan_text(
     plan: &crate::install::plan::UninstallPlan,
-    layout: &crate::install::layout::Layout,
+    _layout: &crate::install::layout::Layout,
+    glyphs: &crate::tui::theme::Glyphs,
 ) -> String {
+    use crate::install::state::ArtifactKind as K;
     let mut s = format!(
         "{} {} {}\n",
         paint(HEADER, "Desinstalar"),
         paint(NAME, &plan.app),
         paint(VERSION, &plan.version)
     );
-    let mut n = 1;
-    let mut line = |text: String| {
-        s.push_str(&format!("{n:>3}. {text}\n"));
-        n += 1;
-    };
-    line(format!("Apagar {}", layout.app_dir(&plan.app).display()));
-    for text in plan.artifact_lines() {
-        line(text);
+    let mut lines: Vec<String> = vec!["Apaga a pasta do app".into()];
+    let of = |k: K| plan.artifacts.iter().filter(move |a| a.kind == k);
+    let shims: Vec<&str> = of(K::Shim).map(|a| a.target.as_str()).collect();
+    if !shims.is_empty() {
+        lines.push(format!("Comandos: {}", shims.join(", ")));
+    }
+    for a in of(K::Shortcut) {
+        lines.push(format!(
+            "Atalho no Menu Iniciar: {}",
+            shortcut_name(&a.target)
+        ));
+    }
+    for a in of(K::Path) {
+        match plan.path_users.iter().find(|(t, _)| *t == a.target) {
+            Some((_, users)) => lines.push(format!(
+                "PATH do usuário mantém {} (ainda usado por: {})",
+                a.target,
+                users.join(", ")
+            )),
+            None if plan.remove_path_entry => lines.push(format!(
+                "PATH do usuário {} remove {}",
+                glyphs.arrow, a.target
+            )),
+            None => {}
+        }
+    }
+    for a in of(K::Env) {
+        lines.push(format!(
+            "Variável de usuário {} volta ao valor anterior",
+            a.target
+        ));
+    }
+    for a in of(K::Persist) {
+        lines.push(if plan.purge {
+            format!("Apaga os dados: {}", a.target)
+        } else {
+            format!("Dados mantidos: {} (use --purge para apagar)", a.target)
+        });
+    }
+    for (i, text) in lines.iter().enumerate() {
+        s.push_str(&numbered(i + 1, text));
     }
     s
 }
 
+/// The short plan `install`/`upgrade` show before asking: only what touches the world
+/// outside the app folder, numbered in plan order.
+pub fn plan_summary(
+    plan: &crate::install::plan::InstallPlan,
+    layout: &crate::install::layout::Layout,
+    glyphs: &crate::tui::theme::Glyphs,
+) -> String {
+    use crate::install::archive::ArchiveKind;
+    use crate::install::plan::Step;
+    let arch = plan.arch.map_or("sem arquitetura", |a| a.key());
+    let mut s = match &plan.upgrade_from {
+        Some(old) => format!(
+            "{} {} {} {} {}",
+            paint(HEADER, "Atualizar"),
+            paint(NAME, &plan.app),
+            paint(VERSION, old),
+            glyphs.arrow,
+            paint(NEW_VERSION, &plan.version)
+        ),
+        None => format!(
+            "{} {} {}",
+            paint(HEADER, "Instalar"),
+            paint(NAME, &plan.app),
+            paint(VERSION, &plan.version)
+        ),
+    };
+    s.push_str(&paint(DIM, &format!("  {} · {arch}", plan.bucket)));
+    s.push('\n');
+    let shims: Vec<&str> = plan
+        .steps
+        .iter()
+        .filter_map(|st| match st {
+            Step::Shim(sp) => Some(sp.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let persists: Vec<String> = plan
+        .steps
+        .iter()
+        .filter_map(|st| match st {
+            Step::Persist(p) => Some(p.in_version.display().to_string()),
+            _ => None,
+        })
+        .collect();
+    let (mut shims_done, mut persists_done) = (false, false);
+    let mut lines: Vec<String> = Vec::new();
+    for step in &plan.steps {
+        match step {
+            Step::Shim(_) if !shims_done => {
+                shims_done = true;
+                lines.push(format!("Comandos: {}", shims.join(", ")));
+            }
+            Step::Persist(_) if !persists_done => {
+                persists_done = true;
+                lines.push(format!(
+                    "Dados mantidos entre versões: {}",
+                    persists.join(", ")
+                ));
+            }
+            Step::Shortcut(sc) => lines.push(format!(
+                "Atalho no Menu Iniciar: {}",
+                shortcut_name(&sc.link.display().to_string())
+            )),
+            Step::EnvSet { name, value } => {
+                lines.push(format!("Variável de usuário {name} = {value}"));
+            }
+            Step::EnvAddPath { entry } => lines.push(format!(
+                "PATH do usuário {} {}",
+                glyphs.arrow,
+                entry.display()
+            )),
+            Step::EnsureShimsOnPath => lines.push(format!(
+                "PATH do usuário {} {}",
+                glyphs.arrow,
+                layout.shims().display()
+            )),
+            Step::RemoveOldVersion { version } => {
+                lines.push(format!("Remove a versão {version}"));
+            }
+            // Shim/Persist already grouped; the rest is internal bookkeeping.
+            _ => {}
+        }
+    }
+    for (i, text) in lines.iter().enumerate() {
+        s.push_str(&numbered(i + 1, text));
+    }
+    let has_msi = plan.steps.iter().any(|st| {
+        matches!(st, Step::Download { source, .. }
+            if matches!(ArchiveKind::of(&source.file_name), Ok(ArchiveKind::Msi)))
+    });
+    if has_msi {
+        s.push_str(&paint(
+            DIM,
+            "  Se o extrator não suportar este MSI, pede --allow-msiexec\n",
+        ));
+    }
+    s
+}
+
+/// After a successful install: the command names to use once a new terminal sees the PATH
+/// folder the plan added, or `None` when the running process already has every folder.
+pub fn new_terminal_hint(
+    plan: &crate::install::plan::InstallPlan,
+    layout: &crate::install::layout::Layout,
+    process_path: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    use crate::install::plan::Step;
+    let norm = |p: &std::path::Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_lowercase()
+    };
+    let have: Vec<String> = process_path
+        .map(|p| std::env::split_paths(p).map(|d| norm(&d)).collect())
+        .unwrap_or_default();
+    let folders = plan.steps.iter().filter_map(|st| match st {
+        Step::EnsureShimsOnPath => Some(layout.shims()),
+        Step::EnvAddPath { entry } => Some(entry.clone()),
+        _ => None,
+    });
+    let missing = folders.into_iter().any(|f| !have.contains(&norm(&f)));
+    let names: Vec<&str> = plan
+        .steps
+        .iter()
+        .filter_map(|st| match st {
+            Step::Shim(sp) => Some(sp.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    (missing && !names.is_empty()).then(|| {
+        format!(
+            "{} {}",
+            paint(DIM, "Abra um terminal novo para usar:"),
+            names.join(", ")
+        )
+    })
+}
 /// One line per residue for the picker and the listings.
 pub fn residue_label(r: &crate::install::residue::Residue) -> String {
     use crate::install::residue::ResidueKind as K;
@@ -340,31 +523,73 @@ fn mib(n: u64) -> String {
     format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
 }
 
-/// Single-line download progress, padded so a shorter line fully overwrites a longer one.
-pub fn progress_line(done: u64, total: Option<u64>) -> String {
-    let text = match total {
-        Some(t) if t > 0 => format!(
-            "Baixando: {} / {} ({}%)",
-            mib(done),
-            mib(t),
-            (done.min(t) * 100) / t
-        ),
-        _ => format!("Baixando: {}", mib(done)),
-    };
-    format!("{text:<60}")
+/// Phase of an install as the CLI shows it on one stderr line: downloads (summed over all
+/// URLs), the Windows Installer, then "Instalando…". Pure state; the caller draws.
+#[derive(Default)]
+pub struct Phases {
+    per_url: std::collections::BTreeMap<String, (u64, Option<u64>)>,
+    installer_since: Option<std::time::Instant>,
 }
 
+impl Phases {
+    pub fn new() -> Phases {
+        Phases::default()
+    }
+
+    /// One progress event: `label` is a download URL, except `INSTALLER_RUNNING`.
+    pub fn update(&mut self, label: &str, done: u64, total: Option<u64>) {
+        if label == crate::install::executor::INSTALLER_RUNNING {
+            // Each launch restarts the clock; it is never a download.
+            self.installer_since = Some(std::time::Instant::now());
+        } else {
+            self.installer_since = None;
+            self.per_url.insert(label.to_string(), (done, total));
+        }
+    }
+
+    /// The line for spinner frame `frame`, or `None` while there is nothing to show.
+    pub fn line(&self, frame: usize, glyphs: &crate::tui::theme::Glyphs) -> Option<String> {
+        let spin = glyphs.spinner.get(frame % glyphs.spinner.len().max(1))?;
+        if let Some(since) = self.installer_since {
+            let secs = since.elapsed().as_secs();
+            return Some(format!(
+                "{spin} Windows Installer (msiexec /a) · não pode ser cancelado · {:02}:{:02}",
+                secs / 60,
+                secs % 60
+            ));
+        }
+        if self.per_url.is_empty() {
+            return None;
+        }
+        let done: u64 = self.per_url.values().map(|(d, _)| d).sum();
+        let known = self.per_url.values().all(|(_, t)| t.is_some());
+        let total: u64 = self.per_url.values().filter_map(|(_, t)| *t).sum();
+        let finished = self
+            .per_url
+            .values()
+            .all(|(d, t)| t.is_some_and(|t| *d >= t));
+        if finished {
+            return Some(format!("{spin} Instalando…"));
+        }
+        Some(match known.then_some(total).filter(|t| *t > 0) {
+            Some(t) => {
+                let pct = done.min(t) * 100 / t;
+                let filled = usize::try_from(pct / 5).unwrap_or(20).min(20);
+                format!(
+                    "{spin} Baixando [{}{}] {pct}%  {:.1} / {}",
+                    "#".repeat(filled),
+                    "-".repeat(20 - filled),
+                    done as f64 / (1024.0 * 1024.0),
+                    mib(t)
+                )
+            }
+            None => format!("{spin} Baixando {}", mib(done)),
+        })
+    }
+}
 #[cfg(test)]
 mod install_output_tests {
     use super::*;
-
-    #[test]
-    fn progress_line_shows_percent_and_pads() {
-        let l = progress_line(512 * 1024, Some(1024 * 1024));
-        assert!(l.starts_with("Baixando: 0.5 MiB / 1.0 MiB (50%)"), "{l}");
-        assert_eq!(l.chars().count(), 60);
-        assert!(progress_line(10, None).starts_with("Baixando: 0.0 MiB"));
-    }
 
     #[test]
     fn ambiguous_text_lists_bucket_ids() {

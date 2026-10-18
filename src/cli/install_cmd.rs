@@ -6,11 +6,13 @@ use crate::install::residue::{self, Confidence, Residue};
 use crate::install::target::Candidate;
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::picker::PickerItem;
+use crate::tui::theme::Glyphs;
 use anyhow::bail;
-use std::collections::BTreeMap;
+use output::Phases;
 use std::io::Write;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 /// Everything the commands ask of the user. Production: [`TtyUi`].
 pub trait Ui {
@@ -23,22 +25,32 @@ pub trait Ui {
         items: Vec<PickerItem>,
         initial: &[bool],
     ) -> anyhow::Result<Option<Vec<usize>>>;
+    /// Glyph set for the short plans (arrows).
+    fn glyphs(&self) -> &'static Glyphs {
+        Glyphs::for_set(crate::tui::theme::GlyphSet::Ascii)
+    }
+    /// Stops and erases the progress line; called before anything else is printed.
+    fn end_progress(&self) {}
 }
 
 pub struct TtyUi {
     theme: crate::tui::theme::Theme,
-    glyphs: &'static crate::tui::theme::Glyphs,
+    glyphs: &'static Glyphs,
+    progress: Arc<LineProgress>,
 }
 
 impl TtyUi {
     pub fn new(cfg: &crate::config::Config) -> TtyUi {
-        use crate::tui::theme::{GlyphSet, Glyphs, Theme, detect_depth};
+        use crate::tui::theme::{GlyphSet, Theme, detect_depth};
+        use std::io::IsTerminal;
         let set = match cfg.glyphs.as_str() {
             "unicode" => GlyphSet::Unicode,
             "ascii" => GlyphSet::Ascii,
             _ => GlyphSet::Nerd,
         };
+        let glyphs = Glyphs::for_set(set);
         TtyUi {
+            progress: Arc::new(LineProgress::new(std::io::stderr().is_terminal(), glyphs)),
             theme: Theme::new(
                 cfg.theme != "light",
                 detect_depth(
@@ -46,8 +58,13 @@ impl TtyUi {
                     std::env::var("NO_COLOR").ok().as_deref(),
                 ),
             ),
-            glyphs: Glyphs::for_set(set),
+            glyphs,
         }
+    }
+
+    /// The progress line this UI stops through [`Ui::end_progress`]; feed it to `OpsCtx.progress`.
+    pub fn progress(&self) -> Arc<LineProgress> {
+        Arc::clone(&self.progress)
     }
 }
 
@@ -60,6 +77,14 @@ fn is_yes(answer: &str) -> bool {
 }
 
 impl Ui for TtyUi {
+    fn glyphs(&self) -> &'static Glyphs {
+        self.glyphs
+    }
+
+    fn end_progress(&self) {
+        self.progress.finish();
+    }
+
     fn interactive(&self) -> bool {
         super::picker::is_interactive()
     }
@@ -90,49 +115,120 @@ impl Ui for TtyUi {
     }
 }
 
-/// Aggregated one-line download progress on stderr; a no-op unless `enabled` (a TTY).
-pub struct LineProgress {
-    enabled: bool,
+/// Width every progress line is padded to, so a shorter one fully overwrites a longer one.
+const LINE_WIDTH: usize = 79;
+const TICK: Duration = Duration::from_millis(120);
+
+struct ProgressState {
+    glyphs: &'static Glyphs,
+    phases: Mutex<Phases>,
+    frame: AtomicUsize,
     drawn: AtomicBool,
-    per_url: Mutex<BTreeMap<String, (u64, Option<u64>)>>,
 }
 
-impl LineProgress {
-    pub fn new(enabled: bool) -> LineProgress {
-        LineProgress {
-            enabled,
-            drawn: AtomicBool::new(false),
-            per_url: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    pub fn update(&self, url: &str, done: u64, total: Option<u64>) {
-        if !self.enabled {
-            return;
-        }
-        let (sum, all_known, sum_total) = {
-            let mut map = self.per_url.lock().unwrap_or_else(|p| p.into_inner());
-            map.insert(url.to_string(), (done, total));
-            let sum: u64 = map.values().map(|(d, _)| d).sum();
-            let known = map.values().all(|(_, t)| t.is_some());
-            let tot: u64 = map.values().filter_map(|(_, t)| *t).sum();
-            (sum, known, tot)
+impl ProgressState {
+    /// Draws the current phase line, if any, on stderr.
+    fn draw(&self) {
+        let line = {
+            let phases = self.phases.lock().unwrap_or_else(|p| p.into_inner());
+            phases.line(self.frame.load(Ordering::Relaxed), self.glyphs)
         };
-        let line = output::progress_line(sum, all_known.then_some(sum_total));
+        let Some(line) = line else { return };
         let mut err = std::io::stderr().lock();
         // Progress is cosmetic: a broken stderr must not fail the install.
-        let _ = write!(err, "\r{line}");
+        let _ = write!(err, "\r{line:<LINE_WIDTH$}");
         let _ = err.flush();
         self.drawn.store(true, Ordering::Relaxed);
     }
+}
 
-    /// Erases the progress line.
+/// The animation thread: ticks the spinner and the installer clock until its sender drops.
+struct Animation {
+    stop: mpsc::Sender<()>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Phase progress line on stderr (download bar, Windows Installer, "Instalando…") with an
+/// animation thread; a no-op unless `enabled` (a TTY).
+pub struct LineProgress {
+    enabled: bool,
+    state: Arc<ProgressState>,
+    animation: Mutex<Option<Animation>>,
+}
+
+impl LineProgress {
+    pub fn new(enabled: bool, glyphs: &'static Glyphs) -> LineProgress {
+        LineProgress {
+            enabled,
+            state: Arc::new(ProgressState {
+                glyphs,
+                phases: Mutex::new(Phases::new()),
+                frame: AtomicUsize::new(0),
+                drawn: AtomicBool::new(false),
+            }),
+            animation: Mutex::new(None),
+        }
+    }
+
+    pub fn update(&self, label: &str, done: u64, total: Option<u64>) {
+        if !self.enabled {
+            return;
+        }
+        self.state
+            .phases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .update(label, done, total);
+        self.state.draw();
+        self.start_animation();
+    }
+
+    fn start_animation(&self) {
+        let mut slot = self.animation.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let (stop, rx) = mpsc::channel::<()>();
+        let state = Arc::clone(&self.state);
+        let handle = std::thread::spawn(move || {
+            // `Timeout` is a tick; a message or the sender dropping ends the thread.
+            while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(TICK) {
+                state.frame.fetch_add(1, Ordering::Relaxed);
+                state.draw();
+            }
+        });
+        *slot = Some(Animation { stop, handle });
+    }
+
+    /// Stops and joins the animation thread, then erases the line.
     pub fn finish(&self) {
-        if self.drawn.swap(false, Ordering::Relaxed) {
+        let animation = self
+            .animation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(Animation { stop, handle }) = animation {
+            drop(stop);
+            if let Err(panic) = handle.join() {
+                // A panic while already unwinding (Drop) cannot be re-raised.
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+        if self.state.drawn.swap(false, Ordering::Relaxed) {
             let mut err = std::io::stderr().lock();
-            let _ = write!(err, "\r{:<60}\r", "");
+            let _ = write!(err, "\r{:<LINE_WIDTH$}\r", "");
             let _ = err.flush();
         }
+        // Next phase list starts clean (several plans run through one `LineProgress`).
+        *self.state.phases.lock().unwrap_or_else(|p| p.into_inner()) = Phases::new();
+    }
+}
+
+impl Drop for LineProgress {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -266,9 +362,24 @@ fn choose(
     }
 }
 
-fn print_plans(plans: &[crate::install::plan::InstallPlan]) {
+/// `--dry-run` prints every step; otherwise the short summary.
+fn print_plans(ui: &dyn Ui, plans: &[crate::install::plan::InstallPlan], full: bool) {
     for p in plans {
-        anstream::println!("{p}");
+        if full {
+            anstream::println!("{p}");
+        } else {
+            let layout = crate::install::layout::Layout::new(p.root.clone());
+            anstream::print!("{}", output::plan_summary(p, &layout, ui.glyphs()));
+        }
+    }
+}
+
+/// `Abra um terminal novo…` when the plan put a folder on the user PATH this process lacks.
+fn print_terminal_hint(plan: &crate::install::plan::InstallPlan) {
+    let layout = crate::install::layout::Layout::new(plan.root.clone());
+    let path = std::env::var_os("PATH");
+    if let Some(hint) = output::new_terminal_hint(plan, &layout, path.as_deref()) {
+        anstream::println!("{hint}");
     }
 }
 
@@ -284,7 +395,7 @@ async fn install(
         return Ok(());
     };
     let plans = ops::plan_for(ctx, &cand, false)?;
-    print_plans(&plans);
+    print_plans(ui, &plans, f.dry_run);
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
         return Ok(());
@@ -295,6 +406,7 @@ async fn install(
     }
     let log = JobLog::start(JobInfo::for_plans("install", &plans));
     let applied = ops::apply_allowing(ctx, &plans, &f.allow()).await;
+    ui.end_progress();
     finish_log(log, &applied, "instalado");
     applied?;
     for p in &plans {
@@ -304,6 +416,7 @@ async fn install(
             p.app,
             p.version
         );
+        print_terminal_hint(p);
     }
     Ok(())
 }
@@ -320,7 +433,7 @@ fn uninstall(
     let plan = ops::plan_uninstall(ctx, app, purge)?;
     anstream::print!(
         "{}",
-        output::uninstall_plan_text(&plan, &ctx.data.install_layout())
+        output::uninstall_plan_text(&plan, &ctx.data.install_layout(), ui.glyphs())
     );
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
@@ -487,7 +600,7 @@ async fn upgrade(
         groups.push(ops::plan_for(ctx, &cand, keep)?);
     }
     for g in &groups {
-        print_plans(g);
+        print_plans(ui, g, f.dry_run);
     }
     if f.dry_run {
         anstream::println!("Simulação: nada foi alterado.");
@@ -499,6 +612,7 @@ async fn upgrade(
     }
     let log = JobLog::start(JobInfo::for_plans("upgrade", groups.iter().flatten()));
     let applied = ops::apply_groups_allowing(ctx, groups, &f.allow()).await;
+    ui.end_progress();
     finish_log(log, &applied, "atualizado");
     for p in applied? {
         anstream::println!(
@@ -507,6 +621,7 @@ async fn upgrade(
             p.app,
             p.version
         );
+        print_terminal_hint(&p);
     }
     Ok(())
 }

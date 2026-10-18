@@ -208,8 +208,12 @@ fn uninstall_plan_lists_every_other_user_of_the_entry() {
     );
 }
 
+fn ascii() -> &'static wingetrs::tui::theme::Glyphs {
+    wingetrs::tui::theme::Glyphs::for_set(wingetrs::tui::theme::GlyphSet::Ascii)
+}
+
 #[test]
-fn uninstall_plan_text_is_unchanged_without_shared_entries() {
+fn uninstall_plan_text_lists_each_action() {
     use wingetrs::install::plan::UninstallPlan;
     let dir = tempfile::tempdir().unwrap();
     let mut db = StateDb::open(&dir.path().join("state.db")).unwrap();
@@ -223,8 +227,8 @@ fn uninstall_plan_text_is_unchanged_without_shared_entries() {
     .unwrap();
     let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
     assert_eq!(
-        wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R")),
-        "Desinstalar a 1\n  1. Apagar C:\\R\\apps\\a\n  2. Desfazer entrada no PATH: C:\\R\\shims\n  3. Manter conf (dados persistentes; use --purge)\n"
+        wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R"), ascii()),
+        "Desinstalar a 1\n  1. Apaga a pasta do app\n  2. PATH do usuário -> remove C:\\R\\shims\n  3. Dados mantidos: conf (use --purge para apagar)\n"
     );
 }
 
@@ -234,9 +238,9 @@ fn uninstall_plan_text_says_kept_when_shared() {
     let dir = tempfile::tempdir().unwrap();
     let db = shared_path_db(dir.path());
     let plan = UninstallPlan::from_state(&db, "a", false).unwrap().unwrap();
-    let text = wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R"));
-    assert!(text.contains(r"Manter entrada no PATH: C:\R\shims (ainda usada por: b)"));
-    assert!(!text.contains(r"Desfazer entrada no PATH: C:\R\shims"));
+    let text = wingetrs::cli::output::uninstall_plan_text(&plan, &Layout::new(r"C:\R"), ascii());
+    assert!(text.contains(r"PATH do usuário mantém C:\R\shims (ainda usado por: b)"));
+    assert!(!text.contains(r"remove C:\R\shims"));
 }
 
 #[test]
