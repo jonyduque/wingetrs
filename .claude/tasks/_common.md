@@ -25,6 +25,7 @@ Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira c
 - **Teste de "nunca faz X" cuja regressão seria esperar** (Task 140): sem prazo, o mutante só fica lento (600 s de `wait_max`) e o teste passa. Envolva em `tokio::time::timeout`/prazo curto e exija o resultado; a mutação tem que falhar rápido.
 - **Código nunca se molda à âncora do brief** (Task 143): `#[rustfmt::skip]` ou linha artificial só para o texto da mutação casar é proibido. Formate normalmente e use `-AnchorFile`/`-ReplacementFile` com o trecho real; se o brief citar texto que mudou, diga no relatório.
 - **Gate com outros agentes no checkout** (2026-10-18: um agente rodou o gate 6 vezes em 25 min esperando arquivos alheios): rode o gate **uma** vez; se falhar só em arquivos que não são seus (confira com `git status`/caminho do erro), não espere nem repita: prove os seus com `cargo test --quiet --test it <seus_modulos>::` e `cargo clippy --all-targets` filtrado pelos seus caminhos, diga isso no relatório e entregue. O orquestrador roda o gate depois.
+- **Teste que roda programa real** (`pwsh`, `winget`, `msiexec`, `reg`, `innounp`, instalador) é `#[ignore = "live: ..."]`, mesmo com script sintético, mesmo que o brief esqueça de marcar (Task 155: `end_to_end_pwsh` rodava pwsh pelo PATH no gate, 4,6 s, e derrubaria o gate numa máquina sem pwsh).
 - **Recusa nova em extrator/parser** (Task 138): rode contra o corpus real da sonda do formato (ou peça a sonda) antes de entregar; fixture sintética não prova que arquivos reais passam.
 
 #### Report contract
