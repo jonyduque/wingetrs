@@ -1,6 +1,6 @@
 ---
-source: tests/tui_view.rs
-expression: "render(&a, 100, 24)"
+source: tests/it/tui_view.rs
+expression: "render(&a, 100, 26)"
 ---
 "╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                                              "
 "│ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │                                    wingetrs  "
@@ -13,6 +13,8 @@ expression: "render(&a, 100, 24)"
 "│                                                                                                  │"
 "│ Aparência                                                                                        │"
 "│   Redirecionar https para http        ‹ recusar ›  aceitar                                       │"
+"│   Motor do winget                     ‹ wingetrs ›  winget                                       │"
+"│   Escopo padrão (winget)              ‹ usuário ›  máquina                                       │"
 "│   Glifos                              nerd  unicode  ‹ ascii ›                                   │"
 "│   Ícones                              ‹ Automático ›  iTerm2  Sixel  Desligado                   │"
 "│   Ícones da lista                     ‹ visíveis ›  só ao abrir                                  │"

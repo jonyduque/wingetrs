@@ -1,5 +1,5 @@
 //! State of the Settings tab: which setting is selected and the values being edited.
-use crate::config::{Behavior, ConfirmMode, ResidueMode};
+use crate::config::{Behavior, ConfirmMode, DefaultScope, ResidueMode, WingetEngine};
 use crate::tui::theme::GlyphSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +9,8 @@ pub enum SettingId {
     KeepOld,
     Residues,
     HttpRedirect,
+    WingetEngine,
+    DefaultScope,
     Glyphs,
     Icons,
     ListIcons,
@@ -17,12 +19,14 @@ pub enum SettingId {
 }
 
 /// Order of the settings on screen.
-pub const ORDER: [SettingId; 10] = [
+pub const ORDER: [SettingId; 12] = [
     SettingId::Confirm,
     SettingId::Purge,
     SettingId::KeepOld,
     SettingId::Residues,
     SettingId::HttpRedirect,
+    SettingId::WingetEngine,
+    SettingId::DefaultScope,
     SettingId::Glyphs,
     SettingId::Icons,
     SettingId::ListIcons,
@@ -38,6 +42,8 @@ impl SettingId {
             SettingId::KeepOld => "Ao atualizar, manter versão antiga",
             SettingId::Residues => "Resíduos após remover",
             SettingId::HttpRedirect => "Redirecionar https para http",
+            SettingId::WingetEngine => "Motor do winget",
+            SettingId::DefaultScope => "Escopo padrão (winget)",
             SettingId::Glyphs => "Glifos",
             SettingId::Icons => "Ícones",
             SettingId::ListIcons => "Ícones da lista",
@@ -52,6 +58,8 @@ impl SettingId {
             SettingId::Purge | SettingId::KeepOld => &["não", "sim"],
             SettingId::Residues => &["perguntar", "só alta confiança", "manter"],
             SettingId::HttpRedirect => &["recusar", "aceitar"],
+            SettingId::WingetEngine => &["wingetrs", "winget"],
+            SettingId::DefaultScope => &["usuário", "máquina"],
             SettingId::Glyphs => &["nerd", "unicode", "ascii"],
             SettingId::Icons => &["Automático", "iTerm2", "Sixel", "Desligado"],
             SettingId::ListIcons => &["visíveis", "só ao abrir"],
@@ -72,6 +80,12 @@ impl SettingId {
             SettingId::Residues => "O que fazer com restos deixados no sistema após remover.",
             SettingId::HttpRedirect => {
                 "Aceita downloads que trocam https por http no caminho. O hash ainda confere o arquivo, mas a rede vê o que é baixado."
+            }
+            SettingId::WingetEngine => {
+                "Quem instala e remove pacotes do winget: o próprio wingetrs (mais rápido; usa o winget quando não sabe instalar um tipo) ou sempre o winget."
+            }
+            SettingId::DefaultScope => {
+                "Para quem instalar quando o pacote oferece os dois: só você, ou todos os usuários (pede UAC)."
             }
             SettingId::Glyphs => "Conjunto de ícones da interface.",
             SettingId::Icons => {
@@ -161,6 +175,14 @@ impl SettingsState {
                 ResidueMode::Keep => 2,
             },
             SettingId::HttpRedirect => usize::from(self.behavior.allow_http_redirect),
+            SettingId::WingetEngine => match self.behavior.winget_engine {
+                WingetEngine::Wingetrs => 0,
+                WingetEngine::Winget => 1,
+            },
+            SettingId::DefaultScope => match self.behavior.default_scope {
+                DefaultScope::User => 0,
+                DefaultScope::Machine => 1,
+            },
             SettingId::Glyphs => match self.glyphs {
                 GlyphSet::Nerd => 0,
                 GlyphSet::Unicode => 1,
@@ -201,6 +223,12 @@ impl SettingsState {
                     [ResidueMode::Ask, ResidueMode::High, ResidueMode::Keep][next];
             }
             SettingId::HttpRedirect => self.behavior.allow_http_redirect = next == 1,
+            SettingId::WingetEngine => {
+                self.behavior.winget_engine = [WingetEngine::Wingetrs, WingetEngine::Winget][next];
+            }
+            SettingId::DefaultScope => {
+                self.behavior.default_scope = [DefaultScope::User, DefaultScope::Machine][next];
+            }
             SettingId::Glyphs => {
                 self.glyphs = [GlyphSet::Nerd, GlyphSet::Unicode, GlyphSet::Ascii][next];
             }

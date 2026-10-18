@@ -29,6 +29,24 @@ pub enum ResidueMode {
     Keep,
 }
 
+/// Who installs and removes winget packages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WingetEngine {
+    #[default]
+    Wingetrs,
+    Winget,
+}
+
+/// Install scope preferred when a package offers both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultScope {
+    #[default]
+    User,
+    Machine,
+}
+
 /// `[behavior]` section of `config.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -41,6 +59,10 @@ pub struct Behavior {
     pub allow_http_redirect: bool,
     /// Capture the terminal mouse (click, wheel); off leaves text selection to the terminal.
     pub mouse: bool,
+    /// Who installs and removes winget packages.
+    pub winget_engine: WingetEngine,
+    /// Preferred scope when a winget package offers both.
+    pub default_scope: DefaultScope,
 }
 
 impl Default for Behavior {
@@ -52,6 +74,8 @@ impl Default for Behavior {
             residues: ResidueMode::default(),
             allow_http_redirect: false,
             mouse: true,
+            winget_engine: WingetEngine::default(),
+            default_scope: DefaultScope::default(),
         }
     }
 }

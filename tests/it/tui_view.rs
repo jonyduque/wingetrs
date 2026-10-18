@@ -1332,7 +1332,7 @@ fn settings_screen_snapshot() {
     let mut a = App::new(entries(), GlyphSet::Ascii);
     a.tab = wingetrs::tui::app::Tab::Settings;
     a.buckets_summary = "main, extras".into();
-    insta::assert_snapshot!(render(&a, 100, 24));
+    insta::assert_snapshot!(render(&a, 100, 26));
 }
 
 #[test]
@@ -1759,7 +1759,7 @@ fn turning_icons_off_clears_the_cache_and_the_indent() {
     );
     assert!(!a.icons.is_empty());
     a.tab = Tab::Settings;
-    for _ in 0..6 {
+    for _ in 0..8 {
         key(&mut a, KeyCode::Down);
     }
     key(&mut a, KeyCode::Enter);
