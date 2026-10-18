@@ -45,6 +45,12 @@ pub enum Phase {
     RunningInstaller { name: String },
     /// Native winget install: looking for the app among the installed ones.
     Verifying,
+    /// Native removal: copying the data folders another installation shares to the backups.
+    CopyingFolders,
+    /// Native removal: the uninstaller of `name` is running (cannot be cancelled).
+    Uninstalling { name: String },
+    /// Native removal: waiting (up to two minutes) for the record of `name` to go away.
+    CheckingRemoval { name: String },
 }
 
 /// Format name shown next to the file being extracted.
@@ -84,6 +90,13 @@ pub fn phase_title(phase: &Phase) -> String {
             format!("Instalador de {name} rodando (pode abrir janelas)")
         }
         Phase::Verifying => "Conferindo a instalação".into(),
+        Phase::CopyingFolders => "Copiando as pastas de dados para backups".into(),
+        Phase::Uninstalling { name } => {
+            format!("Desinstalador de {name} rodando (pode abrir janelas)")
+        }
+        Phase::CheckingRemoval { name } => {
+            format!("Conferindo a remoção de {name} (até 2 min)")
+        }
     }
 }
 
@@ -104,9 +117,11 @@ pub fn phase_text(phase: &Phase, elapsed: Duration) -> String {
 pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
     let text = phase_text(phase, elapsed);
     match phase {
-        Phase::Installer { .. } | Phase::RunningInstaller { .. } | Phase::WaitingElevation => {
-            format!("{text} · não pode ser cancelado")
-        }
+        Phase::Installer { .. }
+        | Phase::RunningInstaller { .. }
+        | Phase::WaitingElevation
+        | Phase::Uninstalling { .. }
+        | Phase::CheckingRemoval { .. } => format!("{text} · não pode ser cancelado"),
         Phase::Preparing
         | Phase::WaitingInstaller
         | Phase::Extracting { .. }
@@ -115,6 +130,7 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::Recording
         | Phase::Removing { .. }
         | Phase::Scanning
-        | Phase::Verifying => text,
+        | Phase::Verifying
+        | Phase::CopyingFolders => text,
     }
 }

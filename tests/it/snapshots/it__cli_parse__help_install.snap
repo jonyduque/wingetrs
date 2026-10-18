@@ -2,7 +2,7 @@
 source: tests/it/cli_parse.rs
 expression: sub.render_long_help().to_string()
 ---
-Instala um app de um bucket do Scoop, ou um pacote do winget pelo próprio winget
+Instala um app de um bucket do Scoop ou um pacote do winget (pelo wingetrs ou pelo winget, conforme as Configurações)
 
 Uso: wingetrs install [OPÇÕES] <ALVO>
 

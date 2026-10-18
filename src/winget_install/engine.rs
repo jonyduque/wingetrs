@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use super::ops::{
     InstallReport, WingetCtx, WingetOpsError, fetch_verified, install, install_fetched,
-    lock_install,
+    lock_install_for,
 };
 use super::plan::{PlanOrBridge, WingetPlan, plan};
 use super::post_check::version_warning;
@@ -297,7 +297,7 @@ pub async fn upgrade(
                 );
             }
             // Removal and install under one `install.lock`: nothing runs in between.
-            let lock = lock_install(&wctx.data.install_layout(), wctx.wait).await?;
+            let lock = lock_install_for(&wctx.data.install_layout(), wctx.wait, &wctx.gate).await?;
             // Like winget: the new installer is downloaded and verified (and kept open, so it
             // cannot change) before the old version goes; a failed download removes nothing.
             let file = fetch_verified(wctx, &fresh).await?;

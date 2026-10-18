@@ -18,13 +18,13 @@ use crate::installed::correlate::InstallScope;
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use crate::winget_install::engine::{self, UpgradeError, UpgradeRoute, upgrade_route};
-use crate::winget_install::launch::Elevation;
 use crate::winget_install::ops::{self as winget_ops, WingetCtx, WingetOpsError};
 use crate::winget_install::orphans::{ArpRegistry, remove_orphan};
 use crate::winget_install::plan::WingetPlan as NativePlan;
+use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::uninstall::{
-    BackupLimits, KEY_STAYED, MsiQueue, UninstallCtx, UninstallPlan as WingetUninstallPlan,
-    UninstallStatus, UninstallTarget, backup_folders, remove_registry_only, uninstall_queued,
+    KEY_STAYED, MsiQueue, UninstallCtx, UninstallPlan as WingetUninstallPlan, UninstallStatus,
+    UninstallTarget, remove_registry_only,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -112,7 +112,10 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::Scanning
             | Phase::WaitingElevation
             | Phase::RunningInstaller { .. }
-            | Phase::Verifying),
+            | Phase::Verifying
+            | Phase::CopyingFolders
+            | Phase::Uninstalling { .. }
+            | Phase::CheckingRemoval { .. }),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }
@@ -597,17 +600,6 @@ fn phase_of(env: &WingetEnv<'_>, p: Phase) {
     (env.install.progress)(&ProgressEvent::Phase(p));
 }
 
-/// The phase while a removal runs: the UAC (and the elevated helper) or the removal itself.
-fn removal_phase(elevated: bool, name: &str) -> Phase {
-    if elevated {
-        Phase::WaitingElevation
-    } else {
-        Phase::Removing {
-            app: name.to_string(),
-        }
-    }
-}
-
 /// The outcome of a native install or upgrade: a warning (the app did not show up) is an
 /// error without effect, never "Instalado".
 fn install_done(
@@ -676,45 +668,16 @@ async fn run_winget_inner(
             }
         }
         Action::WingetUninstall(plan) => {
-            // Nothing else of wingetrs runs meanwhile (as an upgrade's removal).
-            let layout = env.install.data.install_layout();
-            let _lock = match winget_ops::lock_install(&layout, env.install.wait).await {
-                Ok(l) => l,
-                Err(e) => return failed(winget_fail(e)),
+            // The copy is kept only when the plan still has folders (the user left it checked).
+            let how = if plan.shared.as_ref().is_some_and(|s| !s.folders.is_empty()) {
+                RemovalChoice::BackupThenRemove
+            } else {
+                RemovalChoice::Remove
             };
-            winget_uninstall(env, &plan)
+            winget_removal(env, &plan, how).await
         }
         Action::WingetRegistryOnly(plan) => {
-            let layout = env.install.data.install_layout();
-            let _lock = match winget_ops::lock_install(&layout, env.install.wait).await {
-                Ok(l) => l,
-                Err(e) => return failed(winget_fail(e)),
-            };
-            let hklm =
-                matches!(&plan.target, UninstallTarget::Arp { hive, .. } if *hive != Hive::User);
-            if let Err(f) = start_removal(env, removal_phase(hklm, &plan.name)) {
-                return failed(f);
-            }
-            match remove_registry_only(
-                &plan,
-                env.registry,
-                env.install.elevated,
-                env.backups,
-                &env.stamp,
-            ) {
-                Ok(file) => (
-                    Ok(Done {
-                        summary: format!(
-                            "Registro de {} removido (cópia em {})",
-                            plan.name,
-                            file.display()
-                        ),
-                        residues: None,
-                    }),
-                    Outcome::Ok,
-                ),
-                Err(e) => failed(InstallFail::Other(format!("{}: {e}", plan.name))),
-            }
+            winget_removal(env, &plan, RemovalChoice::RegistryOnly).await
         }
         Action::RemoveOrphan(o) => {
             let layout = env.install.data.install_layout();
@@ -722,7 +685,9 @@ async fn run_winget_inner(
                 Ok(l) => l,
                 Err(e) => return failed(winget_fail(e)),
             };
-            if let Err(f) = start_removal(env, removal_phase(o.hive != Hive::User, &o.name)) {
+            if let Err(f) =
+                start_removal(env, removal::removal_phase(o.hive != Hive::User, &o.name))
+            {
                 return failed(f);
             }
             match remove_orphan(
@@ -753,42 +718,43 @@ async fn run_winget_inner(
     }
 }
 
-/// Copies the shared data folders (when the plan still has them: the user kept the option),
-/// then runs the uninstaller. A refused copy removes nothing.
-fn winget_uninstall(
+/// A native removal through `removal::remove` (the same sequence as the CLI's).
+async fn winget_removal(
     env: &WingetEnv<'_>,
     plan: &WingetUninstallPlan,
+    how: RemovalChoice,
 ) -> (Result<Done, InstallFail>, Outcome) {
     let failed = |f: InstallFail| (Err(f), Outcome::Ok);
-    let mut copied = None;
-    if let Some(shared) = &plan.shared
-        && !shared.folders.is_empty()
-    {
-        let dest = env.backups.join(format!("{}-pastas", env.stamp));
-        let limits = BackupLimits::standard(env.free_space);
-        match backup_folders(&shared.folders, &dest, &limits) {
-            Ok(notes) => {
-                for n in &notes {
-                    tracing::warn!(app = %plan.name, "backup: {n}");
-                }
-                copied = Some(dest);
-            }
-            Err(e) => {
-                return failed(InstallFail::Other(format!(
-                    "{}: cópia das pastas recusada ({e}); nada foi removido",
-                    plan.name
-                )));
-            }
-        }
-    }
-    if let Err(f) = start_removal(
-        env,
-        removal_phase(plan.elevation == Elevation::Helper, &plan.name),
-    ) {
-        return failed(f);
-    }
-    match uninstall_queued(&env.uninstall, Some(&MsiQueue::of(&env.install)), plan) {
-        Ok(r) if r.status == UninstallStatus::Removed && r.warning.is_none() => {
+    let layout = env.install.data.install_layout();
+    let steps = Steps {
+        gate: &env.install.gate,
+        progress: env.install.progress,
+        backups: env.backups,
+        stamp: &env.stamp,
+        free_space: env.free_space,
+    };
+    let queue = MsiQueue::of(&env.install);
+    let removed = removal::remove(
+        &steps,
+        winget_ops::lock_install(&layout, env.install.wait),
+        plan,
+        how,
+        |p| removal::run_uninstaller(&env.uninstall, &queue, plan, p),
+        || {
+            remove_registry_only(
+                plan,
+                env.registry,
+                env.install.elevated,
+                env.backups,
+                &env.stamp,
+            )
+        },
+    )
+    .await;
+    match removed {
+        Ok(Removed::App { report, copied })
+            if report.status == UninstallStatus::Removed && report.warning.is_none() =>
+        {
             let mut summary = format!("{} removido", plan.name);
             if let Some(dest) = copied {
                 summary.push_str(&format!(" (pastas copiadas para {})", dest.display()));
@@ -801,15 +767,27 @@ fn winget_uninstall(
                 Outcome::Ok,
             )
         }
-        Ok(r) => (
+        Ok(Removed::App { report, .. }) => (
             Err(InstallFail::Other(format!(
                 "{}: {}",
                 plan.name,
-                r.warning.unwrap_or_else(|| KEY_STAYED.to_string())
+                report.warning.unwrap_or_else(|| KEY_STAYED.to_string())
             ))),
-            r.status.job_outcome(),
+            report.status.job_outcome(),
         ),
-        Err(e) => failed(InstallFail::Other(format!("{}: {e}", plan.name))),
+        Ok(Removed::Record(file)) => (
+            Ok(Done {
+                summary: format!(
+                    "Registro de {} removido (cópia em {})",
+                    plan.name,
+                    file.display()
+                ),
+                residues: None,
+            }),
+            Outcome::Ok,
+        ),
+        Err(RemovalError::Lock(e)) => failed(winget_fail(e)),
+        Err(e) => failed(InstallFail::Other(e.to_string())),
     }
 }
 

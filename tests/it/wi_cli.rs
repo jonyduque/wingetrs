@@ -18,7 +18,9 @@ use wingetrs::catalog::Catalog;
 use wingetrs::cli::Cli;
 use wingetrs::cli::install_cmd::{self, Flags, Interrupts, Stop, Ui};
 use wingetrs::cli::output::Phases;
-use wingetrs::cli::winget_cmd::{self, CleanupArgs, Held, Op, Sink, WingetFlows};
+use wingetrs::cli::winget_cmd::{
+    self, CleanupArgs, Held, Op, RecordRemover, Sink, Uninstaller, WingetFlows,
+};
 use wingetrs::config::Behavior;
 use wingetrs::core::{PackageEntry, SourceKind};
 use wingetrs::http::Http;
@@ -99,6 +101,12 @@ type InstallHook = Arc<dyn Fn(&LaunchGate) -> Result<InstallReport, WingetOpsErr
 /// Shared, in order: `lock`, `phase:<title>`, `run`, `registry-only`.
 type Steps = Arc<Mutex<Vec<String>>>;
 
+/// What a fake `install.lock` wait does on its thread (given the launch gate).
+type LockHook = Arc<dyn Fn(&LaunchGate) -> Result<(), WingetOpsError> + Send + Sync>;
+
+/// What a fake uninstaller does on its thread before it ends.
+type RunHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Default)]
 struct Fake {
     planned: Option<PlanOrBridge>,
@@ -119,6 +127,8 @@ struct Fake {
     /// The plans' shared data (Kindle) and elevation.
     shared: Option<SharedData>,
     elevation: Option<Elevation>,
+    lock_hook: Option<LockHook>,
+    run_hook: Option<RunHook>,
 }
 
 fn report_ok() -> InstallReport {
@@ -205,40 +215,50 @@ impl WingetFlows for Fake {
             shared: self.shared.clone(),
         })
     }
-    fn lock_install(&self) -> Op<Result<Held, String>> {
-        let steps = Arc::clone(&self.steps);
+    fn lock_install(&self) -> Op<Result<Held, WingetOpsError>> {
+        let (steps, hook, gate) = (
+            Arc::clone(&self.steps),
+            self.lock_hook.clone(),
+            self.gate.clone(),
+        );
         Box::new(move || {
             Box::pin(async move {
+                if let Some(h) = hook {
+                    h(&gate)?;
+                }
                 steps.lock().unwrap().push("lock".into());
                 Ok(Box::new(()) as Held)
             })
         })
     }
-    fn uninstall(&self, plan: &UninstallPlan) -> Op<Result<UninstallReport, String>> {
+    fn uninstall(&self, plan: &UninstallPlan) -> Uninstaller {
         let (done, steps) = (Arc::clone(&self.uninstalled), Arc::clone(&self.steps));
-        let (target, backups) = (plan.target.clone(), self.backups.clone());
-        Box::new(move || {
-            Box::pin(async move {
-                // Whether the folder copy already exists when the uninstaller runs.
-                let copied = std::fs::read_dir(&backups).is_ok_and(|mut d| d.next().is_some());
-                steps.lock().unwrap().push(format!("run copied={copied}"));
-                done.lock().unwrap().push(target);
-                Ok(UninstallReport {
-                    status: UninstallStatus::Removed,
-                    warning: None,
-                    reboot: None,
-                })
+        let (target, backups, hook) = (
+            plan.target.clone(),
+            self.backups.clone(),
+            self.run_hook.clone(),
+        );
+        Box::new(move |_: &dyn Fn(&ProgressEvent)| {
+            // Whether the folder copy already exists when the uninstaller runs.
+            let copied = std::fs::read_dir(&backups).is_ok_and(|mut d| d.next().is_some());
+            steps.lock().unwrap().push(format!("run copied={copied}"));
+            if let Some(h) = hook {
+                h();
+            }
+            done.lock().unwrap().push(target);
+            Ok(UninstallReport {
+                status: UninstallStatus::Removed,
+                warning: None,
+                reboot: None,
             })
         })
     }
-    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> Op<Result<PathBuf, String>> {
+    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> RecordRemover {
         let steps = Arc::clone(&self.steps);
         let file = self.backups.join(ts).join(format!("{}.reg", plan.name));
         Box::new(move || {
-            Box::pin(async move {
-                steps.lock().unwrap().push("registry-only".into());
-                Ok(file)
-            })
+            steps.lock().unwrap().push("registry-only".into());
+            Ok(file)
         })
     }
     fn free_space(&self) -> fn(&Path) -> Option<u64> {
@@ -932,7 +952,7 @@ async fn cli_ctrl_c_after_launch_prints_notice_once() {
     );
     assert_eq!(
         *ui.notices.borrow(),
-        vec![winget_cmd::LAUNCHED_NOTICE.to_string()]
+        vec![install_cmd::uncancellable(Some("instalador"))]
     );
 }
 
@@ -1173,8 +1193,10 @@ async fn cli_kindle_backup_then_remove() {
     assert_eq!(
         *fake.steps.lock().unwrap(),
         vec![
+            "phase:Preparando".to_string(),
             "lock".to_string(),
-            "phase:Removendo Amazon Kindle".to_string(),
+            "phase:Copiando as pastas de dados para backups".to_string(),
+            "phase:Desinstalador de Amazon Kindle rodando (pode abrir janelas)".to_string(),
             "run copied=true".to_string(),
         ]
     );
@@ -1226,6 +1248,7 @@ async fn cli_kindle_registry_only_and_cancel() {
     assert_eq!(
         *fake.steps.lock().unwrap(),
         vec![
+            "phase:Preparando".to_string(),
             "lock".to_string(),
             "phase:Removendo Amazon Kindle".to_string(),
             "registry-only".to_string(),
@@ -1254,7 +1277,10 @@ async fn cli_kindle_registry_only_and_cancel() {
 async fn cli_uninstall_shows_phases() {
     let glyphs = Glyphs::for_set(GlyphSet::Ascii);
     for (elevation, title) in [
-        (Elevation::Never, "Removendo Contoso App".to_string()),
+        (
+            Elevation::Never,
+            "Desinstalador de Contoso App rodando (pode abrir janelas)".to_string(),
+        ),
         (Elevation::Helper, phase_title(&Phase::WaitingElevation)),
     ] {
         let fake = Fake {
@@ -1280,28 +1306,57 @@ async fn cli_uninstall_shows_phases() {
         .await
         .unwrap()
         .unwrap();
-        // `install.lock` first, then the phase, then the uninstaller.
+        // A phase while waiting for `install.lock`, then the running phase, then the
+        // uninstaller.
         assert_eq!(
             *fake.steps.lock().unwrap(),
             vec![
+                "phase:Preparando".to_string(),
                 "lock".to_string(),
                 format!("phase:{title}"),
                 "run copied=false".to_string()
             ]
         );
-        // What the CLI line draws from it: the phase and its clock.
+        // What the CLI line draws from it: the phase, its clock, and that it cannot be
+        // cancelled.
         let events = fake.events.lock().unwrap().clone();
-        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events.len(), 2, "{events:?}");
         let mut line = Phases::new();
         let t0 = Instant::now();
-        line.update_at(&events[0], t0);
+        line.update_at(&events[1], t0);
         let shown = line
             .line_at(0, glyphs, t0 + Duration::from_secs(3))
             .unwrap();
         assert!(shown.contains(&format!("{title} · 00:03")), "{shown}");
+        assert!(shown.contains("não pode ser cancelado"), "{shown}");
+        // Past five minutes without an end: a window may be waiting for an answer.
+        let late = line
+            .line_at(0, glyphs, t0 + Duration::from_secs(6 * 60))
+            .unwrap();
+        assert!(
+            late.contains("rodando há 6 min; pode haver uma janela"),
+            "{late}"
+        );
     }
-    let checking = phase_title(&winget_cmd::checking_phase("Contoso App"));
-    assert_eq!(checking, "Removendo Contoso App (conferindo a remoção)");
+    // The wait for the record to go: its clock, no window warning (it is a fixed wait).
+    let checking = Phase::CheckingRemoval {
+        name: "Contoso App".into(),
+    };
+    assert_eq!(
+        phase_title(&checking),
+        "Conferindo a remoção de Contoso App (até 2 min)"
+    );
+    let mut line = Phases::new();
+    let t0 = Instant::now();
+    line.update_at(&ProgressEvent::Phase(checking), t0);
+    let shown = line
+        .line_at(0, glyphs, t0 + Duration::from_secs(400))
+        .unwrap();
+    assert!(
+        shown.contains("· 06:40 · não pode ser cancelado"),
+        "{shown}"
+    );
+    assert!(!shown.contains("janela"), "{shown}");
 }
 
 #[tokio::test]
@@ -1492,7 +1547,8 @@ fn cli_uninstall_of_msi_waits_for_msi_lock() {
                 sleep: &|_| {},
             };
             let progress = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
-            let r = winget_cmd::run_uninstaller(&u, &queue, &plan, &progress);
+            let r =
+                wingetrs::winget_install::removal::run_uninstaller(&u, &queue, &plan, &progress);
             done_tx.send(r.map(|r| r.status)).unwrap();
         });
         // While the lock is held, msiexec is never launched.
@@ -1510,8 +1566,169 @@ fn cli_uninstall_of_msi_waits_for_msi_lock() {
     assert_eq!(launcher.runs.load(Ordering::SeqCst), 1);
     assert_eq!(
         *events.lock().unwrap(),
-        vec![ProgressEvent::Phase(winget_cmd::checking_phase(
-            "Contoso App"
-        ))]
+        vec![ProgressEvent::Phase(Phase::CheckingRemoval {
+            name: "Contoso App".into()
+        })]
+    );
+}
+
+// ---- Task 193 review: Ctrl+C during a removal, install.lock never dropped ----
+
+async fn uninstall_contoso(
+    fake: &Fake,
+    ui: &FakeUi,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+) -> (anyhow::Result<()>, Vec<String>) {
+    let gate = fake.gate.clone();
+    let mut out = Vec::new();
+    let r = tokio::time::timeout(
+        Duration::from_secs(30),
+        winget_cmd::uninstall(
+            fake,
+            ui,
+            "Pub.App",
+            false,
+            yes(),
+            Stop::new(rx, &gate),
+            &mut |l: &str| out.push(l.to_string()),
+        ),
+    )
+    .await
+    .expect("the removal ended within the deadline");
+    (r, out)
+}
+
+#[tokio::test]
+async fn cli_uninstall_ctrl_c_while_waiting_cancels() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let hook: LockHook = Arc::new(move |gate: &LaunchGate| {
+        // Another operation holds `install.lock`; it is let go (after about 10 s at most)
+        // right as Ctrl+C arrives: the lock is taken, but the launch gate must still refuse.
+        // (`lock_install_for` itself gives up on a cancel: `lock_install_for_gives_up_on_cancel`.)
+        started_tx.lock().unwrap().send(()).unwrap();
+        for _ in 0..1000 {
+            if gate.cancelled() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    });
+    let fake = Fake {
+        rows: vec![row("Contoso App", "arp/hkcu/Contoso", Some("Pub.App"))],
+        lock_hook: Some(hook),
+        ..Default::default()
+    };
+    let ui = FakeUi::default();
+    let (tx, mut rx) = quiet();
+    let sender = std::thread::spawn(move || {
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        tx.send(()).unwrap();
+        tx
+    });
+    let (r, out) = uninstall_contoso(&fake, &ui, &mut rx).await;
+    let _tx = sender.join().unwrap();
+    let e = r.unwrap_err();
+    assert!(e.is::<install_cmd::Cancelled>(), "{e:#}");
+    assert!(out.iter().any(|l| l.contains("Cancelado.")), "{out:?}");
+    assert!(
+        fake.uninstalled.lock().unwrap().is_empty(),
+        "nothing removed"
+    );
+    assert_eq!(
+        *fake.steps.lock().unwrap(),
+        vec!["phase:Preparando".to_string(), "lock".to_string()],
+        "nothing launched"
+    );
+    assert_eq!(
+        *ui.notices.borrow(),
+        vec![winget_cmd::CANCELLING_NOTICE.to_string()]
+    );
+}
+
+#[tokio::test]
+async fn cli_uninstall_ctrl_c_after_launch_prints_notice_once() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let release_rx = Mutex::new(release_rx);
+    let hook: RunHook = Arc::new(move || {
+        started_tx.lock().unwrap().send(()).unwrap();
+        // The uninstaller runs until the test lets it end.
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+    });
+    let fake = Fake {
+        rows: vec![row("Contoso App", "arp/hkcu/Contoso", Some("Pub.App"))],
+        run_hook: Some(hook),
+        ..Default::default()
+    };
+    let ui = FakeUi::default();
+    let (tx, mut rx) = quiet();
+    let sender = std::thread::spawn(move || {
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        tx.send(()).unwrap();
+        tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        tx
+    });
+    let (r, out) = uninstall_contoso(&fake, &ui, &mut rx).await;
+    let _tx = sender.join().unwrap();
+    r.unwrap();
+    assert!(
+        out.iter()
+            .any(|l| l.contains("Desinstalado: Contoso App 1.0")),
+        "{out:?}"
+    );
+    assert_eq!(fake.uninstalled.lock().unwrap().len(), 1);
+    assert_eq!(
+        *ui.notices.borrow(),
+        vec![install_cmd::uncancellable(Some("desinstalador"))]
+    );
+}
+
+/// A held `install.lock` and Ctrl+C: the wait gives up quickly, every slice was awaited (no
+/// thread left to take the lock after "Cancelado.").
+#[tokio::test]
+async fn lock_install_for_gives_up_on_cancel() {
+    use wingetrs::install::layout::Layout;
+    use wingetrs::winget_install::ops::lock_install_for;
+    let t = TempDir::new().unwrap();
+    let layout = Layout::new(t.path());
+    std::fs::create_dir_all(layout.install_lock().parent().unwrap()).unwrap();
+    let held = wingetrs::cache::UpdateLock::try_acquire(&layout.install_lock())
+        .unwrap()
+        .unwrap();
+    let gate = LaunchGate::default();
+    let (r, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            lock_install_for(&layout, LockWait::Block(Duration::from_secs(60)), &gate),
+            async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(gate.try_cancel());
+            }
+        )
+    })
+    .await
+    .expect("the wait gave up within the deadline");
+    assert!(matches!(r, Err(WingetOpsError::Cancelled)), "{:?}", r.err());
+    drop(held);
+    // Nobody is still waiting for it: the lock stays free.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        wingetrs::cache::UpdateLock::try_acquire(&layout.install_lock())
+            .unwrap()
+            .is_some()
+    );
+    // Not cancelled and free: taken.
+    let gate = LaunchGate::default();
+    assert!(
+        lock_install_for(&layout, LockWait::NoWait, &gate)
+            .await
+            .is_ok()
     );
 }

@@ -854,7 +854,8 @@ async fn upgrade_previous_download_failure_keeps_old() {
 #[tokio::test(flavor = "multi_thread")]
 async fn upgrade_previous_cancel_before_removal_keeps_old() {
     let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
-    // Ctrl+C came first: the download may finish, the removal never starts.
+    // Ctrl+C came first: the `install.lock` wait sees it (Task 193), so nothing is downloaded
+    // and the removal never starts.
     assert!(w.gate.try_cancel());
     let p = w.plan(Some("0.9"));
     let err = w.run(&p).await.unwrap_err();
@@ -862,7 +863,7 @@ async fn upgrade_previous_cancel_before_removal_keeps_old() {
         matches!(err, UpgradeError::Install(WingetOpsError::Cancelled)),
         "{err}"
     );
-    assert_eq!(w.events(), ["fetch"]);
+    assert!(w.events().is_empty(), "{:?}", w.events());
 }
 
 #[test]

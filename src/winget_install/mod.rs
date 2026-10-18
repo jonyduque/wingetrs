@@ -23,6 +23,7 @@ pub mod orphans_win;
 pub mod plan;
 pub mod post_check;
 pub mod previous;
+pub mod removal;
 #[cfg(windows)]
 pub mod previous_win;
 #[cfg(windows)]

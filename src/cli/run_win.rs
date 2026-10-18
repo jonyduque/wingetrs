@@ -1,7 +1,9 @@
 //! Runs the operation commands against the production context.
 use super::Command;
 use super::install_cmd::{self, Flags, Interrupts, LineProgress, Stop, TtyUi, Ui};
-use super::winget_cmd::{self, Held, HelperShutdown, Op, Sink, WingetFlows};
+use super::winget_cmd::{
+    self, Held, HelperShutdown, Op, RecordRemover, Sink, Uninstaller, WingetFlows,
+};
 use crate::bridge::BridgeJob;
 use crate::bridge::elevated::ElevatedBridge;
 use crate::bridge::worker::ScopeArg;
@@ -33,9 +35,9 @@ use crate::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
 use crate::winget_install::previous::RemovalRequest;
 use crate::winget_install::select::{Refusal, ScopeWanted};
 use crate::winget_install::uninstall::{
-    self, MsiQueue, SystemClock, UninstallCtx, UninstallPlan, UninstallReport, UninstallTarget,
+    self, MsiQueue, SystemClock, UninstallCtx, UninstallPlan, UninstallTarget,
 };
-use crate::winget_install::{folders_win, host_win, previous_win, prod_win};
+use crate::winget_install::{folders_win, host_win, previous_win, prod_win, removal};
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -240,49 +242,46 @@ impl WingetFlows for ProdFlows<'_, '_> {
         previous_win::plain_removal_plan(self.ctx.data.root(), &req, manifest.as_ref())
     }
 
-    fn lock_install(&self) -> Op<Result<Held, String>> {
-        let (data, wait) = (self.ctx.data.clone(), self.ctx.wait);
+    fn lock_install(&self) -> Op<Result<Held, WingetOpsError>> {
+        let (data, wait, gate) = (
+            self.ctx.data.clone(),
+            self.ctx.wait,
+            self.ctx.launch.clone(),
+        );
         Box::new(move || {
             Box::pin(async move {
-                wops::lock_install(&data.install_layout(), wait)
+                wops::lock_install_for(&data.install_layout(), wait, &gate)
                     .await
                     .map(|l| Box::new(l) as Held)
-                    .map_err(|e| e.to_string())
             })
         })
     }
 
-    fn uninstall(&self, plan: &UninstallPlan) -> Op<Result<UninstallReport, String>> {
+    fn uninstall(&self, plan: &UninstallPlan) -> Uninstaller {
         let o = self.owned();
         let plan = plan.clone();
-        Box::new(move || {
-            Box::pin(async move {
-                let progress = |ev: &ProgressEvent| o.update(ev);
-                let w = o
-                    .wctx(&progress)
-                    .map_err(|e| format!("msiexec.exe não encontrado: {e}"))?;
-                let clock = SystemClock::new();
-                let u = UninstallCtx {
-                    launcher: &ShellLauncher,
-                    elevated: &*o.helper,
-                    msix: &SystemMsix,
-                    key_exists: &key_exists,
-                    clock: &clock,
-                    user_expand: &user_env,
-                    msiexec: &w.msiexec,
-                };
-                winget_cmd::run_uninstaller(&u, &MsiQueue::of(&w), &plan, &progress)
-            })
+        Box::new(move |progress: &dyn Fn(&ProgressEvent)| {
+            let line = |ev: &ProgressEvent| o.update(ev);
+            let w = o.wctx(&line).map_err(|e| e.to_string())?;
+            let clock = SystemClock::new();
+            let u = UninstallCtx {
+                launcher: &ShellLauncher,
+                elevated: &*o.helper,
+                msix: &SystemMsix,
+                key_exists: &key_exists,
+                clock: &clock,
+                user_expand: &user_env,
+                msiexec: &w.msiexec,
+            };
+            removal::run_uninstaller(&u, &MsiQueue::of(&w), &plan, progress)
         })
     }
 
-    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> Op<Result<PathBuf, String>> {
+    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> RecordRemover {
         let (helper, backups) = (Arc::clone(&self.helper.0), self.backups());
         let (plan, ts) = (plan.clone(), ts.to_string());
         Box::new(move || {
-            Box::pin(async move {
-                uninstall::remove_registry_only(&plan, &SystemArp, &*helper, &backups, &ts)
-            })
+            uninstall::remove_registry_only(&plan, &SystemArp, &*helper, &backups, &ts)
         })
     }
 

@@ -35,7 +35,7 @@ use wingetrs::winget_install::ops::{InstallReport, WingetOpsError};
 use wingetrs::winget_install::orphans::Orphan;
 use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan};
 use wingetrs::winget_install::select::{Refusal, ScopeWanted};
-use wingetrs::winget_install::uninstall::{UninstallPlan, UninstallReport, UninstallTarget};
+use wingetrs::winget_install::uninstall::{UninstallPlan, UninstallTarget};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -133,20 +133,18 @@ impl WingetFlows for NoWinget {
     }
     fn lock_install(
         &self,
-    ) -> wingetrs::cli::winget_cmd::Op<Result<wingetrs::cli::winget_cmd::Held, String>> {
+    ) -> wingetrs::cli::winget_cmd::Op<Result<wingetrs::cli::winget_cmd::Held, WingetOpsError>>
+    {
         unreachable!("winget")
     }
-    fn uninstall(
-        &self,
-        _: &UninstallPlan,
-    ) -> wingetrs::cli::winget_cmd::Op<Result<UninstallReport, String>> {
+    fn uninstall(&self, _: &UninstallPlan) -> wingetrs::cli::winget_cmd::Uninstaller {
         unreachable!("winget")
     }
     fn remove_registry_only(
         &self,
         _: &UninstallPlan,
         _: &str,
-    ) -> wingetrs::cli::winget_cmd::Op<Result<PathBuf, String>> {
+    ) -> wingetrs::cli::winget_cmd::RecordRemover {
         unreachable!("winget")
     }
     fn free_space(&self) -> fn(&Path) -> Option<u64> {

@@ -2,7 +2,7 @@
 //!
 //! Platform-neutral: every real effect arrives through [`WingetFlows`] (production:
 //! `run_win::ProdFlows`), every prompt through `Ui`, every printed line through a `Say`.
-use super::install_cmd::{Cancelled, Flags, Interrupts, Stop, Ui, proceed};
+use super::install_cmd::{Cancelled, Flags, Interrupts, Stop, Ui, proceed, uncancellable};
 use super::style;
 use crate::bridge::elevated::{ElevatedBridge, SystemTransport};
 use crate::bridge::worker::ScopeArg;
@@ -11,7 +11,7 @@ use crate::cache::BlobStore;
 use crate::config::{Behavior, DefaultScope, WingetEngine};
 use crate::install::executor::LaunchGate;
 use crate::install::ops::OpsCtx;
-use crate::install::progress::{Phase, ProgressEvent};
+use crate::install::progress::ProgressEvent;
 use crate::install::target::Candidate;
 use crate::installed::Hive;
 use crate::installed::correlate::{InstallScope, ListRow};
@@ -21,14 +21,14 @@ use crate::tui::app::{Done, InstallFail};
 use crate::tui::picker::PickerItem;
 use crate::winget_install::codes;
 use crate::winget_install::engine::{Engine, UpgradeError, choose_engine, upgrade_scope};
-use crate::winget_install::launch::Elevation;
 use crate::winget_install::ops::{InstallReport, WingetOpsError};
 use crate::winget_install::orphans::Orphan;
 use crate::winget_install::plan::{PlanOrBridge, WingetPlan, bridge_reason, name_version};
+use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::select::{Refusal, Scope, ScopeWanted};
 use crate::winget_install::uninstall::{
-    BackupLimits, MsiQueue, SharedData, UninstallCtx, UninstallPlan, UninstallReport,
-    UninstallStatus, UninstallTarget, backup_folders, human_size, target_of, uninstall_queued,
+    SharedData, UninstallPlan, UninstallReport, UninstallStatus, UninstallTarget, human_size,
+    target_of,
 };
 use anyhow::{Context, anyhow, bail};
 use std::collections::BTreeSet;
@@ -54,8 +54,12 @@ pub type Sink = Arc<dyn Fn(&ProgressEvent) + Send + Sync>;
 /// `install.lock`, held until dropped.
 pub type Held = Box<dyn std::any::Any>;
 
-/// Said once when Ctrl+C arrives after the installer (or uninstaller) was launched.
-pub const LAUNCHED_NOTICE: &str = "o instalador já começou e não pode ser interrompido; aguarde";
+/// The uninstaller of a plan, run on the removal's thread (given the progress).
+pub type Uninstaller =
+    Box<dyn FnOnce(&dyn Fn(&ProgressEvent)) -> Result<UninstallReport, String> + Send>;
+
+/// The registry-only removal of a plan, run on the removal's thread (the `.reg` written).
+pub type RecordRemover = Box<dyn FnOnce() -> Result<PathBuf, String> + Send>;
 
 /// Said once when Ctrl+C arrives before anything was launched.
 pub const CANCELLING_NOTICE: &str = "cancelando: nada foi iniciado; esperando a etapa atual parar";
@@ -63,9 +67,6 @@ pub const CANCELLING_NOTICE: &str = "cancelando: nada foi iniciado; esperando a 
 /// `--yes` on a removal whose data folders another installation shares (Kindle, D6).
 pub const SHARED_YES_REFUSED: &str =
     "este app compartilha dados com outros; rode sem --yes para escolher";
-
-/// How often a waiting operation looks at the launch gate (Ctrl+C before the launch).
-const CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// One line per agreement: `Licença: <label> — <url>`, or `Licença aceita: …` once accepted.
 pub fn agreement_lines(agreements: &[Agreement], accepted: bool) -> Vec<String> {
@@ -235,13 +236,13 @@ pub trait WingetFlows {
         row: &ListRow,
         target: &UninstallTarget,
     ) -> impl Future<Output = Result<UninstallPlan, String>>;
-    /// Waits for `install.lock` (nothing else of wingetrs runs during a removal).
-    fn lock_install(&self) -> Op<Result<Held, String>>;
-    /// `winget_install::uninstall::uninstall`; announces [`checking_phase`] once the
-    /// uninstaller ended and the record is being watched.
-    fn uninstall(&self, plan: &UninstallPlan) -> Op<Result<UninstallReport, String>>;
+    /// Waits for `install.lock` (nothing else of wingetrs runs during a removal); gives up
+    /// with `Cancelled` once the gate is cancelled (never dropped while waiting).
+    fn lock_install(&self) -> Op<Result<Held, WingetOpsError>>;
+    /// `removal::run_uninstaller` of `plan` (queued on `msi.lock`).
+    fn uninstall(&self, plan: &UninstallPlan) -> Uninstaller;
     /// `winget_install::uninstall::remove_registry_only` (exported to `<backups>\<ts>`).
-    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> Op<Result<PathBuf, String>>;
+    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> RecordRemover;
     /// Free bytes on the volume of a path (the folder backup's limit).
     fn free_space(&self) -> fn(&Path) -> Option<u64>;
     /// Pinned apps (`pins::load`).
@@ -304,27 +305,11 @@ fn show_and_confirm(ui: &dyn Ui, text: &str, f: Flags, say: Say<'_>) -> anyhow::
     Ok(true)
 }
 
-/// `op` until it ends, or `None` once the gate was cancelled while it waited (it is dropped
-/// at its next await; a blocking step runs to its end first).
-async fn or_cancelled<T>(gate: &LaunchGate, op: impl Future<Output = T>) -> Option<T> {
-    tokio::pin!(op);
-    loop {
-        tokio::select! {
-            biased;
-            out = &mut op => return Some(out),
-            () = tokio::time::sleep(CANCEL_POLL) => {
-                if gate.cancelled() {
-                    return None;
-                }
-            }
-        }
-    }
-}
-
 /// Runs `op` on a `spawn_blocking` thread while this task keeps reading `interrupts`: before
-/// the launch a request cancels through `gate` (said once, then the step is awaited); after
-/// it, [`LAUNCHED_NOTICE`] is said once and the operation goes on. The handle is always
-/// awaited and a panic of the worker goes on unwinding here. `None` = dropped by the gate.
+/// the launch a request cancels through `gate` (said once; the operation sees the gate at its
+/// next check and ends by itself, it is never dropped); after it, `uncancellable(<step>)` is
+/// said once and the operation goes on. The handle is always awaited and a panic of the worker
+/// goes on unwinding here. `None` only when the runtime shuts down.
 async fn run_blocking<T: Send + 'static>(
     ui: &dyn Ui,
     interrupts: &mut impl Interrupts,
@@ -332,8 +317,7 @@ async fn run_blocking<T: Send + 'static>(
     op: Op<T>,
 ) -> Option<T> {
     let handle = tokio::runtime::Handle::current();
-    let watched = gate.clone();
-    let task = tokio::task::spawn_blocking(move || handle.block_on(or_cancelled(&watched, op())));
+    let task = tokio::task::spawn_blocking(move || handle.block_on(op()));
     tokio::pin!(task);
     let (mut told_launched, mut told_cancel) = (false, false);
     let joined = loop {
@@ -348,14 +332,14 @@ async fn run_blocking<T: Send + 'static>(
                     }
                 } else if !told_launched {
                     told_launched = true;
-                    ui.notice(LAUNCHED_NOTICE);
+                    ui.notice(&uncancellable(gate.running().as_deref()));
                 }
             }
             joined = &mut task => break joined,
         }
     };
     match joined {
-        Ok(out) => out,
+        Ok(out) => Some(out),
         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
         // Only a runtime shutting down cancels a blocking task.
         Err(_) => None,
@@ -596,17 +580,6 @@ pub async fn uninstall<F: WingetFlows>(
     run_removal(flows, ui, stop, &row.app_key, plan, choice, say).await
 }
 
-/// How a confirmed native removal goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovalChoice {
-    /// The uninstaller, nothing copied.
-    Remove,
-    /// The shared data folders copied to the backups first, then the uninstaller.
-    BackupThenRemove,
-    /// Only this installation's registry record (exported first); the app stays.
-    RegistryOnly,
-}
-
 /// The data another installation shares with this one, when there is something to choose
 /// (folders to copy or the registry-only removal).
 fn shared_choice(plan: &UninstallPlan) -> Option<&SharedData> {
@@ -666,57 +639,9 @@ fn removal_choice(
         .and_then(|i| options.get(i).map(|(c, _)| *c)))
 }
 
-/// The phase of a removal once launched: the UAC (and the elevated helper) or the removal.
-fn removal_phase(elevated: bool, name: &str) -> Phase {
-    if elevated {
-        Phase::WaitingElevation
-    } else {
-        Phase::Removing {
-            app: name.to_string(),
-        }
-    }
-}
-
-/// The native uninstall of a CLI removal, on its thread: queued on `msi.lock` (an
-/// `msiexec /x` waits for another installer and retries 1618, Task 194), announcing
-/// [`checking_phase`] once the uninstaller ended and the record is being watched.
-pub fn run_uninstaller(
-    u: &UninstallCtx<'_>,
-    queue: &MsiQueue<'_>,
-    plan: &UninstallPlan,
-    progress: &dyn Fn(&ProgressEvent),
-) -> Result<UninstallReport, String> {
-    let watching = std::sync::atomic::AtomicBool::new(false);
-    // The first look at the record comes right after the uninstaller ended.
-    let key_watched = |hive: Hive, key: &str| {
-        if !watching.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            progress(&ProgressEvent::Phase(checking_phase(&plan.name)));
-        }
-        (u.key_exists)(hive, key)
-    };
-    let watched = UninstallCtx {
-        key_exists: &key_watched,
-        ..*u
-    };
-    uninstall_queued(&watched, Some(queue), plan)
-}
-
-/// The phase while the record is watched after the uninstaller ended (up to two minutes).
-pub fn checking_phase(name: &str) -> Phase {
-    Phase::Removing {
-        app: format!("{name} (conferindo a remoção)"),
-    }
-}
-
-/// What a removal did.
-enum Removed {
-    App(UninstallReport, Option<PathBuf>),
-    Record(PathBuf),
-}
-
-/// Runs a confirmed removal on its own thread, as the TUI does: `install.lock`, the folder
-/// copy (a refused copy removes nothing), the launch gate, the phase, then the uninstaller or
-/// the registry-only removal. Ctrl+C is read the whole time (see [`run_blocking`]).
+/// Runs a confirmed removal on its own thread with `removal::remove`, the same sequence as
+/// the TUI (`install.lock`, folder copy, launch gate, phase, uninstaller or registry-only).
+/// Ctrl+C is read the whole time (see [`run_blocking`]).
 async fn run_removal<F: WingetFlows>(
     flows: &F,
     ui: &dyn Ui,
@@ -730,59 +655,20 @@ async fn run_removal<F: WingetFlows>(
     let progress = flows.progress();
     let lock = flows.lock_install();
     let stamp = crate::cache::now_unix().to_string();
-    let backup = match (choice, &plan.shared) {
-        (RemovalChoice::BackupThenRemove, Some(s)) if !s.folders.is_empty() => Some((
-            s.folders.clone(),
-            flows.backups().join(format!("{stamp}-pastas")),
-            flows.free_space(),
-        )),
-        _ => None,
-    };
-    let (elevated, work): (bool, Op<Result<Removed, String>>) = match choice {
-        RemovalChoice::RegistryOnly => {
-            let hklm =
-                matches!(&plan.target, UninstallTarget::Arp { hive, .. } if *hive != Hive::User);
-            let op = flows.remove_registry_only(&plan, &stamp);
-            (
-                hklm,
-                Box::new(move || Box::pin(async move { op().await.map(Removed::Record) })),
-            )
-        }
-        RemovalChoice::Remove | RemovalChoice::BackupThenRemove => {
-            let op = flows.uninstall(&plan);
-            (
-                plan.elevation == Elevation::Helper,
-                Box::new(move || {
-                    Box::pin(async move { op().await.map(|r| Removed::App(r, None)) })
-                }),
-            )
-        }
-    };
-    let phase = removal_phase(elevated, &plan.name);
-    let name = plan.name.clone();
-    let launch = gate.clone();
-    let job: Op<Result<Removed, String>> = Box::new(move || {
+    let uninstaller = flows.uninstall(&plan);
+    let remover = flows.remove_registry_only(&plan, &stamp);
+    let (backups, free) = (flows.backups(), flows.free_space());
+    let (launch, job_plan) = (gate.clone(), plan.clone());
+    let job: Op<Result<Removed, RemovalError>> = Box::new(move || {
         Box::pin(async move {
-            let _held = lock().await?;
-            let mut copied = None;
-            if let Some((folders, dest, free)) = backup {
-                let limits = BackupLimits::standard(&free);
-                let notes = backup_folders(&folders, &dest, &limits).map_err(|e| {
-                    format!("{name}: cópia das pastas recusada ({e}); nada foi removido")
-                })?;
-                for n in &notes {
-                    tracing::warn!(app = %name, "backup: {n}");
-                }
-                copied = Some(dest);
-            }
-            if !launch.try_launch_for("desinstalador") {
-                return Err(WingetOpsError::Cancelled.to_string());
-            }
-            progress(&ProgressEvent::Phase(phase));
-            match work().await? {
-                Removed::App(r, _) => Ok(Removed::App(r, copied)),
-                other => Ok(other),
-            }
+            let steps = Steps {
+                gate: &launch,
+                progress: &*progress,
+                backups: &backups,
+                stamp: &stamp,
+                free_space: &free,
+            };
+            removal::remove(&steps, lock(), &job_plan, choice, uninstaller, remover).await
         })
     });
     stop.interrupts.hold();
@@ -798,7 +684,7 @@ async fn run_removal<F: WingetFlows>(
     let out = run_blocking(ui, stop.interrupts, &gate, job).await;
     ui.end_progress();
     let out = match out {
-        Some(out) if !gate.cancelled() => out,
+        Some(out) if !gate.cancelled() && !matches!(out, Err(RemovalError::Cancelled)) => out,
         _ => {
             log.finish(Outcome::Cancelled, "Ctrl+C");
             say(&style::paint(style::WARN, "Cancelado."));
@@ -807,16 +693,16 @@ async fn run_removal<F: WingetFlows>(
         }
     };
     match &out {
-        Ok(Removed::App(r, _)) => log.finish(
-            r.status.job_outcome(),
-            r.warning.as_deref().unwrap_or("removido"),
+        Ok(Removed::App { report, .. }) => log.finish(
+            report.status.job_outcome(),
+            report.warning.as_deref().unwrap_or("removido"),
         ),
         Ok(Removed::Record(_)) => log.finish(Outcome::Ok, "registro removido"),
-        Err(e) => log.finish(Outcome::Failed, e),
+        Err(e) => log.finish(Outcome::Failed, &e.to_string()),
     }
     stop.interrupts.release();
-    match out.map_err(anyhow::Error::msg)? {
-        Removed::App(report, copied) => {
+    match out.map_err(|e| anyhow!("{e}"))? {
+        Removed::App { report, copied } => {
             print_uninstalled(&report, &plan, &mut *say);
             if let Some(dest) = copied {
                 say(&format!("Pastas copiadas para {}", dest.display()));
@@ -831,6 +717,7 @@ async fn run_removal<F: WingetFlows>(
     }
     Ok(())
 }
+
 fn print_uninstalled(r: &UninstallReport, plan: &UninstallPlan, say: Say<'_>) {
     match (r.status, &r.warning) {
         (UninstallStatus::Removed, None) => {

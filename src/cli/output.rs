@@ -830,6 +830,10 @@ const SPEED_WINDOW: Duration = Duration::from_secs(3);
 pub const STALL_AFTER: Duration = Duration::from_secs(10);
 /// Log silence of the Windows Installer after which the line warns.
 pub const INSTALLER_IDLE: Duration = Duration::from_secs(60);
+
+/// Time after which a native installer or uninstaller (no log to follow) is said to maybe wait
+/// for an answer in a window.
+pub const NATIVE_QUIET: Duration = Duration::from_secs(300);
 /// Windows Installer time after which [`INSTALLER_NOTICE`] is printed once.
 pub const INSTALLER_NOTICE_AFTER: Duration = Duration::from_secs(30);
 /// Fixed line printed above the animation once the Windows Installer passes 30 s.
@@ -954,7 +958,10 @@ impl Phases {
                 | Phase::Scanning
                 | Phase::WaitingElevation
                 | Phase::RunningInstaller { .. }
-                | Phase::Verifying,
+                | Phase::Verifying
+                | Phase::CopyingFolders
+                | Phase::Uninstalling { .. }
+                | Phase::CheckingRemoval { .. },
                 _,
             ))
             | None => None,
@@ -1010,7 +1017,10 @@ impl Phases {
                 | Phase::Scanning
                 | Phase::WaitingElevation
                 | Phase::RunningInstaller { .. }
-                | Phase::Verifying,
+                | Phase::Verifying
+                | Phase::CopyingFolders
+                | Phase::Uninstalling { .. }
+                | Phase::CheckingRemoval { .. },
                 _,
             ))
             | None => return None,
@@ -1079,10 +1089,21 @@ impl Phases {
                 | Phase::Recording
                 | Phase::Removing { .. }
                 | Phase::Scanning
-                | Phase::Verifying => {}
-                // The native installer cannot be cancelled either; it has no log to follow.
-                Phase::RunningInstaller { .. } | Phase::WaitingElevation => {
+                | Phase::Verifying
+                | Phase::CopyingFolders => {}
+                // The native installer and uninstaller cannot be cancelled either; they have
+                // no log to follow: past `NATIVE_QUIET` the line says a window may be waiting.
+                Phase::RunningInstaller { .. }
+                | Phase::WaitingElevation
+                | Phase::Uninstalling { .. }
+                | Phase::CheckingRemoval { .. } => {
                     main = format!("{spin} {}", phase_status(phase, elapsed));
+                    if elapsed >= NATIVE_QUIET && !matches!(phase, Phase::CheckingRemoval { .. }) {
+                        warn = format!(
+                            " · rodando há {} min; pode haver uma janela esperando resposta",
+                            elapsed.as_secs() / 60
+                        );
+                    }
                 }
             }
             return Some((main, warn));

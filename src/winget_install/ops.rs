@@ -146,6 +146,47 @@ pub async fn lock_install(layout: &Layout, wait: LockWait) -> Result<UpdateLock,
         .ok_or(WingetOpsError::Busy)
 }
 
+/// One slice of the `install.lock` wait of [`lock_install_for`] (the gate is read between).
+const LOCK_SLICE: Duration = Duration::from_millis(200);
+
+/// [`lock_install`] that gives up once `gate` is cancelled (Ctrl+C before anything launched).
+/// It waits in short slices, each one awaited: a cancel never leaves a thread waiting for the
+/// lock (it would take it after the user was told "Cancelado.") nor a handle unawaited; a lock
+/// taken while the cancel arrived is let go at once.
+pub async fn lock_install_for(
+    layout: &Layout,
+    wait: LockWait,
+    gate: &LaunchGate,
+) -> Result<UpdateLock, WingetOpsError> {
+    let path = layout.install_lock();
+    let total = match wait {
+        LockWait::Block(d) => d,
+        LockWait::NoWait => Duration::ZERO,
+    };
+    let start = std::time::Instant::now();
+    loop {
+        if gate.cancelled() {
+            return Err(WingetOpsError::Cancelled);
+        }
+        let slice = total.saturating_sub(start.elapsed()).min(LOCK_SLICE);
+        let p = path.clone();
+        let handle = tokio::task::spawn_blocking(move || UpdateLock::acquire_timeout(&p, slice));
+        let got = match handle.await {
+            Ok(r) => r.map_err(|e| WingetOpsError::Lock(e.to_string()))?,
+            Err(e) => match e.try_into_panic() {
+                Ok(p) => std::panic::resume_unwind(p),
+                Err(e) => return Err(WingetOpsError::Lock(e.to_string())),
+            },
+        };
+        match got {
+            Some(_) if gate.cancelled() => return Err(WingetOpsError::Cancelled),
+            Some(lock) => return Ok(lock),
+            None if start.elapsed() >= total => return Err(WingetOpsError::Busy),
+            None => {}
+        }
+    }
+}
+
 /// Hashes the materialized file again through a handle that denies write, delete and rename
 /// until `file` is dropped.
 #[cfg(windows)]
@@ -189,7 +230,7 @@ pub async fn install(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
 ) -> Result<InstallReport, WingetOpsError> {
-    let lock = lock_install(&ctx.data.install_layout(), ctx.wait).await?;
+    let lock = lock_install_for(&ctx.data.install_layout(), ctx.wait, &ctx.gate).await?;
     install_locked(ctx, plan, &lock).await
 }
 
