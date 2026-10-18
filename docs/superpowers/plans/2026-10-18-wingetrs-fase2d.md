@@ -682,6 +682,8 @@ Testes (`tests/it/wi_install_flow.rs`; wiremock serve o "instalador" — bytes q
 5. `pub fn known_folders() -> std::io::Result<KnownFolders>` no lado Windows (`SHGetKnownFolderPath`: `ProgramFiles`, `ProgramFilesX86`, `Windows`, `ProgramData`), nunca variável de ambiente.
 6. Cliente: `ElevatedRunner` ganha `run_uninstaller(..) -> Result<i32, ElevatedError>` e `delete_arp_key(..) -> Result<(), ElevatedError>`.
 
+**Da revisão da Task 172 (2026-10-18): o parser do ARP (`uninstall_cmd::split_command`) não recusa nada; quem roda elevado recusa.** O auxiliar, antes de executar um desinstalador: (a) recusa linha de `Hive::User` (HKCU é gravável pelo usuário: rodar como admin seria escalada); (b) expande variáveis só por KnownFolder (`%ProgramFiles%`, `%ProgramFiles(x86)%`, `%SystemRoot%`, `%CommonProgramFiles%`), nunca pelo ambiente; (c) exige programa por caminho absoluto, existente, fora de pastas graváveis pelo usuário (sem relativo, sem PATH, sem aspas abertas, sem texto sem `.exe`); (d) `msiexec` vindo de Quiet/Uninstall só com `/x{GUID}` validado (nunca `/i`, `/f`, `/p`), e o programa é o `msiexec.exe` de `System32` por KnownFolder, não o texto da linha. Um teste por recusa.
+
 **Files:**
 - Create: `src/winget_install/elevated_rules.rs` (já existe com uma linha `//!`)
 - Modify: `src/bridge/worker.rs`, `src/bridge/elevated.rs`, `src/bridge/elevate_win.rs`, `src/bridge/staging_win.rs` (se as funções Win32 de registro ficarem lá; ou um `src/bridge/arp_ops_win.rs` novo — diga qual)
