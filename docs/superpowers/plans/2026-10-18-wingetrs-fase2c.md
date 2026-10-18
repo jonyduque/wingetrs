@@ -1112,6 +1112,8 @@ Testes (`tests/it/script_host_win.rs`):
 
 **Da revisão da Task 151 (2026-10-18):** `execute_uninstall` devolve as notas de desinstalador pulado (manifesto gravado ausente/alterado/irresolvível), mas `ops::uninstall` só as registra no log. Esta tarefa (e a 162 na TUI) leva essas notas ao usuário no resultado da remoção, com teste.
 
+**Da Task 160 (2026-10-18):** o texto `UNCANCELLABLE` do CLI (aviso do Ctrl+C recusado) ainda fala só de "Windows Installer"; deixe genérico para hooks e instaladores ("um passo que não pode ser interrompido está rodando: <qual>; esperando terminar"), com teste.
+
 **Files:**
 - Modify: `src/cli/mod.rs`, `src/cli/install_cmd.rs`, `src/cli/output.rs`, `src/install/ops.rs`
 - Test: `tests/it/cli_scripts.rs` (**já criado pelo orquestrador**; `TestUi`/contexto como em `tests/it/cli_install.rs`, `FakeHost` em `Arc` com contador)
