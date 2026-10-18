@@ -11,6 +11,8 @@ pub mod elevate_win;
 pub mod elevated;
 #[cfg(windows)]
 pub mod spawn_win;
+#[cfg(windows)]
+pub mod staging_win;
 pub mod worker;
 
 pub const PINNED_NOTE: &str = "versão fixada";
