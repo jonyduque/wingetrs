@@ -1,6 +1,5 @@
 ---
-source: tests/install_planner.rs
-assertion_line: 247
+source: tests/it/install_planner.rs
 expression: p.to_string()
 ---
 Instalar app 1.67.4 (bucket main, 64bit)
@@ -11,4 +10,5 @@ Instalar app 1.67.4 (bucket main, 64bit)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.67.4 (junção)
   6. Criar comando air em C:\W\shims (air.exe + air.shim) -> C:\W\apps\app\current\air.exe
   7. Garantir C:\W\shims no PATH do usuário
-  8. Registrar app 1.67.4 (main) em C:\W\state.db
+  8. gravar C:\W\apps\app\1.67.4\manifest.json
+  9. Registrar app 1.67.4 (main) em C:\W\state.db

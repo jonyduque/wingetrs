@@ -12,6 +12,8 @@ pub enum StateError {
     UnknownKind(String),
     #[error("erro de E/S no estado: {0}")]
     Io(#[from] std::io::Error),
+    #[error("o manifesto gravado de {0} não confere com o registro")]
+    ManifestMismatch(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -239,6 +241,28 @@ pub fn write_install_json(
     std::fs::write(&tmp, bytes)?;
     let dst = version_dir.join("install.json");
     crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &dst))
+}
+
+/// Reads `<version_dir>\manifest.json` written at install time; `None` for apps installed
+/// before Phase 2c. Bytes that are not UTF-8 or whose SHA-256 differs from the record are refused.
+pub fn installed_manifest(
+    layout: &Layout,
+    app: &str,
+    version: &str,
+    expected_sha256: &str,
+) -> Result<Option<String>, StateError> {
+    let path = layout.version_dir(app, version).join("manifest.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if crate::cache::sha256_hex(&bytes) != expected_sha256 {
+        return Err(StateError::ManifestMismatch(app.to_string()));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| StateError::ManifestMismatch(app.to_string()))
 }
 
 fn read_install_json(app_dir: &Path) -> Option<serde_json::Value> {

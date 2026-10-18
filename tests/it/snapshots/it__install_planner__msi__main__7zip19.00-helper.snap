@@ -1,5 +1,5 @@
 ---
-source: tests/install_planner.rs
+source: tests/it/install_planner.rs
 expression: p.to_string()
 ---
 Instalar app 19.00 (bucket main, 64bit)
@@ -10,4 +10,5 @@ Instalar app 19.00 (bucket main, 64bit)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\19.00 (junção)
   6. Criar comando 7z1900-helper em C:\W\shims (7z1900-helper.exe + 7z1900-helper.shim) -> C:\W\apps\app\current\7z.exe
   7. Garantir C:\W\shims no PATH do usuário
-  8. Registrar app 19.00 (main) em C:\W\state.db
+  8. gravar C:\W\apps\app\19.00\manifest.json
+  9. Registrar app 19.00 (main) em C:\W\state.db

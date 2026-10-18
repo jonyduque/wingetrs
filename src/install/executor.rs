@@ -279,6 +279,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::EnvSet { .. } => "env",
         Step::EnvAddPath { .. } => "path",
         Step::EnsureShimsOnPath => "shims_path",
+        Step::WriteManifest { .. } => "manifest",
         Step::RecordState => "state",
         Step::RemoveOldVersion { .. } => "remove_old",
     }
@@ -304,7 +305,7 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
         | Step::EnvSet { .. }
         | Step::EnvAddPath { .. }
         | Step::EnsureShimsOnPath => Some(Phase::Linking),
-        Step::RecordState => Some(Phase::Recording),
+        Step::WriteManifest { .. } | Step::RecordState => Some(Phase::Recording),
     }
 }
 
@@ -321,6 +322,7 @@ fn step_label(step: &Step) -> String {
         Step::EnvSet { name, .. } => format!("variável {name}"),
         Step::EnvAddPath { entry } => format!("PATH {}", entry.display()),
         Step::EnsureShimsOnPath => "shims no PATH".into(),
+        Step::WriteManifest { .. } => "gravar manifesto".into(),
         Step::RecordState => "registro".into(),
         Step::RemoveOldVersion { version } => format!("remover versão {version}"),
     }
@@ -928,6 +930,19 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
         Step::EnvAddPath { entry } => add_path(run, ctx.effects.env, &entry.display().to_string()),
         Step::EnsureShimsOnPath => {
             add_path(run, ctx.effects.env, &layout.shims().display().to_string())
+        }
+        Step::WriteManifest { json } => {
+            let dir = layout.version_dir(app, version);
+            let dest = dir.join("manifest.json");
+            let tmp = dir.join("manifest.json.tmp");
+            let written = fs::write(&tmp, json.as_bytes())
+                .and_then(|()| fs_retry::retry("renomear", &tmp, || fs::rename(&tmp, &dest)));
+            if let Err(e) = written {
+                let _ = fs::remove_file(&tmp);
+                return Err(io_msg(&dest, e));
+            }
+            run.push(Undo::RemovePath(dest.clone()));
+            Ok(())
         }
         Step::RecordState => {
             // Last step that can fail (validated up front); `record` is one transaction, so a

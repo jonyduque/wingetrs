@@ -1,6 +1,5 @@
 ---
-source: tests/install_planner.rs
-assertion_line: 247
+source: tests/it/install_planner.rs
 expression: p.to_string()
 ---
 Instalar app 1.3.39 (bucket main, 64bit)
@@ -11,4 +10,5 @@ Instalar app 1.3.39 (bucket main, 64bit)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.3.39 (junção)
   6. Criar comando acli em C:\W\shims (acli.exe + acli.shim) -> C:\W\apps\app\current\acli.exe
   7. Garantir C:\W\shims no PATH do usuário
-  8. Registrar app 1.3.39 (main) em C:\W\state.db
+  8. gravar C:\W\apps\app\1.3.39\manifest.json
+  9. Registrar app 1.3.39 (main) em C:\W\state.db

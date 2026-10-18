@@ -1,5 +1,5 @@
 ---
-source: tests/install_planner.rs
+source: tests/it/install_planner.rs
 expression: p.to_string()
 ---
 Instalar app 3.02a09 (bucket main, sem arquitetura)
@@ -23,4 +23,5 @@ Instalar app 3.02a09 (bucket main, sem arquitetura)
  18. Criar comando scgcheck em C:\W\shims (scgcheck.exe + scgcheck.shim) -> C:\W\apps\app\current\scgcheck.exe
  19. Criar comando scgskeleton em C:\W\shims (scgskeleton.exe + scgskeleton.shim) -> C:\W\apps\app\current\scgskeleton.exe
  20. Garantir C:\W\shims no PATH do usuário
- 21. Registrar app 3.02a09 (main) em C:\W\state.db
+ 21. gravar C:\W\apps\app\3.02a09\manifest.json
+ 22. Registrar app 3.02a09 (main) em C:\W\state.db

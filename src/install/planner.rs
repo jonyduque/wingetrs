@@ -316,6 +316,9 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         }
     }
     steps.push(Step::EnsureShimsOnPath);
+    steps.push(Step::WriteManifest {
+        json: m.raw_json.clone(),
+    });
     steps.push(Step::RecordState);
     if let Some(old) = &upgrade_from
         && !input.keep_old

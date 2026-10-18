@@ -1259,7 +1259,7 @@ async fn install_emits_one_span_per_stage_and_per_app() {
     }
     assert_eq!(closed.count("install.step:env"), 1, "só leaf tem env_set");
     let step_parents = closed.parents("install.step");
-    assert_eq!(step_parents.len(), 15, "{:?}", closed.names());
+    assert_eq!(step_parents.len(), 17, "{:?}", closed.names());
     assert!(
         step_parents.iter().all(|p| p == "install.execute"),
         "{step_parents:?}"

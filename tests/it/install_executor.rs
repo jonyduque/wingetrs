@@ -1299,7 +1299,7 @@ async fn install_remove_msi_leaves_nothing() {
     let names: Vec<_> = std::fs::read_dir(&current)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "install.json")
+        .filter(|n| n != "install.json" && n != "manifest.json")
         .collect();
     assert_eq!(names, ["one.txt"]);
     let mut ctx = s.ctx_with_hook(&NoHook);
@@ -1604,7 +1604,7 @@ async fn allowed_msiexec_extracts_via_fake() {
     // No `pkg-1.0.msi` (the administrative copy) and no `_msiexec` work folder.
     assert_eq!(
         names_in(&current),
-        ["PKG", "install.json", "readme.txt"],
+        ["PKG", "install.json", "manifest.json", "readme.txt"],
         "{}",
         current.display()
     );
@@ -1628,7 +1628,10 @@ async fn msiexec_tree_goes_through_extract_dir_without_case() {
         .unwrap();
     drop(ctx);
     let current = s.layout.current("app");
-    assert_eq!(names_in(&current), ["install.json", "one.txt"]);
+    assert_eq!(
+        names_in(&current),
+        ["install.json", "manifest.json", "one.txt"]
+    );
     assert_eq!(std::fs::read(current.join("one.txt")).unwrap(), b"one\r\n");
 }
 

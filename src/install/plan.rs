@@ -52,18 +52,34 @@ pub struct PersistSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     EnsureLauncher,
-    Download { index: usize, source: Source },
-    Extract { index: usize },
+    Download {
+        index: usize,
+        source: Source,
+    },
+    Extract {
+        index: usize,
+    },
     Promote,
     Persist(PersistSpec),
     LinkCurrent,
     Shim(ShimSpec),
     Shortcut(ShortcutSpec),
-    EnvSet { name: String, value: String },
-    EnvAddPath { entry: PathBuf },
+    EnvSet {
+        name: String,
+        value: String,
+    },
+    EnvAddPath {
+        entry: PathBuf,
+    },
     EnsureShimsOnPath,
+    /// Writes the manifest text as-is to `<version_dir>\manifest.json`.
+    WriteManifest {
+        json: String,
+    },
     RecordState,
-    RemoveOldVersion { version: String },
+    RemoveOldVersion {
+        version: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +299,10 @@ impl InstallPlan {
             Step::EnsureShimsOnPath => {
                 format!("Garantir {} no PATH do usuário", l.shims().display())
             }
+            Step::WriteManifest { .. } => format!(
+                "gravar {}",
+                l.version_dir(app, v).join("manifest.json").display()
+            ),
             Step::RecordState => format!(
                 "Registrar {app} {v} ({}) em {}",
                 self.bucket,

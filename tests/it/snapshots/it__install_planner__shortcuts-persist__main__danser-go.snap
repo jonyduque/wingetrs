@@ -1,6 +1,5 @@
 ---
-source: tests/install_planner.rs
-assertion_line: 247
+source: tests/it/install_planner.rs
 expression: p.to_string()
 ---
 Instalar app 0.12.0 (bucket main, 64bit)
@@ -14,4 +13,5 @@ Instalar app 0.12.0 (bucket main, 64bit)
   8. Criar comando danser-cli em C:\W\shims (danser-cli.exe + danser-cli.shim) -> C:\W\apps\app\current\danser-cli.exe
   9. Criar atalho C:\SM\wingetrs Apps\danser-go.lnk -> C:\W\apps\app\current\danser.exe
  10. Garantir C:\W\shims no PATH do usuário
- 11. Registrar app 0.12.0 (main) em C:\W\state.db
+ 11. gravar C:\W\apps\app\0.12.0\manifest.json
+ 12. Registrar app 0.12.0 (main) em C:\W\state.db

@@ -51,6 +51,7 @@ fn step_order_is_the_executor_contract() {
             Step::EnvSet { .. } => "envset",
             Step::EnvAddPath { .. } => "envpath",
             Step::EnsureShimsOnPath => "path",
+            Step::WriteManifest { .. } => "manifest",
             Step::RecordState => "state",
             Step::RemoveOldVersion { .. } => "rmold",
         })
@@ -59,7 +60,7 @@ fn step_order_is_the_executor_contract() {
         kinds,
         [
             "launcher", "download", "extract", "promote", "persist", "current", "shim", "shim",
-            "shortcut", "path", "state"
+            "shortcut", "path", "manifest", "state"
         ]
     );
     assert!(
