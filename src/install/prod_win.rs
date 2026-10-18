@@ -10,13 +10,13 @@ use crate::install::download::Progress;
 use crate::install::env_win::RegEnvStore;
 use crate::install::executor::{Msiexec, Runners};
 use crate::install::fs_win;
-use crate::install::inno_win;
 use crate::install::msiexec_win;
 use crate::install::ops::{OpsCtx, ResidueScan, installed_by_scoop};
 use crate::install::registry_win::RegScanner;
 use crate::install::shortcut_win::{self, ComShortcuts};
 use crate::install::traits::{EffectError, Effects};
 use crate::install::trash_win::ShellTrash;
+use crate::install::{inno_win, installer_win};
 use crate::update::LockWait;
 
 /// Owns the real effect implementations; [`ProdEffects::effects`] borrows them.
@@ -74,6 +74,7 @@ pub fn build_ctx<'a>(
             },
             Runners {
                 innounp: inno_win::run,
+                installer: Some(installer_win::run),
             },
         )
     };

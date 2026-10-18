@@ -171,8 +171,8 @@ fn support_keys_inside_architecture_variant() {
         ("post_install", r#""x""#),
         ("pre_uninstall", r#""x""#),
         ("post_uninstall", r#""x""#),
-        ("installer", r#"{"file":"a.exe"}"#),
-        ("uninstaller", r#"{"file":"a.exe"}"#),
+        ("installer", r#"{"file":"a.ps1"}"#),
+        ("uninstaller", r#"{"file":"a.ps1"}"#),
     ] {
         let j = format!(
             r#"{{"version":"1","architecture":{{"64bit":{{"url":"https://x/a.zip","hash":"aa","{k}":{v}}}}}}}"#

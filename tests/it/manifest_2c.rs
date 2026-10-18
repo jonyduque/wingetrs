@@ -187,8 +187,8 @@ fn planner_refuses_each_2c_key_with_old_text() {
         r#","post_install":"x""#,
         r#","pre_uninstall":"x""#,
         r#","post_uninstall":"x""#,
-        r#","installer":{"file":"a.exe"}"#,
-        r#","uninstaller":{"file":"a.exe"}"#,
+        r#","installer":{"file":"a.ps1"}"#,
+        r#","uninstaller":{"file":"a.ps1"}"#,
     ];
     let keys = [
         "pre_install",

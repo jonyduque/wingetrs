@@ -1,2 +1,469 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Phase 2c tests (Task 151).
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
+use wingetrs::cache::DataDir;
+use wingetrs::http::Http;
+use wingetrs::install::executor::{
+    ExecCtx, ExecError, NoHook, Runners, ToolRun, execute_install, execute_uninstall,
+};
+use wingetrs::install::installer_args::installer_args;
+use wingetrs::install::layout::Layout;
+use wingetrs::install::manifest::{Arch, resolve};
+use wingetrs::install::plan::{InstallPlan, Step, UninstallPlan};
+use wingetrs::install::planner::{PlanError, PlanInput, plan_install};
+use wingetrs::install::state::StateDb;
+use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
+use wingetrs::install::traits::{Effects, EnvStore, EnvValue, Shortcuts};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn fake_pe(subsystem: u16) -> Vec<u8> {
+    let mut b = vec![0u8; 0x80 + 24 + 96];
+    b[0] = b'M';
+    b[1] = b'Z';
+    b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+    b[0x80..0x84].copy_from_slice(b"PE\0\0");
+    let off = 0x80 + 24 + 68;
+    b[off..off + 2].copy_from_slice(&subsystem.to_le_bytes());
+    b
+}
+
+fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut z = zip::ZipWriter::new(&mut buf);
+        let o = zip::write::SimpleFileOptions::default();
+        for (name, bytes) in entries {
+            z.start_file(*name, o).unwrap();
+            z.write_all(bytes).unwrap();
+        }
+        z.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    hex::encode(Sha256::digest(b))
+}
+
+fn no_progress(_: &wingetrs::install::progress::ProgressEvent) {}
+fn nothing_in_use(_: &Path) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+struct World {
+    server: MockServer,
+    _t: TempDir,
+    layout: Layout,
+    data: DataDir,
+    env: FakeEnv,
+    shortcuts: FakeShortcuts,
+    trash: FakeTrash,
+    registry: FakeRegistry,
+    state: StateDb,
+    state_path: PathBuf,
+    http: Http,
+}
+
+async fn setup() -> World {
+    let server = MockServer::start().await;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("root");
+    let layout = Layout::new(&root);
+    std::fs::create_dir_all(layout.launcher().parent().unwrap()).unwrap();
+    std::fs::write(layout.launcher(), fake_pe(3)).unwrap();
+    let env = FakeEnv::new();
+    env.set(
+        "Path",
+        &EnvValue {
+            value: r"C:\Existing".into(),
+            expand: true,
+        },
+    )
+    .unwrap();
+    let state_path = t.path().join("state").join("state.db");
+    World {
+        server,
+        data: DataDir::new(&root),
+        layout,
+        env,
+        shortcuts: FakeShortcuts::new(t.path().join("startmenu")),
+        trash: FakeTrash::new(),
+        registry: FakeRegistry::new(),
+        state: StateDb::open(&state_path).unwrap(),
+        state_path,
+        http: Http::new().unwrap(),
+        _t: t,
+    }
+}
+
+impl World {
+    /// Serves a zip at `/pkg.zip`; returns the manifest JSON with `extra` merged in.
+    async fn manifest(&self, extra: serde_json::Value) -> String {
+        let zip = zip_of(&[
+            ("pkg/tool.exe", &fake_pe(3)),
+            ("pkg/setup.exe", &fake_pe(3)),
+            ("pkg/unins.exe", &fake_pe(3)),
+        ]);
+        let sha = sha256_hex(&zip);
+        Mock::given(method("GET"))
+            .and(path("/pkg.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
+            .mount(&self.server)
+            .await;
+        let mut m = serde_json::json!({
+            "version": "1.0",
+            "url": format!("{}/pkg.zip", self.server.uri()),
+            "hash": sha,
+            "extract_dir": "pkg",
+            "bin": "tool.exe",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            m[k] = v.clone();
+        }
+        m.to_string()
+    }
+
+    fn plan(&self, manifest: &str) -> InstallPlan {
+        let m = resolve(manifest, Arch::X64).unwrap();
+        let sha = sha256_hex(manifest.as_bytes());
+        plan_install(&PlanInput {
+            app: "app",
+            bucket: "main",
+            manifest: &m,
+            layout: &self.layout,
+            shortcut_root: &self.shortcuts.root(),
+            installed: None,
+            launcher_present: true,
+            keep_old: false,
+            manifest_sha256: &sha,
+        })
+        .unwrap()
+    }
+
+    fn ctx(&self, installer: Option<ToolRun>) -> ExecCtx<'_> {
+        let state: &mut StateDb = Box::leak(Box::new(StateDb::open(&self.state_path).unwrap()));
+        ExecCtx {
+            layout: &self.layout,
+            data: &self.data,
+            http: &self.http,
+            effects: Effects {
+                env: &self.env,
+                shortcuts: &self.shortcuts,
+                trash: &self.trash,
+                registry: &self.registry,
+            },
+            state,
+            hook: &NoHook,
+            progress: &no_progress,
+            in_use: &nothing_in_use,
+            msiexec: None,
+            launch: Default::default(),
+            runners: Runners {
+                installer,
+                ..Runners::disabled()
+            },
+        }
+    }
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn args_substitute_only_dir_global_version() {
+    let vdir = Path::new(r"C:\r\apps\app\1.0");
+    let got = installer_args(
+        &strs(&["/D=$dir", "$global", "$version", "$persist_dir", "$app"]),
+        vdir,
+        "1.0",
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        strs(&[
+            r"/D=C:\r\apps\app\1.0",
+            "False",
+            "1.0",
+            "$persist_dir",
+            "$app"
+        ])
+    );
+    // case-sensitive, like String.Replace
+    let got = installer_args(&strs(&["$DIR"]), vdir, "1.0").unwrap();
+    assert_eq!(got, strs(&["$DIR"]));
+}
+
+#[test]
+fn args_split_like_scoop() {
+    let d = Path::new("x");
+    assert_eq!(
+        installer_args(&strs(&[r"/S /D=C:\x y"]), d, "1").unwrap(),
+        strs(&["/S", r"/D=C:\x y"])
+    );
+    assert_eq!(
+        installer_args(&strs(&["\"q\""]), d, "1").unwrap(),
+        strs(&["q"])
+    );
+    assert_eq!(
+        installer_args(&strs(&["C:/Program Files/x"]), d, "1").unwrap(),
+        strs(&["C:/Program Files/x"])
+    );
+}
+
+#[test]
+fn args_with_control_characters_are_refused() {
+    let r = installer_args(&strs(&["/S\n"]), Path::new("x"), "1");
+    assert!(matches!(r, Err(PlanError::UnsafeArgs(_))), "{r:?}");
+}
+
+fn plan_for(manifest: &serde_json::Value) -> Result<InstallPlan, PlanError> {
+    let t = tempfile::tempdir().unwrap();
+    let layout = Layout::new(t.path().join("root"));
+    let m = resolve(&manifest.to_string(), Arch::X64).unwrap();
+    plan_install(&PlanInput {
+        app: "app",
+        bucket: "main",
+        manifest: &m,
+        layout: &layout,
+        shortcut_root: t.path(),
+        installed: None,
+        launcher_present: true,
+        keep_old: false,
+        manifest_sha256: "",
+    })
+}
+
+fn exe_manifest(installer: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "version": "1.0",
+        "url": "https://example.invalid/setup.exe",
+        "hash": "0".repeat(64),
+        "installer": installer,
+    })
+}
+
+#[test]
+fn file_defaults_to_download_name() {
+    let plan = plan_for(&exe_manifest(serde_json::json!({"args": ["/S"]}))).unwrap();
+    let promote = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::Promote))
+        .unwrap();
+    assert!(
+        matches!(&plan.steps[promote + 1], Step::RunInstaller { file, .. } if file == "setup.exe"),
+        "{:?}",
+        plan.steps[promote + 1]
+    );
+}
+
+#[test]
+fn msi_file_refused() {
+    let r = plan_for(&exe_manifest(serde_json::json!({"file": "x.MSI"})));
+    assert!(
+        matches!(&r, Err(PlanError::Unsupported(m)) if m.contains(".msi")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn ps1_or_script_still_refused_with_old_text() {
+    const OLD: &str =
+        "não suportado: usa installer (PowerShell/instalador próprio): suportado na fase 2c";
+    for installer in [
+        serde_json::json!({"file": "x.ps1"}),
+        serde_json::json!({"script": "a"}),
+    ] {
+        let e = plan_for(&exe_manifest(installer)).unwrap_err();
+        assert_eq!(e.to_string(), OLD);
+    }
+    let mut m = exe_manifest(serde_json::json!({"file": "x.ps1"}));
+    m["uninstaller"] = m["installer"].take();
+    let e = plan_for(&m).unwrap_err();
+    assert!(e.to_string().contains("usa uninstaller"), "{e}");
+}
+
+#[test]
+fn unsafe_installer_file_is_a_manifest_error() {
+    let m = exe_manifest(serde_json::json!({"file": "..\\x.exe"}));
+    assert!(resolve(&m.to_string(), Arch::X64).is_err());
+}
+
+static SEEN: Mutex<Vec<(PathBuf, Vec<String>, PathBuf)>> = Mutex::new(Vec::new());
+
+fn fake_ok(exe: &Path, args: &[String], dir: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    assert!(exe.is_file(), "the installer exists while it runs");
+    SEEN.lock()
+        .unwrap()
+        .push((exe.to_path_buf(), args.to_vec(), dir.to_path_buf()));
+    Ok((0, Vec::new()))
+}
+
+#[tokio::test]
+async fn runs_with_consent_and_deletes_file() {
+    for keep in [false, true] {
+        let s = setup().await;
+        let m = s
+            .manifest(serde_json::json!({"installer": {
+                "file": "setup.exe",
+                "args": ["/D=$dir", "$global", "$version", "$persist_dir", "$app"],
+                "keep": keep,
+            }}))
+            .await;
+        let plan = s.plan(&m);
+        SEEN.lock().unwrap().clear();
+        let mut ctx = s.ctx(Some(fake_ok));
+        execute_install(&plan, &mut ctx).await.unwrap();
+        let vdir = s.layout.version_dir("app", "1.0");
+        let seen = SEEN.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].2, vdir, "cwd is the version folder");
+        assert_eq!(seen[0].0, vdir.join("setup.exe"));
+        assert_eq!(
+            seen[0].1,
+            strs(&[
+                &format!("/D={}", vdir.display()),
+                "False",
+                "1.0",
+                "$persist_dir",
+                "$app"
+            ])
+        );
+        assert_eq!(vdir.join("setup.exe").exists(), keep, "keep={keep}");
+        assert!(vdir.join("tool.exe").exists());
+    }
+}
+
+fn fake_exit3(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    Ok((3, vec!["boom".into()]))
+}
+
+#[tokio::test]
+async fn exit_3_rolls_back_with_warning() {
+    let s = setup().await;
+    let m = s
+        .manifest(serde_json::json!({"installer": {"file": "setup.exe"}}))
+        .await;
+    let plan = s.plan(&m);
+    let mut ctx = s.ctx(Some(fake_exit3));
+    let e = execute_install(&plan, &mut ctx).await.unwrap_err();
+    let text = e.to_string();
+    assert!(text.contains("código 3"), "{text}");
+    assert!(text.contains("não foi desfeito"), "{text}");
+    assert!(!s.layout.app_dir("app").exists(), "apps\\app gone");
+    assert!(s.state.get("app").unwrap().is_none());
+}
+
+static CALLS: AtomicUsize = AtomicUsize::new(0);
+fn fake_count(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    CALLS.fetch_add(1, Ordering::SeqCst);
+    Ok((0, Vec::new()))
+}
+
+#[tokio::test]
+async fn no_consent_fails_before_anything() {
+    let s = setup().await;
+    let m = s
+        .manifest(serde_json::json!({"installer": {"file": "setup.exe"}}))
+        .await;
+    let plan = s.plan(&m);
+    let mut ctx = s.ctx(None);
+    let e = execute_install(&plan, &mut ctx).await.unwrap_err();
+    assert!(matches!(e, ExecError::NeedsScriptConsent { .. }), "{e}");
+    assert!(e.to_string().contains("--allow-scripts"), "{e}");
+    assert_eq!(s.server.received_requests().await.unwrap().len(), 0);
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+    assert!(!s.layout.app_dir("app").exists());
+}
+
+#[tokio::test]
+async fn installer_outside_version_dir_refused() {
+    let s = setup().await;
+    let m = s.manifest(serde_json::json!({})).await;
+    let plan = s.plan(&m);
+    let promote = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, Step::Promote))
+        .unwrap();
+    for file in ["..\\x.exe", "nope.exe"] {
+        let mut p = plan.clone();
+        p.steps.insert(
+            promote + 1,
+            Step::RunInstaller {
+                file: file.into(),
+                args: Vec::new(),
+                keep: true,
+            },
+        );
+        let mut ctx = s.ctx(Some(fake_count));
+        let e = execute_install(&p, &mut ctx).await.unwrap_err();
+        assert!(matches!(e, ExecError::Failed { .. }), "{file}: {e}");
+        assert!(!s.layout.app_dir("app").exists());
+    }
+    assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+}
+
+static UN_CODE: AtomicUsize = AtomicUsize::new(1);
+static UN_SEEN: Mutex<Vec<(PathBuf, Vec<String>)>> = Mutex::new(Vec::new());
+
+fn fake_uninstaller(exe: &Path, args: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+    if exe.ends_with("unins.exe") {
+        UN_SEEN
+            .lock()
+            .unwrap()
+            .push((exe.to_path_buf(), args.to_vec()));
+        return Ok((UN_CODE.load(Ordering::SeqCst) as i32, Vec::new()));
+    }
+    Ok((0, Vec::new()))
+}
+
+#[tokio::test]
+async fn uninstaller_runs_before_removal() {
+    let s = setup().await;
+    let m = s
+        .manifest(serde_json::json!({
+            "installer": {"file": "setup.exe"},
+            "uninstaller": {"file": "unins.exe", "args": ["/x", "$dir"], "keep": true},
+        }))
+        .await;
+    let plan = s.plan(&m);
+    let mut ctx = s.ctx(Some(fake_uninstaller));
+    execute_install(&plan, &mut ctx).await.unwrap();
+    let vdir = s.layout.version_dir("app", "1.0");
+    let up = UninstallPlan::from_state(&s.state, "app", false)
+        .unwrap()
+        .unwrap();
+
+    // no consent: nothing runs, nothing is removed
+    let mut ctx = s.ctx(None);
+    let e = execute_uninstall(&up, &mut ctx).unwrap_err();
+    assert!(matches!(e, ExecError::NeedsScriptConsent { .. }), "{e}");
+    assert!(vdir.join("tool.exe").exists());
+
+    UN_CODE.store(1, Ordering::SeqCst);
+    let mut ctx = s.ctx(Some(fake_uninstaller));
+    let e = execute_uninstall(&up, &mut ctx).unwrap_err();
+    assert!(e.to_string().contains("código 1"), "{e}");
+    assert!(vdir.join("tool.exe").exists(), "app stays");
+    assert!(s.layout.shims().join("tool.exe").exists(), "shim stays");
+    assert!(s.state.get("app").unwrap().is_some());
+
+    UN_CODE.store(0, Ordering::SeqCst);
+    UN_SEEN.lock().unwrap().clear();
+    let mut ctx = s.ctx(Some(fake_uninstaller));
+    execute_uninstall(&up, &mut ctx).unwrap();
+    assert!(!s.layout.app_dir("app").exists());
+    assert!(s.state.get("app").unwrap().is_none());
+    let seen = UN_SEEN.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].1, strs(&["/x", &vdir.display().to_string()]));
+}

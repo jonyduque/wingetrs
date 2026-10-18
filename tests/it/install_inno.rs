@@ -309,7 +309,10 @@ impl World {
             in_use: &nothing_in_use,
             msiexec: None,
             launch: Default::default(),
-            runners: Runners { innounp },
+            runners: Runners {
+                innounp,
+                installer: None,
+            },
         };
         wingetrs::install::executor::execute_install(&self.plan, &mut ctx).await
     }

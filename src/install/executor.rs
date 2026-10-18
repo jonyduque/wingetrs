@@ -15,8 +15,9 @@ use crate::cache::DataDir;
 use crate::fs_retry;
 use crate::http::Http;
 use crate::install::download::{self, Progress};
+use crate::install::installer_args;
 use crate::install::layout::Layout;
-use crate::install::manifest::Source;
+use crate::install::manifest::{self, Arch, Source};
 use crate::install::msi_queue::{self, Attempt};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimSpec, ShortcutSpec, Step, UninstallPlan,
@@ -80,6 +81,9 @@ pub type ToolRun = fn(&Path, &[String], &Path) -> io::Result<(i32, Vec<String>)>
 #[derive(Debug, Clone)]
 pub struct Runners {
     pub innounp: ToolRun,
+    /// Runs `installer.file`/`uninstaller.file` (third-party code). `None` = the user gave no
+    /// consent: a plan with a `RunInstaller` fails before any step.
+    pub installer: Option<ToolRun>,
 }
 
 fn refuse_innounp(_: &Path, _: &[String], _: &Path) -> io::Result<(i32, Vec<String>)> {
@@ -91,6 +95,7 @@ impl Runners {
     pub fn disabled() -> Runners {
         Runners {
             innounp: refuse_innounp,
+            installer: None,
         }
     }
 }
@@ -180,6 +185,9 @@ pub enum ExecError {
         source_index: usize,
         reason: String,
     },
+    /// The plan (or the installed app) runs third-party code and no consent was given.
+    #[error("{app}: roda código de terceiros ({what}); é preciso confirmar com --allow-scripts")]
+    NeedsScriptConsent { app: String, what: String },
 }
 
 /// User environment variable holding the PATH.
@@ -297,6 +305,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::Extract { .. } => "extract",
         Step::ExtractInno { .. } => "extract_inno",
         Step::Promote => "promote",
+        Step::RunInstaller { .. } => "installer",
         Step::Persist(_) => "persist",
         Step::LinkCurrent => "link",
         Step::Shim(_) => "shim",
@@ -331,7 +340,7 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
             }),
             _ => None,
         }),
-        Step::Promote | Step::Persist(_) => Some(Phase::Placing),
+        Step::Promote | Step::RunInstaller { .. } | Step::Persist(_) => Some(Phase::Placing),
         Step::LinkCurrent
         | Step::Shim(_)
         | Step::Shortcut(_)
@@ -350,6 +359,7 @@ fn step_label(step: &Step) -> String {
         Step::Extract { index } => format!("extrair [{}]", index + 1),
         Step::ExtractInno { index } => format!("extrair [{}] (Inno Setup)", index + 1),
         Step::Promote => "promover versão".into(),
+        Step::RunInstaller { file, .. } => format!("rodar instalador {file}"),
         Step::Persist(p) => format!("persistir {}", p.in_version.display()),
         Step::LinkCurrent => "apontar current".into(),
         Step::Shim(s) => format!("comando {}", s.name),
@@ -536,6 +546,16 @@ pub async fn execute_install_with(
     check_component("app", &plan.app).map_err(fail_early)?;
     check_component("versão", &plan.version).map_err(fail_early)?;
     check_order(&plan.steps).map_err(fail_early)?;
+    let needs_consent = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, Step::RunInstaller { .. }));
+    if needs_consent && ctx.runners.installer.is_none() {
+        return Err(ExecError::NeedsScriptConsent {
+            app: plan.app.clone(),
+            what: "instalador do manifesto".into(),
+        });
+    }
     for s in &plan.steps {
         if let Step::RemoveOldVersion { version } = s {
             check_component("versão", version).map_err(fail_early)?;
@@ -774,6 +794,50 @@ fn own_staging(
     Ok(staging)
 }
 
+/// Appended to a failed installer: it ran outside our journal.
+const INSTALLER_SIDE_EFFECTS: &str =
+    "; o instalador pode ter alterado arquivos fora da pasta do app, e isso não foi desfeito";
+
+/// The installer's exit as a step result: a spawn error or a code other than 0 fails.
+fn check_installer_exit(r: io::Result<(i32, Vec<String>)>) -> Result<(), String> {
+    match r {
+        Ok((0, _)) => Ok(()),
+        Ok((code, lines)) => {
+            let tail = lines.last().map(|l| format!(" ({l})")).unwrap_or_default();
+            Err(format!(
+                "o instalador saiu com código {code}{tail}{INSTALLER_SIDE_EFFECTS}"
+            ))
+        }
+        Err(e) => Err(format!("não consegui rodar o instalador: {e}")),
+    }
+}
+
+/// Deleting the installer afterwards is tidiness: a failure is only logged.
+fn remove_installer(program: &Path) {
+    if let Err(e) = fs::remove_file(program) {
+        tracing::warn!("{}: {e}", program.display());
+    }
+}
+
+/// `<vdir>/<file>` for an existing regular file that stays inside `vdir` once normalized
+/// (links followed). `file` came from a manifest: joined only through safepath.
+fn installer_program(vdir: &Path, file: &str) -> Result<PathBuf, String> {
+    let comps = safepath::safe_components(file)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| format!("caminho inseguro do instalador: {file}"))?;
+    let mut program = vdir.to_path_buf();
+    program.extend(comps);
+    if !program.is_file() {
+        return Err(format!("instalador {file} não existe"));
+    }
+    let real = fs::canonicalize(&program).map_err(|e| io_msg(&program, e))?;
+    let root = fs::canonicalize(vdir).map_err(|e| io_msg(vdir, e))?;
+    if !real.starts_with(&root) {
+        return Err(format!("instalador {file} fica fora da pasta da versão"));
+    }
+    Ok(program)
+}
+
 /// Runs innounp on `installer` into the fresh folder `tmp` (inside the staging folder) and
 /// moves what it wrote into `<staging>\<extract_to>`. The caller removes `tmp` on error.
 fn inno_extract(
@@ -1006,6 +1070,38 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let arch = plan.arch.map(|a| a.key());
             state::write_install_json(&vdir, &plan.bucket, arch, version)
                 .map_err(|e| io_msg(&vdir, e))
+        }
+        Step::RunInstaller { file, args, keep } => {
+            let Some(runner) = ctx.runners.installer else {
+                return Err("sem consentimento para rodar o instalador".into());
+            };
+            let vdir = layout.version_dir(app, version);
+            let program = installer_program(&vdir, file)?;
+            let work = {
+                let (program, args, dir) = (program.clone(), args.clone(), vdir.clone());
+                move || runner(&program, &args, &dir)
+            };
+            tracing::info!("rodando o instalador {file}");
+            let staging = layout.staging_dir(app, version);
+            let result = match AwaitWorker::spawn(work, staging, ctx.launch.clone())
+                .join()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => match e.try_into_panic() {
+                    // Re-raised by `execute_install` once the install is rolled back.
+                    Ok(p) => {
+                        run.panic = Some(p);
+                        return Err("pânico ao rodar o instalador".into());
+                    }
+                    Err(e) => return Err(e.to_string()),
+                },
+            };
+            check_installer_exit(result)?;
+            if !keep {
+                remove_installer(&program);
+            }
+            Ok(())
         }
         Step::Persist(spec) => persist(run, spec, layout),
         Step::LinkCurrent => {
@@ -1722,6 +1818,10 @@ pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<
     if let Some(p) = (ctx.in_use)(&app_dir).first() {
         return Err(ExecError::InUse(p.display().to_string()));
     }
+    run_uninstaller(ctx, &plan.app).map_err(|e| match e {
+        UninstallerError::Consent(e) => e,
+        UninstallerError::Failed(m) => fail(0, "rodar desinstalador".into(), m),
+    })?;
     for (i, a) in plan.artifacts.iter().enumerate() {
         if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry, false)
         {
@@ -1737,4 +1837,66 @@ pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<
     ctx.state
         .remove(&plan.app)
         .map_err(|e| fail(n + 2, "registro".into(), e.to_string()))
+}
+
+enum UninstallerError {
+    Consent(ExecError),
+    Failed(String),
+}
+
+/// Host architecture recorded at install time (`None` = unknown key).
+fn arch_of_key(key: &str) -> Option<Arch> {
+    [Arch::X64, Arch::X86, Arch::Arm64]
+        .into_iter()
+        .find(|a| a.key() == key)
+}
+
+/// Runs `uninstaller.file` of the installed manifest, if it has one, before anything is
+/// removed. A manifest that is missing, altered (hash differs from the record) or not
+/// resolvable runs nothing: the removal goes on as before, with a warning.
+fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<(), UninstallerError> {
+    let failed = |m: String| UninstallerError::Failed(m);
+    let Some((rec, _)) = ctx.state.get(app).map_err(|e| failed(e.to_string()))? else {
+        return Ok(());
+    };
+    check_component("versão", &rec.version).map_err(failed)?;
+    let raw = match state::installed_manifest(ctx.layout, app, &rec.version, &rec.manifest_sha256) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!("{app}: manifesto instalado ignorado: {e}");
+            return Ok(());
+        }
+    };
+    let arch = rec
+        .arch
+        .as_deref()
+        .and_then(arch_of_key)
+        .unwrap_or_else(Arch::host);
+    let manifest = match manifest::resolve(&raw, arch) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("{app}: manifesto instalado ignorado: {e}");
+            return Ok(());
+        }
+    };
+    let Some(spec) = manifest.uninstaller else {
+        return Ok(());
+    };
+    let Some(file) = spec.file.as_deref().filter(|_| spec.script.is_none()) else {
+        tracing::warn!("{app}: uninstaller sem file (ou com script): nada a rodar");
+        return Ok(());
+    };
+    let Some(runner) = ctx.runners.installer else {
+        return Err(UninstallerError::Consent(ExecError::NeedsScriptConsent {
+            app: app.to_string(),
+            what: "desinstalador do manifesto".into(),
+        }));
+    };
+    let vdir = ctx.layout.version_dir(app, &rec.version);
+    let args = installer_args::installer_args(&spec.args, &vdir, &rec.version)
+        .map_err(|e| failed(e.to_string()))?;
+    let program = installer_program(&vdir, file).map_err(failed)?;
+    tracing::info!("rodando o desinstalador {file}");
+    check_installer_exit(runner(&program, &args, &vdir)).map_err(failed)
 }

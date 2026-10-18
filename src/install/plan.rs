@@ -64,6 +64,13 @@ pub enum Step {
         index: usize,
     },
     Promote,
+    /// Runs `file` (relative to the version folder, no PowerShell) with the already
+    /// substituted and split `args`; deletes it afterwards unless `keep` (Task 151).
+    RunInstaller {
+        file: String,
+        args: Vec<String>,
+        keep: bool,
+    },
     Persist(PersistSpec),
     LinkCurrent,
     Shim(ShimSpec),
@@ -280,6 +287,20 @@ impl InstallPlan {
                 )
             }
             Step::Promote => format!("Mover {} para {}", staging.display(), version_dir.display()),
+            Step::RunInstaller { file, args, .. } => {
+                // `file` came from a manifest: joined only through safepath.
+                let mut program = version_dir.clone();
+                program.extend(
+                    crate::install::safepath::safe_components(file)
+                        .into_iter()
+                        .flatten(),
+                );
+                format!(
+                    "Rodar o instalador {} {}",
+                    program.display(),
+                    args.join(" ")
+                )
+            }
             Step::Persist(p) => {
                 let what = match p.kind {
                     PersistKind::Dir => "pasta",

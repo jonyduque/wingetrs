@@ -285,7 +285,11 @@ fn exec_ctx<'a>(
         in_use: ctx.in_use,
         msiexec,
         launch: ctx.launch.clone(),
-        runners: ctx.runners.clone(),
+        // No production path grants consent to third-party code before Task 161.
+        runners: executor::Runners {
+            installer: None,
+            ..ctx.runners.clone()
+        },
     }
 }
 

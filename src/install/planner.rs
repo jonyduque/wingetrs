@@ -3,8 +3,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::install::installer_args::installer_args;
 use crate::install::layout::Layout;
-use crate::install::manifest::{Arch, Resolved};
+use crate::install::manifest::{Arch, InstallerSpec, Resolved};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimKind, ShimSpec, ShortcutSpec, Step,
 };
@@ -208,13 +209,49 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
     if m.hooks.post_uninstall.is_some() {
         return refuse("post_uninstall");
     }
-    if m.installer.is_some() {
+    // `.ps1` and `script` need PowerShell; a plain file runs through Task 151.
+    if m.installer.as_ref().is_some_and(needs_powershell) {
         return refuse("installer");
     }
-    if m.uninstaller.is_some() {
+    if m.uninstaller.as_ref().is_some_and(needs_powershell) {
         return refuse("uninstaller");
     }
     Ok(())
+}
+
+fn needs_powershell(spec: &InstallerSpec) -> bool {
+    spec.script.is_some()
+        || spec
+            .file
+            .as_deref()
+            .is_some_and(|f| f.to_lowercase().ends_with(".ps1"))
+}
+
+/// `Step::RunInstaller` for `installer` (Scoop `Invoke-Installer`): the file defaults to the
+/// first download.
+fn installer_step(m: &Resolved, spec: &InstallerSpec, vdir: &Path) -> Result<Step, PlanError> {
+    let file = match (&spec.file, m.sources.first()) {
+        (Some(f), _) => f.clone(),
+        (None, Some(s)) => s.file_name.clone(),
+        (None, None) => {
+            return Err(PlanError::Unsupported(
+                "installer sem file e sem arquivo baixado".into(),
+            ));
+        }
+    };
+    if safepath::safe_components(&file).is_none_or(|c| c.is_empty()) {
+        return Err(PlanError::UnsafePath(file));
+    }
+    if file.to_lowercase().ends_with(".msi") {
+        return Err(PlanError::Unsupported(
+            "installer.file .msi não roda direto (o Scoop também não executa)".into(),
+        ));
+    }
+    Ok(Step::RunInstaller {
+        file,
+        args: installer_args(&spec.args, vdir, &m.version)?,
+        keep: spec.keep,
+    })
 }
 
 pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
@@ -254,6 +291,9 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         });
     }
     steps.push(Step::Promote);
+    if let Some(spec) = &m.installer {
+        steps.push(installer_step(m, spec, &layout.version_dir(app, version))?);
+    }
     for p in &m.persist {
         steps.push(Step::Persist(PersistSpec {
             in_version: rel_path(&p.source)?,
