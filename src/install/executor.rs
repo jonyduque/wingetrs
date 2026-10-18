@@ -1214,7 +1214,6 @@ fn read_effects(path: &Path) -> Result<Vec<ScriptEffect>, String> {
 /// read by Windows, the shells, a language runtime or a downloader at startup (proxy, CA
 /// bundle, package index), or owned by one toolchain installer.
 const DENIED_ENV: &[&str] = &[
-    "PATHEXT",
     "ComSpec",
     "TEMP",
     "TMP",
@@ -1248,7 +1247,8 @@ const DENIED_ENV: &[&str] = &[
 
 /// Families refused by prefix (any case): loader, profiler and runtime hooks (.NET, Node,
 /// Python, Perl, Ruby, Lua, git, the dynamic linker), `PSModule*`, the processor variables,
-/// wingetrs' and Scoop's own, CA files and package-manager settings.
+/// wingetrs' and Scoop's own, CA files and package-manager settings and indexes (pip, npm,
+/// uv, poetry, conda, bun, yarn, Go, rustup, electron-get).
 const DENIED_ENV_PREFIXES: &[&str] = &[
     "COR_",
     "CORECLR_",
@@ -1268,6 +1268,17 @@ const DENIED_ENV_PREFIXES: &[&str] = &[
     "PIP_",
     "NPM_CONFIG_",
     "LUA_INIT",
+    "UV_",
+    "POETRY_",
+    "CONDA_",
+    "BUN_",
+    "YARN_",
+    "GOPROXY",
+    "GOPRIVATE",
+    "GONOSUMDB",
+    "GOFLAGS",
+    "RUSTUP_DIST_",
+    "ELECTRON_GET_",
 ];
 
 /// The only variables a script may set: the names the Scoop buckets set (`env_set` and
@@ -1288,9 +1299,6 @@ const ALLOWED_ENV: &[&str] = &[
     "BAZEL_SH",
     "Boost_INCLUDE_DIR",
     "BOOST_ROOT",
-    "BUN_INSTALL",
-    "BUN_INSTALL_BIN",
-    "BUN_INSTALL_GLOBAL_DIR",
     "CABAL_DIR",
     "CANGJIE_HOME",
     "CATALINA_BASE",
@@ -1448,11 +1456,6 @@ const ALLOWED_ENV: &[&str] = &[
     "TNS_ADMIN",
     "TRILIUM_DATA_DIR",
     "TurboJPEG_ROOT",
-    "UV_CACHE_DIR",
-    "UV_PYTHON_BIN_DIR",
-    "UV_PYTHON_INSTALL_DIR",
-    "UV_TOOL_BIN_DIR",
-    "UV_TOOL_DIR",
     "VCPKG_ROOT",
     "VK_SDK_PATH",
     "VLC",
@@ -1495,8 +1498,64 @@ fn env_is_path(name: &str) -> bool {
 /// Longest `Remove-Path` pattern accepted (the match is quadratic in the worst case).
 const MAX_PATTERN_CHARS: usize = 1024;
 
+/// Executable extensions: a script may only append to the user's value ([`check_pathext`]).
+const PATHEXT_VAR: &str = "PATHEXT";
+
+/// `PATHEXT` written by a script: the current user value, its extensions in the same order,
+/// then new extensions (`.` + 2 to 5 ASCII letters) not already listed. Anything else (a
+/// removal, a reorder, a repeated extension, no current user value) is refused.
+fn check_pathext(current: Option<&str>, new: Option<&str>) -> Result<(), String> {
+    let refuse = || "o script só pode acrescentar extensões no fim do PATHEXT".to_string();
+    let (Some(current), Some(new)) = (current, new) else {
+        return Err(refuse());
+    };
+    let tokens = |v: &str| -> Vec<String> {
+        v.split(';')
+            .filter(|t| !t.is_empty())
+            .map(str::to_ascii_uppercase)
+            .collect()
+    };
+    let (cur, new) = (tokens(current), tokens(new));
+    if new.len() < cur.len() || new[..cur.len()] != cur[..] {
+        return Err(refuse());
+    }
+    let added = &new[cur.len()..];
+    for (i, ext) in added.iter().enumerate() {
+        let letters = ext.strip_prefix('.').unwrap_or("");
+        let valid = (2..=5).contains(&letters.len())
+            && letters.chars().all(|c| c.is_ascii_alphabetic())
+            && !cur.contains(ext)
+            && !added[..i].contains(ext);
+        if !valid {
+            return Err(refuse());
+        }
+    }
+    Ok(())
+}
+
+/// Variables holding a download address: only `https://` values. The bucket sample of Task
+/// 157 sets none (no `env_set` value with `://`), so the list holds one known mirror only;
+/// package-index variables stay refused by [`DENIED_ENV_PREFIXES`].
+const URL_ENV: &[&str] = &["ELECTRON_MIRROR"];
+
+fn env_is_url(name: &str) -> bool {
+    URL_ENV.iter().any(|u| u.eq_ignore_ascii_case(name))
+}
+
+fn is_https_url(v: &str) -> bool {
+    let rest = v
+        .get(..8)
+        .filter(|h| h.eq_ignore_ascii_case("https://"))
+        .and(v.get(8..));
+    rest.is_some_and(|r| {
+        !r.is_empty()
+            && !r.contains([';', '%', '"', '\\'])
+            && !r.chars().any(|c| c.is_whitespace() || c.is_control())
+    })
+}
+
 /// Name a script may set: `[A-Za-z_][A-Za-z0-9_]*`, at most 255 characters, not the PATH,
-/// not refused by [`env_denied`] and listed in [`ALLOWED_ENV`].
+/// not refused by [`env_denied`] and listed in [`ALLOWED_ENV`] or [`URL_ENV`].
 fn check_env_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let valid = name.len() <= 255
@@ -1512,6 +1571,9 @@ fn check_env_name(name: &str) -> Result<(), String> {
     }
     if env_denied(name) {
         return Err(format!("a variável {name} não pode ser gravada por script"));
+    }
+    if env_is_url(name) {
+        return Ok(());
     }
     if !ALLOWED_ENV.iter().any(|a| a.eq_ignore_ascii_case(name)) {
         return Err(format!(
@@ -1639,9 +1701,22 @@ fn apply_effect(
     let env = ctx.effects.env;
     match effect {
         ScriptEffect::SetEnv { name, value } => {
+            if name.eq_ignore_ascii_case(PATHEXT_VAR) {
+                let cur = env.get(PATHEXT_VAR).map_err(|e| e.to_string())?;
+                check_pathext(cur.as_ref().map(|v| v.value.as_str()), value.as_deref())?;
+                return set_env(run, env, PATHEXT_VAR, value.as_deref());
+            }
             check_env_name(&name)?;
-            // A folder (by name, or a value that looks like a path) must be inside the app.
-            if let Some(v) = &value
+            if env_is_url(&name) {
+                if let Some(v) = &value
+                    && !is_https_url(v)
+                {
+                    return Err(format!(
+                        "o script tentou gravar {name}={v} (só endereço https é aceito)"
+                    ));
+                }
+            } else if let Some(v) = &value
+                // A folder (by name, or a value that looks like a path) must be inside the app.
                 && (env_is_path(&name) || v.contains(['\\', '/', ':']))
             {
                 for part in v.split(';').filter(|p| !p.is_empty()) {

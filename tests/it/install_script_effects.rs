@@ -523,7 +523,7 @@ async fn set_env_path_refused() {
 #[tokio::test]
 async fn set_env_denied_var_refused() {
     let w = setup().await;
-    for name in ["PSModulePath", "psmodulepath", "ComSpec", "PATHEXT", "TEMP"] {
+    for name in ["PSModulePath", "psmodulepath", "ComSpec", "TEMP"] {
         refused(
             &w,
             &[set_env(name, Some("C:\\x"))],
@@ -604,6 +604,20 @@ async fn set_env_denied_families_refused() {
         "LUA_INIT_5_4",
         "GIT_INSTALL_ROOT",
         "NODE_PATH",
+        "UV_INDEX_URL",
+        "uv_extra_index_url",
+        "UV_CACHE_DIR",
+        "POETRY_REPOSITORIES_X_URL",
+        "CONDA_CHANNELS",
+        "BUN_INSTALL",
+        "YARN_NPM_REGISTRY_SERVER",
+        "GOPROXY",
+        "GOPRIVATE",
+        "GONOSUMDB",
+        "GOFLAGS",
+        "RUSTUP_DIST_SERVER",
+        "ELECTRON_GET_USE_PROXY",
+        "npm_config_registry",
     ] {
         refused(
             &w,
@@ -1106,4 +1120,162 @@ async fn remove_path_own_entry_outside_root_ignored() {
             .any(|s| s == ORIGINAL_PATH),
         "{seen:?}"
     );
+}
+
+const USER_PATHEXT: &str = ".COM;.EXE;.BAT";
+
+fn set_user_pathext(w: &World) {
+    w.env
+        .set(
+            "PATHEXT",
+            &EnvValue {
+                value: USER_PATHEXT.into(),
+                expand: false,
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pathext_append_accepted_and_restored_on_uninstall() {
+    let w = setup().await;
+    set_user_pathext(&w);
+    let value = format!("{USER_PATHEXT};.PY;.PYW");
+    let host = FakeHost::writing(&[set_env("PATHEXT", Some(&value))]);
+    w.run(&w.plan(), &host).await.unwrap();
+    assert_eq!(w.var("PATHEXT").unwrap(), value);
+    w.uninstall();
+    assert_eq!(w.var("PATHEXT").unwrap(), USER_PATHEXT);
+}
+
+#[tokio::test]
+async fn pathext_append_undone_on_rollback() {
+    let w = setup().await;
+    set_user_pathext(&w);
+    let value = format!("{USER_PATHEXT};.PY");
+    let host = FakeHost::writing(&[set_env("PATHEXT", Some(&value))]);
+    let plan = w.plan();
+    let hook_at = plan
+        .steps
+        .iter()
+        .position(|s| matches!(s, wingetrs::install::plan::Step::Hook { .. }))
+        .unwrap();
+    let scripts: Arc<dyn ScriptHost> = host.clone();
+    let mut ctx = w.ctx(&FailAt(hook_at + 1), Some(scripts));
+    let err = wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap_err();
+    drop(ctx);
+    assert!(err.to_string().contains("injected"), "{err}");
+    assert_eq!(w.var("PATHEXT").unwrap(), USER_PATHEXT);
+}
+
+#[tokio::test]
+async fn pathext_other_forms_refused() {
+    let w = setup().await;
+    set_user_pathext(&w);
+    let refuse = "o script só pode acrescentar extensões no fim do PATHEXT";
+    for value in [
+        Some(".COM;.BAT;.PY".to_string()),
+        Some(format!("{USER_PATHEXT};.EXE")),
+        Some(format!("{USER_PATHEXT};.PY;.py")),
+        Some(".EXE;.COM;.BAT;.PY".to_string()),
+        Some(format!("{USER_PATHEXT};.P")),
+        Some(format!("{USER_PATHEXT};.PYTHON")),
+        Some(format!("{USER_PATHEXT};.P1")),
+        Some(format!("{USER_PATHEXT};PY")),
+        Some("%PATHEXT%;.PY".to_string()),
+        None,
+    ] {
+        refused(&w, &[set_env("PATHEXT", value.as_deref())], refuse).await;
+        assert_eq!(w.var("PATHEXT").unwrap(), USER_PATHEXT);
+    }
+}
+
+#[tokio::test]
+async fn pathext_without_user_value_refused() {
+    let w = setup().await;
+    refused(
+        &w,
+        &[set_env("PATHEXT", Some(";.PY;.PYW"))],
+        "o script só pode acrescentar extensões no fim do PATHEXT",
+    )
+    .await;
+    assert_eq!(w.var("PATHEXT"), None);
+}
+
+/// The PATHEXT lines of `main/python`'s `installer.script` (catalog text, 2026-10-18) are
+/// refused at planning for `-Global`; the same lines for the user (no `-Global`) pass the
+/// gate, and the effect they would write is accepted.
+#[tokio::test]
+async fn python_catalog_pathext_script() {
+    let w = setup().await;
+    set_user_pathext(&w);
+    let catalog = serde_json::json!([
+        "if ($global) {",
+        "    $pathext = (Get-EnvVar -Name PATHEXT -Global) -replace ';.PYW?', ''",
+        "    Set-EnvVar -Name PATHEXT -Value \"$pathext;.PY;.PYW\" -Global",
+        "}"
+    ]);
+    match w.try_plan(&w.manifest("1.0", serde_json::json!({"installer": {"script": catalog}}))) {
+        Err(PlanError::ScriptRefused { reasons, .. }) => {
+            assert!(reasons.iter().all(|r| r.contains("-Global")), "{reasons:?}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let user = serde_json::json!([
+        "$pathext = (Get-EnvVar -Name PATHEXT) -replace ';.PYW?', ''",
+        "Set-EnvVar -Name PATHEXT -Value \"$pathext;.PY;.PYW\""
+    ]);
+    let plan = w
+        .try_plan(&w.manifest("1.0", serde_json::json!({"installer": {"script": user}})))
+        .unwrap();
+    let value = format!("{USER_PATHEXT};.PY;.PYW");
+    let host = FakeHost::writing(&[set_env("PATHEXT", Some(&value))]);
+    w.run(&plan, &host).await.unwrap();
+    assert_eq!(w.var("PATHEXT").unwrap(), value);
+}
+
+#[tokio::test]
+async fn url_var_https_accepted() {
+    let w = setup().await;
+    let value = "https://npmmirror.com/mirrors/electron/";
+    let host = FakeHost::writing(&[set_env("electron_mirror", Some(value))]);
+    w.run(&w.plan(), &host).await.unwrap();
+    assert_eq!(w.var("electron_mirror").as_deref(), Some(value));
+}
+
+#[tokio::test]
+async fn url_like_names_off_the_list_refused() {
+    let w = setup().await;
+    for name in ["TOOL_DOWNLOAD_URL", "TOOL_MIRROR"] {
+        refused(
+            &w,
+            &[set_env(name, Some("https://example.com/"))],
+            &format!("a variável {name} não está entre as que um script pode gravar"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn url_var_not_https_refused() {
+    let w = setup().await;
+    for value in [
+        "http://example.com/",
+        "file:///C:/x",
+        r"C:\x",
+        "https://",
+        "https://a b",
+        r"https://x;C:\y",
+        "https://%EVIL%",
+        r"https://x\y",
+    ] {
+        refused(
+            &w,
+            &[set_env("ELECTRON_MIRROR", Some(value))],
+            "só endereço https é aceito",
+        )
+        .await;
+    }
 }
