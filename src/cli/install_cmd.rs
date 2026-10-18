@@ -551,6 +551,7 @@ fn uninstall(
         cmd: None,
     });
     let removed = ops::uninstall(ctx, &plan);
+    ui.end_progress();
     finish_log(log, &removed, "removido");
     let residues = removed?;
     anstream::println!(

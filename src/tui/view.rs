@@ -1405,7 +1405,10 @@ pub fn running_text(app: &App, g: &Glyphs) -> Option<String> {
 /// The phase with its clock (the CLI's text, without color), or the download bar.
 fn progress_text(p: &RunProgress, now: std::time::Instant) -> String {
     if let Some((phase, since)) = &p.phase {
-        return crate::install::progress::phase_text(phase, now.saturating_duration_since(*since));
+        return crate::install::progress::phase_status(
+            phase,
+            now.saturating_duration_since(*since),
+        );
     }
     match p.total.filter(|t| *t > 0) {
         Some(total) => {

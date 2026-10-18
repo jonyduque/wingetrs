@@ -700,8 +700,8 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 run.ensure_dirs(&layout.app_dir(app))?;
                 run.push(Undo::RemovePath(staging.clone()));
             }
-            // Each `msiexec /a` launch (its log path), reported as `Phase::Installer`.
-            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
+            // Phases of the `msiexec /a` fallback (waiting, each launch, importing).
+            let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<Phase>();
             // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
@@ -730,11 +730,11 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                         extract_dir: dir.as_deref(),
                         extract_to: to.as_deref(),
                     };
-                    let started = |log: &Path| {
+                    let phase = |p: Phase| {
                         // The receiver is gone only once the install stopped waiting.
-                        let _ = started_tx.send(log.to_path_buf());
+                        let _ = phase_tx.send(p);
                     };
-                    extract_with_msiexec(m, &layout, &app, &source, &staging, &started)
+                    extract_with_msiexec(m, &layout, &app, &source, &staging, &phase)
                         .map_err(Refused::Failed)
                 }
             };
@@ -745,7 +745,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let joined = loop {
                 tokio::select! {
                     r = &mut joined => break r,
-                    Some(log) = started_rx.recv() => run.enter(ctx, Phase::Installer { log }),
+                    Some(p) = phase_rx.recv() => run.enter(ctx, p),
                 }
             };
             let result = match joined {
@@ -921,16 +921,16 @@ impl Drop for RemoveWork {
 /// `<staging>.msiexec\SourceDir` (a sibling, so it never mixes with the package's own
 /// folders), queued behind `msi.lock` (taken after `install.lock`, never before) and the
 /// Windows Installer mutex, then its tree moved into `staging` through
-/// `extract::import_admin_tree`. Blocks until `msiexec` ends: it is never killed. `started`
-/// is called with the log path each time `msiexec` is launched (from then on the job cannot
-/// be cancelled).
+/// `extract::import_admin_tree`. Blocks until `msiexec` ends: it is never killed. `phase`
+/// gets `WaitingInstaller` while queued or retrying, `Installer` with the log path at each
+/// launch (from then on the job cannot be cancelled), then `Placing` before the import.
 pub fn extract_with_msiexec(
     m: Msiexec,
     layout: &Layout,
     app: &str,
     source: &extract::ExtractSource<'_>,
     staging: &Path,
-    started: &dyn Fn(&Path),
+    phase: &dyn Fn(Phase),
 ) -> Result<(), String> {
     let mut work = staging.as_os_str().to_owned();
     work.push(MSIEXEC_SUFFIX);
@@ -949,11 +949,21 @@ pub fn extract_with_msiexec(
         fs::copy(source.file, &package).map_err(|e| io_msg(&package, e))?;
     }
     let target = work.join("SourceDir");
+    let started = |log: &Path| {
+        phase(Phase::Installer {
+            log: log.to_path_buf(),
+        })
+    };
     let mut status = |s: msi_queue::Status| {
         tracing::info!(app, status = ?s, "msiexec /a");
-        // Same numbering as the launch below: one launch per `Running`.
-        if let msi_queue::Status::Running { attempt } = s {
-            started(&layout.msiexec_log(app, u32::from(attempt)));
+        match s {
+            // Same numbering as the launch below: one launch per `Running`.
+            msi_queue::Status::Running { attempt } => {
+                started(&layout.msiexec_log(app, u32::from(attempt)));
+            }
+            msi_queue::Status::WaitingLock
+            | msi_queue::Status::WaitingInstaller
+            | msi_queue::Status::Retrying { .. } => phase(Phase::WaitingInstaller),
         }
     };
     let lock = msi_queue::lock_msi(&layout.msi_lock(), &mut status).map_err(|e| e.to_string())?;
@@ -969,9 +979,35 @@ pub fn extract_with_msiexec(
         &mut status,
     );
     drop(lock);
-    ran.map_err(|e| format!("msiexec /a: {e}"))?;
+    if let Err(e) = ran {
+        let mut message = format!("msiexec /a: {e}");
+        if let msi_queue::MsiQueueError::Failed(code) = e
+            && let Some(hint) = failure_hint(code, &layout.msiexec_log(app, attempt))
+        {
+            message.push_str("; ");
+            message.push_str(hint);
+        }
+        return Err(message);
+    }
+    // The log stops growing now: a phase of its own, not a silent installer.
+    phase(Phase::Placing);
     extract::import_admin_tree(source, &target, &admin, staging, &extract::DEFAULT_LIMITS)
         .map_err(|e| e.to_string())
+}
+
+/// What the end of the failed attempt's log explains about exit `code`, if anything. Only
+/// the tail is read (the log reaches hundreds of MB).
+fn failure_hint(code: i32, log: &Path) -> Option<&'static str> {
+    use crate::install::msiexec_log;
+    let tail = fs::File::open(log)
+        .and_then(|mut f| msiexec_log::tail_text(&mut f, msiexec_log::ERROR_WINDOW));
+    match tail {
+        Ok(text) => msiexec_log::failure_hint(code, &text),
+        Err(e) => {
+            tracing::debug!("{}: {e}", log.display());
+            None
+        }
+    }
 }
 
 /// Set once the worker ends (returned or unwound).

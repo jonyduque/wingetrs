@@ -3,22 +3,27 @@
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use wingetrs::cache::DataDir;
 use wingetrs::cli::output::{PhaseLog, Phases};
 use wingetrs::http::Http;
-use wingetrs::install::executor::{ExecCtx, NoHook};
+use wingetrs::install::download::Progress;
+use wingetrs::install::executor::{ExecCtx, ExtractFn, Msiexec, NoHook};
 use wingetrs::install::layout::Layout;
 use wingetrs::install::manifest::{Arch, resolve};
+use wingetrs::install::msi_queue::Attempt;
 use wingetrs::install::msiexec_log::{LogTail, TAIL_WINDOW, read_tail};
+use wingetrs::install::ops::{self, OpsCtx, ResidueScan};
 use wingetrs::install::planner::{PlanInput, plan_install};
 use wingetrs::install::progress::{Phase, ProgressEvent};
 use wingetrs::install::state::StateDb;
 use wingetrs::install::traits::Effects;
 use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
 use wingetrs::tui::theme::{GlyphSet, Glyphs};
+use wingetrs::update::LockWait;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -71,91 +76,131 @@ fn traced_extract(
     wingetrs::install::extract::extract(file, name, dir, to, staging)
 }
 
+/// A served `tool` 1.0 zip, its plan, and the download already in the blob cache (as after
+/// `ops::prefetch`).
+struct Tool {
+    _server: MockServer,
+    t: tempfile::TempDir,
+    layout: Layout,
+    data: DataDir,
+    http: Http,
+    env: FakeEnv,
+    shortcuts: FakeShortcuts,
+    trash: FakeTrash,
+    registry: FakeRegistry,
+    plan: wingetrs::install::plan::InstallPlan,
+}
+
+impl Tool {
+    async fn new() -> Tool {
+        let server = MockServer::start().await;
+        let zip = zip_of(&[("pkg/tool.exe", &fake_pe())]);
+        let sha = hex::encode(Sha256::digest(&zip));
+        Mock::given(method("GET"))
+            .and(path("/tool-1.0.zip"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
+            .mount(&server)
+            .await;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("root");
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(layout.launcher().parent().unwrap()).unwrap();
+        std::fs::write(layout.launcher(), fake_pe()).unwrap();
+        let data = DataDir::new(&root);
+        let http = Http::new().unwrap();
+        let manifest = serde_json::json!({
+            "version": "1.0",
+            "url": format!("{}/tool-1.0.zip", server.uri()),
+            "hash": sha,
+            "extract_dir": "pkg",
+            "bin": "tool.exe",
+        })
+        .to_string();
+        let m = resolve(&manifest, Arch::X64).unwrap();
+        let shortcuts = FakeShortcuts::new(t.path().join("startmenu"));
+        let shortcut_root = {
+            use wingetrs::install::traits::Shortcuts;
+            shortcuts.root()
+        };
+        let plan = plan_install(&PlanInput {
+            app: "tool",
+            bucket: "main",
+            manifest: &m,
+            layout: &layout,
+            shortcut_root: &shortcut_root,
+            installed: None,
+            launcher_present: true,
+            keep_old: false,
+            manifest_sha256: "",
+        })
+        .unwrap();
+        let sources: Vec<_> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                wingetrs::install::plan::Step::Download { source, .. } => Some(source.clone()),
+                _ => None,
+            })
+            .collect();
+        wingetrs::install::download::fetch_all(&http, &data, &sources, &|_| {})
+            .await
+            .unwrap();
+        Tool {
+            _server: server,
+            t,
+            layout,
+            data,
+            http,
+            env: FakeEnv::new(),
+            shortcuts,
+            trash: FakeTrash::new(),
+            registry: FakeRegistry::new(),
+            plan,
+        }
+    }
+
+    fn effects(&self) -> Effects<'_> {
+        Effects {
+            env: &self.env,
+            shortcuts: &self.shortcuts,
+            trash: &self.trash,
+            registry: &self.registry,
+        }
+    }
+
+    /// Runs the plan with `extract`, reporting to `progress`.
+    async fn install(&self, progress: Progress<'_>, extract: ExtractFn) {
+        let mut state = StateDb::open(&self.layout.state_db()).unwrap();
+        let mut ctx = ExecCtx {
+            layout: &self.layout,
+            data: &self.data,
+            http: &self.http,
+            effects: self.effects(),
+            state: &mut state,
+            hook: &NoHook,
+            progress,
+            in_use: &nothing_in_use,
+            msiexec: None,
+        };
+        wingetrs::install::executor::execute_install_with(&self.plan, &mut ctx, extract)
+            .await
+            .unwrap();
+    }
+}
+
+/// `{:?}` of an event (`Phase` debug text), so traces compare as strings.
+fn trace_line(ev: &ProgressEvent) -> String {
+    match ev {
+        ProgressEvent::Download { url, .. } => format!("download {url}"),
+        ProgressEvent::Phase(p) => format!("{p:?}"),
+    }
+}
+
 #[tokio::test]
 async fn cached_install_emits_phases_in_order() {
-    let server = MockServer::start().await;
-    let zip = zip_of(&[("pkg/tool.exe", &fake_pe())]);
-    let sha = hex::encode(Sha256::digest(&zip));
-    Mock::given(method("GET"))
-        .and(path("/tool-1.0.zip"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
-        .mount(&server)
-        .await;
-    let t = tempfile::tempdir().unwrap();
-    let root = t.path().join("root");
-    let layout = Layout::new(&root);
-    std::fs::create_dir_all(layout.launcher().parent().unwrap()).unwrap();
-    std::fs::write(layout.launcher(), fake_pe()).unwrap();
-    let data = DataDir::new(&root);
-    let http = Http::new().unwrap();
-    let manifest = serde_json::json!({
-        "version": "1.0",
-        "url": format!("{}/tool-1.0.zip", server.uri()),
-        "hash": sha,
-        "extract_dir": "pkg",
-        "bin": "tool.exe",
-    })
-    .to_string();
-    let m = resolve(&manifest, Arch::X64).unwrap();
-    let shortcuts = FakeShortcuts::new(t.path().join("startmenu"));
-    let shortcut_root = {
-        use wingetrs::install::traits::Shortcuts;
-        shortcuts.root()
-    };
-    let plan = plan_install(&PlanInput {
-        app: "tool",
-        bucket: "main",
-        manifest: &m,
-        layout: &layout,
-        shortcut_root: &shortcut_root,
-        installed: None,
-        launcher_present: true,
-        keep_old: false,
-        manifest_sha256: "",
-    })
-    .unwrap();
-    // The download is already in the blob cache (as after `ops::prefetch`).
-    let sources: Vec<_> = plan
-        .steps
-        .iter()
-        .filter_map(|s| match s {
-            wingetrs::install::plan::Step::Download { source, .. } => Some(source.clone()),
-            _ => None,
-        })
-        .collect();
-    wingetrs::install::download::fetch_all(&http, &data, &sources, &|_| {})
-        .await
-        .unwrap();
-
-    let record = |ev: &ProgressEvent| {
-        let line = match ev {
-            ProgressEvent::Download { url, .. } => format!("download {url}"),
-            ProgressEvent::Phase(p) => format!("{p:?}"),
-        };
-        TRACE.lock().unwrap().push(line);
-    };
-    let env = FakeEnv::new();
-    let (trash, registry) = (FakeTrash::new(), FakeRegistry::new());
-    let mut state = StateDb::open(&t.path().join("state.db")).unwrap();
-    let mut ctx = ExecCtx {
-        layout: &layout,
-        data: &data,
-        http: &http,
-        effects: Effects {
-            env: &env,
-            shortcuts: &shortcuts,
-            trash: &trash,
-            registry: &registry,
-        },
-        state: &mut state,
-        hook: &NoHook,
-        progress: &record,
-        in_use: &nothing_in_use,
-        msiexec: None,
-    };
-    wingetrs::install::executor::execute_install_with(&plan, &mut ctx, traced_extract)
-        .await
-        .unwrap();
+    let tool = Tool::new().await;
+    let record = |ev: &ProgressEvent| TRACE.lock().unwrap().push(trace_line(ev));
+    tool.install(&record, traced_extract).await;
     let trace = TRACE.lock().unwrap().clone();
     let extracting = format!(
         "{:?}",
@@ -177,6 +222,162 @@ async fn cached_install_emits_phases_in_order() {
     );
 }
 
+#[tokio::test]
+async fn uninstall_emits_removing_then_scanning() {
+    let tool = Tool::new().await;
+    tool.install(&|_| {}, wingetrs::install::extract::extract)
+        .await;
+    assert!(tool.layout.app_dir("tool").exists());
+    let trace: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let app_dir = tool.layout.app_dir("tool");
+    let record = |ev: &ProgressEvent| {
+        // Each phase with whether the app folder was still there when it was reported.
+        let line = format!("{} dir={}", trace_line(ev), app_dir.exists());
+        trace.lock().unwrap().push(line);
+    };
+    let catalog = wingetrs::catalog::Catalog::open_in_memory().unwrap();
+    let ctx = OpsCtx {
+        data: &tool.data,
+        http: &tool.http,
+        catalog: &catalog,
+        effects: tool.effects(),
+        wait: LockWait::NoWait,
+        progress: &record,
+        in_use: &nothing_in_use,
+        residue: ResidueScan::none(),
+        msiexec: Msiexec::DISABLED,
+    };
+    let plan = ops::plan_uninstall(&ctx, "tool", false).unwrap();
+    ops::uninstall(&ctx, &plan).unwrap();
+    assert!(!app_dir.exists());
+    let removing = Phase::Removing { app: "tool".into() };
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            format!("{removing:?} dir=true"),
+            format!("{:?} dir=false", Phase::Scanning),
+        ]
+    );
+    drop(tool.t);
+}
+
+static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+
+fn never_busy() -> bool {
+    false
+}
+
+/// 1618 on the first launch; then an administrative tree with one file.
+fn busy_then_done(_: &Path, target: &Path, _: &Path) -> std::io::Result<Attempt> {
+    if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+        return Ok(Attempt::Busy1618);
+    }
+    std::fs::create_dir_all(target)?;
+    std::fs::write(target.join("tool.txt"), b"tool")?;
+    Ok(Attempt::Done)
+}
+
+#[test]
+fn installer_retry_reports_each_attempt_log() {
+    let t = tempfile::tempdir().unwrap();
+    let layout = Layout::new(t.path().join("root"));
+    std::fs::create_dir_all(layout.root()).unwrap();
+    let msi = t.path().join("m-1.0.msi");
+    std::fs::write(&msi, vec![0u8; 4096]).unwrap();
+    let staging = layout.staging_dir("m", "1.0");
+    std::fs::create_dir_all(&staging).unwrap();
+    let source = wingetrs::install::extract::ExtractSource {
+        file: &msi,
+        file_name: "m-1.0.msi",
+        extract_dir: None,
+        extract_to: None,
+    };
+    let fake = Msiexec {
+        busy: never_busy,
+        launch: busy_then_done,
+    };
+    let phases: Mutex<Vec<Phase>> = Mutex::new(Vec::new());
+    let record = |p: Phase| phases.lock().unwrap().push(p);
+    // Waits the first retry delay of the policy (5 s).
+    wingetrs::install::executor::extract_with_msiexec(
+        fake, &layout, "m", &source, &staging, &record,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(staging.join("tool.txt")).unwrap(), b"tool");
+    assert_eq!(
+        *phases.lock().unwrap(),
+        [
+            Phase::Installer {
+                log: layout.msiexec_log("m", 1),
+            },
+            Phase::WaitingInstaller,
+            Phase::Installer {
+                log: layout.msiexec_log("m", 2),
+            },
+            Phase::Placing,
+        ]
+    );
+    assert!(layout.msiexec_log("m", 2).ends_with("msiexec-m-2.log"));
+}
+/// Exits 1603 after writing a log whose end has `Error 1304` (a path past MAX_PATH).
+fn fails_on_long_path(_: &Path, _: &Path, log: &Path) -> std::io::Result<Attempt> {
+    std::fs::create_dir_all(log.parent().unwrap())?;
+    let lines = [
+        file_line("ok.txt"),
+        r"MSI (s) (A0:B4): Product: Rust -- Error 1304. Error writing to file: C:\x\long.html"
+            .to_string(),
+        "MSI (s) (A0:B4): Product: Rust -- Installation failed.".to_string(),
+    ];
+    std::fs::write(log, utf16_log(&lines))?;
+    Ok(Attempt::Failed(1603))
+}
+
+/// Exits 1603 with a log that says nothing about paths.
+fn fails_otherwise(_: &Path, _: &Path, log: &Path) -> std::io::Result<Attempt> {
+    std::fs::create_dir_all(log.parent().unwrap())?;
+    let lines = ["MSI (s): Product: Rust -- Error 1316.".to_string()];
+    std::fs::write(log, utf16_log(&lines))?;
+    Ok(Attempt::Failed(1603))
+}
+
+#[test]
+fn installer_1603_error_names_the_path_limit_only_for_1304() {
+    let t = tempfile::tempdir().unwrap();
+    let layout = Layout::new(t.path().join("root"));
+    std::fs::create_dir_all(layout.root()).unwrap();
+    let msi = t.path().join("m-1.0.msi");
+    std::fs::write(&msi, vec![0u8; 4096]).unwrap();
+    let staging = layout.staging_dir("m", "1.0");
+    let source = wingetrs::install::extract::ExtractSource {
+        file: &msi,
+        file_name: "m-1.0.msi",
+        extract_dir: None,
+        extract_to: None,
+    };
+    let run = |launch: fn(&Path, &Path, &Path) -> std::io::Result<Attempt>| {
+        let fake = Msiexec {
+            busy: never_busy,
+            launch,
+        };
+        wingetrs::install::executor::extract_with_msiexec(
+            fake,
+            &layout,
+            "m",
+            &source,
+            &staging,
+            &|_| {},
+        )
+        .unwrap_err()
+    };
+    let hint = "o caminho de algum arquivo passou de 260 caracteres (limite do Windows Installer); use uma raiz mais curta";
+    let e = run(fails_on_long_path);
+    assert_eq!(
+        e,
+        format!("msiexec /a: o msiexec terminou com código 1603; {hint}")
+    );
+    let e = run(fails_otherwise);
+    assert_eq!(e, "msiexec /a: o msiexec terminou com código 1603");
+}
 #[test]
 fn phase_line_has_spinner_and_clock() {
     let base = Instant::now();
@@ -209,6 +410,15 @@ fn phase_line_has_spinner_and_clock() {
         (Phase::Placing, "Colocando os arquivos · 00:02"),
         (Phase::Linking, "Criando comandos · 00:02"),
         (Phase::Recording, "Registrando · 00:02"),
+        (
+            Phase::WaitingInstaller,
+            "Aguardando o Windows Installer (outro instalador em uso) · 00:02",
+        ),
+        (
+            Phase::Removing { app: "rust".into() },
+            "Removendo rust · 00:02",
+        ),
+        (Phase::Scanning, "Procurando resíduos · 00:02"),
     ] {
         let mut ph = Phases::new();
         ph.update_at(&ProgressEvent::Phase(phase), base);
@@ -308,6 +518,42 @@ fn msiexec_log_tail_reads_last_file() {
     let empty = utf16_log(&["=== Verbose logging started ===".to_string()]);
     let t = read_tail(&mut Cursor::new(empty), TAIL_WINDOW, 0).unwrap();
     assert_eq!((t.last_file, t.new_files), (None, 0));
+
+    // A zero window, even on an odd size (a half-written unit): nothing read, no overflow.
+    let mut odd = log.clone();
+    odd.push(b'F');
+    for bytes in [log.clone(), odd] {
+        let size = bytes.len() as u64;
+        let t = read_tail(&mut Cursor::new(bytes.clone()), 0, size).unwrap();
+        assert_eq!((t.size, t.last_file, t.new_files), (size, None, 0));
+        let text = wingetrs::install::msiexec_log::tail_text(&mut Cursor::new(bytes), 0).unwrap();
+        assert_eq!(text, "");
+    }
+}
+
+#[test]
+fn msiexec_1603_with_error_1304_explains_max_path() {
+    use wingetrs::install::msiexec_log::{ERROR_WINDOW, failure_hint, tail_text};
+    let mut lines: Vec<String> = (0..2000).map(|i| file_line(&format!("f{i}.txt"))).collect();
+    lines.push(
+        r"MSI (s) (A0:B4) [12:07:00:001]: Product: Rust -- Error 1304. Error writing to file: C:\x\SourceDir\share\doc\rust\html\very\long.html"
+            .into(),
+    );
+    lines.extend((0..50).map(|i| format!("MSI (s) (A0:B4): Rollback: line {i}")));
+    lines.push("MSI (s) (A0:B4): Product: Rust -- Installation failed.".into());
+    let log = utf16_log(&lines);
+    assert!(
+        log.len() as u64 > ERROR_WINDOW,
+        "the head of the log is never read"
+    );
+    let text = tail_text(&mut Cursor::new(log.clone()), ERROR_WINDOW).unwrap();
+    let hint = "o caminho de algum arquivo passou de 260 caracteres (limite do Windows Installer); use uma raiz mais curta";
+    assert_eq!(failure_hint(1603, &text), Some(hint));
+    // Another exit code, or 1603 without 1304: nothing added.
+    assert_eq!(failure_hint(1618, &text), None);
+    let other = utf16_log(&["MSI (s): Product: Rust -- Error 1316.".to_string()]);
+    let text = tail_text(&mut Cursor::new(other), ERROR_WINDOW).unwrap();
+    assert_eq!(failure_hint(1603, &text), None);
 }
 
 fn installer_at(base: Instant) -> Phases {
@@ -464,12 +710,17 @@ fn tui_status_shows_phase_and_clock() {
     a.now = base + Duration::from_secs(3);
     let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
     assert!(text.ends_with("Instalar rust Preparando · 00:03"), "{text}");
-    update(&mut a, Msg::InstallerRunning);
+    update(
+        &mut a,
+        Msg::InstallerRunning(PathBuf::from("msiexec-rust-1.log")),
+    );
     assert!(a.installer_running);
     a.now = base + Duration::from_secs(3 + 192);
     let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
     assert!(
-        text.ends_with("Instalar rust Windows Installer (msiexec /a) · 03:12"),
+        text.ends_with(
+            "Instalar rust Windows Installer (msiexec /a) · 03:12 · não pode ser cancelado"
+        ),
         "{text}"
     );
     assert!(!text.contains('\x1b'), "{text}");

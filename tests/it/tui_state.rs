@@ -4996,7 +4996,7 @@ fn quit_waits_for_uncancellable_job() {
         update(&mut a, key(KeyCode::Enter)),
         vec![Cmd::Execute(allowed("b"))]
     );
-    assert!(update(&mut a, Msg::InstallerRunning).is_empty());
+    assert!(update(&mut a, Msg::InstallerRunning("m.log".into())).is_empty());
     assert!(update(&mut a, key(KeyCode::Char('q'))).is_empty());
     match &a.modal {
         Some(Modal::ConfirmQuit { text }) => assert_eq!(
@@ -5048,6 +5048,6 @@ fn msiexec_job_not_launched_yet_still_force_quits() {
     assert_eq!(update(&mut a, ctrl('c')), vec![Cmd::Quit]);
     // A launch reported for a job that already ended changes nothing.
     let mut idle = app();
-    update(&mut idle, Msg::InstallerRunning);
+    update(&mut idle, Msg::InstallerRunning("m.log".into()));
     assert_eq!(update(&mut idle, key(KeyCode::Char('q'))), vec![Cmd::Quit]);
 }

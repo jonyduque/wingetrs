@@ -88,13 +88,16 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
         ProgressEvent::Download { url, done, total } => throttle
             .admit(now, url, *done, *total)
             .map(|(label, done, total)| Msg::InstallProgress { label, done, total }),
-        ProgressEvent::Phase(Phase::Installer { .. }) => Some(Msg::InstallerRunning),
+        ProgressEvent::Phase(Phase::Installer { log }) => Some(Msg::InstallerRunning(log.clone())),
         ProgressEvent::Phase(
             p @ (Phase::Preparing
+            | Phase::WaitingInstaller
             | Phase::Extracting { .. }
             | Phase::Placing
             | Phase::Linking
-            | Phase::Recording),
+            | Phase::Recording
+            | Phase::Removing { .. }
+            | Phase::Scanning),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }

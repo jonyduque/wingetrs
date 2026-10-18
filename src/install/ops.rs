@@ -798,6 +798,10 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
 /// executor, both before anything changes), broadcasts the environment change once, and returns the
 /// classified residues; the caller confirms and calls `residue::clean`.
 pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>, OpsError> {
+    // Deleting a large app folder takes a while: a live line from the lock wait on.
+    (ctx.progress)(&ProgressEvent::Phase(Phase::Removing {
+        app: plan.app.clone(),
+    }));
     let layout = layout(ctx);
     let _lock =
         tracing::debug_span!("uninstall.lock").in_scope(|| lock_blocking(&layout, ctx.wait))?;
@@ -824,6 +828,7 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     tracing::debug_span!("uninstall.broadcast")
         .in_scope(|| broadcast_if_changed(env, &names, &before));
     result?;
+    (ctx.progress)(&ProgressEvent::Phase(Phase::Scanning));
     Ok(tracing::debug_span!("uninstall.residue_scan")
         .in_scope(|| scan_residues(ctx, &app_dir, &plan.app, homepage.as_deref())))
 }

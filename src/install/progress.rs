@@ -22,16 +22,22 @@ pub enum ProgressEvent {
 pub enum Phase {
     /// Lock, revalidation, cache checks, launcher.
     Preparing,
+    /// `msi.lock` or the Windows Installer mutex is held by another install (or a 1618 retry).
+    WaitingInstaller,
     /// Own extraction of `file` (`engine`: the format, e.g. `MSI`).
     Extracting { file: String, engine: String },
     /// `msiexec /a` launched, writing its verbose log at `log` (cannot be cancelled).
     Installer { log: PathBuf },
-    /// Moving the extracted version into place and its persisted data.
+    /// Moving the extracted version (or the `msiexec /a` tree) into place and its persisted data.
     Placing,
     /// `current`, commands, shortcuts and environment.
     Linking,
     /// Writing the install record.
     Recording,
+    /// Uninstall: removing `app`'s artifacts and folder.
+    Removing { app: String },
+    /// Uninstall: looking for leftovers in the registry and on disk.
+    Scanning,
 }
 
 /// Format name shown next to the file being extracted.
@@ -54,11 +60,16 @@ pub fn engine_of(file_name: &str) -> String {
 pub fn phase_title(phase: &Phase) -> String {
     match phase {
         Phase::Preparing => "Preparando".into(),
+        Phase::WaitingInstaller => {
+            "Aguardando o Windows Installer (outro instalador em uso)".into()
+        }
         Phase::Extracting { file, engine } => format!("Extraindo {file} ({engine})"),
         Phase::Installer { .. } => "Windows Installer (msiexec /a)".into(),
         Phase::Placing => "Colocando os arquivos".into(),
         Phase::Linking => "Criando comandos".into(),
         Phase::Recording => "Registrando".into(),
+        Phase::Removing { app } => format!("Removendo {app}"),
+        Phase::Scanning => "Procurando resíduos".into(),
     }
 }
 
@@ -72,4 +83,21 @@ pub fn clock(elapsed: Duration) -> String {
 /// `Extraindo x.msi (MSI) · 00:04`.
 pub fn phase_text(phase: &Phase, elapsed: Duration) -> String {
     format!("{} · {}", phase_title(phase), clock(elapsed))
+}
+
+/// [`phase_text`] plus what the phase means for the user: the Windows Installer cannot be
+/// cancelled. The TUI status bar, and the CLI line before the installer log says more.
+pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
+    let text = phase_text(phase, elapsed);
+    match phase {
+        Phase::Installer { .. } => format!("{text} · não pode ser cancelado"),
+        Phase::Preparing
+        | Phase::WaitingInstaller
+        | Phase::Extracting { .. }
+        | Phase::Placing
+        | Phase::Linking
+        | Phase::Recording
+        | Phase::Removing { .. }
+        | Phase::Scanning => text,
+    }
 }

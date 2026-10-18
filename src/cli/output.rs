@@ -2,7 +2,7 @@
 use super::style::{DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, paint};
 use crate::core::{PackageDetails, PackageEntry};
 use crate::install::msiexec_log::LogTail;
-use crate::install::progress::{Phase, ProgressEvent, phase_text, phase_title};
+use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 use std::collections::VecDeque;
@@ -666,10 +666,13 @@ impl Phases {
             }
             Some((
                 Phase::Preparing
+                | Phase::WaitingInstaller
                 | Phase::Extracting { .. }
                 | Phase::Placing
                 | Phase::Linking
-                | Phase::Recording,
+                | Phase::Recording
+                | Phase::Removing { .. }
+                | Phase::Scanning,
                 _,
             ))
             | None => None,
@@ -712,16 +715,26 @@ impl Phases {
 
     /// [`INSTALLER_NOTICE`] the first time the Windows Installer passes 30 s, else `None`.
     pub fn take_notice_at(&mut self, now: Instant) -> Option<&'static str> {
-        match &self.phase {
-            Some((Phase::Installer { .. }, since))
-                if !self.notice_shown
-                    && now.saturating_duration_since(*since) >= INSTALLER_NOTICE_AFTER =>
-            {
-                self.notice_shown = true;
-                Some(INSTALLER_NOTICE)
-            }
-            _ => None,
+        let since = match &self.phase {
+            Some((Phase::Installer { .. }, since)) => *since,
+            Some((
+                Phase::Preparing
+                | Phase::WaitingInstaller
+                | Phase::Extracting { .. }
+                | Phase::Placing
+                | Phase::Linking
+                | Phase::Recording
+                | Phase::Removing { .. }
+                | Phase::Scanning,
+                _,
+            ))
+            | None => return None,
+        };
+        if self.notice_shown || now.saturating_duration_since(since) < INSTALLER_NOTICE_AFTER {
+            return None;
         }
+        self.notice_shown = true;
+        Some(INSTALLER_NOTICE)
     }
 
     /// [`Phases::line_at`] now.
@@ -754,7 +767,7 @@ impl Phases {
             let mut warn = String::new();
             match phase {
                 Phase::Installer { .. } => match &self.log {
-                    None => main.push_str(" · não pode ser cancelado"),
+                    None => main = format!("{spin} {}", phase_status(phase, elapsed)),
                     Some(w) => {
                         if w.files > 0 {
                             let approx = if w.estimated { "~" } else { "" };
@@ -774,10 +787,13 @@ impl Phases {
                     }
                 },
                 Phase::Preparing
+                | Phase::WaitingInstaller
                 | Phase::Extracting { .. }
                 | Phase::Placing
                 | Phase::Linking
-                | Phase::Recording => {}
+                | Phase::Recording
+                | Phase::Removing { .. }
+                | Phase::Scanning => {}
             }
             return Some((main, warn));
         }

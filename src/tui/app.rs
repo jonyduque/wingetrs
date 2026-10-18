@@ -145,8 +145,9 @@ pub enum Msg {
         done: u64,
         total: Option<u64>,
     },
-    /// The running operation launched `msiexec /a`: from now on it cannot be cancelled.
-    InstallerRunning,
+    /// The running operation launched `msiexec /a` (writing its log at the path): from now on
+    /// it cannot be cancelled.
+    InstallerRunning(std::path::PathBuf),
     /// The running operation entered a slow step (the installer launch is `InstallerRunning`).
     InstallPhase(crate::install::progress::Phase),
     /// The operation ended (also on failure, so the installed list is rescanned).
@@ -1728,13 +1729,11 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             }
             Vec::new()
         }
-        Msg::InstallerRunning => {
+        Msg::InstallerRunning(log) => {
             if let Some(r) = &mut app.running {
                 app.installer_running = true;
-                // Each launch restarts the clock; the TUI does not read the log.
-                let installer = crate::install::progress::Phase::Installer {
-                    log: std::path::PathBuf::new(),
-                };
+                // Each launch restarts the clock.
+                let installer = crate::install::progress::Phase::Installer { log };
                 r.progress = Some(phase_progress(installer, app.now));
             }
             Vec::new()

@@ -20,25 +20,51 @@ pub struct LogTail {
     pub estimated: bool,
 }
 
-/// Reads at most `window` bytes from the end of `r` (aligned to a UTF-16 unit, so a window
-/// that starts in the middle of a character still decodes) and counts the `File:` lines that
-/// start at or after byte `since`.
-pub fn read_tail<R: Read + Seek>(r: &mut R, window: u64, since: u64) -> io::Result<LogTail> {
+/// Bytes read from the end of the log of a failed `msiexec` (the error comes before the
+/// rollback lines).
+pub const ERROR_WINDOW: u64 = 64 * 1024;
+
+/// Added to the error of an `msiexec /a` that failed on a path too long for it.
+pub const MAX_PATH_HINT: &str = "o caminho de algum arquivo passou de 260 caracteres (limite do Windows Installer); use uma raiz mais curta";
+
+/// `(size, window start, UTF-16 units)` of the last `window` bytes of `r`; the start is
+/// aligned to a unit and never before the BOM nor past the end.
+fn read_units<R: Read + Seek>(r: &mut R, window: u64) -> io::Result<(u64, u64, Vec<u16>)> {
     let size = r.seek(SeekFrom::End(0))?;
     let mut start = size.saturating_sub(window);
     // UTF-16 units start at even offsets (the BOM is unit 0).
     start += start % 2;
-    // The BOM is not text.
-    start = start.max(2.min(size));
+    // The BOM is not text; an odd size with a zero window would land past the end.
+    start = start.max(2).min(size);
     r.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::with_capacity(usize::try_from(size - start).unwrap_or(0));
     r.take(size - start).read_to_end(&mut bytes)?;
-    let units: Vec<u16> = bytes
+    let units = bytes
         .as_chunks::<2>()
         .0
         .iter()
         .map(|c| u16::from_le_bytes(*c))
         .collect();
+    Ok((size, start, units))
+}
+
+/// The last `window` bytes of the log as text (aligned like [`read_tail`]).
+pub fn tail_text<R: Read + Seek>(r: &mut R, window: u64) -> io::Result<String> {
+    let (_, _, units) = read_units(r, window)?;
+    Ok(String::from_utf16_lossy(&units))
+}
+
+/// Explanation added to the error of an `msiexec` that exited with `code`, from the end of
+/// its log: only 1603 with `Error 1304` (a file it could not write: a path past MAX_PATH).
+pub fn failure_hint(code: i32, tail: &str) -> Option<&'static str> {
+    (code == 1603 && tail.contains("Error 1304")).then_some(MAX_PATH_HINT)
+}
+
+/// Reads at most `window` bytes from the end of `r` (aligned to a UTF-16 unit, so a window
+/// that starts in the middle of a character still decodes) and counts the `File:` lines that
+/// start at or after byte `since`.
+pub fn read_tail<R: Read + Seek>(r: &mut R, window: u64, since: u64) -> io::Result<LogTail> {
+    let (size, start, units) = read_units(r, window)?;
     // (byte offset, text) of each line; the first is cut unless the window starts the file.
     let mut lines = Vec::new();
     let mut line_start = 0usize;

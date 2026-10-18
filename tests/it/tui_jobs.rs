@@ -1535,7 +1535,7 @@ fn installer_launch_is_never_throttled() {
     });
     assert!(matches!(
         jobs::progress_msg(&t, base, &installer),
-        Some(Msg::InstallerRunning)
+        Some(Msg::InstallerRunning(p)) if p == std::path::Path::new("x.log")
     ));
     // Other phases are never throttled either.
     assert!(matches!(
