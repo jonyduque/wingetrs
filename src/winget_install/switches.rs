@@ -121,6 +121,12 @@ pub fn fill_log(args: &str, log: &Path) -> Result<String, ArgsError> {
     if p.contains(['"', '\r', '\n', '\0']) {
         return Err(ArgsError::Invalid("caminho de log inválido"));
     }
+    // A trailing backslash would escape the closing quote of "<LOGPATH>" in CreateProcess.
+    if p.ends_with('\\') {
+        return Err(ArgsError::Invalid(
+            "caminho de log termina em barra invertida",
+        ));
+    }
     Ok(args.replace(LOG_TOKEN, &p))
 }
 

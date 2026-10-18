@@ -125,6 +125,7 @@ fn exe_only_manifest() {
 fn refuses_bad_args() {
     for bad in [
         "a\nb".to_string(),
+        "a\rb".to_string(),
         "a\0b".to_string(),
         "x".repeat(33 * 1024),
     ] {
@@ -146,6 +147,7 @@ fn fill_log_quotes_and_refuses_quote_in_path() {
         r#"/log "C:\a b\x.log""#
     );
     assert!(fill_log(r#"/log "<LOGPATH>""#, Path::new("C:\\a\"b\\x.log")).is_err());
+    assert!(fill_log(r#"/log "<LOGPATH>""#, Path::new(r"C:\logs\")).is_err());
 }
 
 #[test]
