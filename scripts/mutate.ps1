@@ -51,6 +51,14 @@ if ($text.Contains("`r`n")) {
 $count = ([regex]::Matches($text, [regex]::Escape($Anchor))).Count
 if ($count -ne 1) { "[!] âncora encontrada $count vezes (precisa ser 1): $(($Anchor -split "`r?`n")[0])"; exit 2 }
 
+# Baseline: a test that already fails would turn every mutant into a false "PEGA" (Task 164).
+$baseOut = Invoke-Expression "$TestCommand 2>&1" | ForEach-Object { "$_" }
+if ($LASTEXITCODE -ne 0) {
+    "[?] INCONCLUSIVO: o teste já falha sem a mutação (exit $LASTEXITCODE). Conserte o teste ou o código antes de provar a mutação."
+    $baseOut | Select-String -Pattern 'panicked at|FAILED|^error' | Select-Object -First 5 | ForEach-Object { "  $($_.Line)" }
+    exit 2
+}
+
 $mutant = $text.Replace($Anchor, $Replacement)
 try {
     [IO.File]::WriteAllText((Resolve-Path $Path), $mutant, [Text.UTF8Encoding]::new($false))
