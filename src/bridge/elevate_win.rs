@@ -556,6 +556,48 @@ impl super::worker::WorkerOps for SystemOps {
     ) -> std::io::Result<i32> {
         super::staging_win::run_installer(req, on_line)
     }
+
+    fn known_folders(
+        &self,
+    ) -> std::io::Result<crate::winget_install::elevated_rules::KnownFolders> {
+        super::arp_ops_win::known_folders()
+    }
+
+    fn read_arp(
+        &mut self,
+        hive: crate::installed::Hive,
+        key: &str,
+    ) -> std::io::Result<Option<crate::winget_install::uninstall_cmd::ArpDetails>> {
+        crate::winget_install::arp_read_win::read_details(hive, key)
+    }
+
+    fn arp_entries(
+        &mut self,
+    ) -> std::io::Result<Vec<crate::winget_install::uninstall_cmd::ArpDetails>> {
+        super::arp_ops_win::arp_entries()
+    }
+
+    /// Anything at `path`, links included (a dangling link still counts: nothing is orphan
+    /// unless the path is truly empty).
+    fn exists(&self, path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
+    fn msiexec(&self) -> std::io::Result<PathBuf> {
+        crate::winget_install::launch_win::msiexec_path()
+    }
+
+    fn run_uninstaller(&mut self, program: &Path, args: &str) -> std::io::Result<i32> {
+        super::arp_ops_win::run_uninstaller(program, args)
+    }
+
+    fn delete_arp_key(
+        &mut self,
+        hive: super::worker::MachineHive,
+        key: &str,
+    ) -> std::io::Result<()> {
+        super::arp_ops_win::delete_key(hive, key)
+    }
 }
 
 /// The worker's exec: only `winget`, and only the one Windows installed (see `winget_exe`),

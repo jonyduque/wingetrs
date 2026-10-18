@@ -7,6 +7,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
+pub mod arp_ops_win;
+#[cfg(windows)]
 pub mod elevate_win;
 pub mod elevated;
 #[cfg(windows)]

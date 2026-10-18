@@ -3,11 +3,17 @@
 //! with a valid id, `bridge::winget_source_update`, or a hash-verified installer whose fields
 //! pass `InstallerRequest::check`; anything else is refused or closes the channel.
 use super::{BridgeJob, BridgeOp, Tool};
+use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
+use crate::installed::guid::pack_guid;
+use crate::winget_install::elevated_rules::{
+    KnownFolders, expand_known, in_admin_folder, is_duplicate, still_orphan,
+};
+use crate::winget_install::uninstall_cmd::{ArpDetails, Rule, uninstall_command, valid_arp_key};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Longest line either side reads or writes, without its `\n`.
 pub const LINE_CAP: usize = 64 * 1024;
@@ -35,6 +41,20 @@ pub enum Request {
         kind: ElevatedKind,
         params: String,
     },
+    /// Runs the uninstaller of an HKLM ARP entry, recomputed from the key as it is now
+    /// (Task 182); `rule` is what the user confirmed.
+    RunUninstaller {
+        hive: MachineHive,
+        key: String,
+        rule: Rule,
+        nsis_hint: bool,
+    },
+    /// Deletes an HKLM ARP key once `reason` holds again (Task 182).
+    DeleteArpKey {
+        hive: MachineHive,
+        key: String,
+        reason: DeleteReason,
+    },
     /// Ends the helper.
     Quit {},
 }
@@ -45,6 +65,34 @@ pub enum Request {
 pub enum ScopeArg {
     User,
     Machine,
+}
+
+/// An HKLM ARP view. HKCU has no value on purpose: the user writes it, so nothing from it
+/// ever runs or is deleted elevated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MachineHive {
+    Hklm64,
+    Hklm32,
+}
+
+impl From<MachineHive> for Hive {
+    fn from(h: MachineHive) -> Hive {
+        match h {
+            MachineHive::Hklm64 => Hive::MachineX64,
+            MachineHive::Hklm32 => Hive::MachineX86,
+        }
+    }
+}
+
+/// Why an ARP key may be deleted; the helper checks it again before deleting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeleteReason {
+    /// Its uninstaller no longer exists.
+    Orphan,
+    /// Another record has the same name.
+    Duplicate,
 }
 
 impl From<ScopeArg> for InstallScope {
@@ -431,6 +479,41 @@ pub trait WorkerOps {
         req: &InstallerRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> std::io::Result<i32>;
+    /// The known folders (never the environment). Unavailable by default.
+    fn known_folders(&self) -> std::io::Result<KnownFolders> {
+        Err(unsupported())
+    }
+    /// Reads one ARP key with the view of `hive`; `Ok(None)` when it does not exist.
+    fn read_arp(&mut self, _hive: Hive, _key: &str) -> std::io::Result<Option<ArpDetails>> {
+        Err(unsupported())
+    }
+    /// Every ARP entry of HKLM 64, HKLM 32 and HKCU.
+    fn arp_entries(&mut self) -> std::io::Result<Vec<ArpDetails>> {
+        Err(unsupported())
+    }
+    /// Whether something is at `path`. By default everything exists (nothing is orphan).
+    fn exists(&self, _path: &Path) -> bool {
+        true
+    }
+    /// `System32\msiexec.exe` from the known folder.
+    fn msiexec(&self) -> std::io::Result<PathBuf> {
+        Err(unsupported())
+    }
+    /// Runs an uninstaller the helper already checked; its exit code.
+    fn run_uninstaller(&mut self, _program: &Path, _args: &str) -> std::io::Result<i32> {
+        Err(unsupported())
+    }
+    /// Deletes the ARP key `key` and its tree with the view of `hive`, refusing a link.
+    fn delete_arp_key(&mut self, _hive: MachineHive, _key: &str) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+}
+
+fn unsupported() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "operação não suportada por este auxiliar",
+    )
 }
 
 /// A winget exec (a `BridgeExec` closure) as operations: `run` calls it, and installers are
@@ -558,6 +641,19 @@ pub fn serve(
                 run_installer(writer, ops, &req)?;
                 continue;
             }
+            Request::RunUninstaller {
+                hive,
+                key,
+                rule,
+                nsis_hint,
+            } => {
+                serve_uninstaller(writer, ops, hive, &key, rule, nsis_hint)?;
+                continue;
+            }
+            Request::DeleteArpKey { hive, key, reason } => {
+                serve_delete(writer, ops, hive, &key, reason)?;
+                continue;
+            }
             Request::Upgrade { target } => (target, BridgeOp::Upgrade),
             Request::Install { target, scope } => (
                 target,
@@ -682,5 +778,225 @@ fn run(
             not_found: e.kind() == std::io::ErrorKind::NotFound,
         },
     };
+    send(writer, &reply)
+}
+/// Answer of an ARP key whose name is not one safe sub-key component.
+pub const BAD_KEY: &str = "nome de chave ARP inválido";
+/// Answer when the key is gone.
+pub const KEY_GONE: &str = "a chave não existe mais";
+/// Answer when the recomputed rule is not the confirmed one.
+pub const KEY_CHANGED: &str = "a chave mudou desde a confirmação";
+/// Answer when the uninstaller is not an absolute `.exe` in an administrator folder.
+pub const OUTSIDE_ADMIN: &str = "desinstalador fora de pasta de administrador";
+/// Answer when the uninstaller is a shell or script host.
+pub const INTERPRETER: &str = "desinstalador por interpretador recusado";
+/// Answer when an `msiexec` line is not `/x{GUID}` with quiet switches only.
+pub const MSIEXEC_REFUSED: &str = "parâmetros do msiexec recusados";
+
+/// Programs that run whatever their arguments name; never run elevated from an ARP line.
+const INTERPRETERS: [&str; 8] = [
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "rundll32.exe",
+    "regsvr32.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+];
+
+/// Switches an `msiexec /x` line may carry besides the product code.
+const MSIEXEC_SWITCHES: [&str; 9] = [
+    "/quiet",
+    "/passive",
+    "/q",
+    "/qn",
+    "/qb",
+    "/qb-",
+    "/qb!",
+    "/norestart",
+    "reboot=reallysuppress",
+];
+
+fn refusal(message: &str) -> Reply {
+    Reply::Error {
+        message: message.to_string(),
+        not_found: false,
+    }
+}
+
+fn failure(e: &std::io::Error) -> Reply {
+    Reply::Error {
+        message: e.to_string(),
+        not_found: e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The last component of a program as written (`\` or `/` separated), lowercase.
+fn program_file(program: &str) -> String {
+    program
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase()
+}
+
+fn is_msiexec(program: &str) -> bool {
+    matches!(program_file(program).as_str(), "msiexec" | "msiexec.exe")
+}
+
+/// `args` of an `msiexec` uninstall rebuilt from its tokens: `/x{GUID}` (or `/x {GUID}`) with
+/// a valid product code, then only quiet/no-restart switches; `None` for anything else
+/// (`/i`, `/f`, `/p`, properties, files).
+pub fn msiexec_uninstall_args(args: &str) -> Option<String> {
+    let mut tokens = args.split_whitespace();
+    let first = tokens.next()?;
+    let lower = first.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("/x")
+        .or_else(|| lower.strip_prefix("-x"))?;
+    let guid = if rest.is_empty() {
+        tokens.next()?
+    } else {
+        first.get(2..)?
+    };
+    pack_guid(guid)?;
+    let mut out = format!("/x{guid}");
+    for t in tokens {
+        if !MSIEXEC_SWITCHES.contains(&t.to_ascii_lowercase().as_str()) {
+            return None;
+        }
+        out.push(' ');
+        out.push_str(t);
+    }
+    Some(out)
+}
+
+/// The program and arguments that uninstall `key`, checked as the helper requires: the rule
+/// recomputed from the key as it is now equals `rule`; `msiexec` is the system one with
+/// `/x{GUID}`; anything else is an existing absolute `.exe` in an administrator folder,
+/// expanded with the known folders only, and not a shell or script host.
+fn uninstall_plan(
+    ops: &mut dyn WorkerOps,
+    hive: MachineHive,
+    key: &str,
+    rule: Rule,
+    nsis_hint: bool,
+) -> Result<(PathBuf, String), Reply> {
+    if !valid_arp_key(key) {
+        return Err(refusal(BAD_KEY));
+    }
+    let d = ops
+        .read_arp(hive.into(), key)
+        .map_err(|e| failure(&e))?
+        .ok_or_else(|| refusal(KEY_GONE))?;
+    let cmd = uninstall_command(&d, nsis_hint)
+        .filter(|c| c.rule == rule)
+        .ok_or_else(|| refusal(KEY_CHANGED))?;
+    if is_msiexec(&cmd.program) {
+        let args = msiexec_uninstall_args(&cmd.args).ok_or_else(|| refusal(MSIEXEC_REFUSED))?;
+        let msiexec = ops.msiexec().map_err(|e| failure(&e))?;
+        return Ok((msiexec, args));
+    }
+    let k = ops.known_folders().map_err(|e| failure(&e))?;
+    let program = Some(cmd.program.trim())
+        .filter(|p| p.to_ascii_lowercase().ends_with(".exe"))
+        .and_then(|p| expand_known(p, &k))
+        .map(PathBuf::from)
+        .filter(|p| in_admin_folder(p, &k))
+        .ok_or_else(|| refusal(OUTSIDE_ADMIN))?;
+    if INTERPRETERS.contains(&program_file(&cmd.program).as_str()) {
+        return Err(refusal(INTERPRETER));
+    }
+    if !ops.exists(&program) {
+        return Err(Reply::Error {
+            message: format!("desinstalador não encontrado: {}", program.display()),
+            not_found: true,
+        });
+    }
+    Ok((program, cmd.args))
+}
+
+/// `RunUninstaller`: runs the checked uninstaller (see `uninstall_plan`) and answers its exit
+/// code; a refused request runs nothing.
+fn serve_uninstaller(
+    writer: &mut dyn Write,
+    ops: &mut dyn WorkerOps,
+    hive: MachineHive,
+    key: &str,
+    rule: Rule,
+    nsis_hint: bool,
+) -> std::io::Result<()> {
+    let (program, args) = match uninstall_plan(ops, hive, key, rule, nsis_hint) {
+        Ok(plan) => plan,
+        Err(reply) => {
+            tracing::warn!(?hive, ?rule, ?reply, "bridge worker: uninstall refused");
+            return send(writer, &reply);
+        }
+    };
+    tracing::info!(?hive, ?rule, program = %program.display(), "bridge worker: running uninstaller");
+    let reply = match ops.run_uninstaller(&program, &args) {
+        Ok(code) => Reply::End { code },
+        Err(e) => failure(&e),
+    };
+    send(writer, &reply)
+}
+
+/// Whether `reason` holds for `key` now, read by the helper itself.
+fn reason_holds(
+    ops: &mut dyn WorkerOps,
+    hive: MachineHive,
+    key: &str,
+    reason: DeleteReason,
+) -> Result<bool, Reply> {
+    if !valid_arp_key(key) {
+        return Err(refusal(BAD_KEY));
+    }
+    let d = ops
+        .read_arp(hive.into(), key)
+        .map_err(|e| failure(&e))?
+        .ok_or_else(|| refusal(KEY_GONE))?;
+    Ok(match reason {
+        DeleteReason::Orphan => {
+            let k = ops.known_folders().map_err(|e| failure(&e))?;
+            still_orphan(&d, &k, |p| ops.exists(p))
+        }
+        DeleteReason::Duplicate => {
+            let all = ops.arp_entries().map_err(|e| failure(&e))?;
+            is_duplicate(&d, &all)
+        }
+    })
+}
+
+/// `DeleteArpKey`: deletes the key with the same view once `reason` holds again.
+fn serve_delete(
+    writer: &mut dyn Write,
+    ops: &mut dyn WorkerOps,
+    hive: MachineHive,
+    key: &str,
+    reason: DeleteReason,
+) -> std::io::Result<()> {
+    let reply = match reason_holds(ops, hive, key, reason) {
+        Err(reply) => reply,
+        Ok(false) => refusal(match reason {
+            DeleteReason::Orphan => "a chave deixou de ser sobra",
+            DeleteReason::Duplicate => "a chave deixou de ser duplicada",
+        }),
+        Ok(true) => {
+            tracing::info!(?hive, ?reason, "bridge worker: deleting ARP key");
+            match ops.delete_arp_key(hive, key) {
+                Ok(()) => Reply::End { code: 0 },
+                Err(e) => failure(&e),
+            }
+        }
+    };
+    if let Reply::Error { message, .. } = &reply {
+        tracing::warn!(
+            ?hive,
+            ?reason,
+            message,
+            "bridge worker: ARP key not deleted"
+        );
+    }
     send(writer, &reply)
 }

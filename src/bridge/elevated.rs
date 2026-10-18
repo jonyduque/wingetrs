@@ -1,9 +1,10 @@
 //! One elevated helper per session for machine-wide winget upgrades: the first such job asks
 //! for UAC once and starts `wingetrs bridge-worker`; later ones reuse it. A refusal is final
 //! for the session (the jobs run unelevated, as before). The Win32 side is `elevate_win`.
-use super::worker::{self, InstallerRequest, Reply, Request};
+use super::worker::{self, DeleteReason, InstallerRequest, MachineHive, Reply, Request};
 use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
 use crate::installed::correlate::InstallScope;
+use crate::winget_install::uninstall_cmd::Rule;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError, TryLockError};
@@ -266,6 +267,32 @@ pub trait ElevatedRunner: Send + Sync {
         req: &InstallerRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<i32, ElevatedError>;
+
+    /// Runs the uninstaller of an HKLM ARP entry (Task 182): the helper recomputes the command
+    /// from the key and refuses when its rule is not `rule`. The uninstaller's exit code.
+    fn run_uninstaller(
+        &self,
+        _hive: MachineHive,
+        _key: &str,
+        _rule: Rule,
+        _nsis_hint: bool,
+    ) -> Result<i32, ElevatedError> {
+        Err(ElevatedError::Remote(
+            "desinstalação elevada não suportada".to_string(),
+        ))
+    }
+
+    /// Deletes an HKLM ARP key once the helper confirms `reason` again (Task 182).
+    fn delete_arp_key(
+        &self,
+        _hive: MachineHive,
+        _key: &str,
+        _reason: DeleteReason,
+    ) -> Result<(), ElevatedError> {
+        Err(ElevatedError::Remote(
+            "exclusão elevada de chave não suportada".to_string(),
+        ))
+    }
 }
 
 impl ElevatedRunner for ElevatedBridge {
@@ -282,21 +309,68 @@ impl ElevatedRunner for ElevatedBridge {
             kind: req.kind,
             params: req.params.clone(),
         };
+        self.ask_elevated(&request, on_line)
+    }
+
+    fn run_uninstaller(
+        &self,
+        hive: MachineHive,
+        key: &str,
+        rule: Rule,
+        nsis_hint: bool,
+    ) -> Result<i32, ElevatedError> {
+        let request = Request::RunUninstaller {
+            hive,
+            key: key.to_string(),
+            rule,
+            nsis_hint,
+        };
+        self.ask_elevated(&request, &mut |_| {})
+    }
+
+    fn delete_arp_key(
+        &self,
+        hive: MachineHive,
+        key: &str,
+        reason: DeleteReason,
+    ) -> Result<(), ElevatedError> {
+        let request = Request::DeleteArpKey {
+            hive,
+            key: key.to_string(),
+            reason,
+        };
+        match self.ask_elevated(&request, &mut |_| {})? {
+            0 => Ok(()),
+            code => Err(ElevatedError::Remote(format!(
+                "resposta inesperada {code} ao apagar a chave"
+            ))),
+        }
+    }
+}
+
+impl ElevatedBridge {
+    /// Sends one request that needs the helper, starting it when needed (the one UAC prompt);
+    /// a refusal this session is final. The helper's exit code.
+    fn ask_elevated(
+        &self,
+        request: &Request,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
         let mut state = self.lock();
         match self.ensure_started(&mut state) {
             Ok(()) => {}
             Err(None) => return Err(ElevatedError::Refused),
             Err(Some(e)) => {
-                tracing::warn!(error = %e, "bridge: elevation refused for an installer");
+                tracing::warn!(error = %e, "bridge: elevation refused");
                 return Err(ElevatedError::Refused);
             }
         }
-        match self.ask_running(&mut state, &request, on_line) {
+        match self.ask_running(&mut state, request, on_line) {
             Ok(Ok((code, _))) => Ok(code),
             Ok(Err(e)) => Err(ElevatedError::Remote(e.to_string())),
             Err(Fail::Lost(e)) => Err(ElevatedError::Lost(e.to_string())),
             Err(Fail::Refused(e)) => {
-                tracing::warn!(error = %e, "bridge: elevation refused for an installer");
+                tracing::warn!(error = %e, "bridge: elevation refused");
                 Err(ElevatedError::Refused)
             }
         }
