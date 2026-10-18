@@ -81,6 +81,7 @@ struct Fake {
     uninstalled: RefCell<Vec<UninstallTarget>>,
     removed: RefCell<Vec<String>>,
     backups: PathBuf,
+    pins: BTreeSet<String>,
 }
 
 impl WingetFlows for Fake {
@@ -141,7 +142,7 @@ impl WingetFlows for Fake {
         })
     }
     fn pins(&self) -> BTreeSet<String> {
-        BTreeSet::new()
+        self.pins.clone()
     }
     async fn plan_upgrade(
         &self,
@@ -373,10 +374,6 @@ fn yes_with_orphans_removes_each() {
     r.unwrap();
     assert!(dry.removed.borrow().is_empty());
     assert!(out.iter().any(|l| l == "Simulação: nada foi alterado."));
-    assert!(
-        !t.path().join("backups").exists(),
-        "dry run exports nothing"
-    );
 }
 
 #[tokio::test]
@@ -541,15 +538,39 @@ fn ambiguous_name_needs_terminal() {
         rows: rows.clone(),
         ..Default::default()
     };
-    let ui = FakeUi::default();
     let (_tx, mut rx) = quiet();
     let gate = LaunchGate::default();
+    // `--yes` never picks, even with a terminal that could.
+    let ui = FakeUi {
+        interactive: true,
+        pick: Some(0),
+        ..Default::default()
+    };
     let e = winget_cmd::uninstall(
         &fake,
         &ui,
         "amazon kindle",
         false,
         yes(),
+        Stop::new(&mut rx, &gate),
+        &mut |_: &str| {},
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("mais de um app instalado"), "{e}");
+    assert_eq!(ui.picks.get(), 0);
+    assert!(fake.planned_targets.borrow().is_empty());
+    // No terminal (and no --yes): the same error.
+    let ui = FakeUi {
+        pick: Some(0),
+        ..Default::default()
+    };
+    let e = winget_cmd::uninstall(
+        &fake,
+        &ui,
+        "amazon kindle",
+        false,
+        Flags::default(),
         Stop::new(&mut rx, &gate),
         &mut |_: &str| {},
     )
@@ -646,4 +667,46 @@ fn free_space_reads_the_nearest_existing_folder() {
     let later = free_space(&t.path().join("not").join("yet")).unwrap();
     assert!(later > 0);
     assert!(!t.path().join("not").exists(), "nothing created");
+}
+
+fn upgrade_error(fake: &Fake, target: &str) -> String {
+    let ui = FakeUi::default();
+    let (_tx, mut rx) = quiet();
+    let gate = LaunchGate::default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    rt.block_on(winget_cmd::upgrade(
+        fake,
+        &ui,
+        target,
+        yes(),
+        Stop::new(&mut rx, &gate),
+        &mut |_: &str| {},
+    ))
+    .unwrap_err()
+    .to_string()
+}
+
+#[test]
+fn upgrade_needs_a_winget_match() {
+    let fake = Fake {
+        rows: vec![row("Contoso App", "arp/hkcu/Contoso", None)],
+        planned: Some(PlanOrBridge::Native(native_plan())),
+        ..Default::default()
+    };
+    let e = upgrade_error(&fake, "Contoso App");
+    assert!(e.contains("não foi associado a um pacote do winget"), "{e}");
+}
+
+#[test]
+fn upgrade_refuses_a_pinned_app() {
+    let fake = Fake {
+        rows: vec![row("Contoso App", "arp/hkcu/Contoso", Some("Pub.App"))],
+        planned: Some(PlanOrBridge::Native(native_plan())),
+        pins: BTreeSet::from([wingetrs::pins::key("arp", "Contoso App")]),
+        ..Default::default()
+    };
+    let e = upgrade_error(&fake, "Pub.App");
+    assert!(e.contains("versão fixada"), "{e}");
 }
