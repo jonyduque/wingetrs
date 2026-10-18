@@ -1206,6 +1206,8 @@ Testes:
 4. Proposta (não aplicada) do texto D2-1 para o `CLAUDE.md`, para o orquestrador aplicar **com confirmação do usuário**.
 5. Prova ao vivo **só com autorização explícita do usuário**, registrada no relatório: um S-psm, o `xming` (S-inno, o menor da sonda D4) e um S-hook de veredito `Confirm`; antes e depois, listagem de `%USERPROFILE%\scoop`, diff de `HKCU\Environment` e `scripts/leftovers.ps1`. Sem autorização, a seção diz "não executada".
 
+**Da Task 157 (2026-10-18):** o `python` do main é recusado pelo portão porque o `installer.script` dele tem `-Global` dentro de `if ($global) { ... }` (ramo que nunca roda na instalação por usuário). Na validação, meça quantos manifestos S-hook do corpus são recusados só por construções dentro de `if ($global)` e traga ao orquestrador a proposta (com o risco) de ignorar esse bloco quando `$global` é fixo em `$false` e nenhum trecho reatribui `global` — a decisão é do usuário.
+
 **Files:**
 - Create: `examples/bench_script_host.rs`, `docs/superpowers/reports/<data>-fase2c-validacao.md`
 - Modify: `examples/oracle_2c.rs`
