@@ -217,6 +217,8 @@ pub enum Planned {
         text: String,
         action: Action,
         code: Vec<ThirdParty>,
+        /// The record's hash of the manifest the code was read from.
+        manifest_sha256: String,
     },
     /// The text matched more than one package.
     Choose(Vec<Candidate>),
@@ -236,6 +238,8 @@ pub enum Action {
     ApplyMsiexec {
         groups: Vec<Vec<InstallPlan>>,
         app: String,
+        /// The groups came from a confirmed `ApplyScripts`: the consent to their code goes along.
+        scripts: bool,
     },
     /// Like `Apply`, after the user read the third-party code of the plans in the
     /// confirmation and allowed it. Built only by that confirmation.
@@ -243,7 +247,12 @@ pub enum Action {
         groups: Vec<Vec<InstallPlan>>,
     },
     /// Like `Remove`, after the user allowed the app's uninstall code (hooks, uninstaller).
-    RemoveScripts(UninstallPlan),
+    /// `manifest_sha256` is the record's hash of the manifest whose code the user read; the
+    /// removal is refused if the record changed since.
+    RemoveScripts {
+        plan: UninstallPlan,
+        manifest_sha256: String,
+    },
     /// Native install of a winget package.
     WingetInstall(WingetPlan),
     /// Native uninstall of an ARP or MSIX record (with the folder backup when
@@ -275,7 +284,9 @@ impl Action {
                 let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
                 format!("Instalando {}", apps.join(", "))
             }
-            Action::Remove(p) | Action::RemoveScripts(p) => format!("Removendo {}", p.app),
+            Action::Remove(p) | Action::RemoveScripts { plan: p, .. } => {
+                format!("Removendo {}", p.app)
+            }
             Action::Bridge(job) => match job.op {
                 BridgeOp::Install { .. } => {
                     format!("Instalando {} via {}", job.name, job.tool.name())
@@ -449,6 +460,8 @@ pub struct ScriptSection {
     pub apps: Vec<String>,
     /// Lowercase apps with a script the gate refuses (never run).
     pub refused: Vec<String>,
+    /// `(lowercase app, manifest hash)` of the removals shown.
+    pub shas: Vec<(String, String)>,
 }
 
 /// The dialog on top of the screen; it takes every key until it closes.
@@ -782,7 +795,8 @@ pub struct App {
     /// `None` = no plan key pending, the current setting applies.
     pub planning_confirm: Option<ConfirmMode>,
     /// Third-party code of the removals planned and not yet confirmed, by lowercase app.
-    pub removal_code: HashMap<String, Vec<ThirdParty>>,
+    /// `(manifest hash, code)`.
+    pub removal_code: HashMap<String, (String, Vec<ThirdParty>)>,
     /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
     pub now: Instant,
     /// Toasts on screen, newest first.
@@ -2555,7 +2569,7 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     checked: true,
                 }));
             }
-            Action::ApplyMsiexec { groups, app } => {
+            Action::ApplyMsiexec { groups, app, .. } => {
                 let plan = groups
                     .iter()
                     .flatten()
@@ -2569,7 +2583,7 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     checked: true,
                 });
             }
-            Action::Remove(p) | Action::RemoveScripts(p) => items.push(ConfirmItem {
+            Action::Remove(p) | Action::RemoveScripts { plan: p, .. } => items.push(ConfirmItem {
                 name: p.app.clone(),
                 key: ours(&p.app).and_then(row_key),
                 from: Some(p.version.clone()),
@@ -2694,7 +2708,7 @@ fn action_notes(app: &App, action: &Action) -> Vec<String> {
     match action {
         Action::Bridge(job) => vec![bridge_note(job.tool).to_string()],
         Action::ApplyMsiexec { .. } => vec![MSIEXEC_NOTE.to_string()],
-        Action::Remove(p) | Action::RemoveScripts(p) if p.purge => vec![format!(
+        Action::Remove(p) | Action::RemoveScripts { plan: p, .. } if p.purge => vec![format!(
             "Os dados persistentes de {} serão APAGADOS (purge).",
             p.app
         )],
@@ -2727,7 +2741,14 @@ fn confirm_modal(
         }
     }
     all.extend(notes);
-    let scripts = script_section(&actions_code(app, &actions));
+    let mut scripts = script_section(&actions_code(app, &actions));
+    for a in &actions {
+        if let Action::Remove(p) = a
+            && let Some((sha, _)) = app.removal_code.get(&p.app.to_lowercase())
+        {
+            scripts.shas.push((p.app.to_lowercase(), sha.clone()));
+        }
+    }
     Modal::Confirm {
         items: confirm_items(app, &actions),
         notes: all,
@@ -2756,7 +2777,7 @@ fn actions_code(app: &App, actions: &[Action]) -> Vec<(String, Vec<ThirdParty>)>
             }
             Action::Remove(p) => {
                 let code = app.removal_code.get(&p.app.to_lowercase());
-                add(&p.app, code.cloned().unwrap_or_default());
+                add(&p.app, code.map(|(_, c)| c.clone()).unwrap_or_default());
             }
             _ => {}
         }
@@ -2895,7 +2916,22 @@ fn authorize_scripts(sec: &ScriptSection, actions: Vec<Action>) -> Result<Vec<Ac
                     continue;
                 }
             }
-            Action::Remove(p) if code(&p.app) => (vec![p.app.clone()], Action::RemoveScripts(p)),
+            Action::Remove(p) if code(&p.app) => {
+                let sha = sec
+                    .shas
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(&p.app))
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default();
+                let names = vec![p.app.clone()];
+                (
+                    names,
+                    Action::RemoveScripts {
+                        plan: p,
+                        manifest_sha256: sha,
+                    },
+                )
+            }
             other => {
                 out.push(other);
                 continue;
@@ -4138,9 +4174,15 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
             }
             return ready_one(app, action, confirm);
         }
-        Ok(Planned::ReadyScripts { action, code, .. }) => {
+        Ok(Planned::ReadyScripts {
+            action,
+            code,
+            manifest_sha256,
+            ..
+        }) => {
             if let Action::Remove(p) = &action {
-                app.removal_code.insert(p.app.to_lowercase(), code);
+                app.removal_code
+                    .insert(p.app.to_lowercase(), (manifest_sha256, code));
             }
             return ready_one(app, action, confirm);
         }
@@ -4299,9 +4341,15 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
                     removals.push(other);
                 }
             },
-            Ok(Planned::ReadyScripts { action, code, .. }) => {
+            Ok(Planned::ReadyScripts {
+                action,
+                code,
+                manifest_sha256,
+                ..
+            }) => {
                 if let Action::Remove(p) = &action {
-                    app.removal_code.insert(p.app.to_lowercase(), code);
+                    app.removal_code
+                        .insert(p.app.to_lowercase(), (manifest_sha256, code));
                 }
                 removals.push(action);
             }
@@ -4365,11 +4413,15 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
             reason,
             applied,
         }) => {
-            let groups = match finished.and_then(|r| r.action) {
-                Some(Action::Apply(groups) | Action::ApplyMsiexec { groups, .. }) => groups,
-                _ => Vec::new(),
+            let (groups, scripts) = match finished.and_then(|r| r.action) {
+                Some(Action::Apply(groups)) => (groups, false),
+                Some(Action::ApplyScripts { groups }) => (groups, true),
+                Some(Action::ApplyMsiexec {
+                    groups, scripts, ..
+                }) => (groups, scripts),
+                _ => (Vec::new(), false),
             };
-            cmds.extend(ask_msiexec(app, name, reason, &applied, groups));
+            cmds.extend(ask_msiexec(app, name, reason, &applied, groups, scripts));
         }
         Err(InstallFail::Other(message)) => app.push_toast(ToastKind::Error, message),
     }
@@ -4386,6 +4438,7 @@ fn ask_msiexec(
     reason: String,
     applied: &[String],
     groups: Vec<Vec<InstallPlan>>,
+    scripts: bool,
 ) -> Vec<Cmd> {
     let done = |p: &InstallPlan| applied.iter().any(|a| a.eq_ignore_ascii_case(&p.app));
     let (with, rest): (Vec<_>, Vec<_>) = groups
@@ -4402,11 +4455,18 @@ fn ask_msiexec(
     }
     let mut cmds = Vec::new();
     if !rest.is_empty() {
-        cmds.extend(enqueue(app, Action::Apply(rest)));
+        // The rest keeps the consent the user gave to the whole batch.
+        let again = if scripts {
+            Action::ApplyScripts { groups: rest }
+        } else {
+            Action::Apply(rest)
+        };
+        cmds.extend(enqueue(app, again));
     }
     let action = Action::ApplyMsiexec {
         groups: with,
         app: name.clone(),
+        scripts,
     };
     let note = format!("{name}: o extrator do wingetrs não abre este MSI ({reason}).");
     let modal = confirm_modal(app, vec![action], vec![note], None);
@@ -4483,8 +4543,28 @@ fn confirm_rows(app: &App) -> usize {
         return 1;
     };
     let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
-    let geom = crate::tui::regions::confirm_geom(items.len(), notes, scripts.lines.len(), area);
+    let geom = crate::tui::regions::confirm_geom(items.len(), notes, &scripts.lines, area);
     (usize::from(geom.list.height) / ITEM_ROWS).max(1)
+}
+
+/// Whether the open confirmation has third-party code but too little room to show more than
+/// the section title (fewer than two lines of it).
+fn scripts_hidden(app: &App) -> bool {
+    let Some(Modal::Confirm {
+        items,
+        notes,
+        scripts,
+        ..
+    }) = &app.modal
+    else {
+        return false;
+    };
+    if scripts.lines.is_empty() {
+        return false;
+    }
+    let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
+    let geom = crate::tui::regions::confirm_geom(items.len(), notes, &scripts.lines, area);
+    geom.scripts.height < 3
 }
 
 /// `(rows, width)` the scripts section draws its lines in (at least one row).
@@ -4499,7 +4579,7 @@ fn script_rows(app: &App) -> (usize, usize) {
         return (1, 1);
     };
     let area = ratatui::layout::Rect::new(0, 0, app.size.0, app.size.1);
-    let geom = crate::tui::regions::confirm_geom(items.len(), notes, scripts.lines.len(), area);
+    let geom = crate::tui::regions::confirm_geom(items.len(), notes, &scripts.lines, area);
     (
         usize::from(geom.scripts.height.saturating_sub(1)).max(1),
         usize::from(geom.scripts.width).max(1),
@@ -4569,6 +4649,14 @@ fn continue_confirm(app: &mut App) -> Vec<Cmd> {
         }) => authorize_scripts(scripts, checked_actions(items, actions.clone())).err(),
         _ => None,
     };
+    // Consent needs the code on screen: a window too small to show it blocks Continue.
+    if scripts_hidden(app) {
+        app.push_toast(
+            ToastKind::Warning,
+            "A janela é pequena demais para mostrar os scripts; aumente a janela para revisá-los antes de continuar",
+        );
+        return Vec::new();
+    }
     if let Some(name) = refused {
         // A refused script never runs: the dialog stays so the item can be unchecked.
         app.push_toast(

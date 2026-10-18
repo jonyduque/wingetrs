@@ -154,7 +154,7 @@ pub fn regions(app: &App, area: Rect) -> Regions {
         ..
     }) = &app.modal
     {
-        let g = confirm_geom(items.len(), notes, scripts.lines.len(), area);
+        let g = confirm_geom(items.len(), notes, &scripts.lines, area);
         r.confirm = g.dialog;
         r.confirm_list = g.list;
         r.confirm_scripts = g.scripts;
@@ -183,14 +183,14 @@ pub struct ConfirmGeom {
     pub buttons: Vec<(Rect, ConfirmButton)>,
 }
 
-/// Lays out a confirmation of `items` packages, `notes` and `script_lines` lines of
-/// third-party scripts: at most 80% of `area` per side; buttons at the foot, the notes on top,
+/// Lays out a confirmation of `items` packages, `notes` and the `script_lines` of
+/// third-party scripts (wrapped rows count): at most 80% of `area` per side; buttons at the foot, the notes on top,
 /// then the list and the scripts section share the rows in between (the list keeps at least
 /// one item, half of the rows when it has more).
 pub fn confirm_geom(
     items: usize,
     notes: &[String],
-    script_lines: usize,
+    script_lines: &[ScriptLine],
     area: Rect,
 ) -> ConfirmGeom {
     let mut g = ConfirmGeom::default();
@@ -207,10 +207,14 @@ pub fn confirm_geom(
         wrapped.len() + 1
     };
     // The section: a title row, its lines and a gap.
-    let script_rows = if script_lines == 0 {
+    let script_total: usize = script_lines
+        .iter()
+        .map(|l| script_line_rows(l, text_w))
+        .sum();
+    let script_rows = if script_lines.is_empty() {
         0
     } else {
-        script_lines + 2
+        script_total + 2
     };
     // Notes (and a gap), the list, the scripts, a gap and the button row.
     let wanted = chrome_h as usize + note_rows + list_rows + script_rows + 2;
@@ -229,7 +233,7 @@ pub fn confirm_geom(
     }
     let body = inner.height.saturating_sub(2);
     // The notes yield to at least one item (and a few rows of scripts).
-    let script_min = if script_lines == 0 {
+    let script_min = if script_lines.is_empty() {
         0
     } else {
         SCRIPT_MIN_ROWS + 1
@@ -241,7 +245,7 @@ pub fn confirm_geom(
     let gap = u16::from(notes_h > 0);
     let free = body.saturating_sub(notes_h + gap);
     let mut list_h = free;
-    if script_lines > 0 {
+    if !script_lines.is_empty() {
         // Half of the rows for the list (at least one item), the rest for the scripts.
         let half = (free.saturating_sub(1) / 2).max(ITEM_ROWS as u16);
         list_h = u16::try_from(list_rows)
@@ -249,7 +253,7 @@ pub fn confirm_geom(
             .min(half)
             .min(free);
         let left = free.saturating_sub(list_h + 1);
-        let want = u16::try_from(script_lines + 1).unwrap_or(u16::MAX);
+        let want = u16::try_from(script_total + 1).unwrap_or(u16::MAX);
         let h = want.min(left);
         if h > 0 {
             g.scripts = Rect::new(

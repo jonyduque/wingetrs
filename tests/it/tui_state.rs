@@ -4891,6 +4891,7 @@ fn allowed(app: &str) -> Action {
     Action::ApplyMsiexec {
         groups: vec![vec![plan(app)]],
         app: app.into(),
+        scripts: false,
     }
 }
 

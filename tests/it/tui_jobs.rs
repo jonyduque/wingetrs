@@ -1407,6 +1407,7 @@ async fn run_action_needs_msiexec_then_runs_the_allowed_item_only() {
     let other = Action::ApplyMsiexec {
         groups: groups.clone(),
         app: "outro".into(),
+        scripts: false,
     };
     assert!(matches!(
         jobs::run_action(&ctx, other).await,
@@ -1415,6 +1416,7 @@ async fn run_action_needs_msiexec_then_runs_the_allowed_item_only() {
     let allowed = Action::ApplyMsiexec {
         groups,
         app: "m".into(),
+        scripts: false,
     };
     let no_launch = |l: &Vec<String>| !l.iter().any(|l| l == INSTALLER_RUNNING);
     assert!(no_launch(&labels.lock().unwrap()));
@@ -1502,6 +1504,7 @@ async fn msiexec_fallback_and_bridge_job_queue_without_deadlock() {
         Action::ApplyMsiexec {
             groups,
             app: "m".into(),
+            scripts: false,
         },
     )
     .await;

@@ -1317,7 +1317,7 @@ fn draw_confirm<'a>(
     frame: &mut Frame,
     area: Rect,
 ) -> IconPlaces<'a> {
-    let geom = confirm_geom(items.len(), notes, scripts.lines.len(), area);
+    let geom = confirm_geom(items.len(), notes, &scripts.lines, area);
     frame.render_widget(Clear, geom.dialog);
     frame.render_widget(modal_block(theme, "Confirmar"), geom.dialog);
     let line = |frame: &mut Frame, rect: Rect, text: &str, style| {

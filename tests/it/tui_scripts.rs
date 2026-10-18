@@ -25,7 +25,10 @@ use wingetrs::install::progress::ProgressEvent;
 use wingetrs::install::script_scan::{ScriptReport, Verdict};
 use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
 use wingetrs::install::traits::{Effects, EnvStore, EnvValue};
-use wingetrs::tui::app::{Action, App, Modal, Msg, Planned, ToastKind, update};
+use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+use wingetrs::tui::app::{
+    Action, App, Cmd, InstallFail, Modal, Msg, Planned, Tab, ToastKind, update,
+};
 use wingetrs::tui::jobs;
 use wingetrs::tui::regions::confirm_geom;
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
@@ -105,6 +108,7 @@ fn removal_planned(a: &mut App, name: &str, script: &str, verdict: Verdict) {
         Msg::Planned(Ok(Planned::ReadyScripts {
             text: String::new(),
             action: Action::Remove(uninstall_plan(name)),
+            manifest_sha256: "sha-a".into(),
             code: vec![ThirdParty::Script {
                 hook: "pre_uninstall".into(),
                 script: script.into(),
@@ -236,7 +240,7 @@ fn remove_with_scripts_yields_remove_scripts() {
     );
     update(&mut a, key(KeyCode::Enter));
     assert!(
-        matches!(started(&a), Some(Action::RemoveScripts(p)) if p.app == "tool"),
+        matches!(started(&a), Some(Action::RemoveScripts { plan, manifest_sha256 }) if plan.app == "tool" && manifest_sha256 == "sha-a"),
         "{:?}",
         started(&a)
     );
@@ -291,7 +295,7 @@ fn bidi_and_control_characters_are_shown_escaped() {
 #[test]
 fn regions_has_script_area() {
     let area = Rect::new(0, 0, 80, 24);
-    let g = confirm_geom(1, &[], 40, area);
+    let g = confirm_geom(1, &[], &code_lines(40), area);
     assert!(g.scripts.height > 0, "{g:?}");
     let inside = g.scripts.x >= g.dialog.x
         && g.scripts.y >= g.dialog.y
@@ -302,7 +306,7 @@ fn regions_has_script_area() {
     assert!(g.list.height >= 2);
     assert!(g.list.bottom() <= g.scripts.y);
     // No scripts: no section.
-    assert_eq!(confirm_geom(1, &[], 0, area).scripts.height, 0);
+    assert_eq!(confirm_geom(1, &[], &[], area).scripts.height, 0);
 }
 
 #[test]
@@ -410,6 +414,7 @@ impl World {
             "extract_dir": "pkg",
             "bin": "hooked.exe",
             "post_install": ["$marker = 1"],
+            "post_uninstall": ["$marker = 2"],
         })
         .to_string();
         let mut catalog = Catalog::open_in_memory().unwrap();
@@ -557,4 +562,230 @@ fn paging_shows_every_line_and_reaches_the_end() {
         update(&mut a, key(KeyCode::PageDown));
     }
     assert_eq!(seen.len(), 40, "lines never shown: {seen:?}");
+}
+// ---- review: batches, msiexec, small windows, shown manifest ----
+
+fn irow(name: &str) -> ListRow {
+    ListRow {
+        name: name.into(),
+        app_key: String::new(),
+        not_in_catalog: false,
+        origin: "wingetrs".into(),
+        installed_version: Some("1".into()),
+        correlation: Correlation::Matched {
+            source: "scoop:main".into(),
+            package_id: name.into(),
+            rule: Rule::ScoopManifest,
+        },
+        latest: Some("1".into()),
+        state: UpdateState::UpToDate,
+        tiebreak: None,
+        ..Default::default()
+    }
+}
+
+/// Installed tab with `alpha` and `beta` marked and the removal batch planned.
+fn marked_pair(mode: ConfirmMode) -> App {
+    let mut a = app_with(mode);
+    a.installed = vec![irow("alpha"), irow("beta")];
+    a.tab = Tab::Installed;
+    for i in 0..2 {
+        a.selected = i;
+        update(&mut a, key(KeyCode::Char(' ')));
+    }
+    assert_eq!(a.marked_count(), 2);
+    let cmds = update(&mut a, key(KeyCode::Char('u')));
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::PlanBatch { .. }]),
+        "{cmds:?}"
+    );
+    a
+}
+
+fn batch_results() -> Vec<Result<Planned, String>> {
+    vec![
+        Ok(Planned::ReadyScripts {
+            text: String::new(),
+            action: Action::Remove(uninstall_plan("alpha")),
+            manifest_sha256: "sha-alpha".into(),
+            code: vec![ThirdParty::Script {
+                hook: "pre_uninstall".into(),
+                script: "$gone = 1".into(),
+                report: report(Verdict::Confirm),
+            }],
+        }),
+        Ok(Planned::Ready {
+            text: String::new(),
+            action: Action::Remove(uninstall_plan("beta")),
+        }),
+    ]
+}
+
+#[test]
+fn batch_shows_removal_code_and_yields_remove_scripts() {
+    let mut a = marked_pair(ConfirmMode::Always);
+    update(&mut a, Msg::BatchPlanned(batch_results()));
+    a.size = (100, 50);
+    let text = render(&a, 100, 50);
+    assert!(
+        text.contains("Script de terceiro (pre_uninstall)"),
+        "{text}"
+    );
+    assert!(text.contains("1 | $gone = 1"), "{text}");
+    update(&mut a, key(KeyCode::Enter));
+    assert!(
+        matches!(
+            started(&a),
+            Some(Action::RemoveScripts { plan, manifest_sha256 })
+                if plan.app == "alpha" && manifest_sha256 == "sha-alpha"
+        ),
+        "{:?}",
+        started(&a)
+    );
+    // The one without code stays a plain removal.
+    assert!(matches!(&a.queue[0].action, Action::Remove(p) if p.app == "beta"));
+}
+
+#[test]
+fn batch_dialog_forced_even_when_confirm_setting_skips() {
+    let mut a = marked_pair(ConfirmMode::Never);
+    update(&mut a, Msg::BatchPlanned(batch_results()));
+    assert!(matches!(a.modal, Some(Modal::Confirm { .. })));
+    assert!(a.running.is_none() && a.queue.is_empty());
+    // Without code the same setting runs everything at once.
+    let mut b = marked_pair(ConfirmMode::Never);
+    let plain: Vec<_> = ["alpha", "beta"]
+        .iter()
+        .map(|n| {
+            Ok(Planned::Ready {
+                text: String::new(),
+                action: Action::Remove(uninstall_plan(n)),
+            })
+        })
+        .collect();
+    update(&mut b, Msg::BatchPlanned(plain));
+    assert!(b.modal.is_none());
+    assert!(started(&b).is_some());
+}
+
+#[test]
+fn msiexec_in_a_scripts_batch_keeps_the_consent_of_the_rest() {
+    let mut a = app_with(ConfirmMode::Always);
+    let groups: Vec<Vec<InstallPlan>> = ["one", "two", "three"]
+        .iter()
+        .map(|n| vec![plan_with(n, Some("$x = 1"))])
+        .collect();
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::Ready {
+            text: String::new(),
+            action: Action::Apply(groups),
+        })),
+    );
+    update(&mut a, key(KeyCode::Enter));
+    assert!(matches!(started(&a), Some(Action::ApplyScripts { .. })));
+    let cmds = update(
+        &mut a,
+        Msg::InstallFinished(Err(InstallFail::NeedsMsiexec {
+            app: "two".into(),
+            reason: "MSI".into(),
+            applied: vec!["one".into()],
+        })),
+    );
+    // `three` goes on at once, still with the consent; it is not dropped or downgraded.
+    let again = cmds.iter().find_map(|c| match c {
+        Cmd::Execute(act) => Some(act.clone()),
+        _ => None,
+    });
+    assert!(
+        matches!(&again, Some(Action::ApplyScripts { groups })
+            if groups.len() == 1 && groups[0][0].app == "three"),
+        "{cmds:?}"
+    );
+    // `two` waits for the msiexec confirmation and keeps it too.
+    update(&mut a, key(KeyCode::Enter));
+    assert!(
+        matches!(&a.queue[0].action, Action::ApplyMsiexec { app, scripts: true, .. } if app == "two"),
+        "{:?}",
+        a.queue
+    );
+}
+
+#[test]
+fn window_too_small_for_the_scripts_blocks_continue() {
+    let mut a = app_with(ConfirmMode::Never);
+    a.size = (80, 12);
+    apply_planned(&mut a, plan_with("tool", Some(&script_of(5))));
+    let g = confirm_geom(1, &[], &code_lines(5), Rect::new(0, 0, 80, 12));
+    assert!(g.scripts.height < 3, "{g:?}");
+    update(&mut a, key(KeyCode::Enter));
+    assert!(matches!(a.modal, Some(Modal::Confirm { .. })), "stays open");
+    assert!(a.running.is_none() && a.queue.is_empty());
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Warning && t.text.contains("aumente a janela")),
+        "{:?}",
+        a.toasts
+    );
+    // Room enough: it goes.
+    a.size = (80, 24);
+    update(&mut a, key(KeyCode::Enter));
+    assert!(matches!(started(&a), Some(Action::ApplyScripts { .. })));
+}
+
+#[tokio::test]
+async fn remove_scripts_refuses_a_manifest_other_than_the_one_shown() {
+    let w = World::new().await;
+    let host = Arc::new(FakeHost::default());
+    let groups = plans_of(&w, &host).await;
+    let ctx = w.ctx(&host, &quiet);
+    jobs::run_action(&ctx, Action::ApplyScripts { groups })
+        .await
+        .unwrap();
+    let Ok(Planned::ReadyScripts {
+        action: Action::Remove(plan),
+        manifest_sha256,
+        code,
+        ..
+    }) = jobs::plan_remove(&ctx, "hooked", false)
+    else {
+        panic!("expected a removal with code");
+    };
+    assert!(!code.is_empty() && !manifest_sha256.is_empty());
+    // Another manifest than the one the user read: nothing is removed.
+    let refused = jobs::run_action(
+        &ctx,
+        Action::RemoveScripts {
+            plan: plan.clone(),
+            manifest_sha256: "outro".into(),
+        },
+    )
+    .await;
+    match refused {
+        Err(InstallFail::Other(m)) => assert!(m.contains("mudou desde que você revisou"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(w.layout.current("hooked").exists());
+    assert!(!host.seen.lock().unwrap().contains(&HookKind::PostUninstall));
+    // The manifest that was shown: it runs.
+    jobs::run_action(
+        &ctx,
+        Action::RemoveScripts {
+            plan,
+            manifest_sha256,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(host.seen.lock().unwrap().contains(&HookKind::PostUninstall));
+}
+
+fn code_lines(n: usize) -> Vec<wingetrs::tui::app::ScriptLine> {
+    (0..n)
+        .map(|i| wingetrs::tui::app::ScriptLine {
+            kind: wingetrs::tui::app::ScriptLineKind::Code,
+            text: format!("  {i} | x"),
+        })
+        .collect()
 }
