@@ -559,3 +559,512 @@ function startmenu_shortcut([System.IO.FileInfo] $target, $shortcutName, $argume
     $i = if ($icon) { $icon.FullName } else { $null }
     __wr_effect @{ op = 'shortcut'; target = $target.FullName; name = "$shortcutName"; args = $a; icon = $i }
 }
+
+# ---- Group 3 (Task 154): extraction through helpers, external commands, persist ----
+# Helpers (7z, lessmsi, innounp, dark) come only from $__wr_helpers as absolute paths;
+# nothing is looked up on the PATH. The Windows Installer is never run from here.
+
+# internal: absolute path of a helper, or throws when it is not listed / not on disk
+function __wr_helper($name) {
+    $p = $null
+    if ($null -ne $__wr_helpers -and $__wr_helpers.ContainsKey($name)) { $p = $__wr_helpers[$name] }
+    if ([string]::IsNullOrEmpty($p) -or !(Test-Path -LiteralPath $p -PathType Leaf)) {
+        throw ("auxiliar '$name' n" + [char]0xE3 + 'o instalado')
+    }
+    return $p
+}
+
+# internal: a relative path taken from a manifest or archive listing; refuses '..',
+# rooted paths, drives, UNC and alternate streams (install::safepath rule)
+function __wr_safe_rel($p) {
+    $s = "$p"
+    if ($s.Contains(':') -or $s -match '^[\\/]' -or $s -match '(^|[\\/])\.\.([\\/]|$)') {
+        throw ('caminho inseguro: ' + $s)
+    }
+    return $s
+}
+
+# internal: runs a helper through Invoke-ExternalCommand; throws with the exit code
+function __wr_run($exe, $argList, $log, $path) {
+    $ok = Invoke-ExternalCommand $exe $argList -LogPath $log
+    if (!$ok) {
+        throw ('falha ao extrair ' + $path + ' (c' + [char]0xF3 + 'digo ' + $script:__wr_last_exit + ')')
+    }
+}
+
+# internal: directory that holds the archive ('.' when the path has none)
+function __wr_dirof($path) {
+    $d = Split-Path $path
+    if ([string]::IsNullOrEmpty($d)) { return '.' }
+    return $d
+}
+
+# core.ps1:713 -- elevation (-RunAs) and the Windows Installer are refused; the exit code of
+# the last call stays in $script:__wr_last_exit; returns $true / $false like the original
+function Invoke-ExternalCommand {
+    [CmdletBinding(DefaultParameterSetName = "Default")]
+    [OutputType([Boolean])]
+    param (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [Alias("Path")]
+        [ValidateNotNullOrEmpty()]
+        [String]
+        $FilePath,
+        [Parameter(Position = 1)]
+        [Alias("Args")]
+        [String[]]
+        $ArgumentList,
+        [Parameter(ParameterSetName = "UseShellExecute")]
+        [Switch]
+        $RunAs,
+        [Parameter(ParameterSetName = "UseShellExecute")]
+        [Switch]
+        $Quiet,
+        [Alias("Msg")]
+        [String]
+        $Activity,
+        [Alias("cec")]
+        [Hashtable]
+        $ContinueExitCodes,
+        [Parameter(ParameterSetName = "Default")]
+        [Alias("Log")]
+        [String]
+        $LogPath
+    )
+    if ($RunAs) { throw ('eleva' + [char]0xE7 + [char]0xE3 + 'o n' + [char]0xE3 + 'o suportada pelo wingetrs') }
+    if ([System.IO.Path]::GetFileNameWithoutExtension($FilePath) -like 'msi*exec') {
+        throw ('o Windows Installer s' + [char]0xF3 + ' roda pela fila do wingetrs')
+    }
+    $script:__wr_last_exit = -1
+    if ($Activity) {
+        Write-Host "$Activity " -NoNewline
+    }
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo.FileName = $FilePath
+    $Process.StartInfo.UseShellExecute = $false
+    if ($LogPath) {
+        $redirectToLogFile = $true
+        $Process.StartInfo.RedirectStandardOutput = $true
+        $Process.StartInfo.RedirectStandardError = $true
+    }
+    if ($Quiet) {
+        $Process.StartInfo.UseShellExecute = $true
+        $Process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    }
+    if ($ArgumentList.Length -gt 0) {
+        # remove existing double quotes and split arguments before each switch
+        $ArgumentList = $ArgumentList.ForEach({ $_ -replace '"' -split '(?<=(?<![:\w])[/-]\w+) | (?=[/-])' })
+        # legacy escaping for commands with non-standard argument handling
+        $LegacyCommand = $FilePath -match '^((cmd|cscript|find|sqlcmd|wscript)(\.exe)?|.*\.(bat|cmd|js|vbs|wsf))$' -or
+        ($ArgumentList -match '^/S$|^/D=[A-Z]:[\\/].*$').Length -eq 2
+        $SupportArgumentList = $Process.StartInfo.PSObject.Properties.Name -contains 'ArgumentList'
+        if ((-not $LegacyCommand) -and $SupportArgumentList) {
+            $ArgumentList.ForEach({ $Process.StartInfo.ArgumentList.Add($_) })
+        } else {
+            $escapedArgs = switch -regex ($ArgumentList) {
+                # quote paths starting with a drive letter
+                '(?<!/D=)[A-Z]:[\\/].*' { $_ -replace '([A-Z]:[\\/].*)', '"$1"'; continue }
+                # do not quote paths if it is NSIS's '/D' argument
+                '/D=[A-Z]:[\\/].*' { $_; continue }
+                # quote args with spaces
+                ' ' { "`"$_`""; continue }
+                default { $_; continue }
+            }
+            $Process.StartInfo.Arguments = $escapedArgs -join ' '
+        }
+    }
+    try {
+        [void]$Process.Start()
+    } catch {
+        if ($Activity) {
+            Write-Host "Error." -ForegroundColor DarkRed
+        }
+        error $_.Exception.Message
+        return $false
+    }
+    if ($redirectToLogFile) {
+        # read both streams asynchronously to avoid a deadlock
+        $stdoutTask = $Process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $Process.StandardError.ReadToEndAsync()
+    }
+    $Process.WaitForExit()
+    if ($redirectToLogFile) {
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::AppendAllText($LogPath, "$($stdoutTask.Result)", $utf8)
+        [System.IO.File]::AppendAllText($LogPath, "$($stderrTask.Result)", $utf8)
+    }
+    $code = $Process.ExitCode
+    $script:__wr_last_exit = $code
+    if ($code -ne 0) {
+        if ($ContinueExitCodes -and ($ContinueExitCodes.ContainsKey($code))) {
+            if ($Activity) {
+                Write-Host "Done." -ForegroundColor DarkYellow
+            }
+            warn $ContinueExitCodes[$code]
+            return $true
+        } else {
+            if ($Activity) {
+                Write-Host "Error." -ForegroundColor DarkRed
+            }
+            error "Exit code was $code!"
+            return $false
+        }
+    }
+    if ($Activity) {
+        Write-Host "Done." -ForegroundColor Green
+    }
+    return $true
+}
+
+# decompress.ps1:63 -- 7z.exe from $__wr_helpers['7zip'] (use_external_7zip is always off)
+function Expand-7zipArchive {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [String]
+        $Path,
+        [Parameter(Position = 1)]
+        [String]
+        $DestinationPath = (Split-Path $Path),
+        [String]
+        $ExtractDir,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [String]
+        $Switches,
+        [ValidateSet('All', 'Skip', 'Rename')]
+        [String]
+        $Overwrite,
+        [Switch]
+        $Removal
+    )
+    if ($ExtractDir) { [void](__wr_safe_rel $ExtractDir) }
+    $7zPath = __wr_helper '7zip'
+    $LogPath = "$(__wr_dirof $Path)\7zip.log"
+    $DestinationPath = $DestinationPath.TrimEnd('\')
+    $ArgList = @('x', $Path, "-o$DestinationPath", '-xr!*.nsis', '-y')
+    $IsTar = (($Path -replace '\.[^\.]*$', '') -match '\.tar$') -or ($Path -match '\.t[abgpx]z2?$')
+    if (!$IsTar -and $ExtractDir) {
+        $ArgList += "-ir!$ExtractDir\*"
+    }
+    if ($Switches) {
+        $ArgList += (-split $Switches)
+    }
+    switch ($Overwrite) {
+        'All' { $ArgList += '-aoa' }
+        'Skip' { $ArgList += '-aos' }
+        'Rename' { $ArgList += '-aou' }
+    }
+    __wr_run $7zPath $ArgList $LogPath $Path
+    if ($IsTar) {
+        # check for tar: list the archive, then extract the inner tar
+        $Status = Invoke-ExternalCommand $7zPath @('l', $Path) -LogPath $LogPath
+        if ($Status) {
+            $TarFile = (Select-String -Path $LogPath -Pattern '[^ ]*tar$').Matches.Value
+            [void](__wr_safe_rel $TarFile)
+            Expand-7zipArchive -Path "$DestinationPath\$TarFile" -DestinationPath $DestinationPath -ExtractDir $ExtractDir -Removal
+        } else {
+            throw ('falha ao listar ' + $Path + ': n' + [char]0xE3 + 'o ' + [char]0xE9 + ' um arquivo aceito pelo 7-Zip')
+        }
+    }
+    if (!$IsTar -and $ExtractDir) {
+        movedir "$DestinationPath\$ExtractDir" $DestinationPath | Out-Null
+        # remove the temporary directory if it is empty
+        $ExtractDirTopPath = [string] "$DestinationPath\$($ExtractDir -replace '[\\/].*')"
+        if ((Get-ChildItem -Path $ExtractDirTopPath -Force -ErrorAction Ignore).Count -eq 0) {
+            Remove-Item -Path $ExtractDirTopPath -Recurse -Force -ErrorAction Ignore
+        }
+    }
+    if (Test-Path $LogPath) {
+        Remove-Item $LogPath -Force
+    }
+    if ($Removal) {
+        # remove the original archive file
+        Remove-Item $Path -Force
+    }
+}
+
+# decompress.ps1:169 -- only the lessmsi branch; the other branch is not ported
+function Expand-MsiArchive {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [String]
+        $Path,
+        [Parameter(Position = 1)]
+        [String]
+        $DestinationPath = (Split-Path $Path),
+        [String]
+        $ExtractDir,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [String]
+        $Switches,
+        [Switch]
+        $Removal
+    )
+    if ($ExtractDir) { [void](__wr_safe_rel $ExtractDir) }
+    $MsiPath = __wr_helper 'lessmsi'
+    $DestinationPath = $DestinationPath.TrimEnd('\')
+    if ($ExtractDir) {
+        $OriDestinationPath = $DestinationPath
+        $DestinationPath = "$DestinationPath\_tmp"
+    }
+    $ArgList = @('x', $Path, "$DestinationPath\")
+    $LogPath = "$(__wr_dirof $Path)\msi.log"
+    if ($Switches) {
+        $ArgList += (-split $Switches)
+    }
+    __wr_run $MsiPath $ArgList $LogPath $Path
+    if ($ExtractDir -and (Test-Path "$DestinationPath\SourceDir")) {
+        movedir "$DestinationPath\SourceDir\$ExtractDir" $OriDestinationPath | Out-Null
+        Remove-Item $DestinationPath -Recurse -Force
+    } elseif ($ExtractDir) {
+        movedir "$DestinationPath\$ExtractDir" $OriDestinationPath | Out-Null
+        Remove-Item $DestinationPath -Recurse -Force
+    } elseif (Test-Path "$DestinationPath\SourceDir") {
+        movedir "$DestinationPath\SourceDir" $DestinationPath | Out-Null
+    }
+    if (($DestinationPath -ne (Split-Path $Path)) -and (Test-Path "$DestinationPath\$(Split-Path $Path -Leaf)")) {
+        Remove-Item "$DestinationPath\$(Split-Path $Path -Leaf)" -Force
+    }
+    if (Test-Path $LogPath) {
+        Remove-Item $LogPath -Force
+    }
+    if ($Removal) {
+        # remove the original archive file
+        Remove-Item $Path -Force
+    }
+}
+
+# decompress.ps1:227 -- same arguments as inno_args (inno.rs); exit 0 with no files is an error
+function Expand-InnoArchive {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [String]
+        $Path,
+        [Parameter(Position = 1)]
+        [String]
+        $DestinationPath = (Split-Path $Path),
+        [String]
+        $ExtractDir,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [String]
+        $Switches,
+        [Switch]
+        $Removal
+    )
+    if ($ExtractDir) { [void](__wr_safe_rel $ExtractDir) }
+    $InnoPath = __wr_helper 'innounp'
+    $LogPath = "$(__wr_dirof $Path)\innounp.log"
+    $ArgList = @('-x', "-d$DestinationPath", $Path, '-y')
+    if (!$ExtractDir) {
+        $ArgList += '-c{app}'
+    } elseif ($ExtractDir.StartsWith('{')) {
+        $ArgList += "-c$ExtractDir"
+    } else {
+        $ArgList += "-c{app}\$ExtractDir"
+    }
+    if ($Switches) {
+        $ArgList += (-split $Switches)
+    }
+    __wr_run $InnoPath $ArgList $LogPath $Path
+    # innounp exits 0 with no files when the filter matches nothing (probe D4)
+    $count = @(Get-ChildItem -LiteralPath $DestinationPath -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+    if ($count -eq 0) {
+        throw ('innounp: nenhum arquivo extra' + [char]0xED + 'do')
+    }
+    if (Test-Path $LogPath) {
+        Remove-Item $LogPath -Force
+    }
+    if ($Removal) {
+        # remove the original archive file
+        Remove-Item $Path -Force
+    }
+}
+
+# decompress.ps1:267 -- System.IO.Compression.ZipFile (zip-slip safe in .NET)
+function Expand-ZipArchive {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [String]
+        $Path,
+        [Parameter(Position = 1)]
+        [String]
+        $DestinationPath = (Split-Path $Path),
+        [String]
+        $ExtractDir,
+        [Switch]
+        $Removal
+    )
+    if ($ExtractDir) {
+        [void](__wr_safe_rel $ExtractDir)
+        $OriDestinationPath = $DestinationPath
+        $DestinationPath = "$DestinationPath\_tmp"
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory((Get-AbsolutePath $Path), (Get-AbsolutePath $DestinationPath), $true)
+    if ($ExtractDir) {
+        movedir "$DestinationPath\$ExtractDir" $OriDestinationPath | Out-Null
+        Remove-Item $DestinationPath -Recurse -Force
+    }
+    if ($Removal) {
+        # remove the original archive file
+        Remove-Item $Path -Force
+    }
+}
+
+# decompress.ps1:303
+function Expand-DarkArchive {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
+        [String]
+        $Path,
+        [Parameter(Position = 1)]
+        [String]
+        $DestinationPath = (Split-Path $Path),
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [String]
+        $Switches,
+        [Switch]
+        $Removal
+    )
+    $DarkPath = __wr_helper 'dark'
+    $LogPath = "$(__wr_dirof $Path)\dark.log"
+    if ((Split-Path $DarkPath -Leaf) -eq 'wix.exe') {
+        $ArgList = @('burn', 'extract', $Path, '-out', $DestinationPath, '-outba', "$DestinationPath\UX")
+    } else {
+        $ArgList = @('-nologo', '-x', $DestinationPath, $Path)
+    }
+    if ($Switches) {
+        $ArgList += (-split $Switches)
+    }
+    __wr_run $DarkPath $ArgList $LogPath $Path
+    if (Test-Path "$DestinationPath\WixAttachedContainer") {
+        Rename-Item "$DestinationPath\WixAttachedContainer" 'AttachedContainer' -ErrorAction Ignore
+    } else {
+        if (Test-Path "$DestinationPath\AttachedContainer\a0") {
+            $Xml = [xml](Get-Content -Raw "$DestinationPath\UX\manifest.xml" -Encoding utf8)
+            # names come from the installer: skip any that leave their folder
+            $Xml.BurnManifest.UX.Payload | ForEach-Object {
+                try { [void](__wr_safe_rel $_.SourcePath); [void](__wr_safe_rel $_.FilePath) } catch { return }
+                Rename-Item "$DestinationPath\UX\$($_.SourcePath)" $_.FilePath -ErrorAction Ignore
+            }
+            $Xml.BurnManifest.Payload | ForEach-Object {
+                try { [void](__wr_safe_rel $_.SourcePath); [void](__wr_safe_rel $_.FilePath) } catch { return }
+                Rename-Item "$DestinationPath\AttachedContainer\$($_.SourcePath)" $_.FilePath -ErrorAction Ignore
+            }
+        }
+    }
+    if (Test-Path $LogPath) {
+        Remove-Item $LogPath -Force
+    }
+    if ($Removal) {
+        # remove the original archive file
+        Remove-Item $Path -Force
+    }
+}
+
+# install.ps1:430 (persist_def, internal)
+function __wr_persist_def($persist) {
+    if ($persist -is [Array]) {
+        $source = $persist[0]
+        $target = $persist[1]
+    } else {
+        $source = $persist
+        $target = $null
+    }
+    if (!$target) {
+        $target = $source
+    }
+    return $source, $target
+}
+
+# install.ps1:444 -- $dir is the caller's variable, as in the original. Every definition is
+# checked (relative, no '..') before anything is created, so links stay under $dir and
+# the data under $persist_dir.
+function persist_data($manifest, $original_dir, $persist_dir) {
+    $persist = $manifest.persist
+    if ($persist) {
+        if ([string]::IsNullOrEmpty($dir)) { throw '$dir not defined by the script' }
+        foreach ($p in @($persist)) {
+            $s, $t = __wr_persist_def $p
+            [void](__wr_safe_rel $s)
+            [void](__wr_safe_rel $t)
+        }
+
+        $persist_dir = ensure $persist_dir
+
+        if ($persist -is [String]) {
+            $persist = @($persist)
+        }
+
+        $persist | ForEach-Object {
+            $source, $target = __wr_persist_def $_
+
+            Write-Host "Persisting $source"
+
+            $source = $source.TrimEnd('/').TrimEnd('\\')
+
+            $source = "$dir\$source"
+            $target = "$persist_dir\$target"
+
+            # if we have had persist data in the store, just create link and go
+            if (Test-Path -LiteralPath $target) {
+                # if there is also a source data, rename it (to keep a original backup)
+                if (Test-Path -LiteralPath $source) {
+                    Move-Item -Force -LiteralPath $source -Destination "$source.original"
+                }
+                # we don't have persist data in the store, move the source to target, then create link
+            } elseif (Test-Path -LiteralPath $source) {
+                # ensure target parent folder exist
+                ensure (Split-Path -Path $target) | Out-Null
+                Move-Item -LiteralPath $source -Destination $target
+                # we have neither source nor target data: create an empty target directory
+            } else {
+                ensure $target | Out-Null
+            }
+
+            # create link
+            if (Test-Path -LiteralPath $target -PathType Container) {
+                # target is a directory, create junction
+                New-Item -Path $source -ItemType Junction -Value $target | Out-Null
+                & "$env:SystemRoot\System32\attrib.exe" $source +R /L | Out-Null
+            } else {
+                # target is a file, create hard link
+                New-Item -Path $source -ItemType HardLink -Value $target | Out-Null
+            }
+        }
+    }
+}
+
+# install.ps1:496
+function unlink_persist_data($manifest, $dir) {
+    $persist = $manifest.persist
+    # unlink all junction / hard link in the directory
+    if ($persist) {
+        @($persist) | ForEach-Object {
+            $source, $null = __wr_persist_def $_
+            [void](__wr_safe_rel $source)
+            $source = Get-Item -LiteralPath "$dir\$source" -ErrorAction SilentlyContinue
+            if ($source.LinkType) {
+                $source_path = $source.FullName
+                # directory (junction)
+                if ($source -is [System.IO.DirectoryInfo]) {
+                    # remove read-only attribute on the link
+                    & "$env:SystemRoot\System32\attrib.exe" -R $source_path /L | Out-Null
+                    # remove the junction
+                    Remove-Item -LiteralPath $source_path -Recurse -Force -ErrorAction SilentlyContinue
+                } else {
+                    # remove the hard link
+                    Remove-Item -LiteralPath $source_path -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    }
+}
+
+# install.ps1:521 -- no effect: wingetrs never runs with $global
+function persist_permission($manifest, $global) {
+}

@@ -40,6 +40,15 @@ pub const PRELUDE_FUNCTIONS: &[&str] = &[
     "rm_shim",
     "shortcut_folder",
     "startmenu_shortcut",
+    "Expand-7zipArchive",
+    "Expand-MsiArchive",
+    "Expand-InnoArchive",
+    "Expand-DarkArchive",
+    "Expand-ZipArchive",
+    "Invoke-ExternalCommand",
+    "persist_data",
+    "unlink_persist_data",
+    "persist_permission",
 ];
 
 /// Variables the runner defines before dot-sourcing the prelude.

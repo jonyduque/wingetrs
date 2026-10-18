@@ -7,7 +7,7 @@ use std::process::Command;
 
 use wingetrs::install::prelude::{CONTRACT_VARS, PRELUDE, PRELUDE_FUNCTIONS};
 
-const FUNCTIONS: [&str; 35] = [
+const FUNCTIONS: [&str; 44] = [
     "info",
     "warn",
     "error",
@@ -43,6 +43,15 @@ const FUNCTIONS: [&str; 35] = [
     "rm_shim",
     "shortcut_folder",
     "startmenu_shortcut",
+    "Expand-7zipArchive",
+    "Expand-MsiArchive",
+    "Expand-InnoArchive",
+    "Expand-DarkArchive",
+    "Expand-ZipArchive",
+    "Invoke-ExternalCommand",
+    "persist_data",
+    "unlink_persist_data",
+    "persist_permission",
 ];
 
 struct Out {
