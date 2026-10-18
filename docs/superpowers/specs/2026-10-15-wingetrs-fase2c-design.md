@@ -1,7 +1,7 @@
 # wingetrs — Fase 2c: scripts PowerShell, innosetup e installer.file/args (design)
 
 Data: 2026-10-15
-Status: **rascunho; as decisões D1–D8 são do usuário.** Depende da 2b.
+Status: **decidida pelo usuário em 2026-10-18** (ver "Decisões do usuário" ao fim da seção b). Depende da 2b.
 Rascunho escrito por um agente opus em modo só leitura, a partir do fonte do Scoop (master em 2026-10-15). Nada foi executado.
 
 ## (a) Objetivo e escopo
@@ -58,6 +58,11 @@ Sub-casos, em ordem de risco:
 | D6 | `$bucketsdir` e `scripts/` | 1 o `update` guarda `<repo>/scripts/**` (com `safepath` e troca atômica). 2 baixar na hora. 3 recusar manifestos que usam `scripts/` | **1** |
 | D7 | Análise estática | 1 léxico mínimo em Rust; o que não for analisável vira "desconhecido" com confirmação reforçada. 2 AST do pwsh (custo por manifesto; seria um segundo caminho) | **1**; o AST serve só para validar o léxico (sonda) |
 | D8 | Elevação | 1 recusar com o wingetrs elevado; o portão recusa `RunAs`, `sudo`, `HKLM:`, `-Global` e escrita em `ProgramFiles`/`windir`. 2 permitir com confirmação | **1** (o UAC fica para a 2d) |
+
+### Decisões do usuário (2026-10-18)
+
+- **D1 = B: prelúdio próprio.** Nada da lib do Scoop é baixado nem carregado. O runner dot-source um prelúdio do wingetrs que implementa em PowerShell (ou intercepta como efeito em `effects.jsonl`) **só as funções do Scoop que os manifestos reais chamam**, medidas pelo oráculo (P1). Função do Scoop que o prelúdio não tem ⇒ o portão (P9) recusa com o nome dela e o motivo "função do Scoop ainda não suportada". Consequências: a sonda D2 e a P10 ("Lib do Scoop fixada") saem; entra a **P10' Prelúdio próprio** (lista medida, uma função por vez, teste por função com pwsh falso ou script sintético); o risco "substituições desatualizadas" vira "manifesto usa função que não temos" (recusa clara + contagem no oráculo); a variável `$scoopdir` e afins são definidas pelo prelúdio apontando para a nossa raiz.
+- **D2–D8:** como recomendado (D2 = 1, D3 = 1, D4 = 1, D5 = 1, D6 = 1, D7 = 1, D8 = 1).
 
 **Texto proposto para o CLAUDE.md (D2-1):**
 

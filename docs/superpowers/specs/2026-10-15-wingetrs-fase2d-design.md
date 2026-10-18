@@ -1,7 +1,7 @@
 # wingetrs — Fase 2d: instaladores do winget (design)
 
 Data: 2026-10-15
-Status: **rascunho; as decisões D1–D8 são do usuário.** Rascunho feito por um agente opus, só leitura, a partir do winget-cli (`ManifestCommon.cpp`, `ShellExecuteInstallerHandler`, `MsiInstallFlow`, `MSIXInstallerHandler`), da sonda da Task 105 e das notas da 2d na spec da 2a.
+Status: **decidida pelo usuário em 2026-10-18** (ver "Decisões do usuário" ao fim da seção b). Rascunho feito por um agente opus, só leitura, a partir do winget-cli (`ManifestCommon.cpp`, `ShellExecuteInstallerHandler`, `MsiInstallFlow`, `MSIXInstallerHandler`), da sonda da Task 105 e das notas da 2d na spec da 2a.
 
 ## (a) Objetivo e escopo
 
@@ -45,6 +45,14 @@ Instalar, remover e atualizar pacotes do catálogo winget com o próprio wingetr
 | D6 | Kindle (instalação antiga junto com a nova) | A avisar e oferecer cópia das pastas conhecidas para `backups\<ts>\<app>\`; B só avisar; C "remover só o registro" | **A + C**. C só quando o registro não é o principal do grupo. Pastas conferidas só por existência: `%LOCALAPPDATA%\<Publisher>`, `%APPDATA%\<Publisher>`, `%LOCALAPPDATA%\<Nome>`, `%APPDATA%\<Nome>`, `Documents\<Nome>` |
 | D7 | Instalador falso nos testes | A `.cmd` em tempdir; B `examples/fake_installer.rs`; C `[[bin]]` de teste | **A**. Hash calculado no teste e servido pelo wiremock; `Launcher` injetado; nunca `runas` em teste automático |
 | D8 | Agreements / Dependencies | A mostrar Agreements, e "Confirmar" aceita (`--yes` exige `--accept-package-agreements`); B Dependencies ⇒ ponte com o motivo; C recusar os dois | **A + B** |
+
+### Decisões do usuário (2026-10-18)
+
+- **D1 = C (híbrido)**, como recomendado: P1–P4 primeiro, a ponte `winget install/uninstall` (P13a) cedo.
+- **D2 = A + Ajustes:** escopo `user` primeiro por padrão; `--scope user|machine` na CLI; nova opção em Ajustes (e no `config.toml`) para trocar o padrão para `machine`. "pede UAC" aparece na confirmação.
+- **D3 = B para tudo:** um auxiliar elevado por sessão, estendendo o `wingetrs bridge-worker` da Task 137 (pipe com DACL do usuário, PIDs conferidos, protocolo fechado). Cada operação nova é fechada e revisada à parte: "rodar o instalador já baixado e conferido por hash em `<raiz>\installers\…` com a linha de comando montada pelo wingetrs", "rodar o desinstalador lido do ARP HKLM revalidado", "apagar a chave HKLM já exportada e revalidada". A regra do `CLAUDE.md` para código elevado vale (sem PATH, sem tocar pastas do usuário; instalador copiado para pasta que só admin grava antes de rodar elevado, ou aberto com compartilhamento que impede troca entre a conferência e a execução — decidir no brief da P6 com sonda).
+- **D4–D7:** como recomendado.
+- **D8:** Dependencies ⇒ ponte com o motivo (B). Agreements: mostrados na confirmação; **`--yes` significa aceitar as licenças** (sem flag extra). Com `--yes` o CLI imprime uma linha com o nome e o link de cada licença aceita, e o `job.start` registra isso no log.
 
 ## (c) Design
 
