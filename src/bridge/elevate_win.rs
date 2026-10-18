@@ -577,10 +577,8 @@ impl super::worker::WorkerOps for SystemOps {
         super::arp_ops_win::arp_entries()
     }
 
-    /// Anything at `path`, links included (a dangling link still counts: nothing is orphan
-    /// unless the path is truly empty).
     fn exists(&self, path: &Path) -> bool {
-        std::fs::symlink_metadata(path).is_ok()
+        super::arp_ops_win::exists(path)
     }
 
     fn msiexec(&self) -> std::io::Result<PathBuf> {
@@ -595,8 +593,9 @@ impl super::worker::WorkerOps for SystemOps {
         &mut self,
         hive: super::worker::MachineHive,
         key: &str,
-    ) -> std::io::Result<()> {
-        super::arp_ops_win::delete_key(hive, key)
+        confirm: super::worker::DeleteCheck<'_>,
+    ) -> std::io::Result<super::worker::ArpDelete> {
+        super::arp_ops_win::delete_key(hive, key, confirm)
     }
 }
 

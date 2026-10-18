@@ -359,7 +359,7 @@ fn exe_params_allowlist() {
     }
     let bad = [
         // Unknown switches and loose positional arguments.
-        (Inno, "/VERYSILENT /TYPE=full"),
+        (Inno, "/VERYSILENT /PASSWORD=x"),
         (Inno, "/VERYSILENT setup.iss"),
         (Nullsoft, "/S /NCRC"),
         (Nullsoft, "/s"),

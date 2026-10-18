@@ -4,7 +4,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use wingetrs::bridge::worker::{
-    self, DeleteReason, MachineHive, Reply, Request, WorkerOps, msiexec_uninstall_args,
+    self, ArpDelete, DeleteCheck, DeleteReason, MachineHive, Reply, Request, WorkerOps,
+    msiexec_uninstall_args,
 };
 use wingetrs::installed::Hive;
 use wingetrs::winget_install::elevated_rules::{
@@ -115,9 +116,29 @@ impl WorkerOps for FakeOps {
         Ok(7)
     }
 
-    fn delete_arp_key(&mut self, hive: MachineHive, key: &str) -> std::io::Result<()> {
+    /// Reads the entry with the crate's own view mapping (`Hive::from`), as the real one does.
+    fn delete_arp_key(
+        &mut self,
+        hive: MachineHive,
+        key: &str,
+        confirm: DeleteCheck<'_>,
+    ) -> std::io::Result<ArpDelete> {
+        self.reads += 1;
+        let view = Hive::from(hive);
+        let Some(d) = self
+            .entries
+            .iter()
+            .find(|e| e.hive == view && e.key == key)
+            .cloned()
+        else {
+            return Ok(ArpDelete::Missing);
+        };
+        let files = self.files.clone();
+        if !confirm(&d, &|p: &Path| files.iter().any(|f| f == p)) {
+            return Ok(ArpDelete::Kept);
+        }
         self.deleted.push((hive, key.to_string()));
-        Ok(())
+        Ok(ArpDelete::Deleted)
     }
 }
 
@@ -738,4 +759,249 @@ fn live_delete_test_key() {
     assert!(bridge.shutdown(std::time::Duration::from_secs(5)));
     assert_eq!(r, Ok(()));
     assert!(read_details(Hive::MachineX86, key).unwrap().is_none());
+}
+
+/// Real descriptors read on this machine (Task 182 review), plus synthetic edge cases.
+mod acl {
+    use AclLevel::{Ancestor, File, Parent};
+    use wingetrs::winget_install::elevated_rules::{AclLevel, sddl_admin_only};
+
+    const TI: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+    fn real_root() -> String {
+        format!(
+            "O:{TI}G:{TI}D:(A;;LC;;;AU)(A;OICIIO;SDGXGWGR;;;AU)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;;0x1000a1;;;S-1-15-3-65536-1888954469-739942743-1668119174-2468466756-4239452838-1296943325-355587736-700089176)"
+        )
+    }
+
+    fn real_program_files() -> String {
+        format!(
+            "O:{TI}G:{TI}D:PAI(A;OICIIO;GA;;;CO)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;SY)(A;OICIIO;GA;;;BA)(A;;0x1301bf;;;BA)(A;OICIIO;GXGR;;;BU)(A;;0x1200a9;;;BU)(A;CIIO;GA;;;{TI})(A;;FA;;;{TI})(A;;0x1200a9;;;AC)(A;OICIIO;GXGR;;;AC)(A;;0x1200a9;;;S-1-15-2-2)(A;OICIIO;GXGR;;;S-1-15-2-2)"
+        )
+    }
+
+    const REAL_UNINSTALL_EXE: &str = "O:BAG:S-1-5-21-375664104-1787174015-2556015593-1001D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;BU)(A;ID;0x1200a9;;;AC)(A;ID;0x1200a9;;;S-1-15-2-2)";
+    const REAL_CRMLOG: &str = "O:BAG:SYD:PAI(A;OICI;0x1f01df;;;SY)(A;OICI;0x1f01df;;;BA)(A;;0x12008b;;;BU)(A;OIIO;SDGWGR;;;BU)";
+    const REAL_PROGRAMDATA: &str = "O:SYG:SYD:PAI(A;OICIIO;GA;;;CO)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)";
+
+    #[test]
+    fn real_descriptors() {
+        assert!(sddl_admin_only(&real_root(), Ancestor));
+        assert!(!sddl_admin_only(&real_root(), Parent), "AU may add folders");
+        assert!(sddl_admin_only(&real_program_files(), Parent));
+        assert!(sddl_admin_only(&real_program_files(), Ancestor));
+        assert!(sddl_admin_only(REAL_UNINSTALL_EXE, File));
+        assert!(!sddl_admin_only(REAL_CRMLOG, Parent), "BU may write");
+        assert!(sddl_admin_only(REAL_PROGRAMDATA, Ancestor));
+        assert!(
+            !sddl_admin_only(REAL_PROGRAMDATA, Parent),
+            "BU may add files"
+        );
+    }
+
+    #[test]
+    fn owner_must_be_trusted() {
+        for owner in ["SY", "BA", "S-1-5-18", "S-1-5-32-544", TI] {
+            assert!(
+                sddl_admin_only(&format!("O:{owner}D:P(A;;FA;;;SY)"), File),
+                "{owner}"
+            );
+        }
+        for owner in ["S-1-5-21-1-2-3-1001", "BU", "WD", "AU"] {
+            assert!(
+                !sddl_admin_only(&format!("O:{owner}D:P(A;;FA;;;SY)"), File),
+                "{owner}"
+            );
+        }
+    }
+
+    #[test]
+    fn rights_per_level() {
+        let one =
+            |ace: &str, level| sddl_admin_only(&format!("O:SYG:SYD:P(A;;FA;;;SY){ace}"), level);
+        // Write data / append: file and parent, not above.
+        for r in ["DC", "LC", "0x2", "0x4", "GW", "FW"] {
+            let ace = format!("(A;;{r};;;BU)");
+            assert!(!one(&ace, File), "{r}");
+            assert!(!one(&ace, Parent), "{r}");
+            assert!(one(&ace, Ancestor), "{r}");
+        }
+        // Delete child: parent and above; meaningless on a file.
+        assert!(one("(A;;DT;;;BU)", File));
+        assert!(!one("(A;;DT;;;BU)", Parent));
+        assert!(!one("(A;;0x40;;;BU)", Ancestor));
+        // Delete, re-ACL, take ownership, everything: refused at every level.
+        for r in [
+            "SD",
+            "WD",
+            "WO",
+            "GA",
+            "FA",
+            "0x10000",
+            "0x40000",
+            "0x80000",
+            "0x10000000",
+        ] {
+            let ace = format!("(A;;{r};;;S-1-5-21-1-2-3-1001)");
+            for level in [File, Parent, Ancestor] {
+                assert!(!one(&ace, level), "{r} {level:?}");
+            }
+        }
+        // Read/execute for anyone is fine.
+        for level in [File, Parent, Ancestor] {
+            assert!(one("(A;;0x1200a9;;;WD)", level));
+            assert!(one("(A;;FA;;;BA)", level));
+            assert!(one(&format!("(A;;FA;;;{TI})"), level));
+            assert!(one("(A;;FA;;;OW)", level));
+        }
+    }
+
+    #[test]
+    fn ace_forms() {
+        let one = |aces: &str| sddl_admin_only(&format!("O:SYD:{aces}"), Parent);
+        assert!(
+            one("(A;OICIIO;GA;;;BU)"),
+            "inherit-only never reaches the object"
+        );
+        assert!(!one("(A;CIOI;GA;;;BU)"), "CI+OI is not IO");
+        assert!(!one("(A;OICI;GA;;;BU)"));
+        assert!(one("(D;;FA;;;BU)"), "a deny ACE grants nothing");
+        assert!(!one("(XA;;FA;;;BU)"));
+        assert!(!one("(A;;KA;;;BU)"), "unknown right code");
+        assert!(!one("(AU;SA;FA;;;BU)"), "unknown ACE kind in a DACL");
+        assert!(!one("(A;;FA;;;BU"), "unclosed");
+        assert!(!one("(A;;FA)"), "too few fields");
+        assert!(one("P"), "an empty DACL grants nothing");
+        assert!(
+            !sddl_admin_only("O:SYD:NO_ACCESS_CONTROL", Parent),
+            "null DACL"
+        );
+        assert!(!sddl_admin_only("O:SYG:SY", Parent), "no DACL");
+        assert!(!sddl_admin_only("D:P(A;;FA;;;SY)", Parent), "no owner");
+    }
+}
+
+#[test]
+fn trailing_dot_or_space_component_refused() {
+    let k = kf();
+    for p in [
+        r"C:\W\Temp.\x.exe",
+        r"C:\W\Temp \x.exe",
+        r"C:\PF\A.\u.exe",
+        r"C:\PF\A \u.exe",
+        r"C:\PF\A\u.exe.",
+    ] {
+        assert!(!in_admin_folder(Path::new(p), &k), "{p}");
+    }
+    assert!(in_admin_folder(Path::new(r"C:\PF\A.B\u.exe"), &k));
+}
+
+#[test]
+fn arg_paths_found() {
+    use wingetrs::winget_install::elevated_rules::arg_paths;
+    assert_eq!(
+        arg_paths(r#"/S _?=C:\PF\A /log="C:\Users\me\x y.log" \\srv\s\x /p:D:/t x86:\no"#),
+        vec![
+            r"C:\PF\A".to_string(),
+            r"C:\Users\me\x y.log".to_string(),
+            r"\\srv\s\x".to_string(),
+            "D:/t".to_string(),
+        ]
+    );
+    assert!(arg_paths("/S /quiet --mode=unattended").is_empty());
+}
+
+#[test]
+fn absolute_paths_in_args_must_be_admin_folders() {
+    let run = |args: &str| {
+        let mut ops = FakeOps {
+            entries: vec![quiet(
+                Hive::MachineX64,
+                "app",
+                &format!(r#""C:\PF\A\u.exe" {args}"#),
+            )],
+            files: vec![PathBuf::from(r"C:\PF\A\u.exe")],
+            ..FakeOps::default()
+        };
+        let reply = ask(
+            &uninstall(MachineHive::Hklm64, "app", Rule::Quiet),
+            &mut ops,
+        );
+        (reply, ops.launched.len())
+    };
+    assert_eq!(run(r"/S _?=C:\PF\A"), (Reply::End { code: 7 }, 1));
+    for bad in [
+        r#"/log="C:\Users\me\x.log""#,
+        r"/config=C:\Users\me\AppData\Local\Temp\evil.xml",
+        r"\\srv\share\x.dll",
+        r"/d=C:\PF\..\Users\x",
+    ] {
+        let (reply, launched) = run(bad);
+        assert_eq!(error_text(&reply), worker::ARG_OUTSIDE_ADMIN, "{bad}");
+        assert_eq!(launched, 0, "{bad}");
+    }
+}
+
+#[test]
+fn every_interpreter_refused() {
+    for name in worker::INTERPRETERS {
+        let program = format!(r"C:\W\System32\{name}");
+        let mut ops = FakeOps {
+            entries: vec![quiet(Hive::MachineX64, "app", &format!("{program} /x"))],
+            files: vec![PathBuf::from(&program)],
+            ..FakeOps::default()
+        };
+        let reply = ask(
+            &uninstall(MachineHive::Hklm64, "app", Rule::Quiet),
+            &mut ops,
+        );
+        assert_eq!(error_text(&reply), worker::INTERPRETER, "{name}");
+        assert!(ops.launched.is_empty(), "{name}");
+    }
+    for name in [
+        "msbuild.exe",
+        "installutil.exe",
+        "regasm.exe",
+        "regsvcs.exe",
+        "cmstp.exe",
+        "odbcconf.exe",
+        "forfiles.exe",
+        "wmic.exe",
+        "msdt.exe",
+        "wsl.exe",
+        "bash.exe",
+        "explorer.exe",
+        "mshta.exe",
+        "wscript.exe",
+        "cscript.exe",
+    ] {
+        assert!(worker::INTERPRETERS.contains(&name), "{name}");
+    }
+}
+
+/// Task 182 review: Inno name-list switches of real winget manifests (Task 180 allowlist).
+#[test]
+fn inno_name_list_switches() {
+    use wingetrs::bridge::worker::{ElevatedKind::Inno, exe_params_allowed};
+    let roots = [r"C:\Program Files".to_string()];
+    for ok in [
+        "/VERYSILENT /MERGETASKS=!runcode,addcontextmenufiles",
+        "/tasks=desktopicon /COMPONENTS=main,help_files /TYPE=full /LANG=pt-BR",
+        "/SILENT /NOICONS /NORESTARTAPPLICATIONS",
+        "/RESTARTAPPLICATIONS",
+    ] {
+        assert!(exe_params_allowed(Inno, ok, &roots), "{ok}");
+    }
+    for bad in [
+        r"/TASKS=..\x",
+        "/TASKS=C:x",
+        "/TASKS=",
+        "/MERGETASKS=a/b",
+        r#"/TASKS="a,b""#,
+        "/LANG=a.b",
+        "/TYPE=a b",
+        "/TASKSX=a",
+    ] {
+        assert!(!exe_params_allowed(Inno, bad, &roots), "{bad}");
+    }
 }

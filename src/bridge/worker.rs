@@ -7,7 +7,8 @@ use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
 use crate::installed::guid::pack_guid;
 use crate::winget_install::elevated_rules::{
-    KnownFolders, elevated_duplicate, expand_known, in_admin_folder, still_orphan,
+    KnownFolders, args_in_admin_folder, elevated_duplicate, expand_known, in_admin_folder,
+    still_orphan,
 };
 use crate::winget_install::uninstall_cmd::{ArpDetails, Rule, uninstall_command, valid_arp_key};
 use serde::de::DeserializeOwned;
@@ -221,7 +222,7 @@ fn under_program_files(value: &str, program_files: &[String]) -> bool {
 const CONFIG_SWITCHES: [&str; 2] = ["loadinf", "saveinf"];
 
 /// Inno Setup switches without a value the helper passes (any case).
-const INNO_FLAGS: [&str; 9] = [
+const INNO_FLAGS: [&str; 12] = [
     "/verysilent",
     "/silent",
     "/suppressmsgboxes",
@@ -231,7 +232,27 @@ const INNO_FLAGS: [&str; 9] = [
     "/nocancel",
     "/allusers",
     "/currentuser",
+    "/noicons",
+    "/norestartapplications",
+    "/restartapplications",
 ];
+
+/// Inno Setup switches whose value is a list of names (`/MERGETASKS=!runcode,addcontextmenufiles`
+/// in VS Code's manifest); the value passes `inno_names`.
+const INNO_LIST_SWITCHES: [&str; 5] = [
+    "/tasks=",
+    "/mergetasks=",
+    "/components=",
+    "/type=",
+    "/lang=",
+];
+
+/// A non-empty Inno name list: only `[A-Za-z0-9_,!-]`, so no path, quote, space or `..`.
+fn inno_names(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b',' | b'!' | b'-'))
+}
 
 /// Burn switches without a value the helper passes (`/` or `-`, any case).
 const BURN_FLAGS: [&str; 3] = ["quiet", "passive", "norestart"];
@@ -254,7 +275,8 @@ fn plain_value(v: &str) -> bool {
 
 /// Whether `params` for an exe-type installer holds only the switches the helper allows for
 /// `kind` (an allowlist; any other token, positional ones included, is refused):
-/// - inno: `INNO_FLAGS`, `/LOG=<LOGPATH>`, `/DIR=<folder in program_files>`;
+/// - inno: `INNO_FLAGS`, `INNO_LIST_SWITCHES` with `inno_names`, `/LOG=<LOGPATH>`,
+///   `/DIR=<folder in program_files>`;
 /// - nullsoft: `/S`, and `/D=<folder in program_files>` last (the rest of the line);
 /// - burn: `BURN_FLAGS` and `/log <LOGPATH>` (`/` or `-`);
 /// - exe: `/key`, `-key`, `/key=value` or `/key:value` with `plain_value`, or a key followed by
@@ -269,6 +291,9 @@ pub fn exe_params_allowed(kind: ElevatedKind, params: &str, program_files: &[Str
         let ok = match kind {
             ElevatedKind::Inno => {
                 INNO_FLAGS.contains(&lower.as_str())
+                    || INNO_LIST_SWITCHES
+                        .iter()
+                        .any(|k| lower.starts_with(k) && inno_names(&t[k.len()..]))
                     || lower.strip_prefix("/log=").is_some() && is_log(&t[5..])
                     || lower.strip_prefix("/dir=").is_some()
                         && under_program_files(&t[5..], program_files)
@@ -503,10 +528,34 @@ pub trait WorkerOps {
     fn run_uninstaller(&mut self, _program: &Path, _args: &str) -> std::io::Result<i32> {
         Err(unsupported())
     }
-    /// Deletes the ARP key `key` and its tree with the view of `hive`, refusing a link.
-    fn delete_arp_key(&mut self, _hive: MachineHive, _key: &str) -> std::io::Result<()> {
+    /// Opens the ARP key `key` once, with the view of `hive` and as itself (a registry link is
+    /// refused), reads it through that handle and, only when `confirm` accepts what was read,
+    /// deletes its tree through the same handle.
+    fn delete_arp_key(
+        &mut self,
+        _hive: MachineHive,
+        _key: &str,
+        _confirm: DeleteCheck<'_>,
+    ) -> std::io::Result<ArpDelete> {
         Err(unsupported())
     }
+}
+
+/// Decides, from the values read through the open key and a file-existence check, whether the
+/// key may be deleted.
+pub type DeleteCheck<'a> = &'a mut dyn FnMut(&ArpDetails, &dyn Fn(&Path) -> bool) -> bool;
+
+/// An owned `DeleteCheck`.
+type OwnedCheck = Box<dyn FnMut(&ArpDetails, &dyn Fn(&Path) -> bool) -> bool>;
+
+/// What `WorkerOps::delete_arp_key` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArpDelete {
+    /// The key does not exist.
+    Missing,
+    /// `confirm` refused: nothing deleted.
+    Kept,
+    Deleted,
 }
 
 fn unsupported() -> std::io::Error {
@@ -793,8 +842,11 @@ pub const INTERPRETER: &str = "desinstalador por interpretador recusado";
 /// Answer when an `msiexec` line is not `/x{GUID}` with quiet switches only.
 pub const MSIEXEC_REFUSED: &str = "parâmetros do msiexec recusados";
 
+/// Answer when an argument names an absolute path outside the administrator folders.
+pub const ARG_OUTSIDE_ADMIN: &str = "argumento do desinstalador fora de pasta de administrador";
+
 /// Programs that run whatever their arguments name; never run elevated from an ARP line.
-const INTERPRETERS: [&str; 8] = [
+pub const INTERPRETERS: [&str; 20] = [
     "cmd.exe",
     "powershell.exe",
     "pwsh.exe",
@@ -803,6 +855,18 @@ const INTERPRETERS: [&str; 8] = [
     "wscript.exe",
     "cscript.exe",
     "mshta.exe",
+    "msbuild.exe",
+    "installutil.exe",
+    "regasm.exe",
+    "regsvcs.exe",
+    "cmstp.exe",
+    "odbcconf.exe",
+    "forfiles.exe",
+    "wmic.exe",
+    "msdt.exe",
+    "wsl.exe",
+    "bash.exe",
+    "explorer.exe",
 ];
 
 /// Switches an `msiexec /x` line may carry besides the product code.
@@ -875,7 +939,8 @@ pub fn msiexec_uninstall_args(args: &str) -> Option<String> {
 /// The program and arguments that uninstall `key`, checked as the helper requires: the rule
 /// recomputed from the key as it is now equals `rule`; `msiexec` is the system one with
 /// `/x{GUID}`; anything else is an existing absolute `.exe` in an administrator folder,
-/// expanded with the known folders only, and not a shell or script host.
+/// expanded with the known folders only, not a shell or script host, and every absolute path in
+/// its arguments is in an administrator folder too.
 fn uninstall_plan(
     ops: &mut dyn WorkerOps,
     hive: MachineHive,
@@ -907,6 +972,9 @@ fn uninstall_plan(
         .ok_or_else(|| refusal(OUTSIDE_ADMIN))?;
     if INTERPRETERS.contains(&program_file(&cmd.program).as_str()) {
         return Err(refusal(INTERPRETER));
+    }
+    if !args_in_admin_folder(&cmd.args, &k) {
+        return Err(refusal(ARG_OUTSIDE_ADMIN));
     }
     if !ops.exists(&program) {
         return Err(Reply::Error {
@@ -942,33 +1010,44 @@ fn serve_uninstaller(
     send(writer, &reply)
 }
 
-/// Whether `reason` holds for `key` now, read by the helper itself.
-fn reason_holds(
+/// Revalidates `reason` on the open key and deletes it; the refusal or failure otherwise.
+fn delete_checked(
     ops: &mut dyn WorkerOps,
     hive: MachineHive,
     key: &str,
     reason: DeleteReason,
-) -> Result<bool, Reply> {
+) -> Result<(), Reply> {
     if !valid_arp_key(key) {
         return Err(refusal(BAD_KEY));
     }
-    let d = ops
-        .read_arp(hive.into(), key)
-        .map_err(|e| failure(&e))?
-        .ok_or_else(|| refusal(KEY_GONE))?;
-    Ok(match reason {
+    let mut check: OwnedCheck = match reason {
         DeleteReason::Orphan => {
             let k = ops.known_folders().map_err(|e| failure(&e))?;
-            still_orphan(&d, &k, |p| ops.exists(p))
+            Box::new(move |d, exists| still_orphan(d, &k, exists))
         }
         DeleteReason::Duplicate => {
             let all = ops.arp_entries().map_err(|e| failure(&e))?;
-            elevated_duplicate(&d, &all)
+            Box::new(move |d, _| elevated_duplicate(d, &all))
         }
-    })
+    };
+    tracing::info!(
+        ?hive,
+        ?reason,
+        "bridge worker: deleting ARP key if it still qualifies"
+    );
+    match ops.delete_arp_key(hive, key, &mut *check) {
+        Ok(ArpDelete::Deleted) => Ok(()),
+        Ok(ArpDelete::Missing) => Err(refusal(KEY_GONE)),
+        Ok(ArpDelete::Kept) => Err(refusal(match reason {
+            DeleteReason::Orphan => "a chave deixou de ser sobra",
+            DeleteReason::Duplicate => "a chave deixou de ser duplicada",
+        })),
+        Err(e) => Err(failure(&e)),
+    }
 }
 
-/// `DeleteArpKey`: deletes the key with the same view once `reason` holds again.
+/// `DeleteArpKey`: opens the key once (see `WorkerOps::delete_arp_key`) and deletes it through
+/// the same handle once `reason` holds again for what that handle reads.
 fn serve_delete(
     writer: &mut dyn Write,
     ops: &mut dyn WorkerOps,
@@ -976,19 +1055,9 @@ fn serve_delete(
     key: &str,
     reason: DeleteReason,
 ) -> std::io::Result<()> {
-    let reply = match reason_holds(ops, hive, key, reason) {
+    let reply = match delete_checked(ops, hive, key, reason) {
+        Ok(()) => Reply::End { code: 0 },
         Err(reply) => reply,
-        Ok(false) => refusal(match reason {
-            DeleteReason::Orphan => "a chave deixou de ser sobra",
-            DeleteReason::Duplicate => "a chave deixou de ser duplicada",
-        }),
-        Ok(true) => {
-            tracing::info!(?hive, ?reason, "bridge worker: deleting ARP key");
-            match ops.delete_arp_key(hive, key) {
-                Ok(()) => Reply::End { code: 0 },
-                Err(e) => failure(&e),
-            }
-        }
     };
     if let Reply::Error { message, .. } = &reply {
         tracing::warn!(
