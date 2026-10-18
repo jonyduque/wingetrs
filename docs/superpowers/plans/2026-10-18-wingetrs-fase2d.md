@@ -1031,7 +1031,7 @@ Testes (`tests/it/wi_portable.rs`, wiremock + zip montado no teste):
 
 1. Remover pela ponte cedo: **não**; a desinstalação fica nativa (D1), na 184.
 2. UAC mostra "wingetrs": **aceito** como consequência da D3 = B (um UAC por sessão, pedido do usuário); a confirmação do wingetrs lista o que vai rodar elevado, com nome do instalador e SHA-256.
-3. MSIX em uso: **`DeploymentOptions::None`** e a mensagem `"feche <app> e tente de novo"`; nunca fechar o app à força.
+3. MSIX em uso: **como o winget** (revisão da 179): `AddPackageAsync` em uso ⇒ stage + `RegisterPackageByFullNameAsync`; registro em uso ⇒ adiado, conta como sucesso ("o app será atualizado quando for fechado"); nunca fechar o app à força.
 4. Escopo na ponte: **resolvido na Task 176** (passa `--scope machine` quando o Ajustes pede; sem instalador para máquina ⇒ uma tentativa sem `--scope`, com aviso).
 5. `upgrade --all`: continua só com apps do wingetrs (BACKLOG).
 6. `--location`: fora desta fase.
