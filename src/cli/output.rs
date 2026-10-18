@@ -529,7 +529,7 @@ pub fn repair_text(r: &crate::install::ops::RepairReport) -> String {
     };
     let h = |t: &str| paint(HEADER, t);
     format!(
-        "{}: {}\n{}: {}\n{}: {}\n{}: {}\n",
+        "{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n",
         h("Reconstruídos"),
         list(&r.rebuilt),
         h("Mantidos"),
@@ -537,7 +537,9 @@ pub fn repair_text(r: &crate::install::ops::RepairReport) -> String {
         h("Registros removidos (app sumiu do disco)"),
         list(&r.removed),
         h("Pulados (sem install.json legível)"),
-        list(&r.skipped)
+        list(&r.skipped),
+        h("Pastas apagadas (só sobras de instalação interrompida)"),
+        list(&r.cleaned)
     )
 }
 

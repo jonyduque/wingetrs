@@ -721,6 +721,40 @@ async fn repair_rebuilds_a_deleted_state_db() {
 }
 
 #[tokio::test]
+async fn repair_removes_app_folders_holding_only_leftovers_of_a_killed_install() {
+    let mut w = World::new().await;
+    w.add(app("leaf", &[])).await;
+    w.install("leaf").await;
+    let apps = w.layout.apps();
+    // Killed during `msiexec /a` (Task 140): staging, work folder, an extraction temp.
+    let dead = apps.join("dead");
+    std::fs::create_dir_all(dead.join(".staging-2.0.msiexec").join("SourceDir")).unwrap();
+    std::fs::write(
+        dead.join(".staging-2.0.msiexec")
+            .join("SourceDir")
+            .join("x"),
+        b"x",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dead.join(".staging-2.0")).unwrap();
+    std::fs::create_dir_all(dead.join(".wingetrs-extract-77-0")).unwrap();
+    // Leftovers beside anything else: not ours to judge, left as it is.
+    let mixed = apps.join("mixed");
+    std::fs::create_dir_all(mixed.join(".staging-1.0.msiexec")).unwrap();
+    std::fs::write(mixed.join("notes.txt"), b"user").unwrap();
+    // A recorded app keeps its leftovers until its next install sweeps them.
+    let kept_leftover = w.layout.app_dir("leaf").join(".staging-9.msiexec");
+    std::fs::create_dir_all(&kept_leftover).unwrap();
+    let report = repair(&w.ctx()).unwrap();
+    assert_eq!(report.cleaned, ["dead"]);
+    assert_eq!(report.skipped, ["mixed"]);
+    assert_eq!(report.kept, ["leaf"]);
+    assert!(!dead.exists());
+    assert!(mixed.join("notes.txt").exists());
+    assert!(kept_leftover.exists());
+}
+
+#[tokio::test]
 async fn repair_keeps_intact_records_and_drops_orphans() {
     let mut w = World::new().await;
     w.add(App {

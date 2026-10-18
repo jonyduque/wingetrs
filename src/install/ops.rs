@@ -167,6 +167,9 @@ pub struct RepairReport {
     pub removed: Vec<String>,
     /// App folders without a readable `current\install.json` (broken; left as they are).
     pub skipped: Vec<String>,
+    /// App folders without a record holding only what a killed install leaves (staging,
+    /// `msiexec` work, extraction temps), removed.
+    pub cleaned: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1034,10 +1037,24 @@ fn shim_targets(layout: &Layout) -> Vec<(String, String)> {
     out
 }
 
+/// Whether every entry of `dir` is a leftover of a killed install (an empty folder too).
+fn only_dead_run_leftovers(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.into_iter().all(|e| {
+            e.is_ok_and(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(executor::is_dead_run_leftover)
+            })
+        })
+    })
+}
+
 /// Rebuilds `state.db` records from disk under `install.lock`: each `apps\<app>` with a
 /// readable `current\install.json` and no record gets one, with its shims (targets under
 /// `apps\<app>\`), its PATH entries under `apps\<app>\` and, when `…\wingetrs\shims` is on
 /// the PATH, that entry. Intact records are kept; records of apps gone from disk are removed.
+/// An app folder without a record holding only leftovers of a killed install is removed.
 pub fn repair(ctx: &OpsCtx<'_>) -> Result<RepairReport, OpsError> {
     let layout = layout(ctx);
     let _lock = lock_blocking(&layout, ctx.wait)?;
@@ -1064,6 +1081,16 @@ pub fn repair(ctx: &OpsCtx<'_>) -> Result<RepairReport, OpsError> {
     for (app, dir) in &dirs {
         if state.get(app)?.is_some() {
             report.kept.push(app.clone());
+            continue;
+        }
+        if only_dead_run_leftovers(dir) {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => report.cleaned.push(app.clone()),
+                Err(e) => {
+                    tracing::warn!("{}: {e}", dir.display());
+                    report.skipped.push(app.clone());
+                }
+            }
             continue;
         }
         let install = read_json(&dir.join("current").join("install.json"));

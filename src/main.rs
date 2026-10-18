@@ -40,6 +40,10 @@ fn main() -> std::process::ExitCode {
     let cli = parse();
     match wingetrs::cli::run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
+        // Ctrl+C: `Cancelado.` is already on screen; 130 is the usual code for it.
+        Err(e) if e.is::<wingetrs::cli::install_cmd::Cancelled>() => {
+            std::process::ExitCode::from(130)
+        }
         Err(e) => {
             anstream::eprintln!(
                 "{} {e:#}",

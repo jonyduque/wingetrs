@@ -244,6 +244,9 @@ fn mapper_for(s: &ExtractSource<'_>) -> Result<Mapper, ExtractError> {
     })
 }
 
+/// Name prefix of the temp folders [`through_temp`] creates beside the destination.
+pub const TEMP_PREFIX: &str = ".wingetrs-extract-";
+
 /// Runs `fill` on a fresh sibling temp folder of `dest` and moves the result into `dest`
 /// only when it succeeds; the temp folder is removed on every path.
 fn through_temp(
@@ -253,7 +256,7 @@ fn through_temp(
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(io_at("criar pasta", parent))?;
     let tmp = parent.join(format!(
-        ".wingetrs-extract-{}-{}",
+        "{TEMP_PREFIX}{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

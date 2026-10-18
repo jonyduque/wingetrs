@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -697,17 +697,22 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             if !owned {
                 // A staging folder left by a crashed run is garbage of ours.
                 not_found_ok(remove_any(&staging)).map_err(|e| io_msg(&staging, e))?;
+                // So is what a killed run left beside it (`msiexec` work, extraction temps).
+                remove_dead_run_leftovers(&layout.app_dir(app));
                 run.ensure_dirs(&layout.app_dir(app))?;
                 run.push(Undo::RemovePath(staging.clone()));
             }
             // Phases of the `msiexec /a` fallback (waiting, each launch, importing).
             let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<Phase>();
+            // Set when the install is dropped: `msiexec` must not launch any more.
+            let cancel = Arc::new(AtomicBool::new(false));
             // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
                 let (dir, to) = (source.extract_dir.clone(), source.extract_to.clone());
                 let (msiexec, layout, app) = (ctx.msiexec, layout.clone(), app.to_string());
                 let staging = staging.clone();
+                let cancel = Arc::clone(&cancel);
                 move || -> Result<(), Refused> {
                     let e = match extract(&file, &name, dir.as_deref(), to.as_deref(), &staging) {
                         Ok(()) => return Ok(()),
@@ -734,13 +739,13 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                         // The receiver is gone only once the install stopped waiting.
                         let _ = phase_tx.send(p);
                     };
-                    extract_with_msiexec(m, &layout, &app, &source, &staging, &phase)
+                    extract_with_msiexec_until(m, &layout, &app, &source, &staging, &phase, &cancel)
                         .map_err(Refused::Failed)
                 }
             };
             tracing::info!("extraindo {}", source.file_name);
             let start = Instant::now();
-            let joined = AwaitWorker::spawn(work, staging).join();
+            let joined = AwaitWorker::spawn(work, staging, cancel).join();
             tokio::pin!(joined);
             let joined = loop {
                 tokio::select! {
@@ -932,6 +937,22 @@ pub fn extract_with_msiexec(
     staging: &Path,
     phase: &dyn Fn(Phase),
 ) -> Result<(), String> {
+    let never = AtomicBool::new(false);
+    extract_with_msiexec_until(m, layout, app, source, staging, phase, &never)
+}
+
+/// [`extract_with_msiexec`] that gives up before each launch once `cancel` is set (the
+/// install was dropped while queued); a launched `msiexec` is always awaited.
+fn extract_with_msiexec_until(
+    m: Msiexec,
+    layout: &Layout,
+    app: &str,
+    source: &extract::ExtractSource<'_>,
+    staging: &Path,
+    phase: &dyn Fn(Phase),
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let cancelled = || cancel.load(Ordering::SeqCst);
     let mut work = staging.as_os_str().to_owned();
     work.push(MSIEXEC_SUFFIX);
     let work = PathBuf::from(work);
@@ -970,8 +991,15 @@ pub fn extract_with_msiexec(
     let mut attempt = 0u32;
     let ran = msi_queue::run_queued(
         &msi_queue::POLICY,
-        &mut || (m.busy)(),
+        // A cancelled install stops waiting at once; the launch below then refuses.
+        &mut || !cancelled() && (m.busy)(),
         &mut || {
+            if cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "instalação cancelada antes de o msiexec começar",
+                ));
+            }
             attempt += 1;
             (m.launch)(&package, &target, &layout.msiexec_log(app, attempt))
         },
@@ -1031,10 +1059,16 @@ struct AwaitWorker<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
     done: DoneFlag,
     staging: PathBuf,
+    /// Set by the drop, before waiting: tells the worker to stop before launching anything.
+    cancel: Arc<AtomicBool>,
 }
 
 impl<T: Send + 'static> AwaitWorker<T> {
-    fn spawn(work: impl FnOnce() -> T + Send + 'static, staging: PathBuf) -> AwaitWorker<T> {
+    fn spawn(
+        work: impl FnOnce() -> T + Send + 'static,
+        staging: PathBuf,
+        cancel: Arc<AtomicBool>,
+    ) -> AwaitWorker<T> {
         let done: DoneFlag = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = SignalDone(Arc::clone(&done));
         let handle = tokio::task::spawn_blocking(move || {
@@ -1045,6 +1079,7 @@ impl<T: Send + 'static> AwaitWorker<T> {
             handle: Some(handle),
             done,
             staging,
+            cancel,
         }
     }
 
@@ -1064,6 +1099,7 @@ impl<T> Drop for AwaitWorker<T> {
         if self.handle.take().is_none() {
             return;
         }
+        self.cancel.store(true, Ordering::SeqCst);
         let wait = || {
             let (lock, cvar) = &*self.done;
             let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1082,6 +1118,35 @@ impl<T> Drop for AwaitWorker<T> {
         );
         if let Err(e) = not_found_ok(remove_any(&self.staging)) {
             tracing::warn!("{}: {e}", self.staging.display());
+        }
+        // The app folder the extraction step created, when nothing else is in it (a fresh
+        // install); `remove_dir` refuses a folder that is not empty.
+        if let Some(app_dir) = self.staging.parent() {
+            let _ = fs::remove_dir(app_dir);
+        }
+    }
+}
+
+/// Whether `name`, in an app folder, is what a killed install leaves behind: a staging
+/// folder (`.staging-<v>`), the `msiexec` work beside it (`.staging-<v>.msiexec`) or an
+/// extraction temp (`.wingetrs-extract-*`). Only ever touched under `install.lock`.
+pub fn is_dead_run_leftover(name: &str) -> bool {
+    name.starts_with(".staging-") || name.starts_with(extract::TEMP_PREFIX)
+}
+
+/// Removes every [`is_dead_run_leftover`] in `app_dir`, best effort: a leftover that cannot
+/// go (say, an orphaned `msiexec` of a closed console still writing) is logged, not fatal.
+fn remove_dead_run_leftovers(app_dir: &Path) {
+    let Ok(entries) = fs::read_dir(app_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_str().is_some_and(is_dead_run_leftover) {
+            let p = entry.path();
+            tracing::info!("removendo sobra de execução interrompida: {}", p.display());
+            if let Err(e) = not_found_ok(remove_any(&p)) {
+                tracing::warn!("{}: {e}", p.display());
+            }
         }
     }
 }
