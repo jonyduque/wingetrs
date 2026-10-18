@@ -14,6 +14,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use wingetrs::cache::DataDir;
+use wingetrs::cli::install_cmd::uncancellable;
 use wingetrs::http::Http;
 use wingetrs::install::executor::{
     ExecCtx, ExecError, LaunchGate, NoHook, Runners, ScriptHost, ScriptJob, StepHook,
@@ -285,6 +286,19 @@ struct World {
 }
 
 async fn world() -> World {
+    world_with(serde_json::json!({"post_install": "info 'x'"})).await
+}
+
+/// The installer runner of these tests: only reached when the gate let it launch.
+fn installer_must_not_run(
+    _exe: &Path,
+    _args: &[String],
+    _dir: &Path,
+) -> std::io::Result<(i32, Vec<String>)> {
+    panic!("the installer launched after the cancel");
+}
+
+async fn world_with(extra: serde_json::Value) -> World {
     let server = MockServer::start().await;
     let t = tempfile::tempdir().unwrap();
     let layout = Layout::new(t.path().join("root"));
@@ -296,13 +310,15 @@ async fn world() -> World {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
         .mount(&server)
         .await;
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "version": "1.0",
         "url": format!("{}/pkg.zip", server.uri()),
         "hash": sha,
-        "post_install": "info 'x'",
-    })
-    .to_string();
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        manifest[k] = v.clone();
+    }
+    let manifest = manifest.to_string();
     let shortcuts = FakeShortcuts::new(t.path().join("startmenu"));
     let root = wingetrs::install::traits::Shortcuts::root(&shortcuts);
     let plan = plan_install(&PlanInput {
@@ -359,6 +375,7 @@ impl World {
             launch: gate,
             runners: Runners {
                 scripts: Some(scripts),
+                installer: Some(installer_must_not_run),
                 ..Runners::disabled()
             },
         };
@@ -391,11 +408,12 @@ async fn workdir_removed_with_code_1() {
     assert!(w.script_dirs().is_empty(), "{:?}", w.script_dirs());
 }
 
-/// Cancels the install right before its hook step (a Ctrl+C before PowerShell starts).
+/// Cancels the install right before its hook or installer step (a Ctrl+C before the
+/// third-party code starts).
 struct CancelBeforeHook(LaunchGate);
 impl StepHook for CancelBeforeHook {
     fn before(&self, _i: usize, step: &Step) -> Result<(), ExecError> {
-        if matches!(step, Step::Hook { .. }) {
+        if matches!(step, Step::Hook { .. } | Step::RunInstaller { .. }) {
             assert!(self.0.try_cancel(), "nothing launched yet");
         }
         Ok(())
@@ -452,5 +470,100 @@ async fn cancel_after_launch_waits_for_the_hook() {
     );
     assert!(done.is_file(), "the hook ran to its end, nobody killed it");
     assert!(!gate.try_cancel(), "the launch won: the cancel was refused");
+    assert_eq!(gate.running().as_deref(), Some("script post_install"));
+    assert_eq!(
+        uncancellable(gate.running().as_deref()),
+        "um passo já começou e não pode ser interrompido (script post_install); esperando terminar"
+    );
     assert!(w.script_dirs().is_empty(), "{:?}", w.script_dirs());
+}
+
+fn gpo_all_signed(_: &Path) -> GpoValues {
+    GpoValues {
+        machine_policy: Some("AllSigned".into()),
+        ..GpoValues::default()
+    }
+}
+
+fn no_gpo(_: &Path) -> GpoValues {
+    GpoValues::default()
+}
+
+fn elevated() -> std::io::Result<bool> {
+    Ok(true)
+}
+
+fn not_elevated() -> std::io::Result<bool> {
+    Ok(false)
+}
+
+#[test]
+fn gpo_refusal_starts_nothing() {
+    let u = unit();
+    let program = fake_pwsh(u.t.path(), &u.out, 0, "");
+    let host = PwshHost::with_program_and_checks(program.clone(), gpo_all_signed, not_elevated);
+    let e = host.run(&u.job()).unwrap_err().to_string();
+    assert!(e.contains("política de grupo (GPO)"), "{e}");
+    assert!(!u.out.exists(), "the fake never ran");
+    // Same seam, nothing blocking: it runs (the refusal above is the policy's).
+    PwshHost::with_program_and_checks(program, no_gpo, not_elevated)
+        .run(&u.job())
+        .unwrap();
+    assert!(u.out.is_file());
+}
+
+#[test]
+fn elevated_refusal_starts_nothing() {
+    let u = unit();
+    let program = fake_pwsh(u.t.path(), &u.out, 0, "");
+    let host = PwshHost::with_program_and_checks(program.clone(), no_gpo, elevated);
+    let e = host.run(&u.job()).unwrap_err().to_string();
+    assert_eq!(
+        e,
+        "o wingetrs não roda scripts de manifesto com o processo elevado"
+    );
+    assert!(!u.out.exists(), "the fake never ran");
+    PwshHost::with_program_and_checks(program, no_gpo, not_elevated)
+        .run(&u.job())
+        .unwrap();
+    assert!(u.out.is_file());
+}
+
+#[test]
+fn uncancellable_names_the_step() {
+    let gate = LaunchGate::default();
+    assert_eq!(gate.running(), None);
+    assert!(gate.try_launch_for("Windows Installer"));
+    assert!(!gate.try_cancel());
+    assert_eq!(
+        uncancellable(gate.running().as_deref()),
+        "um passo já começou e não pode ser interrompido (Windows Installer); esperando terminar"
+    );
+    // A later launch in the same plan names itself.
+    assert!(gate.try_launch_for("script post_install"));
+    assert_eq!(gate.running().as_deref(), Some("script post_install"));
+    // A new plan is free again; a cancelled gate launches nothing and names nothing.
+    gate.next_plan();
+    assert_eq!(gate.running(), None);
+    assert!(gate.try_cancel());
+    assert!(!gate.try_launch_for("instalador x"));
+    assert_eq!(gate.running(), None);
+}
+
+#[tokio::test]
+async fn cancel_before_installer_runs_nothing() {
+    let w = world_with(serde_json::json!({"installer": {"file": "tool.txt"}})).await;
+    assert!(
+        w.plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::RunInstaller { .. }))
+    );
+    let out = w.t.path().join("record.txt");
+    let host = PwshHost::with_program(fake_pwsh(w.t.path(), &out, 0, ""));
+    let gate = LaunchGate::default();
+    let hook = CancelBeforeHook(gate.clone());
+    let e = w.install(host, &hook, gate).await.unwrap_err().to_string();
+    assert!(e.contains("cancelada antes de o instalador começar"), "{e}");
+    assert!(!w.layout.version_dir("app", "1.0").exists(), "rolled back");
 }

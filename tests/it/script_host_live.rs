@@ -12,14 +12,15 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 use wingetrs::cache::DataDir;
 use wingetrs::http::Http;
+use wingetrs::install::env_win::RegEnvStore;
 use wingetrs::install::executor::{ExecCtx, NoHook, Runners, ScriptHost, ScriptJob, ScriptOutcome};
 use wingetrs::install::layout::Layout;
 use wingetrs::install::manifest::{Arch, resolve};
 use wingetrs::install::planner::{PlanInput, plan_install};
 use wingetrs::install::script_host_win::PwshHost;
 use wingetrs::install::state::StateDb;
-use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
-use wingetrs::install::traits::{Effects, Shortcuts};
+use wingetrs::install::traits::fake::{FakeRegistry, FakeShortcuts, FakeTrash};
+use wingetrs::install::traits::{Effects, EnvStore, Shortcuts};
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
 use wiremock::matchers::{method, path};
@@ -76,15 +77,13 @@ fn scoop_listing() -> BTreeMap<String, Option<std::time::SystemTime>> {
     }
 }
 
-/// Every value of the real `HKCU\Environment` (read only).
-fn hkcu_environment() -> BTreeMap<String, String> {
-    let key = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey("Environment")
-        .unwrap();
-    key.enum_values()
-        .flatten()
-        .map(|(name, value)| (name, format!("{value:?}")))
-        .collect()
+/// Removes the `WINGETRS_TEST_ENV_KEY`-style key on every way out.
+struct DropTestKey(String);
+
+impl Drop for DropTestKey {
+    fn drop(&mut self) {
+        let _ = RegKey::predef(HKEY_CURRENT_USER).delete_subkey_all(&self.0);
+    }
 }
 
 #[tokio::test]
@@ -130,8 +129,13 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         seen: Mutex::new(None),
     });
     let scoop_before = scoop_listing();
-    let hkcu_before = hkcu_environment();
-    let env = FakeEnv::new();
+    // The registry store under a test key, as `WINGETRS_TEST_ENV_KEY` selects it: the real
+    // `HKCU\Environment` is never opened.
+    let test_key = DropTestKey(format!(
+        r"Software\wingetrs-test\t160-live-{}",
+        std::process::id()
+    ));
+    let env = RegEnvStore::for_test_key(&test_key.0);
     let (trash, registry) = (FakeTrash::new(), FakeRegistry::new());
     let http = Http::new().unwrap();
     let mut state = StateDb::open(&t.path().join("state").join("state.db")).unwrap();
@@ -157,8 +161,6 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
             ..Runners::disabled()
         },
     };
-    // Applying effects belongs to another task: the install may end either way; what the
-    // script did and did not touch is what is checked.
     let result = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
     let (effects, marker) = recording
         .seen
@@ -178,5 +180,16 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         version_dir.join("bin").to_str().unwrap()
     );
     assert_eq!(scoop_listing(), scoop_before, "~/scoop untouched");
-    assert_eq!(hkcu_environment(), hkcu_before, "real HKCU untouched");
+    // The effect was applied by wingetrs, to the test key only.
+    result.unwrap();
+    let path = env
+        .get("Path")
+        .unwrap()
+        .expect("PATH in the test key")
+        .value;
+    assert!(
+        path.split(';')
+            .any(|e| e.eq_ignore_ascii_case(version_dir.join("bin").to_str().unwrap())),
+        "{path}"
+    );
 }

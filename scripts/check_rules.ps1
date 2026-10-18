@@ -5,7 +5,7 @@
     Each rule exists because the defect escaped at least once and was caught only by a reviewer.
     Exit 0 = clean, 1 = violations (listed as path:line: rule).
 #>
-[CmdletBinding()] param([string]$Path = 'src', [string]$ItDir = '')
+[CmdletBinding()] param([string]$Path = 'src', [string]$ItDir = '', [string]$TestsDir = '')
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 # Any internal error must fail the gate, never pass it silently (a .Count on a one-line file once skipped checks).
@@ -82,26 +82,46 @@ foreach ($f in (Get-ChildItem -Recurse -File -Path $clockRoots -Filter *.rs)) {
 }
 # Task 160: the real PowerShell host runs third-party code. In src/ it is named only where it is
 # built and wired; in tests/ the real one (`PwshHost::locate`) only in the live file, where every
-# test carries `#[ignore = "live: ...` right below its attribute (`with_program(<fake>)` is free).
-$pwshRoots = @($Path)
-if ($Path -eq 'src' -and (Test-Path 'tests')) { $pwshRoots += 'tests' }
+# test carries `#[ignore = "live: ...` right below its attribute (`with_program(<fake>)` is free),
+# and `build_ctx(` (production wiring, real host included) only inside a live-ignored test. An
+# alias (`PwshHost as X`, `type X = PwshHost`) would hide the name from these checks: refused.
+$pwshTests = if ($TestsDir) { $TestsDir } elseif ($Path -eq 'src' -and (Test-Path 'tests')) { 'tests' } else { '' }
+$pwshFiles = @(Get-ChildItem -Recurse -File -Path $Path -Filter *.rs | ForEach-Object { @{ F = $_; Test = $false } })
+if ($pwshTests) {
+    $pwshFiles += @(Get-ChildItem -Recurse -File -Path $pwshTests -Filter *.rs | ForEach-Object { @{ F = $_; Test = $true } })
+}
 $pwshWired = '^src[\\/]install[\\/](script_host_win|prod_win)\.rs$'
-$pwshLive = '^tests[\\/]it[\\/]script_host_live\.rs$'
-foreach ($f in (Get-ChildItem -Recurse -File -Path $pwshRoots -Filter *.rs)) {
+foreach ($pf in $pwshFiles) {
+    $f = $pf.F
     $rel = [IO.Path]::GetRelativePath($root, $f.FullName)
-    $isTest = $rel -match '^tests[\\/]'
+    $isTest = $pf.Test
+    $isLive = $isTest -and ([IO.Path]::GetRelativePath((Resolve-Path $pwshTests).Path, $f.FullName) -match '^it[\\/]script_host_live\.rs$')
     $lines = @(Get-Content $f.FullName)
+    # Whether the fn being read is a test whose attributes include `#[ignore = "live:`.
+    $inTestAttrs = $false; $attrLive = $false; $fnLive = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
         if ($line -match '^\s*//') { continue }
+        if ($line -match '\bPwshHost\s+as\b|=\s*PwshHost\s*;') {
+            $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'PwshHost com apelido', $line.Trim()
+        }
         if ($isTest) {
-            if ($line -match '\bPwshHost\s*::\s*locate\b' -and $rel -notmatch $pwshLive) {
+            if ($line -match '^\s*#\[(tokio::)?test\b') { $inTestAttrs = $true; $attrLive = $false }
+            elseif ($inTestAttrs -and $line -match '^\s*#\[ignore\s*=\s*"live:') { $attrLive = $true }
+            if ($line -match '^\s*(pub(\([^)]*\))?\s+)?(async\s+)?fn\s') {
+                $fnLive = $inTestAttrs -and $attrLive
+                $inTestAttrs = $false
+            }
+            if ($line -match '\bPwshHost\s*::\s*locate\b' -and -not $isLive) {
                 $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'PwshHost real fora do teste ao vivo', $line.Trim()
+            }
+            if ($line -match '\bbuild_ctx\s*\(' -and -not $fnLive) {
+                $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'build_ctx em teste sem ignore live', $line.Trim()
             }
         } elseif ($line -match '\bPwshHost\b' -and $rel -notmatch $pwshWired) {
             $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'PwshHost fora de script_host_win/prod_win', $line.Trim()
         }
-        if ($rel -match $pwshLive -and $line -match '^\s*#\[(tokio::)?test\b') {
+        if ($isLive -and $line -match '^\s*#\[(tokio::)?test\b') {
             $j = $i + 1
             while ($j -lt $lines.Count -and $lines[$j] -match '^\s*$') { $j++ }
             if ($j -ge $lines.Count -or $lines[$j] -notmatch '^\s*#\[ignore\s*=\s*"live:') {

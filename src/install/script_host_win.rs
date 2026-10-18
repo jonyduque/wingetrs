@@ -26,17 +26,21 @@ const CHILD_ENV_REMOVE: [&str; 1] = ["PSModulePath"];
 const WINDOWS_POLICY_KEY: &str = r"SOFTWARE\Policies\Microsoft\Windows\PowerShell";
 const CORE_POLICY_KEY: &str = r"SOFTWARE\Policies\Microsoft\PowerShellCore";
 
-/// PowerShell at an absolute path, plus where its group policy is read from.
+/// PowerShell at an absolute path, plus where its group policy and the elevation of this
+/// process are read from.
 pub struct PwshHost {
     program: PathBuf,
     gpo: fn(&Path) -> GpoValues,
+    elevated: fn() -> io::Result<bool>,
 }
 
 impl PwshHost {
     /// `<ProgramFiles>\PowerShell\7\pwsh.exe` when installed, else Windows PowerShell 5.1
-    /// (`<System32>\WindowsPowerShell\v1.0\powershell.exe`). Both folders come from
-    /// `SHGetKnownFolderPath` and only an administrator writes there: nothing is searched in
-    /// `PATH`, the current folder or the App Execution Alias folder. Neither found ⇒ `run` fails.
+    /// (`<System32>\WindowsPowerShell\v1.0\powershell.exe`), both folders from
+    /// `SHGetKnownFolderPath`: nothing is searched in `PATH`, the current folder or the App
+    /// Execution Alias folder. Their DACL is not checked: the safety against a planted
+    /// executable is that `run` refuses an elevated process, so a swapped program gains no
+    /// more than the user already has. Neither found ⇒ `run` fails.
     pub fn locate() -> PwshHost {
         let pwsh7 = known(&FOLDERID_ProgramFiles)
             .ok()
@@ -54,14 +58,26 @@ impl PwshHost {
         PwshHost {
             program,
             gpo: read_gpo,
+            elevated: is_elevated,
         }
     }
 
-    /// A given program (tests: a `.cmd` fake). The policy keys are not read.
+    /// A given program (tests: a `.cmd` fake). The policy keys are not read; the elevation
+    /// is the real one.
     pub fn with_program(program: PathBuf) -> PwshHost {
+        PwshHost::with_program_and_checks(program, |_| GpoValues::default(), is_elevated)
+    }
+
+    /// Test seam: a given program, group policy and elevation.
+    pub fn with_program_and_checks(
+        program: PathBuf,
+        gpo: fn(&Path) -> GpoValues,
+        elevated: fn() -> io::Result<bool>,
+    ) -> PwshHost {
         PwshHost {
             program,
-            gpo: |_| GpoValues::default(),
+            gpo,
+            elevated,
         }
     }
 
@@ -72,7 +88,7 @@ impl PwshHost {
 
 impl ScriptHost for PwshHost {
     fn run(&self, job: &ScriptJob) -> io::Result<ScriptOutcome> {
-        refuse_if_elevated(is_elevated()?)
+        refuse_if_elevated((self.elevated)()?)
             .map_err(|m| io::Error::new(io::ErrorKind::PermissionDenied, m))?;
         if let Some(m) = gpo_blocks(&(self.gpo)(&self.program)) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, m));

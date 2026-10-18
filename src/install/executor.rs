@@ -161,24 +161,44 @@ pub struct ExecCtx<'a> {
     pub runners: Runners,
 }
 
-/// The one decision between launching `msiexec` and cancelling the install: whichever
-/// comes first wins, the other one is refused. Free at the start of each plan; once
-/// `msiexec` launched it stays launched (a 1618 relaunch included) until the next plan.
-/// Clones share the decision (the CLI keeps one, the executor and its worker others).
+/// The one decision between launching an uncancellable step (`msiexec`, a manifest hook, an
+/// installer) and cancelling the install: whichever comes first wins, the other one is
+/// refused. Free at the start of each plan; once a step launched it stays launched (a 1618
+/// relaunch included) until the next plan. Clones share the decision (the CLI keeps one, the
+/// executor and its worker others) and the name of the step that launched last.
 #[derive(Debug, Clone, Default)]
-pub struct LaunchGate(Arc<AtomicU8>);
+pub struct LaunchGate {
+    state: Arc<AtomicU8>,
+    step: Arc<Mutex<String>>,
+}
 
 const GATE_FREE: u8 = 0;
 const GATE_LAUNCHED: u8 = 1;
 const GATE_CANCELLED: u8 = 2;
 
 impl LaunchGate {
-    /// Taken by the worker right before each launch: `false` = the install was cancelled.
+    /// [`LaunchGate::try_launch_for`] of an unnamed installer.
     pub fn try_launch(&self) -> bool {
-        match self.cas(GATE_FREE, GATE_LAUNCHED) {
+        self.try_launch_for("instalador")
+    }
+
+    /// Taken by the worker right before each launch of `step` (readable, for the Ctrl+C
+    /// notice): `false` = the install was cancelled.
+    pub fn try_launch_for(&self, step: &str) -> bool {
+        let won = match self.cas(GATE_FREE, GATE_LAUNCHED) {
             Ok(_) => true,
             Err(now) => now == GATE_LAUNCHED,
+        };
+        if won {
+            *self.step.lock().unwrap_or_else(|p| p.into_inner()) = step.to_string();
         }
+        won
+    }
+
+    /// The step that launched last in this plan; `None` while nothing launched.
+    pub fn running(&self) -> Option<String> {
+        (self.state.load(Ordering::SeqCst) == GATE_LAUNCHED)
+            .then(|| self.step.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
     /// Asked on Ctrl+C (and by a dropped install): `false` = `msiexec` already launched, the
@@ -191,17 +211,17 @@ impl LaunchGate {
     }
 
     pub fn cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == GATE_CANCELLED
+        self.state.load(Ordering::SeqCst) == GATE_CANCELLED
     }
 
     /// Each plan starts free: Ctrl+C cancels again until its own `msiexec` launches. (A
     /// cancelled install is dropped at once, so no plan of it starts afterwards.)
     pub fn next_plan(&self) {
-        self.0.store(GATE_FREE, Ordering::SeqCst);
+        self.state.store(GATE_FREE, Ordering::SeqCst);
     }
 
     fn cas(&self, from: u8, to: u8) -> Result<u8, u8> {
-        self.0
+        self.state
             .compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst)
     }
 }
@@ -1117,7 +1137,7 @@ async fn run_hook(
     let launch = move || {
         // Right before PowerShell starts: a Ctrl+C until here cancels; from here it is refused
         // and the hook runs to its end (it is never killed halfway through its effects).
-        if !gate.try_launch() {
+        if !gate.try_launch_for(&format!("script {hook}")) {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "instalação cancelada antes de o script começar",
@@ -1773,7 +1793,17 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let program = installer_program(&vdir, file)?;
             let work = {
                 let (program, args, dir) = (program.clone(), args.clone(), vdir.clone());
-                move || runner(&program, &args, &dir)
+                let (gate, step) = (ctx.launch.clone(), format!("instalador {file}"));
+                move || {
+                    // Like a hook: cancelled until it starts, then it runs to its end.
+                    if !gate.try_launch_for(&step) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "instalação cancelada antes de o instalador começar",
+                        ));
+                    }
+                    runner(&program, &args, &dir)
+                }
             };
             tracing::info!("rodando o instalador {file}");
             let staging = layout.staging_dir(app, version);
@@ -1957,7 +1987,7 @@ fn extract_with_msiexec_until(
         &mut || !gate.cancelled() && (m.busy)(),
         &mut || {
             // Right before the launch: from here a Ctrl+C is refused, or this refuses.
-            if !gate.try_launch() {
+            if !gate.try_launch_for("Windows Installer") {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "instalação cancelada antes de o msiexec começar",

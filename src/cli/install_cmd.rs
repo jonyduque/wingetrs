@@ -37,8 +37,12 @@ pub trait Ui {
     fn notice(&self, _text: &str) {}
 }
 
-/// Said once when Ctrl+C arrives while the Windows Installer runs.
-pub const UNCANCELLABLE: &str = "o Windows Installer não pode ser cancelado; esperando terminar";
+/// Said once when Ctrl+C arrives while an uncancellable step runs (`LaunchGate::running`:
+/// the Windows Installer, a manifest script, an installer).
+pub fn uncancellable(step: Option<&str>) -> String {
+    let step = step.unwrap_or("instalador");
+    format!("um passo já começou e não pode ser interrompido ({step}); esperando terminar")
+}
 
 /// The user stopped the operation with Ctrl+C. `Cancelado.` was already printed and the job
 /// log says `cancelado`; `main` only sets the exit code.
@@ -519,7 +523,9 @@ pub(super) struct Stop<'a, I: Interrupts> {
 impl<I: Interrupts> Stop<'_, I> {
     /// [`until_interrupted`], telling the user through `ui` when Ctrl+C cannot stop it.
     async fn run<T>(&mut self, ui: &dyn Ui, op: impl std::future::Future<Output = T>) -> Option<T> {
-        until_interrupted(op, self.interrupts, self.gate, &|| ui.notice(UNCANCELLABLE)).await
+        let gate = self.gate;
+        let refused = || ui.notice(&uncancellable(gate.running().as_deref()));
+        until_interrupted(op, self.interrupts, gate, &refused).await
     }
 }
 
