@@ -279,11 +279,14 @@ fn msi_file_refused() {
 }
 
 #[test]
-fn ps1_still_refused_with_old_text() {
-    const OLD: &str =
-        "não suportado: usa installer (PowerShell/instalador próprio): suportado na fase 2c";
-    let e = plan_for(&exe_manifest(serde_json::json!({"file": "x.ps1"}))).unwrap_err();
-    assert_eq!(e.to_string(), OLD);
+fn ps1_plans_a_ps1_step_and_uninstaller_stays_refused() {
+    // `installer.file` `.ps1` runs through the script host since Task 158.
+    let plan = plan_for(&exe_manifest(serde_json::json!({"file": "x.ps1"}))).unwrap();
+    assert!(
+        plan.steps
+            .iter()
+            .any(|s| matches!(s, Step::RunPs1Installer { file, .. } if file == "x.ps1"))
+    );
     // `installer.script` runs through the script host since Task 156.
     assert!(plan_for(&exe_manifest(serde_json::json!({"script": "a"}))).is_ok());
     let mut m = exe_manifest(serde_json::json!({"file": "x.ps1"}));

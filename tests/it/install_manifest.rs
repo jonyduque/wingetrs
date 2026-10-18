@@ -170,7 +170,6 @@ fn support_keys_inside_architecture_variant() {
     for (k, v) in [
         ("pre_uninstall", r#""x""#),
         ("post_uninstall", r#""x""#),
-        ("installer", r#"{"file":"a.ps1"}"#),
         ("uninstaller", r#"{"file":"a.ps1"}"#),
     ] {
         let j = format!(
@@ -178,6 +177,9 @@ fn support_keys_inside_architecture_variant() {
         );
         assert!(unsup(&j), "{k}");
     }
+    // `installer.file` `.ps1` is planned since Task 158.
+    let ok_ps1 = r#"{"version":"1","architecture":{"64bit":{"url":"https://x/a.zip","hash":"aa","installer":{"file":"a.ps1"}}}}"#;
+    assert!(!unsup(ok_ps1));
     // `psmodule` and `innosetup` are read from the root only (as scoop does).
     for (k, v) in [("psmodule", r#"{"name":"X"}"#), ("innosetup", "true")] {
         let j = format!(

@@ -23,7 +23,7 @@ use crate::install::msi_queue::{self, Attempt};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimSpec, ShortcutSpec, Step, UninstallPlan,
 };
-use crate::install::prelude::{CONTRACT_VARS, PRELUDE};
+use crate::install::prelude::{CONTRACT_VARS, PRELUDE, PRELUDE_FUNCTIONS};
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::runner::{
     RunnerInput, ScriptBody, ScriptContext, ScriptOp, VarValue, runner_ps1, script_vars,
@@ -370,6 +370,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::ExtractInno { .. } => "extract_inno",
         Step::Promote => "promote",
         Step::RunInstaller { .. } => "installer",
+        Step::RunPs1Installer { .. } => "installer_ps1",
         Step::Hook { .. } => "hook",
         Step::Persist(_) => "persist",
         Step::LinkCurrent => "link",
@@ -405,7 +406,10 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
             }),
             _ => None,
         }),
-        Step::Promote | Step::RunInstaller { .. } | Step::Persist(_) => Some(Phase::Placing),
+        Step::Promote
+        | Step::RunInstaller { .. }
+        | Step::RunPs1Installer { .. }
+        | Step::Persist(_) => Some(Phase::Placing),
         Step::Hook { kind, .. } => match kind {
             HookKind::PostInstall => Some(Phase::Linking),
             _ => Some(Phase::Placing),
@@ -428,7 +432,9 @@ fn step_label(step: &Step) -> String {
         Step::Extract { index } => format!("extrair [{}]", index + 1),
         Step::ExtractInno { index } => format!("extrair [{}] (Inno Setup)", index + 1),
         Step::Promote => "promover versão".into(),
-        Step::RunInstaller { file, .. } => format!("rodar instalador {file}"),
+        Step::RunInstaller { file, .. } | Step::RunPs1Installer { file, .. } => {
+            format!("rodar instalador {file}")
+        }
         Step::Hook { kind, .. } => format!("script {}", kind.key()),
         Step::Persist(p) => format!("persistir {}", p.in_version.display()),
         Step::LinkCurrent => "apontar current".into(),
@@ -627,7 +633,10 @@ pub async fn execute_install_with(
             what: "o instalador do manifesto".into(),
         });
     }
-    let has_hooks = plan.steps.iter().any(|s| matches!(s, Step::Hook { .. }));
+    let has_hooks = plan
+        .steps
+        .iter()
+        .any(|s| matches!(s, Step::Hook { .. } | Step::RunPs1Installer { .. }));
     if has_hooks && ctx.runners.scripts.is_none() {
         return Err(ExecError::NeedsScriptConsent {
             app: plan.app.clone(),
@@ -1029,13 +1038,60 @@ fn fresh_script_dir(
     Err(format!("nenhuma pasta livre para o script {}", kind.key()))
 }
 
+/// What `run_hook` runs: a manifest script, or a `.ps1` installer file of the version folder.
+enum HookBody<'a> {
+    Script(&'a str),
+    Ps1 { file: &'a str, args: &'a [String] },
+}
+
+/// Cap of a `.ps1` installer read for scanning.
+const MAX_PS1_BYTES: u64 = 1024 * 1024;
+
+/// Reads a `.ps1` installer (bounded) and runs `script_scan` over it; a refused verdict, an
+/// oversized file or one that is not plain text (UTF-16 would blind the scanner) stops the step.
+fn scan_ps1_file(program: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let name = program
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let f = fs::File::open(program).map_err(|e| io_msg(program, e))?;
+    let mut bytes = Vec::new();
+    f.take(MAX_PS1_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_msg(program, e))?;
+    if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_PS1_BYTES) {
+        return Err(format!("instalador {name} passa de 1 MiB: não analisado"));
+    }
+    if bytes.contains(&0) {
+        return Err(format!(
+            "instalador {name} não é texto simples (UTF-16?): não analisado"
+        ));
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let report = script_scan::scan(&text, PRELUDE_FUNCTIONS);
+    if report.verdict == script_scan::Verdict::Refuse {
+        let reasons: Vec<String> = report
+            .flags
+            .into_iter()
+            .filter(|f| f.verdict == script_scan::Verdict::Refuse)
+            .map(|f| f.detail)
+            .collect();
+        return Err(format!(
+            "instalador {name} recusado pela análise: {}",
+            reasons.join("; ")
+        ));
+    }
+    Ok(text)
+}
+
 /// `Step::Hook`: writes the hook, the prelude, the manifest, the environment seed and the
 /// runner into a fresh folder (removed on every path out), then runs it through the host.
 async fn run_hook(
     run: &mut Run<'_>,
     ctx: &mut ExecCtx<'_>,
     kind: HookKind,
-    script: &str,
+    body: HookBody<'_>,
 ) -> Result<(), String> {
     let Some(host) = ctx.runners.scripts.clone() else {
         return Err("sem consentimento para rodar os scripts do manifesto".into());
@@ -1043,6 +1099,16 @@ async fn run_hook(
     let plan = run.plan;
     let layout = ctx.layout;
     let (app, version) = (plan.app.as_str(), plan.version.as_str());
+    // A `.ps1` installer is third-party code the manifest does not contain: located inside the
+    // version folder and scanned (size-capped read) before anything is written or run.
+    let (script, ps1_program) = match &body {
+        HookBody::Script(s) => ((*s).to_string(), None),
+        HookBody::Ps1 { file, .. } => {
+            let program = installer_program(&layout.version_dir(app, version), file)?;
+            (scan_ps1_file(&program)?, Some(program))
+        }
+    };
+    let script = script.as_str();
     let hook = kind.key();
     let manifest_json = plan
         .steps
@@ -1060,7 +1126,11 @@ async fn run_hook(
         Ok(p)
     };
     let prelude = write("prelude.ps1", PRELUDE.as_bytes())?;
-    let hook_file = write("hook.ps1", script.as_bytes())?;
+    // A `.ps1` installer runs from its own path (`$PSScriptRoot` and relative files keep working).
+    let hook_file = match &ps1_program {
+        Some(_) => PathBuf::new(),
+        None => write("hook.ps1", script.as_bytes())?,
+    };
     let manifest_path = write("manifest.json", manifest_json.as_bytes())?;
     let before = env_values(ctx.effects.env, &script_env_names(script))?;
     let seed = env_seed_json(&before);
@@ -1109,8 +1179,14 @@ async fn run_hook(
         contract: &contract,
         vars: &vars,
         prelude_path: &prelude,
-        body: ScriptBody::Hook {
-            script_path: &hook_file,
+        body: match (&body, &ps1_program) {
+            (HookBody::Ps1 { args, .. }, Some(program)) => ScriptBody::Ps1File {
+                path: program,
+                args,
+            },
+            _ => ScriptBody::Hook {
+                script_path: &hook_file,
+            },
         },
     })
     .map_err(|e| format!("erro interno: {e}"))?;
@@ -2133,7 +2209,17 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             }
             Ok(())
         }
-        Step::Hook { kind, script } => run_hook(run, ctx, *kind, script).await,
+        Step::RunPs1Installer { file, args } => {
+            // Scoop keeps .ps1 installers even without keep
+            run_hook(
+                run,
+                ctx,
+                HookKind::InstallerScript,
+                HookBody::Ps1 { file, args },
+            )
+            .await
+        }
+        Step::Hook { kind, script } => run_hook(run, ctx, *kind, HookBody::Script(script)).await,
         Step::Persist(spec) => persist(run, spec, layout),
         Step::LinkCurrent => {
             let current = layout.current(app);

@@ -46,6 +46,7 @@ fn step_order_is_the_executor_contract() {
             Step::ExtractInno { .. } => "extract_inno",
             Step::Promote => "promote",
             Step::RunInstaller { .. } => "installer",
+            Step::RunPs1Installer { .. } => "installer_ps1",
             Step::Hook { .. } => "hook",
             Step::Persist(_) => "persist",
             Step::LinkCurrent => "current",

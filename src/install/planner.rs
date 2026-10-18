@@ -207,11 +207,8 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
     if m.hooks.post_uninstall.is_some() {
         return refuse("post_uninstall");
     }
-    // A `.ps1` file needs PowerShell; a plain file runs through Task 151 and `installer.script`
-    // through the script host (Task 156).
-    if m.installer.as_ref().is_some_and(runs_ps1_file) {
-        return refuse("installer");
-    }
+    // `installer.file` (a plain file: Task 151, `.ps1`: Task 158) and `installer.script`
+    // (Task 156) run; the uninstaller waits for the removal task.
     if m.uninstaller.as_ref().is_some_and(needs_powershell) {
         return refuse("uninstaller");
     }
@@ -269,9 +266,13 @@ fn installer_step(m: &Resolved, spec: &InstallerSpec, vdir: &Path) -> Result<Ste
             "installer.file .msi não roda direto (o Scoop também não executa)".into(),
         ));
     }
+    let args = installer_args(&spec.args, vdir, &m.version)?;
+    if file.to_lowercase().ends_with(".ps1") {
+        return Ok(Step::RunPs1Installer { file, args });
+    }
     Ok(Step::RunInstaller {
         file,
-        args: installer_args(&spec.args, vdir, &m.version)?,
+        args,
         keep: spec.keep,
     })
 }

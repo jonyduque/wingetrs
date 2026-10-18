@@ -706,6 +706,22 @@ fn set_environment_variable(l: &str) -> Option<bool> {
     Some(persistent)
 }
 
+/// Gate report of an `installer.file` ending in `.ps1`: its content is not in the manifest, so
+/// the plan cannot scan it (the executor scans the real file before running it).
+pub fn ps1_installer_report(file: &str) -> ScriptReport {
+    ScriptReport {
+        commands: vec![file.to_string()],
+        variables: BTreeSet::new(),
+        flags: vec![Flag {
+            kind: FlagKind::DynamicCode,
+            verdict: Verdict::ConfirmStrong,
+            detail: "instalador .ps1: conteúdo não analisado".to_string(),
+            line: 1,
+        }],
+        verdict: Verdict::ConfirmStrong,
+    }
+}
+
 /// One report per script present in the manifest, in [`HookKind`] order.
 pub fn scan_manifest(m: &Resolved, supported: &[&str]) -> Vec<(HookKind, ScriptReport)> {
     fn script(s: Option<&InstallerSpec>) -> Option<&str> {

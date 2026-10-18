@@ -71,6 +71,12 @@ pub enum Step {
         args: Vec<String>,
         keep: bool,
     },
+    /// Runs the `.ps1` file `file` (relative to the version folder) through the script host,
+    /// with the substituted and split `args` (Task 158). Never deleted afterwards.
+    RunPs1Installer {
+        file: String,
+        args: Vec<String>,
+    },
     /// Runs a manifest hook (`pre_install`, `installer.script`, `post_install`) through the
     /// script host (Task 156).
     Hook {
@@ -306,6 +312,20 @@ impl InstallPlan {
                 );
                 format!(
                     "Rodar o instalador {} {}",
+                    program.display(),
+                    args.join(" ")
+                )
+            }
+            Step::RunPs1Installer { file, args } => {
+                // `file` came from a manifest: joined only through safepath.
+                let mut program = version_dir.clone();
+                program.extend(
+                    crate::install::safepath::safe_components(file)
+                        .into_iter()
+                        .flatten(),
+                );
+                format!(
+                    "Rodar o instalador PowerShell {} {}",
                     program.display(),
                     args.join(" ")
                 )
