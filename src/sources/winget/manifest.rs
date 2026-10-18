@@ -32,6 +32,8 @@ pub struct MergedManifest {
     pub platform: Option<Vec<String>>,
     #[serde(default, rename = "MinimumOSVersion")]
     pub minimum_os_version: Option<String>,
+    #[serde(default, rename = "UnsupportedOSArchitectures")]
+    pub unsupported_os_architectures: Option<Vec<String>>,
     #[serde(default)]
     pub install_modes: Option<Vec<String>>,
     #[serde(default)]
@@ -112,6 +114,8 @@ pub struct Installer {
     pub platform: Option<Vec<String>>,
     #[serde(default, rename = "MinimumOSVersion")]
     pub minimum_os_version: Option<String>,
+    #[serde(default, rename = "UnsupportedOSArchitectures")]
+    pub unsupported_os_architectures: Option<Vec<String>>,
     #[serde(default)]
     pub install_modes: Option<Vec<String>>,
     #[serde(default)]
@@ -294,6 +298,7 @@ pub struct EffectiveInstaller {
     pub locale: Option<String>,
     pub platform: Vec<String>,
     pub minimum_os_version: Option<String>,
+    pub unsupported_os_architectures: Vec<String>,
     pub install_modes: Vec<String>,
     pub switches: InstallerSwitches,
     pub success_codes: Vec<i64>,
@@ -366,6 +371,11 @@ impl MergedManifest {
                         .minimum_os_version
                         .clone()
                         .or(root.minimum_os_version.clone()),
+                    unsupported_os_architectures: i
+                        .unsupported_os_architectures
+                        .clone()
+                        .or(root.unsupported_os_architectures.clone())
+                        .unwrap_or_default(),
                     install_modes: i
                         .install_modes
                         .clone()

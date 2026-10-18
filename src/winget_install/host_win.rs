@@ -1,10 +1,9 @@
 //! Host architecture and OS facts (Task 173).
 use super::select::Host;
 use winreg::RegKey;
-use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
 
 const NT: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
-const INTERNATIONAL: &str = r"Control Panel\International";
 
 fn os_version() -> std::io::Result<[u32; 4]> {
     let k = RegKey::predef(HKEY_LOCAL_MACHINE)
@@ -22,13 +21,63 @@ fn os_version() -> std::io::Result<[u32; 4]> {
     ])
 }
 
-fn locale() -> std::io::Result<String> {
-    let k = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(INTERNATIONAL, KEY_READ)?;
-    let name: String = k.get_value("LocaleName")?;
-    if name.trim().is_empty() {
-        return Err(std::io::Error::other("LocaleName vazio"));
+// GetUserPreferredUILanguages (kernel32); declared here because the `windows` feature for
+// Win32_Globalization is not enabled in Cargo.toml.
+unsafe extern "system" {
+    fn GetUserPreferredUILanguages(
+        flags: u32,
+        num_languages: *mut u32,
+        buffer: *mut u16,
+        buffer_len: *mut u32,
+    ) -> i32;
+}
+
+const MUI_LANGUAGE_NAME: u32 = 0x8;
+/// Ceiling on the multi-string buffer (UTF-16 units) before allocating.
+const MAX_LANGUAGES_BUF: u32 = 16 * 1024;
+
+/// The user's preferred UI languages in order (`pt-BR`, `en-US`, ...), as winget uses them.
+fn locale() -> std::io::Result<Vec<String>> {
+    let mut count = 0u32;
+    let mut len = 0u32;
+    // SAFETY: a null buffer asks only for the required length; both out-pointers are live locals.
+    let ok = unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut count,
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    Ok(name.trim().to_string())
+    if len == 0 || len > MAX_LANGUAGES_BUF {
+        return Err(std::io::Error::other(
+            "lista de idiomas vazia ou grande demais",
+        ));
+    }
+    let mut buf = vec![0u16; len as usize];
+    // SAFETY: `buf` holds `len` UTF-16 units, the size the call itself requested.
+    let ok = unsafe {
+        GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let langs = parse_multi_string(&buf[..(len as usize).min(buf.len())]);
+    if langs.is_empty() {
+        return Err(std::io::Error::other("lista de idiomas vazia"));
+    }
+    Ok(langs)
+}
+
+/// Splits a double-NUL-terminated UTF-16 multi-string, dropping empty entries.
+fn parse_multi_string(buf: &[u16]) -> Vec<String> {
+    buf.split(|&c| c == 0)
+        .filter(|part| !part.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
 }
 
 /// Native architecture of the machine, even for an emulated process (an x64 build on ARM64
@@ -55,14 +104,14 @@ pub fn current() -> Host {
         [10, 0, 0, 0]
     });
     let locale = locale().unwrap_or_else(|e| {
-        tracing::warn!("locale ilegível ({e}); assumindo en-US");
-        "en-US".to_string()
+        tracing::warn!("idiomas preferidos ilegíveis ({e}); assumindo en-US");
+        vec!["en-US".to_string()]
     });
     Host {
         arch: native_arch()
             .unwrap_or_else(crate::bridge::host_arch)
             .to_string(),
         os,
-        locale,
+        locale: locale.into(),
     }
 }

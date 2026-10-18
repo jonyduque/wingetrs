@@ -178,10 +178,28 @@ fn classic_types_are_native() {
 }
 
 #[test]
-fn platform_filter() {
+fn platform_is_not_a_filter() {
+    // winget's ManifestComparator has no Platform filter: Windows.Universal stays eligible
+    let items = [inst(
+        "x64",
+        "  Platform:
+  - Windows.Universal
+",
+    )];
+    assert_eq!(idx(&items, &host("x64"), PU), 0);
     let items = [
-        inst("x64", "  Platform:\n  - Windows.Universal\n"),
-        inst("x86", "  Platform:\n  - Windows.Desktop\n"),
+        inst(
+            "x86",
+            "  Platform:
+  - Windows.Desktop
+",
+        ),
+        inst(
+            "x64",
+            "  Platform:
+  - Windows.Universal
+",
+        ),
     ];
     assert_eq!(idx(&items, &host("x64"), PU), 1);
 }
@@ -223,20 +241,6 @@ fn min_os_equal_to_host_with_missing_zero_is_accepted() {
 }
 
 #[test]
-fn platform_refusal_and_case_insensitive_desktop() {
-    let h = host("x64");
-    let err = choose(
-        &effs("", &[inst("x64", "  Platform:\n  - Windows.Universal\n")]),
-        &h,
-        PU,
-    )
-    .unwrap_err();
-    assert!(err.0.contains("plataforma"), "{}", err.0);
-    let ok = [inst("x64", "  Platform:\n  - windows.desktop\n")];
-    assert_eq!(idx(&ok, &h, PU), 0);
-}
-
-#[test]
 fn unreadable_min_os_has_its_own_reason() {
     let bad = [inst("x64", "  MinimumOSVersion: abc\n")];
     let err = choose(&effs("", &bad), &host("x64"), PU).unwrap_err();
@@ -268,4 +272,64 @@ fn unknown_named_type_goes_to_the_bridge() {
         Verdict::Bridge(m) => assert!(m.contains("tipo foo"), "{m}"),
         v => panic!("{v:?}"),
     }
+}
+
+fn host_langs(arch: &str, langs: &[&str]) -> Host {
+    Host {
+        locale: langs
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .into(),
+        ..host(arch)
+    }
+}
+
+#[test]
+fn locale_prefers_ui_language_list() {
+    let l = |t: &str| inst("x64", &format!("  InstallerLocale: {t}\n"));
+    let items = [l("pt-BR"), l("en-US")];
+    let h = host_langs("x64", &["en-US", "pt-BR"]);
+    assert_eq!(idx(&items, &h, PU), 1);
+    // the order of the list matters: flipped, the other one wins
+    let h = host_langs("x64", &["pt-BR", "en-US"]);
+    assert_eq!(idx(&items, &h, PU), 0);
+}
+
+#[test]
+fn locale_language_only_match_ranks_below_exact() {
+    let l = |t: &str| inst("x64", &format!("  InstallerLocale: {t}\n"));
+    let h = host_langs("x64", &["pt-BR"]);
+    assert_eq!(idx(&[l("pt-PT"), l("pt-BR")], &h, PU), 1);
+    assert_eq!(idx(&[l("pt-BR"), l("pt-PT")], &h, PU), 0);
+    // a language-only match of the first preference still beats an exact match of the second
+    let h = host_langs("x64", &["pt-BR", "en-US"]);
+    assert_eq!(idx(&[l("en-US"), l("pt-PT")], &h, PU), 1);
+}
+
+#[test]
+fn unsupported_os_architecture_excluded() {
+    let h = host("arm64");
+    // the x64 installer is native-ranked second but marked unsupported on arm64
+    let items = [
+        inst("x64", "  UnsupportedOSArchitectures:\n  - arm64\n"),
+        inst("x86", ""),
+    ];
+    assert_eq!(idx(&items, &h, PU), 1);
+    // only candidate unsupported: refused with a reason
+    let err = choose(
+        &effs(
+            "",
+            &[inst("x64", "  UnsupportedOSArchitectures:\n  - arm64\n")],
+        ),
+        &h,
+        PU,
+    )
+    .unwrap_err();
+    assert!(err.0.contains("não suportada"), "{}", err.0);
+    // root-level list applies to installers without their own
+    let root = "UnsupportedOSArchitectures:\n- arm64\n";
+    assert!(choose(&effs(root, &[inst("x64", "")]), &h, PU).is_err());
+    // another host architecture is unaffected
+    assert_eq!(idx(&items, &host("x64"), PU), 0);
 }

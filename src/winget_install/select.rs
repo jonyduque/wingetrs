@@ -1,6 +1,6 @@
 //! Installer selection (Task 173): which `EffectiveInstaller` to run on this host, and
 //! whether it runs natively or through the winget bridge.
-// Filters and ordering follow winget-cli's ManifestComparator.cpp (architecture, platform,
+// Filters and ordering follow winget-cli's ManifestComparator.cpp (architecture,
 // minimum OS version, locale, scope), trimmed to what the native path needs.
 use crate::sources::winget::manifest::{EffectiveInstaller, InstallerKind};
 
@@ -11,8 +11,34 @@ pub struct Host {
     pub arch: String,
     /// Windows version: major, minor, build, revision.
     pub os: [u32; 4],
-    /// BCP-47 locale name such as `pt-BR`.
-    pub locale: String,
+    /// Preferred UI languages (BCP-47, such as `pt-BR`), most preferred first.
+    pub locale: Languages,
+}
+
+/// Ordered language preference list; `"pt-BR".into()` makes a one-item list.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Languages(Vec<String>);
+
+impl Languages {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl From<Vec<String>> for Languages {
+    fn from(v: Vec<String>) -> Self {
+        Languages(v)
+    }
+}
+
+impl From<&str> for Languages {
+    fn from(s: &str) -> Self {
+        Languages(vec![s.to_string()])
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,13 +157,20 @@ enum Cmp {
 
 /// Does `first` beat `second` on locale?
 // LocaleComparator::IsFirstBetter in ManifestComparator.cpp.
-fn locale_cmp(first: &EffectiveInstaller, second: &EffectiveInstaller, host: &str) -> Cmp {
-    let (f, s) = (
-        locale_level(&first.locale, host),
-        locale_level(&second.locale, host),
-    );
-    if f >= 1 || s >= 1 {
-        return if f > s { Cmp::Strong } else { Cmp::Negative };
+fn locale_cmp(first: &EffectiveInstaller, second: &EffectiveInstaller, host: &Languages) -> Cmp {
+    // no preference at all: nothing to compare (winget returns Negative)
+    if host.is_empty() {
+        return Cmp::Negative;
+    }
+    // the first preference either installer matches decides, so earlier languages weigh more
+    for preferred in host.as_slice() {
+        let (f, s) = (
+            locale_level(&first.locale, preferred),
+            locale_level(&second.locale, preferred),
+        );
+        if f >= 1 || s >= 1 {
+            return if f > s { Cmp::Strong } else { Cmp::Negative };
+        }
     }
     if first.locale.is_none() && second.locale.is_some() {
         Cmp::Weak
@@ -232,30 +265,39 @@ pub fn choose(
 ) -> Result<Selection, Refusal> {
     let (ScopeWanted::Prefer(pref) | ScopeWanted::Only(pref)) = wanted;
 
-    let by_arch: Vec<(usize, &EffectiveInstaller)> = installers
+    // Installers that declare the system architecture unsupported are dropped first.
+    // IsSystemArchitectureUnsupportedByInstaller, ManifestComparator.cpp.
+    let supported: Vec<(usize, &EffectiveInstaller)> = installers
         .iter()
         .enumerate()
+        .filter(|(_, i)| {
+            !i.unsupported_os_architectures
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&host.arch))
+        })
+        .collect();
+    let by_arch: Vec<(usize, &EffectiveInstaller)> = supported
+        .iter()
+        .copied()
         .filter(|(_, i)| arch_rank(&i.architecture, &host.arch).is_some())
         .collect();
     if by_arch.is_empty() {
-        return Err(Refusal(format!(
-            "nenhum instalador para esta arquitetura ({})",
-            host.arch
-        )));
+        return Err(Refusal(if supported.len() < installers.len() {
+            format!(
+                "o instalador declara esta arquitetura ({}) como não suportada",
+                host.arch
+            )
+        } else {
+            format!("nenhum instalador para esta arquitetura ({})", host.arch)
+        }));
     }
 
-    // Platform and minimum OS version; remember why installers were turned away.
+    // Minimum OS version; remember why installers were turned away. No Platform filter:
+    // winget's ManifestComparator.cpp has none (Windows.Universal MSIX must stay eligible).
     let mut lowest_needed: Option<([u32; 4], String)> = None;
     let mut bad_version = false;
     let mut by_os = Vec::new();
     for (idx, i) in by_arch {
-        if !(i.platform.is_empty()
-            || i.platform
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case("Windows.Desktop")))
-        {
-            continue;
-        }
         if let Some(text) = &i.minimum_os_version {
             match parse_os(text) {
                 Some(min) if min <= host.os => {}
@@ -277,7 +319,7 @@ pub fn choose(
         return Err(Refusal(match lowest_needed {
             Some((_, text)) => format!("exige Windows {text} ou mais novo"),
             None if bad_version => "versão mínima do Windows inválida no manifesto".to_string(),
-            None => "nenhum instalador para a plataforma Windows.Desktop".to_string(),
+            None => "nenhum instalador aplicável a este Windows".to_string(),
         }));
     }
 
