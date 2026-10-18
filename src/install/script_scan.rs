@@ -330,9 +330,37 @@ const WRITE_CMDLETS: &[&str] = &[
     "out-file",
     "remove-item",
     "rename-item",
+    // Aliases and native copiers.
+    "mkdir",
+    "md",
+    "ni",
+    "cp",
+    "cpi",
+    "copy",
+    "mv",
+    "mi",
+    "move",
+    "rm",
+    "ri",
+    "rd",
+    "rmdir",
+    "del",
+    "erase",
+    "ren",
+    "rni",
+    "sc",
+    "ac",
+    "robocopy",
+    "robocopy.exe",
+    "xcopy",
+    "xcopy.exe",
 ];
+/// .NET writers, matched as text (`[IO.File]::WriteAllText`, `[System.IO.File]::WriteAllBytes`).
+const WRITE_TEXT: &[&str] = &["io.file]::write"];
 const SYSTEM_DIRS: &[&str] = &[
     "env:programfiles",
+    "env:programw6432",
+    "env:commonprogramfiles",
     "env:windir",
     "env:systemroot",
     "c:\\program files",
@@ -390,7 +418,11 @@ const D_ABSOLUTE: &str = "caminho absoluto fora da pasta do app";
 /// (compared case-insensitively); any other name of [`SCOOP_FUNCTIONS`] is refused.
 pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
     let text = strip_here_strings(&strip_comments(script));
-    let lines: Vec<String> = text.lines().map(str::to_ascii_lowercase).collect();
+    // Backticks are dropped before matching: `Run`As` and `HK`LM:` mean the same to pwsh.
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.replace('`', "").to_ascii_lowercase())
+        .collect();
     let script_lines: Vec<String> = script.lines().map(str::to_ascii_lowercase).collect();
     let commands = commands_in(script);
     let has_cmd = |names: &[&str]| -> Vec<&String> {
@@ -464,16 +496,15 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
         if any(&["runas", "-runas"]) {
             push(FlagKind::Elevation, Verdict::Refuse, D_ELEVATION, line);
         }
-        if contains(&["hklm:", "hklm\\", "hkey_local_machine"]) {
+        let hklm_dotnet = contains(&["registry]::localmachine", "registryhive]::localmachine"])
+            || (l.contains("openbasekey") && l.contains("localmachine"));
+        if contains(&["hklm:", "hklm\\", "hkey_local_machine"]) || hklm_dotnet {
             push(FlagKind::Hklm, Verdict::Refuse, D_HKLM, line);
         }
-        // `-Global:$global` forwards Scoop's own scope flag, which is `$false` for the
-        // per-user installs wingetrs does (84 lines of the 2026-10-18 catalog).
-        let passthrough_removed = l.replace("-global:$global", " ");
-        if words(&passthrough_removed).any(|w| w == "-global") {
+        if global_switch(l) {
             push(FlagKind::GlobalSwitch, Verdict::Refuse, D_GLOBAL, line);
         }
-        if any(WRITE_CMDLETS) && contains(SYSTEM_DIRS) {
+        if (any(WRITE_CMDLETS) || contains(WRITE_TEXT)) && contains(SYSTEM_DIRS) {
             push(FlagKind::SystemWrite, Verdict::Refuse, D_SYSTEM, line);
         }
         if any(&["start-process", "saps", "start"]) && any(&["msiexec", "msiexec.exe"]) {
@@ -645,6 +676,36 @@ fn is_word(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '$' | '\\' | '/')
 }
 
+/// Chars after which `#` is part of the word, not a comment (same set as the
+/// `classify_2c` lexer).
+fn continues_word(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '\\' | '/' | ':')
+}
+
+/// `-Global` or an abbreviation pwsh accepts (`-Glo`, `-Glob`, `-Globa`), except
+/// `-Global:$global` (forwards Scoop's own scope flag, `$false` for the per-user installs
+/// wingetrs does; 84 lines of the 2026-10-18 catalog). `$globalx` is another variable.
+fn global_switch(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    (0..chars.len()).any(|i| {
+        if chars[i] != '-' || i.checked_sub(1).is_some_and(|p| is_word(chars[p])) {
+            return false;
+        }
+        let end = (i + 1..chars.len())
+            .find(|&k| !is_word(chars[k]))
+            .unwrap_or(chars.len());
+        let tok: String = chars[i..end].iter().collect();
+        if !["-glo", "-glob", "-globa", "-global"].contains(&tok.as_str()) {
+            return false;
+        }
+        let rest: String = chars[end..].iter().collect();
+        let passthrough = rest
+            .strip_prefix(":$global")
+            .is_some_and(|r| r.chars().next().is_none_or(|c| !is_word(c)));
+        !passthrough
+    })
+}
+
 /// Words of a (lowercase) line, with leading/trailing dots trimmed.
 fn words(line: &str) -> impl Iterator<Item = &str> {
     line.split(|c: char| !is_word(c))
@@ -811,10 +872,8 @@ fn blank(src: &str, comments: bool, here_strings: bool) -> String {
                 }
                 i = end;
             }
-            '#' if prev.is_none_or(|p| {
-                p.is_whitespace() || matches!(p, ';' | '|' | '{' | '}' | '(' | ')')
-            }) =>
-            {
+            // As in pwsh, `#` opens a comment unless it continues a word (`a#b`).
+            '#' if prev.is_none_or(|p| !continues_word(p)) => {
                 while i < n && chars[i] != '\n' {
                     put(&mut out, chars[i], comments);
                     i += 1;

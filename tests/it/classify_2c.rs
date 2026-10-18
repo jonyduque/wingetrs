@@ -1,7 +1,9 @@
 //! Phase 2c classification of Scoop manifests (Task 142).
 use std::collections::BTreeSet;
 
-use wingetrs::install::classify_2c::{Classification, SubCase, classify, script_commands};
+use wingetrs::install::classify_2c::{
+    Classification, SubCase, classify, commands_in, script_commands,
+};
 
 fn class(raw: &str) -> Option<Classification> {
     match classify(raw) {
@@ -192,4 +194,12 @@ fn braced_variables_and_while_are_not_commands() {
     })
     .to_string();
     assert_eq!(script_commands(&raw), vec!["Out-Null", "Start-Sleep"]);
+}
+
+#[test]
+fn hash_glued_to_a_word_is_not_a_comment() {
+    // pwsh: `a#b` is one word; `=#` opens a comment, so `@'` there is no here-string.
+    assert_eq!(commands_in("Foo a#b; Baz"), vec!["Foo", "Baz"]);
+    let script = "$x =#@'\nStart-Process \"$dir\\x.exe\" -Verb RunAs\n'@'";
+    assert_eq!(commands_in(script), vec!["Start-Process"]);
 }

@@ -216,7 +216,7 @@ fn is_word_char(c: char) -> bool {
 ///   `=` (hashtable key or assignment target);
 /// - the name after `function`/`filter` is a definition (scope prefix such as `global:`
 ///   dropped); defined names are removed from the result by [`Lexer::finish`];
-/// - skipped: `#` comments to end of line, `<# #>` block comments, `'...'` strings,
+/// - skipped: `#` comments to end of line (a `#` glued to a word, as in `a#b`, is part of it), `<# #>` block comments, `'...'` strings,
 ///   here-strings `@'`/`@"` up to a line starting with `'@`/`"@`, and the character
 ///   after a backtick (line continuation);
 /// - `"..."` strings and `@" "@` here-strings are skipped except for `$( ... )`
@@ -295,6 +295,11 @@ impl Lexer {
                         i += 1;
                     }
                     i += 2;
+                }
+                // As in pwsh, `#` right after a word char continues the word (`a#b`).
+                '#' if i > 0 && is_word_char(chars[i - 1]) => {
+                    at_start = false;
+                    i += 1;
                 }
                 '#' => {
                     while i < n && chars[i] != '\n' {

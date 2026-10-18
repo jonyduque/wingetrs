@@ -392,6 +392,95 @@ fn line_numbers_follow_the_original_script() {
 }
 
 #[test]
+fn hash_after_non_word_char_is_a_comment() {
+    // `=#` opens a comment in pwsh, so `@'` is no here-string and the RunAs line runs.
+    let r = scan(
+        "$x =#@'\nStart-Process \"$dir\\x.exe\" -Verb RunAs\n'@'",
+        SUP,
+    );
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", kinds(&r));
+    assert!(has(&r, FlagKind::Elevation));
+    // Glued to a word, `#` is part of it and the rest of the line still counts.
+    let r = scan("Get-Thing a#b; iex x", SUP);
+    assert!(has(&r, FlagKind::DynamicCode), "{:?}", kinds(&r));
+}
+
+#[test]
+fn backticks_inside_words_are_ignored() {
+    let cases: &[(&str, FlagKind, Verdict)] = &[
+        (
+            r#"Start-Process "$dir\x.exe" -Verb Run`As"#,
+            FlagKind::Elevation,
+            Verdict::Refuse,
+        ),
+        (
+            r"Set-ItemProperty 'HK`LM:\SOFTWARE\X' -Name a -Value 1",
+            FlagKind::Hklm,
+            Verdict::Refuse,
+        ),
+        (
+            "Inv`oke-Expression $s",
+            FlagKind::DynamicCode,
+            Verdict::ConfirmStrong,
+        ),
+    ];
+    for (s, k, v) in cases {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, *v, "{s}: {:?}", kinds(&r));
+        assert!(has(&r, *k), "{s}: {:?}", kinds(&r));
+    }
+}
+
+#[test]
+fn global_passthrough_only_with_the_exact_variable() {
+    for s in [
+        "Get-Thing -Global:$globalx",
+        "Get-Thing -Global:$global2",
+        "Get-Thing -Glo",
+        "Get-Thing -Glob",
+        "Get-Thing -GLOBA",
+        "Get-Thing -Glob:$true",
+    ] {
+        let r = scan(s, SUP);
+        assert!(has(&r, FlagKind::GlobalSwitch), "{s}: {:?}", kinds(&r));
+    }
+    for s in [
+        "Get-Thing -Global:$global",
+        "Get-Thing -Global:$Global)",
+        "Get-Thing -Globe",
+    ] {
+        let r = scan(s, SUP);
+        assert!(!has(&r, FlagKind::GlobalSwitch), "{s}: {:?}", kinds(&r));
+    }
+}
+
+#[test]
+fn hklm_through_dotnet_refused() {
+    for s in [
+        "[Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\\X')",
+        "$k = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')",
+        "$k = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, 0)",
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}");
+        assert!(has(&r, FlagKind::Hklm), "{s}: {:?}", kinds(&r));
+    }
+}
+
+#[test]
+fn program_files_write_through_aliases_and_dotnet() {
+    for s in [
+        r#"cp "$dir\x" "$env:ProgramFiles\X""#,
+        r#"robocopy "$dir" "$env:ProgramW6432\X" /E"#,
+        r#"[IO.File]::WriteAllText("$env:CommonProgramFiles\x.txt", 'a')"#,
+        r#"mkdir "${env:CommonProgramFiles(x86)}\X""#,
+    ] {
+        let r = scan(s, SUP);
+        assert!(has(&r, FlagKind::SystemWrite), "{s}: {:?}", kinds(&r));
+    }
+}
+
+#[test]
 fn variables_lowercase_without_dollar() {
     let r = scan(r#"Copy-Item "$Dir\x" "$env:APPDATA\y" $Persist_Dir"#, SUP);
     let want: BTreeSet<String> = ["dir", "env:appdata", "persist_dir"]
