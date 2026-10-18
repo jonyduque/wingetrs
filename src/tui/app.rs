@@ -147,6 +147,8 @@ pub enum Msg {
     },
     /// The running operation launched `msiexec /a`: from now on it cannot be cancelled.
     InstallerRunning,
+    /// The running operation entered a slow step (the installer launch is `InstallerRunning`).
+    InstallPhase(crate::install::progress::Phase),
     /// The operation ended (also on failure, so the installed list is rescanned).
     InstallFinished(Result<Done, InstallFail>),
     /// `BUSY_RETRY` passed since another process held the lock: try the queue again.
@@ -250,6 +252,18 @@ pub struct RunProgress {
     pub label: String,
     pub done: u64,
     pub total: Option<u64>,
+    /// The step under way and when it started (`App::now`); `None` while downloading.
+    pub phase: Option<(crate::install::progress::Phase, Instant)>,
+}
+
+/// Progress of a step that started at `now`.
+fn phase_progress(phase: crate::install::progress::Phase, now: Instant) -> RunProgress {
+    RunProgress {
+        label: String::new(),
+        done: 0,
+        total: None,
+        phase: Some((phase, now)),
+    }
 }
 
 /// The operation in progress (an action, or the cleanup of residues).
@@ -1705,18 +1719,36 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
             if let Some(r) = &mut app.running {
-                r.progress = Some(RunProgress { label, done, total });
+                r.progress = Some(RunProgress {
+                    label,
+                    done,
+                    total,
+                    phase: None,
+                });
             }
             Vec::new()
         }
         Msg::InstallerRunning => {
             if let Some(r) = &mut app.running {
                 app.installer_running = true;
-                r.progress = Some(RunProgress {
-                    label: crate::install::executor::INSTALLER_RUNNING.to_string(),
-                    done: 0,
-                    total: None,
-                });
+                // Each launch restarts the clock; the TUI does not read the log.
+                let installer = crate::install::progress::Phase::Installer {
+                    log: std::path::PathBuf::new(),
+                };
+                r.progress = Some(phase_progress(installer, app.now));
+            }
+            Vec::new()
+        }
+        Msg::InstallPhase(phase) => {
+            if let Some(r) = &mut app.running {
+                let same = r
+                    .progress
+                    .as_ref()
+                    .and_then(|p| p.phase.as_ref())
+                    .is_some_and(|(cur, _)| *cur == phase);
+                if !same {
+                    r.progress = Some(phase_progress(phase, app.now));
+                }
             }
             Vec::new()
         }

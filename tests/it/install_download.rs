@@ -65,7 +65,7 @@ async fn fetches_two_sources_then_serves_from_cache() {
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
     let sources = [src(&server, "/a", SHA_A), src(&server, "/b", MD5_B)];
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
 
     let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
     assert_eq!(paths.len(), 2);
@@ -86,7 +86,7 @@ async fn wrong_bytes_give_hash_mismatch_and_leave_no_files() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     let err = fetch_all(&http, &data, &[src(&server, "/a", SHA_A)], &progress)
         .await
         .unwrap_err();
@@ -102,7 +102,7 @@ async fn tampered_cached_blob_is_redownloaded() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     let sources = [src(&server, "/a", SHA_A)];
     let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -126,7 +126,7 @@ async fn index_pointing_at_wrong_blob_is_not_trusted() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     // A perfectly valid blob (content matches its sha256 name) but of other bytes.
     let other = b"other";
     let other_sha = "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa"; // sha256("other")
@@ -151,7 +151,7 @@ async fn uppercase_sha256_in_manifest_lands_in_a_lowercase_blob() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     // `HashSpec::parse` lowercases, so build the spec by hand to keep the uppercase.
     let mut s = src(&server, "/a", SHA_A);
     s.hash.hex = SHA_A.to_ascii_uppercase();
@@ -178,7 +178,7 @@ async fn sha512_cached_blob_with_wrong_content_is_redownloaded() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     let sources = [src(&server, "/c", sha512_abc)];
     let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -329,7 +329,7 @@ async fn at_most_four_downloads_run_at_once() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     let paths = fetch_all(&http, &data, &sources, &progress).await.unwrap();
     assert_eq!(paths.len(), 8);
     let m = max.load(Ordering::SeqCst);
@@ -365,7 +365,7 @@ async fn fetch_each_keeps_order_and_reports_each_failure() {
     let td = tempfile::tempdir().unwrap();
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     let sources = [
         src(&server, "/ok1", &hex(b"one")),
         src(&server, "/missing", &hex(b"gone")),
@@ -435,7 +435,7 @@ async fn pruned_scenario(age_it: bool) -> usize {
     let data = DataDir::new(td.path());
     let http = Http::new().unwrap();
     let sources = [src(&server, "/a", SHA_A)];
-    let progress = |_: &str, _: u64, _: Option<u64>| {};
+    let progress = |_: &wingetrs::install::progress::ProgressEvent| {};
     let first = fetch_all(&http, &data, &sources, &progress).await.unwrap();
     if age_it {
         age_days(&first[0], 40);

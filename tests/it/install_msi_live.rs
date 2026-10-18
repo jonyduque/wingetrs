@@ -29,7 +29,7 @@ const VECTORS: [(&str, &str, &str); 3] = [
     ),
 ];
 
-fn no_progress(_: &str, _: u64, _: Option<u64>) {}
+fn no_progress(_: &wingetrs::install::progress::ProgressEvent) {}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live: msiexec"]
@@ -67,7 +67,7 @@ async fn own_extraction_matches_msiexec_admin() {
         extract::extract_all(std::slice::from_ref(&src), &own).unwrap();
         let fallback = t.path().join("msiexec").join(app);
         tokio::task::block_in_place(|| {
-            extract_with_msiexec(real, &layout, app, &src, &fallback, &|| {})
+            extract_with_msiexec(real, &layout, app, &src, &fallback, &|_| {})
         })
         .unwrap();
         let tree = |p: &std::path::Path| wingetrs::install::snapshot::snapshot(p).unwrap();

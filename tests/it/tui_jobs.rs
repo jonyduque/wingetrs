@@ -13,6 +13,7 @@ use wingetrs::core::SourceKind;
 use wingetrs::http::Http;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::ops::{OpsCtx, ResidueScan};
+use wingetrs::install::progress::{Phase, ProgressEvent};
 use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
 use wingetrs::install::traits::{Effects, EnvStore, EnvValue};
 use wingetrs::tui::app::{Action, InstallFail, Msg, Planned};
@@ -146,7 +147,7 @@ impl World {
     fn ctx<'a>(
         &'a self,
         wait: LockWait,
-        progress: &'a (dyn Fn(&str, u64, Option<u64>) + Send + Sync),
+        progress: &'a (dyn Fn(&ProgressEvent) + Send + Sync),
     ) -> OpsCtx<'a> {
         OpsCtx {
             data: &self.data,
@@ -167,7 +168,7 @@ impl World {
     }
 }
 
-fn quiet(_: &str, _: u64, _: Option<u64>) {}
+fn quiet(_: &ProgressEvent) {}
 
 #[tokio::test]
 async fn plan_install_gives_a_confirmation_for_a_scoop_package() {
@@ -196,7 +197,11 @@ async fn run_action_installs_reports_progress_and_then_removes() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let seen: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-    let record = |_: &str, done: u64, _: Option<u64>| seen.lock().unwrap().push(done);
+    let record = |ev: &ProgressEvent| {
+        if let ProgressEvent::Download { done, .. } = ev {
+            seen.lock().unwrap().push(*done);
+        }
+    };
     let ctx = w.ctx(LockWait::NoWait, &record);
     let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
     else {
@@ -1288,7 +1293,10 @@ fn bridge_winget_takes_msi_lock() {
 }
 // ---- msiexec /a fallback in the jobs (Task 129) ----
 
-use wingetrs::install::executor::{INSTALLER_RUNNING, Msiexec};
+use wingetrs::install::executor::Msiexec;
+
+/// Label the recorder gives the `msiexec /a` launch.
+const INSTALLER_RUNNING: &str = "installer";
 use wingetrs::install::msi_queue::Attempt;
 
 /// The smallest MSI the own extractor refuses: files outside the package (word count 0).
@@ -1365,7 +1373,14 @@ async fn run_action_needs_msiexec_then_runs_the_allowed_item_only() {
     let mut w = World::new().await;
     w.add_msi("m").await;
     let labels: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let record = |label: &str, _: u64, _: Option<u64>| labels.lock().unwrap().push(label.into());
+    let record = |ev: &ProgressEvent| {
+        let label = match ev {
+            ProgressEvent::Download { url, .. } => url.clone(),
+            ProgressEvent::Phase(Phase::Installer { .. }) => INSTALLER_RUNNING.to_string(),
+            ProgressEvent::Phase(p) => format!("{p:?}"),
+        };
+        labels.lock().unwrap().push(label);
+    };
     let mut ctx = w.ctx(LockWait::NoWait, &record);
     ctx.msiexec = Msiexec {
         busy: never_busy,
@@ -1510,15 +1525,31 @@ fn installer_launch_is_never_throttled() {
     let base = Instant::now();
     let t = ProgressThrottle::new(base);
     assert!(matches!(
-        jobs::progress_msg(&t, base, "a.zip", 1, Some(10)),
+        jobs::progress_msg(&t, base, &dl("a.zip", 1, Some(10))),
         Some(Msg::InstallProgress { .. })
     ));
     // Within the gap: an ordinary report is dropped, the launch goes through.
-    assert!(jobs::progress_msg(&t, base, "a.zip", 2, Some(10)).is_none());
+    assert!(jobs::progress_msg(&t, base, &dl("a.zip", 2, Some(10))).is_none());
+    let installer = ProgressEvent::Phase(Phase::Installer {
+        log: "x.log".into(),
+    });
     assert!(matches!(
-        jobs::progress_msg(&t, base, INSTALLER_RUNNING, 0, None),
+        jobs::progress_msg(&t, base, &installer),
         Some(Msg::InstallerRunning)
     ));
+    // Other phases are never throttled either.
+    assert!(matches!(
+        jobs::progress_msg(&t, base, &ProgressEvent::Phase(Phase::Placing)),
+        Some(Msg::InstallPhase(Phase::Placing))
+    ));
+}
+
+fn dl(url: &str, done: u64, total: Option<u64>) -> ProgressEvent {
+    ProgressEvent::Download {
+        url: url.into(),
+        done,
+        total,
+    }
 }
 
 fn log_line<'a>(text: &'a str, what: &str) -> &'a str {

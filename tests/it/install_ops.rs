@@ -58,7 +58,7 @@ fn fx(n: &str) -> String {
     std::fs::read_to_string(format!("tests/fixtures/scoop/manifests/{n}")).unwrap()
 }
 
-fn no_progress(_: &str, _: u64, _: Option<u64>) {}
+fn no_progress(_: &wingetrs::install::progress::ProgressEvent) {}
 fn nothing_in_use(_: &Path) -> Vec<PathBuf> {
     Vec::new()
 }

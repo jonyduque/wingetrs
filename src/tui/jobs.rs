@@ -9,6 +9,7 @@ use crate::install::executor::ExecError;
 use crate::install::msi_queue;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, OpsError, Resolution};
 use crate::install::plan::InstallPlan;
+use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
 use crate::job_log::{JobInfo, JobLog, Outcome};
@@ -80,21 +81,22 @@ impl ProgressThrottle {
     }
 }
 
-/// Message for one progress report of a running action: the `msiexec /a` launch always goes
-/// through (never throttled), the rest through `throttle`.
-pub fn progress_msg(
-    throttle: &ProgressThrottle,
-    now: Instant,
-    label: &str,
-    done: u64,
-    total: Option<u64>,
-) -> Option<Msg> {
-    if label == crate::install::executor::INSTALLER_RUNNING {
-        return Some(Msg::InstallerRunning);
+/// Message for one progress report of a running action: phases (the `msiexec /a` launch
+/// among them) always go through, download bytes through `throttle`.
+pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEvent) -> Option<Msg> {
+    match ev {
+        ProgressEvent::Download { url, done, total } => throttle
+            .admit(now, url, *done, *total)
+            .map(|(label, done, total)| Msg::InstallProgress { label, done, total }),
+        ProgressEvent::Phase(Phase::Installer { .. }) => Some(Msg::InstallerRunning),
+        ProgressEvent::Phase(
+            p @ (Phase::Preparing
+            | Phase::Extracting { .. }
+            | Phase::Placing
+            | Phase::Linking
+            | Phase::Recording),
+        ) => Some(Msg::InstallPhase(p.clone())),
     }
-    throttle
-        .admit(now, label, done, total)
-        .map(|(label, done, total)| Msg::InstallProgress { label, done, total })
 }
 
 /// Waits for a blocking job. A worker panic is handed to the main loop (never swallowed).

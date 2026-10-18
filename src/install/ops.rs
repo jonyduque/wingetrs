@@ -19,6 +19,7 @@ use crate::install::manifest::{self, Arch, ManifestError, Resolved};
 use crate::install::path_edit;
 use crate::install::plan::{InstallPlan, Step, UninstallPlan};
 use crate::install::planner::{self, InstalledInfo, PlanError, PlanInput};
+use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue, ResidueInput};
 use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb, StateError};
 use crate::install::target::{self, Candidate, TargetError};
@@ -685,6 +686,8 @@ async fn apply_with_targets(
     targets: &std::collections::HashSet<String>,
     allow: &AllowMsiexec,
 ) -> Result<(), OpsError> {
+    // A live line from the first instant: the lock wait and the cache checks are silent.
+    (ctx.progress)(&ProgressEvent::Phase(Phase::Preparing));
     let layout = layout(ctx);
     let _lock = lock_async(&layout, ctx.wait)
         .instrument(tracing::debug_span!("install.lock"))

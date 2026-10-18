@@ -2,6 +2,7 @@
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
 use super::{Command, output, style};
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
+use crate::install::progress::ProgressEvent;
 use crate::install::residue::{self, Confidence, Residue};
 use crate::install::target::Candidate;
 use crate::job_log::{JobInfo, JobLog, Outcome};
@@ -117,6 +118,9 @@ impl Ui for TtyUi {
 
 const TICK: Duration = Duration::from_millis(120);
 
+/// How often the animation looks at the end of the Windows Installer log.
+const LOG_POLL: Duration = Duration::from_secs(1);
+
 struct ProgressState {
     glyphs: &'static Glyphs,
     phases: Mutex<Phases>,
@@ -127,46 +131,99 @@ struct ProgressState {
     closed: AtomicBool,
 }
 
+/// `main` then `warn` cut to `cols` chars (the warning goes first).
+fn fit_cols(main: String, warn: String, cols: usize) -> (String, String) {
+    let n = main.chars().count();
+    if n >= cols {
+        return (main.chars().take(cols).collect(), String::new());
+    }
+    (main, warn.chars().take(cols - n).collect())
+}
+
 impl ProgressState {
-    /// Draws the current phase line, if any, on stderr.
+    fn phases(&self) -> std::sync::MutexGuard<'_, Phases> {
+        self.phases.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Draws the current phase line, if any, on stderr (with the one-time notice above it).
     fn draw(&self) {
-        let line = {
-            let phases = self.phases.lock().unwrap_or_else(|p| p.into_inner());
-            phases.line(self.frame.load(Ordering::Relaxed), self.glyphs)
+        let (parts, notice) = {
+            let mut phases = self.phases();
+            let now = std::time::Instant::now();
+            let notice = phases.take_notice_at(now);
+            (
+                phases.parts_at(self.frame.load(Ordering::Relaxed), self.glyphs, now),
+                notice,
+            )
         };
-        let Some(line) = line else { return };
+        // One column less than the terminal: a full line would wrap and break the `\r`.
+        let cols = crossterm::terminal::size()
+            .map(|(c, _)| usize::from(c))
+            .unwrap_or(output::LINE_COLUMNS + 1)
+            .saturating_sub(1)
+            .max(20);
         let mut err = std::io::stderr().lock();
         // `finish` sets `closed` before erasing under this same lock, so no late redraw.
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        let len = line.chars().count();
-        let width = len.max(self.drawn.load(Ordering::Relaxed));
         // Progress is cosmetic: a broken stderr must not fail the install.
-        let _ = write!(err, "\r{line:<width$}");
+        if let Some(notice) = notice {
+            let width = self.drawn.swap(0, Ordering::Relaxed);
+            let _ = writeln!(err, "\r{:<width$}\r{notice}", "");
+        }
+        let Some((main, warn)) = parts else {
+            let _ = err.flush();
+            return;
+        };
+        let (main, warn) = fit_cols(main, warn, cols);
+        let len = main.chars().count() + warn.chars().count();
+        let pad = " ".repeat(self.drawn.load(Ordering::Relaxed).saturating_sub(len));
+        let _ = write!(err, "\r{main}{}{pad}", style::paint(style::WARN, &warn));
         let _ = err.flush();
         self.drawn.store(len, Ordering::Relaxed);
     }
+
+    /// Looks at the end of the Windows Installer log, when that is the phase.
+    fn poll_log(&self) {
+        let Some((log, since)) = self.phases().log_to_read() else {
+            return;
+        };
+        // Read-only; std opens with read/write/delete sharing, so msiexec keeps writing.
+        let tail = std::fs::File::open(&log).and_then(|mut f| {
+            crate::install::msiexec_log::read_tail(
+                &mut f,
+                crate::install::msiexec_log::TAIL_WINDOW,
+                since,
+            )
+        });
+        if let Err(e) = &tail {
+            tracing::debug!("{}: {e}", log.display());
+        }
+        self.phases()
+            .log_read_at(&log, tail.ok(), std::time::Instant::now());
+    }
 }
 
-/// The animation thread: ticks the spinner and the installer clock until its sender drops.
+/// The animation thread: ticks the spinner and the phase clock until its sender drops.
 struct Animation {
     stop: mpsc::Sender<()>,
     handle: std::thread::JoinHandle<()>,
 }
 
-/// Phase progress line on stderr (download bar, Windows Installer, "Instalando…") with an
-/// animation thread; a no-op unless `enabled` (a TTY).
+/// Progress on stderr. On a terminal: one animated line (phase and clock, download bar,
+/// Windows Installer) redrawn by a thread. Otherwise: one plain line per phase change.
 pub struct LineProgress {
-    enabled: bool,
+    tty: bool,
     state: Arc<ProgressState>,
+    plain: Mutex<output::PhaseLog>,
     animation: Mutex<Option<Animation>>,
 }
 
 impl LineProgress {
-    pub fn new(enabled: bool, glyphs: &'static Glyphs) -> LineProgress {
+    pub fn new(tty: bool, glyphs: &'static Glyphs) -> LineProgress {
         LineProgress {
-            enabled,
+            tty,
             state: Arc::new(ProgressState {
                 glyphs,
                 phases: Mutex::new(Phases::new()),
@@ -174,19 +231,27 @@ impl LineProgress {
                 drawn: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),
             }),
+            plain: Mutex::new(output::PhaseLog::new()),
             animation: Mutex::new(None),
         }
     }
 
-    pub fn update(&self, label: &str, done: u64, total: Option<u64>) {
-        if !self.enabled || self.state.closed.load(Ordering::Relaxed) {
+    pub fn update(&self, ev: &ProgressEvent) {
+        if self.state.closed.load(Ordering::Relaxed) {
             return;
         }
-        self.state
-            .phases
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .update(label, done, total);
+        if !self.tty {
+            let line = self
+                .plain
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .line(ev);
+            if let Some(line) = line {
+                let _ = writeln!(std::io::stderr().lock(), "{line}");
+            }
+            return;
+        }
+        self.state.phases().update(ev);
         self.state.draw();
         self.start_animation();
     }
@@ -199,8 +264,13 @@ impl LineProgress {
         let (stop, rx) = mpsc::channel::<()>();
         let state = Arc::clone(&self.state);
         let handle = std::thread::spawn(move || {
+            let mut polled = std::time::Instant::now();
             // `Timeout` is a tick; a message or the sender dropping ends the thread.
             while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(TICK) {
+                if polled.elapsed() >= LOG_POLL {
+                    polled = std::time::Instant::now();
+                    state.poll_log();
+                }
                 state.frame.fetch_add(1, Ordering::Relaxed);
                 state.draw();
             }
@@ -674,7 +744,7 @@ mod tests {
         }
     }
 
-    fn no_progress(_: &str, _: u64, _: Option<u64>) {}
+    fn no_progress(_: &crate::install::progress::ProgressEvent) {}
     fn nothing_in_use(_: &std::path::Path) -> Vec<std::path::PathBuf> {
         Vec::new()
     }

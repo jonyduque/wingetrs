@@ -20,6 +20,7 @@ use crate::install::msi_queue::{self, Attempt};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimSpec, ShortcutSpec, Step, UninstallPlan,
 };
+use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
 use crate::install::{extract, link, path_edit, safepath, shim, state};
@@ -236,6 +237,30 @@ fn step_kind(step: &Step) -> &'static str {
     }
 }
 
+/// Phase entered when `step` starts; `None` keeps the current one (a download reports its
+/// own bytes, the old version is removed after the record).
+fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
+    match step {
+        Step::EnsureLauncher => Some(Phase::Preparing),
+        Step::Download { .. } | Step::RemoveOldVersion { .. } => None,
+        Step::Extract { index } => plan.steps.iter().find_map(|s| match s {
+            Step::Download { index: i, source } if i == index => Some(Phase::Extracting {
+                file: source.file_name.clone(),
+                engine: crate::install::progress::engine_of(&source.file_name),
+            }),
+            _ => None,
+        }),
+        Step::Promote | Step::Persist(_) => Some(Phase::Placing),
+        Step::LinkCurrent
+        | Step::Shim(_)
+        | Step::Shortcut(_)
+        | Step::EnvSet { .. }
+        | Step::EnvAddPath { .. }
+        | Step::EnsureShimsOnPath => Some(Phase::Linking),
+        Step::RecordState => Some(Phase::Recording),
+    }
+}
+
 fn step_label(step: &Step) -> String {
     match step {
         Step::EnsureLauncher => "lançador".into(),
@@ -267,9 +292,19 @@ struct Run<'p> {
     panic: Option<Box<dyn std::any::Any + Send>>,
     /// `(source index, reason)` of an MSI that needs `msiexec /a`, not authorized.
     needs_msiexec: Option<(usize, String)>,
+    /// Last phase reported: a step of the same phase reports nothing.
+    phase: Option<Phase>,
 }
 
 impl Run<'_> {
+    /// Reports `phase` unless it is the one already reported.
+    fn enter(&mut self, ctx: &ExecCtx<'_>, phase: Phase) {
+        if self.phase.as_ref() != Some(&phase) {
+            (ctx.progress)(&ProgressEvent::Phase(phase.clone()));
+            self.phase = Some(phase);
+        }
+    }
+
     fn push(&mut self, u: Undo) {
         self.journal.push((self.label.clone(), u));
     }
@@ -435,6 +470,7 @@ pub async fn execute_install_with(
         extract,
         panic: None,
         needs_msiexec: None,
+        phase: None,
     };
     // Removing the old version runs only after every other step succeeded.
     let (main, cleanup): (Vec<_>, Vec<_>) = plan
@@ -444,6 +480,9 @@ pub async fn execute_install_with(
         .partition(|(_, s)| !matches!(s, Step::RemoveOldVersion { .. }));
     for (i, step) in main {
         run.label = step_label(step);
+        if let Some(phase) = step_phase(step, plan) {
+            run.enter(ctx, phase);
+        }
         let result = match ctx.hook.before(i, step) {
             Ok(()) => {
                 run_step(&mut run, step, ctx)
@@ -661,8 +700,8 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 run.ensure_dirs(&layout.app_dir(app))?;
                 run.push(Undo::RemovePath(staging.clone()));
             }
-            // Each `msiexec /a` launch, reported as `INSTALLER_RUNNING` progress.
-            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            // Each `msiexec /a` launch (its log path), reported as `Phase::Installer`.
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<PathBuf>();
             // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
@@ -691,9 +730,9 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                         extract_dir: dir.as_deref(),
                         extract_to: to.as_deref(),
                     };
-                    let started = || {
+                    let started = |log: &Path| {
                         // The receiver is gone only once the install stopped waiting.
-                        let _ = started_tx.send(());
+                        let _ = started_tx.send(log.to_path_buf());
                     };
                     extract_with_msiexec(m, &layout, &app, &source, &staging, &started)
                         .map_err(Refused::Failed)
@@ -706,7 +745,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             let joined = loop {
                 tokio::select! {
                     r = &mut joined => break r,
-                    Some(()) = started_rx.recv() => (ctx.progress)(INSTALLER_RUNNING, 0, None),
+                    Some(log) = started_rx.recv() => run.enter(ctx, Phase::Installer { log }),
                 }
             };
             let result = match joined {
@@ -863,10 +902,6 @@ enum Refused {
     NeedsMsiexec(String),
 }
 
-/// Progress label sent each time `msiexec /a` is launched: from then on the job cannot be
-/// cancelled (the TUI waits for it on quit).
-pub const INSTALLER_RUNNING: &str = "Windows Installer (msiexec /a)";
-
 /// Suffix of the sibling of the staging folder where `msiexec /a` works.
 const MSIEXEC_SUFFIX: &str = ".msiexec";
 
@@ -887,14 +922,15 @@ impl Drop for RemoveWork {
 /// folders), queued behind `msi.lock` (taken after `install.lock`, never before) and the
 /// Windows Installer mutex, then its tree moved into `staging` through
 /// `extract::import_admin_tree`. Blocks until `msiexec` ends: it is never killed. `started`
-/// is called each time `msiexec` is launched.
+/// is called with the log path each time `msiexec` is launched (from then on the job cannot
+/// be cancelled).
 pub fn extract_with_msiexec(
     m: Msiexec,
     layout: &Layout,
     app: &str,
     source: &extract::ExtractSource<'_>,
     staging: &Path,
-    started: &dyn Fn(),
+    started: &dyn Fn(&Path),
 ) -> Result<(), String> {
     let mut work = staging.as_os_str().to_owned();
     work.push(MSIEXEC_SUFFIX);
@@ -915,8 +951,9 @@ pub fn extract_with_msiexec(
     let target = work.join("SourceDir");
     let mut status = |s: msi_queue::Status| {
         tracing::info!(app, status = ?s, "msiexec /a");
-        if let msi_queue::Status::Running { .. } = s {
-            started();
+        // Same numbering as the launch below: one launch per `Running`.
+        if let msi_queue::Status::Running { attempt } = s {
+            started(&layout.msiexec_log(app, u32::from(attempt)));
         }
     };
     let lock = msi_queue::lock_msi(&layout.msi_lock(), &mut status).map_err(|e| e.to_string())?;

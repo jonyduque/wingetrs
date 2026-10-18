@@ -1313,7 +1313,7 @@ fn with_ctx<R>(
     Err("instalar e remover só funciona no Windows".to_string())
 }
 
-fn no_progress(_label: &str, _done: u64, _total: Option<u64>) {}
+fn no_progress(_ev: &crate::install::progress::ProgressEvent) {}
 
 /// Runs `f` with the production `OpsCtx`; the TUI never waits for `install.lock`.
 fn with_ops<R>(
@@ -1419,8 +1419,8 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
     spawn_job(ctx, move |c, handle| {
         let tx = c.tx.clone();
         let throttle = jobs::ProgressThrottle::new(Instant::now());
-        let progress = move |label: &str, done: u64, total: Option<u64>| {
-            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), label, done, total) {
+        let progress = move |ev: &crate::install::progress::ProgressEvent| {
+            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), ev) {
                 let _ = tx.send(msg);
             }
         };

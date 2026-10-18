@@ -91,7 +91,7 @@ fn manifest_json(url: &str, sha256: &str) -> String {
     manifest_custom(url, sha256, &default_opts())
 }
 
-fn no_progress(_: &str, _: u64, _: Option<u64>) {}
+fn no_progress(_: &wingetrs::install::progress::ProgressEvent) {}
 fn nothing_in_use(_: &Path) -> Vec<PathBuf> {
     Vec::new()
 }

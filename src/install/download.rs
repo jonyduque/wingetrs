@@ -12,6 +12,7 @@ use crate::cache::DataDir;
 use crate::fs_retry;
 use crate::http::Http;
 use crate::install::manifest::{HashAlgo, HashSpec, Source};
+use crate::install::progress::ProgressEvent;
 
 fn hex_of(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -86,7 +87,8 @@ pub enum DownloadError {
     Io(String),
 }
 
-pub type Progress<'a> = &'a (dyn Fn(&str, u64, Option<u64>) + Send + Sync);
+/// Receives every [`ProgressEvent`] of an install (download bytes, phases).
+pub type Progress<'a> = &'a (dyn Fn(&ProgressEvent) + Send + Sync);
 
 const MAX_PARALLEL: usize = 4;
 
@@ -212,8 +214,14 @@ async fn download_one(
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let mut guard = TmpGuard(Some(tmp.clone()));
-    http.get_to_file(&src.url, &tmp, |d, t| progress(&src.url, d, t))
-        .await?;
+    http.get_to_file(&src.url, &tmp, |done, total| {
+        progress(&ProgressEvent::Download {
+            url: src.url.clone(),
+            done,
+            total,
+        })
+    })
+    .await?;
     let hashing = tokio::task::spawn_blocking({
         let (tmp, algo) = (tmp.clone(), src.hash.algo);
         move || hash_file(&tmp, algo)

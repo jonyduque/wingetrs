@@ -1,8 +1,12 @@
 //! Text rendering for CLI commands; colored through `style::paint` when color is on.
 use super::style::{DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, paint};
 use crate::core::{PackageDetails, PackageEntry};
+use crate::install::msiexec_log::LogTail;
+use crate::install::progress::{Phase, ProgressEvent, phase_text, phase_title};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 /// `text` painted, then padded to `width` columns counted on the plain text.
 fn pad(style: Style, text: &str, width: usize) -> String {
@@ -541,12 +545,78 @@ fn mib(n: u64) -> String {
     format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
 }
 
-/// Phase of an install as the CLI shows it on one stderr line: downloads (summed over all
-/// URLs), the Windows Installer, then "Instalando…". Pure state; the caller draws.
+/// Window of the average download speed.
+const SPEED_WINDOW: Duration = Duration::from_secs(3);
+/// Download silence after which the line says so.
+pub const STALL_AFTER: Duration = Duration::from_secs(10);
+/// Log silence of the Windows Installer after which the line warns.
+pub const INSTALLER_IDLE: Duration = Duration::from_secs(60);
+/// Windows Installer time after which [`INSTALLER_NOTICE`] is printed once.
+pub const INSTALLER_NOTICE_AFTER: Duration = Duration::from_secs(30);
+/// Fixed line printed above the animation once the Windows Installer passes 30 s.
+pub const INSTALLER_NOTICE: &str =
+    "O Windows Installer pode levar vários minutos em pacotes grandes; não feche o terminal.";
+/// Columns the progress line is made to fit (the current file is cut from the left).
+pub const LINE_COLUMNS: usize = 100;
+
+/// What the Windows Installer log said at the last look.
+struct LogWatch {
+    size: u64,
+    /// When `size` last changed (or was first seen).
+    changed_at: Instant,
+    files: u64,
+    estimated: bool,
+    last_file: Option<String>,
+}
+
+/// `18.304`: thousands separated by dots.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `text` cut from the left to `room` chars, with `…` in front when cut.
+fn fit_left(text: &str, room: usize) -> String {
+    let n = text.chars().count();
+    if n <= room {
+        return text.to_string();
+    }
+    let keep = room.saturating_sub(1);
+    let tail: String = text.chars().skip(n - keep).collect();
+    format!("…{tail}")
+}
+
+/// `~6 s` or `~3 min`.
+fn eta(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s < 60 {
+        format!("~{s} s")
+    } else {
+        format!("~{} min", s.div_ceil(60))
+    }
+}
+
+/// Phase of an install as the CLI shows it on one stderr line: the phase with its clock,
+/// the download bar (summed over all URLs) with speed and estimate, or the Windows Installer
+/// with what its log says. Pure state with an injected clock; the caller draws.
 #[derive(Default)]
 pub struct Phases {
     per_url: std::collections::BTreeMap<String, (u64, Option<u64>)>,
-    installer_since: Option<std::time::Instant>,
+    /// The phase and when it started; `None` while downloads are the latest news.
+    phase: Option<(Phase, Instant)>,
+    /// `(when, summed bytes)` of recent download reports, plus one anchor before the window.
+    samples: VecDeque<(Instant, u64)>,
+    /// When the summed bytes last grew (or the first report).
+    last_data: Option<Instant>,
+    log: Option<LogWatch>,
+    notice_shown: bool,
 }
 
 impl Phases {
@@ -554,27 +624,162 @@ impl Phases {
         Phases::default()
     }
 
-    /// One progress event: `label` is a download URL, except `INSTALLER_RUNNING`.
-    pub fn update(&mut self, label: &str, done: u64, total: Option<u64>) {
-        if label == crate::install::executor::INSTALLER_RUNNING {
-            // Each launch restarts the clock; it is never a download.
-            self.installer_since = Some(std::time::Instant::now());
-        } else {
-            self.installer_since = None;
-            self.per_url.insert(label.to_string(), (done, total));
+    /// [`Phases::update_at`] now.
+    pub fn update(&mut self, ev: &ProgressEvent) {
+        self.update_at(ev, Instant::now());
+    }
+
+    /// One progress event at `now`. The same phase again keeps its clock.
+    pub fn update_at(&mut self, ev: &ProgressEvent, now: Instant) {
+        match ev {
+            ProgressEvent::Download { url, done, total } => {
+                self.phase = None;
+                self.per_url.insert(url.clone(), (*done, *total));
+                let sum = self
+                    .per_url
+                    .values()
+                    .fold(0u64, |a, (d, _)| a.saturating_add(*d));
+                if self.samples.back().is_none_or(|(_, last)| sum > *last) {
+                    self.last_data = Some(now);
+                }
+                self.samples.push_back((now, sum));
+                while self.samples.len() >= 2 && self.samples[1].0 + SPEED_WINDOW <= now {
+                    self.samples.pop_front();
+                }
+            }
+            ProgressEvent::Phase(p) => {
+                if self.phase.as_ref().is_some_and(|(cur, _)| cur == p) {
+                    return;
+                }
+                self.phase = Some((p.clone(), now));
+                self.log = None;
+            }
         }
     }
 
-    /// The line for spinner frame `frame`, or `None` while there is nothing to show.
+    /// The Windows Installer log to look at and the size seen last time (`0` the first time),
+    /// or `None` outside that phase.
+    pub fn log_to_read(&self) -> Option<(std::path::PathBuf, u64)> {
+        match &self.phase {
+            Some((Phase::Installer { log }, _)) => {
+                Some((log.clone(), self.log.as_ref().map_or(0, |l| l.size)))
+            }
+            Some((
+                Phase::Preparing
+                | Phase::Extracting { .. }
+                | Phase::Placing
+                | Phase::Linking
+                | Phase::Recording,
+                _,
+            ))
+            | None => None,
+        }
+    }
+
+    /// A look at `log` at `now`; `None` (a read error) leaves only the phase and the clock.
+    /// Ignored when the phase moved on to another log meanwhile (a relaunch).
+    pub fn log_read_at(&mut self, log: &std::path::Path, tail: Option<LogTail>, now: Instant) {
+        if self.log_to_read().is_none_or(|(cur, _)| cur != log) {
+            return;
+        }
+        let Some(t) = tail else {
+            self.log = None;
+            return;
+        };
+        match &mut self.log {
+            Some(w) => {
+                if t.size != w.size {
+                    w.changed_at = now;
+                    w.size = t.size;
+                }
+                w.files = w.files.saturating_add(t.new_files);
+                w.estimated |= t.estimated;
+                if t.last_file.is_some() {
+                    w.last_file = t.last_file;
+                }
+            }
+            None => {
+                self.log = Some(LogWatch {
+                    size: t.size,
+                    changed_at: now,
+                    files: t.new_files,
+                    estimated: t.estimated,
+                    last_file: t.last_file,
+                });
+            }
+        }
+    }
+
+    /// [`INSTALLER_NOTICE`] the first time the Windows Installer passes 30 s, else `None`.
+    pub fn take_notice_at(&mut self, now: Instant) -> Option<&'static str> {
+        match &self.phase {
+            Some((Phase::Installer { .. }, since))
+                if !self.notice_shown
+                    && now.saturating_duration_since(*since) >= INSTALLER_NOTICE_AFTER =>
+            {
+                self.notice_shown = true;
+                Some(INSTALLER_NOTICE)
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Phases::line_at`] now.
     pub fn line(&self, frame: usize, glyphs: &crate::tui::theme::Glyphs) -> Option<String> {
+        self.line_at(frame, glyphs, Instant::now())
+    }
+
+    /// The line for spinner frame `frame` at `now`, or `None` while there is nothing to show.
+    pub fn line_at(
+        &self,
+        frame: usize,
+        glyphs: &crate::tui::theme::Glyphs,
+        now: Instant,
+    ) -> Option<String> {
+        self.parts_at(frame, glyphs, now)
+            .map(|(main, warn)| main + &warn)
+    }
+
+    /// The line split in its plain part and its warning (painted by the caller; may be empty).
+    pub fn parts_at(
+        &self,
+        frame: usize,
+        glyphs: &crate::tui::theme::Glyphs,
+        now: Instant,
+    ) -> Option<(String, String)> {
         let spin = glyphs.spinner.get(frame % glyphs.spinner.len().max(1))?;
-        if let Some(since) = self.installer_since {
-            let secs = since.elapsed().as_secs();
-            return Some(format!(
-                "{spin} Windows Installer (msiexec /a) · não pode ser cancelado · {:02}:{:02}",
-                secs / 60,
-                secs % 60
-            ));
+        if let Some((phase, since)) = &self.phase {
+            let elapsed = now.saturating_duration_since(*since);
+            let mut main = format!("{spin} {}", phase_text(phase, elapsed));
+            let mut warn = String::new();
+            match phase {
+                Phase::Installer { .. } => match &self.log {
+                    None => main.push_str(" · não pode ser cancelado"),
+                    Some(w) => {
+                        if w.files > 0 {
+                            let approx = if w.estimated { "~" } else { "" };
+                            main.push_str(&format!(" · {approx}{} arquivos", thousands(w.files)));
+                        }
+                        let idle = now.saturating_duration_since(w.changed_at);
+                        if idle >= INSTALLER_IDLE {
+                            warn = format!(
+                                " · sem atividade há {} min; o Windows Installer pode estar \
+                                 esperando outro instalador",
+                                idle.as_secs() / 60
+                            );
+                        } else if let Some(f) = &w.last_file {
+                            let room = LINE_COLUMNS.saturating_sub(main.chars().count() + 3);
+                            main.push_str(&format!(" · {}", fit_left(f, room)));
+                        }
+                    }
+                },
+                Phase::Preparing
+                | Phase::Extracting { .. }
+                | Phase::Placing
+                | Phase::Linking
+                | Phase::Recording => {}
+            }
+            return Some((main, warn));
         }
         if self.per_url.is_empty() {
             return None;
@@ -587,9 +792,10 @@ impl Phases {
             .values()
             .all(|(d, t)| t.is_some_and(|t| *d >= t));
         if finished {
-            return Some(format!("{spin} Instalando…"));
+            return Some((format!("{spin} Instalando…"), String::new()));
         }
-        Some(match known.then_some(total).filter(|t| *t > 0) {
+        let total = known.then_some(total).filter(|t| *t > 0);
+        let mut main = match total {
             Some(t) => {
                 let pct = done.min(t) * 100 / t;
                 let filled = usize::try_from(pct / 5).unwrap_or(20).min(20);
@@ -602,7 +808,62 @@ impl Phases {
                 )
             }
             None => format!("{spin} Baixando {}", mib(done)),
-        })
+        };
+        if let Some(rate) = self.speed_at(now) {
+            main.push_str(&format!(" · {}/s", mib(rate as u64)));
+            if let Some(t) = total {
+                main.push_str(&format!(" · {}", eta(t.saturating_sub(done) as f64 / rate)));
+            }
+        }
+        let mut warn = String::new();
+        if let Some(at) = self.last_data {
+            let quiet = now.saturating_duration_since(at);
+            if quiet >= STALL_AFTER {
+                warn = format!(" · sem dados há {} s", quiet.as_secs());
+            }
+        }
+        Some((main, warn))
+    }
+
+    /// Average bytes per second over the last ~3 s, or `None` without a measurable rise.
+    fn speed_at(&self, now: Instant) -> Option<f64> {
+        let (_, latest) = *self.samples.back()?;
+        let anchor = self
+            .samples
+            .iter()
+            .rev()
+            .find(|(t, _)| *t + SPEED_WINDOW <= now)
+            .or(self.samples.front())?;
+        let secs = now.saturating_duration_since(anchor.0).as_secs_f64();
+        let rate = latest.saturating_sub(anchor.1) as f64 / secs;
+        (secs >= 0.5 && rate > 0.0).then_some(rate)
+    }
+}
+
+/// Progress for a stderr that is not a terminal: one plain line per phase change (no `\r`,
+/// no color), so a redirected log shows how far the install got.
+#[derive(Default)]
+pub struct PhaseLog {
+    /// Kind of the last line: `Some(None)` = downloading.
+    last: Option<Option<Phase>>,
+}
+
+impl PhaseLog {
+    pub fn new() -> PhaseLog {
+        PhaseLog::default()
+    }
+
+    /// The line to print for `ev`, or `None` while it is still the same phase.
+    pub fn line(&mut self, ev: &ProgressEvent) -> Option<String> {
+        let (kind, text) = match ev {
+            ProgressEvent::Download { .. } => (None, "Baixando".to_string()),
+            ProgressEvent::Phase(p) => (Some(p.clone()), phase_title(p)),
+        };
+        if self.last.as_ref() == Some(&kind) {
+            return None;
+        }
+        self.last = Some(kind);
+        Some(format!("{text}…"))
     }
 }
 #[cfg(test)]

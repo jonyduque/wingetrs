@@ -2,12 +2,12 @@
 use std::path::PathBuf;
 use wingetrs::cli::output::{self, Phases};
 use wingetrs::cli::style;
-use wingetrs::install::executor::INSTALLER_RUNNING;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::manifest::{Arch, HashAlgo, HashSpec, Source};
 use wingetrs::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimKind, ShimSpec, ShortcutSpec, Step, UninstallPlan,
 };
+use wingetrs::install::progress::{Phase, ProgressEvent};
 use wingetrs::install::state::{Artifact, ArtifactKind};
 use wingetrs::tui::theme::{GlyphSet, Glyphs};
 
@@ -196,6 +196,20 @@ fn bold_numbers_when_colored() {
     assert!(!off.contains('\x1b'), "{off:?}");
 }
 
+fn dl(url: &str, done: u64, total: Option<u64>) -> ProgressEvent {
+    ProgressEvent::Download {
+        url: url.into(),
+        done,
+        total,
+    }
+}
+
+fn installer() -> ProgressEvent {
+    ProgressEvent::Phase(Phase::Installer {
+        log: "msiexec.log".into(),
+    })
+}
+
 fn line(ph: &Phases) -> String {
     ph.line(0, ascii()).unwrap()
 }
@@ -203,11 +217,15 @@ fn line(ph: &Phases) -> String {
 #[test]
 fn installer_label_is_not_a_download() {
     let mut ph = Phases::new();
-    ph.update("https://example.invalid/x.msi", 5 * MIB, Some(10 * MIB));
+    ph.update(&dl(
+        "https://example.invalid/x.msi",
+        5 * MIB,
+        Some(10 * MIB),
+    ));
     let l = line(&ph);
     assert!(l.contains("Baixando") && l.contains("50%"), "{l}");
     assert!(l.contains("5.0 / 10.0 MiB"), "{l}");
-    ph.update(INSTALLER_RUNNING, 0, None);
+    ph.update(&installer());
     let l = line(&ph);
     assert!(l.contains("Windows Installer (msiexec /a)"), "{l}");
     assert!(
@@ -221,7 +239,7 @@ fn installer_label_is_not_a_download() {
 fn cached_download_shows_no_zero_line() {
     let mut ph = Phases::new();
     assert!(ph.line(0, ascii()).is_none());
-    ph.update(INSTALLER_RUNNING, 0, None);
+    ph.update(&installer());
     let l = line(&ph);
     assert!(!l.contains("Baixando") && !l.contains("0.0 MiB"), "{l}");
 }
@@ -229,20 +247,20 @@ fn cached_download_shows_no_zero_line() {
 #[test]
 fn installing_phase_after_every_download_finished() {
     let mut ph = Phases::new();
-    ph.update("u1", 3 * MIB, Some(3 * MIB));
-    ph.update("u2", MIB, Some(2 * MIB));
+    ph.update(&dl("u1", 3 * MIB, Some(3 * MIB)));
+    ph.update(&dl("u2", MIB, Some(2 * MIB)));
     assert!(line(&ph).contains("Baixando"));
-    ph.update("u2", 2 * MIB, Some(2 * MIB));
+    ph.update(&dl("u2", 2 * MIB, Some(2 * MIB)));
     let l = line(&ph);
     assert!(l.contains("Instalando…") && !l.contains("Baixando"), "{l}");
-    ph.update("u3", 0, None);
+    ph.update(&dl("u3", 0, None));
     assert!(line(&ph).contains("Baixando 5.0 MiB"));
 }
 
 #[test]
 fn download_bar_has_twenty_columns() {
     let mut ph = Phases::new();
-    ph.update("u", 5 * MIB, Some(20 * MIB));
+    ph.update(&dl("u", 5 * MIB, Some(20 * MIB)));
     let l = line(&ph);
     assert!(l.contains("[#####---------------] 25%"), "{l}");
 }
