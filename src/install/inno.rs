@@ -99,6 +99,23 @@ pub fn count_files(dir: &Path) -> io::Result<u64> {
     Ok(n)
 }
 
+/// The first link or junction under `dir` (not followed), if any.
+pub fn find_link(dir: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            return Ok(Some(entry.path()));
+        }
+        if ty.is_dir()
+            && let Some(link) = find_link(&entry.path())?
+        {
+            return Ok(Some(link));
+        }
+    }
+    Ok(None)
+}
+
 /// Reads innounp's exit: code 0 with nothing extracted means the `-c` filter matched nothing.
 pub fn check_exit(
     code: i32,

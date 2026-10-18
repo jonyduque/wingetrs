@@ -68,7 +68,15 @@ fn args_unsafe_dir_refused() {
         Err(ExtractError::UnsafePath(_))
     ));
     // A `{name}` is accepted only as the first component, and `..` after it is refused too.
-    for bad in ["a/{tmp}", "{tmp}/../x", "{a\\b}", "{}", "{tmp}x"] {
+    for bad in [
+        "a/{tmp}",
+        "{tmp}/../x",
+        "{a\\b}",
+        "{}",
+        "{tmp}x",
+        "{a b}",
+        "{..}",
+    ] {
         assert!(
             matches!(
                 inno_args(&inst, &dest, Some(bad)),
@@ -526,4 +534,33 @@ async fn extract_to_into_the_temp_folder_is_refused() {
     assert!(m.contains("caminho inseguro"), "{m}");
     assert_eq!(INTO_TMP_CALLS.load(Ordering::SeqCst), 0);
     assert!(!w.layout.app_dir("app").exists());
+}
+
+static LINK_CALLS: AtomicUsize = AtomicUsize::new(0);
+fn writes_a_junction(_: &Path, args: &[String], _: &Path) -> io::Result<(i32, Vec<String>)> {
+    LINK_CALLS.fetch_add(1, Ordering::SeqCst);
+    let d = dest_of(args);
+    std::fs::write(d.join("a.txt"), b"a")?;
+    // Outside the install: the junction must not be imported (nor followed).
+    // `<root>\apps\app\.staging-1.0\.inno-0` -> `<root>\t147-outside`.
+    let outside = d.ancestors().nth(4).unwrap().join("t147-outside");
+    std::fs::create_dir_all(&outside)?;
+    std::fs::write(outside.join("keep.txt"), b"k")?;
+    std::fs::create_dir_all(d.join("sub"))?;
+    wingetrs::install::link::create(&outside, &d.join("sub").join("j"))?;
+    Ok((0, Vec::new()))
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn link_in_extracted_tree_is_refused() {
+    let w = setup(None).await;
+    w.put_innounp();
+    let e = w.install(writes_a_junction).await.unwrap_err();
+    let m = message(&e);
+    assert!(m.contains("caminho inseguro"), "{m}");
+    assert_eq!(LINK_CALLS.load(Ordering::SeqCst), 1);
+    assert!(!w.layout.app_dir("app").exists());
+    let outside = w.layout.apps().parent().unwrap().join("t147-outside");
+    assert!(outside.join("keep.txt").is_file());
 }

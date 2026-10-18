@@ -813,6 +813,10 @@ fn inno_extract(
     };
     let files = inno::count_files(tmp).map_err(|e| io_err(tmp, e))?;
     inno::check_exit(code, files, extract_dir, &lines)?;
+    // A link written by the installer would be moved into the app as is: refused.
+    if let Some(link) = inno::find_link(tmp).map_err(|e| io_err(tmp, e))? {
+        return Err(ExtractError::UnsafePath(link.display().to_string()));
+    }
     let mut dest = staging.to_path_buf();
     dest.extend(&to);
     if let Some(parent) = dest.parent() {
