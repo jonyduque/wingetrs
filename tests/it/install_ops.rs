@@ -73,6 +73,7 @@ struct App<'a> {
     version: &'a str,
     depends: &'a [&'a str],
     env: bool,
+    psmodule: bool,
     delay_ms: u64,
 }
 
@@ -82,6 +83,7 @@ fn app<'a>(id: &'a str, depends: &'a [&'a str]) -> App<'a> {
         version: "1.0",
         depends,
         env: false,
+        psmodule: false,
         delay_ms: 0,
     }
 }
@@ -200,6 +202,9 @@ impl World {
         });
         if a.env {
             m["env_set"] = serde_json::json!({ format!("{}_HOME", a.id.to_uppercase()): "$dir" });
+        }
+        if a.psmodule {
+            m["psmodule"] = serde_json::json!({"name": a.id});
         }
         let raw = m.to_string();
         self.put_raw(a.id, a.version, raw.clone());
@@ -627,6 +632,76 @@ async fn env_broadcast_happens_once_for_two_plans_with_env() {
         2,
         "uninstall that removed a variable broadcasts once"
     );
+}
+
+#[tokio::test]
+async fn psmodule_changes_psmodulepath_so_it_broadcasts() {
+    let mut w = World::new().await;
+    let shims = w.layout.shims().display().to_string();
+    let set = |name: &str, value: String| {
+        w.env
+            .set(
+                name,
+                &EnvValue {
+                    value,
+                    expand: false,
+                },
+            )
+            .unwrap()
+    };
+    set("Path", format!("{ORIGINAL_PATH};{shims}"));
+    set("PSModulePath", r"C:\Z".to_string());
+    w.add(App {
+        psmodule: true,
+        ..app("mod", &[])
+    })
+    .await;
+    let plans = w.plans("mod").unwrap();
+    apply(&w.ctx(), &plans).await.unwrap();
+    assert!(w.env.get_raw("PSModulePath").unwrap().ends_with(r";C:\Z"));
+    assert_eq!(w.broadcasts(), 1, "only PSModulePath changed");
+    let p = plan_uninstall(&w.ctx(), "mod", false).unwrap();
+    uninstall(&w.ctx(), &p).unwrap();
+    assert_eq!(w.env.get_raw("PSModulePath").as_deref(), Some(r"C:\Z"));
+    assert_eq!(w.broadcasts(), 2, "uninstall changed PSModulePath back");
+}
+
+#[tokio::test]
+async fn failed_psmodule_batch_leaves_psmodulepath_and_does_not_broadcast() {
+    let mut w = World::new().await;
+    let shims = w.layout.shims().display().to_string();
+    for (n, v) in [
+        ("Path", format!("{ORIGINAL_PATH};{shims}")),
+        ("PSModulePath", r"C:\Z".into()),
+    ] {
+        w.env
+            .set(
+                n,
+                &EnvValue {
+                    value: v,
+                    expand: false,
+                },
+            )
+            .unwrap();
+    }
+    w.add(App {
+        psmodule: true,
+        ..app("one", &[])
+    })
+    .await;
+    w.add(App {
+        psmodule: true,
+        ..app("two", &["one"])
+    })
+    .await;
+    // Both want module names equal to their ids; make the 2nd collide with a foreign folder.
+    std::fs::create_dir_all(w.layout.modules().join("two")).unwrap();
+    let plans = w.plans("two").unwrap();
+    apply(&w.ctx(), &plans).await.unwrap_err();
+    // The 1st plan stays applied (PartlyApplied), the 2nd rolled back: only the 1st changed it.
+    let v = w.env.get_raw("PSModulePath").unwrap();
+    assert_eq!(v, format!(r"{};C:\Z", w.layout.modules().display()));
+    assert_eq!(w.broadcasts(), 1);
 }
 
 #[tokio::test]

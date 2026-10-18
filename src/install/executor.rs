@@ -1367,7 +1367,7 @@ fn persist(run: &mut Run<'_>, spec: &PersistSpec, layout: &Layout) -> Result<(),
 }
 
 /// User variable listing PowerShell module folders.
-const PSMODULE_VAR: &str = "PSModulePath";
+pub(crate) const PSMODULE_VAR: &str = "PSModulePath";
 
 /// Scoop `lib/psmodules.ps1` `install_psmodule` + `ensure_in_psmodulepath`: junction
 /// `<modules>\<name>` -> `current`, and `<modules>` first in the user `PSModulePath`.

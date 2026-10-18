@@ -718,6 +718,7 @@ async fn apply_with_targets(
         .await?;
     let names = env_names(plans.iter().flat_map(|p| &p.steps).filter_map(|s| match s {
         Step::EnvSet { name, .. } => Some(name.clone()),
+        Step::PsModule { .. } => Some(crate::install::executor::PSMODULE_VAR.to_string()),
         _ => None,
     }));
     let env = ctx.effects.env;
@@ -827,12 +828,11 @@ pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>,
     };
     refuse_if_needed(ctx, &state, &plan.app)?;
     let app_dir = layout.app_dir(&plan.app);
-    let names = env_names(
-        plan.artifacts
-            .iter()
-            .filter(|a| a.kind == ArtifactKind::Env)
-            .map(|a| a.target.clone()),
-    );
+    let names = env_names(plan.artifacts.iter().filter_map(|a| match a.kind {
+        ArtifactKind::Env => Some(a.target.clone()),
+        ArtifactKind::PsModule => Some(crate::install::executor::PSMODULE_VAR.to_string()),
+        _ => None,
+    }));
     let env = ctx.effects.env;
     let before = env_snapshot(env, &names)?;
     let result = {
