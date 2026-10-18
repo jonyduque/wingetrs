@@ -28,6 +28,7 @@ Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira c
 - **Teste que roda programa real** (`pwsh`, `winget`, `msiexec`, `reg`, `innounp`, instalador) é `#[ignore = "live: ..."]`, mesmo com script sintético, mesmo que o brief esqueça de marcar (Task 155: `end_to_end_pwsh` rodava pwsh pelo PATH no gate, 4,6 s, e derrubaria o gate numa máquina sem pwsh).
 - **O índice do git é compartilhado:** nunca deixe arquivo `git add`-ado sem commitar no mesmo comando (`git add <arqs> && git commit -- <arqs>`); um arquivo parado no índice entra no commit do próximo agente que rodar `git commit` sem caminhos (Task 175 deixou o relatório no índice).
 - **Scratchpad compartilhado:** arquivos de âncora/mutação e saídas temporárias levam o número da tarefa no nome (`t<N>-anchor.txt`); outro agente sobrescreveu a âncora da Task 155 com um nome genérico.
+- **Todo `.join(x)` com `x` vindo de manifesto, catálogo, registro ou rede** (id, versão, nome de módulo, nome de arquivo) passa antes por `install::safepath` como um componente só, e o resultado é conferido dentro da pasta-mãe (`parent() == Some(&base)`). Duas vezes em 2026-10-18 (Task 145: nome do psmodule; Task 177: id do winget aceitava `Pub.App.`/`NUL`). Liste no relatório cada `.join` com dado externo que você escreveu.
 - **Recusa nova em extrator/parser** (Task 138): rode contra o corpus real da sonda do formato (ou peça a sonda) antes de entregar; fixture sintética não prova que arquivos reais passam.
 
 #### Report contract
