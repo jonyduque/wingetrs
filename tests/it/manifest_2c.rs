@@ -219,3 +219,35 @@ fn planner_refuses_each_2c_key_with_old_text() {
 fn simple_manifest_still_plans() {
     assert!(plan(&ok("")).is_ok());
 }
+
+fn invalid_msg(extra: &str, msg: &str) {
+    assert_eq!(
+        res(extra).unwrap_err(),
+        ManifestError::Invalid(msg.into()),
+        "{extra}"
+    );
+}
+
+#[test]
+fn each_new_refusal_has_its_own_fixture() {
+    invalid_msg(r#","installer":"x""#, "installer deve ser um objeto");
+    invalid_msg(
+        r#","installer":{"file":"a.exe","keep":"yes"}"#,
+        "installer.keep deve ser true ou false",
+    );
+    invalid_msg(
+        r#","post_install":["a",3]"#,
+        "post_install: deve ser texto ou lista de textos",
+    );
+    invalid_msg(r#","psmodule":"x""#, "psmodule deve ser um objeto");
+}
+
+#[test]
+fn empty_variant_value_falls_back_to_root() {
+    let m = ok(r#","pre_install":"R","architecture":{"64bit":{"pre_install":""}}"#);
+    assert_eq!(m.hooks.pre_install.as_deref(), Some("R"));
+    let m = ok(r#","post_install":"R","architecture":{"64bit":{"post_install":[]}}"#);
+    assert_eq!(m.hooks.post_install.as_deref(), Some("R"));
+    let m = ok(r#","installer":{"file":"r.exe"},"architecture":{"64bit":{"installer":{}}}"#);
+    assert_eq!(m.installer.unwrap().file.as_deref(), Some("r.exe"));
+}

@@ -230,10 +230,19 @@ fn unsupported<T>(reason: impl Into<String>) -> Result<T, ManifestError> {
     })
 }
 
-/// Field of the architecture variant if present, else of the root.
+/// Field of the architecture variant if present and non-empty, else of the root
+/// (scoop `arch_specific`, manifest.ps1: `if ($val)`).
 fn field<'a>(root: &'a Obj, variant: Option<&'a Obj>, key: &str) -> Option<&'a Value> {
+    let blank = |v: &Value| match v {
+        Value::Null => true,
+        Value::String(s) => s.is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => o.is_empty(),
+        _ => false,
+    };
     variant
         .and_then(|v| v.get(key))
+        .filter(|v| !blank(v))
         .or_else(|| root.get(key))
         .filter(|v| !v.is_null())
 }

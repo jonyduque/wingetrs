@@ -544,6 +544,7 @@ pub fn plan_for(
         OpsError::Unsupported(format!("{} sem manifesto no catálogo", c.entry.id))
     })?;
     let target = manifest::resolve(&raw, Arch::host())?;
+    planner::refuse_2c(&target)?;
     let layout = layout(ctx);
     let state = read_state(&layout)?;
     let mut walk = DepWalk {

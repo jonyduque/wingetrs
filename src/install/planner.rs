@@ -218,9 +218,9 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
         return refuse("psmodule");
     }
     if m.innosetup {
-        // one line on purpose: the task that supports innosetup deletes exactly this line
-        #[rustfmt::skip]
-        return Err(PlanError::Unsupported("usa innosetup: suportado na fase 2c".into()));
+        return Err(PlanError::Unsupported(
+            "usa innosetup: suportado na fase 2c".into(),
+        ));
     }
     Ok(())
 }
