@@ -39,6 +39,8 @@ pub enum PlanError {
     UnsafePath(String),
     #[error("argumento inseguro no manifesto: {0}")]
     UnsafeArgs(String),
+    #[error("não suportado: {0}")]
+    Unsupported(String),
 }
 
 /// Replaces scoop manifest variables (`$dir`, `$persist_dir`, `$version`, `$app`,
@@ -187,8 +189,45 @@ fn persist_kind(source: &str) -> PersistKind {
     }
 }
 
+/// Phase 2c keys are parsed but not yet executed; each later task removes its `if`.
+pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
+    let refuse = |k: &str| {
+        Err(PlanError::Unsupported(format!(
+            "usa {k} (PowerShell/instalador próprio): suportado na fase 2c"
+        )))
+    };
+    if m.hooks.pre_install.is_some() {
+        return refuse("pre_install");
+    }
+    if m.hooks.post_install.is_some() {
+        return refuse("post_install");
+    }
+    if m.hooks.pre_uninstall.is_some() {
+        return refuse("pre_uninstall");
+    }
+    if m.hooks.post_uninstall.is_some() {
+        return refuse("post_uninstall");
+    }
+    if m.installer.is_some() {
+        return refuse("installer");
+    }
+    if m.uninstaller.is_some() {
+        return refuse("uninstaller");
+    }
+    if m.psmodule.is_some() {
+        return refuse("psmodule");
+    }
+    if m.innosetup {
+        // one line on purpose: the task that supports innosetup deletes exactly this line
+        #[rustfmt::skip]
+        return Err(PlanError::Unsupported("usa innosetup: suportado na fase 2c".into()));
+    }
+    Ok(())
+}
+
 pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     let m = input.manifest;
+    refuse_2c(m)?;
     let (app, version, layout) = (input.app, m.version.as_str(), input.layout);
     let upgrade_from = match &input.installed {
         Some(i) if i.version == m.version => {

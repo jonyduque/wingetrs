@@ -1,5 +1,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use wingetrs::install::manifest::{Arch, HashAlgo, ManifestError, resolve};
+use wingetrs::install::planner::refuse_2c;
+
+/// Reason of a refusal: by `resolve` (download formats, hashes) or by the planner (phase 2c keys).
+fn refusal(json: &str) -> Option<String> {
+    match resolve(json, Arch::X64) {
+        Err(ManifestError::Unsupported { reason }) => Some(reason),
+        Err(e) => panic!("{e:?}"),
+        Ok(m) => refuse_2c(&m).err().map(|e| e.to_string()),
+    }
+}
 fn fx(n: &str) -> String {
     std::fs::read_to_string(format!("tests/fixtures/scoop/manifests/{n}")).unwrap()
 }
@@ -96,10 +106,7 @@ fn env_and_depends() {
 
 #[test]
 fn unsupported_manifests_say_why() {
-    let reason = |f: &str| match resolve(&fx(f), Arch::X64) {
-        Err(ManifestError::Unsupported { reason }) => reason,
-        o => panic!("{f}: {o:?}"),
-    };
+    let reason = |f: &str| refusal(&fx(f)).unwrap_or_else(|| panic!("{f}: not refused"));
     assert!(reason("unsup-script__main__7zip.json").contains("post_install"));
     let r = reason("unsup-innosetup__main__boost.json");
     assert!(r.contains("innosetup") || r.contains("pre_install"), "{r}");
@@ -132,10 +139,7 @@ fn every_fixture_manifest_is_classified_by_its_prefix() {
         let name = e.file_name().to_string_lossy().into_owned();
         let r = resolve(&fx(&name), Arch::X64);
         if name.starts_with("unsup-") {
-            assert!(
-                matches!(r, Err(ManifestError::Unsupported { .. })),
-                "{name}: {r:?}"
-            );
+            assert!(refusal(&fx(&name)).is_some(), "{name}: {r:?}");
         } else {
             assert!(r.is_ok(), "{name}: {r:?}");
         }
@@ -145,10 +149,7 @@ fn every_fixture_manifest_is_classified_by_its_prefix() {
 }
 
 fn unsup(json: &str) -> bool {
-    matches!(
-        resolve(json, Arch::X64),
-        Err(ManifestError::Unsupported { .. })
-    )
+    refusal(json).is_some()
 }
 
 #[test]
@@ -165,24 +166,28 @@ fn hash_count_mismatch() {
 
 #[test]
 fn support_keys_inside_architecture_variant() {
-    for k in [
-        "pre_install",
-        "post_install",
-        "pre_uninstall",
-        "post_uninstall",
-        "installer",
-        "uninstaller",
-        "psmodule",
-        "innosetup",
+    for (k, v) in [
+        ("pre_install", r#""x""#),
+        ("post_install", r#""x""#),
+        ("pre_uninstall", r#""x""#),
+        ("post_uninstall", r#""x""#),
+        ("installer", r#"{"file":"a.exe"}"#),
+        ("uninstaller", r#"{"file":"a.exe"}"#),
     ] {
         let j = format!(
-            r#"{{"version":"1","architecture":{{"64bit":{{"url":"https://x/a.zip","hash":"aa","{k}":"x"}}}}}}"#
+            r#"{{"version":"1","architecture":{{"64bit":{{"url":"https://x/a.zip","hash":"aa","{k}":{v}}}}}}}"#
         );
         assert!(unsup(&j), "{k}");
-        let ok =
-            r#"{"version":"1","architecture":{"64bit":{"url":"https://x/a.zip","hash":"aa"}}}"#;
-        assert!(resolve(ok, Arch::X64).is_ok());
     }
+    // `psmodule` and `innosetup` are read from the root only (as scoop does).
+    for (k, v) in [("psmodule", r#"{"name":"X"}"#), ("innosetup", "true")] {
+        let j = format!(
+            r#"{{"version":"1","architecture":{{"64bit":{{"url":"https://x/a.zip","hash":"aa","{k}":{v}}}}}}}"#
+        );
+        assert!(!unsup(&j), "{k}");
+    }
+    let ok = r#"{"version":"1","architecture":{"64bit":{"url":"https://x/a.zip","hash":"aa"}}}"#;
+    assert!(!unsup(ok));
 }
 
 #[test]
@@ -276,10 +281,6 @@ fn bin_with_three_and_two_elements_is_unchanged() {
 #[test]
 fn innosetup_points_to_phase_2c() {
     let json = r#"{"version":"1","url":"https://x/a.exe","hash":"0000000000000000000000000000000000000000000000000000000000000000","innosetup":true}"#;
-    match resolve(json, Arch::X64) {
-        Err(ManifestError::Unsupported { reason }) => {
-            assert!(reason.contains("fase 2c"), "{reason}")
-        }
-        o => panic!("{o:?}"),
-    }
+    let reason = refusal(json).unwrap();
+    assert!(reason.contains("fase 2c"), "{reason}");
 }

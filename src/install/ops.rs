@@ -500,6 +500,14 @@ impl DepWalk<'_> {
                     other => other.to_string(),
                 },
             })?;
+        // A dependency that still needs a phase 2c feature keeps the old dependency error.
+        planner::refuse_2c(&manifest).map_err(|e| OpsError::DependencyUnsupported {
+            app: id.clone(),
+            reason: e
+                .to_string()
+                .trim_start_matches("não suportado: ")
+                .to_string(),
+        })?;
         self.stack.push(id.clone());
         for d in &manifest.depends {
             self.visit(&bucket, d)?;

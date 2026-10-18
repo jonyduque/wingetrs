@@ -1,9 +1,13 @@
 //! Typed scoop manifest: parses the raw JSON stored in the catalog, resolves the
 //! architecture variant and checks whether phase 2a supports the manifest.
+use std::collections::BTreeSet;
+
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::install::archive::ArchiveKind;
+use crate::install::classify_2c::commands_in;
+use crate::install::safepath::safe_components;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Arch {
@@ -122,7 +126,87 @@ pub struct Resolved {
     pub env_add_path: Vec<String>,
     pub env_set: Vec<(String, String)>,
     pub depends: Vec<String>,
+    pub hooks: Hooks,
+    pub installer: Option<InstallerSpec>,
+    pub uninstaller: Option<InstallerSpec>,
+    pub psmodule: Option<PsModule>,
+    pub innosetup: bool,
+    pub helpers: BTreeSet<Helper>,
+    /// The text received by `resolve`, unformatted.
+    pub raw_json: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HookKind {
+    PreInstall,
+    InstallerScript,
+    PostInstall,
+    PreUninstall,
+    UninstallerScript,
+    PostUninstall,
+}
+
+impl HookKind {
+    pub fn key(&self) -> &'static str {
+        match self {
+            HookKind::PreInstall => "pre_install",
+            HookKind::InstallerScript => "installer.script",
+            HookKind::PostInstall => "post_install",
+            HookKind::PreUninstall => "pre_uninstall",
+            HookKind::UninstallerScript => "uninstaller.script",
+            HookKind::PostUninstall => "post_uninstall",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hooks {
+    pub pre_install: Option<String>,
+    pub post_install: Option<String>,
+    pub pre_uninstall: Option<String>,
+    pub post_uninstall: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallerSpec {
+    pub file: Option<String>,
+    pub args: Vec<String>,
+    pub keep: bool,
+    pub script: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PsModule {
+    pub name: String,
+}
+
+/// Scoop apps that scripts may need (`lib/depends.ps1` Get-InstallationHelper).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Helper {
+    SevenZip,
+    Lessmsi,
+    Innounp,
+    Dark,
+}
+
+impl Helper {
+    pub fn app(&self) -> &'static str {
+        match self {
+            Helper::SevenZip => "7zip",
+            Helper::Lessmsi => "lessmsi",
+            Helper::Innounp => "innounp",
+            Helper::Dark => "dark",
+        }
+    }
+}
+
+// scoop lib/depends.ps1 Get-InstallationHelper: command name -> helper app.
+const HELPER_COMMANDS: [(&str, Helper); 4] = [
+    ("expand-7ziparchive", Helper::SevenZip),
+    ("expand-msiarchive", Helper::Lessmsi),
+    ("expand-innoarchive", Helper::Innounp),
+    ("expand-darkarchive", Helper::Dark),
+];
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ManifestError {
@@ -203,31 +287,119 @@ fn tuple_items(
     Ok(out)
 }
 
-const SCRIPT_KEYS: [&str; 7] = [
-    "pre_install",
-    "post_install",
-    "pre_uninstall",
-    "post_uninstall",
-    "installer",
-    "uninstaller",
-    "psmodule",
-];
+/// Script value: text, list of texts (joined by CRLF as scoop's Invoke-HookScript does), or absent/empty.
+fn script_value(v: Option<&Value>, key: &str) -> Result<Option<String>, ManifestError> {
+    let text = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => {
+            let mut lines = Vec::new();
+            for x in a {
+                match x.as_str() {
+                    Some(s) => lines.push(s),
+                    None => return invalid(format!("{key}: deve ser texto ou lista de textos")),
+                }
+            }
+            lines.join("\r\n")
+        }
+        Some(_) => return invalid(format!("{key}: deve ser texto ou lista de textos")),
+    };
+    Ok((!text.is_empty()).then_some(text))
+}
 
-fn check_keys(root: &Obj) -> Result<(), ManifestError> {
-    for k in SCRIPT_KEYS {
-        if root.get(k).is_some_and(|v| !v.is_null()) {
-            return unsupported(format!(
-                "usa {k} (PowerShell/instalador próprio): suportado na fase 2c"
-            ));
+fn installer_spec(v: Option<&Value>, key: &str) -> Result<Option<InstallerSpec>, ManifestError> {
+    let Some(v) = v else { return Ok(None) };
+    let Some(o) = v.as_object() else {
+        return invalid(format!("{key} deve ser um objeto"));
+    };
+    let file = match o.get("file").filter(|v| !v.is_null()) {
+        None => None,
+        Some(f) => {
+            let f = str_of(f, &format!("{key}.file"))?;
+            if safe_components(&f).is_none() {
+                return invalid(format!("{key}.file: caminho inseguro"));
+            }
+            Some(f)
+        }
+    };
+    let args = str_list(
+        o.get("args").filter(|v| !v.is_null()),
+        &format!("{key}.args"),
+    )?;
+    if args.iter().any(|a| a.chars().any(char::is_control)) {
+        return invalid(format!("{key}.args: caractere de controle"));
+    }
+    let keep = match o.get("keep") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return invalid(format!("{key}.keep deve ser true ou false")),
+    };
+    let script = script_value(o.get("script"), &format!("{key}.script"))?;
+    if file.is_none() && args.is_empty() && script.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(InstallerSpec {
+        file,
+        args,
+        keep,
+        script,
+    }))
+}
+
+fn psmodule_spec(root: &Obj) -> Result<Option<PsModule>, ManifestError> {
+    let Some(v) = root.get("psmodule").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let Some(o) = v.as_object() else {
+        return invalid("psmodule deve ser um objeto");
+    };
+    let Some(name) = o
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+    else {
+        return invalid("psmodule sem name");
+    };
+    match safe_components(name) {
+        Some(c) if c.len() == 1 && !name.contains(['\\', '/']) => Ok(Some(PsModule {
+            name: name.to_string(),
+        })),
+        _ => invalid("psmodule.name: nome inseguro"),
+    }
+}
+
+fn innosetup_flag(root: &Obj) -> Result<bool, ManifestError> {
+    match root.get("innosetup") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => invalid("innosetup deve ser true ou false"),
+    }
+}
+
+fn helpers_for(
+    pre_install: Option<&str>,
+    installer_script: Option<&str>,
+    post_install: Option<&str>,
+    innosetup: bool,
+) -> BTreeSet<Helper> {
+    let mut set = BTreeSet::new();
+    if innosetup {
+        set.insert(Helper::Innounp);
+    }
+    for script in [pre_install, installer_script, post_install]
+        .into_iter()
+        .flatten()
+    {
+        for cmd in commands_in(script) {
+            let cmd = cmd.to_lowercase();
+            for (name, helper) in HELPER_COMMANDS {
+                if cmd == name {
+                    set.insert(helper);
+                }
+            }
         }
     }
-    if root
-        .get("innosetup")
-        .is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
-    {
-        return unsupported("usa innosetup: suportado na fase 2c");
-    }
-    Ok(())
+    set
 }
 
 /// Returns the request URL (without fragment) and the file name to save as (`#/name` renames).
@@ -299,7 +471,6 @@ pub fn resolve(raw_json: &str, host: Arch) -> Result<Resolved, ManifestError> {
         Some(Value::String(s)) if !s.is_empty() => s.clone(),
         _ => return invalid("version ausente ou não é texto"),
     };
-    check_keys(root)?;
 
     let (arch, variant) = match root.get("architecture") {
         None | Some(Value::Null) => (None, None),
@@ -318,9 +489,6 @@ pub fn resolve(raw_json: &str, host: Arch) -> Result<Resolved, ManifestError> {
         }
         Some(_) => return invalid("architecture deve ser um objeto"),
     };
-    if let Some(v) = variant {
-        check_keys(v)?;
-    }
 
     let sources = build_sources(root, variant)?;
     let bin = tuple_items(field(root, variant, "bin"), "bin", usize::MAX)?
@@ -368,6 +536,22 @@ pub fn resolve(raw_json: &str, host: Arch) -> Result<Resolved, ManifestError> {
             .collect::<Result<_, ManifestError>>()?,
         Some(_) => return invalid("env_set deve ser um objeto"),
     };
+    let hooks = Hooks {
+        pre_install: script_value(field(root, variant, "pre_install"), "pre_install")?,
+        post_install: script_value(field(root, variant, "post_install"), "post_install")?,
+        pre_uninstall: script_value(field(root, variant, "pre_uninstall"), "pre_uninstall")?,
+        post_uninstall: script_value(field(root, variant, "post_uninstall"), "post_uninstall")?,
+    };
+    let installer = installer_spec(field(root, variant, "installer"), "installer")?;
+    let uninstaller = installer_spec(field(root, variant, "uninstaller"), "uninstaller")?;
+    let psmodule = psmodule_spec(root)?;
+    let innosetup = innosetup_flag(root)?;
+    let helpers = helpers_for(
+        hooks.pre_install.as_deref(),
+        installer.as_ref().and_then(|i| i.script.as_deref()),
+        hooks.post_install.as_deref(),
+        innosetup,
+    );
     Ok(Resolved {
         version,
         arch,
@@ -378,5 +562,12 @@ pub fn resolve(raw_json: &str, host: Arch) -> Result<Resolved, ManifestError> {
         env_add_path: str_list(field(root, variant, "env_add_path"), "env_add_path")?,
         env_set,
         depends: str_list(root.get("depends"), "depends")?,
+        hooks,
+        installer,
+        uninstaller,
+        psmodule,
+        innosetup,
+        helpers,
+        raw_json: raw_json.to_string(),
     })
 }
