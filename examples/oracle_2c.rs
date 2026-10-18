@@ -458,6 +458,9 @@ struct Installable {
     guard_only_reassign: Vec<String>,
     /// Gate-refused manifests with at least one `if ($global)` block.
     refused_with_guard: usize,
+    /// Resolved 2c manifests that assign `$global` in some script (Task 164: the runner's
+    /// constant `$global` makes that assignment fail).
+    assigns_global: Vec<String>,
 }
 
 fn plan(app: &str, bucket: &str, m: &Resolved, layout: &Layout) -> Result<(), PlanError> {
@@ -640,17 +643,22 @@ impl Installable {
                 *self.other_reasons.entry(g).or_default() += 1;
                 Outcome::OtherError
             }
-            Ok(m) => match plan(app, bucket, &m, layout) {
-                Ok(()) => Outcome::Installable,
-                Err(PlanError::ScriptRefused { .. }) => {
-                    self.refused(app, bucket, &m, layout);
-                    Outcome::GateRefused
+            Ok(m) => {
+                if scripts_of(&m).iter().any(|s| assigns_global(s)) {
+                    self.assigns_global.push(format!("{bucket}/{app}"));
                 }
-                Err(e) => {
-                    *self.other_reasons.entry(group_error(&e)).or_default() += 1;
-                    Outcome::OtherError
+                match plan(app, bucket, &m, layout) {
+                    Ok(()) => Outcome::Installable,
+                    Err(PlanError::ScriptRefused { .. }) => {
+                        self.refused(app, bucket, &m, layout);
+                        Outcome::GateRefused
+                    }
+                    Err(e) => {
+                        *self.other_reasons.entry(group_error(&e)).or_default() += 1;
+                        Outcome::OtherError
+                    }
                 }
-            },
+            }
         };
         *self
             .cells
@@ -782,6 +790,12 @@ impl Installable {
             names(&self.guard_only_global_switch),
             self.guard_only_reassign.len(),
             names(&self.guard_only_reassign),
+        );
+        println!(
+            "
+Atribuem `$global` em algum script (Task 164: com o `$global` constante do wingetrs a atribuição dá erro e o script falha): {} ({}). Declaram `$global` como nome próprio (recusa `GlobalName`): ver a linha `GlobalName` da tabela de tipos de recusa.",
+            self.assigns_global.len(),
+            names(&self.assigns_global),
         );
     }
 }

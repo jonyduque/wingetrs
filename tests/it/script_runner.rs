@@ -293,3 +293,23 @@ fn end_to_end_pwsh() {
     assert_eq!(code, 0);
     assert_eq!(out.trim_end(), "o\u{2019}brien");
 }
+
+#[test]
+fn runner_global_is_constant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hook = tmp.path().join("hook.ps1");
+    let prelude = tmp.path().join("prelude.ps1");
+    let vars = script_vars(HookKind::PreInstall, &cx(ScriptOp::Install, tmp.path()));
+    let text = hook_runner(&vars, &prelude, &hook).unwrap();
+    let constant = text
+        .find("Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global")
+        .unwrap();
+    let prelude_idx = text
+        .find(&format!(
+            ". {}",
+            ps_single_quoted(&prelude.to_string_lossy())
+        ))
+        .unwrap();
+    assert!(constant < prelude_idx);
+    assert!(!text.contains("$global = "), "{text}");
+}

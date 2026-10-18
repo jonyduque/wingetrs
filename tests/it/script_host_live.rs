@@ -193,3 +193,106 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         "{path}"
     );
 }
+
+/// Every file named `name` under `dir` (recursive, no reparse points followed).
+fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            out.extend(files_named(&e.path(), name));
+        } else if e.file_name().eq_ignore_ascii_case(name) {
+            out.push(e.path());
+        }
+    }
+    out
+}
+
+#[tokio::test]
+#[ignore = "live: pwsh"]
+async fn constant_global_blocks_reassignment() {
+    let server = MockServer::start().await;
+    let t = tempfile::tempdir().unwrap();
+    let layout = Layout::new(t.path().join("root"));
+    let data = DataDir::new(layout.root());
+    let zip = zip_of(&[("tool.txt", b"hi")]);
+    let sha = hex::encode(Sha256::digest(&zip));
+    Mock::given(method("GET"))
+        .and(path("/pkg.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
+        .mount(&server)
+        .await;
+    let hook = "$global = $true; if ($global) { New-Item (Join-Path $dir 'RAN') }";
+    let manifest = serde_json::json!({
+        "version": "1.0",
+        "url": format!("{}/pkg.zip", server.uri()),
+        "hash": sha,
+        "post_install": hook,
+    })
+    .to_string();
+    let shortcuts = FakeShortcuts::new(t.path().join("startmenu"));
+    let plan = plan_install(&PlanInput {
+        app: "app",
+        bucket: "main",
+        manifest: &resolve(&manifest, Arch::X64).unwrap(),
+        layout: &layout,
+        shortcut_root: &shortcuts.root(),
+        installed: None,
+        launcher_present: true,
+        keep_old: false,
+        manifest_sha256: "",
+    })
+    .unwrap();
+    let version_dir = layout.version_dir("app", "1.0");
+    let recording = Arc::new(Recording {
+        inner: PwshHost::locate(),
+        marker: version_dir.join("RAN"),
+        seen: Mutex::new(None),
+    });
+    let test_key = DropTestKey(format!(
+        r"Software\wingetrs-test\t164-live-{}",
+        std::process::id()
+    ));
+    let env = RegEnvStore::for_test_key(&test_key.0);
+    let (trash, registry) = (FakeTrash::new(), FakeRegistry::new());
+    let http = Http::new().unwrap();
+    let mut state = StateDb::open(&t.path().join("state").join("state.db")).unwrap();
+    let scripts: Arc<dyn ScriptHost> = recording.clone();
+    let mut ctx = ExecCtx {
+        layout: &layout,
+        data: &data,
+        http: &http,
+        effects: Effects {
+            env: &env,
+            shortcuts: &shortcuts,
+            trash: &trash,
+            registry: &registry,
+        },
+        state: &mut state,
+        hook: &NoHook,
+        progress: &no_progress,
+        in_use: &nothing_in_use,
+        msiexec: None,
+        launch: Default::default(),
+        runners: Runners {
+            scripts: Some(scripts),
+            ..Runners::disabled()
+        },
+    };
+    let result = wingetrs::install::executor::execute_install(&plan, &mut ctx).await;
+    let (_, marker) = recording
+        .seen
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| panic!("the hook never ran: {result:?}"));
+    assert!(result.is_err(), "the hook must fail on `$global = $true`");
+    assert!(!marker, "the if ($global) block ran: {result:?}");
+    assert!(files_named(t.path(), "RAN").is_empty());
+}

@@ -395,3 +395,81 @@ fn prelude_text_is_declared_ascii_and_clean() {
         assert!(!PRELUDE.contains(bad), "forbidden text in prelude: {bad}");
     }
 }
+
+#[test]
+fn prelude_has_no_global_parameter() {
+    let re = fancy_regex::Regex::new(r"(?i)\$global\b").unwrap();
+    for (i, line) in PRELUDE.lines().enumerate() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let code = line
+            .replace("[Alias('global')]", "")
+            .replace("[Alias('Global')]", "");
+        assert!(
+            !re.is_match(&code).unwrap(),
+            "prelude.ps1:{}: {line}",
+            i + 1
+        );
+    }
+}
+/// Calls the prelude functions the ways manifests pass Scoop's `$global` (positional,
+/// `-global $global`, `-Global:$global`) with the runner's constant `$global` (Task 164).
+fn constant_global_calls(shell: &str) {
+    let (_t, work, root) = dirs();
+    let effects = work.join("effects.jsonl");
+    let body = format!(
+        "Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global\n\
+        $__wr_effects = '{}'\n\
+        appdir foo $global\n\
+        appdir foo -global $global\n\
+        versiondir foo '1.0' $global\n\
+        installed foo $global\n\
+        Select-CurrentVersion foo -Global:$global\n\
+        Add-Path -Path x -Global:$global\n\
+        'done'",
+        effects.display()
+    );
+    let o = run_with(shell, &work, &root, &body);
+    assert!(
+        std::fs::read_to_string(&effects)
+            .unwrap_or_default()
+            .contains("add_path")
+    );
+    assert_eq!(o.code, 0, "{}", o.out);
+    let r = root.display().to_string();
+    assert_eq!(
+        lines(&o),
+        vec![
+            format!("{r}\\apps\\foo"),
+            format!("{r}\\apps\\foo"),
+            format!("{r}\\apps\\foo\\1.0"),
+            "False".to_string(),
+            "done".to_string(),
+        ],
+        "{}",
+        o.out
+    );
+    for body in ["appdir foo -global $true", "Add-Path -Path x -Global"] {
+        let body = format!(
+            "Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global\n{body}"
+        );
+        let g = run_with(shell, &work, &root, &body);
+        assert_ne!(g.code, 0, "{body}: {}", g.out);
+        assert!(
+            g.out.contains("global n\u{e3}o suportado"),
+            "{body}: {}",
+            g.out
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn prelude_accepts_constant_global() {
+    constant_global_calls(&pwsh());
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    constant_global_calls(&format!(
+        r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe"
+    ));
+}

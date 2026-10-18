@@ -631,3 +631,262 @@ fn variables_lowercase_without_dollar() {
         .collect();
     assert_eq!(r.variables, want);
 }
+
+// ---- Task 164: `$global` is a constant `$false`; `if ($global)` blocks are informational ----
+
+const GLOBAL_ONLY: &str = "só roda em instalação global";
+const OWN_GLOBAL: &str =
+    "usa `$global` como nome próprio (incompatível com o `$global` fixo do wingetrs)";
+
+fn informational(r: &ScriptReport) -> bool {
+    r.verdict == Verdict::Confirm
+        && r.flags
+            .iter()
+            .any(|f| f.verdict == Verdict::Confirm && f.detail.starts_with(GLOBAL_ONLY))
+}
+
+#[test]
+fn global_block_is_informational() {
+    let r = scan(
+        "if ($global) { $c = $c -replace 'HKEY_CURRENT_USER', 'HKEY_LOCAL_MACHINE' }",
+        SUP,
+    );
+    assert_eq!(r.verdict, Verdict::Confirm, "{:?}", r.flags);
+    let f: Vec<_> = r
+        .flags
+        .iter()
+        .filter(|f| f.detail.starts_with(GLOBAL_ONLY))
+        .collect();
+    assert_eq!(f.len(), 1, "{:?}", r.flags);
+    assert_eq!(f[0].verdict, Verdict::Confirm);
+}
+
+#[test]
+fn global_block_multiline() {
+    let r = scan(
+        "if ($global) {\n    $c = $c -replace 'HKEY_CURRENT_USER', 'HKEY_LOCAL_MACHINE'\n}",
+        SUP,
+    );
+    assert_eq!(r.verdict, Verdict::Confirm, "{:?}", r.flags);
+    let f: Vec<_> = r
+        .flags
+        .iter()
+        .filter(|f| f.detail.starts_with(GLOBAL_ONLY))
+        .collect();
+    assert_eq!(f.len(), 1, "{:?}", r.flags);
+    assert_eq!(f[0].verdict, Verdict::Confirm);
+    assert_eq!(f[0].line, 2);
+}
+
+#[test]
+fn global_block_else_still_scanned() {
+    for s in [
+        "if ($global) { $x = 1 } else { Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1 }",
+        "if ($global) {\n    $x = 1\n} else {\n    Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1\n}",
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(
+            r.flags
+                .iter()
+                .any(|f| f.kind == FlagKind::Hklm && f.verdict == Verdict::Refuse),
+            "{s}: {:?}",
+            r.flags
+        );
+    }
+}
+
+#[test]
+fn global_and_condition() {
+    let hklm = "Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1";
+    let r = scan(&format!("if ($global -and $x) {{ {hklm} }}"), SUP);
+    assert!(informational(&r), "{:?}", r.flags);
+    let r = scan(&format!("if ($global -or $x) {{ {hklm} }}"), SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+    let r = scan(&format!("if (!$global) {{ {hklm} }}"), SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+}
+
+#[test]
+fn global_block_unbalanced_fails_closed() {
+    let r = scan(
+        "if ($global) { \"}\" ; Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1 }",
+        SUP,
+    );
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+}
+
+#[test]
+fn own_global_parameter_refused() {
+    for s in ["function f($global) { }", "foreach ($global in $a) { }"] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(
+            r.flags
+                .iter()
+                .any(|f| f.verdict == Verdict::Refuse && f.detail == OWN_GLOBAL),
+            "{s}: {:?}",
+            r.flags
+        );
+    }
+}
+const HKLM: &str = "Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1";
+
+#[test]
+fn global_block_forms_that_are_informational() {
+    for s in [
+        format!("if ($Global) {{ {HKLM} }}"),
+        format!("if (  $GLOBAL  ) {{ {HKLM} }}"),
+        format!("if ($x) {{ $y = 1 }} elseif ($global) {{ {HKLM} }}"),
+        format!("if ($global)\n{{\n    {HKLM}\n}}"),
+        format!("if ($global -and   $x -eq 1) {{ {HKLM} }}"),
+        format!("if ($global) {{\n    # machine-wide\n    {HKLM}\n}}"),
+        format!("if ($global) {{ $h = @{{ a = 1 }}; {HKLM} }}"),
+        format!("if ($global) {{ if ($x) {{ {HKLM} }} }}"),
+        format!("if ($global) {{ $p = \"$dir\\x\"; {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert!(informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn global_block_doubts_fail_closed() {
+    for s in [
+        // Conditions other than `$global` / `$global -and ...`.
+        format!("if (($global)) {{ {HKLM} }}"),
+        format!("if ($global -and (Test-Path $x)) {{ {HKLM} }}"),
+        format!("if (-not $global) {{ {HKLM} }}"),
+        format!("if ($global -and -not $x) {{ {HKLM} }}"),
+        format!("if ($global -and $x -eq 'a') {{ {HKLM} }}"),
+        format!("if ($global -and $x -eq \"a\") {{ {HKLM} }}"),
+        format!("if ($global -xor $x) {{ {HKLM} }}"),
+        // `-and` and `-or` have the same precedence: `($global -and $x) -or $y`.
+        format!("if ($global -and $x -or $y) {{ {HKLM} }}"),
+        format!("if ($global -and $x -xor $y) {{ {HKLM} }}"),
+        // True with the constant `$false`.
+        format!("if ($global -eq $false) {{ {HKLM} }}"),
+        format!("if ($global -ne $true) {{ {HKLM} }}"),
+        format!("if ($global -andx $x) {{ {HKLM} }}"),
+        format!("if ($globalx) {{ {HKLM} }}"),
+        format!("if ($global:x) {{ {HKLM} }}"),
+        format!("if ($script:global) {{ {HKLM} }}"),
+        format!("if ($global\n) {{ {HKLM} }}"),
+        // Opening brace two lines below the condition.
+        format!("if ($global)\n\n{{ {HKLM} }}"),
+        // No closing brace.
+        format!("if ($global) {{ {HKLM}"),
+        // Brace in a single-quoted string, a comment, a backtick escape.
+        format!("if ($global) {{ '{{' ; {HKLM} }}"),
+        format!("if ($global) {{\n    # }}\n    {HKLM}\n}}"),
+        format!("if ($global) {{ $x = `}} ; {HKLM} }}"),
+        // Here-string and block comment inside the block.
+        format!("if ($global) {{\n$t = @'\nx\n'@\n{HKLM}\n}}"),
+        format!("if ($global) {{ <# x #> {HKLM} }}"),
+        // A brace inside a multi-line block comment: pwsh closes the block at line 5.
+        format!("if ($global) {{\n<#\n{{\n#>\n}}\n{HKLM}\n}}"),
+        // `x#y` is a word to pwsh, so the quote after it opens a string holding `{`.
+        format!("if ($global) {{\n    $a = x#y '\n{{\n'\n# '\n}}\n{HKLM}\n}}"),
+        // `a#b` is not a comment to pwsh.
+        format!("if ($global) {{ $a = b#c; {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn global_keyword_in_string_or_comment_is_not_a_block() {
+    for s in [
+        format!("$s = \"if ($global) {{\"\n{HKLM}\n$t = '}}'"),
+        format!("# if ($global) {{\n{HKLM}\n# }}"),
+        format!("$t = @'\nif ($global) {{\n'@\n{HKLM}\n}}"),
+        format!("$elif ($global) {{ {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn global_block_code_after_it_is_live() {
+    let r = scan(&format!("if ($global) {{ $a = 1 }}\n{HKLM}"), SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+    let f = r.flags.iter().find(|f| f.kind == FlagKind::Hklm).unwrap();
+    assert_eq!((f.line, f.verdict), (2, Verdict::Refuse));
+}
+
+#[test]
+fn global_block_command_rules() {
+    // A command seen only inside the block is informational.
+    let r = scan("if ($global) {\n    sudo x\n}", SUP);
+    assert!(informational(&r), "{:?}", r.flags);
+    let f = r
+        .flags
+        .iter()
+        .find(|f| f.kind == FlagKind::Elevation)
+        .unwrap();
+    assert_eq!(f.line, 2);
+    assert!(
+        f.detail.ends_with("(pede elevação (RunAs/sudo))"),
+        "{}",
+        f.detail
+    );
+    // The same command outside the block still refuses.
+    let r = scan("if ($global) { sudo x }\nsudo y", SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+    let r = scan("if ($global) { get_hash x }", SUP);
+    assert!(informational(&r), "{:?}", r.flags);
+    let r = scan("if ($global) { get_hash x }\nget_hash y", SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+}
+
+#[test]
+fn global_block_hidden_code_is_informational() {
+    // A refusal seen only in the raw text of a block comment line inside the body.
+    let r = scan("if ($global) {\n    $x = 1 # HKLM:\\x\n}", SUP);
+    assert!(informational(&r), "{:?}", r.flags);
+    assert!(has(&r, FlagKind::HiddenCode), "{:?}", kinds(&r));
+    // The same outside a block keeps its strong confirmation.
+    let r = scan("$x = 1 # HKLM:\\x", SUP);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", r.flags);
+}
+
+#[test]
+fn own_global_forms() {
+    for s in [
+        "param($a, [switch]$Global)",
+        "function f {\n    param(\n        $a,\n        $GLOBAL\n    )\n}",
+        "filter g ([bool]${global}) { }",
+        "function script:f ($x, $global = $false) { }",
+        "foreach ( $Global in $a) { }",
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(has(&r, FlagKind::GlobalName), "{s}: {:?}", kinds(&r));
+    }
+    let r = scan(
+        "function f {\n    param(\n        $a,\n        $global\n    )\n}",
+        SUP,
+    );
+    let f = r
+        .flags
+        .iter()
+        .find(|f| f.kind == FlagKind::GlobalName)
+        .unwrap();
+    assert_eq!(f.line, 4);
+    for s in [
+        "function f($globalx) { }",
+        "foreach ($g in $global) { }",
+        "$global:x = 1",
+        "$global = $true",
+        "Get-Thing -Global:$global",
+        "function f($x) { appdir $x $global }",
+        "# function f($global) { }",
+        "param($global:x)",
+    ] {
+        let r = scan(s, SUP);
+        assert!(!has(&r, FlagKind::GlobalName), "{s}: {:?}", kinds(&r));
+    }
+}

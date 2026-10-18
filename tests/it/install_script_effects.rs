@@ -1203,20 +1203,26 @@ async fn pathext_without_user_value_refused() {
     assert_eq!(w.var("PATHEXT"), None);
 }
 
-/// The PATHEXT lines of `main/python`'s `installer.script` (catalog text, 2026-10-18) are
-/// refused at planning for `-Global`; the same lines for the user (no `-Global`) pass the
-/// gate, and the effect they would write is accepted.
+/// The PATHEXT lines of `main/python`'s `installer.script` (catalog text, 2026-10-18) sit
+/// inside `if ($global)`: informational since Task 164, so they plan; without the guard
+/// they are refused at planning for `-Global`. The same lines for the user (no `-Global`)
+/// pass the gate, and the effect they would write is accepted.
 #[tokio::test]
 async fn python_catalog_pathext_script() {
     let w = setup().await;
     set_user_pathext(&w);
-    let catalog = serde_json::json!([
-        "if ($global) {",
+    let lines = [
         "    $pathext = (Get-EnvVar -Name PATHEXT -Global) -replace ';.PYW?', ''",
         "    Set-EnvVar -Name PATHEXT -Value \"$pathext;.PY;.PYW\" -Global",
-        "}"
-    ]);
-    match w.try_plan(&w.manifest("1.0", serde_json::json!({"installer": {"script": catalog}}))) {
+    ];
+    let catalog = serde_json::json!(["if ($global) {", lines[0], lines[1], "}"]);
+    w.try_plan(&w.manifest("1.0", serde_json::json!({"installer": {"script": catalog}})))
+        .unwrap();
+    let unguarded = serde_json::json!(lines);
+    match w.try_plan(&w.manifest(
+        "1.0",
+        serde_json::json!({"installer": {"script": unguarded}}),
+    )) {
         Err(PlanError::ScriptRefused { reasons, .. }) => {
             assert!(reasons.iter().all(|r| r.contains("-Global")), "{reasons:?}")
         }

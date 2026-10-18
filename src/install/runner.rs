@@ -100,6 +100,7 @@ pub fn script_vars(kind: HookKind, cx: &ScriptContext) -> Vec<(String, VarValue)
         put("original_dir", path_str(&cx.version_dir));
     }
     put("persist_dir", path_str(&cx.persist_dir));
+    // `runner_ps1` writes it as a constant (`GLOBAL_CONSTANT`), not as an assignment.
     put("global", VarValue::Bool(false));
     put(
         "bucket",
@@ -197,6 +198,9 @@ fn literal(value: &VarValue) -> String {
     }
 }
 
+const GLOBAL_CONSTANT: &str =
+    "Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global\n";
+
 const CATCH: &str = "catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }";
 
 /// Text of runner.ps1. No `$ErrorActionPreference` (decision R1: Scoop does not
@@ -206,9 +210,16 @@ pub fn runner_ps1(input: &RunnerInput<'_>) -> Result<String, RunnerError> {
     let mut s = String::new();
     s.push_str("[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n");
     s.push_str("$OutputEncoding = [Console]::OutputEncoding\n");
+    // wingetrs never installs globally: `$global` is a constant `$false` in every scope
+    // (`AllScope`, so `$global = $true` in the hook's child scope fails instead of
+    // creating a local copy), and `if ($global) { ... }` blocks can never run.
+    s.push_str(GLOBAL_CONSTANT);
     for (name, value) in input.contract.iter().chain(input.vars.iter()) {
         if !valid_name(name) {
             return Err(RunnerError::BadName(name.clone()));
+        }
+        if name.eq_ignore_ascii_case("global") {
+            continue;
         }
         s.push_str(&format!("${name} = {}\n", literal(value)));
     }

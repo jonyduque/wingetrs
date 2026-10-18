@@ -39,32 +39,32 @@ function get_config($name, $default) {
 }
 
 # core.ps1:367-385 -- paths under $__wr_root; global is not supported
-function appsdir($global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function appsdir([Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\apps"
 }
-function shimdir($global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function shimdir([Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\shims"
 }
-function modulesdir($global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function modulesdir([Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\modules"
 }
-function appdir($app, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function appdir($app, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\apps\$app"
 }
-function versiondir($app, $version, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function versiondir($app, $version, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\apps\$app\$version"
 }
-function currentdir($app, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function currentdir($app, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\apps\$app\current"
 }
-function persistdir($app, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function persistdir($app, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     "$__wr_root\persist\$app"
 }
 
@@ -78,11 +78,12 @@ function Select-CurrentVersion {
         [String]
         $AppName,
         [Parameter(Position = 1)]
+        [Alias('Global')]
         [Switch]
-        $Global
+        $__wr_gs
     )
     process {
-        if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+        if ($__wr_gs) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
         $appPath = "$__wr_root\apps\$AppName"
         $currentPath = "$appPath\current"
         $currentVersion = $null
@@ -108,8 +109,8 @@ function Select-CurrentVersion {
 }
 
 # core.ps1:407
-function installed($app, [Nullable[bool]]$global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function installed($app, [Alias('global')][Nullable[bool]]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     $app = ($app -split '/|\\')[-1]
     return $null -ne (Select-CurrentVersion -AppName $app)
 }
@@ -414,9 +415,9 @@ function __wr_env_lookup($Name) {
 function Get-EnvVar {
     param(
         [string]$Name,
-        [switch]$Global
+        [Alias('Global')][switch]$__wr_gs
     )
-    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($__wr_gs) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     $found, $value = __wr_env_lookup $Name
     if ($found) { return $value }
     throw ("Get-EnvVar: a vari" + [char]0xE1 + "vel '$Name' n" + [char]0xE3 + "o foi pr" + [char]0xE9 + "-carregada pelo wingetrs")
@@ -427,9 +428,9 @@ function Set-EnvVar {
     param(
         [string]$Name,
         $Value,
-        [switch]$Global
+        [Alias('Global')][switch]$__wr_gs
     )
-    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($__wr_gs) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     if ($null -eq $Value -or "$Value" -eq '') { $Value = $null } else { $Value = "$Value" }
     __wr_effect @{ op = 'set_env'; name = $Name; value = $Value }
     if ($null -eq $script:__wr_env_overlay) { $script:__wr_env_overlay = @{} }
@@ -442,11 +443,11 @@ function Add-Path {
     param(
         [string[]]$Path,
         [string]$TargetEnvVar = 'PATH',
-        [switch]$Global,
+        [Alias('Global')][switch]$__wr_gs,
         [switch]$Force,
         [switch]$Quiet
     )
-    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($__wr_gs) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     __wr_effect @{ op = 'add_path'; var = $TargetEnvVar; entries = [string[]]@($Path); prepend = $true; force = [bool]$Force }
     # future sessions (overlay); an unknown variable stays unknown
     $found, $value = __wr_env_lookup $TargetEnvVar
@@ -470,11 +471,11 @@ function Remove-Path {
     param(
         [string[]]$Path,
         [string]$TargetEnvVar = 'PATH',
-        [switch]$Global,
+        [Alias('Global')][switch]$__wr_gs,
         [switch]$Quiet,
         [switch]$PassThru
     )
-    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($__wr_gs) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     __wr_effect @{ op = 'remove_path'; var = $TargetEnvVar; entries = [string[]]@($Path) }
     # future sessions (overlay); an unknown variable stays unknown
     $inPath = $null
@@ -501,8 +502,8 @@ function Remove-Path {
 }
 
 # system.ps1:153 (deprecated)
-function env($name, $global, $val) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function env($name, [Alias('global')]$__wr_g, $val) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     if ($PSBoundParameters.ContainsKey('val')) {
         Set-EnvVar -Name $name -Value $val
     } else {
@@ -511,20 +512,20 @@ function env($name, $global, $val) {
 }
 
 # system.ps1:168 (deprecated)
-function add_first_in_path($dir, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function add_first_in_path($dir, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     Add-Path -Path $dir -Force
 }
 
 # system.ps1:173 (deprecated)
-function remove_from_path($dir, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function remove_from_path($dir, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     Remove-Path -Path $dir
 }
 
 # core.ps1:949 -- records shim only; the executor keeps the shims dir on the PATH
-function shim($path, $global, $name, $arg) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function shim($path, [Alias('global')]$__wr_g, $name, $arg) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     if (!(Test-Path $path)) { abort "Can't shim '$(Split-Path -Leaf $path)': couldn't find '$path'." }
     if (!$name) { $name = [System.IO.Path]::GetFileNameWithoutExtension("$path") }
     $resolved = Convert-Path $path
@@ -538,15 +539,15 @@ function rm_shim($name, $shimdir, $app) {
 }
 
 # shortcuts.ps1:22 -- the shortcut root comes from $__wr_shortcut_root (created if missing)
-function shortcut_folder($global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function shortcut_folder([Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     if ([string]::IsNullOrEmpty($__wr_shortcut_root)) { throw 'shortcut root not defined by the runner' }
     return Convert-Path (ensure $__wr_shortcut_root)
 }
 
 # shortcuts.ps1:31 -- records shortcut only (no WScript.Shell, no .lnk)
-function startmenu_shortcut([System.IO.FileInfo] $target, $shortcutName, $arguments, [System.IO.FileInfo]$icon, $global) {
-    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+function startmenu_shortcut([System.IO.FileInfo] $target, $shortcutName, $arguments, [System.IO.FileInfo]$icon, [Alias('global')]$__wr_g) {
+    if ($__wr_g) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     if (!$target.Exists) {
         Write-Host -f DarkRed "Creating shortcut for $shortcutName ($(Split-Path -Leaf $target)) failed: Couldn't find $target"
         return
@@ -1079,5 +1080,5 @@ function unlink_persist_data($manifest, $dir) {
 }
 
 # install.ps1:521 -- no effect: wingetrs never runs with $global
-function persist_permission($manifest, $global) {
+function persist_permission($manifest, [Alias('global')]$__wr_g) {
 }

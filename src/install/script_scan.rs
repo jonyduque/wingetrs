@@ -307,6 +307,9 @@ pub enum FlagKind {
     PreludeRedefinition,
     /// `[Environment]::SetEnvironmentVariable(...)`.
     EnvironmentVariable,
+    /// Declares its own `$global` (parameter, `param(...)`, `foreach`), which clashes with
+    /// the runner's constant `$global`.
+    GlobalName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,6 +430,13 @@ const D_ENV_PERSISTENT: &str =
     "grava variável de ambiente do usuário ou da máquina por [Environment]::SetEnvironmentVariable";
 const D_ENV_PROCESS: &str = "muda variável de ambiente por [Environment]::SetEnvironmentVariable";
 const D_HIDDEN: &str = "possível código escondido em comentário ou here-string";
+const D_GLOBAL_NAME: &str =
+    "usa `$global` como nome próprio (incompatível com o `$global` fixo do wingetrs)";
+
+/// Detail of a flag found only inside an `if ($global) { ... }` body.
+fn global_only(detail: &str) -> String {
+    format!("só roda em instalação global; não roda no wingetrs ({detail})")
+}
 
 /// Scans one script. `supported` lists the Scoop functions the wingetrs prelude implements
 /// (compared case-insensitively); any other name of [`SCOOP_FUNCTIONS`] is refused.
@@ -434,12 +444,21 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
     // Typographic quotes are string delimiters to pwsh (see `normalize_quotes`).
     let script = &normalize_quotes(script);
     let text = strip_here_strings(&strip_comments(script));
+    // `$global` is a constant `$false` in the runner: the bodies of `if ($global) { ... }`
+    // never run. Their text is scanned apart and only informs (`Verdict::Confirm`).
+    let dead = global_dead_mask(script);
+    let (live_text, dead_text) = split_by_mask(&text, &dead);
+    let (live_raw, dead_raw) = split_by_mask(script, &dead);
     // Backticks are dropped before matching: `Run`As` and `HK`LM:` mean the same to pwsh.
-    let lines: Vec<String> = text
-        .lines()
-        .map(|l| l.replace('`', "").to_ascii_lowercase())
-        .collect();
-    let script_lines: Vec<String> = script.lines().map(str::to_ascii_lowercase).collect();
+    let clean = |t: &str| -> Vec<String> {
+        t.lines()
+            .map(|l| l.replace('`', "").to_ascii_lowercase())
+            .collect()
+    };
+    let lines = clean(&live_text);
+    let dead_lines = clean(&dead_text);
+    let script_lines: Vec<String> = live_raw.lines().map(str::to_ascii_lowercase).collect();
+    let dead_script_lines: Vec<String> = dead_raw.lines().map(str::to_ascii_lowercase).collect();
     let commands = commands_in(script);
     let has_cmd = |names: &[&str]| -> Vec<&String> {
         commands
@@ -447,21 +466,33 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
             .filter(|c| names.iter().any(|n| c.eq_ignore_ascii_case(n)))
             .collect()
     };
-    let line_of = |name: &str| -> usize {
+    // (1-based line, whether the name appears only inside `if ($global)` bodies).
+    let line_of = |name: &str| -> (usize, bool) {
         let name = name.to_ascii_lowercase();
         let find = |ls: &[String]| ls.iter().position(|l| words(l).any(|w| w == name));
-        find(&lines)
-            .or_else(|| find(&script_lines))
-            .map_or(1, |i| i + 1)
+        if let Some(i) = find(&lines).or_else(|| find(&script_lines)) {
+            return (i + 1, false);
+        }
+        match find(&dead_lines).or_else(|| find(&dead_script_lines)) {
+            Some(i) => (i + 1, true),
+            None => (1, false),
+        }
     };
 
     let mut flags: Vec<Flag> = Vec::new();
-    let mut push = |kind: FlagKind, verdict: Verdict, detail: &str, line: usize| {
+    // `at` = (1-based line, inside an `if ($global)` body). A flag found only inside those
+    // bodies is informational.
+    let mut push_at = |kind: FlagKind, verdict: Verdict, detail: &str, at: (usize, bool)| {
+        let (verdict, detail) = if at.1 {
+            (Verdict::Confirm, global_only(detail))
+        } else {
+            (verdict, detail.to_string())
+        };
         let f = Flag {
             kind,
             verdict,
-            detail: detail.to_string(),
-            line,
+            detail,
+            line: at.0,
         };
         if !flags.contains(&f) {
             flags.push(f);
@@ -470,7 +501,7 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
 
     // Command-based rules.
     for c in has_cmd(&["sudo", "gsudo"]) {
-        push(
+        push_at(
             FlagKind::Elevation,
             Verdict::Refuse,
             D_ELEVATION,
@@ -478,10 +509,10 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
         );
     }
     for c in has_cmd(&["scoop", "scoop.cmd", "scoop.ps1"]) {
-        push(FlagKind::ScoopCommand, Verdict::Refuse, D_SCOOP, line_of(c));
+        push_at(FlagKind::ScoopCommand, Verdict::Refuse, D_SCOOP, line_of(c));
     }
     for c in has_cmd(&["msiexec", "msiexec.exe"]) {
-        push(FlagKind::Msiexec, Verdict::Refuse, D_MSIEXEC, line_of(c));
+        push_at(FlagKind::Msiexec, Verdict::Refuse, D_MSIEXEC, line_of(c));
     }
     for name in &commands {
         let Some(canon) = SCOOP_FUNCTIONS
@@ -492,7 +523,7 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
         };
         if !supported.iter().any(|s| s.eq_ignore_ascii_case(name)) {
             let detail = format!("função do Scoop ainda não suportada: {canon}");
-            push(
+            push_at(
                 FlagKind::UnknownScoopFunction,
                 Verdict::Refuse,
                 &detail,
@@ -502,29 +533,47 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
     }
     let calls_reg = !has_cmd(&["reg", "reg.exe"]).is_empty();
 
-    // Line-based rules, on the text without comments and here-string bodies.
-    for (i, l) in lines.iter().enumerate() {
-        for (kind, verdict, detail) in line_rules(l, calls_reg) {
-            push(kind, verdict, &detail, i + 1);
-        }
-    }
-    // Fail closed: the comment/here-string stripping may disagree with pwsh about where
-    // a comment starts. A refusal rule that matches only in the raw line (comments and
-    // here-strings kept) still asks for a strong confirmation.
-    let raw_lines = script
-        .lines()
-        .map(|l| l.replace('`', "").to_ascii_lowercase());
-    for (i, raw) in raw_lines.enumerate() {
-        let clean = lines
-            .get(i)
-            .map(|l| line_rules(l, calls_reg))
-            .unwrap_or_default();
-        for (kind, verdict, detail) in line_rules(&raw, calls_reg) {
-            if verdict == Verdict::Refuse && !clean.iter().any(|c| c.0 == kind) {
-                let detail = format!("{D_HIDDEN}: {detail}");
-                push(FlagKind::HiddenCode, Verdict::ConfirmStrong, &detail, i + 1);
+    // Line-based rules, on the text without comments and here-string bodies; the live
+    // text first, then the `if ($global)` bodies.
+    for (clean_lines, raw_text, in_dead) in
+        [(&lines, &live_raw, false), (&dead_lines, &dead_raw, true)]
+    {
+        for (i, l) in clean_lines.iter().enumerate() {
+            for (kind, verdict, detail) in line_rules(l, calls_reg) {
+                push_at(kind, verdict, &detail, (i + 1, in_dead));
             }
         }
+        // Fail closed: the comment/here-string stripping may disagree with pwsh about where
+        // a comment starts. A refusal rule that matches only in the raw line (comments and
+        // here-strings kept) still asks for a strong confirmation.
+        let raw_lines = raw_text
+            .lines()
+            .map(|l| l.replace('`', "").to_ascii_lowercase());
+        for (i, raw) in raw_lines.enumerate() {
+            let clean = clean_lines
+                .get(i)
+                .map(|l| line_rules(l, calls_reg))
+                .unwrap_or_default();
+            for (kind, verdict, detail) in line_rules(&raw, calls_reg) {
+                if verdict == Verdict::Refuse && !clean.iter().any(|c| c.0 == kind) {
+                    let detail = format!("{D_HIDDEN}: {detail}");
+                    push_at(
+                        FlagKind::HiddenCode,
+                        Verdict::ConfirmStrong,
+                        &detail,
+                        (i + 1, in_dead),
+                    );
+                }
+            }
+        }
+    }
+    for line in own_global_lines(&text) {
+        push_at(
+            FlagKind::GlobalName,
+            Verdict::Refuse,
+            D_GLOBAL_NAME,
+            (line, false),
+        );
     }
 
     flags.sort_by_key(|f| f.line);
@@ -1093,4 +1142,299 @@ fn here_string_start(chars: &[char], i: usize) -> bool {
         j += 1;
     }
     j >= chars.len() || chars[j] == '\n'
+}
+/// `src` split in two copies of the same length (newlines kept): the chars outside the
+/// mask (others blanked) and the chars inside it. `mask` is per char of `src`.
+fn split_by_mask(src: &str, mask: &[bool]) -> (String, String) {
+    let mut live = String::with_capacity(src.len());
+    let mut dead = String::with_capacity(src.len());
+    for (i, c) in src.chars().enumerate() {
+        let in_mask = mask.get(i).copied().unwrap_or(false);
+        let keep = |out: &mut String, yes: bool| {
+            out.push(if yes || c == '\n' || c == '\r' {
+                c
+            } else {
+                ' '
+            });
+        };
+        keep(&mut live, !in_mask);
+        keep(&mut dead, in_mask);
+    }
+    (live, dead)
+}
+
+/// Per char of `script`: inside the body (between the braces) of an `if ($global) { ... }`
+/// or `elseif ($global) { ... }` whose bounds are certain (see [`global_block`]).
+fn global_dead_mask(script: &str) -> Vec<bool> {
+    let chars: Vec<char> = script.chars().collect();
+    let n = chars.len();
+    let mut mask = vec![false; n];
+    let mut i = 0;
+    // Same tokenizing as `blank`: the keyword counts only in code.
+    while i < n {
+        let c = chars[i];
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        match c {
+            '`' => i += 2,
+            '@' if here_string_start(&chars, i) => {
+                let quote = chars[i + 1];
+                i += 2;
+                while i < n {
+                    if chars[i] == '\n' {
+                        let mut j = i + 1;
+                        while j < n && matches!(chars[j], ' ' | '\t') {
+                            j += 1;
+                        }
+                        if chars.get(j) == Some(&quote) && chars.get(j + 1) == Some(&'@') {
+                            i = j + 2;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            '\'' | '"' => i = string_end(&chars, i).unwrap_or(n),
+            '<' if chars.get(i + 1) == Some(&'#') => {
+                i = (i + 2..n)
+                    .find(|&k| chars[k] == '#' && chars.get(k + 1) == Some(&'>'))
+                    .map_or(n, |k| k + 2);
+            }
+            '#' if prev.is_none_or(|p| !continues_word(p)) => {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            _ => {
+                let starts_word = prev.is_none_or(|p| !continues_word(p) && p != '$');
+                let keyword = ["if", "elseif"].into_iter().find(|k| {
+                    let end = i + k.len();
+                    end <= n
+                        && chars[i..end]
+                            .iter()
+                            .collect::<String>()
+                            .eq_ignore_ascii_case(k)
+                        && chars.get(end).is_none_or(|c| !is_word(*c))
+                });
+                match keyword.filter(|_| starts_word) {
+                    Some(k) => match global_block(&chars, i + k.len()) {
+                        Some((open, close)) => {
+                            mask[open + 1..close].iter_mut().for_each(|m| *m = true);
+                            i = close + 1;
+                        }
+                        None => i += k.len(),
+                    },
+                    None => i += 1,
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// Index just past the end of the quoted string opening at `i` (`''` and backtick escapes
+/// as in `blank`), or `None` when it never closes.
+fn string_end(chars: &[char], i: usize) -> Option<usize> {
+    let q = chars[i];
+    let mut k = i + 1;
+    while k < chars.len() {
+        let d = chars[k];
+        if q == '"' && d == '`' {
+            k += 2;
+            continue;
+        }
+        k += 1;
+        if d == q {
+            if q == '\'' && chars.get(k) == Some(&'\'') {
+                k += 1;
+                continue;
+            }
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// After `if`/`elseif` at `j`: `(open, close)` brace indices of the block when the condition
+/// is exactly `$global` or starts with `$global -and ` and the bounds are certain. `None`
+/// (the block is scanned as live code) on any doubt: another condition (`-or`, `-not`, `!`,
+/// extra parentheses, quotes), opening brace neither on the condition's line nor the next,
+/// unbalanced braces, a brace inside a string or comment, a here-string or block comment.
+fn global_block(chars: &[char], j: usize) -> Option<(usize, usize)> {
+    let n = chars.len();
+    let skip_blank = |mut k: usize| {
+        while k < n && matches!(chars[k], ' ' | '\t') {
+            k += 1;
+        }
+        k
+    };
+    let j = skip_blank(j);
+    if chars.get(j) != Some(&'(') {
+        return None;
+    }
+    let close_paren = (j + 1..n)
+        .take_while(|&k| chars[k] != '\n')
+        .find(|&k| chars[k] == ')')?;
+    let cond: String = chars[j + 1..close_paren]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_ascii_lowercase();
+    let rest = cond.strip_prefix("$global")?;
+    let and = rest
+        .strip_prefix(char::is_whitespace)
+        .map(str::trim_start)
+        .and_then(|r| r.strip_prefix("-and"))
+        .is_some_and(|r| r.starts_with(char::is_whitespace));
+    if !(rest.is_empty() || and) {
+        return None;
+    }
+    let banned = ['(', '!', '\'', '"', '`', '|', ';', '{', '}', '#', '@'];
+    if cond.contains(banned) || ["-or", "-xor", "-not"].iter().any(|op| cond.contains(op)) {
+        return None;
+    }
+    let mut k = skip_blank(close_paren + 1);
+    if chars.get(k) == Some(&'\r') {
+        k += 1;
+    }
+    if chars.get(k) == Some(&'\n') {
+        k = skip_blank(k + 1);
+    }
+    if chars.get(k) != Some(&'{') {
+        return None;
+    }
+    let open = k;
+    let mut depth = 0usize;
+    while k < n {
+        let c = chars[k];
+        let prev = k.checked_sub(1).map(|p| chars[p]);
+        match c {
+            '`' => {
+                if matches!(chars.get(k + 1), Some('{' | '}')) {
+                    return None;
+                }
+                k += 2;
+                continue;
+            }
+            '\'' | '"' => {
+                let end = string_end(chars, k)?;
+                if chars[k..end].iter().any(|d| matches!(d, '{' | '}')) {
+                    return None;
+                }
+                k = end;
+                continue;
+            }
+            '@' if here_string_start(chars, k) => return None,
+            '<' if chars.get(k + 1) == Some(&'#') => return None,
+            // `a#b` is a word to pwsh; no guessing about what follows.
+            '#' if prev.is_some_and(continues_word) => return None,
+            '#' => {
+                while k < n && chars[k] != '\n' {
+                    if matches!(chars[k], '{' | '}') {
+                        return None;
+                    }
+                    k += 1;
+                }
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open, k));
+                }
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    None
+}
+
+/// 1-based lines of `text` (comments and here-strings blanked) where the script declares
+/// its own `$global`: `foreach ($global ...`, or a `param(...)` or `function`/`filter`
+/// parameter list naming `$global` (or `${global}`).
+fn own_global_lines(text: &str) -> Vec<usize> {
+    let chars: Vec<char> = text
+        .chars()
+        .filter(|c| *c != '`')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let n = chars.len();
+    let line_at = |k: usize| chars[..k].iter().filter(|c| **c == '\n').count() + 1;
+    let skip_ws = |mut k: usize| {
+        while k < n && chars[k].is_whitespace() {
+            k += 1;
+        }
+        k
+    };
+    // `$global`/`${global}` at `k` (not `$globalx`, not `$global:x`).
+    let global_at = |k: usize| -> bool {
+        let s: String = chars[k..(k + 9).min(n)].iter().collect();
+        s.starts_with("${global}")
+            || (s.starts_with("$global")
+                && chars
+                    .get(k + 7)
+                    .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '_' | ':'))))
+    };
+    // Index of the `)` matching the `(` at `k` (quotes skipped), or the end.
+    let paren_end = |k: usize| -> usize {
+        let mut depth = 0usize;
+        let mut m = k;
+        while m < n {
+            match chars[m] {
+                '\'' | '"' => {
+                    m = string_end(&chars, m).unwrap_or(n);
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return m;
+                    }
+                }
+                _ => {}
+            }
+            m += 1;
+        }
+        n
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        if prev.is_some_and(|p| continues_word(p) || p == '$') {
+            i += 1;
+            continue;
+        }
+        let word_end = (i..n)
+            .find(|&k| !(chars[k].is_alphanumeric() || chars[k] == '_'))
+            .unwrap_or(n);
+        let word: String = chars[i..word_end].iter().collect();
+        let open = match word.as_str() {
+            "foreach" | "param" => Some(skip_ws(word_end)),
+            "function" | "filter" => {
+                // Skip the name (scope prefix included) up to its parameter list.
+                let name = skip_ws(word_end);
+                let after = (name..n)
+                    .find(|&k| chars[k].is_whitespace() || matches!(chars[k], '(' | '{'))
+                    .unwrap_or(n);
+                Some(skip_ws(after))
+            }
+            _ => None,
+        };
+        if let Some(open) = open.filter(|&o| chars.get(o) == Some(&'(')) {
+            let span = if word == "foreach" {
+                let first = skip_ws(open + 1);
+                first..(first + 1).min(n)
+            } else {
+                open + 1..paren_end(open)
+            };
+            if let Some(k) = span.into_iter().find(|&k| chars[k] == '$' && global_at(k)) {
+                out.push(line_at(k));
+            }
+        }
+        i = word_end.max(i + 1);
+    }
+    out
 }
