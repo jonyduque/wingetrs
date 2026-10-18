@@ -32,34 +32,37 @@ pub enum Elevation {
 }
 
 /// Whether an install runs through the elevated helper, from the installer type, its `Scope`
-/// and its `ElevationRequirement` (all comparisons case-insensitive).
+/// and its `ElevationRequirement` (all comparisons case-insensitive). A `user` scope never goes
+/// to the helper, not even with `elevationRequired`: elevated through another account it would
+/// install into the administrator's profile; the installer asks for UAC by itself. An unknown
+/// scope counts as absent.
 pub fn install_elevation(
     kind: &InstallerKind,
     scope: Option<&str>,
     requirement: Option<&str>,
 ) -> Elevation {
     let is = |v: Option<&str>, want: &str| v.is_some_and(|s| s.eq_ignore_ascii_case(want));
+    let user = is(scope, "user");
+    let machine = is(scope, "machine");
     if matches!(kind, InstallerKind::Msix | InstallerKind::Appx) {
         return Elevation::Never;
     }
     if is(requirement, "elevationProhibited") {
         return Elevation::Never;
     }
+    if user {
+        return Elevation::Never;
+    }
     if is(requirement, "elevationRequired") {
         return Elevation::Helper;
     }
-    if is(scope, "user") {
-        return Elevation::Never;
-    }
-    if is(scope, "machine") {
+    if machine {
         return Elevation::Helper;
     }
-    if scope.is_none()
-        && matches!(
-            kind,
-            InstallerKind::Msi | InstallerKind::Wix | InstallerKind::Burn
-        )
-    {
+    if matches!(
+        kind,
+        InstallerKind::Msi | InstallerKind::Wix | InstallerKind::Burn
+    ) {
         return Elevation::Helper;
     }
     // The installer asks for UAC by itself when it needs it.

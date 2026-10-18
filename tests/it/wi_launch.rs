@@ -15,7 +15,8 @@ fn install_elevation_truth_table() {
         (Inno, Some("machine"), None, Helper),
         (Nullsoft, Some("Machine"), Some("elevatesSelf"), Helper),
         (Exe, None, Some("elevatesSelf"), Never),
-        (Exe, Some("user"), Some("elevationRequired"), Helper),
+        // A user scope never goes to the helper, not even with elevationRequired.
+        (Exe, Some("user"), Some("elevationRequired"), Never),
         (Msi, Some("machine"), Some("elevationProhibited"), Never),
         (Msix, Some("machine"), Some("elevationRequired"), Never),
         (Burn, None, None, Helper),
@@ -23,7 +24,14 @@ fn install_elevation_truth_table() {
         // Extra rows: appx like msix, case-insensitive requirement, prohibited beats a
         // missing scope on msi.
         (Appx, Some("machine"), None, Never),
-        (Exe, Some("USER"), Some("ElevationRequired"), Helper),
+        (Exe, Some("USER"), Some("ElevationRequired"), Never),
+        (Exe, None, Some("ElevationRequired"), Helper),
+        (Inno, Some("x"), Some("elevationRequired"), Helper),
+        // An unknown scope counts as absent.
+        (Msi, Some("x"), None, Helper),
+        (Burn, Some(""), None, Helper),
+        (Inno, Some("x"), None, Never),
+        (Exe, Some(""), None, Never),
         (Wix, None, Some("ELEVATIONPROHIBITED"), Never),
         (Exe, None, None, Never),
     ];
