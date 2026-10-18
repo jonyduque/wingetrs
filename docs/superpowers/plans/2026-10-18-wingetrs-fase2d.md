@@ -481,6 +481,8 @@ Testes (`tests/it/wi_fetch.rs`, wiremock servindo os bytes, SHA calculado no tes
 5. `pub fn is_elevated() -> std::io::Result<bool>` (`OpenProcessToken` + `GetTokenInformation(TokenElevation)`); `pub fn msiexec_path() -> std::io::Result<PathBuf>` = `SHGetKnownFolderPath(FOLDERID_System)` + `msiexec.exe` (nunca PATH, nunca `%SystemRoot%`).
 6. Sem features novas do `windows` (as necessárias já estão habilitadas; se faltar alguma, diga qual e por quê).
 
+**Decisão do orquestrador (revisão da 178, 2026-10-18):** escopo `user` nunca vai ao auxiliar, nem com `ElevationRequirement: elevationRequired` (o instalador pede UAC sozinho se precisar); escopo desconhecido conta como ausente.
+
 **Files:**
 - Create: `src/winget_install/launch.rs`, `src/winget_install/launch_win.rs` (já existem com uma linha `//!`)
 - Test: `tests/it/wi_launch.rs` (**já criado pelo orquestrador** com uma linha `//!`; não edite `tests/it/main.rs`)
