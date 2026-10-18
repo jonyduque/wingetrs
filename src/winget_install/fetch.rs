@@ -104,6 +104,33 @@ fn one_component(name: &str) -> bool {
     safe_components(name).is_some_and(|c| c.len() == 1 && c[0] == name)
 }
 
+/// `https`, or plain `http` only to a loopback host (`127.0.0.1`, `::1`, `localhost`) and
+/// without credentials in the URL. Parsed with `reqwest::Url`, never by text prefix.
+fn scheme_allowed(raw: &str) -> bool {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let Ok(u) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    match u.scheme() {
+        "https" => true,
+        "http" => {
+            // `host_str` is already normalized by the parser (lowercase, canonical IPv4,
+            // IPv6 in brackets); IPs are compared as addresses.
+            let host = u.host_str().unwrap_or("");
+            let loopback = host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .is_ok_and(|a| {
+                        a == IpAddr::V4(Ipv4Addr::LOCALHOST) || a == IpAddr::V6(Ipv6Addr::LOCALHOST)
+                    });
+            loopback && u.username().is_empty() && u.password().is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Downloads (or reuses from the cache) the installer, verified against its SHA-256, and
 /// materializes it at `<root>\installers\<id>\<ver>\<id>-<ver>.<ext>`.
 pub async fn fetch_installer(
@@ -114,37 +141,7 @@ pub async fn fetch_installer(
     inst: &EffectiveInstaller,
     progress: Progress<'_>,
 ) -> Result<Materialized, FetchError> {
-    fetch(http, data, id, version, inst, progress, true).await
-}
-
-/// Same as [`fetch_installer`] without the `https://` requirement: only for tests against a
-/// local plain-http mock server (the SHA-256 check still applies).
-#[doc(hidden)]
-pub async fn fetch_installer_allowing_plain_http(
-    http: &Http,
-    data: &DataDir,
-    id: &str,
-    version: &str,
-    inst: &EffectiveInstaller,
-    progress: Progress<'_>,
-) -> Result<Materialized, FetchError> {
-    fetch(http, data, id, version, inst, progress, false).await
-}
-
-async fn fetch(
-    http: &Http,
-    data: &DataDir,
-    id: &str,
-    version: &str,
-    inst: &EffectiveInstaller,
-    progress: Progress<'_>,
-    require_https: bool,
-) -> Result<Materialized, FetchError> {
-    let has_https = inst
-        .url
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("https://"));
-    if require_https && !has_https {
+    if !scheme_allowed(&inst.url) {
         return Err(FetchError::NotHttps(inst.url.clone()));
     }
     let sha = inst.sha256.trim().to_ascii_lowercase();
