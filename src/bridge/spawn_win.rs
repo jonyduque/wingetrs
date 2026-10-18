@@ -1,8 +1,11 @@
 //! Runs winget or scoop with no window and stdin closed, reading stdout and stderr line by line.
 use super::Tail;
+pub use super::utf8_lossy;
+use std::ffi::OsString;
 use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
@@ -106,8 +109,9 @@ fn read_loop(
     pipe: &mut impl Read,
     stop: &AtomicBool,
     tx: &Sender<String>,
+    decode: fn(&[u8]) -> String,
 ) -> std::io::Result<Option<String>> {
-    let mut tail = Tail::new();
+    let mut tail = Tail::with_decoder(decode);
     let mut buf = vec![0u8; CHUNK];
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -136,6 +140,7 @@ fn spawn_reader(
     pipe: impl Read + AsRawHandle + Send + 'static,
     tx: Sender<String>,
     stop: Arc<AtomicBool>,
+    decode: fn(&[u8]) -> String,
 ) -> Reader {
     let raw = pipe.as_raw_handle() as usize;
     let pipe = Arc::new(Mutex::new(pipe));
@@ -143,7 +148,7 @@ fn spawn_reader(
     let thread = std::thread::spawn(move || {
         // Only this thread locks it; the slot just keeps it alive.
         let mut pipe = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        read_loop(&mut *pipe, &stop, &tx)
+        read_loop(&mut *pipe, &stop, &tx, decode)
     });
     Reader {
         thread,
@@ -173,7 +178,7 @@ pub fn run_with_grace(
 ) -> std::io::Result<(i32, Vec<String>)> {
     let mut cmd = Command::new(program);
     cmd.args(args);
-    run_command(cmd, program, grace, on_line)
+    run_command(cmd, program, grace, utf8_lossy, on_line)
 }
 
 /// `run` of the program at the absolute path `program` (no `PATH` search), started in `dir`.
@@ -185,13 +190,59 @@ pub fn run_in(
 ) -> std::io::Result<(i32, Vec<String>)> {
     let mut cmd = Command::new(program);
     cmd.args(args).current_dir(dir);
-    run_command(cmd, &program.display().to_string(), PIPE_GRACE, on_line)
+    run_command(
+        cmd,
+        &program.display().to_string(),
+        PIPE_GRACE,
+        utf8_lossy,
+        on_line,
+    )
+}
+
+/// Everything `run_spec` needs: an absolute program, its arguments and working dir, the
+/// environment changes (applied over the inherited one), the line decoder and the pipe grace.
+pub struct RunSpec<'a> {
+    pub program: &'a Path,
+    pub args: &'a [String],
+    pub dir: &'a Path,
+    pub env: &'a [(OsString, OsString)],
+    pub env_remove: &'a [OsString],
+    pub decode: fn(&[u8]) -> String,
+    pub grace: Duration,
+}
+
+/// `run_in` with environment changes, a byte decoder and a grace. A relative program is
+/// `ErrorKind::InvalidInput` (no `PATH` or current-dir search ever).
+pub fn run_spec(
+    spec: &RunSpec<'_>,
+    on_line: impl FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    if !spec.program.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "caminho do programa precisa ser absoluto",
+        ));
+    }
+    let mut cmd = Command::new(spec.program);
+    cmd.args(spec.args).current_dir(spec.dir);
+    cmd.envs(spec.env.iter().map(|(k, v)| (k, v)));
+    for name in spec.env_remove {
+        cmd.env_remove(name);
+    }
+    run_command(
+        cmd,
+        &spec.program.display().to_string(),
+        spec.grace,
+        spec.decode,
+        on_line,
+    )
 }
 
 fn run_command(
     mut cmd: Command,
     program: &str,
     grace: Duration,
+    decode: fn(&[u8]) -> String,
     mut on_line: impl FnMut(&str),
 ) -> std::io::Result<(i32, Vec<String>)> {
     let mut child = cmd
@@ -206,11 +257,11 @@ fn run_command(
         out: child
             .stdout
             .take()
-            .map(|p| spawn_reader(p, tx.clone(), Arc::clone(&stop))),
+            .map(|p| spawn_reader(p, tx.clone(), Arc::clone(&stop), decode)),
         err: child
             .stderr
             .take()
-            .map(|p| spawn_reader(p, tx.clone(), Arc::clone(&stop))),
+            .map(|p| spawn_reader(p, tx.clone(), Arc::clone(&stop), decode)),
         stop,
     };
     drop(tx);
@@ -279,8 +330,13 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let open = || std::fs::File::open(&file).unwrap();
         let readers = Readers {
-            out: Some(spawn_reader(open(), tx.clone(), Arc::clone(&stop))),
-            err: Some(spawn_reader(open(), tx, Arc::clone(&stop))),
+            out: Some(spawn_reader(
+                open(),
+                tx.clone(),
+                Arc::clone(&stop),
+                utf8_lossy,
+            )),
+            err: Some(spawn_reader(open(), tx, Arc::clone(&stop), utf8_lossy)),
             stop,
         };
         assert_eq!(rx.iter().count(), 2, "both readers sent `a` and ended");
@@ -313,7 +369,7 @@ mod tests {
     fn read_loop_995_without_flag_is_error() {
         let (tx, _rx) = channel();
         let stop = AtomicBool::new(false);
-        let err = read_loop(&mut Failing(OPERATION_ABORTED), &stop, &tx).unwrap_err();
+        let err = read_loop(&mut Failing(OPERATION_ABORTED), &stop, &tx, utf8_lossy).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(OPERATION_ABORTED));
         // A flag set during the read turns the same error into the end.
         struct SetsFlag<'a>(&'a AtomicBool);
@@ -325,7 +381,7 @@ mod tests {
         }
         let stop = AtomicBool::new(false);
         assert!(
-            read_loop(&mut SetsFlag(&stop), &stop, &tx)
+            read_loop(&mut SetsFlag(&stop), &stop, &tx, utf8_lossy)
                 .unwrap()
                 .is_none()
         );
@@ -341,7 +397,11 @@ mod tests {
         }
         let (tx, _rx) = channel();
         let stop = AtomicBool::new(true);
-        assert!(read_loop(&mut Panics, &stop, &tx).unwrap().is_none());
+        assert!(
+            read_loop(&mut Panics, &stop, &tx, utf8_lossy)
+                .unwrap()
+                .is_none()
+        );
     }
 
     static CANCELS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

@@ -504,20 +504,43 @@ pub fn scoop_message(
 
 /// Splits a tool's output into lines and keeps the last `TAIL_LINES` useful ones. A line ends
 /// at `\n`; a trailing `\r` is dropped and only the text after the last `\r` is kept (progress
-/// redrawn in place); blank lines are dropped; bytes are decoded lossily and cut at
-/// `LINE_MAX`. An unterminated line longer than `PARTIAL_MAX` is cut and the rest of it
-/// dropped until the next `\n`, so memory stays bounded.
-#[derive(Debug, Default)]
+/// redrawn in place); blank lines are dropped; bytes are decoded (lossy UTF-8 unless
+/// `with_decoder`) and cut at `LINE_MAX`. An unterminated line longer than `PARTIAL_MAX` is
+/// cut and the rest of it dropped until the next `\n`, so memory stays bounded.
+#[derive(Debug)]
 pub struct Tail {
     lines: VecDeque<String>,
     partial: Vec<u8>,
     /// The current line passed `PARTIAL_MAX`: its bytes are dropped until `\n`.
     skipping: bool,
+    /// Turns one line's raw bytes (without `\r`/`\n`) into text.
+    decode: fn(&[u8]) -> String,
+}
+
+/// Lossy UTF-8: invalid bytes become `U+FFFD`.
+pub fn utf8_lossy(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+impl Default for Tail {
+    fn default() -> Tail {
+        Tail::with_decoder(utf8_lossy)
+    }
 }
 
 impl Tail {
     pub fn new() -> Tail {
         Tail::default()
+    }
+
+    /// A tail whose lines are decoded by `decode` (e.g. an OEM code page) instead of UTF-8.
+    pub fn with_decoder(decode: fn(&[u8]) -> String) -> Tail {
+        Tail {
+            lines: VecDeque::new(),
+            partial: Vec::new(),
+            skipping: false,
+            decode,
+        }
     }
 
     /// Takes the next piece of output; returns the lines it completed, in order.
@@ -584,7 +607,8 @@ impl Tail {
             Some(i) => &raw[i + 1..],
             None => raw,
         };
-        let mut line = String::from_utf8_lossy(seg).trim_end().to_string();
+        let decoded = (self.decode)(seg);
+        let mut line = decoded.trim_end().to_string();
         if line.trim_start().is_empty() {
             return None;
         }
