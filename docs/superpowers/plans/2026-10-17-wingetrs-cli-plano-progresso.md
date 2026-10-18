@@ -104,6 +104,7 @@ Testes (`tests/it/cli_plan_summary.rs`, com `style::with_enabled(false, …)` pa
 - `src/install/executor.rs`: `AwaitWorker` (~:957; o `Drop` espera o worker e só então apaga o staging), `extract_with_msiexec` (~:891, `RemoveWork`), o `started` que vira `INSTALLER_RUNNING`.
 - TUI: a política já existe (`tui/run.rs`): o job de reserva só fica não cancelável a partir do instante em que o `msiexec` arranca (Task 129, `657e155`).
 - `tokio` tem `features = ["full"]` (inclui `signal`).
+- **Desde a Task 141:** o rótulo `INSTALLER_RUNNING` não existe mais. O progresso é `install::progress::ProgressEvent` (`Download` | `Phase(Phase)`), e o `msiexec` começa em `Phase::Installer { log }` (antes dela vêm `WaitingInstaller` e, depois, `Placing`). "Depois do `INSTALLER_RUNNING`" abaixo quer dizer "depois do primeiro `Phase::Installer`". O uninstall emite `Removing`/`Scanning`; Ctrl+C no uninstall segue a regra de cancelar antes de apagar e não interromper a remoção já começada (diga como ficou).
 
 #### What binds this task
 

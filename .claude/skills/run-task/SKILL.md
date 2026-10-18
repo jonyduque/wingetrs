@@ -22,7 +22,7 @@ O orquestrador (sessão principal) **não implementa**. Ele despacha, audita e i
    - `pwsh -File scripts/leftovers.ps1` — processos de agente sobrando (só reporte; encerrar exige pedido do usuário).
 6. **Revisão** (`subagent_type: "rs-reviewer"`): brief + `git show <sha>` + relatório + um "foco extra" escrito por você com os riscos específicos da tarefa (concorrência, arquivos de terceiros, equivalência entre caminhos, dados reais).
 7. **Correção:** só Critical/Important, mais Minors baratos que protegem tarefa futura. Reenvie ao **mesmo** implementador (SendMessage) a lista exata, com o teste literal quando possível. Achado que não se sustenta: recuse com a evidência (ex.: CRLF "faltando" que estava lá).
-8. **Ledger:** uma linha em `.claude/tasks/progress.md` com o que a revisão achou (é o que alimenta `docs/ARMADILHAS.md`). Commit do ledger + base + relatório com `git commit -- <arquivos>`.
+8. **Ledger:** uma linha em `.claude/tasks/progress.md` com o que a revisão achou (é o que alimenta `docs/ARMADILHAS.md`). Commit do ledger + base + relatório com `git add` dos dois novos (base e relatório nunca foram rastreados; sem isso o `git commit -- <arquivos>` falha com "pathspec did not match") e `git commit -- <arquivos>`.
 9. **Lição nova?** Se um defeito escapou do implementador e só a revisão pegou, pergunte: qual instrumento deixaria isso impossível? (regra em `check_rules.ps1`, item em `ARMADILHAS.md`, regra no `CLAUDE.md`, seção no `_common.md`). Faça isso **antes** da próxima tarefa e prove o instrumento (plante a violação, veja o gate falhar, restaure).
 
 ## Paralelismo
