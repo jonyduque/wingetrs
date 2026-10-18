@@ -206,11 +206,8 @@ fn planner_refuses_each_2c_key_with_old_text() {
             format!("não suportado: usa {k} (PowerShell/instalador próprio): suportado na fase 2c")
         );
     }
-    let e = plan(&ok(r#","innosetup":true"#)).unwrap_err();
-    assert_eq!(
-        e.to_string(),
-        "não suportado: usa innosetup: suportado na fase 2c"
-    );
+    // `innosetup` is planned since Task 147 (extracted through innounp).
+    assert!(plan(&ok(r#","innosetup":true"#)).is_ok());
 }
 
 #[test]

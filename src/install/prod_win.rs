@@ -8,8 +8,9 @@ use crate::catalog::Catalog;
 use crate::http::Http;
 use crate::install::download::Progress;
 use crate::install::env_win::RegEnvStore;
-use crate::install::executor::Msiexec;
+use crate::install::executor::{Msiexec, Runners};
 use crate::install::fs_win;
+use crate::install::inno_win;
 use crate::install::msiexec_win;
 use crate::install::ops::{OpsCtx, ResidueScan, installed_by_scoop};
 use crate::install::registry_win::RegScanner;
@@ -62,14 +63,17 @@ pub fn build_ctx<'a>(
     progress: Progress<'a>,
 ) -> OpsCtx<'a> {
     // Under test nothing real is scanned, and `msiexec` never runs.
-    let (residue, msiexec) = if std::env::var_os("WINGETRS_TEST_ENV_KEY").is_some() {
-        (ResidueScan::none(), Msiexec::DISABLED)
+    let (residue, msiexec, runners) = if std::env::var_os("WINGETRS_TEST_ENV_KEY").is_some() {
+        (ResidueScan::none(), Msiexec::DISABLED, Runners::disabled())
     } else {
         (
             ResidueScan::user_profile(&link_target, &installed_by_scoop),
             Msiexec {
                 busy: msiexec_win::installer_busy,
                 launch: msiexec_win::msiexec_admin,
+            },
+            Runners {
+                innounp: inno_win::run,
             },
         )
     };
@@ -84,5 +88,6 @@ pub fn build_ctx<'a>(
         residue,
         msiexec,
         launch: Default::default(),
+        runners,
     }
 }

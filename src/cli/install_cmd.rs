@@ -937,6 +937,7 @@ mod tests {
             residue: ResidueScan::none(),
             msiexec: crate::install::executor::Msiexec::DISABLED,
             launch: Default::default(),
+            runners: crate::install::executor::Runners::disabled(),
         };
         let res = |name: &str, confidence, preselected| Residue {
             kind: ResidueKind::Folder {

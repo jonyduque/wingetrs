@@ -618,7 +618,7 @@ fn rename_retrying(from: &Path, to: &Path) -> Result<(), ExtractError> {
 }
 
 /// Moves the contents of `src` into `dest`, merging with existing directories.
-fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
+pub(crate) fn merge_into(src: &Path, dest: &Path) -> Result<(), ExtractError> {
     if !dest.exists() {
         return rename_retrying(src, dest);
     }

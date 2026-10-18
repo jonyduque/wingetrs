@@ -59,6 +59,10 @@ pub enum Step {
     Extract {
         index: usize,
     },
+    /// Source `index` is an Inno Setup installer (`innosetup: true`), unpacked by innounp.
+    ExtractInno {
+        index: usize,
+    },
     Promote,
     Persist(PersistSpec),
     LinkCurrent,
@@ -253,6 +257,27 @@ impl InstallPlan {
                     }
                 }
                 format!("{verb} {name} para {}{extra}", dest.display())
+            }
+            Step::ExtractInno { index } => {
+                let mut dest = staging.clone();
+                let mut name = format!("[{}]", index + 1);
+                let mut extra = String::new();
+                if let Some(src) = self.source(*index) {
+                    name = format!("[{}] {}", index + 1, src.file_name);
+                    let to = src.extract_to.as_deref();
+                    dest.extend(
+                        to.and_then(crate::install::safepath::safe_components)
+                            .into_iter()
+                            .flatten(),
+                    );
+                    if let Some(dir) = &src.extract_dir {
+                        extra = format!(" (só {dir})");
+                    }
+                }
+                format!(
+                    "Extrair {name} (Inno Setup, com o innounp) para {}{extra}",
+                    dest.display()
+                )
             }
             Step::Promote => format!("Mover {} para {}", staging.display(), version_dir.display()),
             Step::Persist(p) => {

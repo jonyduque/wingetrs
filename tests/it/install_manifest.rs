@@ -279,8 +279,8 @@ fn bin_with_three_and_two_elements_is_unchanged() {
 }
 
 #[test]
-fn innosetup_points_to_phase_2c() {
+fn innosetup_is_no_longer_refused() {
+    // Task 147: `innosetup` installs through innounp.
     let json = r#"{"version":"1","url":"https://x/a.exe","hash":"0000000000000000000000000000000000000000000000000000000000000000","innosetup":true}"#;
-    let reason = refusal(json).unwrap();
-    assert!(reason.contains("fase 2c"), "{reason}");
+    assert_eq!(refusal(json), None);
 }

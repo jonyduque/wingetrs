@@ -173,6 +173,7 @@ impl World {
             in_use: &nothing_in_use,
             msiexec: None,
             launch: Default::default(),
+            runners: wingetrs::install::executor::Runners::disabled(),
         }
     }
 

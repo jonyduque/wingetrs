@@ -214,11 +214,6 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
     if m.uninstaller.is_some() {
         return refuse("uninstaller");
     }
-    if m.innosetup {
-        return Err(PlanError::Unsupported(
-            "usa innosetup: suportado na fase 2c".into(),
-        ));
-    }
     Ok(())
 }
 
@@ -249,8 +244,14 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
             source: source.clone(),
         });
     }
-    for index in 0..m.sources.len() {
-        steps.push(Step::Extract { index });
+    for (index, source) in m.sources.iter().enumerate() {
+        // Like scoop's Invoke-Extraction: innounp only for the `.exe` sources.
+        let inno = m.innosetup && source.file_name.to_lowercase().ends_with(".exe");
+        steps.push(if inno {
+            Step::ExtractInno { index }
+        } else {
+            Step::Extract { index }
+        });
     }
     steps.push(Step::Promote);
     for p in &m.persist {

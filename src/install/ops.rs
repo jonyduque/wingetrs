@@ -126,6 +126,8 @@ pub struct OpsCtx<'a> {
     pub msiexec: Msiexec,
     /// Shared with every executor of this context: the CLI cancels through it.
     pub launch: executor::LaunchGate,
+    /// External tools (innounp); `Runners::disabled()` under test.
+    pub runners: executor::Runners,
 }
 
 /// Which apps of an `apply` may fall back to `msiexec /a` (CLI `--allow-msiexec`: all; TUI:
@@ -283,6 +285,7 @@ fn exec_ctx<'a>(
         in_use: ctx.in_use,
         msiexec,
         launch: ctx.launch.clone(),
+        runners: ctx.runners.clone(),
     }
 }
 

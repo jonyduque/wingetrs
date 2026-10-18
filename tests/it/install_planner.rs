@@ -43,6 +43,7 @@ fn step_order_is_the_executor_contract() {
             Step::EnsureLauncher => "launcher",
             Step::Download { .. } => "download",
             Step::Extract { .. } => "extract",
+            Step::ExtractInno { .. } => "extract_inno",
             Step::Promote => "promote",
             Step::Persist(_) => "persist",
             Step::LinkCurrent => "current",

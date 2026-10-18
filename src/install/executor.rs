@@ -16,6 +16,7 @@ use crate::fs_retry;
 use crate::http::Http;
 use crate::install::download::{self, Progress};
 use crate::install::layout::Layout;
+use crate::install::manifest::Source;
 use crate::install::msi_queue::{self, Attempt};
 use crate::install::plan::{
     InstallPlan, PersistKind, PersistSpec, ShimSpec, ShortcutSpec, Step, UninstallPlan,
@@ -23,7 +24,7 @@ use crate::install::plan::{
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
-use crate::install::{extract, link, path_edit, safepath, shim, state};
+use crate::install::{extract, inno, link, path_edit, safepath, shim, state};
 
 pub trait StepHook: Send + Sync {
     fn before(&self, index: usize, step: &Step) -> Result<(), ExecError>;
@@ -72,6 +73,28 @@ impl Msiexec {
     };
 }
 
+/// `(exe, args, dir)` → exit code and decoded output lines.
+pub type ToolRun = fn(&Path, &[String], &Path) -> io::Result<(i32, Vec<String>)>;
+
+/// External tools the executor runs, injected like [`Msiexec`]. Production: `inno_win::run`.
+#[derive(Debug, Clone)]
+pub struct Runners {
+    pub innounp: ToolRun,
+}
+
+fn refuse_innounp(_: &Path, _: &[String], _: &Path) -> io::Result<(i32, Vec<String>)> {
+    Err(io::Error::other("innounp desativado neste ambiente"))
+}
+
+impl Runners {
+    /// Runs nothing (non-Windows, tests, `WINGETRS_TEST_ENV_KEY`).
+    pub fn disabled() -> Runners {
+        Runners {
+            innounp: refuse_innounp,
+        }
+    }
+}
+
 pub struct ExecCtx<'a> {
     pub layout: &'a Layout,
     pub data: &'a DataDir,
@@ -86,6 +109,7 @@ pub struct ExecCtx<'a> {
     pub msiexec: Option<Msiexec>,
     /// Who came first: the launch of `msiexec` or a cancellation (see [`LaunchGate`]).
     pub launch: LaunchGate,
+    pub runners: Runners,
 }
 
 /// The one decision between launching `msiexec` and cancelling the install: whichever
@@ -271,6 +295,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::EnsureLauncher => "launcher",
         Step::Download { .. } => "download",
         Step::Extract { .. } => "extract",
+        Step::ExtractInno { .. } => "extract_inno",
         Step::Promote => "promote",
         Step::Persist(_) => "persist",
         Step::LinkCurrent => "link",
@@ -299,6 +324,13 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
             }),
             _ => None,
         }),
+        Step::ExtractInno { index } => plan.steps.iter().find_map(|s| match s {
+            Step::Download { index: i, source } if i == index => Some(Phase::Extracting {
+                file: source.file_name.clone(),
+                engine: "Inno Setup".into(),
+            }),
+            _ => None,
+        }),
         Step::Promote | Step::Persist(_) => Some(Phase::Placing),
         Step::LinkCurrent
         | Step::Shim(_)
@@ -316,6 +348,7 @@ fn step_label(step: &Step) -> String {
         Step::EnsureLauncher => "lançador".into(),
         Step::Download { index, .. } => format!("baixar [{}]", index + 1),
         Step::Extract { index } => format!("extrair [{}]", index + 1),
+        Step::ExtractInno { index } => format!("extrair [{}] (Inno Setup)", index + 1),
         Step::Promote => "promover versão".into(),
         Step::Persist(p) => format!("persistir {}", p.in_version.display()),
         Step::LinkCurrent => "apontar current".into(),
@@ -699,6 +732,96 @@ fn remove_old_version(layout: &Layout, app: &str, new: &str, old: &str) -> Resul
     not_found_ok(remove_any(&dir)).map_err(|e| io_msg(&dir, e))
 }
 
+/// The source of extraction step `index` and its downloaded file.
+fn extract_source<'p>(run: &Run<'p>, index: usize) -> Result<(&'p Source, PathBuf), String> {
+    let source = run
+        .plan
+        .steps
+        .iter()
+        .find_map(|s| match s {
+            Step::Download { index: i, source } if *i == index => Some(source),
+            _ => None,
+        })
+        .ok_or_else(|| format!("fonte [{}] sem download no plano", index + 1))?;
+    let file = run
+        .downloads
+        .get(&index)
+        .cloned()
+        .ok_or_else(|| format!("fonte [{}] não baixada", index + 1))?;
+    Ok((source, file))
+}
+
+/// The staging folder, made fresh and journaled by the first extraction step of the run.
+fn own_staging(
+    run: &mut Run<'_>,
+    layout: &Layout,
+    app: &str,
+    version: &str,
+) -> Result<PathBuf, String> {
+    let staging = layout.staging_dir(app, version);
+    let owned = run
+        .journal
+        .iter()
+        .any(|(_, u)| matches!(u, Undo::RemovePath(p) if *p == staging));
+    if !owned {
+        // A staging folder left by a crashed run is garbage of ours.
+        not_found_ok(remove_any(&staging)).map_err(|e| io_msg(&staging, e))?;
+        // So is what a killed run left beside it (`msiexec` work, extraction temps).
+        remove_dead_run_leftovers(&layout.app_dir(app));
+        run.ensure_dirs(&layout.app_dir(app))?;
+        run.push(Undo::RemovePath(staging.clone()));
+    }
+    Ok(staging)
+}
+
+/// Runs innounp on `installer` into the fresh folder `tmp` (inside the staging folder) and
+/// moves what it wrote into `<staging>\<extract_to>`. The caller removes `tmp` on error.
+fn inno_extract(
+    runner: ToolRun,
+    exe: &Path,
+    installer: &Path,
+    extract_dir: Option<&str>,
+    extract_to: Option<&str>,
+    tmp: &Path,
+) -> Result<(), extract::ExtractError> {
+    use extract::ExtractError;
+    let io_err = |p: &Path, e: io::Error| ExtractError::Io(io_msg(p, e));
+    let staging = tmp
+        .parent()
+        .ok_or_else(|| ExtractError::Io(format!("{} sem pasta-mãe", tmp.display())))?;
+    let to = extract_to
+        .map(extract::safe_components)
+        .transpose()?
+        .unwrap_or_default();
+    // `extract_to` inside the temp folder itself would merge it into itself.
+    let tmp_name = tmp.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if to.first().is_some_and(|c| c.eq_ignore_ascii_case(tmp_name)) {
+        return Err(ExtractError::UnsafePath(
+            extract_to.unwrap_or_default().to_string(),
+        ));
+    }
+    let args = inno::inno_args(installer, tmp, extract_dir)?;
+    not_found_ok(remove_any(tmp)).map_err(|e| io_err(tmp, e))?;
+    fs::create_dir_all(tmp).map_err(|e| io_err(tmp, e))?;
+    let (code, lines) = match extract::catch_decoder(|| runner(exe, &args, tmp)) {
+        Ok(r) => r.map_err(|e| ExtractError::Io(format!("innounp: {e}")))?,
+        Err(p) => {
+            return Err(ExtractError::Decoder(
+                crate::install::extract_7z::panic_message(p.as_ref()),
+            ));
+        }
+    };
+    let files = inno::count_files(tmp).map_err(|e| io_err(tmp, e))?;
+    inno::check_exit(code, files, extract_dir, &lines)?;
+    let mut dest = staging.to_path_buf();
+    dest.extend(&to);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    extract::merge_into(tmp, &dest)?;
+    not_found_ok(remove_any(tmp)).map_err(|e| io_err(tmp, e))
+}
+
 async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
     let plan = run.plan;
     let layout = ctx.layout;
@@ -734,32 +857,8 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             Ok(())
         }
         Step::Extract { index } => {
-            let source = plan
-                .steps
-                .iter()
-                .find_map(|s| match s {
-                    Step::Download { index: i, source } if i == index => Some(source),
-                    _ => None,
-                })
-                .ok_or_else(|| format!("fonte [{}] sem download no plano", index + 1))?;
-            let file = run
-                .downloads
-                .get(index)
-                .cloned()
-                .ok_or_else(|| format!("fonte [{}] não baixada", index + 1))?;
-            let staging = layout.staging_dir(app, version);
-            let owned = run
-                .journal
-                .iter()
-                .any(|(_, u)| matches!(u, Undo::RemovePath(p) if *p == staging));
-            if !owned {
-                // A staging folder left by a crashed run is garbage of ours.
-                not_found_ok(remove_any(&staging)).map_err(|e| io_msg(&staging, e))?;
-                // So is what a killed run left beside it (`msiexec` work, extraction temps).
-                remove_dead_run_leftovers(&layout.app_dir(app));
-                run.ensure_dirs(&layout.app_dir(app))?;
-                run.push(Undo::RemovePath(staging.clone()));
-            }
+            let (source, file) = extract_source(run, *index)?;
+            let staging = own_staging(run, layout, app, version)?;
             // Phases of the `msiexec /a` fallback (waiting, each launch, importing).
             let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<Phase>();
             // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
@@ -817,6 +916,52 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                     run.needs_msiexec = Some((*index, reason));
                     Err(message)
                 }
+                Err(e) => match e.try_into_panic() {
+                    // Re-raised by `execute_install` once the staging folder is rolled back.
+                    Ok(p) => {
+                        run.panic = Some(p);
+                        Err("pânico na extração".to_string())
+                    }
+                    Err(e) => Err(e.to_string()),
+                },
+            };
+            tracing::info!(
+                ms = start.elapsed().as_millis() as u64,
+                ok = result.is_ok(),
+                "extração de {} terminada",
+                source.file_name
+            );
+            result
+        }
+        Step::ExtractInno { index } => {
+            let (source, file) = extract_source(run, *index)?;
+            let exe = layout.current("innounp").join("innounp.exe");
+            if !exe.is_file() {
+                return Err("innounp não está instalado (auxiliar do bucket main)".into());
+            }
+            let staging = own_staging(run, layout, app, version)?;
+            let work = {
+                let runner = ctx.runners.innounp;
+                let (dir, to) = (source.extract_dir.clone(), source.extract_to.clone());
+                let (staging, index) = (staging.clone(), *index);
+                move || {
+                    let tmp = staging.join(format!(".inno-{index}"));
+                    let r = inno_extract(runner, &exe, &file, dir.as_deref(), to.as_deref(), &tmp);
+                    if r.is_err()
+                        && let Err(e) = not_found_ok(remove_any(&tmp))
+                    {
+                        tracing::warn!("{}: {e}", tmp.display());
+                    }
+                    r.map_err(|e| e.to_string())
+                }
+            };
+            tracing::info!("extraindo {} com o innounp", source.file_name);
+            let start = Instant::now();
+            let result = match AwaitWorker::spawn(work, staging, ctx.launch.clone())
+                .join()
+                .await
+            {
+                Ok(r) => r,
                 Err(e) => match e.try_into_panic() {
                     // Re-raised by `execute_install` once the staging folder is rolled back.
                     Ok(p) => {
