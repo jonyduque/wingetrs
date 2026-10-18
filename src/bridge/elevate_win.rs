@@ -585,8 +585,17 @@ impl super::worker::WorkerOps for SystemOps {
         crate::winget_install::launch_win::msiexec_path()
     }
 
-    fn run_uninstaller(&mut self, program: &Path, args: &str) -> std::io::Result<i32> {
-        super::arp_ops_win::run_uninstaller(program, args)
+    fn long_path(&self, path: &Path) -> std::io::Result<PathBuf> {
+        super::arp_ops_win::long_path(path)
+    }
+
+    fn run_uninstaller(
+        &mut self,
+        program: &Path,
+        args: &str,
+        also_checked: &[PathBuf],
+    ) -> std::io::Result<i32> {
+        super::arp_ops_win::run_uninstaller(program, args, also_checked)
     }
 
     fn delete_arp_key(

@@ -14,16 +14,19 @@ pub struct KnownFolders {
     pub program_files_x86: PathBuf,
     pub system_root: PathBuf,
     pub program_data: PathBuf,
+    /// The folder of the users' profiles (`C:\Users`): always user-writable below.
+    pub user_profiles: PathBuf,
 }
 
 /// Folders under `system_root` that a standard user may create files in.
-const USER_WRITABLE_UNDER_WINDOWS: [&str; 6] = [
+const USER_WRITABLE_UNDER_WINDOWS: [&str; 7] = [
     "Temp",
     "Tasks",
     "tracing",
     r"System32\Tasks",
-    r"System32\spool",
+    r"System32\spool\drivers\color",
     r"SysWOW64\Tasks",
+    r"Registration\CRMLog",
 ];
 
 /// The value of one `%name%` from the known folders; `None` for any other variable.
@@ -106,6 +109,87 @@ pub fn arg_paths(args: &str) -> Vec<String> {
     out
 }
 
+/// Whether `p` is refused before any ACL is read: not an absolute path on a drive (`X:\`),
+/// with `.`/`..` or a name ending in a dot or space, or under a folder users can always write
+/// (the profiles folder, `Windows\Temp` and the like). Anything else is decided by the real
+/// owner and DACL of the file and its folders.
+pub fn refused_location(p: &Path, k: &KnownFolders) -> bool {
+    let disk = matches!(
+        p.components().next(),
+        Some(Component::Prefix(x)) if matches!(x.kind(), std::path::Prefix::Disk(_))
+    );
+    let Some(parts) = plain_components(p).filter(|_| disk) else {
+        return true;
+    };
+    under(&parts, &k.user_profiles)
+        || USER_WRITABLE_UNDER_WINDOWS
+            .iter()
+            .any(|rel| under(&parts, &k.system_root.join(rel)))
+}
+
+/// Whether `p` lies inside `Program Files` or `Program Files (x86)` (by known folder).
+pub fn in_program_files(p: &Path, k: &KnownFolders) -> bool {
+    let Some(parts) = plain_components(p) else {
+        return false;
+    };
+    !refused_location(p, k)
+        && !under(&parts, &k.system_root)
+        && [&k.program_files, &k.program_files_x86]
+            .iter()
+            .any(|root| under(&parts, root))
+}
+
+/// Whether a token of a command line names one of `interpreters` (`cmd`, `cmd.exe` or a path
+/// ending in either; quotes ignored, any case).
+pub fn names_interpreter(args: &str, interpreters: &[&str]) -> bool {
+    args.split(|c: char| c.is_whitespace() || matches!(c, '"' | ','))
+        .filter(|t| !t.is_empty())
+        .any(|t| {
+            let file = t
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(t)
+                .to_ascii_lowercase();
+            let stem = file.strip_suffix(".exe").unwrap_or(&file);
+            interpreters
+                .iter()
+                .any(|i| i.strip_suffix(".exe").unwrap_or(i) == stem)
+        })
+}
+
+/// Whether `p` is the system's own `rundll32.exe` (`System32` or `SysWOW64`).
+pub fn is_system_rundll32(p: &Path, k: &KnownFolders) -> bool {
+    let Some(parts) = plain_components(p) else {
+        return false;
+    };
+    ["System32", "SysWOW64"].iter().any(|dir| {
+        plain_components(&k.system_root.join(dir).join("rundll32.exe")).as_ref() == Some(&parts)
+    })
+}
+
+/// The only `rundll32` form the helper runs: `"<dll>",<Export> [args]`, the DLL quoted and
+/// ending in `.dll`, the export a plain name. `(dll, export, rest)`; `None` for any other form.
+pub fn parse_rundll32(args: &str) -> Option<(String, String, String)> {
+    let body = args.trim().strip_prefix('"')?;
+    let close = body.find('"')?;
+    let dll = &body[..close];
+    let after = body[close + 1..].strip_prefix(',')?;
+    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+    let export = &after[..end];
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '#');
+    if dll.is_empty() || !dll.to_ascii_lowercase().ends_with(".dll") || export.is_empty() {
+        return None;
+    }
+    if !export.chars().all(plain) {
+        return None;
+    }
+    Some((
+        dll.to_string(),
+        export.to_string(),
+        after[end..].trim().to_string(),
+    ))
+}
+
 /// Whether every absolute path in `args` (see `arg_paths`) is in an administrator folder.
 pub fn args_in_admin_folder(args: &str, k: &KnownFolders) -> bool {
     arg_paths(args)
@@ -155,6 +239,32 @@ fn trusted_sid(sid: &str) -> bool {
     let sid = sid.trim();
     ["SY", "S-1-5-18", "BA", "S-1-5-32-544", "OW", "S-1-3-4"].contains(&sid)
         || sid.eq_ignore_ascii_case(TRUSTED_INSTALLER)
+}
+
+/// An ACE trustee that no user token carries: a trusted SID, CREATOR OWNER (outside an
+/// inherit-only ACE it matches nobody) or a service SID (`NT SERVICE\…` `S-1-5-80-…`,
+/// restricted services `S-1-5-99-…`), which only service tokens hold.
+fn no_user_trustee(sid: &str) -> bool {
+    let sid = sid.trim();
+    trusted_sid(sid)
+        || ["CO", "S-1-3-0"].contains(&sid)
+        || sid.starts_with("S-1-5-80-")
+        || sid.starts_with("S-1-5-99-")
+}
+
+/// The index of the `)` closing a `(` already consumed, counting nested parentheses (the
+/// condition of a callback ACE).
+fn closing_paren(body: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, c) in body.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(i),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// An SDDL access mask (`0x...` or two-letter codes); `None` for a code not known here.
@@ -244,7 +354,7 @@ pub fn sddl_admin_only(sddl: &str, level: AclLevel) -> bool {
     let bad = dangerous(level);
     let mut rest = &dacl[open..];
     while let Some(body) = rest.strip_prefix('(') {
-        let Some(close) = body.find(')') else {
+        let Some(close) = closing_paren(body) else {
             return false;
         };
         let fields: Vec<&str> = body[..close].split(';').collect();
@@ -264,7 +374,7 @@ pub fn sddl_admin_only(sddl: &str, level: AclLevel) -> bool {
         let Some(mask) = sddl_rights(rights) else {
             return false;
         };
-        if mask & bad != 0 && !trusted_sid(sid) {
+        if mask & bad != 0 && !no_user_trustee(sid) {
             return false;
         }
     }
@@ -285,10 +395,7 @@ pub fn in_admin_folder(p: &Path, k: &KnownFolders) -> bool {
     let Some(parts) = plain_components(p) else {
         return false;
     };
-    if USER_WRITABLE_UNDER_WINDOWS
-        .iter()
-        .any(|rel| under(&parts, &k.system_root.join(rel)))
-    {
+    if refused_location(p, k) {
         return false;
     }
     [

@@ -7,8 +7,8 @@ use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
 use crate::installed::guid::pack_guid;
 use crate::winget_install::elevated_rules::{
-    KnownFolders, args_in_admin_folder, elevated_duplicate, expand_known, in_admin_folder,
-    still_orphan,
+    KnownFolders, args_in_admin_folder, elevated_duplicate, expand_known, in_program_files,
+    is_system_rundll32, names_interpreter, parse_rundll32, refused_location, still_orphan,
 };
 use crate::winget_install::uninstall_cmd::{ArpDetails, Rule, uninstall_command, valid_arp_key};
 use serde::de::DeserializeOwned;
@@ -524,8 +524,20 @@ pub trait WorkerOps {
     fn msiexec(&self) -> std::io::Result<PathBuf> {
         Err(unsupported())
     }
-    /// Runs an uninstaller the helper already checked; its exit code.
-    fn run_uninstaller(&mut self, _program: &Path, _args: &str) -> std::io::Result<i32> {
+    /// The long form of `path` (8.3 names expanded); an error when it does not exist. By
+    /// default `path` itself.
+    fn long_path(&self, path: &Path) -> std::io::Result<PathBuf> {
+        Ok(path.to_path_buf())
+    }
+    /// Runs an uninstaller the helper already checked, once `program` and every file in
+    /// `also_checked` (a DLL it loads) and all their folders pass the real owner/DACL check and
+    /// are held; its exit code.
+    fn run_uninstaller(
+        &mut self,
+        _program: &Path,
+        _args: &str,
+        _also_checked: &[PathBuf],
+    ) -> std::io::Result<i32> {
         Err(unsupported())
     }
     /// Opens the ARP key `key` once, with the view of `hive` and as itself (a registry link is
@@ -839,6 +851,8 @@ pub const KEY_CHANGED: &str = "a chave mudou desde a confirmação";
 pub const OUTSIDE_ADMIN: &str = "desinstalador fora de pasta de administrador";
 /// Answer when the uninstaller is a shell or script host.
 pub const INTERPRETER: &str = "desinstalador por interpretador recusado";
+/// Answer when a `rundll32` line is not `"<dll>",<Export>` with an acceptable DLL.
+pub const RUNDLL32_REFUSED: &str = "linha do rundll32 recusada";
 /// Answer when an `msiexec` line is not `/x{GUID}` with quiet switches only.
 pub const MSIEXEC_REFUSED: &str = "parâmetros do msiexec recusados";
 
@@ -936,18 +950,77 @@ pub fn msiexec_uninstall_args(args: &str) -> Option<String> {
     Some(out)
 }
 
+/// What runs an uninstall, as checked by `uninstall_plan`.
+struct UninstallPlan {
+    program: PathBuf,
+    args: String,
+    /// Other files the program loads (a `rundll32` DLL), checked like the program.
+    also_checked: Vec<PathBuf>,
+}
+
+fn not_found(path: &Path) -> Reply {
+    Reply::Error {
+        message: format!("desinstalador não encontrado: {}", path.display()),
+        not_found: true,
+    }
+}
+
+/// `raw` (as written in the registry) expanded with the known folders and its 8.3 names, when
+/// it passes `refused_location` before and after; `Err(None)` refused, `Err(Some(_))` missing.
+fn located(ops: &dyn WorkerOps, raw: &str, k: &KnownFolders) -> Result<PathBuf, Option<Reply>> {
+    let path = expand_known(raw.trim(), k).map(PathBuf::from).ok_or(None)?;
+    if refused_location(&path, k) {
+        return Err(None);
+    }
+    let long = ops.long_path(&path).map_err(|_| Some(not_found(&path)))?;
+    if refused_location(&long, k) {
+        return Err(None);
+    }
+    Ok(long)
+}
+
+/// The checked `rundll32` arguments: the DLL located like a program, inside Program Files (never
+/// a system DLL), existing; the rest names no interpreter and every absolute path in it is in an
+/// administrator folder. `(args rebuilt, dll)`.
+fn rundll32_args(
+    ops: &dyn WorkerOps,
+    args: &str,
+    k: &KnownFolders,
+) -> Result<(String, PathBuf), Reply> {
+    let (dll, export, rest) = parse_rundll32(args).ok_or_else(|| refusal(RUNDLL32_REFUSED))?;
+    let dll = located(ops, &dll, k).map_err(|e| e.unwrap_or_else(|| refusal(RUNDLL32_REFUSED)))?;
+    // System DLLs export generic launchers (`shell32,ShellExec_RunDLL`, `url,FileProtocolHandler`,
+    // `advpack`, `setupapi`, ...): only an application's own DLL under Program Files.
+    if !in_program_files(&dll, k) {
+        return Err(refusal(RUNDLL32_REFUSED));
+    }
+    if !ops.exists(&dll) {
+        return Err(not_found(&dll));
+    }
+    if names_interpreter(&rest, &INTERPRETERS) {
+        return Err(refusal(INTERPRETER));
+    }
+    if !args_in_admin_folder(&rest, k) {
+        return Err(refusal(ARG_OUTSIDE_ADMIN));
+    }
+    let args = format!("\"{}\",{export} {rest}", dll.display());
+    Ok((args.trim_end().to_string(), dll))
+}
+
 /// The program and arguments that uninstall `key`, checked as the helper requires: the rule
 /// recomputed from the key as it is now equals `rule`; `msiexec` is the system one with
-/// `/x{GUID}`; anything else is an existing absolute `.exe` in an administrator folder,
-/// expanded with the known folders only, not a shell or script host, and every absolute path in
-/// its arguments is in an administrator folder too.
+/// `/x{GUID}`; anything else is an existing absolute `.exe` (known folders and 8.3 names
+/// expanded) outside the always user-writable places, not a shell or script host (the system
+/// `rundll32` only as `"<dll>",<Export>`), with every absolute path in its arguments in an
+/// administrator folder. The real owner/DACL check of the files and their folders is the
+/// runner's (`WorkerOps::run_uninstaller`).
 fn uninstall_plan(
     ops: &mut dyn WorkerOps,
     hive: MachineHive,
     key: &str,
     rule: Rule,
     nsis_hint: bool,
-) -> Result<(PathBuf, String), Reply> {
+) -> Result<UninstallPlan, Reply> {
     if !valid_arp_key(key) {
         return Err(refusal(BAD_KEY));
     }
@@ -961,28 +1034,37 @@ fn uninstall_plan(
     if is_msiexec(&cmd.program) {
         let args = msiexec_uninstall_args(&cmd.args).ok_or_else(|| refusal(MSIEXEC_REFUSED))?;
         let msiexec = ops.msiexec().map_err(|e| failure(&e))?;
-        return Ok((msiexec, args));
-    }
-    let k = ops.known_folders().map_err(|e| failure(&e))?;
-    let program = Some(cmd.program.trim())
-        .filter(|p| p.to_ascii_lowercase().ends_with(".exe"))
-        .and_then(|p| expand_known(p, &k))
-        .map(PathBuf::from)
-        .filter(|p| in_admin_folder(p, &k))
-        .ok_or_else(|| refusal(OUTSIDE_ADMIN))?;
-    if INTERPRETERS.contains(&program_file(&cmd.program).as_str()) {
-        return Err(refusal(INTERPRETER));
-    }
-    if !args_in_admin_folder(&cmd.args, &k) {
-        return Err(refusal(ARG_OUTSIDE_ADMIN));
-    }
-    if !ops.exists(&program) {
-        return Err(Reply::Error {
-            message: format!("desinstalador não encontrado: {}", program.display()),
-            not_found: true,
+        return Ok(UninstallPlan {
+            program: msiexec,
+            args,
+            also_checked: Vec::new(),
         });
     }
-    Ok((program, cmd.args))
+    let k = ops.known_folders().map_err(|e| failure(&e))?;
+    if !cmd.program.trim().to_ascii_lowercase().ends_with(".exe") {
+        return Err(refusal(OUTSIDE_ADMIN));
+    }
+    let program =
+        located(ops, &cmd.program, &k).map_err(|e| e.unwrap_or_else(|| refusal(OUTSIDE_ADMIN)))?;
+    let file = program_file(&program.to_string_lossy());
+    let (args, also_checked) = if file == "rundll32.exe" && is_system_rundll32(&program, &k) {
+        let (args, dll) = rundll32_args(ops, &cmd.args, &k)?;
+        (args, vec![dll])
+    } else if INTERPRETERS.contains(&file.as_str()) {
+        return Err(refusal(INTERPRETER));
+    } else if !args_in_admin_folder(&cmd.args, &k) {
+        return Err(refusal(ARG_OUTSIDE_ADMIN));
+    } else {
+        (cmd.args, Vec::new())
+    };
+    if !ops.exists(&program) {
+        return Err(not_found(&program));
+    }
+    Ok(UninstallPlan {
+        program,
+        args,
+        also_checked,
+    })
 }
 
 /// `RunUninstaller`: runs the checked uninstaller (see `uninstall_plan`) and answers its exit
@@ -995,15 +1077,15 @@ fn serve_uninstaller(
     rule: Rule,
     nsis_hint: bool,
 ) -> std::io::Result<()> {
-    let (program, args) = match uninstall_plan(ops, hive, key, rule, nsis_hint) {
+    let plan = match uninstall_plan(ops, hive, key, rule, nsis_hint) {
         Ok(plan) => plan,
         Err(reply) => {
             tracing::warn!(?hive, ?rule, ?reply, "bridge worker: uninstall refused");
             return send(writer, &reply);
         }
     };
-    tracing::info!(?hive, ?rule, program = %program.display(), "bridge worker: running uninstaller");
-    let reply = match ops.run_uninstaller(&program, &args) {
+    tracing::info!(?hive, ?rule, program = %plan.program.display(), "bridge worker: running uninstaller");
+    let reply = match ops.run_uninstaller(&plan.program, &plan.args, &plan.also_checked) {
         Ok(code) => Reply::End { code },
         Err(e) => failure(&e),
     };

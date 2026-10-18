@@ -22,6 +22,7 @@ fn kf() -> KnownFolders {
         program_files_x86: PathBuf::from(r"C:\PF86"),
         system_root: PathBuf::from(r"C:\W"),
         program_data: PathBuf::from(r"C:\PD"),
+        user_profiles: PathBuf::from(r"C:\Users"),
     }
 }
 
@@ -64,6 +65,10 @@ struct FakeOps {
     files: Vec<PathBuf>,
     reads: usize,
     launched: Vec<(PathBuf, String)>,
+    /// `also_checked` of each launch.
+    held: Vec<Vec<PathBuf>>,
+    /// 8.3 name -> long name; other paths are their own long name when they exist.
+    longs: Vec<(PathBuf, PathBuf)>,
     deleted: Vec<(MachineHive, String)>,
 }
 
@@ -110,7 +115,23 @@ impl WorkerOps for FakeOps {
         Ok(PathBuf::from(MSIEXEC))
     }
 
-    fn run_uninstaller(&mut self, program: &Path, args: &str) -> std::io::Result<i32> {
+    fn long_path(&self, path: &Path) -> std::io::Result<PathBuf> {
+        if let Some((_, long)) = self.longs.iter().find(|(short, _)| short == path) {
+            return Ok(long.clone());
+        }
+        if self.files.iter().any(|f| f == path) {
+            return Ok(path.to_path_buf());
+        }
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+
+    fn run_uninstaller(
+        &mut self,
+        program: &Path,
+        args: &str,
+        also_checked: &[PathBuf],
+    ) -> std::io::Result<i32> {
+        self.held.push(also_checked.to_vec());
         self.launched
             .push((program.to_path_buf(), args.to_string()));
         Ok(7)
@@ -945,7 +966,7 @@ fn absolute_paths_in_args_must_be_admin_folders() {
 #[test]
 fn every_interpreter_refused() {
     for name in worker::INTERPRETERS {
-        let program = format!(r"C:\W\System32\{name}");
+        let program = format!(r"C:\PF\Tools\{name}");
         let mut ops = FakeOps {
             entries: vec![quiet(Hive::MachineX64, "app", &format!("{program} /x"))],
             files: vec![PathBuf::from(&program)],
@@ -1004,4 +1025,323 @@ fn inno_name_list_switches() {
     ] {
         assert!(!exe_params_allowed(Inno, bad, &roots), "{bad}");
     }
+}
+/// Runs one Quiet entry through the plan with `files` existing and `longs` as the 8.3 map.
+fn plan_quiet(cmd: &str, files: &[&str], longs: &[(&str, &str)]) -> (Reply, FakeOps) {
+    let mut ops = FakeOps {
+        entries: vec![quiet(Hive::MachineX86, "app", cmd)],
+        files: files.iter().map(PathBuf::from).collect(),
+        longs: longs
+            .iter()
+            .map(|(a, b)| (PathBuf::from(a), PathBuf::from(b)))
+            .collect(),
+        ..FakeOps::default()
+    };
+    let reply = ask(
+        &uninstall(MachineHive::Hklm32, "app", Rule::Quiet),
+        &mut ops,
+    );
+    (reply, ops)
+}
+
+/// Review 2 of Task 182 (1): outside the known folders the real owner/DACL check decides; only
+/// the always user-writable places are refused up front.
+#[test]
+fn unlisted_location_goes_to_the_acl_check() {
+    let (reply, ops) = plan_quiet(
+        r#""C:\Ruby34-x64\unins000.exe" /SILENT"#,
+        &[r"C:\Ruby34-x64\unins000.exe"],
+        &[],
+    );
+    assert_eq!(reply, Reply::End { code: 7 });
+    assert_eq!(
+        ops.launched,
+        vec![(
+            PathBuf::from(r"C:\Ruby34-x64\unins000.exe"),
+            "/SILENT".to_string()
+        )]
+    );
+    for refused in [
+        r"C:\Users\me\AppData\Local\nvm\unins000.exe",
+        r"C:\Users\Public\x\unins000.exe",
+        r"C:\W\Temp\x\u.exe",
+        r"C:\W\Registration\CRMLog\u.exe",
+        r"C:\W\System32\spool\drivers\color\u.exe",
+        r"D:\x\..\u.exe",
+    ] {
+        let (reply, ops) = plan_quiet(&format!(r#""{refused}" /S"#), &[refused], &[]);
+        assert_eq!(error_text(&reply), worker::OUTSIDE_ADMIN, "{refused}");
+        assert!(ops.launched.is_empty(), "{refused}");
+    }
+}
+
+#[test]
+fn refused_location_rule() {
+    use wingetrs::winget_install::elevated_rules::refused_location;
+    let k = kf();
+    let no = |p: &str| refused_location(Path::new(p), &k);
+    assert!(!no(r"C:\Ruby34-x64\unins000.exe"));
+    assert!(!no(r"D:\Apps\u.exe"));
+    assert!(!no(r"C:\W\System32\spool\DRIVERS\x64\3\E.EXE"));
+    assert!(no(r"C:\Users\me\u.exe"));
+    assert!(no(r"c:\users\me\u.exe"));
+    assert!(no(r"\\srv\share\u.exe"));
+    assert!(no(r"\PF\u.exe"));
+    assert!(no(r"C:\Apps.\u.exe"));
+    assert!(no(r"C:\W\Tasks\u.exe"));
+    assert!(no(r"C:\W\Registration\CRMLog\u.exe"));
+}
+
+/// (2) 8.3 names are expanded before the rule; a short name that does not exist is refused.
+#[test]
+fn short_names_are_expanded() {
+    let short = r"C:\PROGRA~1\DIFX\B60D12~1\dpinst64.exe";
+    let long = r"C:\PF\DIFX\B60D12D\dpinst64.exe";
+    let args = r"/u C:\W\System32\DriverStore\FileRepository\a.inf";
+    let (reply, ops) = plan_quiet(&format!("{short} {args}"), &[long], &[(short, long)]);
+    assert_eq!(reply, Reply::End { code: 7 });
+    assert_eq!(ops.launched, vec![(PathBuf::from(long), args.to_string())]);
+
+    let (reply, ops) = plan_quiet(
+        r"C:\PROGRA~2\x.exe /S",
+        &[r"C:\Users\me\x.exe"],
+        &[(r"C:\PROGRA~2\x.exe", r"C:\Users\me\x.exe")],
+    );
+    assert_eq!(
+        error_text(&reply),
+        worker::OUTSIDE_ADMIN,
+        "expands into a user folder"
+    );
+    assert!(ops.launched.is_empty());
+
+    let (reply, ops) = plan_quiet(r"C:\PROGRA~3\gone.exe /S", &[], &[]);
+    assert!(
+        matches!(
+            reply,
+            Reply::Error {
+                not_found: true,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    assert!(ops.launched.is_empty());
+}
+
+/// (3) Only `spool\drivers\color` is user-writable under `spool`.
+#[test]
+fn spool_driver_folder_accepted() {
+    let exe = r"C:\W\System32\spool\DRIVERS\x64\3\E_YINSYWE.EXE";
+    let (reply, ops) = plan_quiet(
+        &format!(r#"{exe} /R /APD /P:"EPSON L3250 Series""#),
+        &[exe],
+        &[],
+    );
+    assert_eq!(reply, Reply::End { code: 7 });
+    assert_eq!(ops.launched.len(), 1);
+    assert!(in_admin_folder(Path::new(exe), &kf()));
+}
+
+/// (4) The system `rundll32` only as `"<dll>",<Export> [args]`, the DLL checked like a program.
+#[test]
+fn rundll32_only_with_a_checked_dll() {
+    let rundll = r"C:\W\SysWOW64\RunDll32.EXE";
+    let dll = r"C:\PF\NVIDIA\NVI2.DLL";
+    let (reply, ops) = plan_quiet(
+        &format!(r#"{rundll} "{dll}",UninstallPackage Display.Driver"#),
+        &[rundll, dll],
+        &[],
+    );
+    assert_eq!(reply, Reply::End { code: 7 });
+    assert_eq!(
+        ops.launched,
+        vec![(
+            PathBuf::from(rundll),
+            format!(r#""{dll}",UninstallPackage Display.Driver"#)
+        )]
+    );
+    assert_eq!(ops.held, vec![vec![PathBuf::from(dll)]]);
+
+    let system32 = r"C:\W\System32\rundll32.exe";
+    let (reply, _) = plan_quiet(&format!(r#"{system32} "{dll}",Go"#), &[system32, dll], &[]);
+    assert_eq!(reply, Reply::End { code: 7 });
+
+    for (args, want) in [
+        (format!("{dll},Go"), worker::RUNDLL32_REFUSED),
+        (format!(r#""{dll}" Go"#), worker::RUNDLL32_REFUSED),
+        (format!(r#""{dll}","#), worker::RUNDLL32_REFUSED),
+        (format!(r#""{dll}",a;b"#), worker::RUNDLL32_REFUSED),
+        (
+            r#""C:\PF\NVIDIA\x.exe",Go"#.to_string(),
+            worker::RUNDLL32_REFUSED,
+        ),
+        (
+            r#""C:\Users\me\x.dll",Go"#.to_string(),
+            worker::RUNDLL32_REFUSED,
+        ),
+        (r#""%TEMP%\x.dll",Go"#.to_string(), worker::RUNDLL32_REFUSED),
+        (
+            format!(r#""{dll}",Go C:\Users\me\y.txt"#),
+            worker::ARG_OUTSIDE_ADMIN,
+        ),
+    ] {
+        let (reply, ops) = plan_quiet(
+            &format!("{rundll} {args}"),
+            &[rundll, dll, r"C:\PF\NVIDIA\x.exe", r"C:\Users\me\x.dll"],
+            &[],
+        );
+        assert_eq!(error_text(&reply), want, "{args}");
+        assert!(ops.launched.is_empty(), "{args}");
+    }
+
+    // A DLL that does not exist.
+    let (reply, ops) = plan_quiet(
+        &format!(r#"{rundll} "C:\PF\N\gone.dll",Go"#),
+        &[rundll],
+        &[],
+    );
+    assert!(
+        matches!(
+            reply,
+            Reply::Error {
+                not_found: true,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    assert!(ops.launched.is_empty());
+
+    // Any other rundll32 is an interpreter.
+    let other = r"C:\PF\Tools\rundll32.exe";
+    let (reply, ops) = plan_quiet(&format!(r#"{other} "{dll}",Go"#), &[other, dll], &[]);
+    assert_eq!(error_text(&reply), worker::INTERPRETER);
+    assert!(ops.launched.is_empty());
+}
+
+#[test]
+fn parse_rundll32_forms() {
+    use wingetrs::winget_install::elevated_rules::parse_rundll32;
+    assert_eq!(
+        parse_rundll32(r#" "C:\a\b.dll",Run_1 x y "#),
+        Some((
+            r"C:\a\b.dll".to_string(),
+            "Run_1".to_string(),
+            "x y".to_string()
+        ))
+    );
+    assert_eq!(
+        parse_rundll32(r#""C:\a\b.DLL",Go"#),
+        Some((r"C:\a\b.DLL".to_string(), "Go".to_string(), String::new()))
+    );
+    for bad in [
+        r"C:\a\b.dll,Go",
+        r#""C:\a\b.dll Go"#,
+        r#""",Go"#,
+        r#""C:\a\b.dll",-Go"#,
+    ] {
+        assert_eq!(parse_rundll32(bad), None, "{bad}");
+    }
+}
+/// Security review of the rundll32 rule: system DLLs export generic launchers, so the DLL must
+/// be an application's own, under Program Files; and the rest names no interpreter.
+#[test]
+fn rundll32_lolbins_refused() {
+    let rundll = r"C:\W\System32\rundll32.exe";
+    for (dll, rest) in [
+        (
+            r"C:\W\System32\shell32.dll",
+            "ShellExec_RunDLL cmd.exe /c whoami",
+        ),
+        (r"C:\W\System32\url.dll", r"FileProtocolHandler C:\PF\x.exe"),
+        (
+            r"C:\W\System32\advpack.dll",
+            "LaunchINFSection x.inf,DefaultInstall",
+        ),
+        (
+            r"C:\W\System32\setupapi.dll",
+            "InstallHinfSection DefaultInstall 128 x.inf",
+        ),
+        (r"C:\W\System32\zipfldr.dll", r"RouteTheCall C:\PF\x.exe"),
+        (r"C:\W\SysWOW64\ieframe.dll", r"OpenURL C:\PF\x.url"),
+        (
+            r"C:\W\System32\pcwutl.dll",
+            r"LaunchApplication C:\PF\x.exe",
+        ),
+        (r"%SystemRoot%\System32\shell32.dll", "Control_RunDLL"),
+        (r"C:\PD\Package Cache\{g}\x.dll", "Go"),
+        (r"D:\Apps\x.dll", "Go"),
+    ] {
+        let line = format!(r#"{rundll} "{dll}",{rest}"#);
+        let expanded = dll.replace("%SystemRoot%", r"C:\W");
+        let (reply, ops) = plan_quiet(&line, &[rundll, expanded.as_str()], &[]);
+        assert_eq!(error_text(&reply), worker::RUNDLL32_REFUSED, "{line}");
+        assert!(ops.launched.is_empty(), "{line}");
+    }
+    let dll = r"C:\PF\App\x.dll";
+    for rest in [
+        "Go cmd /c whoami",
+        "Go cmd.exe",
+        r"Go C:\W\System32\WindowsPowerShell\v1.0\powershell.exe -c x",
+        r#"Go "C:\W\System32\mshta""#,
+        "Go x,wscript",
+        "Go MSBuild.EXE x.proj",
+    ] {
+        let line = format!(r#"{rundll} "{dll}",{rest}"#);
+        let (reply, ops) = plan_quiet(&line, &[rundll, dll], &[]);
+        assert_eq!(error_text(&reply), worker::INTERPRETER, "{line}");
+        assert!(ops.launched.is_empty(), "{line}");
+    }
+    // NVIDIA's real line is still accepted.
+    let nvidia = r"C:\PF\NVIDIA Corporation\Installer2\InstallerCore\NVI2.DLL";
+    let line = format!(r#"C:\W\SysWOW64\RunDll32.EXE "{nvidia}",UninstallPackage Display.Driver"#);
+    let (reply, ops) = plan_quiet(&line, &[r"C:\W\SysWOW64\RunDll32.EXE", nvidia], &[]);
+    assert_eq!(reply, Reply::End { code: 7 });
+    assert_eq!(ops.held, vec![vec![PathBuf::from(nvidia)]]);
+}
+
+#[test]
+fn names_interpreter_tokens() {
+    use wingetrs::winget_install::elevated_rules::names_interpreter;
+    let list = worker::INTERPRETERS;
+    assert!(names_interpreter("x CMD", &list));
+    assert!(names_interpreter(r#""C:\W\cmd.exe" /c"#, &list));
+    assert!(names_interpreter("a,bash", &list));
+    assert!(!names_interpreter(
+        "Display.Driver /quiet cmdline.txt",
+        &list
+    ));
+    assert!(!names_interpreter("", &list));
+}
+
+/// Real descriptors that the first measurement refused wrongly.
+#[test]
+fn acl_trustees_no_user_holds() {
+    use wingetrs::winget_install::elevated_rules::{AclLevel, sddl_admin_only};
+    // C:\Program Files\DIFX: CREATOR OWNER outside an inherit-only ACE matches nobody.
+    let difx = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;CO)(A;OICI;0x1200a9;;;PU)(A;OICI;0x1200a9;;;BU)";
+    assert!(sddl_admin_only(difx, AclLevel::Ancestor));
+    assert!(sddl_admin_only(difx, AclLevel::Parent));
+    // spool driver: full control for the print spooler's restricted-service SID.
+    let spool = "O:SYD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;WD)(A;ID;0x1200a9;;;AC)(A;ID;FA;;;S-1-5-99-216390572-1995538116-3857911515-2404958512-2623887229)";
+    assert!(sddl_admin_only(spool, AclLevel::File));
+    assert!(sddl_admin_only(
+        "O:SYD:(A;;FA;;;S-1-5-80-1-2-3-4-5)",
+        AclLevel::File
+    ));
+    // But a user, a user group or CO as owner still refuse.
+    assert!(!sddl_admin_only(
+        "O:SYD:(A;;FA;;;S-1-5-21-1-2-3-1001)",
+        AclLevel::File
+    ));
+    assert!(!sddl_admin_only("O:COD:(A;;FA;;;SY)", AclLevel::File));
+    assert!(!sddl_admin_only(
+        "O:S-1-5-80-1-2D:(A;;FA;;;SY)",
+        AclLevel::File
+    ));
+    // A callback ACE with a parenthesised condition is parsed whole.
+    let read_only = r#"O:SYD:AI(XA;OICIID;0x1200a9;;;BU;(WIN://SYSAPPID Contains "Microsoft.X_8wekyb3d8bbwe"))(A;ID;FA;;;SY)"#;
+    assert!(sddl_admin_only(read_only, AclLevel::Parent));
+    let full = r#"O:SYD:AI(XA;OICIID;FA;;;BU;(WIN://SYSAPPID Contains "x"))(A;ID;FA;;;SY)"#;
+    assert!(!sddl_admin_only(full, AclLevel::Parent));
 }

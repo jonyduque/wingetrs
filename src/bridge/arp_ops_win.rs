@@ -8,12 +8,14 @@ use crate::installed::Hive;
 use crate::winget_install::arp_read_win::{details_of, read_details, uninstall_root};
 use crate::winget_install::elevated_rules::{AclLevel, KnownFolders, sddl_admin_only};
 use crate::winget_install::uninstall_cmd::{ArpDetails, valid_arp_key};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
@@ -25,9 +27,11 @@ use windows::Win32::Security::{
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetLongPathNameW, READ_CONTROL,
 };
-use windows::core::PWSTR;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{FOLDERID_UserProfiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+use windows::core::{HSTRING, PWSTR};
 use winreg::RegKey;
 use winreg::enums::{
     DELETE, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, REG_OPTION_OPEN_LINK,
@@ -47,7 +51,39 @@ pub fn known_folders() -> io::Result<KnownFolders> {
         program_files_x86: sys.program_files_x86,
         system_root: sys.windows,
         program_data: sys.program_data,
+        user_profiles: known(&FOLDERID_UserProfiles)?,
     })
+}
+
+/// A known folder's path.
+fn known(id: &windows::core::GUID) -> io::Result<PathBuf> {
+    // SAFETY: the returned string is freed below with CoTaskMemFree.
+    let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // SAFETY: a NUL-terminated string from the call above.
+    let text = unsafe { p.to_string() };
+    // SAFETY: allocated by SHGetKnownFolderPath, freed once.
+    unsafe { CoTaskMemFree(Some(p.0 as *const core::ffi::c_void)) };
+    text.map(PathBuf::from)
+        .map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Longest path `long_path` returns, in UTF-16 units.
+const LONG_PATH_MAX: usize = 32_768;
+
+/// `path` with its 8.3 names expanded (`GetLongPathNameW`); an error when it does not exist.
+pub fn long_path(path: &Path) -> io::Result<PathBuf> {
+    let mut buf = vec![0u16; LONG_PATH_MAX];
+    // SAFETY: `buf` is a writable buffer of the length passed.
+    let n = unsafe { GetLongPathNameW(&HSTRING::from(path.as_os_str()), Some(&mut buf)) } as usize;
+    if n == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let text = buf
+        .get(..n)
+        .filter(|_| n < LONG_PATH_MAX)
+        .ok_or_else(|| io::Error::other("caminho longo demais"))?;
+    Ok(PathBuf::from(OsString::from_wide(text)))
 }
 
 /// Anything at `path`, links included (a dangling link counts: nothing becomes an orphan unless
@@ -236,12 +272,15 @@ fn hold_admin_chain(program: &Path) -> io::Result<Vec<File>> {
     Ok(held)
 }
 
-/// Runs `program args` (already checked by the helper) once the file and its folders are
-/// administrator-only by their real owner and DACL, holding them open until it ends; from the
+/// Runs `program args` (already checked by the helper) once the file and its folders (and each
+/// file of `also_checked`, a DLL it loads, with its folders) are administrator-only by their real owner and DACL, holding them open until it ends; from the
 /// program's folder, with `installer_env` (built from the known folders; `TEMP` in a fresh
 /// execution folder under the staging root). The exit code. Nothing is written in user folders.
-pub fn run_uninstaller(program: &Path, args: &str) -> io::Result<i32> {
-    let held = hold_admin_chain(program)?;
+pub fn run_uninstaller(program: &Path, args: &str, also_checked: &[PathBuf]) -> io::Result<i32> {
+    let mut held = hold_admin_chain(program)?;
+    for dll in also_checked {
+        held.extend(hold_admin_chain(dll)?);
+    }
     let sys = SystemEnv::query()?;
     let dir = program
         .parent()

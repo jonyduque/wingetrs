@@ -33,7 +33,8 @@ mod probe {
 
     #[derive(Default)]
     struct ProbeOps {
-        planned: Option<PathBuf>,
+        /// The program and the other files (a rundll32 DLL) the helper would check and run.
+        planned: Option<Vec<PathBuf>>,
     }
 
     impl WorkerOps for ProbeOps {
@@ -71,8 +72,19 @@ mod probe {
         }
 
         /// Records the program; never runs it.
-        fn run_uninstaller(&mut self, program: &Path, _args: &str) -> std::io::Result<i32> {
-            self.planned = Some(program.to_path_buf());
+        fn long_path(&self, path: &Path) -> std::io::Result<PathBuf> {
+            arp_ops_win::long_path(path)
+        }
+
+        fn run_uninstaller(
+            &mut self,
+            program: &Path,
+            _args: &str,
+            also_checked: &[PathBuf],
+        ) -> std::io::Result<i32> {
+            let mut all = vec![program.to_path_buf()];
+            all.extend_from_slice(also_checked);
+            self.planned = Some(all);
             Ok(0)
         }
     }
@@ -211,10 +223,12 @@ mod probe {
                         &mut ops,
                     );
                     match (reply, ops.planned) {
-                        (Reply::End { .. }, Some(program)) => match chain(&program) {
-                            Ok(()) => (format!("passa ({:?})", cmd.rule), None),
-                            Err((why, sample)) => (why, Some(sample)),
-                        },
+                        (Reply::End { .. }, Some(files)) => {
+                            match files.iter().try_for_each(|f| chain(f)) {
+                                Ok(()) => (format!("passa ({:?})", cmd.rule), None),
+                                Err((why, sample)) => (why, Some(sample)),
+                            }
+                        }
                         (Reply::Error { message, not_found }, _) => {
                             let short = if not_found {
                                 "desinstalador não encontrado".to_string()
