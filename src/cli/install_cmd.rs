@@ -656,6 +656,9 @@ fn print_plans(
     for p in plans {
         if f.dry_run {
             anstream::println!("{p}");
+            if let Some(hint) = output::msi_hint(p, f.allow_msiexec) {
+                anstream::println!("{}", style::paint(style::DIM, hint));
+            }
         } else {
             let layout = crate::install::layout::Layout::new(p.root.clone());
             anstream::print!(
@@ -761,8 +764,13 @@ async fn uninstall(
         "{}",
         output::uninstall_plan_text(&plan, &ctx.data.install_layout(), ui.glyphs())
     );
-    let code: Vec<_> = ops::uninstall_manifest(ctx, &plan)?
-        .map(|m| output::removal_third_party(&m, ""))
+    let (manifest, shown_sha) = ops::uninstall_manifest(ctx, &plan)?;
+    let vdir = ctx
+        .data
+        .install_layout()
+        .version_dir(&plan.app, &plan.version);
+    let code: Vec<_> = manifest
+        .map(|m| output::removal_third_party(&m, &vdir, ""))
         .filter(|items| !items.is_empty())
         .map(|items| (plan.app.clone(), items))
         .into_iter()
@@ -788,7 +796,9 @@ async fn uninstall(
         to: None,
         cmd: None,
     });
-    let removed = ops::uninstall_with(ctx, &plan, f.allow_scripts);
+    // The consent covers the code shown above: checked again under `install.lock`.
+    let scripts = f.allow_scripts.then_some(shown_sha.as_str());
+    let removed = ops::uninstall_with(ctx, &plan, scripts);
     ui.end_progress();
     finish_log(log, &removed, "removido");
     stop.interrupts.release();

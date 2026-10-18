@@ -12,5 +12,5 @@ Instalar app 3.64.0 (bucket main, 64bit)
   7. Apontar C:\W\apps\app\current -> C:\W\apps\app\3.64.0 (junção)
   8. Criar comando alist em C:\W\shims (alist.exe + alist.shim) -> C:\W\apps\app\current\alist.exe --force-bin-dir
   9. Garantir C:\W\shims no PATH do usuário
- 10. gravar C:\W\apps\app\3.64.0\manifest.json
+ 10. Gravar C:\W\apps\app\3.64.0\manifest.json
  11. Registrar app 3.64.0 (main) em C:\W\state.db

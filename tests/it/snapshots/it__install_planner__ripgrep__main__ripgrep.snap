@@ -10,5 +10,5 @@ Instalar app 15.2.0 (bucket main, 64bit)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\15.2.0 (junção)
   6. Criar comando rg em C:\W\shims (rg.exe + rg.shim) -> C:\W\apps\app\current\rg.exe
   7. Garantir C:\W\shims no PATH do usuário
-  8. gravar C:\W\apps\app\15.2.0\manifest.json
+  8. Gravar C:\W\apps\app\15.2.0\manifest.json
   9. Registrar app 15.2.0 (main) em C:\W\state.db

@@ -12,5 +12,5 @@ Instalar app 1.92.0 (bucket main, 64bit)
   7. Definir variável de usuário BOOST_ROOT = C:\W\apps\app\current
   8. Definir variável de usuário Boost_INCLUDE_DIR = C:\W\apps\app\current\boost
   9. Garantir C:\W\shims no PATH do usuário
- 10. gravar C:\W\apps\app\1.92.0\manifest.json
+ 10. Gravar C:\W\apps\app\1.92.0\manifest.json
  11. Registrar app 1.92.0 (main) em C:\W\state.db

@@ -896,3 +896,243 @@ async fn own_path_entry_rule_is_the_same_in_removal_and_update() {
     assert!(!removal.contains(&current), "{removal}");
     assert!(removal.contains(ORIGINAL_PATH), "{removal}");
 }
+// ---- Task 191 ----
+
+/// Installs `manifest` (with a `post_install`) whose hook writes `effects` (one JSON per line);
+/// `before` runs inside the hook, before the effects are read.
+async fn install_with_effects(
+    w: &World,
+    effects: &[serde_json::Value],
+    before: impl Fn() + Send + Sync + 'static,
+) -> Result<(), ExecError> {
+    struct Hook<F> {
+        inner: FakeHost,
+        before: F,
+    }
+    impl<F: Fn() + Send + Sync> ScriptHost for Hook<F> {
+        fn run(&self, job: &ScriptJob) -> std::io::Result<ScriptOutcome> {
+            (self.before)();
+            self.inner.run(job)
+        }
+    }
+    let text: String = effects.iter().map(|v| format!("{v}\n")).collect();
+    let host: Arc<dyn ScriptHost> = Arc::new(Hook {
+        inner: FakeHost {
+            effects: vec![(HookKind::PostInstall, text)],
+            ..FakeHost::default()
+        },
+        before,
+    });
+    let manifest = w.manifest("1.0", serde_json::json!({"post_install": "info 'x'"}));
+    let mut ctx = w.ctx(Some(host), Some(fake_uninstaller));
+    execute_install(&w.plan(&manifest), &mut ctx).await
+}
+
+fn shim_with_args(w: &World, args: &str) -> serde_json::Value {
+    let path = w.layout.version_dir("app", "1.0").join("tool.exe");
+    serde_json::json!({"op": "shim", "path": path, "name": "evil", "args": args})
+}
+
+#[tokio::test]
+async fn shim_effect_args_with_control_char_refused() {
+    let w = setup().await;
+    let e = install_with_effects(&w, &[shim_with_args(&w, "a\r\ncalc.exe")], || {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("argumentos inseguros"), "{e}");
+    assert!(!w.layout.shims().join("evil.cmd").exists());
+    assert!(!w.layout.shims().join("evil.shim").exists());
+    assert!(!w.layout.app_dir("app").exists(), "rolled back: {e}");
+    // Plain arguments still make the shim.
+    install_with_effects(&w, &[shim_with_args(&w, "--flag x")], || {})
+        .await
+        .unwrap();
+    assert!(w.layout.shims().join("evil.shim").exists());
+}
+
+#[tokio::test]
+async fn shim_effect_args_with_quote_refused() {
+    let w = setup().await;
+    let e = install_with_effects(&w, &[shim_with_args(&w, "x\" & calc.exe & \"")], || {})
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("argumentos inseguros"), "{e}");
+    assert!(!w.layout.shims().join("evil.shim").exists());
+    assert!(!w.layout.app_dir("app").exists(), "rolled back: {e}");
+}
+
+fn add_path_effect(entry: &Path) -> serde_json::Value {
+    serde_json::json!({"op": "add_path", "var": "Path", "entries": [entry], "prepend": true, "force": false})
+}
+
+/// Makes the junction `link` -> `target` when the hook runs.
+fn junction(target: PathBuf, link: PathBuf) -> impl Fn() + Send + Sync + 'static {
+    move || wingetrs::install::link::create(&target, &link).unwrap()
+}
+
+/// A junction the hook makes inside the app folder cannot carry a PATH entry, a shim or a
+/// shortcut outside it; a dangling one is refused too. A junction that stays inside the
+/// app's persist folder is fine.
+#[tokio::test]
+async fn effect_path_through_junction_refused() {
+    let w = setup().await;
+    let outside = w.base().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"x").unwrap();
+    std::fs::write(outside.join("evil.exe"), fake_pe(3)).unwrap();
+    let vdir = w.layout.version_dir("app", "1.0");
+    let link = vdir.join("x");
+    let path_before = w.env.get("Path").unwrap().unwrap().value;
+    let cases = [
+        add_path_effect(&link),
+        add_path_effect(&link.join("bin")),
+        serde_json::json!({"op": "shim", "path": link.join("evil.exe"), "name": "evil", "args": null}),
+        serde_json::json!({"op": "shortcut", "target": link.join("evil.exe"), "name": "Evil", "args": null, "icon": null}),
+        serde_json::json!({"op": "shortcut", "target": vdir.join("tool.exe"), "name": "Evil", "args": null, "icon": link.join("evil.exe")}),
+    ];
+    for effect in cases {
+        let make = junction(outside.clone(), link.clone());
+        let e = install_with_effects(&w, std::slice::from_ref(&effect), make)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("junção"), "{effect}: {e}");
+        assert!(!w.layout.app_dir("app").exists(), "rolled back: {e}");
+        assert_eq!(w.env.get("Path").unwrap().unwrap().value, path_before);
+        assert!(!w.layout.shims().join("evil.shim").exists());
+        assert!(w.shortcuts.dump().is_empty(), "{e}");
+        assert!(
+            outside.join("keep.txt").exists(),
+            "rollback stayed out of the junction"
+        );
+    }
+    // Dangling: the target may be created anywhere later.
+    let make = junction(w.base().join("missing"), link.clone());
+    let e = install_with_effects(&w, &[add_path_effect(&link)], make)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("junção") && e.contains("quebrada"), "{e}");
+    assert!(!w.layout.app_dir("app").exists(), "rolled back: {e}");
+    // Inside the app's persist folder: applied.
+    let bin = w.layout.persist_dir("app").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    install_with_effects(&w, &[add_path_effect(&link)], junction(bin, link.clone()))
+        .await
+        .unwrap();
+    let path = w.env.get("Path").unwrap().unwrap().value;
+    assert!(path.contains(&link.display().to_string()), "{path}");
+}
+
+/// A removal that fails after its uninstall code ran says what that code already changed
+/// (nothing undoes it).
+#[tokio::test]
+async fn removal_failure_after_scripts_mentions_effects() {
+    let unset_home = format!(
+        "{}\n",
+        serde_json::json!({"op": "set_env", "name": "TOOL_HOME", "value": null})
+    );
+    // A later script fails.
+    let w = setup().await;
+    w.install(&w.manifest("1.0", uninstall_hooks())).await;
+    let host = Arc::new(FakeHost {
+        fail_on: Some(HookKind::UninstallerScript),
+        effects: vec![(HookKind::PreUninstall, unset_home.clone())],
+        ..FakeHost::default()
+    });
+    let e = w
+        .uninstall(Some(&host), Some(fake_uninstaller))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("os scripts de desinstalação já rodaram e alteraram: variável TOOL_HOME"),
+        "{e}"
+    );
+    assert!(w.intact());
+    // The scripts ran without changing anything wingetrs applies: still said.
+    let w = setup().await;
+    w.install(&w.manifest("1.0", uninstall_hooks())).await;
+    let host = Arc::new(FakeHost {
+        fail_on: Some(HookKind::UninstallerScript),
+        ..FakeHost::default()
+    });
+    let e = w
+        .uninstall(Some(&host), Some(fake_uninstaller))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("os scripts de desinstalação já rodaram e não foram desfeitos"),
+        "{e}"
+    );
+    // Removing the app folder fails (a file held open without sharing).
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        let w = setup().await;
+        w.install(&w.manifest("1.0", uninstall_hooks())).await;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(w.layout.version_dir("app", "1.0").join("tool.exe"))
+            .unwrap();
+        let host = Arc::new(FakeHost {
+            effects: vec![(HookKind::PreUninstall, unset_home)],
+            ..FakeHost::default()
+        });
+        let e = w
+            .uninstall(Some(&host), Some(fake_uninstaller))
+            .unwrap_err()
+            .to_string();
+        drop(held);
+        assert!(e.contains("remover app"), "{e}");
+        assert!(
+            e.contains("os scripts de desinstalação já rodaram e alteraram: variável TOOL_HOME"),
+            "{e}"
+        );
+    }
+    // Nothing ran yet (no consent): no such text.
+    let w = setup().await;
+    w.install(&w.manifest("1.0", uninstall_hooks())).await;
+    let e = w
+        .uninstall(None, Some(fake_uninstaller))
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("já rodaram"), "{e}");
+}
+
+/// Task 191: shim arguments with cmd syntax (`&`, `%VAR%`) or PowerShell syntax (`$(…)`, `'`, `{}`,
+/// a typographic quote) are refused from a hook effect and from the manifest `bin` alike; a
+/// quoted path passes the `bin` rule.
+#[tokio::test]
+async fn shim_args_with_cmd_syntax_refused() {
+    let w = setup().await;
+    let typographic = "\u{201C}calc\u{201D}";
+    for args in [
+        "x & calc",
+        "%PATH%",
+        "$(calc)",
+        "'; calc; '",
+        "{calc}",
+        typographic,
+    ] {
+        let e = install_with_effects(&w, &[shim_with_args(&w, args)], || {})
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("argumentos inseguros"), "{args}: {e}");
+        assert!(!w.layout.shims().join("evil.cmd").exists());
+        assert!(!w.layout.app_dir("app").exists(), "rolled back: {e}");
+        let bin = serde_json::json!({"bin": [["tool.exe", "evil", args]]});
+        let r = w.try_plan(&w.manifest("1.0", bin));
+        assert!(matches!(r, Err(PlanError::UnsafeArgs(_))), "{args}: {r:?}");
+    }
+    // A quoted path passes the manifest rule; a hook's shim takes no quotes at all.
+    let ok = r#"--flag "C:\Program Files\x""#;
+    let bin = serde_json::json!({"bin": [["tool.exe", "ok", ok]]});
+    assert!(w.try_plan(&w.manifest("1.0", bin)).is_ok());
+    install_with_effects(&w, &[shim_with_args(&w, "--flag x")], || {})
+        .await
+        .unwrap();
+}

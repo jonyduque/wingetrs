@@ -568,3 +568,30 @@ async fn link_in_extracted_tree_is_refused() {
     let outside = w.layout.apps().parent().unwrap().join("t147-outside");
     assert!(outside.join("keep.txt").is_file());
 }
+
+/// Task 191: innounp never runs with an elevated token.
+#[cfg(windows)]
+#[test]
+fn innounp_refused_when_elevated() {
+    static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    fn fake_launch(_: &Path, _: &[String], _: &Path) -> io::Result<(i32, Vec<String>)> {
+        LAUNCHES.fetch_add(1, Ordering::SeqCst);
+        Ok((0, Vec::new()))
+    }
+    let t = tempfile::tempdir().unwrap();
+    let exe = t.path().join("innounp.exe");
+    let run = |elevated: fn() -> io::Result<bool>| {
+        wingetrs::install::inno_win::run_with(&exe, &["-x".into()], t.path(), elevated, fake_launch)
+    };
+    let e = run(|| Ok(true)).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        e.to_string(),
+        "o wingetrs não roda scripts de manifesto com o processo elevado"
+    );
+    assert_eq!(LAUNCHES.load(Ordering::SeqCst), 0);
+    assert!(run(|| Err(io::Error::other("token"))).is_err());
+    assert_eq!(LAUNCHES.load(Ordering::SeqCst), 0);
+    assert_eq!(run(|| Ok(false)).unwrap().0, 0);
+    assert_eq!(LAUNCHES.load(Ordering::SeqCst), 1);
+}

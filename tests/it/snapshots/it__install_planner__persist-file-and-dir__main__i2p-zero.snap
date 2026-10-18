@@ -12,5 +12,5 @@ Instalar app 1.20 (bucket main, sem arquitetura)
   7. Apontar C:\W\apps\app\current -> C:\W\apps\app\1.20 (junção)
   8. Criar comando i2p-zero em C:\W\shims (i2p-zero.cmd) -> C:\W\apps\app\current\bin\launch.bat
   9. Garantir C:\W\shims no PATH do usuário
- 10. gravar C:\W\apps\app\1.20\manifest.json
+ 10. Gravar C:\W\apps\app\1.20\manifest.json
  11. Registrar app 1.20 (main) em C:\W\state.db

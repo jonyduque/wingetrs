@@ -280,11 +280,15 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
         "Os dados persistentes do app são mantidos.\n"
     });
     // The removal runs the code of the manifest written at install time: it goes to the user.
-    let code = ops::uninstall_manifest(c, &plan)
-        .map_err(|e| e.to_string())?
-        .map(|m| removal_third_party(&m, ""))
+    let (manifest, manifest_sha256) =
+        ops::uninstall_manifest(c, &plan).map_err(|e| e.to_string())?;
+    let vdir = c
+        .data
+        .install_layout()
+        .version_dir(&plan.app, &plan.version);
+    let code = manifest
+        .map(|m| removal_third_party(&m, &vdir, ""))
         .unwrap_or_default();
-    let plan_app = plan.app.clone();
     let action = Action::Remove(plan);
     if code.is_empty() {
         return Ok(Planned::Ready { text, action });
@@ -293,7 +297,7 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
         text,
         action,
         code,
-        manifest_sha256: recorded_sha(c, &plan_app).map_err(|e| e.to_string())?,
+        manifest_sha256,
     })
 }
 
@@ -360,31 +364,14 @@ fn fail(e: OpsError) -> InstallFail {
     }
 }
 
-/// The manifest hash the state record of `app` holds (what the removal's code is read from).
-fn recorded_sha(c: &OpsCtx<'_>, app: &str) -> Result<String, String> {
-    let state = StateDb::open(&c.data.install_layout().state_db()).map_err(|e| e.to_string())?;
-    Ok(state
-        .get(app)
-        .map_err(|e| e.to_string())?
-        .map(|(rec, _)| rec.manifest_sha256)
-        .unwrap_or_default())
-}
-
-/// A removal confirmed with the code of a manifest runs only if the record still holds that
-/// manifest: otherwise the user read other code.
-fn check_shown_manifest(o: &OpsCtx<'_>, app: &str, shown: &str) -> Result<(), InstallFail> {
-    match recorded_sha(o, app) {
-        Ok(now) if now == shown => Ok(()),
-        Ok(_) => Err(InstallFail::Other(format!(
-            "{app}: o manifesto mudou desde que você revisou os scripts; nada foi removido, peça a remoção de novo"
-        ))),
-        Err(e) => Err(InstallFail::Other(e)),
-    }
-}
-
-/// Removes `plan`; `scripts` is the user's consent to the app's uninstall code. The notes of
-/// what did not happen (a skipped uninstaller) go in the summary the user reads.
-fn removed(o: &OpsCtx<'_>, plan: UninstallPlan, scripts: bool) -> Result<Done, InstallFail> {
+/// Removes `plan`; `scripts` = `Some(sha)` is the user's consent to the uninstall code of the
+/// manifest of hash `sha` they read (checked under `install.lock`). The notes of what did not
+/// happen (a skipped uninstaller) go in the summary the user reads.
+fn removed(
+    o: &OpsCtx<'_>,
+    plan: UninstallPlan,
+    scripts: Option<&str>,
+) -> Result<Done, InstallFail> {
     let done = ops::uninstall_with(o, &plan, scripts).map_err(fail)?;
     Ok(Done {
         summary: removed_summary(&plan.app, &done.notes),
@@ -535,14 +522,11 @@ async fn run_action_inner(o: &OpsCtx<'_>, action: Action) -> Result<Done, Instal
             };
             installed(ops::apply_groups_with(o, groups, &allow).await)
         }
-        Action::Remove(plan) => removed(o, plan, false),
+        Action::Remove(plan) => removed(o, plan, None),
         Action::RemoveScripts {
             plan,
             manifest_sha256,
-        } => {
-            check_shown_manifest(o, &plan.app, &manifest_sha256)?;
-            removed(o, plan, true)
-        }
+        } => removed(o, plan, Some(&manifest_sha256)),
         // Runs outside `install.lock` and the ops context: see `run_bridge`.
         Action::Bridge(job) => Err(InstallFail::Other(format!(
             "{}: atualização via {} fora do executor da ponte",

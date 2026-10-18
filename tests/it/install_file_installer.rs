@@ -666,3 +666,31 @@ fn installer_win_runs_a_cmd_with_fixed_path_cwd_and_args() {
     assert_eq!(find("a1="), "/S");
     assert_eq!(find("a2="), "\"x y\"");
 }
+
+/// Task 191: `installer.file`/`uninstaller.file` never run with an elevated token.
+#[cfg(windows)]
+#[test]
+fn file_installer_refused_when_elevated() {
+    static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
+    fn fake_launch(_: &Path, _: &[String], _: &Path) -> std::io::Result<(i32, Vec<String>)> {
+        LAUNCHES.fetch_add(1, Ordering::SeqCst);
+        Ok((0, Vec::new()))
+    }
+    let t = tempfile::tempdir().unwrap();
+    let exe = t.path().join("setup.exe");
+    let run = |elevated: fn() -> std::io::Result<bool>| {
+        wingetrs::install::installer_win::run_with(&exe, &[], t.path(), elevated, fake_launch)
+    };
+    let e = run(|| Ok(true)).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        e.to_string(),
+        "o wingetrs não roda scripts de manifesto com o processo elevado"
+    );
+    assert_eq!(LAUNCHES.load(Ordering::SeqCst), 0);
+    // An error reading the token is not taken for "not elevated".
+    assert!(run(|| Err(std::io::Error::other("token"))).is_err());
+    assert_eq!(LAUNCHES.load(Ordering::SeqCst), 0);
+    assert_eq!(run(|| Ok(false)).unwrap().0, 0);
+    assert_eq!(LAUNCHES.load(Ordering::SeqCst), 1);
+}

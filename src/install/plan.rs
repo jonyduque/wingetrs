@@ -425,7 +425,7 @@ impl InstallPlan {
                 format!("Garantir {} no PATH do usuário", l.shims().display())
             }
             Step::WriteManifest { .. } => format!(
-                "gravar {}",
+                "Gravar {}",
                 l.version_dir(app, v).join("manifest.json").display()
             ),
             Step::RecordState => format!(

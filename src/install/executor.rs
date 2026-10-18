@@ -1929,6 +1929,64 @@ fn is_inside(entry: &str, base: &Path) -> bool {
     }
 }
 
+/// `entry` (already lexically inside one of `bases`, see [`is_inside`]) still is once both are
+/// resolved on disk (links and junctions followed): a junction the hook made in the app folder
+/// cannot carry a PATH entry, shim or shortcut elsewhere. A link whose target is missing is
+/// refused (it could be pointed anywhere later).
+fn resolves_inside(entry: &str, bases: &[&Path]) -> Result<(), String> {
+    let real = resolve_existing(Path::new(entry))?;
+    for base in bases {
+        if let Ok(b) = resolve_existing(base)
+            && starts_with_ci(&real, &b)
+        {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "passa por uma ligação (junção) que leva a {}, fora da pasta do app",
+        real.display()
+    ))
+}
+
+/// `p` with its longest existing prefix canonicalized and the missing rest appended as is.
+/// A component that exists but cannot be resolved (a dangling link) is an error.
+fn resolve_existing(p: &Path) -> Result<PathBuf, String> {
+    let mut missing = Vec::new();
+    let mut cur = p;
+    loop {
+        match fs::canonicalize(cur) {
+            Ok(mut real) => {
+                real.extend(missing.iter().rev());
+                return Ok(real);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(cur).is_ok() {
+                    return Err(format!(
+                        "passa por uma ligação (junção) quebrada: {}",
+                        cur.display()
+                    ));
+                }
+                match (cur.file_name(), cur.parent()) {
+                    (Some(name), Some(parent)) => {
+                        missing.push(name);
+                        cur = parent;
+                    }
+                    _ => return Err(io_msg(p, e)),
+                }
+            }
+            Err(e) => return Err(io_msg(cur, e)),
+        }
+    }
+}
+
+/// `path` is `base` or under it, components compared ignoring case (Windows paths).
+fn starts_with_ci(path: &Path, base: &Path) -> bool {
+    let lower = |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+    let mut p = path.components();
+    base.components()
+        .all(|b| p.next().is_some_and(|c| lower(c) == lower(b)))
+}
+
 /// PowerShell `-like` (case-insensitive): `*`, `?`, `[set]`/`[a-z]` and the backtick escape.
 fn like(text: &str, pattern: &str) -> bool {
     let t: Vec<char> = text.to_lowercase().chars().collect();
@@ -2109,6 +2167,8 @@ fn apply_effect(
                         "o script tentou pôr {entry} no PATH (fora da pasta do app)"
                     ));
                 }
+                resolves_inside(&entry, &[&app_dir, &persist_dir])
+                    .map_err(|m| format!("o script tentou pôr {entry} no PATH: {m}"))?;
                 add_path(run, env, &entry)?;
             }
             Ok(())
@@ -2163,6 +2223,22 @@ fn apply_effect(
                     "o script tentou criar o comando {name} para {path} (fora da pasta do app)"
                 ));
             }
+            // Written raw into the `.shim`/`.cmd`/`.ps1` text: the manifest `bin` rule, and
+            // no quotes at all (a hook's shim never needed them).
+            if let Some(a) = args.as_deref() {
+                let why = match shim::check_args(a) {
+                    Err(why) => Some(why),
+                    Ok(()) if a.contains('"') => Some("aspas não são aceitas".to_string()),
+                    Ok(()) => None,
+                };
+                if let Some(why) = why {
+                    return Err(format!(
+                        "o script tentou criar o comando {name} com argumentos inseguros: {a:?} ({why})"
+                    ));
+                }
+            }
+            resolves_inside(&path, &[&app_dir])
+                .map_err(|m| format!("o script tentou criar o comando {name} para {path}: {m}"))?;
             let spec = ShimSpec {
                 kind: planner::shim_kind(&path),
                 name,
@@ -2200,6 +2276,8 @@ fn apply_effect(
                         "o script tentou criar o atalho {name} para {p} (fora da pasta do app)"
                     ));
                 }
+                resolves_inside(p, &[&app_dir])
+                    .map_err(|m| format!("o script tentou criar o atalho {name} para {p}: {m}"))?;
             }
             // Refused rather than sanitized: `shortcut_link` would turn `..` into `_`.
             if safepath::safe_components(&name).is_none_or(|c| c.is_empty()) {
@@ -3344,31 +3422,63 @@ pub fn execute_uninstall(
                 what: "o desinstalador do manifesto".into(),
             });
         }
-        run_before_removal(ctx, plan, inst).map_err(|(step, m)| fail(0, step, m))?;
+    }
+    let mut ran = RemovalScripts::default();
+    // From here a failure says what the uninstall code already did (nothing undoes it).
+    let fail = |index: usize, step: String, message: String, ran: &RemovalScripts| {
+        fail(index, step, format!("{message}{}", ran.note()))
+    };
+    if let Some(inst) = &installed {
+        run_before_removal(ctx, plan, inst, &mut ran)
+            .map_err(|(step, m)| fail(0, step, m, &ran))?;
     }
     for (i, a) in plan.artifacts.iter().enumerate() {
         if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry, false)
         {
-            r.map_err(|m| fail(i, label, m))?;
+            r.map_err(|m| fail(i, label, m, &ran))?;
         }
     }
     let n = plan.artifacts.len();
-    remove_any(&app_dir).map_err(|e| fail(n, "remover app".into(), io_msg(&app_dir, e)))?;
+    remove_any(&app_dir).map_err(|e| fail(n, "remover app".into(), io_msg(&app_dir, e), &ran))?;
     if plan.purge {
         let pd = layout.persist_dir(&plan.app);
-        remove_any(&pd).map_err(|e| fail(n + 1, "remover persist".into(), io_msg(&pd, e)))?;
+        remove_any(&pd).map_err(|e| fail(n + 1, "remover persist".into(), io_msg(&pd, e), &ran))?;
     }
     ctx.state
         .remove(&plan.app)
-        .map_err(|e| fail(n + 2, "registro".into(), e.to_string()))?;
+        .map_err(|e| fail(n + 2, "registro".into(), e.to_string(), &ran))?;
     if let Some(inst) = &installed
         && let Some(script) = &inst.manifest.hooks.post_uninstall
     {
         let body = HookBody::Script(script);
-        run_removal_hook(ctx, plan, HookKind::PostUninstall, body, inst)
+        run_removal_hook(ctx, plan, HookKind::PostUninstall, body, inst, &mut ran)
             .map_err(|m| ExecError::Hook(format!("removido, mas o post_uninstall falhou: {m}")))?;
     }
     Ok(notes)
+}
+
+/// What the uninstall code of a removal already did: it is never undone, so a later failure
+/// says so (like [`OLD_HOOKS_RAN`] for an update).
+#[derive(Default)]
+struct RemovalScripts {
+    /// A script or the uninstaller file was started.
+    ran: bool,
+    /// The effects of the uninstall hooks applied so far, for the user.
+    applied: Vec<String>,
+}
+
+impl RemovalScripts {
+    /// Appended to the message of a removal that failed after the uninstall code started.
+    fn note(&self) -> String {
+        match (self.ran, self.applied.is_empty()) {
+            (false, _) => String::new(),
+            (true, true) => "; os scripts de desinstalação já rodaram e não foram desfeitos".into(),
+            (true, false) => format!(
+                "; os scripts de desinstalação já rodaram e alteraram: {}",
+                self.applied.join(", ")
+            ),
+        }
+    }
 }
 
 /// The manifest written when the app being removed was installed, with what its uninstall
@@ -3473,18 +3583,19 @@ fn run_before_removal(
     ctx: &mut ExecCtx<'_>,
     plan: &UninstallPlan,
     inst: &InstalledManifest,
+    ran: &mut RemovalScripts,
 ) -> Result<(), (String, String)> {
     let step = |kind: HookKind| format!("script {}", kind.key());
     if let Some(script) = &inst.manifest.hooks.pre_uninstall {
         let kind = HookKind::PreUninstall;
-        run_removal_hook(ctx, plan, kind, HookBody::Script(script), inst)
+        run_removal_hook(ctx, plan, kind, HookBody::Script(script), inst, ran)
             .map_err(|m| (step(kind), m))?;
     }
     if let Some((file, args)) = &inst.command {
         let vdir = &inst.scope.version_dir;
         if file.to_lowercase().ends_with(".ps1") {
             let kind = HookKind::UninstallerScript;
-            run_removal_hook(ctx, plan, kind, HookBody::Ps1 { file, args }, inst)
+            run_removal_hook(ctx, plan, kind, HookBody::Ps1 { file, args }, inst, ran)
                 .map_err(|m| (step(kind), m))?;
         } else {
             let label = "rodar desinstalador".to_string();
@@ -3493,6 +3604,7 @@ fn run_before_removal(
             };
             let program = installer_program(vdir, file).map_err(|m| (label.clone(), m))?;
             tracing::info!("rodando o desinstalador {file}");
+            ran.ran = true;
             check_installer_exit(runner(&program, args, vdir)).map_err(|m| (label, m))?;
         }
     }
@@ -3503,7 +3615,7 @@ fn run_before_removal(
         .and_then(|u| u.script.as_deref())
     {
         let kind = HookKind::UninstallerScript;
-        run_removal_hook(ctx, plan, kind, HookBody::Script(script), inst)
+        run_removal_hook(ctx, plan, kind, HookBody::Script(script), inst, ran)
             .map_err(|m| (step(kind), m))?;
     }
     Ok(())
@@ -3517,6 +3629,7 @@ fn run_removal_hook(
     kind: HookKind,
     body: HookBody<'_>,
     inst: &InstalledManifest,
+    ran: &mut RemovalScripts,
 ) -> Result<(), String> {
     let Some(host) = ctx.runners.scripts.clone() else {
         return Err("sem consentimento para rodar os scripts do manifesto".into());
@@ -3543,6 +3656,7 @@ fn run_removal_hook(
     if !ctx.launch.try_launch_for(&format!("script {hook}")) {
         return Err("remoção cancelada antes de o script começar".into());
     }
+    ran.ran = true;
     let result = host.run(&prepared.job);
     if let Some(message) = hook_failure(result, hook, ctx.effects.env, &prepared.before) {
         return Err(message);
@@ -3550,22 +3664,25 @@ fn run_removal_hook(
     let parsed =
         read_effects(&prepared.effects).map_err(|e| format!("efeitos do script ilegíveis: {e}"))?;
     for effect in parsed {
-        apply_removal_effect(ctx, app, &plan.artifacts, effect)?;
+        if let Some(done) = apply_removal_effect(ctx, app, &plan.artifacts, effect)? {
+            ran.applied.push(done);
+        }
     }
     Ok(())
 }
 
 /// Applies an effect of an uninstall hook when it touches this app's own artifacts only (a
 /// recorded PATH entry, a registered variable, a shim of the app); anything else is ignored.
+/// Returns what it changed, for the user (`None`: nothing).
 fn apply_removal_effect(
     ctx: &mut ExecCtx<'_>,
     app: &str,
     artifacts: &[Artifact],
     effect: ScriptEffect,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if !own_uninstall_effect(&effect, artifacts) {
         tracing::warn!("{app}: efeito de script de desinstalação ignorado (não é deste app)");
-        return Ok(());
+        return Ok(None);
     }
     let layout = ctx.layout;
     let env = ctx.effects.env;
@@ -3573,6 +3690,7 @@ fn apply_removal_effect(
         ScriptEffect::SetEnv { name, value } => {
             let (app_dir, persist_dir) = (layout.app_dir(app), layout.persist_dir(app));
             validate_set_env(env, &name, value.as_deref(), (&app_dir, &persist_dir), true)?;
+            let done = format!("variável {name}");
             match value {
                 Some(v) => env.set(
                     &name,
@@ -3583,17 +3701,19 @@ fn apply_removal_effect(
                 ),
                 None => env.remove(&name),
             }
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            Ok(Some(done))
         }
         ScriptEffect::RemovePath { var, entries } => {
             if !var.eq_ignore_ascii_case(PATH_VAR) {
                 tracing::warn!("{app}: Remove-Path em {var} ignorado");
-                return Ok(());
+                return Ok(None);
             }
             let patterns = path_patterns(&entries)?;
             let Some(cur) = env.get(PATH_VAR).map_err(|e| e.to_string())? else {
-                return Ok(());
+                return Ok(None);
             };
+            let mut removed = Vec::new();
             let mut value = cur.value.clone();
             for seg in cur.value.split(';') {
                 if seg.is_empty() || !patterns.iter().any(|p| like(seg, p)) {
@@ -3606,10 +3726,11 @@ fn apply_removal_effect(
                 let users = ctx.state.path_users(app, seg).map_err(|e| e.to_string())?;
                 if users.is_empty() {
                     value = path_edit::path_remove(&value, seg);
+                    removed.push(seg.to_string());
                 }
             }
             if value == cur.value {
-                return Ok(());
+                return Ok(None);
             }
             env.set(
                 PATH_VAR,
@@ -3618,12 +3739,14 @@ fn apply_removal_effect(
                     expand: cur.expand,
                 },
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            Ok(Some(format!("PATH (tirou {})", removed.join("; "))))
         }
         ScriptEffect::RmShim { name } => {
             check_component("comando", &name)?;
-            shim::remove_shim(layout, &name).map_err(|e| e.to_string())
+            shim::remove_shim(layout, &name).map_err(|e| e.to_string())?;
+            Ok(Some(format!("comando {name}")))
         }
-        _ => Ok(()),
+        _ => Ok(None),
     }
 }

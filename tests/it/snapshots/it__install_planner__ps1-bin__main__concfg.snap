@@ -10,5 +10,5 @@ Instalar app 0.2025.10.02 (bucket main, sem arquitetura)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\0.2025.10.02 (junção)
   6. Criar comando concfg em C:\W\shims (concfg.cmd + concfg.ps1) -> C:\W\apps\app\current\bin\concfg.ps1
   7. Garantir C:\W\shims no PATH do usuário
-  8. gravar C:\W\apps\app\0.2025.10.02\manifest.json
+  8. Gravar C:\W\apps\app\0.2025.10.02\manifest.json
   9. Registrar app 0.2025.10.02 (main) em C:\W\state.db

@@ -3,15 +3,18 @@ use super::style::{
     DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, WARN, paint,
 };
 use crate::core::{PackageDetails, PackageEntry};
+use crate::install::layout::Layout;
 use crate::install::manifest::{self, Arch, HookKind, Resolved};
 use crate::install::msiexec_log::LogTail;
 use crate::install::plan::{InstallPlan, Step};
+use crate::install::planner;
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
 use crate::install::script_scan::{self, ScriptReport, Verdict, printable};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 use std::collections::VecDeque;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// `text` painted, then padded to `width` columns counted on the plain text.
@@ -349,7 +352,6 @@ pub fn plan_summary(
     user_path: Option<&str>,
     allow_msiexec: bool,
 ) -> String {
-    use crate::install::archive::ArchiveKind;
     use crate::install::plan::Step;
     let arch = plan.arch.map_or("sem arquitetura", |a| a.key());
     let mut s = match &plan.upgrade_from {
@@ -435,21 +437,25 @@ pub fn plan_summary(
     for (i, text) in lines.iter().enumerate() {
         s.push_str(&numbered(i + 1, text));
     }
+    if let Some(hint) = msi_hint(plan, allow_msiexec) {
+        s.push_str(&paint(DIM, &format!("  {hint}\n")));
+    }
+    s
+}
+
+/// What happens when the own extractor refuses an MSI of `plan` (`None`: it downloads no
+/// MSI); shown by the summary and by `--dry-run`.
+pub fn msi_hint(plan: &InstallPlan, allow_msiexec: bool) -> Option<&'static str> {
+    use crate::install::archive::ArchiveKind;
     let has_msi = plan.steps.iter().any(|st| {
         matches!(st, Step::Download { source, .. }
             if matches!(ArchiveKind::of(&source.file_name), Ok(ArchiveKind::Msi)))
     });
-    if has_msi {
-        s.push_str(&paint(
-            DIM,
-            if allow_msiexec {
-                "  Se o extrator recusar este MSI, usa o Windows Installer (msiexec /a)\n"
-            } else {
-                "  Se o extrator não suportar este MSI, pede --allow-msiexec\n"
-            },
-        ));
-    }
-    s
+    has_msi.then_some(if allow_msiexec {
+        "Se o extrator recusar este MSI, usa o Windows Installer (msiexec /a)"
+    } else {
+        "Se o extrator não suportar este MSI, pede --allow-msiexec"
+    })
 }
 
 /// After a successful install: the command names to use once a new terminal sees the PATH
@@ -609,20 +615,28 @@ fn uninstaller_item(file: &str, args: &[String]) -> ThirdParty {
     }
 }
 
-/// The third-party code removing an app of manifest `m` runs, in the executor's order;
-/// `suffix` is appended to each script name (`, na remoção`).
-pub fn removal_third_party(m: &Resolved, suffix: &str) -> Vec<ThirdParty> {
+/// The third-party code removing an app of manifest `m` (installed in `vdir`) runs, in the
+/// executor's order (`pre_uninstall`, the uninstaller file, `uninstaller.script`,
+/// `post_uninstall`); the uninstaller comes from `planner::uninstaller_command`, the same call
+/// the executor makes (an `args`-only uninstaller runs the first download). `suffix` is
+/// appended to each script name (`, na remoção`).
+pub fn removal_third_party(m: &Resolved, vdir: &Path, suffix: &str) -> Vec<ThirdParty> {
     let name = |k: HookKind| format!("{}{suffix}", k.key());
     let mut out = Vec::new();
     if let Some(s) = &m.hooks.pre_uninstall {
         out.push(script_item(name(HookKind::PreUninstall), s));
     }
     if let Some(u) = &m.uninstaller {
+        match planner::uninstaller_command(m, u, vdir) {
+            Ok(Some((file, args))) => out.push(uninstaller_item(&file, &args)),
+            Ok(None) => {}
+            // The removal refuses it before any step; the user still sees it is there.
+            Err(e) => out.push(ThirdParty::Unknown {
+                what: format!("desinstalador do manifesto ({e})"),
+            }),
+        }
         if let Some(s) = &u.script {
             out.push(script_item(name(HookKind::UninstallerScript), s));
-        }
-        if let Some(f) = &u.file {
-            out.push(uninstaller_item(f, &u.args));
         }
     }
     if let Some(s) = &m.hooks.post_uninstall {
@@ -657,7 +671,10 @@ pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
                 Step::WriteManifest { json } => manifest::resolve(json, Arch::host()).ok(),
                 _ => None,
             })
-            .map(|m| removal_third_party(&m, ", na remoção"))
+            .map(|m| {
+                let vdir = Layout::new(&plan.root).version_dir(&plan.app, &plan.version);
+                removal_third_party(&m, &vdir, ", na remoção")
+            })
             .unwrap_or_default();
         if later.is_empty() {
             out.push(ThirdParty::Unknown {

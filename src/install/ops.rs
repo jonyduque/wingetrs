@@ -222,6 +222,10 @@ pub enum OpsError {
     Download { app: String, error: DownloadError },
     #[error("o estado de {0} mudou desde o planejamento; tente de novo")]
     StateChanged(String),
+    #[error(
+        "{0}: o manifesto mudou desde que você revisou os scripts; nada foi removido, peça a remoção de novo"
+    )]
+    ManifestChanged(String),
     #[error("{error} (já instalados: {})", .applied.join(", "))]
     PartlyApplied {
         applied: Vec<String>,
@@ -942,28 +946,37 @@ fn recorded_manifest(
 }
 
 /// The written manifest of `plan`'s app (see [`recorded_manifest`]): its removal runs the
-/// third-party code in it (`pre_uninstall`, `uninstaller`, `post_uninstall`).
+/// third-party code in it (`pre_uninstall`, `uninstaller`, `post_uninstall`). Also the
+/// manifest hash the record holds, read with it: what the user's consent is for (pass it to
+/// [`uninstall_with`]).
 pub fn uninstall_manifest(
     ctx: &OpsCtx<'_>,
     plan: &UninstallPlan,
-) -> Result<Option<Resolved>, OpsError> {
+) -> Result<(Option<Resolved>, String), OpsError> {
     let state = read_state(&layout(ctx))?;
-    recorded_manifest(ctx, &state, &plan.app)
+    let sha = state
+        .get(&plan.app)?
+        .map(|(rec, _)| rec.manifest_sha256)
+        .unwrap_or_default();
+    Ok((recorded_manifest(ctx, &state, &plan.app)?, sha))
 }
 
 /// Uninstalls under `install.lock` (dependents are checked here and files in use by the
 /// executor, both before anything changes), broadcasts the environment change once, and returns the
 /// classified residues; the caller confirms and calls `residue::clean`.
 pub fn uninstall(ctx: &OpsCtx<'_>, plan: &UninstallPlan) -> Result<Vec<Residue>, OpsError> {
-    Ok(uninstall_with(ctx, plan, false)?.residues)
+    Ok(uninstall_with(ctx, plan, None)?.residues)
 }
 
-/// [`uninstall`] where `scripts` grants consent to the app's uninstall code (hooks,
-/// `uninstaller`); also returns the executor's notes for the user.
+/// [`uninstall`] where `scripts` = `Some(sha)` grants consent to the app's uninstall code
+/// (hooks, `uninstaller`) of the written manifest of hash `sha`, the one shown to the user
+/// ([`uninstall_manifest`]); also returns the executor's notes for the user. The record must
+/// still hold that hash under `install.lock`: otherwise [`OpsError::ManifestChanged`] and
+/// nothing runs.
 pub fn uninstall_with(
     ctx: &OpsCtx<'_>,
     plan: &UninstallPlan,
-    scripts: bool,
+    scripts: Option<&str>,
 ) -> Result<Uninstalled, OpsError> {
     // Deleting a large app folder takes a while: a live line from the lock wait on.
     (ctx.progress)(&ProgressEvent::Phase(Phase::Removing {
@@ -974,7 +987,12 @@ pub fn uninstall_with(
         tracing::debug_span!("uninstall.lock").in_scope(|| lock_blocking(&layout, ctx.wait))?;
     let mut state = open_state(&layout)?;
     let homepage = match state.get(&plan.app)? {
-        Some((rec, _)) if rec.version == plan.version => homepage_of(ctx.catalog, &rec)?,
+        Some((rec, _)) if rec.version == plan.version => {
+            if scripts.is_some_and(|shown| shown != rec.manifest_sha256) {
+                return Err(OpsError::ManifestChanged(plan.app.clone()));
+            }
+            homepage_of(ctx.catalog, &rec)?
+        }
         _ => return Err(OpsError::StateChanged(plan.app.clone())),
     };
     refuse_if_needed(ctx, &state, &plan.app)?;
@@ -989,7 +1007,7 @@ pub fn uninstall_with(
     let result = {
         let allow = Allow {
             msiexec: AllowMsiexec::No,
-            scripts,
+            scripts: scripts.is_some(),
         };
         let mut exec = exec_ctx(ctx, &layout, &mut state, None, &allow);
         tracing::debug_span!("uninstall.execute")

@@ -12,6 +12,7 @@ use crate::install::plan::{
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::safepath;
 use crate::install::script_scan::{self, Verdict};
+use crate::install::shim;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledInfo {
@@ -50,6 +51,38 @@ pub enum PlanError {
     Unsupported(String),
     #[error("o script {hook} foi recusado: {}", .reasons.join("; "))]
     ScriptRefused { hook: String, reasons: Vec<String> },
+}
+
+/// The variables [`substitute`] replaces, longest first.
+const SHIM_ARG_VARS: [&str; 5] = ["$persist_dir", "$architecture", "$version", "$dir", "$app"];
+
+/// The `bin` arguments `raw` as the shim text gets them (Task 191). The manifest's text passes
+/// the shim allowlist with its variables standing for themselves; `$version`/`$app` must be
+/// plain values; then each argument (split as cmd would) is substituted and written back
+/// quoted when it needs it, so a folder of the user's profile with `&` or `(` stays inert.
+fn shim_args(
+    raw: &str,
+    app: &str,
+    version: &str,
+    sub: &dyn Fn(&str) -> String,
+) -> Result<String, PlanError> {
+    let unsafe_args = |why: String| PlanError::UnsafeArgs(format!("{raw:?}: {why}"));
+    let template = SHIM_ARG_VARS
+        .iter()
+        .fold(raw.to_string(), |t, v| t.replace(v, "X"));
+    shim::check_args(&template).map_err(unsafe_args)?;
+    for (var, value) in [("$version", version), ("$app", app)] {
+        if raw.contains(var) && !shim::is_plain_value(value) {
+            return Err(unsafe_args(format!(
+                "{var} = {value:?} não é um valor simples"
+            )));
+        }
+    }
+    let tokens: Vec<(String, bool)> = shim::split_args_quoted(raw)
+        .into_iter()
+        .map(|(t, quoted)| (sub(&t), quoted))
+        .collect();
+    shim::cmd_args(&tokens).map_err(unsafe_args)
 }
 
 /// Replaces scoop manifest variables (`$dir`, `$persist_dir`, `$version`, `$app`,
@@ -425,10 +458,11 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         if b.path.chars().any(|c| c.is_control() || c == '"') {
             return Err(PlanError::UnsafePath(format!("{:?}", b.path)));
         }
-        let args = b.args.as_deref().map(sub);
-        if let Some(a) = args.as_deref().filter(|a| a.chars().any(char::is_control)) {
-            return Err(PlanError::UnsafeArgs(format!("{a:?}")));
-        }
+        let args = b
+            .args
+            .as_deref()
+            .map(|raw| shim_args(raw, app, version, &sub))
+            .transpose()?;
         if !names.insert(name.to_lowercase()) {
             return Err(PlanError::ShimConflict(name));
         }

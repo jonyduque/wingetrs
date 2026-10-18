@@ -770,3 +770,136 @@ async fn installer_kind_follows_the_step() {
         "{items:?}"
     );
 }
+// ---- Task 191 ----
+
+fn resolved(extra: serde_json::Value) -> wingetrs::install::manifest::Resolved {
+    let mut m = serde_json::json!({
+        "version": "1.0",
+        "url": "https://example.invalid/x-1.0.zip",
+        "hash": "0".repeat(64),
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        m[k] = v.clone();
+    }
+    wingetrs::install::manifest::resolve(&m.to_string(), wingetrs::install::manifest::Arch::X64)
+        .unwrap()
+}
+
+/// An `uninstaller` with only `args` runs the first download (as the executor does): the
+/// consent lists it.
+#[test]
+fn removal_consent_lists_args_only_uninstaller() {
+    let m = resolved(serde_json::json!({"uninstaller": {"args": "/S"}}));
+    let vdir = Path::new(r"C:\w\apps\x\1.0");
+    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "");
+    assert_eq!(
+        items,
+        [ThirdParty::Program {
+            uninstaller: true,
+            file: "x-1.0.zip".into(),
+            args: vec!["/S".into()],
+        }]
+    );
+    assert_eq!(items[0].label(), "desinstalador x-1.0.zip");
+    // `$dir` in the arguments is the version folder, as the executor passes it.
+    let m = resolved(serde_json::json!({"uninstaller": {"file": "un.exe", "args": ["/D=$dir"]}}));
+    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "");
+    assert_eq!(
+        items,
+        [ThirdParty::Program {
+            uninstaller: true,
+            file: "un.exe".into(),
+            args: vec![r"/D=C:\w\apps\x\1.0".into()],
+        }]
+    );
+    // No uninstaller file and no args: nothing runs, nothing listed.
+    let m = resolved(serde_json::json!({"uninstaller": {"script": "info 'x'"}}));
+    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "");
+    assert_eq!(
+        items.iter().map(ThirdParty::label).collect::<Vec<_>>(),
+        ["script uninstaller.script"]
+    );
+}
+
+/// The executor runs `pre_uninstall`, the uninstaller file, `uninstaller.script`, then
+/// `post_uninstall`: the consent lists them in that order.
+#[test]
+fn removal_consent_order_matches_executor() {
+    let m = resolved(serde_json::json!({
+        "pre_uninstall": "info 'pre'",
+        "uninstaller": {"file": "un.exe", "script": "info 'unins'"},
+        "post_uninstall": "info 'post'",
+    }));
+    let items = wingetrs::cli::output::removal_third_party(&m, Path::new(r"C:\v"), ", na remoção");
+    assert_eq!(
+        items.iter().map(ThirdParty::label).collect::<Vec<_>>(),
+        [
+            "script pre_uninstall, na remoção",
+            "desinstalador un.exe",
+            "script uninstaller.script, na remoção",
+            "script post_uninstall, na remoção",
+        ]
+    );
+    // The same order inside an install plan's consent (its removal code, read back).
+}
+
+/// The consent covers the manifest the user read: a different hash under `install.lock`
+/// runs nothing and removes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_with_sha_mismatch_runs_nothing() {
+    let mut w = World::new().await;
+    w.publish(
+        "1.0",
+        serde_json::json!({ "pre_uninstall": "Write-Host 'tchau'" }),
+    )
+    .await;
+    w.run(&YES, &["install", "x", "--yes", "--allow-scripts"])
+        .await
+        .unwrap();
+    let ctx = w.ctx();
+    let plan = ops::plan_uninstall(&ctx, "x", false).unwrap();
+    let (manifest, shown) = ops::uninstall_manifest(&ctx, &plan).unwrap();
+    assert!(manifest.is_some());
+    assert_eq!(shown.len(), 64, "{shown}");
+    let e = ops::uninstall_with(&ctx, &plan, Some(&"0".repeat(64))).unwrap_err();
+    assert!(
+        matches!(e, OpsError::ManifestChanged(ref a) if a == "x"),
+        "{e}"
+    );
+    assert_eq!(
+        e.to_string(),
+        "x: o manifesto mudou desde que você revisou os scripts; nada foi removido, peça a remoção de novo"
+    );
+    assert_eq!(w.runs(), 0);
+    assert_eq!(w.installed().as_deref(), Some("1.0"));
+    // The hash shown: removed, its script ran once.
+    ops::uninstall_with(&ctx, &plan, Some(&shown)).unwrap();
+    assert_eq!(w.runs(), 1);
+    assert_eq!(w.installed(), None);
+}
+
+/// `--dry-run` of an MSI app (like `main/rust`) says the `msiexec /a` fallback needs
+/// `--allow-msiexec`, and the manifest step is capitalized like the others.
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_msi_shows_allow_msiexec_hint_and_capitalized_steps() {
+    let server = MockServer::start().await;
+    let url = format!("{}/solo-1.0.msi", server.uri());
+    let x = serde_json::json!({"url": url, "extract_dir": "SourceDir"});
+    let lab = binary_lab(&server, "t191-msi", x).await;
+    let o = lab.run(&["install", "s", "--dry-run"]);
+    let out = stdout(&o);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        out.contains("Se o extrator não suportar este MSI, pede --allow-msiexec"),
+        "{out}"
+    );
+    assert!(out.contains(". Gravar "), "{out}");
+    assert!(!out.contains(". gravar "), "{out}");
+    let o = lab.run(&["install", "s", "--dry-run", "--allow-msiexec"]);
+    let out = stdout(&o);
+    assert!(
+        out.contains("usa o Windows Installer (msiexec /a)"),
+        "{out}"
+    );
+    assert!(!out.contains("pede --allow-msiexec"), "{out}");
+}

@@ -10,5 +10,5 @@ Instalar app 0.39.0 (bucket main, 64bit)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\0.39.0 (junção)
   6. Criar comando agent-browser em C:\W\shims (agent-browser.exe + agent-browser.shim) -> C:\W\apps\app\current\agent-browser.exe
   7. Garantir C:\W\shims no PATH do usuário
-  8. gravar C:\W\apps\app\0.39.0\manifest.json
+  8. Gravar C:\W\apps\app\0.39.0\manifest.json
   9. Registrar app 0.39.0 (main) em C:\W\state.db

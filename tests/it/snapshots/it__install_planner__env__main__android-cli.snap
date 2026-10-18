@@ -17,5 +17,5 @@ Instalar app 1.0.16500706 (bucket main, 64bit)
  12. Adicionar ao PATH do usuário: C:\W\apps\app\current\Sdk\cmdline-tools\latest\bin
  13. Adicionar ao PATH do usuário: C:\W\apps\app\current\Sdk\platform-tools
  14. Garantir C:\W\shims no PATH do usuário
- 15. gravar C:\W\apps\app\1.0.16500706\manifest.json
+ 15. Gravar C:\W\apps\app\1.0.16500706\manifest.json
  16. Registrar app 1.0.16500706 (main) em C:\W\state.db

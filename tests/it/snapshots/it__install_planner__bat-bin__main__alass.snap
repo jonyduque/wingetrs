@@ -10,5 +10,5 @@ Instalar app 2.0.0 (bucket main, 64bit)
   5. Apontar C:\W\apps\app\current -> C:\W\apps\app\2.0.0 (junção)
   6. Criar comando alass em C:\W\shims (alass.cmd) -> C:\W\apps\app\current\alass.bat
   7. Garantir C:\W\shims no PATH do usuário
-  8. gravar C:\W\apps\app\2.0.0\manifest.json
+  8. Gravar C:\W\apps\app\2.0.0\manifest.json
   9. Registrar app 2.0.0 (main) em C:\W\state.db

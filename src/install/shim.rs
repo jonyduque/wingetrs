@@ -150,6 +150,116 @@ pub(crate) fn is_safe_shim_name(name: &str) -> bool {
         && crate::install::safepath::safe_components(name).is_some_and(|c| c.len() == 1)
 }
 
+/// Shim arguments (manifest `bin` and the `shim` effect of a hook) go into the `.shim` and
+/// `.cmd` text as is: only an allowlist passes (Task 191), so neither cmd nor PowerShell reads
+/// syntax in them. ASCII letters and digits, space, `- _ . / \ : = , +`, and `"` in balanced
+/// pairs (paths with spaces). Over the catalog of 2026-10-18 (4118 Scoop manifests, 332 `bin`
+/// args, variables replaced) it refuses one: `extras/controlprinters` (`shell:::{GUID}`).
+pub fn check_args(args: &str) -> Result<(), String> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || " -_./\\:=,+".contains(c);
+    let mut quoted = false;
+    for c in args.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if !allowed(c) {
+            return Err(format!("{c:?} não é aceito nos argumentos de um comando"));
+        }
+    }
+    if quoted {
+        return Err("aspas sem fechar nos argumentos de um comando".into());
+    }
+    Ok(())
+}
+
+/// `args` split as cmd and the C runtime would (whitespace outside double quotes separates,
+/// the quotes themselves go), for the `.ps1` shim's literal array.
+pub fn split_args(args: &str) -> Vec<String> {
+    split_args_quoted(args)
+        .into_iter()
+        .map(|(t, _)| t)
+        .collect()
+}
+
+/// [`split_args`], each argument with whether it had double quotes.
+pub fn split_args_quoted(args: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in args.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any || !cur.is_empty() {
+                    out.push((std::mem::take(&mut cur), any));
+                }
+                any = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    if any || !cur.is_empty() {
+        out.push((cur, any));
+    }
+    out
+}
+
+/// `$version`/`$app` values a shim argument may take: `[A-Za-z0-9._+-]`, not empty (they come
+/// from the manifest; a version `1.0&calc` would be cmd syntax once substituted).
+pub fn is_plain_value(v: &str) -> bool {
+    !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// `tokens` (one argument each, already substituted, with whether the manifest quoted it) as
+/// cmd text: a quoted token, or one with anything but ASCII letters, digits and
+/// `- _ . / \ : = , +`, goes inside `"…"`, where cmd reads `&`, `(`, `)` literally; `"`, `%`
+/// and `!` cannot be made inert there and are refused (a user profile path holding one refuses
+/// the shim).
+pub fn cmd_args(tokens: &[(String, bool)]) -> Result<String, String> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "-_./\\:=,+".contains(c);
+    let mut out = Vec::new();
+    for (t, quoted) in tokens {
+        if let Some(c) = t
+            .chars()
+            .find(|&c| c.is_control() || matches!(c, '"' | '%' | '!'))
+        {
+            return Err(format!(
+                "{c:?} em {t:?} não pode ir nos argumentos de um comando (nem entre aspas)"
+            ));
+        }
+        if !quoted && !t.is_empty() && t.chars().all(plain) {
+            out.push(t.clone());
+        } else {
+            out.push(format!("\"{t}\""));
+        }
+    }
+    Ok(out.join(" "))
+}
+
+/// A PowerShell single-quoted literal: nothing inside it expands.
+fn ps_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The `.ps1` shim: the target and the arguments as literals, never interpolated.
+fn ps1_text(target: &str, args: Option<&str>) -> String {
+    let list: Vec<String> = args
+        .map(split_args)
+        .unwrap_or_default()
+        .iter()
+        .map(|a| ps_literal(a))
+        .collect();
+    format!(
+        "$path = {}\r\n$shimArgs = @({})\r\n& $path @shimArgs @args\r\n",
+        ps_literal(target),
+        list.join(", ")
+    )
+}
+
 fn check_name(name: &str) -> Result<(), ShimError> {
     if is_safe_shim_name(name) {
         Ok(())
@@ -214,7 +324,7 @@ pub fn create_shim(layout: &Layout, spec: &ShimSpec) -> Result<Vec<PathBuf>, Shi
         ShimKind::Ps1 => {
             let ps1 = dir.join(format!("{}.ps1", spec.name));
             let cmd = dir.join(format!("{}.cmd", spec.name));
-            write_text(&ps1, &format!("& \"{target}\"{args_sp} @args\r\n"))?;
+            write_text(&ps1, &ps1_text(&target, args))?;
             let cmd_text = format!(
                 "@rem {target}\r\n@echo off\r\nwhere /q pwsh.exe\r\nif %errorlevel% equ 0 (\r\n    pwsh.exe -noprofile -ex unrestricted -file \"{target}\"{args_sp} %*\r\n) else (\r\n    powershell.exe -noprofile -ex unrestricted -file \"{target}\"{args_sp} %*\r\n)\r\n"
             );

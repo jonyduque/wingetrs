@@ -129,7 +129,10 @@ fn script_wrappers_and_remove() {
     create_shim(&layout, &spec("p", &ps1, None, ShimKind::Ps1)).unwrap();
     assert_eq!(
         std::fs::read_to_string(shims.join("p.ps1")).unwrap(),
-        format!("& \"{}\" @args\r\n", ps1.display())
+        format!(
+            "$path = '{}'\r\n$shimArgs = @()\r\n& $path @shimArgs @args\r\n",
+            ps1.display()
+        )
     );
     let cmd = std::fs::read_to_string(shims.join("p.cmd")).unwrap();
     assert!(cmd.contains("pwsh.exe") && cmd.contains("powershell.exe"));
@@ -304,7 +307,7 @@ fn wrappers_with_args_exact_text() {
     let p = ps1.display();
     assert_eq!(
         std::fs::read_to_string(shims.join("p.ps1")).unwrap(),
-        format!("& \"{p}\" -a b @args\r\n")
+        format!("$path = '{p}'\r\n$shimArgs = @('-a', 'b')\r\n& $path @shimArgs @args\r\n")
     );
     assert_eq!(
         std::fs::read_to_string(shims.join("p.cmd")).unwrap(),
@@ -321,5 +324,155 @@ fn wrappers_with_args_exact_text() {
             jar.display(),
             jar.parent().unwrap().display()
         )
+    );
+}
+/// Task 191: shim arguments pass an allowlist (one rule for the manifest `bin` and the hook
+/// `shim` effect).
+#[test]
+fn shim_args_refuse_shell_syntax() {
+    use wingetrs::install::shim::check_args;
+    for ok in [
+        "--flag x",
+        r#"--flag "C:\Program Files\x""#,
+        r#"--user-data-dir="C:\Users\a\apps\brave\current\User Data""#,
+        "-jar a.jar -Xmx=1g,a+b",
+    ] {
+        assert_eq!(check_args(ok), Ok(()), "{ok}");
+    }
+    for bad in [
+        "x & calc",
+        "%PATH%",
+        "$(calc)",
+        "'; calc; '",
+        "{calc}",
+        "\u{201C}calc\u{201D}",
+        "a | b",
+        "a > b",
+        "a ^ b",
+        "a; calc",
+        "`calc`",
+        "@x",
+        "# x",
+        r#""a & b""#,
+        r#""unclosed"#,
+        "a\r\nargs = evil",
+        "a\tb",
+    ] {
+        assert!(check_args(bad).is_err(), "{bad:?}");
+    }
+}
+
+/// The `.ps1` shim never interpolates: a `'` in the target is doubled, a quoted argument is
+/// one literal.
+#[test]
+fn ps1_shim_uses_literal_array() {
+    let (t, layout) = setup();
+    let dir = t.path().join("it's");
+    std::fs::create_dir_all(&dir).unwrap();
+    let ps1 = dir.join("x.ps1");
+    let args = r#"--flag "C:\Program Files\x" -b"#;
+    create_shim(&layout, &spec("p", &ps1, Some(args), ShimKind::Ps1)).unwrap();
+    let want = format!(
+        "$path = '{}'\r\n$shimArgs = @('--flag', 'C:\\Program Files\\x', '-b')\r\n& $path @shimArgs @args\r\n",
+        ps1.display().to_string().replace('\'', "''")
+    );
+    assert_eq!(
+        std::fs::read_to_string(layout.shims().join("p.ps1")).unwrap(),
+        want
+    );
+}
+
+/// Plans a manifest of version `version` whose `bin` passes `args`, under the wingetrs root
+/// `root`; returns its shim step or the planning error.
+fn plan_shim(
+    root: &Path,
+    version: &str,
+    args: &str,
+) -> Result<ShimSpec, wingetrs::install::planner::PlanError> {
+    use wingetrs::install::manifest::{Arch, resolve};
+    use wingetrs::install::plan::Step;
+    use wingetrs::install::planner::{PlanInput, plan_install};
+    let m = serde_json::json!({
+        "version": version,
+        "url": "https://example.invalid/t.zip",
+        "hash": "0".repeat(64),
+        "bin": [["t.ps1", "t", args]],
+    });
+    let m = resolve(&m.to_string(), Arch::X64).unwrap();
+    let layout = Layout::new(root);
+    let shortcuts = root.join("startmenu");
+    let plan = plan_install(&PlanInput {
+        app: "app",
+        bucket: "main",
+        manifest: &m,
+        layout: &layout,
+        shortcut_root: &shortcuts,
+        installed: None,
+        launcher_present: true,
+        keep_old: false,
+        manifest_sha256: "",
+    })?;
+    Ok(plan
+        .steps
+        .into_iter()
+        .find_map(|s| match s {
+            Step::Shim(sp) => Some(sp),
+            _ => None,
+        })
+        .unwrap())
+}
+
+/// Task 191: `$version` comes from the manifest: in shim arguments only a plain value.
+#[test]
+fn shim_args_version_with_cmd_syntax_refused() {
+    use wingetrs::install::planner::PlanError;
+    let t = tempfile::tempdir().unwrap();
+    let r = plan_shim(t.path(), "1.0&calc", "--v $version");
+    assert!(matches!(r, Err(PlanError::UnsafeArgs(_))), "{r:?}");
+    // Not used in the arguments: the version does not matter to them.
+    assert!(plan_shim(t.path(), "1.0&calc", "--v x").is_ok());
+    assert_eq!(
+        plan_shim(t.path(), "1.0-rc.1+b2", "--v $version")
+            .unwrap()
+            .args
+            .as_deref(),
+        Some("--v 1.0-rc.1+b2")
+    );
+}
+
+/// Task 191: a user profile folder with `&` and parentheses reaches the shims only inside
+/// quotes (`.cmd`) or a single-quoted literal (`.ps1`); one with `%` refuses the shim.
+#[test]
+fn shim_args_dir_with_ampersand_stays_inert() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("Tom&Jerry (x)");
+    let spec = plan_shim(&root, "1.0", r#"--data $dir\data --name="a b" -q"#).unwrap();
+    let dir = root.join("apps").join("app").join("current");
+    let data = format!(r"{}\data", dir.display());
+    assert_eq!(
+        spec.args.as_deref(),
+        Some(format!(r#"--data "{data}" "--name=a b" -q"#).as_str())
+    );
+    let layout = Layout::new(&root);
+    create_shim(&layout, &spec).unwrap();
+    let cmd = std::fs::read_to_string(layout.shims().join("t.cmd")).unwrap();
+    assert!(
+        cmd.contains(&format!(
+            r#"-file "{}" --data "{data}" "--name=a b" -q %*"#,
+            spec.target.display()
+        )),
+        "{cmd}"
+    );
+    let ps1 = std::fs::read_to_string(layout.shims().join("t.ps1")).unwrap();
+    assert!(
+        ps1.contains(&format!(
+            "$shimArgs = @('--data', '{data}', '--name=a b', '-q')"
+        )),
+        "{ps1}"
+    );
+    let r = plan_shim(&t.path().join("100%"), "1.0", r"--data $dir\data");
+    assert!(
+        matches!(r, Err(wingetrs::install::planner::PlanError::UnsafeArgs(_))),
+        "{r:?}"
     );
 }
