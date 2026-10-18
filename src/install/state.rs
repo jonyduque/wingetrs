@@ -12,6 +12,8 @@ pub enum StateError {
     UnknownKind(String),
     #[error("erro de E/S no estado: {0}")]
     Io(#[from] std::io::Error),
+    #[error("o manifesto gravado de {0} é grande demais")]
+    ManifestTooLarge(String),
     #[error("o manifesto gravado de {0} não confere com o registro")]
     ManifestMismatch(String),
 }
@@ -23,6 +25,7 @@ pub enum ArtifactKind {
     Persist,
     Path,
     Env,
+    PsModule,
 }
 
 impl ArtifactKind {
@@ -33,6 +36,7 @@ impl ArtifactKind {
             ArtifactKind::Persist => "persist",
             ArtifactKind::Path => "path",
             ArtifactKind::Env => "env",
+            ArtifactKind::PsModule => "psmodule",
         }
     }
     fn parse(s: &str) -> Result<ArtifactKind, StateError> {
@@ -42,6 +46,7 @@ impl ArtifactKind {
             "persist" => ArtifactKind::Persist,
             "path" => ArtifactKind::Path,
             "env" => ArtifactKind::Env,
+            "psmodule" => ArtifactKind::PsModule,
             other => return Err(StateError::UnknownKind(other.to_string())),
         })
     }
@@ -192,6 +197,17 @@ impl StateDb {
         Ok(out)
     }
 
+    /// Apps that record an artifact of `kind`, sorted.
+    pub fn apps_with_artifact(&self, kind: ArtifactKind) -> Result<Vec<String>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT app FROM artifacts WHERE kind = ?1 ORDER BY app")?;
+        let rows = stmt
+            .query_map(params![kind.as_str()], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Apps (other than `app`) whose recorded artifacts include a PATH entry equal to `entry`.
     pub fn path_users(&self, app: &str, entry: &str) -> Result<Vec<String>, StateError> {
         use crate::install::path_edit::norm;
@@ -243,6 +259,9 @@ pub fn write_install_json(
     crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &dst))
 }
 
+/// Upper bound for a written manifest (real ones are a few KiB).
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Reads `<version_dir>\manifest.json` written at install time; `None` for apps installed
 /// before Phase 2c. Bytes that are not UTF-8 or whose SHA-256 differs from the record are refused.
 pub fn installed_manifest(
@@ -252,6 +271,14 @@ pub fn installed_manifest(
     expected_sha256: &str,
 ) -> Result<Option<String>, StateError> {
     let path = layout.version_dir(app, version).join("manifest.json");
+    match std::fs::metadata(&path) {
+        Ok(m) if m.len() > MAX_MANIFEST_BYTES => {
+            return Err(StateError::ManifestTooLarge(app.to_string()));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

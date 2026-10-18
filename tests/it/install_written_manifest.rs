@@ -350,3 +350,25 @@ async fn upgrade_keep_old_has_both_manifests() {
     assert_eq!(read("1.0"), a);
     assert_eq!(read("2.0"), b);
 }
+
+#[tokio::test]
+async fn installed_manifest_non_utf8_is_refused() {
+    let s = setup().await;
+    let dir = s.layout.version_dir("app", "1.0");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = [b'{', 0xFF, 0xFE, b'}'];
+    std::fs::write(dir.join("manifest.json"), bytes).unwrap();
+    let err = installed_manifest(&s.layout, "app", "1.0", &sha256_hex(&bytes)).unwrap_err();
+    assert!(matches!(err, StateError::ManifestMismatch(ref n) if n == "app"));
+}
+
+#[tokio::test]
+async fn installed_manifest_over_the_size_cap_is_refused() {
+    let s = setup().await;
+    let dir = s.layout.version_dir("app", "1.0");
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = vec![b' '; 4 * 1024 * 1024 + 1];
+    std::fs::write(dir.join("manifest.json"), &big).unwrap();
+    let err = installed_manifest(&s.layout, "app", "1.0", &sha256_hex(&big)).unwrap_err();
+    assert!(matches!(err, StateError::ManifestTooLarge(ref n) if n == "app"));
+}
