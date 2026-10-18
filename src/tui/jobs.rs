@@ -98,7 +98,10 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::Linking
             | Phase::Recording
             | Phase::Removing { .. }
-            | Phase::Scanning),
+            | Phase::Scanning
+            | Phase::WaitingElevation
+            | Phase::RunningInstaller { .. }
+            | Phase::Verifying),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }

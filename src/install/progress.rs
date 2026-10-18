@@ -38,6 +38,12 @@ pub enum Phase {
     Removing { app: String },
     /// Uninstall: looking for leftovers in the registry and on disk.
     Scanning,
+    /// Native winget install: the elevated helper was asked to run the installer (UAC).
+    WaitingElevation,
+    /// Native winget install: the installer of `name` is running (cannot be cancelled).
+    RunningInstaller { name: String },
+    /// Native winget install: looking for the app among the installed ones.
+    Verifying,
 }
 
 /// Format name shown next to the file being extracted.
@@ -70,6 +76,14 @@ pub fn phase_title(phase: &Phase) -> String {
         Phase::Recording => "Registrando".into(),
         Phase::Removing { app } => format!("Removendo {app}"),
         Phase::Scanning => "Procurando resíduos".into(),
+        Phase::WaitingElevation => {
+            "Aguardando o UAC; se não aparecer, clique no escudo piscando na barra de tarefas"
+                .into()
+        }
+        Phase::RunningInstaller { name } => {
+            format!("Instalador de {name} rodando (pode abrir janelas)")
+        }
+        Phase::Verifying => "Conferindo a instalação".into(),
     }
 }
 
@@ -90,7 +104,9 @@ pub fn phase_text(phase: &Phase, elapsed: Duration) -> String {
 pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
     let text = phase_text(phase, elapsed);
     match phase {
-        Phase::Installer { .. } => format!("{text} · não pode ser cancelado"),
+        Phase::Installer { .. } | Phase::RunningInstaller { .. } => {
+            format!("{text} · não pode ser cancelado")
+        }
         Phase::Preparing
         | Phase::WaitingInstaller
         | Phase::Extracting { .. }
@@ -98,6 +114,8 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::Linking
         | Phase::Recording
         | Phase::Removing { .. }
-        | Phase::Scanning => text,
+        | Phase::Scanning
+        | Phase::WaitingElevation
+        | Phase::Verifying => text,
     }
 }

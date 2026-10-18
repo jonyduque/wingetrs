@@ -1756,6 +1756,13 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::InstallPhase(phase) => {
             if let Some(r) = &mut app.running {
+                // A native winget installer, like `msiexec /a`, cannot be stopped once running.
+                if matches!(
+                    phase,
+                    crate::install::progress::Phase::RunningInstaller { .. }
+                ) {
+                    app.installer_running = true;
+                }
                 let same = r
                     .progress
                     .as_ref()

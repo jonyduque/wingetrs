@@ -674,7 +674,10 @@ impl Phases {
                 | Phase::Linking
                 | Phase::Recording
                 | Phase::Removing { .. }
-                | Phase::Scanning,
+                | Phase::Scanning
+                | Phase::WaitingElevation
+                | Phase::RunningInstaller { .. }
+                | Phase::Verifying,
                 _,
             ))
             | None => None,
@@ -727,7 +730,10 @@ impl Phases {
                 | Phase::Linking
                 | Phase::Recording
                 | Phase::Removing { .. }
-                | Phase::Scanning,
+                | Phase::Scanning
+                | Phase::WaitingElevation
+                | Phase::RunningInstaller { .. }
+                | Phase::Verifying,
                 _,
             ))
             | None => return None,
@@ -795,7 +801,13 @@ impl Phases {
                 | Phase::Linking
                 | Phase::Recording
                 | Phase::Removing { .. }
-                | Phase::Scanning => {}
+                | Phase::Scanning
+                | Phase::WaitingElevation
+                | Phase::Verifying => {}
+                // The native installer cannot be cancelled either; it has no log to follow.
+                Phase::RunningInstaller { .. } => {
+                    main = format!("{spin} {}", phase_status(phase, elapsed));
+                }
             }
             return Some((main, warn));
         }
