@@ -116,7 +116,7 @@ fn env_path_entry(raw: &str, current: &Path) -> Result<Option<PathBuf>, PlanErro
     Ok(Some(out))
 }
 
-fn shim_kind(path: &str) -> ShimKind {
+pub(crate) fn shim_kind(path: &str) -> ShimKind {
     let lower = path.to_ascii_lowercase();
     if lower.ends_with(".cmd") {
         ShimKind::Cmd
@@ -169,7 +169,7 @@ fn sanitize_component(c: &str) -> String {
     out
 }
 
-fn shortcut_link(root: &Path, name: &str) -> PathBuf {
+pub(crate) fn shortcut_link(root: &Path, name: &str) -> PathBuf {
     let mut parts: Vec<String> = components(name).map(sanitize_component).collect();
     if parts.is_empty() {
         parts.push("_".to_string());

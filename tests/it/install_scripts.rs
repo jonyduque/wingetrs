@@ -759,7 +759,7 @@ async fn env_seed_names_differing_only_in_case_appear_once() {
 }
 
 #[tokio::test]
-async fn effects_not_yet_supported_fail() {
+async fn unknown_effect_op_fails_unreadable() {
     let w = setup().await;
     let before = w.snapshot();
     let host = Arc::new(FakeHost {
@@ -768,7 +768,7 @@ async fn effects_not_yet_supported_fail() {
     });
     let plan = w.plan(serde_json::json!({"post_install": "info 'x'"}));
     let e = w.run(&plan, &host).await.unwrap_err().to_string();
-    assert!(e.contains("ainda não suportados"), "{e}");
+    assert!(e.contains("efeitos do script ilegíveis"), "{e}");
     assert!(!w.layout.app_dir("app").exists());
     assert_eq!(w.snapshot(), before);
 }

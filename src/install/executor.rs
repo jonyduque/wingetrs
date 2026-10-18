@@ -28,9 +28,10 @@ use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::runner::{
     RunnerInput, ScriptBody, ScriptContext, ScriptOp, VarValue, runner_ps1, script_vars,
 };
+use crate::install::script_effects::{self, ScriptEffect};
 use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
-use crate::install::{extract, inno, link, path_edit, safepath, script_scan, shim, state};
+use crate::install::{extract, inno, link, path_edit, planner, safepath, script_scan, shim, state};
 
 pub trait StepHook: Send + Sync {
     fn before(&self, index: usize, step: &Step) -> Result<(), ExecError>;
@@ -1112,7 +1113,19 @@ async fn run_hook(
         ],
     };
     tracing::info!("rodando o script {hook} de {app}");
-    let worker = AwaitWorker::spawn(move || host.run(&job), work.clone(), ctx.launch.clone());
+    let gate = ctx.launch.clone();
+    let launch = move || {
+        // Right before PowerShell starts: a Ctrl+C until here cancels; from here it is refused
+        // and the hook runs to its end (it is never killed halfway through its effects).
+        if !gate.try_launch() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "instalação cancelada antes de o script começar",
+            ));
+        }
+        host.run(&job)
+    };
+    let worker = AwaitWorker::spawn(launch, work.clone(), ctx.launch.clone());
     let result = match worker.join().await {
         Ok(r) => r,
         Err(e) => match e.try_into_panic() {
@@ -1145,14 +1158,378 @@ async fn run_hook(
         }
         return Err(message);
     }
-    // Applying the effects comes with the next task of the lane; until then any is refused.
-    let written = fs::metadata(&effects)
-        .map_err(|e| io_msg(&effects, e))?
-        .len();
-    if written > 0 {
-        return Err("efeitos de script ainda não suportados".into());
+    // Every effect is parsed before any is applied: an unreadable file changes nothing.
+    let parsed = read_effects(&effects).map_err(|e| format!("efeitos do script ilegíveis: {e}"))?;
+    for effect in parsed {
+        apply_effect(run, ctx, effect)?;
     }
     Ok(())
+}
+
+/// Cap of `effects.jsonl`, checked before reading it.
+const MAX_EFFECTS_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Reads and parses `effects.jsonl` (written by third-party code: size checked first, the
+/// read itself bounded by the same cap).
+fn read_effects(path: &Path) -> Result<Vec<ScriptEffect>, String> {
+    use std::io::Read;
+    let too_big = || "effects.jsonl passa de 64 MiB".to_string();
+    let f = fs::File::open(path).map_err(|e| io_msg(path, e))?;
+    let len = f.metadata().map_err(|e| io_msg(path, e))?.len();
+    if len > MAX_EFFECTS_BYTES {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_EFFECTS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_msg(path, e))?;
+    if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_EFFECTS_BYTES) {
+        return Err(too_big());
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "effects.jsonl não é UTF-8".to_string())?;
+    script_effects::parse_effects(&text).map_err(|e| e.to_string())
+}
+
+/// Variables a script may never set with `Set-EnvVar`/`env` (exact name, any case): the
+/// PATH and `PSModulePath` only change entry by entry (`Add-Path`), and the rest are read by
+/// Windows, the shells or a language runtime at startup.
+const DENIED_ENV: &[&str] = &[
+    "PATHEXT",
+    "ComSpec",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SystemRoot",
+    "windir",
+    "PSExecutionPolicyPreference",
+    "__PSLockdownPolicy",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+];
+
+/// Families refused by prefix (any case): loader, profiler and runtime hooks (.NET, Node,
+/// Python, Perl, Ruby, git, the dynamic linker), `PSModule*` and the processor variables.
+const DENIED_ENV_PREFIXES: &[&str] = &[
+    "COR_",
+    "CORECLR_",
+    "COMPLUS_",
+    "DOTNET_",
+    "NODE_",
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "GIT_",
+    "LD_",
+    "PSMODULE",
+    "PROCESSOR_",
+];
+
+/// Harmless names real manifests set that a prefix family would catch; `<APP>_HOME` is
+/// accepted the same way (never an exact name of [`DENIED_ENV`]).
+const ALLOWED_ENV: &[&str] = &[
+    "JAVA_HOME",
+    "GOPATH",
+    "GOROOT",
+    "ANDROID_HOME",
+    "ANDROID_SDK_ROOT",
+];
+
+fn env_denied(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if DENIED_ENV.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+        return true;
+    }
+    if ALLOWED_ENV.iter().any(|a| a.eq_ignore_ascii_case(name)) || upper.ends_with("_HOME") {
+        return false;
+    }
+    DENIED_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
+/// Longest `Remove-Path` pattern accepted (the match is quadratic in the worst case).
+const MAX_PATTERN_CHARS: usize = 1024;
+
+/// Name a script may set: `[A-Za-z_][A-Za-z0-9_]*`, at most 255 characters, not the PATH and
+/// not refused by [`env_denied`].
+fn check_env_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let valid = name.len() <= 255
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(format!("nome de variável inválido: {name:?}"));
+    }
+    if name.eq_ignore_ascii_case(PATH_VAR) {
+        return Err("o script tentou gravar o PATH inteiro; use Add-Path".into());
+    }
+    if env_denied(name) {
+        return Err(format!("a variável {name} não pode ser gravada por script"));
+    }
+    Ok(())
+}
+
+/// `entry` is `base` itself or a path under it made only of safe components (no `..`,
+/// drive, ADS, reserved name), compared through `path_edit::norm`. `;`, `%`, `"` and control
+/// characters are refused: they would split or expand a PATH entry.
+fn is_inside(entry: &str, base: &Path) -> bool {
+    if entry.contains([';', '%', '"']) || entry.chars().any(char::is_control) {
+        return false;
+    }
+    let base = base.to_string_lossy();
+    let Some((head, rest)) = entry.split_at_checked(base.len()) else {
+        return false;
+    };
+    if path_edit::norm(head) != path_edit::norm(&base) {
+        return false;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    match rest.strip_prefix(['\\', '/']) {
+        Some(rel) => safepath::safe_components(rel).is_some(),
+        None => false,
+    }
+}
+
+/// PowerShell `-like` (case-insensitive): `*`, `?`, `[set]`/`[a-z]` and the backtick escape.
+fn like(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.to_lowercase().chars().collect();
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    // One token of the pattern at `pi`: (matches `c`?, length in chars); `None` for `*`.
+    let token = |pi: usize, c: char| -> (bool, usize) {
+        match p[pi] {
+            '?' => (true, 1),
+            '`' if pi + 1 < p.len() => (p[pi + 1] == c, 2),
+            '[' => match p[pi + 1..].iter().position(|&x| x == ']') {
+                Some(end) if end > 0 => {
+                    let set = &p[pi + 1..pi + 1 + end];
+                    let mut hit = false;
+                    let mut i = 0;
+                    while i < set.len() {
+                        if i + 2 < set.len() && set[i + 1] == '-' {
+                            hit |= set[i] <= c && c <= set[i + 2];
+                            i += 3;
+                        } else {
+                            hit |= set[i] == c;
+                            i += 1;
+                        }
+                    }
+                    (hit, end + 2)
+                }
+                _ => (c == '[', 1),
+            },
+            x => (x == c, 1),
+        }
+    };
+    // Greedy match with backtracking to the last `*`.
+    let (mut ti, mut pi) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            pi += 1;
+            star = Some((pi, ti));
+            continue;
+        }
+        if pi < p.len() {
+            let (hit, step) = token(pi, t[ti]);
+            if hit {
+                pi += step;
+                ti += 1;
+                continue;
+            }
+        }
+        match star {
+            Some((sp, st)) => {
+                pi = sp;
+                ti = st + 1;
+                star = Some((sp, st + 1));
+            }
+            None => return false,
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// A PATH entry this app recorded, in this run or in its previous record.
+fn own_path_entry(run: &Run<'_>, entry: &str) -> bool {
+    let want = path_edit::norm(entry);
+    let same = |a: &Artifact| a.kind == ArtifactKind::Path && path_edit::norm(&a.target) == want;
+    run.artifacts.iter().any(same)
+        || run
+            .previous
+            .as_ref()
+            .is_some_and(|(_, arts)| arts.iter().any(same))
+}
+
+/// A shim this app recorded, in this run or in its previous record.
+fn own_shim(run: &Run<'_>, name: &str) -> bool {
+    run.artifacts
+        .iter()
+        .any(|a| a.kind == ArtifactKind::Shim && a.target.eq_ignore_ascii_case(name))
+        || run.previous_artifact(ArtifactKind::Shim, name).is_some()
+}
+
+/// Applies one effect of `effects.jsonl` (untrusted: written by the manifest script)
+/// through the same paths as the phase 2a steps, each with its `Undo` and `Artifact`.
+fn apply_effect(
+    run: &mut Run<'_>,
+    ctx: &mut ExecCtx<'_>,
+    effect: ScriptEffect,
+) -> Result<(), String> {
+    let layout = ctx.layout;
+    let app = run.plan.app.clone();
+    let app_dir = layout.app_dir(&app);
+    let persist_dir = layout.persist_dir(&app);
+    let env = ctx.effects.env;
+    match effect {
+        ScriptEffect::SetEnv { name, value } => {
+            check_env_name(&name)?;
+            set_env(run, env, &name, value.as_deref())
+        }
+        ScriptEffect::AddPath { var, entries, .. } => {
+            let psmodule = var.eq_ignore_ascii_case(PSMODULE_VAR);
+            if !psmodule && !var.eq_ignore_ascii_case(PATH_VAR) {
+                return Err(format!("Add-Path em {var} não suportado"));
+            }
+            let label = if psmodule { PSMODULE_VAR } else { "PATH" };
+            for entry in entries {
+                if !is_inside(&entry, &app_dir) && !is_inside(&entry, &persist_dir) {
+                    return Err(format!(
+                        "o script tentou pôr {entry} no {label} (fora da pasta do app)"
+                    ));
+                }
+                if psmodule {
+                    psmodulepath_prepend(run, env, &entry)?;
+                } else {
+                    add_path(run, env, &entry)?;
+                }
+            }
+            Ok(())
+        }
+        ScriptEffect::RemovePath { var, entries } => {
+            if !var.eq_ignore_ascii_case(PATH_VAR) {
+                tracing::warn!("{app}: Remove-Path em {var} ignorado");
+                return Ok(());
+            }
+            let patterns: Vec<&str> = entries
+                .iter()
+                .flat_map(|e| e.split(';'))
+                .filter(|p| !p.is_empty())
+                .collect();
+            if patterns
+                .iter()
+                .any(|p| p.chars().count() > MAX_PATTERN_CHARS)
+            {
+                return Err("padrão de Remove-Path longo demais".into());
+            }
+            let Some(cur) = env.get(PATH_VAR).map_err(|e| e.to_string())? else {
+                return Ok(());
+            };
+            let mut value = cur.value.clone();
+            for seg in cur.value.split(';') {
+                if seg.is_empty() || !patterns.iter().any(|p| like(seg, p)) {
+                    continue;
+                }
+                if !is_inside(seg, layout.root()) || !own_path_entry(run, seg) {
+                    tracing::warn!("{app}: Remove-Path de {seg} ignorado (não é deste app)");
+                    continue;
+                }
+                let want = path_edit::norm(seg);
+                run.artifacts.retain(|a| {
+                    !(a.kind == ArtifactKind::Path && path_edit::norm(&a.target) == want)
+                });
+                let users = ctx.state.path_users(&app, seg).map_err(|e| e.to_string())?;
+                if users.is_empty() {
+                    value = path_edit::path_remove(&value, seg);
+                }
+            }
+            if value == cur.value {
+                return Ok(());
+            }
+            run.push(Undo::RestoreEnv {
+                name: PATH_VAR.to_string(),
+                previous: Some(cur.clone()),
+            });
+            env.set(
+                PATH_VAR,
+                &EnvValue {
+                    value,
+                    expand: cur.expand,
+                },
+            )
+            .map_err(|e| e.to_string())
+        }
+        ScriptEffect::Shim { path, name, args } => {
+            check_component("comando", &name)?;
+            if !is_inside(&path, &app_dir) {
+                return Err(format!(
+                    "o script tentou criar o comando {name} para {path} (fora da pasta do app)"
+                ));
+            }
+            let spec = ShimSpec {
+                kind: planner::shim_kind(&path),
+                name,
+                target: PathBuf::from(path),
+                args,
+            };
+            make_shim(run, &spec, ctx)
+        }
+        ScriptEffect::RmShim { name } => {
+            check_component("comando", &name)?;
+            if !own_shim(run, &name) {
+                tracing::warn!("{app}: rm_shim de {name} ignorado (não é deste app)");
+                return Ok(());
+            }
+            let saved = saved_shim_files(layout, &name)?;
+            run.push(Undo::RestoreShim {
+                name: name.clone(),
+                saved,
+            });
+            shim::remove_shim(layout, &name).map_err(|e| e.to_string())?;
+            run.artifacts.retain(|a| {
+                !(a.kind == ArtifactKind::Shim && a.target.eq_ignore_ascii_case(&name))
+            });
+            Ok(())
+        }
+        ScriptEffect::Shortcut {
+            target,
+            name,
+            args,
+            icon,
+        } => {
+            for p in std::iter::once(&target).chain(icon.as_ref()) {
+                if !is_inside(p, &app_dir) {
+                    return Err(format!(
+                        "o script tentou criar o atalho {name} para {p} (fora da pasta do app)"
+                    ));
+                }
+            }
+            // Refused rather than sanitized: `shortcut_link` would turn `..` into `_`.
+            if safepath::safe_components(&name).is_none_or(|c| c.is_empty()) {
+                return Err(format!("nome inseguro de atalho: {name}"));
+            }
+            let link = planner::shortcut_link(&ctx.effects.shortcuts.root(), &name);
+            let spec = ShortcutSpec {
+                link,
+                target: PathBuf::from(target),
+                args,
+                icon: icon.map(PathBuf::from),
+            };
+            make_shortcut(run, &spec, ctx)
+        }
+    }
 }
 
 /// Runs innounp on `installer` into the fresh folder `tmp` (inside the staging folder) and
@@ -1442,63 +1819,9 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 .map_err(|e| io_msg(&current, e))
         }
         Step::Shim(spec) => make_shim(run, spec, ctx),
-        Step::Shortcut(spec) => {
-            let target = spec.link.display().to_string();
-            if let Some(owner) = owner_of(ctx.state, app, ArtifactKind::Shortcut, &target)? {
-                return Err(format!("o atalho {target} já pertence a {owner}"));
-            }
-            if run
-                .previous_artifact(ArtifactKind::Shortcut, &target)
-                .is_some()
-            {
-                run.push(Undo::RecreateShortcut(spec.clone()));
-            } else {
-                run.push(Undo::RemoveShortcut(spec.link.clone()));
-            }
-            ctx.effects
-                .shortcuts
-                .create(
-                    &spec.link,
-                    &spec.target,
-                    spec.args.as_deref(),
-                    spec.icon.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
-            run.artifacts.push(Artifact {
-                kind: ArtifactKind::Shortcut,
-                target,
-                previous: None,
-            });
-            Ok(())
-        }
+        Step::Shortcut(spec) => make_shortcut(run, spec, ctx),
         Step::PsModule { name } => psmodule(run, ctx, name),
-        Step::EnvSet { name, value } => {
-            let env = ctx.effects.env;
-            let before = env.get(name).map_err(|e| e.to_string())?;
-            // An upgrade keeps the value from before the first install.
-            let recorded_previous = match run.previous_artifact(ArtifactKind::Env, name) {
-                Some(a) => a.previous.clone(),
-                None => before.as_ref().map(|v| v.value.clone()),
-            };
-            run.push(Undo::RestoreEnv {
-                name: name.clone(),
-                previous: before,
-            });
-            env.set(
-                name,
-                &EnvValue {
-                    value: value.clone(),
-                    expand: value.contains('%'),
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            run.artifacts.push(Artifact {
-                kind: ArtifactKind::Env,
-                target: name.clone(),
-                previous: recorded_previous,
-            });
-            Ok(())
-        }
+        Step::EnvSet { name, value } => set_env(run, ctx.effects.env, name, Some(value)),
         Step::EnvAddPath { entry } => add_path(run, ctx.effects.env, &entry.display().to_string()),
         Step::EnsureShimsOnPath => {
             add_path(run, ctx.effects.env, &layout.shims().display().to_string())
@@ -1739,8 +2062,10 @@ impl<T> Drop for AwaitWorker<T> {
         if self.handle.take().is_none() {
             return;
         }
-        // Refused when `msiexec` already runs: then the wait below is for it to end.
-        let _ = self.gate.try_cancel();
+        // Refused when `msiexec` or a hook already runs: then the wait below is for it to end.
+        if !self.gate.try_cancel() {
+            tracing::warn!("um passo já começou e não pode ser interrompido; esperando terminar");
+        }
         let wait = || {
             let (lock, cvar) = &*self.done;
             let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());
@@ -1754,7 +2079,7 @@ impl<T> Drop for AwaitWorker<T> {
             _ => wait(),
         }
         tracing::warn!(
-            "instalação cancelada durante a extração; removendo {}",
+            "instalação cancelada durante um passo em andamento; removendo {}",
             self.staging.display()
         );
         if let Err(e) = not_found_ok(remove_any(&self.staging)) {
@@ -1849,31 +2174,128 @@ fn owner_of(
     Ok(None)
 }
 
-fn make_shim(run: &mut Run<'_>, spec: &ShimSpec, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
-    if let Some(owner) = owner_of(ctx.state, &run.plan.app, ArtifactKind::Shim, &spec.name)? {
-        return Err(format!("o comando {} já pertence a {owner}", spec.name));
+/// Pushes `a` unless this run already recorded the same kind and target.
+fn push_artifact(run: &mut Run<'_>, a: Artifact) {
+    let dup = run
+        .artifacts
+        .iter()
+        .any(|o| o.kind == a.kind && o.target.eq_ignore_ascii_case(&a.target));
+    if !dup {
+        run.artifacts.push(a);
     }
-    let dir = ctx.layout.shims();
-    run.ensure_dirs(&dir)?;
+}
+
+/// Current contents of `shims\<name>.*`, to put back on undo.
+fn saved_shim_files(layout: &Layout, name: &str) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    let dir = layout.shims();
     let mut saved = Vec::new();
     for ext in ["exe", "shim", "cmd", "ps1"] {
-        let p = dir.join(format!("{}.{ext}", spec.name));
+        let p = dir.join(format!("{name}.{ext}"));
         match fs::read(&p) {
             Ok(bytes) => saved.push((p, bytes)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(io_msg(&p, e)),
         }
     }
+    Ok(saved)
+}
+
+fn make_shim(run: &mut Run<'_>, spec: &ShimSpec, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
+    if let Some(owner) = owner_of(ctx.state, &run.plan.app, ArtifactKind::Shim, &spec.name)? {
+        return Err(format!("o comando {} já pertence a {owner}", spec.name));
+    }
+    let dir = ctx.layout.shims();
+    run.ensure_dirs(&dir)?;
+    let saved = saved_shim_files(ctx.layout, &spec.name)?;
     run.push(Undo::RestoreShim {
         name: spec.name.clone(),
         saved,
     });
     shim::create_shim(ctx.layout, spec).map_err(|e| e.to_string())?;
-    run.artifacts.push(Artifact {
-        kind: ArtifactKind::Shim,
-        target: spec.name.clone(),
-        previous: None,
+    push_artifact(
+        run,
+        Artifact {
+            kind: ArtifactKind::Shim,
+            target: spec.name.clone(),
+            previous: None,
+        },
+    );
+    Ok(())
+}
+
+fn make_shortcut(
+    run: &mut Run<'_>,
+    spec: &ShortcutSpec,
+    ctx: &mut ExecCtx<'_>,
+) -> Result<(), String> {
+    let target = spec.link.display().to_string();
+    if let Some(owner) = owner_of(ctx.state, &run.plan.app, ArtifactKind::Shortcut, &target)? {
+        return Err(format!("o atalho {target} já pertence a {owner}"));
+    }
+    if run
+        .previous_artifact(ArtifactKind::Shortcut, &target)
+        .is_some()
+    {
+        run.push(Undo::RecreateShortcut(spec.clone()));
+    } else {
+        run.push(Undo::RemoveShortcut(spec.link.clone()));
+    }
+    ctx.effects
+        .shortcuts
+        .create(
+            &spec.link,
+            &spec.target,
+            spec.args.as_deref(),
+            spec.icon.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+    push_artifact(
+        run,
+        Artifact {
+            kind: ArtifactKind::Shortcut,
+            target,
+            previous: None,
+        },
+    );
+    Ok(())
+}
+
+/// Sets (`Some`) or removes (`None`) user variable `name`. The artifact keeps the value from
+/// before the first install (an upgrade, or a script setting what an earlier step set).
+fn set_env(
+    run: &mut Run<'_>,
+    env: &dyn EnvStore,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), String> {
+    let before = env.get(name).map_err(|e| e.to_string())?;
+    let recorded_previous = match run.previous_artifact(ArtifactKind::Env, name) {
+        Some(a) => a.previous.clone(),
+        None => before.as_ref().map(|v| v.value.clone()),
+    };
+    run.push(Undo::RestoreEnv {
+        name: name.to_string(),
+        previous: before,
     });
+    match value {
+        Some(v) => env.set(
+            name,
+            &EnvValue {
+                value: v.to_string(),
+                expand: v.contains('%'),
+            },
+        ),
+        None => env.remove(name),
+    }
+    .map_err(|e| e.to_string())?;
+    push_artifact(
+        run,
+        Artifact {
+            kind: ArtifactKind::Env,
+            target: name.to_string(),
+            previous: recorded_previous,
+        },
+    );
     Ok(())
 }
 
@@ -1982,7 +2404,12 @@ fn psmodule(run: &mut Run<'_>, ctx: &mut ExecCtx<'_>, name: &str) -> Result<(), 
         previous: None,
     });
 
-    let env = ctx.effects.env;
+    psmodulepath_prepend(run, ctx.effects.env, &modules.display().to_string())
+}
+
+/// Puts `entry` first in the user `PSModulePath` unless it is there already (a missing
+/// variable starts from the user's default module folder).
+fn psmodulepath_prepend(run: &mut Run<'_>, env: &dyn EnvStore, entry: &str) -> Result<(), String> {
     let before = env.get(PSMODULE_VAR).map_err(|e| e.to_string())?;
     let base = match &before {
         Some(v) => v.value.clone(),
@@ -1994,8 +2421,7 @@ fn psmodule(run: &mut Run<'_>, ctx: &mut ExecCtx<'_>, name: &str) -> Result<(), 
                 .to_string()
         }
     };
-    let modules_s = modules.display().to_string();
-    if path_edit::path_contains(&base, &modules_s) {
+    if path_edit::path_contains(&base, entry) {
         return Ok(());
     }
     run.push(Undo::RestoreEnv {
@@ -2005,7 +2431,7 @@ fn psmodule(run: &mut Run<'_>, ctx: &mut ExecCtx<'_>, name: &str) -> Result<(), 
     env.set(
         PSMODULE_VAR,
         &EnvValue {
-            value: format!("{};{}", modules.display(), base),
+            value: format!("{entry};{base}"),
             expand: before.is_some_and(|v| v.expand),
         },
     )
