@@ -1,5 +1,4 @@
 //! Own PowerShell prelude of Scoop functions (Task 152).
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 /// The prelude text (ASCII only); defines functions and nothing else.
 pub const PRELUDE: &str = include_str!("prelude.ps1");

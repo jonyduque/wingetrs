@@ -7,7 +7,7 @@
 #   $__wr_env_seed      environment seed
 #   $__wr_helpers       hashtable helper name -> absolute exe path
 #   $__wr_shortcut_root shortcut root
-# Optional: $bucketsdir (used by Find-BucketDirectory).
+# Optional: $bucketsdir (Find-BucketDirectory throws if it is empty).
 # This file only defines functions: loading it has no side effects.
 
 # messages -- core.ps1:311-314
@@ -123,6 +123,7 @@ function Find-BucketDirectory {
     if (($null -eq $Name) -or ($Name -eq '')) {
         $Name = 'main'
     }
+    if ([string]::IsNullOrEmpty($bucketsdir)) { throw 'bucketsdir not defined by the runner' }
     $bucket = "$bucketsdir\$Name"
     if ((Test-Path "$bucket\bucket") -and !$Root) {
         $bucket = "$bucket\bucket"
@@ -228,7 +229,7 @@ function movedir($from, $to) {
     $to = $to.trimend('\')
 
     $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo.FileName = 'robocopy.exe'
+    $proc.StartInfo.FileName = "$env:SystemRoot\System32\robocopy.exe"
     $proc.StartInfo.Arguments = "`"$from`" `"$to`" /e /move"
     $proc.StartInfo.RedirectStandardOutput = $true
     $proc.StartInfo.RedirectStandardError = $true

@@ -215,9 +215,14 @@ fn modulesdir_variable_not_defined() {
 #[ignore = "live: roda pwsh real"]
 fn get_config_table_and_default() {
     let (_t, work, root) = dirs();
-    let body = "get_config 'USE_LESSMSI' $false\nget_config 'NO_JUNCTIONS' $true\nget_config 'ZZZ_X' 'pad'";
+    let body = "get_config 'USE_LESSMSI' $false\nget_config 'NO_JUNCTIONS' $true\nget_config 'NO_JUNCTION' $true\nget_config 'ZZZ_X' 'pad'";
     let o = run(&work, &root, body);
-    assert_eq!(lines(&o), vec!["True", "False", "pad"], "{}", o.out);
+    assert_eq!(
+        lines(&o),
+        vec!["True", "False", "False", "pad"],
+        "{}",
+        o.out
+    );
 }
 
 #[test]
@@ -303,4 +308,67 @@ fn loads_on_windows_powershell_5_1() {
     let ps = format!(r"{sysroot}\System32\WindowsPowerShell\v1.0\powershell.exe");
     assert!(Path::new(&ps).is_file(), "{ps}");
     all_defined(&ps);
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn find_bucket_directory_requires_bucketsdir() {
+    let (_t, work, root) = dirs();
+    let o = run(
+        &work,
+        &root,
+        "$bucketsdir = ''
+Find-BucketDirectory main",
+    );
+    assert_ne!(o.code, 0, "{}", o.out);
+    assert!(o.out.contains("bucketsdir not defined"), "{}", o.out);
+}
+
+#[test]
+fn prelude_text_is_declared_ascii_and_clean() {
+    assert!(PRELUDE.is_ascii());
+    let got: BTreeSet<&str> = PRELUDE_FUNCTIONS.iter().copied().collect();
+    let want: BTreeSet<&str> = FUNCTIONS.iter().copied().collect();
+    assert_eq!(
+        PRELUDE_FUNCTIONS.len(),
+        got.len(),
+        "duplicate in PRELUDE_FUNCTIONS"
+    );
+    assert_eq!(got, want);
+    let mut defined = BTreeSet::new();
+    // every `function <name>` anywhere in the text (also after `;` or `{`), word-bounded
+    for (i, _) in PRELUDE.match_indices("function") {
+        let before_ok = PRELUDE[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'));
+        let rest = &PRELUDE[i + "function".len()..];
+        if before_ok && rest.starts_with([' ', '\t']) {
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            defined.insert(name);
+        }
+    }
+    let defined: BTreeSet<&str> = defined.iter().map(String::as_str).collect();
+    assert_eq!(
+        defined, got,
+        "functions in prelude.ps1 differ from PRELUDE_FUNCTIONS"
+    );
+    for bad in [
+        "Invoke-Expression",
+        "iex ",
+        "DownloadString",
+        "Invoke-WebRequest",
+        "Start-Process",
+        "msiexec",
+        "scoopdir",
+        "HKCU:",
+        "SetEnvironmentVariable",
+        "[Environment]::",
+    ] {
+        assert!(!PRELUDE.contains(bad), "forbidden text in prelude: {bad}");
+    }
 }
