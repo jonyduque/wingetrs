@@ -1,1 +1,459 @@
-//! Admin-only execution folder for verified installers (Task 180).
+//! Admin-only execution folder for verified installers (Task 180), on the elevated helper's
+//! side. The installer the user downloaded is copied to
+//! `<FOLDERID_ProgramFiles>\wingetrs\staging\<32 hex>\` (a protected DACL: SYSTEM and
+//! Administrators only), hashed while copied, opened again denying writes and hashed through
+//! that handle, and run from there with `TEMP`/`TMP` inside the same folder. Motivo: a DLL
+//! planted next to the installer, or in the user's `%TEMP%`, would be loaded as admin.
+use super::worker::InstallerRequest;
+use crate::install::msiexec_log;
+use crate::winget_install::fetch::FetchError;
+use crate::winget_install::switches;
+use crate::winget_install::verified_win::VerifiedFile;
+use sha2::{Digest, Sha256};
+use std::ffi::OsString;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::windows::fs::MetadataExt;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+use windows::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
+};
+use windows::Win32::Security::{
+    DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+};
+use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows::core::{HSTRING, PWSTR};
+
+/// DACL of an execution folder: SYSTEM and Administrators, inherited by what is inside, and
+/// nothing inherited from above.
+pub const RUN_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// Largest installer copied.
+pub const COPY_MAX: u64 = 8 << 30;
+/// Execution folders older than this are removed when the helper starts.
+pub const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// The installer log in the execution folder (`<LOGPATH>`).
+pub const LOG_NAME: &str = "install.log";
+/// The installer's `TEMP`/`TMP`, inside the execution folder.
+pub const TMP_NAME: &str = "tmp";
+/// Bytes read from the end of the installer log.
+const LOG_WINDOW: u64 = msiexec_log::TAIL_WINDOW;
+/// `FILE_ATTRIBUTE_REPARSE_POINT`.
+const REPARSE: u32 = 0x400;
+/// Message of a copy whose hash differs from the expected one.
+pub const HASH_MISMATCH: &str = "o instalador não confere com o hash";
+
+/// A Win32 error as the `io::Error` std would build (so `kind()` works).
+fn io_err(e: &windows::core::Error) -> std::io::Error {
+    let code = e.code().0 as u32;
+    if code & 0xFFFF_0000 == 0x8007_0000 {
+        std::io::Error::from_raw_os_error((code & 0xFFFF) as i32)
+    } else {
+        std::io::Error::from_raw_os_error(code as i32)
+    }
+}
+
+/// Frees a `LocalAlloc` block on drop.
+struct Local(*mut core::ffi::c_void);
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: allocated by the API that returned it, freed once.
+            unsafe { LocalFree(Some(HLOCAL(self.0))) };
+        }
+    }
+}
+
+/// Refuses `path` when it is a reparse point (junction, symlink) or not a folder.
+fn plain_dir(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_attributes() & REPARSE != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} é um ponto de reanálise", path.display()),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} não é uma pasta",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// `<program_files>\wingetrs\staging`, created when missing (it inherits the ACL of
+/// `program_files`); refused when `wingetrs` or `staging` is a reparse point.
+pub fn staging_root(program_files: &Path) -> std::io::Result<PathBuf> {
+    let base = program_files.join("wingetrs");
+    let root = base.join("staging");
+    for dir in [&base, &root] {
+        match std::fs::create_dir(dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        plain_dir(dir)?;
+    }
+    Ok(root)
+}
+
+/// Creates the folder `path` with the security descriptor `sddl`; fails when it exists.
+fn create_dir_with(path: &Path, sddl: &str) -> std::io::Result<()> {
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sd` receives a LocalAlloc descriptor, freed by `_free`.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            &HSTRING::from(sddl),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(|e| io_err(&e))?;
+    let _free = Local(sd.0);
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    // SAFETY: `sa` and its descriptor outlive the call.
+    unsafe { CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&sa)) }.map_err(|e| io_err(&e))
+}
+
+/// The DACL of `path` as SDDL (`D:...`).
+pub fn dacl_sddl(path: &Path) -> std::io::Result<String> {
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `sd` receives a LocalAlloc descriptor, freed by `_free`.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            &HSTRING::from(path.as_os_str()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(rc.0 as i32));
+    }
+    let _free = Local(sd.0);
+    let mut text = PWSTR::null();
+    // SAFETY: `sd` is a valid descriptor; `text` receives a LocalAlloc string.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+    }
+    .map_err(|e| io_err(&e))?;
+    let _text = Local(text.0.cast());
+    // SAFETY: a NUL-terminated string from the call above.
+    unsafe { text.to_string() }.map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// One execution folder, removed with everything inside when dropped.
+#[derive(Debug)]
+pub struct RunDir {
+    path: PathBuf,
+}
+
+impl RunDir {
+    /// Creates `<root>\<32 random hex>` with the descriptor `sddl` (`RUN_SDDL` in production).
+    pub fn create(root: &Path, sddl: &str) -> std::io::Result<RunDir> {
+        let path = root.join(super::elevate_win::random_hex()?);
+        create_dir_with(&path, sddl)?;
+        Ok(RunDir { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.path) {
+            // A folder this process may not list is still removable when empty (the right to
+            // delete children of the parent).
+            if std::fs::remove_dir(&self.path).is_err() {
+                tracing::warn!(error = %e, "staging: execution folder left behind");
+            }
+        }
+    }
+}
+
+/// The verified copy of an installer in its execution folder. The handle drops before the
+/// folder is removed (field order).
+#[derive(Debug)]
+pub struct Staged {
+    file: VerifiedFile,
+    run: RunDir,
+}
+
+impl Staged {
+    /// The copy, open denying writes, delete and rename while `self` lives.
+    pub fn file(&self) -> &Path {
+        self.file.path()
+    }
+
+    pub fn run_dir(&self) -> &Path {
+        self.run.path()
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Copies `src` to the new file `dst` in a stream, at most `max` bytes, and checks its SHA-256
+/// against `sha256` (hex, any case).
+pub fn copy_hashed(src: &Path, dst: &Path, sha256: &str, max: u64) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(src)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("instalador ilegível: {e}")))?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    let mut sha = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match input.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        total += n as u64;
+        if total > max {
+            return Err(std::io::Error::other(format!(
+                "instalador maior que {max} bytes"
+            )));
+        }
+        sha.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+    }
+    out.flush()?;
+    if !hex(&sha.finalize()).eq_ignore_ascii_case(sha256.trim()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            HASH_MISMATCH,
+        ));
+    }
+    Ok(())
+}
+
+/// `name` as a single safe path component (see `install::safepath`).
+fn safe_name(name: &str) -> std::io::Result<&str> {
+    match crate::install::safepath::safe_components(name).as_deref() {
+        Some([one]) if one == name => Ok(name),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nome do instalador inválido",
+        )),
+    }
+}
+
+/// Creates an execution folder under `root` with `sddl` (plus its `tmp`), copies and checks
+/// `req.source` into it and opens the copy denying writes. On any error the folder is gone.
+pub fn stage(root: &Path, sddl: &str, req: &InstallerRequest) -> std::io::Result<Staged> {
+    let name = safe_name(&req.file_name)?;
+    let run = RunDir::create(root, sddl)?;
+    create_dir_with(&run.path().join(TMP_NAME), sddl)?;
+    let copy = run.path().join(name);
+    copy_hashed(Path::new(&req.source), &copy, &req.sha256, COPY_MAX)?;
+    let file = VerifiedFile::open(&copy, &req.sha256).map_err(|e| match e {
+        FetchError::Integrity => {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, HASH_MISMATCH)
+        }
+        other => std::io::Error::other(other.to_string()),
+    })?;
+    Ok(Staged { file, run })
+}
+
+/// The installer's environment: `inherited` without the user's `TEMP`/`TMP` (any case) nor the
+/// hidden `=X:` entries, plus `TEMP` and `TMP` set to `tmp`.
+pub fn installer_env(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    tmp: &Path,
+) -> Vec<(OsString, OsString)> {
+    let mut env: Vec<(OsString, OsString)> = inherited
+        .into_iter()
+        .filter(|(k, _)| {
+            let k = k.to_string_lossy();
+            !k.is_empty()
+                && !k.starts_with('=')
+                && !k.eq_ignore_ascii_case("TEMP")
+                && !k.eq_ignore_ascii_case("TMP")
+        })
+        .collect();
+    env.push(("TEMP".into(), tmp.as_os_str().to_owned()));
+    env.push(("TMP".into(), tmp.as_os_str().to_owned()));
+    env
+}
+
+/// The last lines of the log at `path` (UTF-16 with a BOM, as `msiexec` writes, or else
+/// UTF-8), at most `max`; none when there is no log.
+pub fn log_lines(path: &Path, max: usize) -> std::io::Result<Vec<String>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut bom = [0u8; 2];
+    let utf16 = file.read_exact(&mut bom).is_ok() && bom == [0xFF, 0xFE];
+    let size = file.seek(SeekFrom::End(0))?;
+    let text = if utf16 {
+        msiexec_log::tail_text(&mut file, LOG_WINDOW)?
+    } else {
+        let start = size.saturating_sub(LOG_WINDOW);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity(LOG_WINDOW as usize);
+        file.take(LOG_WINDOW).read_to_end(&mut bytes)?;
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // The window cut the first line: drop the part.
+    if size > LOG_WINDOW && lines.len() > 1 {
+        lines.remove(0);
+    }
+    let lines: Vec<String> = lines
+        .into_iter()
+        .map(|l| l.trim_end_matches(['\r', '\0']))
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let skip = lines.len().saturating_sub(max);
+    Ok(lines.into_iter().skip(skip).collect())
+}
+
+/// The program and parameters that run `staged`: `msiexec /i "<copy>" <params>` for msi/wix,
+/// the copy itself otherwise; `<LOGPATH>` is the log in the execution folder.
+pub fn command_for(
+    staged: &Staged,
+    req: &InstallerRequest,
+    msiexec: &Path,
+) -> std::io::Result<(PathBuf, String)> {
+    let log = staged.run_dir().join(LOG_NAME);
+    let params = switches::fill_log(&req.params, &log)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok(if req.kind.is_msi() {
+        (
+            msiexec.to_path_buf(),
+            switches::msiexec_params(staged.file(), &params),
+        )
+    } else {
+        (staged.file().to_path_buf(), params)
+    })
+}
+
+/// Runs `staged` (see `command_for`) from its execution folder with `installer_env`, waits for
+/// it, and sends the end of its log to `on_line`. The exit code.
+pub fn run_staged(
+    staged: &Staged,
+    req: &InstallerRequest,
+    msiexec: &Path,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<i32> {
+    let (program, params) = command_for(staged, req, msiexec)?;
+    let run = staged.run_dir();
+    let status = Command::new(&program)
+        .raw_arg(&params)
+        .current_dir(run)
+        .env_clear()
+        .envs(installer_env(std::env::vars_os(), &run.join(TMP_NAME)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    let code = status
+        .code()
+        .ok_or_else(|| std::io::Error::other("o instalador terminou sem código de saída"))?;
+    match log_lines(&run.join(LOG_NAME), super::worker::INSTALLER_LINES) {
+        Ok(lines) => lines.iter().for_each(|l| on_line(l)),
+        Err(e) => on_line(&format!("log do instalador ilegível: {e}")),
+    }
+    Ok(code)
+}
+
+/// The helper's `RunInstaller`: stages `req` under the production root (from the known folder)
+/// and runs it with the system's `msiexec`.
+pub fn run_installer(
+    req: &InstallerRequest,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<i32> {
+    req.check()
+        .map_err(|r| std::io::Error::new(std::io::ErrorKind::InvalidInput, r))?;
+    let root = staging_root(&super::elevate_win::program_files()?)?;
+    let msiexec = crate::winget_install::launch_win::msiexec_path()?;
+    let staged = stage(&root, RUN_SDDL, req)?;
+    run_staged(&staged, req, &msiexec, on_line)
+}
+
+/// Whether `name` is an execution folder name (32 lowercase hex).
+fn run_name(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Removes the execution folders in `root` older than `STALE_AFTER` at `now` (only plain
+/// folders named like one); how many were removed.
+pub fn prune(root: &Path, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(run_name) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+            continue;
+        }
+        let born = meta.created().or_else(|_| meta.modified());
+        let stale = born
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > STALE_AFTER);
+        if stale {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!(error = %e, "staging: stale folder not removed"),
+            }
+        }
+    }
+    removed
+}
+
+/// At the helper's start: prunes the production root when it exists and is not a reparse
+/// point. Never creates it.
+pub fn prune_at_start() {
+    let Ok(pf) = super::elevate_win::program_files() else {
+        return;
+    };
+    let base = pf.join("wingetrs");
+    let root = base.join("staging");
+    if plain_dir(&base).is_ok() && plain_dir(&root).is_ok() {
+        prune(&root, SystemTime::now());
+    }
+}

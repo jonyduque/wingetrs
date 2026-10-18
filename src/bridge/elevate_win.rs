@@ -185,7 +185,7 @@ impl Write for PipeIo {
 }
 
 /// 16 random bytes from the system RNG, as hex.
-fn random_hex() -> std::io::Result<String> {
+pub(super) fn random_hex() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
     // SAFETY: the buffer is ours; no algorithm handle with the system-preferred flag.
     unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
@@ -521,7 +521,31 @@ pub fn worker_main(pipe: &str, parent: u32) -> std::io::Result<()> {
         ..io.clone()
     });
     let mut writer = io;
-    super::worker::serve(&mut reader, &mut writer, &mut run_winget)
+    super::staging_win::prune_at_start();
+    super::worker::serve(&mut reader, &mut writer, &mut SystemOps)
+}
+
+/// The worker's real operations: winget (`run_winget`) and verified installers
+/// (`staging_win::run_installer`).
+struct SystemOps;
+
+impl super::worker::WorkerOps for SystemOps {
+    fn run(
+        &mut self,
+        program: &str,
+        args: &[String],
+        on_line: &mut dyn FnMut(&str),
+    ) -> std::io::Result<(i32, Vec<String>)> {
+        run_winget(program, args, on_line)
+    }
+
+    fn run_installer(
+        &mut self,
+        req: &super::worker::InstallerRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> std::io::Result<i32> {
+        super::staging_win::run_installer(req, on_line)
+    }
 }
 
 /// The worker's exec: only `winget`, and only the one Windows installed (see `winget_exe`),
@@ -578,7 +602,7 @@ fn winget_in(program_files: &Path, package_dir: &Path) -> Option<PathBuf> {
 }
 
 /// `Program Files` from the known folder, never from an environment variable.
-fn program_files() -> std::io::Result<PathBuf> {
+pub(super) fn program_files() -> std::io::Result<PathBuf> {
     // SAFETY: the returned string is freed below with CoTaskMemFree.
     let p = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
         .map_err(|e| io_err(&e))?;

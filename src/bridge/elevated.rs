@@ -1,7 +1,7 @@
 //! One elevated helper per session for machine-wide winget upgrades: the first such job asks
 //! for UAC once and starts `wingetrs bridge-worker`; later ones reuse it. A refusal is final
 //! for the session (the jobs run unelevated, as before). The Win32 side is `elevate_win`.
-use super::worker::{self, Reply, Request};
+use super::worker::{self, InstallerRequest, Reply, Request};
 use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
 use crate::installed::correlate::InstallScope;
 use std::io::{BufRead, Write};
@@ -154,25 +154,43 @@ impl ElevatedBridge {
     ) -> std::io::Result<(i32, Vec<String>)> {
         let request = request_for(job, program, args)?;
         let mut state = self.lock();
+        match self.ask_running(&mut state, &request, on_line) {
+            Ok(answer) => answer,
+            Err(Fail::Lost(e)) => Err(e),
+            Err(Fail::Refused(reason)) => Err(lost(reason)),
+        }
+    }
+
+    /// Sends `request` to the running helper in `state` and relays its answer. When the
+    /// request cannot even be sent, a new helper is started and it is sent once more; a helper
+    /// lost after that is dropped, so the next request starts a new one.
+    fn ask_running(
+        &self,
+        state: &mut State,
+        request: &Request,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<std::io::Result<(i32, Vec<String>)>, Fail> {
         let mut retried = false;
         loop {
-            let State::Running(helper) = &mut *state else {
-                return Err(lost("não está rodando"));
+            let State::Running(helper) = state else {
+                return Err(Fail::Lost(lost("não está rodando")));
             };
-            let e = match ask(helper.as_mut(), &request, on_line) {
-                Ok(answer) => return answer,
+            let e = match ask(helper.as_mut(), request, on_line) {
+                Ok(answer) => return Ok(answer),
                 Err(Lost::Unsent(e)) if !retried => e,
                 Err(Lost::Unsent(e) | Lost::Midway(e)) => {
                     tracing::warn!(error = %e, "bridge: elevated helper lost");
                     *state = State::NotStarted;
-                    return Err(e);
+                    return Err(Fail::Lost(e));
                 }
             };
             retried = true;
             tracing::warn!(error = %e, "bridge: request not sent; starting a new helper");
             *state = State::NotStarted;
-            if let Err(reason) = self.ensure_started(&mut state) {
-                return Err(lost(reason.unwrap_or_else(|| "recusado".to_string())));
+            if let Err(reason) = self.ensure_started(state) {
+                return Err(Fail::Refused(
+                    reason.unwrap_or_else(|| "recusado".to_string()),
+                ));
             }
         }
     }
@@ -206,6 +224,82 @@ impl ElevatedBridge {
             );
         }
         exited
+    }
+}
+
+/// Why a request did not reach a helper's answer.
+enum Fail {
+    /// The channel broke (see `Lost`).
+    Lost(std::io::Error),
+    /// A new helper was needed and elevation was refused.
+    Refused(String),
+}
+
+/// Why an installer did not run through the helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElevatedError {
+    /// Elevation was refused (now or earlier this session): nothing ran.
+    Refused,
+    /// The helper was lost; the installer may have run.
+    Lost(String),
+    /// The helper refused the request or could not run it.
+    Remote(String),
+}
+
+impl std::fmt::Display for ElevatedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ElevatedError::Refused => f.write_str("sem permissão de administrador"),
+            ElevatedError::Lost(e) => write!(f, "auxiliar elevado perdido: {e}"),
+            ElevatedError::Remote(e) => write!(f, "auxiliar elevado: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ElevatedError {}
+
+/// Runs a hash-verified installer elevated (Task 180).
+pub trait ElevatedRunner: Send + Sync {
+    /// The installer's exit code; `on_line` gets the end of its log.
+    fn run_installer(
+        &self,
+        req: &InstallerRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError>;
+}
+
+impl ElevatedRunner for ElevatedBridge {
+    /// Starts the helper when needed (the one UAC prompt); a refusal this session is final.
+    fn run_installer(
+        &self,
+        req: &InstallerRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        let request = Request::RunInstaller {
+            source: req.source.clone(),
+            sha256: req.sha256.clone(),
+            file_name: req.file_name.clone(),
+            kind: req.kind,
+            params: req.params.clone(),
+        };
+        let mut state = self.lock();
+        match self.ensure_started(&mut state) {
+            Ok(()) => {}
+            Err(None) => return Err(ElevatedError::Refused),
+            Err(Some(e)) => {
+                tracing::warn!(error = %e, "bridge: elevation refused for an installer");
+                return Err(ElevatedError::Refused);
+            }
+        }
+        match self.ask_running(&mut state, &request, on_line) {
+            Ok(Ok((code, _))) => Ok(code),
+            Ok(Err(e)) => Err(ElevatedError::Remote(e.to_string())),
+            Err(Fail::Lost(e)) => Err(ElevatedError::Lost(e.to_string())),
+            Err(Fail::Refused(e)) => {
+                tracing::warn!(error = %e, "bridge: elevation refused for an installer");
+                Err(ElevatedError::Refused)
+            }
+        }
     }
 }
 
