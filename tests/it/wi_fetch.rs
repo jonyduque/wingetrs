@@ -485,3 +485,70 @@ async fn materialized_closes_its_verified_handle_before_deleting() {
     assert!(!p.exists(), "materialized file left behind");
     assert!(!p.parent().unwrap().exists());
 }
+
+/// Task 193: Ctrl+C in the middle of a big download stops it promptly (between chunks, or
+/// while waiting for the next one), deletes the `.part` file and says `Cancelled`.
+#[tokio::test]
+async fn download_stops_mid_body_and_deletes_part() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wingetrs::winget_install::fetch::fetch_installer_until;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    // A 500 MB answer that sends 64 KiB and then stalls until the test ends.
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut req = vec![0u8; 4096];
+        let _ = sock.read(&mut req).await.unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 524288000\r\n\r\n")
+            .await
+            .unwrap();
+        sock.write_all(&vec![7u8; 64 * 1024]).await.unwrap();
+        sock.flush().await.unwrap();
+        let _ = done_rx.await;
+    });
+    let data_tmp = tempfile::tempdir().unwrap();
+    let data = DataDir::new(data_tmp.path());
+    let inst = installer(&format!("http://{addr}/setup.exe"), &"a".repeat(64), "exe");
+    let got = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let progress = |ev: &ProgressEvent| {
+        if let ProgressEvent::Download { done, .. } = ev {
+            got.store(*done, Ordering::SeqCst);
+        }
+    };
+    let http = Http::new().unwrap();
+    let stopped = || stop.load(Ordering::SeqCst);
+    let (r, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(
+            fetch_installer_until(
+                &http,
+                &data,
+                "Pub.App",
+                "1.0",
+                &inst,
+                &progress,
+                &stopped,
+            ),
+            async {
+                // Ctrl+C once some bytes arrived (the body is still far from its end).
+                while got.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                stop.store(true, Ordering::SeqCst);
+            }
+        )
+    })
+    .await
+    .expect("the download stopped within the deadline");
+    assert!(
+        matches!(r, Err(FetchError::Download(DownloadError::Cancelled))),
+        "{:?}",
+        r.err()
+    );
+    assert!(got.load(Ordering::SeqCst) < 524_288_000);
+    assert!(part_files(&data.tmp_dir()).is_empty(), "no .part left");
+    let _ = done_tx.send(());
+    server.await.unwrap();
+}

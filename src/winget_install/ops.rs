@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::codes::{self, Category, Outcome, UAC_REFUSED};
-use super::fetch::{FetchError, Materialized, fetch_installer};
+use super::fetch::{FetchError, Materialized, fetch_installer_until};
 use super::launch::{Elevation, LaunchSpec, Launcher, Show};
 use super::msix::{self, MsixOps};
 use super::plan::{WingetPlan, elevated_kind};
@@ -18,6 +18,7 @@ use crate::bridge::elevated::{ElevatedError, ElevatedRunner};
 use crate::bridge::worker::InstallerRequest;
 use crate::cache::{DataDir, UpdateLock};
 use crate::http::Http;
+use crate::install::download::DownloadError;
 use crate::install::download::Progress;
 use crate::install::executor::LaunchGate;
 use crate::install::layout::Layout;
@@ -252,15 +253,24 @@ pub async fn fetch_verified(
     plan: &WingetPlan,
 ) -> Result<Materialized, WingetOpsError> {
     phase(ctx, Phase::Preparing);
-    let mut file = fetch_installer(
+    // Ctrl+C before the launch stops the download between chunks (the partial file deleted).
+    let gate = &ctx.gate;
+    let mut file = match fetch_installer_until(
         ctx.http,
         ctx.data,
         &plan.id,
         &plan.version,
         &plan.installer,
         ctx.progress,
+        &|| gate.cancelled(),
     )
-    .await?;
+    .await
+    {
+        Err(FetchError::Download(DownloadError::Cancelled)) => {
+            return Err(WingetOpsError::Cancelled);
+        }
+        other => other?,
+    };
     verify(&mut file)?;
     Ok(file)
 }

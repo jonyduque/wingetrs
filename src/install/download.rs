@@ -85,6 +85,14 @@ pub enum DownloadError {
     HashMismatch { url: String },
     #[error("E/S: {0}")]
     Io(String),
+    /// Stopped before the end (Ctrl+C): the partial file was deleted.
+    #[error("download cancelado")]
+    Cancelled,
+}
+
+/// Never stops a download.
+fn never() -> bool {
+    false
 }
 
 /// Receives every [`ProgressEvent`] of an install (download bytes, phases).
@@ -205,6 +213,7 @@ async fn download_one(
     data: &DataDir,
     src: &Source,
     progress: Progress<'_>,
+    stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<(PathBuf, String), DownloadError> {
     let tmp_dir = data.tmp_dir();
     std::fs::create_dir_all(&tmp_dir).map_err(|e| io_err(&tmp_dir, e))?;
@@ -214,14 +223,23 @@ async fn download_one(
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let mut guard = TmpGuard(Some(tmp.clone()));
-    http.get_to_file(&src.url, &tmp, |done, total| {
-        progress(&ProgressEvent::Download {
-            url: src.url.clone(),
-            done,
-            total,
-        })
-    })
-    .await?;
+    let complete = http
+        .get_to_file_until(
+            &src.url,
+            &tmp,
+            |done, total| {
+                progress(&ProgressEvent::Download {
+                    url: src.url.clone(),
+                    done,
+                    total,
+                })
+            },
+            stop,
+        )
+        .await?;
+    if !complete {
+        return Err(DownloadError::Cancelled); // closed already: the guard deletes the file
+    }
     let hashing = tokio::task::spawn_blocking({
         let (tmp, algo) = (tmp.clone(), src.hash.algo);
         move || hash_file(&tmp, algo)
@@ -266,7 +284,19 @@ pub async fn fetch_all(
     sources: &[Source],
     progress: Progress<'_>,
 ) -> Result<Vec<PathBuf>, DownloadError> {
-    fetch_each(http, data, sources, progress)
+    fetch_all_until(http, data, sources, progress, &never).await
+}
+
+/// [`fetch_all`] whose downloads stop (`DownloadError::Cancelled`, partial files deleted)
+/// once `stop()` says so.
+pub async fn fetch_all_until(
+    http: &Http,
+    data: &DataDir,
+    sources: &[Source],
+    progress: Progress<'_>,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Vec<PathBuf>, DownloadError> {
+    fetch_each_until(http, data, sources, progress, stop)
         .await
         .into_iter()
         .collect()
@@ -280,6 +310,16 @@ pub async fn fetch_each(
     sources: &[Source],
     progress: Progress<'_>,
 ) -> Vec<Result<PathBuf, DownloadError>> {
+    fetch_each_until(http, data, sources, progress, &never).await
+}
+
+async fn fetch_each_until(
+    http: &Http,
+    data: &DataDir,
+    sources: &[Source],
+    progress: Progress<'_>,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Vec<Result<PathBuf, DownloadError>> {
     let idx = read_index(data);
     let sem = tokio::sync::Semaphore::new(MAX_PARALLEL);
     let tasks = sources.iter().map(|src| {
@@ -292,7 +332,7 @@ pub async fn fetch_each(
                 .acquire()
                 .await
                 .map_err(|e| DownloadError::Io(e.to_string()))?;
-            let (p, name) = download_one(http, data, src, progress).await?;
+            let (p, name) = download_one(http, data, src, progress, stop).await?;
             Ok::<_, DownloadError>((p, Some((algo_key(&src.hash), name))))
         }
     });

@@ -156,6 +156,20 @@ pub async fn fetch_installer(
     inst: &EffectiveInstaller,
     progress: Progress<'_>,
 ) -> Result<Materialized, FetchError> {
+    fetch_installer_until(http, data, id, version, inst, progress, &|| false).await
+}
+
+/// [`fetch_installer`] whose download stops (`DownloadError::Cancelled`, the partial file
+/// deleted) once `stop()` says so (Ctrl+C before the launch).
+pub async fn fetch_installer_until(
+    http: &Http,
+    data: &DataDir,
+    id: &str,
+    version: &str,
+    inst: &EffectiveInstaller,
+    progress: Progress<'_>,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<Materialized, FetchError> {
     if !scheme_allowed(&inst.url) {
         return Err(FetchError::NotHttps(inst.url.clone()));
     }
@@ -187,11 +201,12 @@ pub async fn fetch_installer(
     let http = http
         .with_strict_download_redirects()
         .map_err(|e| FetchError::Download(DownloadError::Http(e)))?;
-    let blob = download::fetch_all(&http, data, std::slice::from_ref(&source), progress)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| FetchError::Io("download sem resultado".into()))?;
+    let blob =
+        download::fetch_all_until(&http, data, std::slice::from_ref(&source), progress, stop)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| FetchError::Io("download sem resultado".into()))?;
 
     let ver_dir = data.root().join("installers").join(id).join(&ver);
     let target = ver_dir.join(&file_name);

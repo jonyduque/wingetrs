@@ -98,6 +98,9 @@ fn map_err(e: reqwest::Error) -> HttpError {
     }
 }
 
+/// How often a download waiting for its next chunk looks at its stop signal.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[derive(Clone)]
 pub struct Http {
     client: reqwest::Client,
@@ -242,13 +245,38 @@ impl Http {
         path: &std::path::Path,
         progress: impl Fn(u64, Option<u64>),
     ) -> Result<(), HttpError> {
+        self.get_to_file_until(url, path, progress, &|| false)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Http::get_to_file`] that stops once `stop()` says so: looked at between chunks and
+    /// every `STOP_POLL` while waiting for one. The file is flushed and closed before
+    /// returning (no write left in flight), so the caller can delete it. `Ok(false)` =
+    /// stopped before the end.
+    pub async fn get_to_file_until(
+        &self,
+        url: &str,
+        path: &std::path::Path,
+        progress: impl Fn(u64, Option<u64>),
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, HttpError> {
         use futures_util::StreamExt;
         use tokio::io::AsyncWriteExt;
         let idle = self.chunk_timeout;
-        let resp = tokio::time::timeout(idle, self.dl_client.get(url).send())
-            .await
-            .map_err(|_| HttpError::Timeout)?
-            .map_err(map_err)?;
+        let stopped = || async {
+            while !stop() {
+                tokio::time::sleep(STOP_POLL).await;
+            }
+        };
+        let resp = tokio::select! {
+            biased;
+            // Stopped before the answer: nothing was written.
+            () = stopped() => return Ok(false),
+            resp = tokio::time::timeout(idle, self.dl_client.get(url).send()) => {
+                resp.map_err(|_| HttpError::Timeout)?.map_err(map_err)?
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             return Err(HttpError::Status(status.as_u16()));
@@ -258,16 +286,28 @@ impl Http {
         let mut file = tokio::fs::File::create(path).await.map_err(io)?;
         let mut done = 0u64;
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = tokio::time::timeout(idle, stream.next())
-            .await
-            .map_err(|_| HttpError::Timeout)?
-        {
-            let chunk = chunk.map_err(map_err)?;
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = stopped() => None,
+                next = tokio::time::timeout(idle, stream.next()) => {
+                    Some(next.map_err(|_| HttpError::Timeout)?)
+                }
+            };
+            let chunk = match next {
+                // Stopped: the body stream is dropped between chunks (nothing half-written).
+                None => {
+                    file.flush().await.map_err(io)?;
+                    return Ok(false);
+                }
+                Some(None) => break,
+                Some(Some(chunk)) => chunk.map_err(map_err)?,
+            };
             file.write_all(&chunk).await.map_err(io)?;
             done += chunk.len() as u64;
             progress(done, total);
         }
         file.flush().await.map_err(io)?;
-        Ok(())
+        Ok(true)
     }
 }
