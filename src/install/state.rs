@@ -263,13 +263,18 @@ pub fn write_install_json(
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Reads `<version_dir>\manifest.json` written at install time; `None` for apps installed
-/// before Phase 2c. Bytes that are not UTF-8 or whose SHA-256 differs from the record are refused.
+/// before Phase 2c, and for a record with no hash (rebuilt by `repair`: nothing to verify the
+/// file against, so it is not used). Bytes that are not UTF-8 or whose SHA-256 differs from the
+/// record are refused.
 pub fn installed_manifest(
     layout: &Layout,
     app: &str,
     version: &str,
     expected_sha256: &str,
 ) -> Result<Option<String>, StateError> {
+    if expected_sha256.is_empty() {
+        return Ok(None);
+    }
     let path = layout.version_dir(app, version).join("manifest.json");
     match std::fs::metadata(&path) {
         Ok(m) if m.len() > MAX_MANIFEST_BYTES => {

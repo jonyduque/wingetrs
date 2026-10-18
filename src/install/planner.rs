@@ -16,6 +16,10 @@ use crate::install::script_scan::{self, Verdict};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledInfo {
     pub version: String,
+    /// The OLD version's manifest, read from its written `manifest.json` (SHA-256 checked),
+    /// never from the catalog: its uninstall hooks run before an upgrade. `None` for apps
+    /// installed before Phase 2c (nothing to run).
+    pub old_manifest: Option<Resolved>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,27 +198,6 @@ fn persist_kind(source: &str) -> PersistKind {
     }
 }
 
-/// Phase 2c keys are parsed but not yet executed; each later task removes its `if`.
-pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
-    let refuse = |k: &str| {
-        Err(PlanError::Unsupported(format!(
-            "usa {k} (PowerShell/instalador próprio): suportado na fase 2c"
-        )))
-    };
-    if m.hooks.pre_uninstall.is_some() {
-        return refuse("pre_uninstall");
-    }
-    if m.hooks.post_uninstall.is_some() {
-        return refuse("post_uninstall");
-    }
-    // `installer.file` (a plain file: Task 151, `.ps1`: Task 158) and `installer.script`
-    // (Task 156) run; the uninstaller waits for the removal task.
-    if m.uninstaller.as_ref().is_some_and(needs_powershell) {
-        return refuse("uninstaller");
-    }
-    Ok(())
-}
-
 fn runs_ps1_file(spec: &InstallerSpec) -> bool {
     spec.file
         .as_deref()
@@ -277,9 +260,84 @@ fn installer_step(m: &Resolved, spec: &InstallerSpec, vdir: &Path) -> Result<Ste
     })
 }
 
+/// Scoop's `uninstall` order for the OLD version during an update (scoop-update.ps1:351-377):
+/// `pre_uninstall`, the uninstaller file, `uninstaller.script`, `post_uninstall`. Every script
+/// goes through the scanner; the uninstaller file is the one the old manifest declares.
+fn upgrade_uninstall_steps(old: &Resolved, old_vdir: &Path) -> Result<Vec<Step>, PlanError> {
+    let mut steps = Vec::new();
+    let hook = |kind: HookKind, script: &str| {
+        hook_step(kind, script).map(|s| match s {
+            Step::Hook { kind, script } => Step::UpgradeUninstallHook { kind, script },
+            other => other,
+        })
+    };
+    if let Some(script) = &old.hooks.pre_uninstall {
+        steps.push(hook(HookKind::PreUninstall, script)?);
+    }
+    if let Some(spec) = &old.uninstaller {
+        if let Some((file, args)) = uninstaller_command(old, spec, old_vdir)? {
+            steps.push(Step::UpgradeRunUninstaller { file, args });
+        }
+        if let Some(script) = &spec.script {
+            steps.push(hook(HookKind::UninstallerScript, script)?);
+        }
+    }
+    if let Some(script) = &old.hooks.post_uninstall {
+        steps.push(hook(HookKind::PostUninstall, script)?);
+    }
+    Ok(steps)
+}
+
+/// The `uninstaller` file and substituted arguments to run, if the manifest declares any
+/// (Scoop `Invoke-Installer -Uninstall`: only with `file` or `args`, the file defaulting to
+/// the first download). Same checks as the installer file.
+pub fn uninstaller_command(
+    m: &Resolved,
+    spec: &InstallerSpec,
+    vdir: &Path,
+) -> Result<Option<(String, Vec<String>)>, PlanError> {
+    if spec.file.is_none() && spec.args.is_empty() {
+        return Ok(None);
+    }
+    Ok(match installer_step(m, spec, vdir)? {
+        Step::RunInstaller { file, args, .. } | Step::RunPs1Installer { file, args } => {
+            Some((file, args))
+        }
+        _ => None,
+    })
+}
+
+/// Refuses (at planning, `ScriptRefused`) an installed manifest whose uninstall scripts the
+/// scanner refuses; a `.ps1` uninstaller file is scanned when it is about to run.
+pub fn check_uninstall_scripts(m: &Resolved) -> Result<(), PlanError> {
+    let scripts = [
+        (HookKind::PreUninstall, m.hooks.pre_uninstall.as_deref()),
+        (
+            HookKind::UninstallerScript,
+            m.uninstaller.as_ref().and_then(|u| u.script.as_deref()),
+        ),
+        (HookKind::PostUninstall, m.hooks.post_uninstall.as_deref()),
+    ];
+    for (kind, script) in scripts {
+        if let Some(script) = script {
+            hook_step(kind, script)?;
+        }
+    }
+    Ok(())
+}
+
+/// Hooks and the uninstaller file of an installed manifest need the user's consent to run:
+/// the scripts (`pre_uninstall`, `uninstaller.script`, `post_uninstall`, a `.ps1` file).
+pub fn has_uninstall_scripts(m: &Resolved) -> bool {
+    m.hooks.pre_uninstall.is_some()
+        || m.hooks.post_uninstall.is_some()
+        || m.uninstaller.as_ref().is_some_and(needs_powershell)
+}
+
 pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     let m = input.manifest;
-    refuse_2c(m)?;
+    // Its own uninstall hooks run at removal time: the scanner already looks at them here.
+    check_uninstall_scripts(m)?;
     let (app, version, layout) = (input.app, m.version.as_str(), input.layout);
     let upgrade_from = match &input.installed {
         Some(i) if i.version == m.version => {
@@ -312,6 +370,16 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         } else {
             Step::Extract { index }
         });
+    }
+    if let Some(old) = input
+        .installed
+        .as_ref()
+        .and_then(|i| i.old_manifest.as_ref())
+    {
+        steps.extend(upgrade_uninstall_steps(
+            old,
+            &layout.version_dir(app, &old.version),
+        )?);
     }
     steps.push(Step::Promote);
     if let Some(script) = &m.hooks.pre_install {

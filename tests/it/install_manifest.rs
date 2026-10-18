@@ -1,13 +1,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use wingetrs::install::manifest::{Arch, HashAlgo, ManifestError, resolve};
-use wingetrs::install::planner::refuse_2c;
 
-/// Reason of a refusal: by `resolve` (download formats, hashes) or by the planner (phase 2c keys).
+/// Reason of a refusal by `resolve` (download formats, hashes).
 fn refusal(json: &str) -> Option<String> {
     match resolve(json, Arch::X64) {
         Err(ManifestError::Unsupported { reason }) => Some(reason),
         Err(e) => panic!("{e:?}"),
-        Ok(m) => refuse_2c(&m).err().map(|e| e.to_string()),
+        Ok(_) => None,
     }
 }
 fn fx(n: &str) -> String {
@@ -106,9 +105,8 @@ fn env_and_depends() {
 
 #[test]
 fn unsupported_manifests_say_why() {
-    let reason = |f: &str| refusal(&fx(f)).unwrap_or_else(|| panic!("{f}: not refused"));
-    // `post_install` runs through the script host since Task 156; its `uninstaller.script` does not yet.
-    assert!(reason("unsup-script__main__7zip.json").contains("uninstaller"));
+    // Every hook runs through the script host since Task 159 (uninstall hooks included).
+    assert_eq!(refusal(&fx("refused-script__main__7zip.json")), None);
     // `innosetup` (Task 147) and `pre_install` (Task 156) are both planned now.
     assert_eq!(refusal(&fx("hooks-innosetup__main__boost.json")), None);
     let nohash = r#"{"version":"1","url":"https://x/a.zip"}"#;
@@ -167,6 +165,7 @@ fn hash_count_mismatch() {
 
 #[test]
 fn support_keys_inside_architecture_variant() {
+    // The uninstall hooks are planned since Task 159.
     for (k, v) in [
         ("pre_uninstall", r#""x""#),
         ("post_uninstall", r#""x""#),
@@ -175,7 +174,7 @@ fn support_keys_inside_architecture_variant() {
         let j = format!(
             r#"{{"version":"1","architecture":{{"64bit":{{"url":"https://x/a.zip","hash":"aa","{k}":{v}}}}}}}"#
         );
-        assert!(unsup(&j), "{k}");
+        assert!(!unsup(&j), "{k}");
     }
     // `installer.file` `.ps1` is planned since Task 158.
     let ok_ps1 = r#"{"version":"1","architecture":{"64bit":{"url":"https://x/a.zip","hash":"aa","installer":{"file":"a.ps1"}}}}"#;

@@ -83,6 +83,19 @@ pub enum Step {
         kind: HookKind,
         script: String,
     },
+    /// Upgrade only (Task 159): a hook of the OLD version's written manifest
+    /// (`pre_uninstall`, `uninstaller.script`, `post_uninstall`), run before `Promote` with
+    /// `$cmd = 'update'`, the NEW `$version` and the OLD `$manifest`.
+    UpgradeUninstallHook {
+        kind: HookKind,
+        script: String,
+    },
+    /// Upgrade only (Task 159): the OLD version's `uninstaller.file` (relative to the OLD
+    /// version folder), with the arguments already substituted. A `.ps1` runs through the host.
+    UpgradeRunUninstaller {
+        file: String,
+        args: Vec<String>,
+    },
     Persist(PersistSpec),
     LinkCurrent,
     Shim(ShimSpec),
@@ -332,6 +345,24 @@ impl InstallPlan {
             }
             Step::Hook { kind, .. } => {
                 format!("Rodar o script {} do manifesto (PowerShell)", kind.key())
+            }
+            Step::UpgradeUninstallHook { kind, .. } => format!(
+                "Rodar o script {} da versão antiga (PowerShell)",
+                kind.key()
+            ),
+            Step::UpgradeRunUninstaller { file, args } => {
+                let old = self.upgrade_from.as_deref().unwrap_or(v);
+                let mut program = l.version_dir(app, old);
+                program.extend(
+                    crate::install::safepath::safe_components(file)
+                        .into_iter()
+                        .flatten(),
+                );
+                format!(
+                    "Rodar o desinstalador da versão antiga {} {}",
+                    program.display(),
+                    args.join(" ")
+                )
             }
             Step::Persist(p) => {
                 let what = match p.kind {

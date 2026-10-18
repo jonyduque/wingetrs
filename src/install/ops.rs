@@ -21,7 +21,7 @@ use crate::install::plan::{InstallPlan, Step, UninstallPlan};
 use crate::install::planner::{self, InstalledInfo, PlanError, PlanInput};
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue, ResidueInput};
-use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb, StateError};
+use crate::install::state::{self, AppRecord, Artifact, ArtifactKind, StateDb, StateError};
 use crate::install::target::{self, Candidate, TargetError};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
 use crate::update::LockWait;
@@ -508,14 +508,6 @@ impl DepWalk<'_> {
                     other => other.to_string(),
                 },
             })?;
-        // A dependency that still needs a phase 2c feature keeps the old dependency error.
-        planner::refuse_2c(&manifest).map_err(|e| OpsError::DependencyUnsupported {
-            app: id.clone(),
-            reason: e
-                .to_string()
-                .trim_start_matches("não suportado: ")
-                .to_string(),
-        })?;
         self.stack.push(id.clone());
         // Helpers come before declared dependencies (scoop lib/depends.ps1:45).
         for h in &manifest.helpers {
@@ -556,7 +548,6 @@ pub fn plan_for(
         OpsError::Unsupported(format!("{} sem manifesto no catálogo", c.entry.id))
     })?;
     let target = manifest::resolve(&raw, Arch::host())?;
-    planner::refuse_2c(&target)?;
     let layout = layout(ctx);
     let state = read_state(&layout)?;
     let mut walk = DepWalk {
@@ -583,9 +574,13 @@ pub fn plan_for(
     let launcher_present = layout.launcher().exists();
     let mut plans = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        let installed = state
-            .get(&n.id)?
-            .map(|(r, _)| InstalledInfo { version: r.version });
+        let installed = match state.get(&n.id)? {
+            Some((r, _)) => Some(InstalledInfo {
+                old_manifest: old_manifest(&layout, &n.id, &r)?,
+                version: r.version,
+            }),
+            None => None,
+        };
         let sha = crate::cache::sha256_hex(n.raw.as_bytes());
         plans.push(planner::plan_install(&PlanInput {
             app: &n.id,
@@ -600,6 +595,29 @@ pub fn plan_for(
         })?);
     }
     Ok(plans)
+}
+
+/// The manifest written when `rec` was installed (never the catalog's), resolved for the
+/// architecture it was installed with. `None` for an app installed before Phase 2c or whose
+/// written manifest no longer resolves; an altered one (SHA-256 differs) is an error.
+fn old_manifest(
+    layout: &Layout,
+    app: &str,
+    rec: &AppRecord,
+) -> Result<Option<manifest::Resolved>, OpsError> {
+    let Some(raw) = state::installed_manifest(layout, app, &rec.version, &rec.manifest_sha256)?
+    else {
+        return Ok(None);
+    };
+    match manifest::resolve(&raw, Arch::host()) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) => {
+            tracing::warn!(
+                "{app}: manifesto instalado não pôde ser lido ({e}): sem scripts antigos"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Under the lock, before any change: each plan must still match `state.db` (its
@@ -829,6 +847,14 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
     let plan = UninstallPlan::from_state(&state, app, purge)?
         .ok_or_else(|| OpsError::NotInstalled(app.to_string()))?;
     refuse_if_needed(ctx, &state, &plan.app)?;
+    if let Some((rec, _)) = state.get(&plan.app)? {
+        let layout = layout(ctx);
+        let raw =
+            state::installed_manifest(&layout, &plan.app, &rec.version, &rec.manifest_sha256)?;
+        if let Some(m) = raw.and_then(|raw| manifest::resolve(&raw, Arch::host()).ok()) {
+            planner::check_uninstall_scripts(&m)?;
+        }
+    }
     Ok(plan)
 }
 

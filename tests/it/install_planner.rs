@@ -26,7 +26,10 @@ fn plan(
         manifest: &m,
         layout: &l,
         shortcut_root: Path::new(SC),
-        installed: installed.map(|v| InstalledInfo { version: v.into() }),
+        installed: installed.map(|v| InstalledInfo {
+            version: v.into(),
+            old_manifest: None,
+        }),
         launcher_present: launcher,
         keep_old: false,
         manifest_sha256: "",
@@ -48,6 +51,8 @@ fn step_order_is_the_executor_contract() {
             Step::RunInstaller { .. } => "installer",
             Step::RunPs1Installer { .. } => "installer_ps1",
             Step::Hook { .. } => "hook",
+            Step::UpgradeUninstallHook { .. } => "upgrade_hook",
+            Step::UpgradeRunUninstaller { .. } => "upgrade_uninstaller",
             Step::Persist(_) => "persist",
             Step::LinkCurrent => "current",
             Step::Shim(_) => "shim",
@@ -234,7 +239,8 @@ fn upgrade_and_same_version() {
 fn display_snapshots_for_every_supported_fixture() {
     for e in std::fs::read_dir("tests/fixtures/scoop/manifests").unwrap() {
         let name = e.unwrap().file_name().to_string_lossy().to_string();
-        if name.starts_with("unsup-") {
+        // `refused-`: resolves, but the planner refuses its scripts (see below).
+        if name.starts_with("unsup-") || name.starts_with("refused-") {
             continue;
         }
         let Ok(m) = resolve(&fx(&name), Arch::X64) else {
@@ -257,6 +263,16 @@ fn display_snapshots_for_every_supported_fixture() {
     }
 }
 
+#[test]
+fn scanner_refusal_of_a_real_manifest_script_stops_the_plan() {
+    // The 7zip bucket manifest rewrites HKCU to HKLM in `post_install`: refused at planning.
+    let e = plan("refused-script__main__7zip.json", None, false).unwrap_err();
+    assert!(
+        matches!(&e, PlanError::ScriptRefused { hook, .. } if hook == "post_install"),
+        "{e:?}"
+    );
+}
+
 fn plan_raw(
     extra: &str,
     keep_old: bool,
@@ -271,7 +287,10 @@ fn plan_raw(
         manifest: &m,
         layout: &l,
         shortcut_root: Path::new(SC),
-        installed: installed.map(|v| InstalledInfo { version: v.into() }),
+        installed: installed.map(|v| InstalledInfo {
+            version: v.into(),
+            old_manifest: None,
+        }),
         launcher_present: true,
         keep_old,
         manifest_sha256: "",

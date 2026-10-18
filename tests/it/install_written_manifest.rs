@@ -128,11 +128,10 @@ impl World {
 
     fn plan_from(&self, app: &str, manifest: &str, keep_old: bool) -> InstallPlan {
         let m = resolve(manifest, Arch::X64).unwrap();
-        let installed = self
-            .state
-            .get(app)
-            .unwrap()
-            .map(|(r, _)| InstalledInfo { version: r.version });
+        let installed = self.state.get(app).unwrap().map(|(r, _)| InstalledInfo {
+            version: r.version,
+            old_manifest: None,
+        });
         let root = self.shortcuts_root();
         plan_install(&PlanInput {
             app,

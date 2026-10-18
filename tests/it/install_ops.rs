@@ -54,10 +54,6 @@ fn sha256_hex(b: &[u8]) -> String {
     hex::encode(Sha256::digest(b))
 }
 
-fn fx(n: &str) -> String {
-    std::fs::read_to_string(format!("tests/fixtures/scoop/manifests/{n}")).unwrap()
-}
-
 fn no_progress(_: &wingetrs::install::progress::ProgressEvent) {}
 fn nothing_in_use(_: &Path) -> Vec<PathBuf> {
     Vec::new()
@@ -306,7 +302,12 @@ async fn dependency_cycle_is_reported_with_the_chain() {
 #[tokio::test]
 async fn unsupported_dependency_fails_before_any_download() {
     let mut w = World::new().await;
-    w.put_raw("cdrtools", "1", fx("unsup-script__main__7zip.json"));
+    // An archive format the extractor does not handle: `resolve` refuses it.
+    w.put_raw(
+        "cdrtools",
+        "1",
+        r#"{"version":"1","url":"https://x/a.rar","hash":"aa"}"#.into(),
+    );
     let zip = zip_of(&[("pkg/top.exe", &fake_pe(3))]);
     let sha = sha256_hex(&zip);
     Mock::given(method("GET"))
@@ -353,7 +354,7 @@ async fn missing_dependency_is_unsupported() {
 }
 
 #[tokio::test]
-async fn phase_2c_target_is_refused_before_its_dependencies() {
+async fn uninstall_hooks_no_longer_refuse_the_target() {
     let mut w = World::new().await;
     let raw = serde_json::json!({
         "version": "1.0", "url": "https://x/a.zip", "hash": "aa",
@@ -361,11 +362,11 @@ async fn phase_2c_target_is_refused_before_its_dependencies() {
     })
     .to_string();
     w.put_raw("top", "1.0", raw);
-    let e = w.plans("top").unwrap_err();
-    assert_eq!(
-        e.to_string(),
-        "não suportado: usa pre_uninstall (PowerShell/instalador próprio): suportado na fase 2c"
-    );
+    // Planned now (Task 159): the failure is the missing dependency, not the hook.
+    match w.plans("top") {
+        Err(OpsError::DependencyUnsupported { app, .. }) => assert_eq!(app, "ghost"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]

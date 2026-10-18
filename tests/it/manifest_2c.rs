@@ -181,20 +181,14 @@ fn raw_json_kept_verbatim() {
 }
 
 #[test]
-fn planner_refuses_each_2c_key_with_old_text() {
-    let cases = [
+fn planner_no_longer_refuses_uninstall_keys() {
+    // Task 159: the uninstall hooks run through the script host.
+    for c in [
         r#","pre_uninstall":"x""#,
         r#","post_uninstall":"x""#,
         r#","uninstaller":{"file":"a.ps1"}"#,
-    ];
-    let keys = ["pre_uninstall", "post_uninstall", "uninstaller"];
-    for (c, k) in cases.iter().zip(keys) {
-        let e = plan(&ok(c)).unwrap_err();
-        assert!(matches!(e, PlanError::Unsupported(_)), "{k}");
-        assert_eq!(
-            e.to_string(),
-            format!("não suportado: usa {k} (PowerShell/instalador próprio): suportado na fase 2c")
-        );
+    ] {
+        assert!(plan(&ok(c)).is_ok(), "{c}");
     }
     // `innosetup` is planned since Task 147 (extracted through innounp), the install hooks since
     // Task 156 (script host).

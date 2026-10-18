@@ -119,11 +119,10 @@ impl World {
     fn plan(&self, app: &str, manifest: &str) -> InstallPlan {
         use wingetrs::install::traits::Shortcuts;
         let m = resolve(manifest, Arch::X64).unwrap();
-        let installed = self
-            .state
-            .get(app)
-            .unwrap()
-            .map(|(r, _)| InstalledInfo { version: r.version });
+        let installed = self.state.get(app).unwrap().map(|(r, _)| InstalledInfo {
+            version: r.version,
+            old_manifest: None,
+        });
         let root = self.shortcuts.root();
         plan_install(&PlanInput {
             app,

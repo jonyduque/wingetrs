@@ -16,7 +16,6 @@ use crate::cache::DataDir;
 use crate::fs_retry;
 use crate::http::Http;
 use crate::install::download::{self, Progress};
-use crate::install::installer_args;
 use crate::install::layout::Layout;
 use crate::install::manifest::{self, Arch, HookKind, Source};
 use crate::install::msi_queue::{self, Attempt};
@@ -372,6 +371,8 @@ fn step_kind(step: &Step) -> &'static str {
         Step::RunInstaller { .. } => "installer",
         Step::RunPs1Installer { .. } => "installer_ps1",
         Step::Hook { .. } => "hook",
+        Step::UpgradeUninstallHook { .. } => "upgrade_hook",
+        Step::UpgradeRunUninstaller { .. } => "upgrade_uninstaller",
         Step::Persist(_) => "persist",
         Step::LinkCurrent => "link",
         Step::Shim(_) => "shim",
@@ -409,6 +410,8 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
         Step::Promote
         | Step::RunInstaller { .. }
         | Step::RunPs1Installer { .. }
+        | Step::UpgradeUninstallHook { .. }
+        | Step::UpgradeRunUninstaller { .. }
         | Step::Persist(_) => Some(Phase::Placing),
         Step::Hook { kind, .. } => match kind {
             HookKind::PostInstall => Some(Phase::Linking),
@@ -436,6 +439,10 @@ fn step_label(step: &Step) -> String {
             format!("rodar instalador {file}")
         }
         Step::Hook { kind, .. } => format!("script {}", kind.key()),
+        Step::UpgradeUninstallHook { kind, .. } => {
+            format!("script {} da versão antiga", kind.key())
+        }
+        Step::UpgradeRunUninstaller { file, .. } => format!("desinstalador antigo {file}"),
         Step::Persist(p) => format!("persistir {}", p.in_version.display()),
         Step::LinkCurrent => "apontar current".into(),
         Step::Shim(s) => format!("comando {}", s.name),
@@ -465,6 +472,10 @@ struct Run<'p> {
     needs_msiexec: Option<(usize, String)>,
     /// Last phase reported: a step of the same phase reports nothing.
     phase: Option<Phase>,
+    /// Text of the OLD version's written manifest (an update with uninstall steps).
+    old_manifest: Option<String>,
+    /// A script or uninstaller of the OLD version already ran (and is not undone).
+    old_hooks_ran: bool,
 }
 
 impl Run<'_> {
@@ -594,6 +605,10 @@ fn check_order(steps: &[Step]) -> Result<(), String> {
     }
 }
 
+/// Appended to the failure of an update whose OLD version's uninstall scripts already ran.
+const OLD_HOOKS_RAN: &str =
+    "; os scripts de desinstalação da versão antiga já rodaram e não foram desfeitos";
+
 /// Applies `plan`; on failure everything done so far is undone in reverse order.
 ///
 /// Precondition: never cancel (drop) this future on an async worker thread. Dropped during an
@@ -623,20 +638,24 @@ pub async fn execute_install_with(
     check_component("versão", &plan.version).map_err(fail_early)?;
     check_order(&plan.steps).map_err(fail_early)?;
     let needs_consent = plan.third_party_uninstaller
-        || plan
-            .steps
-            .iter()
-            .any(|s| matches!(s, Step::RunInstaller { .. }));
+        || plan.steps.iter().any(|s| match s {
+            Step::RunInstaller { .. } => true,
+            Step::UpgradeRunUninstaller { file, .. } => !file.to_lowercase().ends_with(".ps1"),
+            _ => false,
+        });
     if needs_consent && ctx.runners.installer.is_none() {
         return Err(ExecError::NeedsScriptConsent {
             app: plan.app.clone(),
             what: "o instalador do manifesto".into(),
         });
     }
-    let has_hooks = plan
-        .steps
-        .iter()
-        .any(|s| matches!(s, Step::Hook { .. } | Step::RunPs1Installer { .. }));
+    let has_hooks = plan.steps.iter().any(|s| match s {
+        Step::Hook { .. } | Step::RunPs1Installer { .. } | Step::UpgradeUninstallHook { .. } => {
+            true
+        }
+        Step::UpgradeRunUninstaller { file, .. } => file.to_lowercase().ends_with(".ps1"),
+        _ => false,
+    });
     if has_hooks && ctx.runners.scripts.is_none() {
         return Err(ExecError::NeedsScriptConsent {
             app: plan.app.clone(),
@@ -652,6 +671,30 @@ pub async fn execute_install_with(
         .state
         .get(&plan.app)
         .map_err(|e| fail_early(e.to_string()))?;
+    // The OLD version's uninstall steps read its written manifest (hash checked against the
+    // record), never the catalog: a missing or altered file fails before any step.
+    let old_manifest = match (&previous, plan.upgrade_from.as_deref()) {
+        (Some((rec, _)), Some(old))
+            if plan.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    Step::UpgradeUninstallHook { .. } | Step::UpgradeRunUninstaller { .. }
+                )
+            }) =>
+        {
+            check_component("versão", old).map_err(fail_early)?;
+            match state::installed_manifest(ctx.layout, &plan.app, old, &rec.manifest_sha256) {
+                Ok(Some(text)) if rec.version == old => Some(text),
+                Ok(_) => {
+                    return Err(fail_early(
+                        "o manifesto da versão antiga não existe ou o registro mudou".into(),
+                    ));
+                }
+                Err(e) => return Err(fail_early(e.to_string())),
+            }
+        }
+        _ => None,
+    };
     ctx.launch.next_plan();
     let mut run = Run {
         plan,
@@ -664,6 +707,8 @@ pub async fn execute_install_with(
         panic: None,
         needs_msiexec: None,
         phase: None,
+        old_manifest,
+        old_hooks_ran: false,
     };
     // Removing the old version runs only after every other step succeeded.
     let (main, cleanup): (Vec<_>, Vec<_>) = plan
@@ -701,6 +746,11 @@ pub async fn execute_install_with(
                     reason,
                 });
             }
+            let message = if run.old_hooks_ran {
+                format!("{message}{OLD_HOOKS_RAN}")
+            } else {
+                message
+            };
             return Err(ExecError::Failed {
                 index: i,
                 step: run.label,
@@ -1016,15 +1066,10 @@ fn contract_vars(values: Vec<(&str, VarValue)>) -> Result<Vec<(String, VarValue)
         .collect()
 }
 
-/// A fresh `<root>\tmp\script-<app>-<hook>-<n>` (`app` already checked as one component).
-fn fresh_script_dir(
-    run: &mut Run<'_>,
-    layout: &Layout,
-    app: &str,
-    kind: HookKind,
-) -> Result<PathBuf, String> {
+/// A fresh `<root>\tmp\script-<app>-<hook>-<n>` (`app` already checked as one component;
+/// `<root>\tmp` exists).
+fn fresh_script_dir(layout: &Layout, app: &str, kind: HookKind) -> Result<PathBuf, String> {
     let tmp = layout.root().join("tmp");
-    run.ensure_dirs(&tmp)?;
     let hook = kind.key().replace('.', "-");
     for _ in 0..ASIDE_TRIES {
         let n = SCRIPT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1142,26 +1187,106 @@ fn write_ps1_copy(program: &Path, text: &str) -> Result<(PathBuf, RemoveFile), S
     Ok((copy, guard))
 }
 
-/// `Step::Hook`: writes the hook, the prelude, the manifest, the environment seed and the
-/// runner into a fresh folder (removed on every path out), then runs it through the host.
-async fn run_hook(
-    run: &mut Run<'_>,
-    ctx: &mut ExecCtx<'_>,
+/// What a hook runs against: the values of the Scoop variables that differ between an
+/// install, an update and an uninstall (Task 159).
+#[derive(Clone)]
+struct HookScope {
+    op: ScriptOp,
+    /// `$version`: always the version being installed (the NEW one during an update).
+    version: String,
+    old_version: Option<String>,
+    bucket: Option<String>,
+    arch: Option<Arch>,
+    /// `$dir` (the OLD version's folder in uninstall hooks during an update).
+    version_dir: PathBuf,
+    /// Text of `$manifest` (the OLD one in uninstall hooks during an update).
+    manifest_json: String,
+    purge: bool,
+    fnames: Vec<String>,
+}
+
+impl HookScope {
+    /// Install hooks of `plan` (an update when it has `upgrade_from`).
+    fn install(plan: &InstallPlan, layout: &Layout) -> Result<HookScope, String> {
+        let manifest_json = plan
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                Step::WriteManifest { json } => Some(json.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| "erro interno: plano com script e sem manifesto".to_string())?;
+        Ok(HookScope {
+            op: match plan.upgrade_from {
+                Some(_) => ScriptOp::Update,
+                None => ScriptOp::Install,
+            },
+            version: plan.version.clone(),
+            old_version: plan.upgrade_from.clone(),
+            bucket: Some(plan.bucket.clone()),
+            arch: plan.arch,
+            version_dir: layout.version_dir(&plan.app, &plan.version),
+            manifest_json,
+            purge: false,
+            fnames: plan
+                .steps
+                .iter()
+                .filter_map(|s| match s {
+                    Step::Download { source, .. } => Some(source.file_name.clone()),
+                    _ => None,
+                })
+                .collect(),
+        })
+    }
+
+    /// Uninstall hooks of the OLD version during an update: NEW `$version`, OLD `$manifest`
+    /// and `$dir`.
+    fn upgrade_uninstall(
+        plan: &InstallPlan,
+        layout: &Layout,
+        old: &str,
+        old_manifest: &str,
+    ) -> HookScope {
+        HookScope {
+            op: ScriptOp::Update,
+            version: plan.version.clone(),
+            old_version: Some(old.to_string()),
+            bucket: Some(plan.bucket.clone()),
+            arch: plan.arch,
+            version_dir: layout.version_dir(&plan.app, old),
+            manifest_json: old_manifest.to_string(),
+            purge: false,
+            fnames: Vec::new(),
+        }
+    }
+}
+
+/// A hook written to disk and ready for the host. Dropping it removes its work folder and the
+/// analysed copy of a `.ps1` file.
+struct PreparedHook {
+    job: ScriptJob,
+    effects: PathBuf,
+    before: EnvSnapshot,
+    _copy_guard: Option<RemoveFile>,
+    _remove: RemoveWork,
+}
+
+/// Writes the hook, the prelude, the manifest, the environment seed and the runner into a fresh
+/// folder under `<root>\tmp` (which must exist). A `.ps1` file is third-party code the manifest
+/// does not contain: located inside `scope.version_dir` and scanned before anything is written.
+fn prepare_hook(
+    layout: &Layout,
+    env: &dyn EnvStore,
+    shortcut_root: &Path,
+    app: &str,
     kind: HookKind,
-    body: HookBody<'_>,
-) -> Result<(), String> {
-    let Some(host) = ctx.runners.scripts.clone() else {
-        return Err("sem consentimento para rodar os scripts do manifesto".into());
-    };
-    let plan = run.plan;
-    let layout = ctx.layout;
-    let (app, version) = (plan.app.as_str(), plan.version.as_str());
-    // A `.ps1` installer is third-party code the manifest does not contain: located inside the
-    // version folder and scanned (size-capped read) before anything is written or run.
-    let (script, ps1_program, _copy_guard) = match &body {
+    body: &HookBody<'_>,
+    scope: &HookScope,
+) -> Result<PreparedHook, String> {
+    let (script, ps1_program, copy_guard) = match body {
         HookBody::Script(s) => ((*s).to_string(), None, None),
         HookBody::Ps1 { file, .. } => {
-            let program = installer_program(&layout.version_dir(app, version), file)?;
+            let program = installer_program(&scope.version_dir, file)?;
             let text = scan_ps1_file(&program)?;
             // Only the analysed copy runs; the original is never executed.
             let (copy, guard) = write_ps1_copy(&program, &text)?;
@@ -1169,17 +1294,8 @@ async fn run_hook(
         }
     };
     let script = script.as_str();
-    let hook = kind.key();
-    let manifest_json = plan
-        .steps
-        .iter()
-        .find_map(|s| match s {
-            Step::WriteManifest { json } => Some(json.as_str()),
-            _ => None,
-        })
-        .ok_or_else(|| "erro interno: plano com script e sem manifesto".to_string())?;
-    let work = fresh_script_dir(run, layout, app, kind)?;
-    let _remove = RemoveWork(work.clone());
+    let work = fresh_script_dir(layout, app, kind)?;
+    let remove = RemoveWork(work.clone());
     let write = |name: &str, bytes: &[u8]| -> Result<PathBuf, String> {
         let p = work.join(name);
         fs::write(&p, bytes).map_err(|e| io_msg(&p, e))?;
@@ -1191,35 +1307,25 @@ async fn run_hook(
         Some(_) => PathBuf::new(),
         None => write("hook.ps1", script.as_bytes())?,
     };
-    let manifest_path = write("manifest.json", manifest_json.as_bytes())?;
-    let before = env_values(ctx.effects.env, &script_env_names(script))?;
+    let manifest_path = write("manifest.json", scope.manifest_json.as_bytes())?;
+    let before = env_values(env, &script_env_names(script))?;
     let seed = env_seed_json(&before);
     write("env.json", seed.as_bytes())?;
     let effects = write("effects.jsonl", b"")?;
     let root = layout.root().to_path_buf();
     let cx = ScriptContext {
-        op: match plan.upgrade_from {
-            Some(_) => ScriptOp::Update,
-            None => ScriptOp::Install,
-        },
+        op: scope.op,
         app: app.to_string(),
-        version: version.to_string(),
-        old_version: plan.upgrade_from.clone(),
-        bucket: Some(plan.bucket.clone()),
-        arch: plan.arch,
+        version: scope.version.clone(),
+        old_version: scope.old_version.clone(),
+        bucket: scope.bucket.clone(),
+        arch: scope.arch,
         root: root.clone(),
-        version_dir: layout.version_dir(app, version),
+        version_dir: scope.version_dir.clone(),
         current: layout.current(app),
         persist_dir: layout.persist_dir(app),
-        fnames: plan
-            .steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::Download { source, .. } => Some(source.file_name.clone()),
-                _ => None,
-            })
-            .collect(),
-        purge: false,
+        fnames: scope.fnames.clone(),
+        purge: scope.purge,
         manifest_path,
         bucketsdir: root.join("buckets"),
     };
@@ -1229,17 +1335,14 @@ async fn run_hook(
         ("__wr_effects", path_str(&effects)),
         ("__wr_env_seed", VarValue::Str(seed)),
         ("__wr_helpers", VarValue::Table(script_helpers(layout))),
-        (
-            "__wr_shortcut_root",
-            path_str(&ctx.effects.shortcuts.root()),
-        ),
+        ("__wr_shortcut_root", path_str(shortcut_root)),
     ])?;
     let vars = script_vars(kind, &cx);
     let text = runner_ps1(&RunnerInput {
         contract: &contract,
         vars: &vars,
         prelude_path: &prelude,
-        body: match (&body, &ps1_program) {
+        body: match (body, &ps1_program) {
             (HookBody::Ps1 { args, .. }, Some(program)) => ScriptBody::Ps1File {
                 path: program,
                 args,
@@ -1268,8 +1371,73 @@ async fn run_hook(
             ("SCOOP_CACHE".into(), root.join("cache").into_os_string()),
         ],
     };
+    Ok(PreparedHook {
+        job,
+        effects,
+        before,
+        _copy_guard: copy_guard,
+        _remove: remove,
+    })
+}
+
+/// The failure message of a hook that did not exit with 0 (`None` = it succeeded), with the
+/// variables it changed before failing (D5).
+fn hook_failure(
+    result: io::Result<ScriptOutcome>,
+    hook: &str,
+    env: &dyn EnvStore,
+    before: &EnvSnapshot,
+) -> Option<String> {
+    let mut message = match result {
+        Ok(ScriptOutcome { code: 0, .. }) => return None,
+        Ok(ScriptOutcome { code, lines }) => {
+            let tail = &lines[lines.len().saturating_sub(SCRIPT_TAIL_LINES)..];
+            format!(
+                "o script {hook} saiu com código {code}: {}",
+                tail.join(" | ")
+            )
+        }
+        Err(e) => format!("não consegui rodar o script {hook}: {e}"),
+    };
+    let changed = changed_env(env, before);
+    if !changed.is_empty() {
+        message.push_str(&format!(
+            "; variáveis alteradas pelo script e não desfeitas: {}",
+            changed.join(", ")
+        ));
+    }
+    Some(message)
+}
+
+/// Runs a hook of the install (or of the OLD version during an update) through the host.
+/// `uninstall_effects`: the hook is an uninstall hook, so only [`own_uninstall_effect`]s apply.
+async fn run_hook(
+    run: &mut Run<'_>,
+    ctx: &mut ExecCtx<'_>,
+    kind: HookKind,
+    body: HookBody<'_>,
+    scope: &HookScope,
+    uninstall_effects: bool,
+) -> Result<(), String> {
+    let Some(host) = ctx.runners.scripts.clone() else {
+        return Err("sem consentimento para rodar os scripts do manifesto".into());
+    };
+    let layout = ctx.layout;
+    let app = run.plan.app.as_str();
+    run.ensure_dirs(&layout.root().join("tmp"))?;
+    let prepared = prepare_hook(
+        layout,
+        ctx.effects.env,
+        &ctx.effects.shortcuts.root(),
+        app,
+        kind,
+        &body,
+        scope,
+    )?;
+    let hook = kind.key();
     tracing::info!("rodando o script {hook} de {app}");
     let gate = ctx.launch.clone();
+    let job = prepared.job.clone();
     let launch = move || {
         // Right before PowerShell starts: a Ctrl+C until here cancels; from here it is refused
         // and the hook runs to its end (it is never killed halfway through its effects).
@@ -1281,7 +1449,7 @@ async fn run_hook(
         }
         host.run(&job)
     };
-    let worker = AwaitWorker::spawn(launch, work.clone(), ctx.launch.clone());
+    let worker = AwaitWorker::spawn(launch, prepared.job.workdir.clone(), ctx.launch.clone());
     let result = match worker.join().await {
         Ok(r) => r,
         Err(e) => match e.try_into_panic() {
@@ -1293,35 +1461,45 @@ async fn run_hook(
             Err(e) => return Err(e.to_string()),
         },
     };
-    let failure = match result {
-        Ok(ScriptOutcome { code: 0, .. }) => None,
-        Ok(ScriptOutcome { code, lines }) => {
-            let tail = &lines[lines.len().saturating_sub(SCRIPT_TAIL_LINES)..];
-            Some(format!(
-                "o script {hook} saiu com código {code}: {}",
-                tail.join(" | ")
-            ))
-        }
-        Err(e) => Some(format!("não consegui rodar o script {hook}: {e}")),
-    };
-    if let Some(mut message) = failure {
-        let changed = changed_env(ctx.effects.env, &before);
-        if !changed.is_empty() {
-            message.push_str(&format!(
-                "; variáveis alteradas pelo script e não desfeitas: {}",
-                changed.join(", ")
-            ));
-        }
+    if let Some(message) = hook_failure(result, hook, ctx.effects.env, &prepared.before) {
         return Err(message);
     }
     // Every effect is parsed before any is applied: an unreadable file changes nothing.
-    let parsed = read_effects(&effects).map_err(|e| format!("efeitos do script ilegíveis: {e}"))?;
+    let parsed =
+        read_effects(&prepared.effects).map_err(|e| format!("efeitos do script ilegíveis: {e}"))?;
     for effect in parsed {
-        apply_effect(run, ctx, effect)?;
+        if uninstall_effects {
+            let mut own: Vec<Artifact> = run.artifacts.clone();
+            if let Some((_, previous)) = &run.previous {
+                own.extend(previous.iter().cloned());
+            }
+            if !own_uninstall_effect(&effect, &own) {
+                tracing::warn!(
+                    "{app}: efeito de script de desinstalação ignorado (não é deste app)"
+                );
+                continue;
+            }
+        }
+        apply_effect(run, ctx, effect, uninstall_effects)?;
     }
     Ok(())
 }
 
+/// An effect an uninstall hook may have: `RemovePath` (each entry is checked against the
+/// recorded PATH entries when applied), `SetEnv` of a variable the app registered and `RmShim`
+/// of a shim of the app. Everything else is ignored.
+fn own_uninstall_effect(effect: &ScriptEffect, artifacts: &[Artifact]) -> bool {
+    match effect {
+        ScriptEffect::RemovePath { .. } => true,
+        ScriptEffect::SetEnv { name, .. } => artifacts
+            .iter()
+            .any(|a| a.kind == ArtifactKind::Env && a.target.eq_ignore_ascii_case(name)),
+        ScriptEffect::RmShim { name } => artifacts
+            .iter()
+            .any(|a| a.kind == ArtifactKind::Shim && a.target.eq_ignore_ascii_case(name)),
+        _ => false,
+    }
+}
 /// Cap of `effects.jsonl`, checked before reading it.
 const MAX_EFFECTS_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1693,6 +1871,21 @@ fn is_https_url(v: &str) -> bool {
 /// Name a script may set: `[A-Za-z_][A-Za-z0-9_]*`, at most 255 characters, not the PATH,
 /// not refused by [`env_denied`] and listed in [`ALLOWED_ENV`] or [`URL_ENV`].
 fn check_env_name(name: &str) -> Result<(), String> {
+    check_env_syntax(name)?;
+    if env_is_url(name) {
+        return Ok(());
+    }
+    if !ALLOWED_ENV.iter().any(|a| a.eq_ignore_ascii_case(name)) {
+        return Err(format!(
+            "a variável {name} não está entre as que um script pode gravar"
+        ));
+    }
+    Ok(())
+}
+
+/// The part of [`check_env_name`] that holds for any variable: valid name, not the PATH, not
+/// [`env_denied`].
+fn check_env_syntax(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let valid = name.len() <= 255
         && chars
@@ -1707,14 +1900,6 @@ fn check_env_name(name: &str) -> Result<(), String> {
     }
     if env_denied(name) {
         return Err(format!("a variável {name} não pode ser gravada por script"));
-    }
-    if env_is_url(name) {
-        return Ok(());
-    }
-    if !ALLOWED_ENV.iter().any(|a| a.eq_ignore_ascii_case(name)) {
-        return Err(format!(
-            "a variável {name} não está entre as que um script pode gravar"
-        ));
     }
     Ok(())
 }
@@ -1804,6 +1989,22 @@ fn like(text: &str, pattern: &str) -> bool {
     pi == p.len()
 }
 
+/// The `Remove-Path` patterns of an effect (`;`-separated entries), each bounded.
+fn path_patterns(entries: &[String]) -> Result<Vec<&str>, String> {
+    let patterns: Vec<&str> = entries
+        .iter()
+        .flat_map(|e| e.split(';'))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if patterns
+        .iter()
+        .any(|p| p.chars().count() > MAX_PATTERN_CHARS)
+    {
+        return Err("padrão de Remove-Path longo demais".into());
+    }
+    Ok(patterns)
+}
+
 /// A PATH entry this app recorded, in this run or in its previous record.
 fn own_path_entry(run: &Run<'_>, entry: &str) -> bool {
     let want = path_edit::norm(entry);
@@ -1823,12 +2024,56 @@ fn own_shim(run: &Run<'_>, name: &str) -> bool {
         || run.previous_artifact(ArtifactKind::Shim, name).is_some()
 }
 
+/// Checks a `SetEnv` effect of a script (untrusted): the name, and the value (`PATHEXT` keeps
+/// its extensions, URLs are https, folders are inside the app or its persist folder). `own`: the
+/// variable is one the app registered, so only the always-forbidden names are refused.
+fn validate_set_env(
+    env: &dyn EnvStore,
+    name: &str,
+    value: Option<&str>,
+    (app_dir, persist_dir): (&Path, &Path),
+    own: bool,
+) -> Result<(), String> {
+    if name.eq_ignore_ascii_case(PATHEXT_VAR) {
+        let cur = env.get(PATHEXT_VAR).map_err(|e| e.to_string())?;
+        return check_pathext(cur.as_ref().map(|v| v.value.as_str()), value);
+    }
+    if own {
+        check_env_syntax(name)?;
+    } else {
+        check_env_name(name)?;
+    }
+    if env_is_url(name) {
+        if let Some(v) = value
+            && !is_https_url(v)
+        {
+            return Err(format!(
+                "o script tentou gravar {name}={v} (só endereço https é aceito)"
+            ));
+        }
+    } else if let Some(v) = value
+        // A folder (by name, or a value that looks like a path) must be inside the app.
+        && (env_is_path(name) || v.contains(['\\', '/', ':']))
+    {
+        for part in v.split(';').filter(|p| !p.is_empty()) {
+            if !is_inside(part, app_dir) && !is_inside(part, persist_dir) {
+                return Err(format!(
+                    "o script tentou gravar {name}={part} (fora da pasta do app)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Applies one effect of `effects.jsonl` (untrusted: written by the manifest script)
 /// through the same paths as the phase 2a steps, each with its `Undo` and `Artifact`.
+/// `uninstall`: the effect comes from an uninstall hook (see [`own_uninstall_effect`]).
 fn apply_effect(
     run: &mut Run<'_>,
     ctx: &mut ExecCtx<'_>,
     effect: ScriptEffect,
+    uninstall: bool,
 ) -> Result<(), String> {
     let layout = ctx.layout;
     let app = run.plan.app.clone();
@@ -1837,31 +2082,15 @@ fn apply_effect(
     let env = ctx.effects.env;
     match effect {
         ScriptEffect::SetEnv { name, value } => {
+            validate_set_env(
+                env,
+                &name,
+                value.as_deref(),
+                (&app_dir, &persist_dir),
+                uninstall,
+            )?;
             if name.eq_ignore_ascii_case(PATHEXT_VAR) {
-                let cur = env.get(PATHEXT_VAR).map_err(|e| e.to_string())?;
-                check_pathext(cur.as_ref().map(|v| v.value.as_str()), value.as_deref())?;
                 return set_env(run, env, PATHEXT_VAR, value.as_deref());
-            }
-            check_env_name(&name)?;
-            if env_is_url(&name) {
-                if let Some(v) = &value
-                    && !is_https_url(v)
-                {
-                    return Err(format!(
-                        "o script tentou gravar {name}={v} (só endereço https é aceito)"
-                    ));
-                }
-            } else if let Some(v) = &value
-                // A folder (by name, or a value that looks like a path) must be inside the app.
-                && (env_is_path(&name) || v.contains(['\\', '/', ':']))
-            {
-                for part in v.split(';').filter(|p| !p.is_empty()) {
-                    if !is_inside(part, &app_dir) && !is_inside(part, &persist_dir) {
-                        return Err(format!(
-                            "o script tentou gravar {name}={part} (fora da pasta do app)"
-                        ));
-                    }
-                }
             }
             set_env(run, env, &name, value.as_deref())
         }
@@ -1885,17 +2114,7 @@ fn apply_effect(
                 tracing::warn!("{app}: Remove-Path em {var} ignorado");
                 return Ok(());
             }
-            let patterns: Vec<&str> = entries
-                .iter()
-                .flat_map(|e| e.split(';'))
-                .filter(|p| !p.is_empty())
-                .collect();
-            if patterns
-                .iter()
-                .any(|p| p.chars().count() > MAX_PATTERN_CHARS)
-            {
-                return Err("padrão de Remove-Path longo demais".into());
-            }
+            let patterns = path_patterns(&entries)?;
             let Some(cur) = env.get(PATH_VAR).map_err(|e| e.to_string())? else {
                 return Ok(());
             };
@@ -2044,6 +2263,67 @@ fn inno_extract(
     }
     extract::merge_into(tmp, &dest)?;
     not_found_ok(remove_any(tmp)).map_err(|e| io_err(tmp, e))
+}
+
+/// Scope of the OLD version's uninstall hooks during an update: needs the old written manifest
+/// loaded at the start of the run.
+fn upgrade_scope(run: &Run<'_>, layout: &Layout) -> Result<HookScope, String> {
+    let (Some(old), Some(text)) = (&run.plan.upgrade_from, &run.old_manifest) else {
+        return Err("erro interno: script de desinstalação sem versão antiga".into());
+    };
+    Ok(HookScope::upgrade_uninstall(run.plan, layout, old, text))
+}
+
+/// Runs `file` (inside `vdir`, no PowerShell) through the installer runner; deletes it afterwards
+/// unless `keep`. Cancelled until it starts, then it runs to its end.
+async fn run_installer_file(
+    run: &mut Run<'_>,
+    ctx: &mut ExecCtx<'_>,
+    vdir: &Path,
+    file: &str,
+    args: &[String],
+    keep: bool,
+) -> Result<(), String> {
+    let Some(runner) = ctx.runners.installer else {
+        return Err("sem consentimento para rodar o instalador".into());
+    };
+    let layout = ctx.layout;
+    let program = installer_program(vdir, file)?;
+    let work = {
+        let (program, args, dir) = (program.clone(), args.to_vec(), vdir.to_path_buf());
+        let (gate, step) = (ctx.launch.clone(), format!("instalador {file}"));
+        move || {
+            // Like a hook: cancelled until it starts, then it runs to its end.
+            if !gate.try_launch_for(&step) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "instalação cancelada antes de o instalador começar",
+                ));
+            }
+            runner(&program, &args, &dir)
+        }
+    };
+    tracing::info!("rodando o instalador {file}");
+    let staging = layout.staging_dir(&run.plan.app, &run.plan.version);
+    let result = match AwaitWorker::spawn(work, staging, ctx.launch.clone())
+        .join()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => match e.try_into_panic() {
+            // Re-raised by `execute_install` once the install is rolled back.
+            Ok(p) => {
+                run.panic = Some(p);
+                return Err("pânico ao rodar o instalador".into());
+            }
+            Err(e) => return Err(e.to_string()),
+        },
+    };
+    check_installer_exit(result)?;
+    if !keep {
+        remove_installer(&program);
+    }
+    Ok(())
 }
 
 async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Result<(), String> {
@@ -2228,58 +2508,43 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                 .map_err(|e| io_msg(&vdir, e))
         }
         Step::RunInstaller { file, args, keep } => {
-            let Some(runner) = ctx.runners.installer else {
-                return Err("sem consentimento para rodar o instalador".into());
-            };
             let vdir = layout.version_dir(app, version);
-            let program = installer_program(&vdir, file)?;
-            let work = {
-                let (program, args, dir) = (program.clone(), args.clone(), vdir.clone());
-                let (gate, step) = (ctx.launch.clone(), format!("instalador {file}"));
-                move || {
-                    // Like a hook: cancelled until it starts, then it runs to its end.
-                    if !gate.try_launch_for(&step) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "instalação cancelada antes de o instalador começar",
-                        ));
-                    }
-                    runner(&program, &args, &dir)
-                }
-            };
-            tracing::info!("rodando o instalador {file}");
-            let staging = layout.staging_dir(app, version);
-            let result = match AwaitWorker::spawn(work, staging, ctx.launch.clone())
-                .join()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => match e.try_into_panic() {
-                    // Re-raised by `execute_install` once the install is rolled back.
-                    Ok(p) => {
-                        run.panic = Some(p);
-                        return Err("pânico ao rodar o instalador".into());
-                    }
-                    Err(e) => return Err(e.to_string()),
-                },
-            };
-            check_installer_exit(result)?;
-            if !keep {
-                remove_installer(&program);
-            }
-            Ok(())
+            run_installer_file(run, ctx, &vdir, file, args, *keep).await
         }
         Step::RunPs1Installer { file, args } => {
             // Scoop keeps .ps1 installers even without keep
+            let scope = HookScope::install(plan, layout)?;
             run_hook(
                 run,
                 ctx,
                 HookKind::InstallerScript,
                 HookBody::Ps1 { file, args },
+                &scope,
+                false,
             )
             .await
         }
-        Step::Hook { kind, script } => run_hook(run, ctx, *kind, HookBody::Script(script)).await,
+        Step::Hook { kind, script } => {
+            let scope = HookScope::install(plan, layout)?;
+            run_hook(run, ctx, *kind, HookBody::Script(script), &scope, false).await
+        }
+        Step::UpgradeUninstallHook { kind, script } => {
+            let scope = upgrade_scope(run, layout)?;
+            run_hook(run, ctx, *kind, HookBody::Script(script), &scope, true).await?;
+            run.old_hooks_ran = true;
+            Ok(())
+        }
+        Step::UpgradeRunUninstaller { file, args } => {
+            let scope = upgrade_scope(run, layout)?;
+            if file.to_lowercase().ends_with(".ps1") {
+                let body = HookBody::Ps1 { file, args };
+                run_hook(run, ctx, HookKind::UninstallerScript, body, &scope, true).await?;
+            } else {
+                run_installer_file(run, ctx, &scope.version_dir, file, args, true).await?;
+            }
+            run.old_hooks_ran = true;
+            Ok(())
+        }
         Step::Persist(spec) => persist(run, spec, layout),
         Step::LinkCurrent => {
             let current = layout.current(app);
@@ -3029,11 +3294,16 @@ fn remove_artifact(
 
 /// Removes what the app's record lists. Nothing changes when a file under `apps\<app>` is in use.
 ///
+/// Order (Scoop `scoop-uninstall.ps1`): `pre_uninstall`, the uninstaller file (or `.ps1`),
+/// `uninstaller.script`, the removals, then `post_uninstall` (the version folder is gone). The
+/// hooks come from the manifest written at install time (hash checked against the record), never
+/// the catalog; they need the user's consent (`runners.scripts`), asked before any step.
+///
 /// Never broadcasts the environment change: the caller calls `effects.env.broadcast()` once
 /// after a successful uninstall.
 ///
 /// Returns notes for the user: what did not happen although the app might have wanted it
-/// (the uninstaller skipped because the installed manifest could not be trusted).
+/// (the uninstaller skipped because the installed manifest is missing or unreadable).
 pub fn execute_uninstall(
     plan: &UninstallPlan,
     ctx: &mut ExecCtx<'_>,
@@ -3050,13 +3320,28 @@ pub fn execute_uninstall(
     if let Some(p) = (ctx.in_use)(&app_dir).first() {
         return Err(ExecError::InUse(p.display().to_string()));
     }
-    let notes = run_uninstaller(ctx, &plan.app)
-        .map_err(|e| match e {
-            UninstallerError::Consent(e) => e,
-            UninstallerError::Failed(m) => fail(0, "rodar desinstalador".into(), m),
-        })?
-        .into_iter()
-        .collect();
+    let (installed, notes) = load_installed(ctx, &plan.app)?;
+    if let Some(inst) = &installed {
+        // The scanner and the consent come before the first step: nothing runs, nothing goes.
+        planner::check_uninstall_scripts(&inst.manifest)
+            .map_err(|e| fail(0, "analisar scripts".into(), e.to_string()))?;
+        if planner::has_uninstall_scripts(&inst.manifest) && ctx.runners.scripts.is_none() {
+            return Err(ExecError::NeedsScriptConsent {
+                app: plan.app.clone(),
+                what: "os scripts de desinstalação do manifesto".into(),
+            });
+        }
+        if let Some((file, _)) = &inst.command
+            && !file.to_lowercase().ends_with(".ps1")
+            && ctx.runners.installer.is_none()
+        {
+            return Err(ExecError::NeedsScriptConsent {
+                app: plan.app.clone(),
+                what: "o desinstalador do manifesto".into(),
+            });
+        }
+        run_before_removal(ctx, plan, inst).map_err(|(step, m)| fail(0, step, m))?;
+    }
     for (i, a) in plan.artifacts.iter().enumerate() {
         if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry, false)
         {
@@ -3072,12 +3357,23 @@ pub fn execute_uninstall(
     ctx.state
         .remove(&plan.app)
         .map_err(|e| fail(n + 2, "registro".into(), e.to_string()))?;
+    if let Some(inst) = &installed
+        && let Some(script) = &inst.manifest.hooks.post_uninstall
+    {
+        let body = HookBody::Script(script);
+        run_removal_hook(ctx, plan, HookKind::PostUninstall, body, inst)
+            .map_err(|m| ExecError::Hook(format!("removido, mas o post_uninstall falhou: {m}")))?;
+    }
     Ok(notes)
 }
 
-enum UninstallerError {
-    Consent(ExecError),
-    Failed(String),
+/// The manifest written when the app being removed was installed, with what its uninstall
+/// hooks run against.
+struct InstalledManifest {
+    manifest: manifest::Resolved,
+    scope: HookScope,
+    /// `uninstaller` file and substituted arguments, if the manifest declares any.
+    command: Option<(String, Vec<String>)>,
 }
 
 /// Host architecture recorded at install time (`None` = unknown key).
@@ -3087,27 +3383,47 @@ fn arch_of_key(key: &str) -> Option<Arch> {
         .find(|a| a.key() == key)
 }
 
-/// Runs `uninstaller.file` of the installed manifest, if it has one, before anything is
-/// removed. A manifest that is missing, altered (hash differs from the record) or not
-/// resolvable runs nothing: the removal goes on as before, with a warning.
-fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<Option<String>, UninstallerError> {
-    let failed = |m: String| UninstallerError::Failed(m);
+/// Reads the manifest written at install time. Altered (hash differs from the record) or
+/// unreadable: the removal fails before any step. Missing (installed before Phase 2c) or not
+/// resolvable: `None` plus a note, and the removal goes on without scripts.
+fn load_installed(
+    ctx: &ExecCtx<'_>,
+    app: &str,
+) -> Result<(Option<InstalledManifest>, Vec<String>), ExecError> {
+    let fail = |step: &str, message: String| ExecError::Failed {
+        index: 0,
+        step: step.to_string(),
+        message,
+        undone: Vec::new(),
+    };
     let skipped = |why: String| {
         tracing::warn!("{app}: desinstalador não rodou: {why}");
-        Ok(Some(format!(
-            "o desinstalador do app não rodou: {why}; o que ele instalou fora da pasta pode ter ficado"
-        )))
+        Ok((
+            None,
+            vec![format!(
+                "o desinstalador do app não rodou: {why}; o que ele instalou fora da pasta pode ter ficado"
+            )],
+        ))
     };
-    let Some((rec, _)) = ctx.state.get(app).map_err(|e| failed(e.to_string()))? else {
-        return Ok(None);
+    let Some((rec, _)) = ctx
+        .state
+        .get(app)
+        .map_err(|e| fail("ler registro", e.to_string()))?
+    else {
+        return Ok((None, Vec::new()));
     };
-    check_component("versão", &rec.version).map_err(failed)?;
+    check_component("versão", &rec.version).map_err(|m| fail("validar plano", m))?;
     let raw = match state::installed_manifest(ctx.layout, app, &rec.version, &rec.manifest_sha256) {
         Ok(Some(raw)) => raw,
-        Ok(None) => return skipped("o manifesto instalado não existe".into()),
+        Ok(None) => {
+            return skipped("o manifesto instalado não existe ou não tem hash no registro".into());
+        }
         Err(e) => {
-            return skipped(format!(
-                "o manifesto instalado foi alterado ou está ilegível ({e})"
+            return Err(fail(
+                "ler manifesto instalado",
+                format!(
+                    "o manifesto instalado foi alterado ou está ilegível ({e}); nada foi removido"
+                ),
             ));
         }
     };
@@ -3120,24 +3436,193 @@ fn run_uninstaller(ctx: &mut ExecCtx<'_>, app: &str) -> Result<Option<String>, U
         Ok(m) => m,
         Err(e) => return skipped(format!("o manifesto instalado não pôde ser lido ({e})")),
     };
-    let Some(spec) = manifest.uninstaller else {
-        return Ok(None);
-    };
-    let Some(file) = spec.file.as_deref().filter(|_| spec.script.is_none()) else {
-        tracing::warn!("{app}: uninstaller sem file (ou com script): nada a rodar");
-        return Ok(None);
-    };
-    let Some(runner) = ctx.runners.installer else {
-        return Err(UninstallerError::Consent(ExecError::NeedsScriptConsent {
-            app: app.to_string(),
-            what: "o desinstalador do manifesto".into(),
-        }));
-    };
     let vdir = ctx.layout.version_dir(app, &rec.version);
-    let args = installer_args::installer_args(&spec.args, &vdir, &rec.version)
-        .map_err(|e| failed(e.to_string()))?;
-    let program = installer_program(&vdir, file).map_err(failed)?;
-    tracing::info!("rodando o desinstalador {file}");
-    check_installer_exit(runner(&program, &args, &vdir)).map_err(failed)?;
-    Ok(None)
+    let command = match &manifest.uninstaller {
+        Some(spec) => planner::uninstaller_command(&manifest, spec, &vdir)
+            .map_err(|e| fail("analisar desinstalador", e.to_string()))?,
+        None => None,
+    };
+    let scope = HookScope {
+        op: ScriptOp::Uninstall,
+        version: rec.version.clone(),
+        old_version: None,
+        bucket: Some(rec.bucket.clone()),
+        arch: rec.arch.as_deref().and_then(arch_of_key),
+        version_dir: vdir,
+        manifest_json: raw,
+        purge: false,
+        fnames: Vec::new(),
+    };
+    Ok((
+        Some(InstalledManifest {
+            manifest,
+            scope,
+            command,
+        }),
+        Vec::new(),
+    ))
+}
+
+/// `pre_uninstall`, the uninstaller file, `uninstaller.script`: `(step, message)` on failure.
+fn run_before_removal(
+    ctx: &mut ExecCtx<'_>,
+    plan: &UninstallPlan,
+    inst: &InstalledManifest,
+) -> Result<(), (String, String)> {
+    let step = |kind: HookKind| format!("script {}", kind.key());
+    if let Some(script) = &inst.manifest.hooks.pre_uninstall {
+        let kind = HookKind::PreUninstall;
+        run_removal_hook(ctx, plan, kind, HookBody::Script(script), inst)
+            .map_err(|m| (step(kind), m))?;
+    }
+    if let Some((file, args)) = &inst.command {
+        let vdir = &inst.scope.version_dir;
+        if file.to_lowercase().ends_with(".ps1") {
+            let kind = HookKind::UninstallerScript;
+            run_removal_hook(ctx, plan, kind, HookBody::Ps1 { file, args }, inst)
+                .map_err(|m| (step(kind), m))?;
+        } else {
+            let label = "rodar desinstalador".to_string();
+            let Some(runner) = ctx.runners.installer else {
+                return Err((label, "sem consentimento para rodar o desinstalador".into()));
+            };
+            let program = installer_program(vdir, file).map_err(|m| (label.clone(), m))?;
+            tracing::info!("rodando o desinstalador {file}");
+            check_installer_exit(runner(&program, args, vdir)).map_err(|m| (label, m))?;
+        }
+    }
+    if let Some(script) = inst
+        .manifest
+        .uninstaller
+        .as_ref()
+        .and_then(|u| u.script.as_deref())
+    {
+        let kind = HookKind::UninstallerScript;
+        run_removal_hook(ctx, plan, kind, HookBody::Script(script), inst)
+            .map_err(|m| (step(kind), m))?;
+    }
+    Ok(())
+}
+
+/// Runs one uninstall hook synchronously through the host (the removal is not async) and applies
+/// the effects the hook may have on this app's own artifacts.
+fn run_removal_hook(
+    ctx: &mut ExecCtx<'_>,
+    plan: &UninstallPlan,
+    kind: HookKind,
+    body: HookBody<'_>,
+    inst: &InstalledManifest,
+) -> Result<(), String> {
+    let Some(host) = ctx.runners.scripts.clone() else {
+        return Err("sem consentimento para rodar os scripts do manifesto".into());
+    };
+    let layout = ctx.layout;
+    let app = plan.app.as_str();
+    let tmp = layout.root().join("tmp");
+    fs::create_dir_all(&tmp).map_err(|e| io_msg(&tmp, e))?;
+    let scope = HookScope {
+        purge: plan.purge,
+        ..inst.scope.clone()
+    };
+    let prepared = prepare_hook(
+        layout,
+        ctx.effects.env,
+        &ctx.effects.shortcuts.root(),
+        app,
+        kind,
+        &body,
+        &scope,
+    )?;
+    let hook = kind.key();
+    tracing::info!("rodando o script {hook} de {app}");
+    if !ctx.launch.try_launch_for(&format!("script {hook}")) {
+        return Err("remoção cancelada antes de o script começar".into());
+    }
+    let result = host.run(&prepared.job);
+    if let Some(message) = hook_failure(result, hook, ctx.effects.env, &prepared.before) {
+        return Err(message);
+    }
+    let parsed =
+        read_effects(&prepared.effects).map_err(|e| format!("efeitos do script ilegíveis: {e}"))?;
+    for effect in parsed {
+        apply_removal_effect(ctx, app, &plan.artifacts, effect)?;
+    }
+    Ok(())
+}
+
+/// Applies an effect of an uninstall hook when it touches this app's own artifacts only (a
+/// recorded PATH entry, a registered variable, a shim of the app); anything else is ignored.
+fn apply_removal_effect(
+    ctx: &mut ExecCtx<'_>,
+    app: &str,
+    artifacts: &[Artifact],
+    effect: ScriptEffect,
+) -> Result<(), String> {
+    if !own_uninstall_effect(&effect, artifacts) {
+        tracing::warn!("{app}: efeito de script de desinstalação ignorado (não é deste app)");
+        return Ok(());
+    }
+    let layout = ctx.layout;
+    let env = ctx.effects.env;
+    match effect {
+        ScriptEffect::SetEnv { name, value } => {
+            let (app_dir, persist_dir) = (layout.app_dir(app), layout.persist_dir(app));
+            validate_set_env(env, &name, value.as_deref(), (&app_dir, &persist_dir), true)?;
+            match value {
+                Some(v) => env.set(
+                    &name,
+                    &EnvValue {
+                        expand: v.contains('%'),
+                        value: v,
+                    },
+                ),
+                None => env.remove(&name),
+            }
+            .map_err(|e| e.to_string())
+        }
+        ScriptEffect::RemovePath { var, entries } => {
+            if !var.eq_ignore_ascii_case(PATH_VAR) {
+                tracing::warn!("{app}: Remove-Path em {var} ignorado");
+                return Ok(());
+            }
+            let patterns = path_patterns(&entries)?;
+            let Some(cur) = env.get(PATH_VAR).map_err(|e| e.to_string())? else {
+                return Ok(());
+            };
+            let mut value = cur.value.clone();
+            for seg in cur.value.split(';') {
+                if seg.is_empty() || !patterns.iter().any(|p| like(seg, p)) {
+                    continue;
+                }
+                let want = path_edit::norm(seg);
+                let recorded = artifacts
+                    .iter()
+                    .any(|a| a.kind == ArtifactKind::Path && path_edit::norm(&a.target) == want);
+                if !is_inside(seg, layout.root()) || !recorded {
+                    tracing::warn!("{app}: Remove-Path de {seg} ignorado (não é deste app)");
+                    continue;
+                }
+                let users = ctx.state.path_users(app, seg).map_err(|e| e.to_string())?;
+                if users.is_empty() {
+                    value = path_edit::path_remove(&value, seg);
+                }
+            }
+            if value == cur.value {
+                return Ok(());
+            }
+            env.set(
+                PATH_VAR,
+                &EnvValue {
+                    value,
+                    expand: cur.expand,
+                },
+            )
+            .map_err(|e| e.to_string())
+        }
+        ScriptEffect::RmShim { name } => {
+            check_component("comando", &name)?;
+            shim::remove_shim(layout, &name).map_err(|e| e.to_string())
+        }
+        _ => Ok(()),
+    }
 }
