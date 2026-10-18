@@ -23,6 +23,7 @@ Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira c
 - **Laço de nova tentativa** (Task 136): todo estado por tentativa (resultado, código, linhas, motivo da falha) é zerado no início de cada iteração, e há um teste em que a 2ª tentativa falha por **outro** motivo que a 1ª.
 - **Versão nunca comparada como texto** (Task 134): use `crate::core::version`, com testes "maior", "menor" e "mesma com zeros a mais".
 - **Teste de "nunca faz X" cuja regressão seria esperar** (Task 140): sem prazo, o mutante só fica lento (600 s de `wait_max`) e o teste passa. Envolva em `tokio::time::timeout`/prazo curto e exija o resultado; a mutação tem que falhar rápido.
+- **Código nunca se molda à âncora do brief** (Task 143): `#[rustfmt::skip]` ou linha artificial só para o texto da mutação casar é proibido. Formate normalmente e use `-AnchorFile`/`-ReplacementFile` com o trecho real; se o brief citar texto que mudou, diga no relatório.
 - **Recusa nova em extrator/parser** (Task 138): rode contra o corpus real da sonda do formato (ou peça a sonda) antes de entregar; fixture sintética não prova que arquivos reais passam.
 
 #### Report contract
