@@ -1047,28 +1047,54 @@ enum HookBody<'a> {
 /// Cap of a `.ps1` installer read for scanning.
 const MAX_PS1_BYTES: u64 = 1024 * 1024;
 
-/// Reads a `.ps1` installer (bounded) and runs `script_scan` over it; a refused verdict, an
-/// oversized file or one that is not plain text (UTF-16 would blind the scanner) stops the step.
+/// Reads a `.ps1` installer through its canonical path (bounded), decodes it (BOM: UTF-8 or
+/// UTF-16; none: strict UTF-8, because PowerShell 5.1 reads a BOM-less file as ANSI) and runs
+/// `script_scan` over the text. A refused verdict, an oversized or undecodable file stops the
+/// step. Returns the exact text that was analysed.
 fn scan_ps1_file(program: &Path) -> Result<String, String> {
     use std::io::Read;
     let name = program
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let f = fs::File::open(program).map_err(|e| io_msg(program, e))?;
+    let real = fs::canonicalize(program).map_err(|e| io_msg(program, e))?;
+    let f = fs::File::open(&real).map_err(|e| io_msg(&real, e))?;
     let mut bytes = Vec::new();
     f.take(MAX_PS1_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| io_msg(program, e))?;
+        .map_err(|e| io_msg(&real, e))?;
     if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_PS1_BYTES) {
         return Err(format!("instalador {name} passa de 1 MiB: não analisado"));
     }
-    if bytes.contains(&0) {
-        return Err(format!(
-            "instalador {name} não é texto simples (UTF-16?): não analisado"
-        ));
-    }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let bad = |what: &str| format!("instalador {name} {what}: não analisado");
+    let utf16 = |rest: &[u8], be: bool| -> Result<String, String> {
+        if rest.len() % 2 != 0 {
+            return Err(bad("tem UTF-16 truncado"));
+        }
+        let units = rest.chunks_exact(2).map(|c| {
+            if be {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            }
+        });
+        char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map_err(|_| bad("tem UTF-16 inválido"))
+    };
+    let text = match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false)?,
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true)?,
+        [0xEF, 0xBB, 0xBF, rest @ ..] => {
+            String::from_utf8(rest.to_vec()).map_err(|_| bad("não é UTF-8 válido"))?
+        }
+        other => {
+            if other.contains(&0) {
+                return Err(bad("não é texto simples (UTF-16 sem BOM?)"));
+            }
+            String::from_utf8(other.to_vec()).map_err(|_| bad("não é UTF-8 válido"))?
+        }
+    };
     let report = script_scan::scan(&text, PRELUDE_FUNCTIONS);
     if report.verdict == script_scan::Verdict::Refuse {
         let reasons: Vec<String> = report
@@ -1083,6 +1109,37 @@ fn scan_ps1_file(program: &Path) -> Result<String, String> {
         ));
     }
     Ok(text)
+}
+
+/// Removes the analysed copy of a `.ps1` installer on every path out.
+struct RemoveFile(PathBuf);
+
+impl Drop for RemoveFile {
+    fn drop(&mut self) {
+        if let Err(e) = not_found_ok(fs::remove_file(&self.0)) {
+            tracing::warn!("{}: {e}", self.0.display());
+        }
+    }
+}
+
+/// Writes `text` (UTF-8 with BOM) as `<name>.wingetrs-run.ps1` beside `program`, so the
+/// installer that runs is exactly what was analysed and `$PSScriptRoot` stays the same.
+fn write_ps1_copy(program: &Path, text: &str) -> Result<(PathBuf, RemoveFile), String> {
+    let mut name = program.file_name().unwrap_or_default().to_os_string();
+    name.push(".wingetrs-run.ps1");
+    let copy = program.with_file_name(name);
+    // A stale copy (or a link planted under that name) is removed itself, never followed.
+    not_found_ok(fs::remove_file(&copy)).map_err(|e| io_msg(&copy, e))?;
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(text.as_bytes());
+    let guard = RemoveFile(copy.clone());
+    let write = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&copy)
+        .and_then(|mut f| io::Write::write_all(&mut f, &bytes));
+    write.map_err(|e| io_msg(&copy, e))?;
+    Ok((copy, guard))
 }
 
 /// `Step::Hook`: writes the hook, the prelude, the manifest, the environment seed and the
@@ -1101,11 +1158,14 @@ async fn run_hook(
     let (app, version) = (plan.app.as_str(), plan.version.as_str());
     // A `.ps1` installer is third-party code the manifest does not contain: located inside the
     // version folder and scanned (size-capped read) before anything is written or run.
-    let (script, ps1_program) = match &body {
-        HookBody::Script(s) => ((*s).to_string(), None),
+    let (script, ps1_program, _copy_guard) = match &body {
+        HookBody::Script(s) => ((*s).to_string(), None, None),
         HookBody::Ps1 { file, .. } => {
             let program = installer_program(&layout.version_dir(app, version), file)?;
-            (scan_ps1_file(&program)?, Some(program))
+            let text = scan_ps1_file(&program)?;
+            // Only the analysed copy runs; the original is never executed.
+            let (copy, guard) = write_ps1_copy(&program, &text)?;
+            (text, Some(copy), Some(guard))
         }
     };
     let script = script.as_str();

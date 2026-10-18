@@ -95,6 +95,11 @@ struct FakeHost {
     set_env: Option<(Arc<FakeEnv>, String)>,
     write_effect: bool,
     io_error: bool,
+    /// Bytes of this file are recorded when the job runs.
+    watch: Option<PathBuf>,
+    /// Overwritten with other content when the job runs (the original after the analysis).
+    tamper: Option<PathBuf>,
+    watched: Mutex<Option<Vec<u8>>>,
     panic: bool,
 }
 
@@ -115,6 +120,12 @@ impl ScriptHost for FakeHost {
             panic!("script host bug QQP");
         }
         let runner = std::fs::read(&job.runner)?;
+        if let Some(w) = &self.watch {
+            *self.watched.lock().unwrap() = Some(std::fs::read(w)?);
+        }
+        if let Some(t) = &self.tamper {
+            std::fs::write(t, b"scoop install evil\r\n")?;
+        }
         self.seen.lock().unwrap().push(Seen {
             job: job.clone(),
             runner,
@@ -339,7 +350,7 @@ async fn ps1_runs_via_host_with_ps1_body() {
     let runner = host.runner_of(HookKind::InstallerScript);
     let call = format!(
         "& {} @('/S',{})",
-        quoted(&vdir.join("setup.ps1")),
+        quoted(&vdir.join("setup.ps1.wingetrs-run.ps1")),
         quoted(&vdir)
     );
     assert!(runner.contains(&call), "{runner}");
@@ -510,5 +521,139 @@ fn ps1_path_escape_is_refused_by_the_manifest() {
         matches!(&r, Err(e) if e.to_string().contains("inseguro")),
         "{:?}",
         r.map(|_| ())
+    );
+}
+
+const COPY: &str = "setup.ps1.wingetrs-run.ps1";
+
+#[tokio::test]
+async fn ps1_runs_only_the_analysed_copy() {
+    let text = "info 'caf\u{e9}'\r\n";
+    let w = setup_with(text.as_bytes()).await;
+    let vdir = w.layout.version_dir("app", "1.0");
+    let host = Arc::new(FakeHost {
+        watch: Some(vdir.join(COPY)),
+        tamper: Some(vdir.join("setup.ps1")),
+        ..FakeHost::default()
+    });
+    w.run(&w.plan(ps1_manifest(serde_json::json!([]))), &host)
+        .await
+        .unwrap();
+    let runner = host.runner_of(HookKind::InstallerScript);
+    assert!(
+        runner.contains(&format!("& {} @()", quoted(&vdir.join(COPY)))),
+        "{runner}"
+    );
+    assert!(
+        !runner.contains(&format!("& {} @", quoted(&vdir.join("setup.ps1")))),
+        "{runner}"
+    );
+    let mut want = b"\xEF\xBB\xBF".to_vec();
+    want.extend_from_slice(text.as_bytes());
+    assert_eq!(host.watched.lock().unwrap().clone(), Some(want));
+    // The original was swapped while it ran: the copy, not it, was what ran; the copy is gone.
+    assert!(!vdir.join(COPY).exists());
+    assert!(vdir.join("setup.ps1").is_file());
+}
+
+#[tokio::test]
+async fn ps1_copy_removed_when_the_script_fails() {
+    let w = setup().await;
+    let vdir = w.layout.version_dir("app", "1.0");
+    let host = Arc::new(FakeHost {
+        code: 3,
+        watch: Some(vdir.join(COPY)),
+        ..FakeHost::default()
+    });
+    let plan = w.plan(ps1_manifest(serde_json::json!([])));
+    assert!(w.run(&plan, &host).await.is_err());
+    assert!(host.watched.lock().unwrap().is_some());
+    assert!(!vdir.join(COPY).exists());
+}
+
+#[tokio::test]
+async fn ps1_without_bom_must_be_strict_utf8() {
+    // 0x91-0x94 are curly quotes in ANSI (PowerShell 5.1) but invalid UTF-8.
+    let w = setup_with(b"info \x91x\x92\r\n").await;
+    let host = Arc::new(FakeHost::default());
+    let plan = w.plan(ps1_manifest(serde_json::json!([])));
+    match w.run(&plan, &host).await {
+        Err(ExecError::Failed { message, .. }) => {
+            assert!(message.contains("UTF-8"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(host.seen().is_empty());
+}
+
+#[tokio::test]
+async fn ps1_utf16_with_bom_is_decoded_scanned_and_run_as_utf8() {
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend("info 'x'\r\n".encode_utf16().flat_map(u16::to_le_bytes));
+    let w = setup_with(&bytes).await;
+    let vdir = w.layout.version_dir("app", "1.0");
+    let host = Arc::new(FakeHost {
+        watch: Some(vdir.join(COPY)),
+        ..FakeHost::default()
+    });
+    let plan = w.plan(ps1_manifest(serde_json::json!([])));
+    w.run(&plan, &host).await.unwrap();
+    let mut want = b"\xEF\xBB\xBF".to_vec();
+    want.extend_from_slice(b"info 'x'\r\n");
+    assert_eq!(host.watched.lock().unwrap().clone(), Some(want));
+    // Refused content in UTF-16 with BOM is scanned too, not skipped.
+    let mut evil = vec![0xFF, 0xFE];
+    evil.extend(
+        "scoop install x\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    let w = setup_with(&evil).await;
+    let host = Arc::new(FakeHost::default());
+    let plan = w.plan(ps1_manifest(serde_json::json!([])));
+    assert!(w.run(&plan, &host).await.is_err());
+    assert!(host.seen().is_empty());
+}
+
+#[derive(Clone)]
+struct JunctionBefore {
+    link: PathBuf,
+    target: PathBuf,
+}
+impl StepHook for JunctionBefore {
+    fn before(&self, _: usize, step: &Step) -> Result<(), ExecError> {
+        if matches!(step, Step::RunPs1Installer { .. }) {
+            wingetrs::install::link::create(&self.target, &self.link)
+                .map_err(|e| ExecError::Hook(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn ps1_through_junction_out_of_version_dir_refused() {
+    let w = setup().await;
+    let plan = w.plan(serde_json::json!({"installer": {"file": "sub/x.ps1"}}));
+    let outside = w._t.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("x.ps1"), b"info 'x'\r\n").unwrap();
+    let hook = JunctionBefore {
+        link: w.layout.version_dir("app", "1.0").join("sub"),
+        target: outside.clone(),
+    };
+    let host = Arc::new(FakeHost::default());
+    let scripts: Arc<dyn ScriptHost> = host.clone();
+    let mut ctx = w.ctx(&hook, Some(scripts));
+    let e = wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap_err();
+    drop(ctx);
+    assert!(e.to_string().contains("fora da pasta da versão"), "{e}");
+    assert!(host.seen().is_empty());
+    assert!(outside.join("x.ps1").is_file());
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        1,
+        "no copy outside"
     );
 }

@@ -185,15 +185,9 @@ fn planner_refuses_each_2c_key_with_old_text() {
     let cases = [
         r#","pre_uninstall":"x""#,
         r#","post_uninstall":"x""#,
-        r#","installer":{"file":"a.ps1"}"#,
         r#","uninstaller":{"file":"a.ps1"}"#,
     ];
-    let keys = [
-        "pre_uninstall",
-        "post_uninstall",
-        "installer",
-        "uninstaller",
-    ];
+    let keys = ["pre_uninstall", "post_uninstall", "uninstaller"];
     for (c, k) in cases.iter().zip(keys) {
         let e = plan(&ok(c)).unwrap_err();
         assert!(matches!(e, PlanError::Unsupported(_)), "{k}");
