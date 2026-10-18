@@ -27,6 +27,7 @@ Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira c
 - **Gate com outros agentes no checkout** (2026-10-18: um agente rodou o gate 6 vezes em 25 min esperando arquivos alheios): rode o gate **uma** vez; se falhar só em arquivos que não são seus (confira com `git status`/caminho do erro), não espere nem repita: prove os seus com `cargo test --quiet --test it <seus_modulos>::` e `cargo clippy --all-targets` filtrado pelos seus caminhos, diga isso no relatório e entregue. O orquestrador roda o gate depois.
 - **Teste que roda programa real** (`pwsh`, `winget`, `msiexec`, `reg`, `innounp`, instalador) é `#[ignore = "live: ..."]`, mesmo com script sintético, mesmo que o brief esqueça de marcar (Task 155: `end_to_end_pwsh` rodava pwsh pelo PATH no gate, 4,6 s, e derrubaria o gate numa máquina sem pwsh).
 - **O índice do git é compartilhado:** nunca deixe arquivo `git add`-ado sem commitar no mesmo comando (`git add <arqs> && git commit -- <arqs>`); um arquivo parado no índice entra no commit do próximo agente que rodar `git commit` sem caminhos (Task 175 deixou o relatório no índice).
+- **Scratchpad compartilhado:** arquivos de âncora/mutação e saídas temporárias levam o número da tarefa no nome (`t<N>-anchor.txt`); outro agente sobrescreveu a âncora da Task 155 com um nome genérico.
 - **Recusa nova em extrator/parser** (Task 138): rode contra o corpus real da sonda do formato (ou peça a sonda) antes de entregar; fixture sintética não prova que arquivos reais passam.
 
 #### Report contract
