@@ -1068,7 +1068,7 @@ fn scan_ps1_file(program: &Path) -> Result<String, String> {
     }
     let bad = |what: &str| format!("instalador {name} {what}: não analisado");
     let utf16 = |rest: &[u8], be: bool| -> Result<String, String> {
-        if rest.len() % 2 != 0 {
+        if !rest.len().is_multiple_of(2) {
             return Err(bad("tem UTF-16 truncado"));
         }
         let units = rest.chunks_exact(2).map(|c| {
