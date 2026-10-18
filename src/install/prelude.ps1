@@ -383,3 +383,152 @@ function ConvertToPrettyJson {
         return $output
     }
 }
+
+# ---- Group 2 (Task 153): intercepted global effects ----
+# These functions never touch the registry, the real PATH or create .lnk files: each
+# effect becomes one JSON line appended to $__wr_effects; the executor applies them.
+
+# internal: append one effect (hashtable) as a compressed JSON line, UTF-8 without BOM, LF
+function __wr_effect($effect) {
+    if ([string]::IsNullOrEmpty($__wr_effects)) { throw 'effects file not defined by the runner' }
+    $line = ConvertTo-Json -InputObject $effect -Compress -Depth 4
+    [System.IO.File]::AppendAllText($__wr_effects, $line + "`n", (New-Object System.Text.UTF8Encoding $false))
+}
+
+# system.ps1:30 -- reads the seed JSON ($__wr_env_seed) overlaid by this session's writes
+function Get-EnvVar {
+    param(
+        [string]$Name,
+        [switch]$Global
+    )
+    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($null -eq $script:__wr_env_overlay) { $script:__wr_env_overlay = @{} }
+    if ($script:__wr_env_overlay.ContainsKey($Name)) {
+        return $script:__wr_env_overlay[$Name]
+    }
+    if (![string]::IsNullOrEmpty($__wr_env_seed)) {
+        $seed = ConvertFrom-Json -InputObject $__wr_env_seed -ErrorAction Stop
+        $prop = $seed.PSObject.Properties[$Name]
+        if ($null -ne $prop) { return $prop.Value }
+    }
+    throw ("Get-EnvVar: a vari" + [char]0xE1 + "vel '$Name' n" + [char]0xE3 + "o foi pr" + [char]0xE9 + "-carregada pelo wingetrs")
+}
+
+# system.ps1:46 -- records set_env and the session overlay; empty value removes
+function Set-EnvVar {
+    param(
+        [string]$Name,
+        $Value,
+        [switch]$Global
+    )
+    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($null -eq $Value -or "$Value" -eq '') { $Value = $null } else { $Value = "$Value" }
+    __wr_effect @{ op = 'set_env'; name = $Name; value = $Value }
+    if ($null -eq $script:__wr_env_overlay) { $script:__wr_env_overlay = @{} }
+    $script:__wr_env_overlay[$Name] = $Value
+}
+
+# system.ps1:96 -- records add_path (prepend) and updates the session variable
+function Add-Path {
+    param(
+        [string[]]$Path,
+        [string]$TargetEnvVar = 'PATH',
+        [switch]$Global,
+        [switch]$Force,
+        [switch]$Quiet
+    )
+    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    __wr_effect @{ op = 'add_path'; var = $TargetEnvVar; entries = [string[]]@($Path); prepend = $true }
+    # current session
+    $session = (Get-Item -LiteralPath "env:$TargetEnvVar" -ErrorAction SilentlyContinue).Value
+    $inPath, $strippedPath = Split-PathLikeEnvVar $Path "$session"
+    if (!$inPath -or $Force) {
+        Set-Item -LiteralPath "env:$TargetEnvVar" -Value ((@($Path) + @($strippedPath | Where-Object { $_ })) -join ';')
+    }
+}
+
+# system.ps1:122 -- records remove_path and updates the session variable
+function Remove-Path {
+    param(
+        [string[]]$Path,
+        [string]$TargetEnvVar = 'PATH',
+        [switch]$Global,
+        [switch]$Quiet,
+        [switch]$PassThru
+    )
+    if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    __wr_effect @{ op = 'remove_path'; var = $TargetEnvVar; entries = [string[]]@($Path) }
+    # current session
+    $session = (Get-Item -LiteralPath "env:$TargetEnvVar" -ErrorAction SilentlyContinue).Value
+    $inSessionPath, $strippedPath = Split-PathLikeEnvVar $Path "$session"
+    if ($inSessionPath) {
+        if ($strippedPath) {
+            Set-Item -LiteralPath "env:$TargetEnvVar" -Value $strippedPath
+        } else {
+            Remove-Item -LiteralPath "env:$TargetEnvVar" -ErrorAction SilentlyContinue
+        }
+    }
+    if ($PassThru) {
+        return $inSessionPath
+    }
+}
+
+# system.ps1:153 (deprecated)
+function env($name, $global, $val) {
+    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ($PSBoundParameters.ContainsKey('val')) {
+        Set-EnvVar -Name $name -Value $val
+    } else {
+        Get-EnvVar -Name $name
+    }
+}
+
+# system.ps1:168 (deprecated)
+function add_first_in_path($dir, $global) {
+    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    Add-Path -Path $dir -Force
+}
+
+# system.ps1:173 (deprecated)
+function remove_from_path($dir, $global) {
+    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    Remove-Path -Path $dir
+}
+
+# core.ps1:949 -- records shim only; the executor keeps the shims dir on the PATH
+function shim($path, $global, $name, $arg) {
+    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if (!(Test-Path $path)) { abort "Can't shim '$(Split-Path -Leaf $path)': couldn't find '$path'." }
+    if (!$name) { $name = [System.IO.Path]::GetFileNameWithoutExtension("$path") }
+    $resolved = Convert-Path $path
+    $a = if ($arg) { "$arg" } else { $null }
+    __wr_effect @{ op = 'shim'; path = $resolved; name = "$name".ToLowerInvariant(); args = $a }
+}
+
+# install.ps1:195 -- records rm_shim only
+function rm_shim($name, $shimdir, $app) {
+    __wr_effect @{ op = 'rm_shim'; name = "$name" }
+}
+
+# shortcuts.ps1:22 -- the shortcut root comes from $__wr_shortcut_root (created if missing)
+function shortcut_folder($global) {
+    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if ([string]::IsNullOrEmpty($__wr_shortcut_root)) { throw 'shortcut root not defined by the runner' }
+    return Convert-Path (ensure $__wr_shortcut_root)
+}
+
+# shortcuts.ps1:31 -- records shortcut only (no WScript.Shell, no .lnk)
+function startmenu_shortcut([System.IO.FileInfo] $target, $shortcutName, $arguments, [System.IO.FileInfo]$icon, $global) {
+    if ($global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
+    if (!$target.Exists) {
+        Write-Host -f DarkRed "Creating shortcut for $shortcutName ($(Split-Path -Leaf $target)) failed: Couldn't find $target"
+        return
+    }
+    if ($icon -and !$icon.Exists) {
+        Write-Host -f DarkRed "Creating shortcut for $shortcutName ($(Split-Path -Leaf $target)) failed: Couldn't find icon $icon"
+        return
+    }
+    $a = if ($arguments) { "$arguments" } else { $null }
+    $i = if ($icon) { $icon.FullName } else { $null }
+    __wr_effect @{ op = 'shortcut'; target = $target.FullName; name = "$shortcutName"; args = $a; icon = $i }
+}

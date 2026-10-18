@@ -7,7 +7,7 @@ use std::process::Command;
 
 use wingetrs::install::prelude::{CONTRACT_VARS, PRELUDE, PRELUDE_FUNCTIONS};
 
-const FUNCTIONS: [&str; 24] = [
+const FUNCTIONS: [&str; 35] = [
     "info",
     "warn",
     "error",
@@ -32,6 +32,17 @@ const FUNCTIONS: [&str; 24] = [
     "movedir",
     "Split-PathLikeEnvVar",
     "ConvertToPrettyJson",
+    "Get-EnvVar",
+    "Set-EnvVar",
+    "Add-Path",
+    "Remove-Path",
+    "env",
+    "add_first_in_path",
+    "remove_from_path",
+    "shim",
+    "rm_shim",
+    "shortcut_folder",
+    "startmenu_shortcut",
 ];
 
 struct Out {
@@ -349,7 +360,10 @@ fn prelude_text_is_declared_ascii_and_clean() {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
-            defined.insert(name);
+            // internal helpers (`__wr_*`) are not part of the Scoop surface
+            if !name.starts_with("__wr_") {
+                defined.insert(name);
+            }
         }
     }
     let defined: BTreeSet<&str> = defined.iter().map(String::as_str).collect();
