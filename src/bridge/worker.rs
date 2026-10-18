@@ -7,7 +7,7 @@ use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
 use crate::installed::guid::pack_guid;
 use crate::winget_install::elevated_rules::{
-    KnownFolders, expand_known, in_admin_folder, is_duplicate, still_orphan,
+    KnownFolders, elevated_duplicate, expand_known, in_admin_folder, still_orphan,
 };
 use crate::winget_install::uninstall_cmd::{ArpDetails, Rule, uninstall_command, valid_arp_key};
 use serde::de::DeserializeOwned;
@@ -487,7 +487,7 @@ pub trait WorkerOps {
     fn read_arp(&mut self, _hive: Hive, _key: &str) -> std::io::Result<Option<ArpDetails>> {
         Err(unsupported())
     }
-    /// Every ARP entry of HKLM 64, HKLM 32 and HKCU.
+    /// Every ARP entry of HKLM 64 and HKLM 32 (never HKCU: the user writes it).
     fn arp_entries(&mut self) -> std::io::Result<Vec<ArpDetails>> {
         Err(unsupported())
     }
@@ -963,7 +963,7 @@ fn reason_holds(
         }
         DeleteReason::Duplicate => {
             let all = ops.arp_entries().map_err(|e| failure(&e))?;
-            is_duplicate(&d, &all)
+            elevated_duplicate(&d, &all)
         }
     })
 }

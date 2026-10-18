@@ -8,7 +8,7 @@ use wingetrs::bridge::worker::{
 };
 use wingetrs::installed::Hive;
 use wingetrs::winget_install::elevated_rules::{
-    KnownFolders, expand_known, in_admin_folder, is_duplicate, still_orphan,
+    KnownFolders, elevated_duplicate, expand_known, in_admin_folder, is_duplicate, still_orphan,
 };
 use wingetrs::winget_install::uninstall_cmd::{ArpDetails, Rule};
 
@@ -498,33 +498,104 @@ fn delete_of_a_missing_key_is_refused() {
     assert!(ops.deleted.is_empty());
 }
 
-#[test]
-fn delete_duplicate_needs_other_record() {
-    let me = named(Hive::MachineX86, "Kindle", "Amazon Kindle");
+fn versioned(hive: Hive, key: &str, name: &str, version: &str) -> ArpDetails {
+    ArpDetails {
+        display_version: Some(version.to_string()),
+        ..named(hive, key, name)
+    }
+}
+
+fn ask_duplicate(entries: Vec<ArpDetails>, hive: MachineHive, key: &str) -> (Reply, FakeOps) {
     let mut ops = FakeOps {
-        entries: vec![me.clone(), named(Hive::User, "Other", "Kindle")],
+        entries,
         ..FakeOps::default()
     };
-    let reply = ask(
-        &delete(MachineHive::Hklm32, "Kindle", DeleteReason::Duplicate),
-        &mut ops,
+    let reply = ask(&delete(hive, key, DeleteReason::Duplicate), &mut ops);
+    (reply, ops)
+}
+
+/// Task 182 review (security): only another HKLM record may make an HKLM key a duplicate;
+/// an HKCU record (written by the user) never does, and only the non-principal record (the
+/// lower `DisplayVersion`) may go.
+#[test]
+fn delete_duplicate_needs_other_record() {
+    let me = versioned(Hive::MachineX86, "Kindle", "Amazon Kindle", "2.8.3");
+    // No other record with the same name.
+    let (reply, ops) = ask_duplicate(
+        vec![me.clone(), versioned(Hive::User, "Other", "Kindle", "9.0")],
+        MachineHive::Hklm32,
+        "Kindle",
     );
     assert_eq!(error_text(&reply), "a chave deixou de ser duplicada");
     assert!(ops.deleted.is_empty());
 
-    let mut ops = FakeOps {
-        entries: vec![me, named(Hive::User, "Amazon Kindle", " amazon kindle ")],
-        ..FakeOps::default()
-    };
-    let reply = ask(
-        &delete(MachineHive::Hklm32, "Kindle", DeleteReason::Duplicate),
-        &mut ops,
+    // An identical, newer record in HKCU does not authorize deleting the HKLM one.
+    let (reply, ops) = ask_duplicate(
+        vec![
+            me.clone(),
+            versioned(Hive::User, "Amazon Kindle", " amazon kindle ", "2.9.1"),
+        ],
+        MachineHive::Hklm32,
+        "Kindle",
+    );
+    assert_eq!(error_text(&reply), "a chave deixou de ser duplicada");
+    assert!(ops.deleted.is_empty());
+
+    // A newer record in the other HKLM view does.
+    let (reply, ops) = ask_duplicate(
+        vec![
+            me.clone(),
+            versioned(
+                Hive::MachineX64,
+                "Amazon Kindle",
+                " amazon kindle ",
+                "2.9.1",
+            ),
+        ],
+        MachineHive::Hklm32,
+        "Kindle",
     );
     assert_eq!(reply, Reply::End { code: 0 });
     assert_eq!(
         ops.deleted,
         vec![(MachineHive::Hklm32, "Kindle".to_string())]
     );
+}
+
+#[test]
+fn elevated_duplicate_never_for_a_user_record() {
+    let mine = versioned(Hive::User, "K", "Amazon Kindle", "1.0");
+    let newer = versioned(Hive::MachineX64, "K", "Amazon Kindle", "2.0");
+    assert!(!elevated_duplicate(&mine, &[mine.clone(), newer.clone()]));
+    let hklm = versioned(Hive::MachineX86, "K", "Amazon Kindle", "1.0");
+    assert!(elevated_duplicate(&hklm, &[hklm.clone(), newer]));
+}
+
+#[test]
+fn delete_duplicate_only_the_non_principal_hklm_record() {
+    let old = versioned(Hive::MachineX86, "K1", "Amazon Kindle", "2.8.3");
+    let new = versioned(Hive::MachineX86, "K2", "amazon kindle", "2.10");
+    let both = vec![old.clone(), new.clone()];
+    // The newer one (2.10 > 2.8.3 as versions, not as text) is the principal: refused.
+    let (reply, ops) = ask_duplicate(both.clone(), MachineHive::Hklm32, "K2");
+    assert_eq!(error_text(&reply), "a chave deixou de ser duplicada");
+    assert!(ops.deleted.is_empty());
+    let (reply, ops) = ask_duplicate(both, MachineHive::Hklm32, "K1");
+    assert_eq!(reply, Reply::End { code: 0 });
+    assert_eq!(ops.deleted, vec![(MachineHive::Hklm32, "K1".to_string())]);
+
+    // Same version, or no version: which one is the principal is unknown, so neither goes.
+    for (a, b) in [("2.8.3", "2.8.3.0"), ("", "2.9")] {
+        let x = versioned(Hive::MachineX86, "K1", "Amazon Kindle", a);
+        let y = versioned(Hive::MachineX64, "K1", "Amazon Kindle", b);
+        let (reply, ops) = ask_duplicate(vec![x, y], MachineHive::Hklm32, "K1");
+        assert_eq!(
+            error_text(&reply),
+            "a chave deixou de ser duplicada",
+            "{a} {b}"
+        );
+        assert!(ops.deleted.is_empty());
+    }
 }
 
 #[test]

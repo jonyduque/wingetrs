@@ -2,6 +2,8 @@
 //! deletes its key (Task 182). Pure: the folders come from the caller (known folders on
 //! Windows), never from the environment.
 use super::uninstall_cmd::ArpDetails;
+use crate::core::version::Version;
+use crate::installed::Hive;
 use crate::installed::arp::{expand_vars, missing_uninstaller};
 use std::path::{Component, Path, PathBuf};
 
@@ -113,4 +115,35 @@ pub fn is_duplicate(d: &ArpDetails, others: &[ArpDetails]) -> bool {
         .iter()
         .filter(|o| !(o.hive == d.hive && o.key.eq_ignore_ascii_case(&d.key)))
         .any(|o| name(o).as_deref() == Some(mine.as_str()))
+}
+
+fn is_machine(h: Hive) -> bool {
+    matches!(h, Hive::MachineX64 | Hive::MachineX86)
+}
+
+/// The version of an entry when it has a non-empty `DisplayVersion`.
+fn version_of(e: &ArpDetails) -> Option<Version> {
+    let v = e.display_version.as_deref().map(str::trim)?;
+    (!v.is_empty()).then(|| Version::parse(v))
+}
+
+/// The duplicate rule the elevated helper applies before deleting `d`: `d` is an HKLM record,
+/// and another HKLM record (another key or view) with the same name (see `is_duplicate`) has
+/// a strictly greater `DisplayVersion`, so `d` is not the principal one. HKCU records never
+/// count (the user writes them), and equal or missing versions do not tell which record is
+/// the principal, so they refuse.
+pub fn elevated_duplicate(d: &ArpDetails, others: &[ArpDetails]) -> bool {
+    if !is_machine(d.hive) {
+        return false;
+    }
+    let Some(mine) = version_of(d) else {
+        return false;
+    };
+    let newer: Vec<ArpDetails> = others
+        .iter()
+        .filter(|o| is_machine(o.hive))
+        .filter(|o| version_of(o).is_some_and(|v| v > mine))
+        .cloned()
+        .collect();
+    is_duplicate(d, &newer)
 }

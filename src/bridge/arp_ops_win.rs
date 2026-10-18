@@ -43,10 +43,11 @@ fn uninstall_root(hive: Hive) -> (winreg::HKEY, &'static str, u32) {
     }
 }
 
-/// Every readable ARP entry of HKLM 64, HKLM 32 and HKCU (the HKCU of this token).
+/// Every readable ARP entry of HKLM 64 and HKLM 32. HKCU is never read here: the user writes
+/// it, so it must not decide what the helper deletes.
 pub fn arp_entries() -> io::Result<Vec<ArpDetails>> {
     let mut out = Vec::new();
-    for hive in [Hive::MachineX64, Hive::MachineX86, Hive::User] {
+    for hive in [Hive::MachineX64, Hive::MachineX86] {
         let (root, base, view) = uninstall_root(hive);
         let parent = match RegKey::predef(root).open_subkey_with_flags(base, KEY_READ | view) {
             Ok(k) => k,
