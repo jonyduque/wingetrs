@@ -182,8 +182,8 @@ Entregar S-psm e S-inno primeiro.
 |---|---|
 | Script destrutivo ou malicioso | confirmação obrigatória com o script e os flags; recusa de elevado, HKLM e `-Global`; hash dos downloads; aviso explícito |
 | Análise estática passa falsa segurança | é portão e informação, nunca garantia; `ConfirmStrong` para construções dinâmicas; a UI nunca diz "seguro" |
-| Substituições desatualizadas quando a lib muda | commit fixado, hash por arquivo e um teste que falha se uma função substituída sumir |
-| A lib escapa e grava no `~/scoop` | `SCOOP` sempre definido; o teste do host falso confere o ambiente; a sonda D2 confirma "nada gravado"; o `~/scoop` é comparado antes e depois no teste ao vivo |
+| Manifesto usa função do Scoop que o prelúdio não tem (D1 = B) | o portão recusa com o nome da função; o oráculo mede (0 manifestos de `main`/`extras` na Task 163) |
+| Script grava no `~/scoop` | `SCOOP` aponta para a raiz do wingetrs; o `~/scoop` é comparado antes e depois na prova ao vivo |
 | `$dir` do staging gravado em arquivos | hooks depois do `Promote`; teste do `$dir` por hook |
 | Rollback incompleto | D5 + aviso na confirmação |
 | GPO bloqueia o pwsh | detecção, mensagem clara e a ponte como alternativa |
