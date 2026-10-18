@@ -109,9 +109,26 @@ fn fresh_backup_file(backups: &Path, ts: &str, o: &Orphan) -> Result<PathBuf, St
     Err(format!("nomes de backup esgotados em {}", dir.display()))
 }
 
-/// The export is a UTF-16LE `.reg` (BOM, version 5 header on the first line) that names
-/// `...\Uninstall\<key>` itself (case-insensitive).
+/// The export is a UTF-16LE `.reg` (BOM, version 5 header on the first line) whose key line is
+/// exactly `[<HKLM|HKCU root>\...\Uninstall\<key>]` (case-insensitive), under either root.
 pub fn check_export(file: &Path, key: &str) -> Result<(), String> {
+    check_export_roots(file, key, &[MACHINE_ROOT, USER_ROOT])
+}
+
+/// `check_export` for the root of `hive` only (the view never shows in the file: `reg export
+/// /reg:32` writes the path without `WOW6432Node`).
+pub fn check_export_in(file: &Path, hive: Hive, key: &str) -> Result<(), String> {
+    let root = match hive {
+        Hive::MachineX64 | Hive::MachineX86 => MACHINE_ROOT,
+        Hive::User => USER_ROOT,
+    };
+    check_export_roots(file, key, &[root])
+}
+
+const MACHINE_ROOT: &str = "HKEY_LOCAL_MACHINE";
+const USER_ROOT: &str = "HKEY_CURRENT_USER";
+
+fn check_export_roots(file: &Path, key: &str, roots: &[&str]) -> Result<(), String> {
     let f = std::fs::File::open(file)
         .map_err(|e| format!("backup ausente ({}): {e}", file.display()))?;
     let mut bytes = Vec::new();
@@ -139,11 +156,11 @@ pub fn check_export(file: &Path, key: &str) -> Result<(), String> {
     if lines.next() != Some(REG_HEADER) {
         return Err("backup sem o cabeçalho do Editor do Registro".to_string());
     }
-    let want = format!(r"\uninstall\{}]", key.to_lowercase());
-    let named = lines.any(|l| {
-        let l = l.trim().to_lowercase();
-        l.starts_with("[hkey_") && l.ends_with(&want)
-    });
+    let wanted: Vec<String> = roots
+        .iter()
+        .map(|r| format!(r"[{r}\{UNINSTALL}\{key}]").to_lowercase())
+        .collect();
+    let named = lines.any(|l| wanted.contains(&l.trim().to_lowercase()));
     if named {
         Ok(())
     } else {
@@ -186,7 +203,7 @@ pub fn remove_orphan(
     let file = fresh_backup_file(backups, ts, o)?;
     reg.export(&export_args(o.hive, &o.key, &file))
         .map_err(|e| format!("falha ao exportar {}: {e}", o.key))?;
-    check_export(&file, &o.key)?;
+    check_export_in(&file, o.hive, &o.key)?;
     match machine_hive(o.hive) {
         None => reg
             .delete_user_key(&o.key)

@@ -8,7 +8,8 @@ use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
 use wingetrs::bridge::worker::{DeleteReason, InstallerRequest, MachineHive};
 use wingetrs::installed::{Hive, InstallSource, InstalledApp};
 use wingetrs::winget_install::orphans::{
-    ArpRegistry, Orphan, backup_file, check_export, export_args, orphans, remove_orphan,
+    ArpRegistry, Orphan, backup_file, check_export, check_export_in, export_args, orphans,
+    remove_orphan,
 };
 
 const HEADER: &str = "Windows Registry Editor Version 5.00";
@@ -279,6 +280,75 @@ fn existing_backup_is_never_reused() {
     assert_ne!(got, old);
     assert_eq!(got.parent(), old.parent());
     assert_eq!(*reg.deletes.lock().unwrap(), vec!["App".to_string()]);
+}
+
+#[test]
+fn export_root_must_match_hive() {
+    let dir = tempfile::tempdir().unwrap();
+    // Root swapped: an HKCU orphan whose export names the HKLM key, and the reverse.
+    for (hive, root) in [
+        (Hive::User, "HKEY_LOCAL_MACHINE"),
+        (Hive::MachineX64, "HKEY_CURRENT_USER"),
+        (Hive::MachineX86, "HKEY_CURRENT_USER"),
+    ] {
+        let reg = FakeReg::new(Some(utf16le(&reg_text(root, "App"))));
+        let el = FakeElevated::default();
+        let r = remove_orphan(&reg, &el, dir.path(), "ts10", &orphan(hive, "App"));
+        assert!(r.is_err(), "{hive:?} {root}: {r:?}");
+        assert_nothing_deleted(&reg, &el);
+    }
+    let f = dir.path().join("root.reg");
+    std::fs::write(&f, utf16le(&reg_text("HKEY_LOCAL_MACHINE", "App"))).unwrap();
+    assert_eq!(check_export_in(&f, Hive::MachineX86, "App"), Ok(()));
+    assert_eq!(check_export_in(&f, Hive::MachineX64, "App"), Ok(()));
+    assert!(check_export_in(&f, Hive::User, "App").is_err());
+    // A nested `...\Uninstall\X\Uninstall\App` is not the key.
+    std::fs::write(
+        &f,
+        utf16le(&reg_text("HKEY_LOCAL_MACHINE", r"X\Uninstall\App")),
+    )
+    .unwrap();
+    assert!(check_export(&f, "App").is_err());
+    assert!(check_export_in(&f, Hive::MachineX64, "App").is_err());
+    // Same root in other case: accepted.
+    std::fs::write(&f, utf16le(&reg_text("hkey_local_machine", "app"))).unwrap();
+    assert_eq!(check_export_in(&f, Hive::MachineX64, "App"), Ok(()));
+}
+
+#[test]
+fn oversized_export_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("big.reg");
+    // A valid export padded to 8 MiB + 1 byte: refused only for its size.
+    let mut bytes = utf16le(&reg_text("HKEY_CURRENT_USER", "App"));
+    let ok = bytes.clone();
+    bytes.resize(8 * 1024 * 1024 + 1, 0);
+    std::fs::write(&f, &bytes).unwrap();
+    assert_eq!(
+        check_export(&f, "App"),
+        Err("backup grande demais".to_string())
+    );
+    let mut at_cap = ok;
+    at_cap.resize(8 * 1024 * 1024, 0);
+    std::fs::write(&f, &at_cap).unwrap();
+    assert_eq!(check_export(&f, "App"), Ok(()));
+}
+
+#[test]
+fn truncated_utf16_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("odd.reg");
+    // A valid export plus one stray byte: refused only for the odd length.
+    let mut bytes = utf16le(&reg_text("HKEY_CURRENT_USER", "App"));
+    bytes.push(0);
+    std::fs::write(&f, &bytes).unwrap();
+    assert_eq!(
+        check_export(&f, "App"),
+        Err("backup UTF-16 truncado".to_string())
+    );
+    bytes.push(0);
+    std::fs::write(&f, &bytes).unwrap();
+    assert_eq!(check_export(&f, "App"), Ok(()));
 }
 
 #[test]
