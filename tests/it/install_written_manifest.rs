@@ -220,6 +220,8 @@ async fn setup() -> World {
             root: PathBuf::new(),
             manifest_sha256: String::new(),
             third_party_uninstaller: false,
+            has_uninstall_scripts: false,
+            notes: Vec::new(),
             steps: Vec::new(),
         },
         v1_manifest: String::new(),

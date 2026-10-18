@@ -451,7 +451,7 @@ async fn uninstall_uses_written_manifest_not_catalog() {
 }
 
 #[tokio::test]
-async fn uninstall_manifest_sha_mismatch_refuses() {
+async fn uninstall_manifest_sha_mismatch_removes_without_scripts() {
     let w = setup().await;
     let written = w.manifest("1.0", uninstall_hooks());
     w.install(&written).await;
@@ -461,14 +461,18 @@ async fn uninstall_manifest_sha_mismatch_refuses() {
     )
     .unwrap();
     let host = host_with_events(&w);
-    let e = w
-        .uninstall(Some(&host), Some(fake_uninstaller))
-        .unwrap_err();
-    assert!(e.to_string().contains("alterado"), "{e}");
+    let notes = w.uninstall(Some(&host), Some(fake_uninstaller)).unwrap();
     assert!(host.seen().is_empty(), "no hook ran");
     assert!(w.events().is_empty(), "no uninstaller ran");
-    assert!(w.intact(), "nothing was removed");
-    assert!(w.layout.shims().join("tool.shim").exists());
+    assert!(!w.layout.app_dir("app").exists(), "the app was removed");
+    assert!(w.state.get("app").unwrap().is_none());
+    assert!(!w.layout.shims().join("tool.shim").exists());
+    assert_eq!(
+        notes,
+        [
+            "o desinstalador do app não rodou: manifesto gravado foi alterado; o que ele instalou fora da pasta pode ter ficado"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -609,7 +613,7 @@ async fn upgrade_failure_after_old_hooks_mentions_warning() {
     assert!(message.contains("pre_install"), "{message}");
     assert!(
         message.ends_with(
-            "; os scripts de desinstalação da versão antiga já rodaram e não foram desfeitos"
+            "; os scripts de desinstalação da versão antiga já rodaram e não foram desfeitos; uma remoção posterior vai rodar o desinstalador antigo de novo"
         ),
         "{message}"
     );
@@ -663,6 +667,7 @@ async fn upgrade_with_altered_old_manifest_fails_before_any_step() {
     let mut ctx = w.ctx(Some(scripts), Some(fake_uninstaller));
     let e = execute_install(&plan, &mut ctx).await.unwrap_err();
     assert!(e.to_string().contains("não confere"), "{e}");
+    assert!(e.to_string().contains("remova e instale de novo"), "{e}");
     assert!(host.seen().is_empty());
     assert!(!w.layout.version_dir("app", "2.0").exists());
 }
@@ -673,8 +678,11 @@ async fn pre_2c_install_without_manifest_json_uninstalls_without_scripts() {
     w.install(&w.manifest("1.0", uninstall_hooks())).await;
     // Installed before Phase 2c: no `manifest.json` in the version folder.
     std::fs::remove_file(w.written_manifest("1.0")).unwrap();
-    // An update plans no old steps either.
+    // An update plans no old steps either, and says the old uninstaller will not run.
     let plan = w.plan(&w.manifest("2.0", serde_json::json!({})));
+    assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+    assert!(plan.notes[0].contains("não vão rodar"), "{:?}", plan.notes);
+    assert!(plan.to_string().contains("Aviso: "));
     assert!(!plan.steps.iter().any(|s| matches!(
         s,
         Step::UpgradeUninstallHook { .. } | Step::UpgradeRunUninstaller { .. }
@@ -831,4 +839,60 @@ async fn upgrade_old_hook_effects_only_for_own_artifacts() {
     assert_eq!(w.env.get("OTHER_VAR").unwrap(), None);
     assert!(!w.layout.shims().join("evil.shim").exists());
     assert_eq!(w.state.get("app").unwrap().unwrap().0.version, "2.0");
+}
+
+#[tokio::test]
+async fn install_with_only_post_uninstall_needs_script_consent() {
+    let w = setup().await;
+    let plan = w.plan(&w.manifest("1.0", serde_json::json!({"post_uninstall": "info 'post'"})));
+    assert!(plan.has_uninstall_scripts);
+    let mut ctx = w.ctx(None, Some(fake_uninstaller));
+    let e = execute_install(&plan, &mut ctx).await.unwrap_err();
+    assert!(matches!(e, ExecError::NeedsScriptConsent { .. }), "{e:?}");
+    assert!(!w.layout.app_dir("app").exists(), "refused before any step");
+}
+
+/// The PATH as the hook after `pre_uninstall` found it, when `pre_uninstall` asked to remove
+/// the app's own entry and a foreign one, in a removal or in an update.
+async fn path_after_remove_path_effect(upgrade: bool) -> (String, String) {
+    let w = setup().await;
+    w.install(&w.manifest("1.0", uninstall_hooks())).await;
+    let current = w.layout.current("app").display().to_string();
+    let effects = format!(
+        "{}\n{}\n",
+        serde_json::json!({"op": "remove_path", "var": "Path", "entries": [current]}),
+        serde_json::json!({"op": "remove_path", "var": "Path", "entries": [ORIGINAL_PATH]}),
+    );
+    let host = Arc::new(FakeHost {
+        effects: vec![(HookKind::PreUninstall, effects)],
+        probe_env: Some((w.env.clone(), vec!["Path".into()])),
+        ..FakeHost::default()
+    });
+    if upgrade {
+        w.upgrade(&w.manifest("2.0", serde_json::json!({})), &host)
+            .await
+            .unwrap();
+    } else {
+        w.uninstall(Some(&host), Some(fake_uninstaller)).unwrap();
+    }
+    let path = host.seen_of(HookKind::UninstallerScript).env[0]
+        .1
+        .clone()
+        .unwrap();
+    // The temp root differs between worlds.
+    let root = w.layout.root().display().to_string();
+    (
+        path.replace(&root, "<root>"),
+        current.replace(&root, "<root>"),
+    )
+}
+
+#[tokio::test]
+async fn own_path_entry_rule_is_the_same_in_removal_and_update() {
+    let (removal, current) = path_after_remove_path_effect(false).await;
+    let (update, _) = path_after_remove_path_effect(true).await;
+    // Same entries (the shims folder differs by the temp root only through `current`).
+    assert_eq!(removal, update);
+    assert!(!removal.contains(&current), "{removal}");
+    assert!(removal.contains(ORIGINAL_PATH), "{removal}");
 }

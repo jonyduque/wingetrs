@@ -136,6 +136,11 @@ pub struct InstallPlan {
     /// The manifest has an `uninstaller` that will run third-party code at removal time:
     /// installing it needs the same consent as running an installer (Task 151).
     pub third_party_uninstaller: bool,
+    /// The manifest has uninstall scripts (`pre_uninstall`, `post_uninstall`, `uninstaller.script`,
+    /// a `.ps1` uninstaller): installing it needs the script consent too (Task 159).
+    pub has_uninstall_scripts: bool,
+    /// Warnings for the user, shown with the plan (e.g. the old uninstaller will not run).
+    pub notes: Vec<String>,
     pub steps: Vec<Step>,
 }
 
@@ -454,6 +459,9 @@ impl fmt::Display for InstallPlan {
         let layout = Layout::new(self.root.clone());
         for (i, step) in self.steps.iter().enumerate() {
             writeln!(f, "{:>3}. {}", i + 1, self.step_line(step, &layout))?;
+        }
+        for note in &self.notes {
+            writeln!(f, "Aviso: {note}")?;
         }
         Ok(())
     }

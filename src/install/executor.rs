@@ -606,8 +606,7 @@ fn check_order(steps: &[Step]) -> Result<(), String> {
 }
 
 /// Appended to the failure of an update whose OLD version's uninstall scripts already ran.
-const OLD_HOOKS_RAN: &str =
-    "; os scripts de desinstalação da versão antiga já rodaram e não foram desfeitos";
+const OLD_HOOKS_RAN: &str = "; os scripts de desinstalação da versão antiga já rodaram e não foram desfeitos; uma remoção posterior vai rodar o desinstalador antigo de novo";
 
 /// Applies `plan`; on failure everything done so far is undone in reverse order.
 ///
@@ -649,13 +648,14 @@ pub async fn execute_install_with(
             what: "o instalador do manifesto".into(),
         });
     }
-    let has_hooks = plan.steps.iter().any(|s| match s {
-        Step::Hook { .. } | Step::RunPs1Installer { .. } | Step::UpgradeUninstallHook { .. } => {
-            true
-        }
-        Step::UpgradeRunUninstaller { file, .. } => file.to_lowercase().ends_with(".ps1"),
-        _ => false,
-    });
+    let has_hooks = plan.has_uninstall_scripts
+        || plan.steps.iter().any(|s| match s {
+            Step::Hook { .. }
+            | Step::RunPs1Installer { .. }
+            | Step::UpgradeUninstallHook { .. } => true,
+            Step::UpgradeRunUninstaller { file, .. } => file.to_lowercase().ends_with(".ps1"),
+            _ => false,
+        });
     if has_hooks && ctx.runners.scripts.is_none() {
         return Err(ExecError::NeedsScriptConsent {
             app: plan.app.clone(),
@@ -690,7 +690,9 @@ pub async fn execute_install_with(
                         "o manifesto da versão antiga não existe ou o registro mudou".into(),
                     ));
                 }
-                Err(e) => return Err(fail_early(e.to_string())),
+                Err(e) => {
+                    return Err(fail_early(format!("{e}; remova e instale de novo")));
+                }
             }
         }
         _ => None,
@@ -2007,13 +2009,15 @@ fn path_patterns(entries: &[String]) -> Result<Vec<&str>, String> {
 
 /// A PATH entry this app recorded, in this run or in its previous record.
 fn own_path_entry(run: &Run<'_>, entry: &str) -> bool {
+    let previous = run.previous.iter().flat_map(|(_, arts)| arts.iter());
+    recorded_path(run.artifacts.iter().chain(previous), entry)
+}
+
+/// `entry` is a PATH entry among `artifacts` (the one rule of "this entry is this app's", for
+/// the install-time and the removal-time effects).
+fn recorded_path<'a>(mut artifacts: impl Iterator<Item = &'a Artifact>, entry: &str) -> bool {
     let want = path_edit::norm(entry);
-    let same = |a: &Artifact| a.kind == ArtifactKind::Path && path_edit::norm(&a.target) == want;
-    run.artifacts.iter().any(same)
-        || run
-            .previous
-            .as_ref()
-            .is_some_and(|(_, arts)| arts.iter().any(same))
+    artifacts.any(|a| a.kind == ArtifactKind::Path && path_edit::norm(&a.target) == want)
 }
 
 /// A shim this app recorded, in this run or in its previous record.
@@ -3377,7 +3381,7 @@ struct InstalledManifest {
 }
 
 /// Host architecture recorded at install time (`None` = unknown key).
-fn arch_of_key(key: &str) -> Option<Arch> {
+pub fn arch_of_key(key: &str) -> Option<Arch> {
     [Arch::X64, Arch::X86, Arch::Arm64]
         .into_iter()
         .find(|a| a.key() == key)
@@ -3418,12 +3422,13 @@ fn load_installed(
         Ok(None) => {
             return skipped("o manifesto instalado não existe ou não tem hash no registro".into());
         }
+        Err(state::StateError::ManifestMismatch(_)) => {
+            return skipped("manifesto gravado foi alterado".into());
+        }
         Err(e) => {
             return Err(fail(
                 "ler manifesto instalado",
-                format!(
-                    "o manifesto instalado foi alterado ou está ilegível ({e}); nada foi removido"
-                ),
+                format!("o manifesto instalado está ilegível ({e}); nada foi removido"),
             ));
         }
     };
@@ -3594,11 +3599,7 @@ fn apply_removal_effect(
                 if seg.is_empty() || !patterns.iter().any(|p| like(seg, p)) {
                     continue;
                 }
-                let want = path_edit::norm(seg);
-                let recorded = artifacts
-                    .iter()
-                    .any(|a| a.kind == ArtifactKind::Path && path_edit::norm(&a.target) == want);
-                if !is_inside(seg, layout.root()) || !recorded {
+                if !is_inside(seg, layout.root()) || !recorded_path(artifacts.iter(), seg) {
                     tracing::warn!("{app}: Remove-Path de {seg} ignorado (não é deste app)");
                     continue;
                 }

@@ -104,7 +104,7 @@ fn env_and_depends() {
 }
 
 #[test]
-fn unsupported_manifests_say_why() {
+fn hook_fixtures_resolve_and_a_missing_hash_is_refused() {
     // Every hook runs through the script host since Task 159 (uninstall hooks included).
     assert_eq!(refusal(&fx("refused-script__main__7zip.json")), None);
     // `innosetup` (Task 147) and `pre_install` (Task 156) are both planned now.

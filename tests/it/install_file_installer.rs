@@ -544,28 +544,18 @@ async fn skipped_uninstaller_note_when_manifest_is_gone() {
 }
 
 #[tokio::test]
-async fn altered_manifest_refuses_the_removal_before_anything() {
-    // Task 159: an altered written manifest fails the removal; nothing runs, nothing goes.
-    let s = setup().await;
-    let m = s
-        .manifest(serde_json::json!({"uninstaller": {"file": "unins.exe"}}))
-        .await;
-    let plan = s.plan(&m);
-    let mut ctx = s.ctx(Some(fake_zero));
-    execute_install(&plan, &mut ctx).await.unwrap();
-    drop(ctx);
-    let path = s.layout.version_dir("app", "1.0").join("manifest.json");
-    std::fs::write(&path, m.replace("unins.exe", "evil.exe")).unwrap();
-    let up = UninstallPlan::from_state(&s.state, "app", false)
-        .unwrap()
-        .unwrap();
-    let before = MARKER.load(Ordering::SeqCst);
-    let mut ctx = s.ctx(Some(fake_marker));
-    let e = execute_uninstall(&up, &mut ctx).unwrap_err();
-    assert!(e.to_string().contains("alterado"), "{e}");
-    assert_eq!(MARKER.load(Ordering::SeqCst), before, "no uninstaller ran");
-    assert!(s.layout.app_dir("app").exists(), "nothing was removed");
-    assert!(s.state.get("app").unwrap().is_some());
+async fn skipped_uninstaller_note_when_manifest_was_altered() {
+    let notes = removal_notes(
+        |_| {},
+        |p, m| std::fs::write(p, m.replace("unins.exe", "evil.exe")).unwrap(),
+    )
+    .await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains(SKIPPED) && notes[0].contains("manifesto gravado foi alterado"),
+        "{notes:?}"
+    );
+    assert!(notes[0].ends_with(LEFT_BEHIND), "{notes:?}");
 }
 
 #[tokio::test]

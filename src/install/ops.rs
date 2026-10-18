@@ -599,17 +599,28 @@ pub fn plan_for(
 
 /// The manifest written when `rec` was installed (never the catalog's), resolved for the
 /// architecture it was installed with. `None` for an app installed before Phase 2c or whose
-/// written manifest no longer resolves; an altered one (SHA-256 differs) is an error.
+/// written manifest no longer resolves; an altered one (SHA-256 differs) stops the update.
 fn old_manifest(
     layout: &Layout,
     app: &str,
     rec: &AppRecord,
 ) -> Result<Option<manifest::Resolved>, OpsError> {
-    let Some(raw) = state::installed_manifest(layout, app, &rec.version, &rec.manifest_sha256)?
-    else {
-        return Ok(None);
+    let raw = match state::installed_manifest(layout, app, &rec.version, &rec.manifest_sha256) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(None),
+        Err(StateError::ManifestMismatch(_)) => {
+            return Err(OpsError::Unsupported(format!(
+                "{app}: o manifesto gravado foi alterado; remova e instale de novo"
+            )));
+        }
+        Err(e) => return Err(e.into()),
     };
-    match manifest::resolve(&raw, Arch::host()) {
+    let arch = rec
+        .arch
+        .as_deref()
+        .and_then(executor::arch_of_key)
+        .unwrap_or_else(Arch::host);
+    match manifest::resolve(&raw, arch) {
         Ok(m) => Ok(Some(m)),
         Err(e) => {
             tracing::warn!(
@@ -849,9 +860,17 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
     refuse_if_needed(ctx, &state, &plan.app)?;
     if let Some((rec, _)) = state.get(&plan.app)? {
         let layout = layout(ctx);
-        let raw =
-            state::installed_manifest(&layout, &plan.app, &rec.version, &rec.manifest_sha256)?;
-        if let Some(m) = raw.and_then(|raw| manifest::resolve(&raw, Arch::host()).ok()) {
+        // An altered written manifest does not stop the removal: no script runs (the executor
+        // says so in a note), so there is nothing to scan.
+        let raw = state::installed_manifest(&layout, &plan.app, &rec.version, &rec.manifest_sha256)
+            .ok()
+            .flatten();
+        let arch = rec
+            .arch
+            .as_deref()
+            .and_then(executor::arch_of_key)
+            .unwrap_or_else(Arch::host);
+        if let Some(m) = raw.and_then(|raw| manifest::resolve(&raw, arch).ok()) {
             planner::check_uninstall_scripts(&m)?;
         }
     }

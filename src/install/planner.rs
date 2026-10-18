@@ -349,6 +349,15 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         Some(i) => Some(i.version.clone()),
         None => None,
     };
+    let mut notes = Vec::new();
+    if let Some(i) = &input.installed
+        && i.old_manifest.is_none()
+    {
+        notes.push(format!(
+            "o desinstalador e os scripts de desinstalação da versão {} não vão rodar: o manifesto gravado não existe ou não pôde ser verificado",
+            i.version
+        ));
+    }
     let sub = |s: &str| substitute(s, app, version, m.arch, layout);
     let current = layout.current(app);
 
@@ -488,6 +497,8 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         root: layout.root().to_path_buf(),
         manifest_sha256: input.manifest_sha256.to_string(),
         third_party_uninstaller: m.uninstaller.is_some(),
+        has_uninstall_scripts: has_uninstall_scripts(m),
+        notes,
         steps,
     })
 }

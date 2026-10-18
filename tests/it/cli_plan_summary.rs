@@ -49,6 +49,8 @@ fn plan(steps: Vec<Step>) -> InstallPlan {
         root: PathBuf::from(r"C:\R"),
         manifest_sha256: "00".into(),
         third_party_uninstaller: false,
+        has_uninstall_scripts: false,
+        notes: Vec::new(),
         steps,
     }
 }
