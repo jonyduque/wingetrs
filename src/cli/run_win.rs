@@ -1,6 +1,6 @@
 //! Runs the operation commands against the production context.
 use super::Command;
-use super::install_cmd::{self, InstallerGate, Interrupts, TtyUi};
+use super::install_cmd::{self, Interrupts, TtyUi};
 use crate::cache::DataDir;
 use crate::catalog::Catalog;
 use crate::config::Config;
@@ -18,14 +18,10 @@ pub async fn run(
     let prod = ProdEffects::new().map_err(|e| anyhow::anyhow!("{e}"))?;
     let ui = TtyUi::new(cfg);
     let line = ui.progress();
-    let gate = InstallerGate::default();
-    let progress = |ev: &crate::install::progress::ProgressEvent| {
-        gate.observe(ev);
-        line.update(ev)
-    };
+    let progress = |ev: &crate::install::progress::ProgressEvent| line.update(ev);
     let ctx = build_ctx(&prod, data, http, catalog, LockWait::from_env(), &progress);
     let mut ctrl_c = ConsoleCtrlC::default();
-    let result = install_cmd::execute(&ctx, &ui, cmd, &mut ctrl_c, &gate).await;
+    let result = install_cmd::execute(&ctx, &ui, cmd, &mut ctrl_c).await;
     line.finish();
     result
 }

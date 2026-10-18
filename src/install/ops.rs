@@ -124,6 +124,8 @@ pub struct OpsCtx<'a> {
     /// Launcher of the `msiexec /a` fallback; used only for apps the caller authorized
     /// ([`AllowMsiexec`]).
     pub msiexec: Msiexec,
+    /// Shared with every executor of this context: the CLI cancels through it.
+    pub launch: executor::LaunchGate,
 }
 
 /// Which apps of an `apply` may fall back to `msiexec /a` (CLI `--allow-msiexec`: all; TUI:
@@ -280,6 +282,7 @@ fn exec_ctx<'a>(
         progress: ctx.progress,
         in_use: ctx.in_use,
         msiexec,
+        launch: ctx.launch.clone(),
     }
 }
 

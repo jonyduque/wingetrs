@@ -174,6 +174,7 @@ impl World {
             progress: &no_progress,
             in_use: &nothing_in_use,
             msiexec: None,
+            launch: Default::default(),
         }
     }
 

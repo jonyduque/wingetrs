@@ -10,9 +10,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use wingetrs::cache::DataDir;
-use wingetrs::cli::install_cmd::{InstallerGate, Interrupts, until_interrupted};
+use wingetrs::cli::install_cmd::{Cancelled, Interrupts, exit_code, until_interrupted};
 use wingetrs::http::Http;
-use wingetrs::install::executor::{ExecCtx, Msiexec, NoHook};
+use wingetrs::install::executor::{ExecCtx, LaunchGate, Msiexec, NoHook};
 use wingetrs::install::layout::Layout;
 use wingetrs::install::manifest::{Arch, resolve};
 use wingetrs::install::msi_queue::Attempt;
@@ -131,11 +131,15 @@ impl World {
     }
 
     fn plan(&self, manifest: &str) -> InstallPlan {
+        self.plan_of("app", manifest)
+    }
+
+    fn plan_of(&self, app: &str, manifest: &str) -> InstallPlan {
         use wingetrs::install::traits::Shortcuts;
         let m = resolve(manifest, Arch::X64).unwrap();
         let root = self.shortcuts.root();
         plan_install(&PlanInput {
-            app: "app",
+            app,
             bucket: "main",
             manifest: &m,
             layout: &self.layout,
@@ -168,6 +172,7 @@ impl World {
             progress,
             in_use: &nothing_in_use,
             msiexec: None,
+            launch: Default::default(),
         }
     }
 
@@ -210,11 +215,10 @@ async fn cancel_before_installer_rolls_back() {
         .serve("pkg-1.0.zip", fixture_zip(), Some(Duration::from_secs(600)))
         .await;
     let plan = w.plan(&manifest(&url, &sha, Some("pkg")));
-    let gate = InstallerGate::default();
     let refused = AtomicBool::new(false);
     let mut state = StateDb::open(&w.state_path).unwrap();
-    let progress = |ev: &ProgressEvent| gate.observe(ev);
-    let mut ctx = w.ctx(&mut state, &progress);
+    let mut ctx = w.ctx(&mut state, &no_progress);
+    let gate = ctx.launch.clone();
     let mut ctrl_c = WhenRequested {
         server: &w.server,
         fired: false,
@@ -229,16 +233,17 @@ async fn cancel_before_installer_rolls_back() {
     assert!(r.is_none(), "esperava cancelado: {r:?}");
     assert!(ctrl_c.fired);
     assert!(!refused.load(Ordering::SeqCst));
+    assert!(gate.cancelled());
     assert!(!w.layout.staging_dir("app", "1.0").exists());
     assert!(!w.layout.version_dir("app", "1.0").exists());
     assert!(!w.layout.app_dir("app").exists());
     assert_eq!(w.apps(), 0);
 }
 
-static EXTRACTING: AtomicBool = AtomicBool::new(false);
-
-/// Real extraction into the staging folder, then a pause: the cancel arrives meanwhile.
-fn slow_extract(
+/// Real extraction into the staging folder, then raises `flag` and pauses: the cancel
+/// arrives meanwhile.
+fn extract_then_pause(
+    flag: &AtomicBool,
     file: &Path,
     name: &str,
     dir: Option<&str>,
@@ -247,23 +252,35 @@ fn slow_extract(
 ) -> Result<(), wingetrs::install::extract::ExtractError> {
     let r = wingetrs::install::extract::extract(file, name, dir, to, dest);
     assert!(dest.join("tool.exe").exists(), "{}", dest.display());
-    EXTRACTING.store(true, Ordering::SeqCst);
+    flag.store(true, Ordering::SeqCst);
     std::thread::sleep(Duration::from_millis(300));
     r
 }
 
-/// The "Ctrl+C" of the extraction test: pressed once the extraction filled the staging folder.
-struct WhenExtracting(bool);
+static EXTRACTING: AtomicBool = AtomicBool::new(false);
 
-impl Interrupts for WhenExtracting {
+fn slow_extract(
+    file: &Path,
+    name: &str,
+    dir: Option<&str>,
+    to: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    extract_then_pause(&EXTRACTING, file, name, dir, to, dest)
+}
+
+/// The "Ctrl+C" pressed once `flag` is up.
+struct When(&'static AtomicBool, bool);
+
+impl Interrupts for When {
     async fn next(&mut self) {
-        if self.0 {
+        if self.1 {
             return std::future::pending().await;
         }
-        while !EXTRACTING.load(Ordering::SeqCst) {
+        while !self.0.load(Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        self.0 = true;
+        self.1 = true;
     }
 }
 
@@ -272,11 +289,10 @@ async fn cancel_during_extraction_waits_for_the_worker_then_removes_staging() {
     let w = World::new().await;
     let (url, sha) = w.serve("pkg-1.0.zip", fixture_zip(), None).await;
     let plan = w.plan(&manifest(&url, &sha, Some("pkg")));
-    let gate = InstallerGate::default();
     let mut state = StateDb::open(&w.state_path).unwrap();
-    let progress = |ev: &ProgressEvent| gate.observe(ev);
-    let mut ctx = w.ctx(&mut state, &progress);
-    let mut ctrl_c = WhenExtracting(false);
+    let mut ctx = w.ctx(&mut state, &no_progress);
+    let gate = ctx.launch.clone();
+    let mut ctrl_c = When(&EXTRACTING, false);
     let r = until_interrupted(
         wingetrs::install::executor::execute_install_with(&plan, &mut ctx, slow_extract),
         &mut ctrl_c,
@@ -285,7 +301,7 @@ async fn cancel_during_extraction_waits_for_the_worker_then_removes_staging() {
     )
     .await;
     assert!(r.is_none(), "esperava cancelado: {r:?}");
-    assert!(ctrl_c.0);
+    assert!(ctrl_c.1);
     // The worker had written the staging folder; the cancel waited for it and removed it.
     assert!(!w.layout.staging_dir("app", "1.0").exists());
     assert!(!w.layout.version_dir("app", "1.0").exists());
@@ -318,6 +334,10 @@ fn release_msiexec() {
     cvar.notify_all();
 }
 
+fn msiexec_started() -> bool {
+    MSIEXEC.0.lock().unwrap().0
+}
+
 /// Says it started, then waits to be released (a hang detector of 10 s ends it with a failure
 /// code instead) and leaves the administrative tree.
 fn waiting_admin(_msi: &Path, target: &Path, _log: &Path) -> std::io::Result<Attempt> {
@@ -340,49 +360,134 @@ fn waiting_admin(_msi: &Path, target: &Path, _log: &Path) -> std::io::Result<Att
     Ok(Attempt::Done)
 }
 
+/// Ctrl+C pressed twice once the fake `msiexec` runs; asked a third time (both presses were
+/// handled) it lets `msiexec` finish and presses no more.
+struct TwiceWhileMsiexecRuns(usize);
+
+impl Interrupts for TwiceWhileMsiexecRuns {
+    async fn next(&mut self) {
+        self.0 += 1;
+        if self.0 > 2 {
+            release_msiexec();
+            return std::future::pending().await;
+        }
+        while !msiexec_started() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_during_installer_waits() {
     let w = World::new().await;
     let (url, sha) = w.serve("pkg-1.0.msi", ole_like(), None).await;
     let plan = w.plan(&manifest(&url, &sha, None));
-    let gate = InstallerGate::default();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let refusals = std::sync::atomic::AtomicUsize::new(0);
     let mut state = StateDb::open(&w.state_path).unwrap();
-    // Ctrl+C pressed right after the Windows Installer started.
-    let progress = |ev: &ProgressEvent| {
-        gate.observe(ev);
-        if matches!(ev, ProgressEvent::Phase(Phase::Installer { .. })) {
-            tx.send(()).unwrap();
-        }
-    };
-    let mut ctx = w.ctx(&mut state, &progress);
+    let mut ctx = w.ctx(&mut state, &no_progress);
     ctx.msiexec = Some(Msiexec {
         busy: never_busy,
         launch: waiting_admin,
     });
+    let gate = ctx.launch.clone();
+    let mut ctrl_c = TwiceWhileMsiexecRuns(0);
     let r = until_interrupted(
         wingetrs::install::executor::execute_install_with(&plan, &mut ctx, unsupported),
-        &mut rx,
+        &mut ctrl_c,
         &gate,
         &|| {
             refusals.fetch_add(1, Ordering::SeqCst);
-            release_msiexec();
         },
     )
     .await;
-    assert!(MSIEXEC.0.lock().unwrap().0, "o msiexec falso nunca começou");
-    assert_eq!(refusals.load(Ordering::SeqCst), 1);
+    assert!(msiexec_started(), "o msiexec falso nunca começou");
     match r {
         Some(Ok(())) => {}
         other => panic!("esperava a instalação concluída: {other:?}"),
     }
-    assert!(gate.running());
+    // Two presses handled, one message.
+    assert_eq!(ctrl_c.0, 3);
+    assert_eq!(refusals.load(Ordering::SeqCst), 1);
+    assert!(!gate.cancelled());
     let vdir = w.layout.version_dir("app", "1.0");
     assert_eq!(std::fs::read(vdir.join("tool.txt")).unwrap(), b"ok");
     let app_dir = w.layout.app_dir("app");
     assert!(!app_dir.join(".staging-1.0.msiexec").exists());
     assert!(!w.layout.staging_dir("app", "1.0").exists());
+    assert_eq!(w.apps(), 1);
+}
+
+#[test]
+fn launch_gate_first_come_wins_in_both_orders() {
+    // Launch first: Ctrl+C refused, a 1618 relaunch still allowed.
+    let g = LaunchGate::default();
+    assert!(g.try_launch());
+    assert!(!g.try_cancel());
+    assert!(g.try_launch());
+    assert!(!g.cancelled());
+    // Cancel first: the launch is refused, the cancel stays.
+    let g = LaunchGate::default();
+    assert!(g.try_cancel());
+    assert!(!g.try_launch());
+    assert!(g.try_cancel());
+    assert!(g.cancelled());
+    // A new plan is cancellable again, and clones share the decision.
+    let g = LaunchGate::default();
+    let worker = g.clone();
+    assert!(worker.try_launch());
+    g.next_plan();
+    assert!(g.try_cancel());
+    assert!(!worker.try_launch());
+}
+
+fn quick_admin(_msi: &Path, target: &Path, _log: &Path) -> std::io::Result<Attempt> {
+    std::fs::create_dir_all(target)?;
+    std::fs::write(target.join("tool.txt"), b"ok")?;
+    Ok(Attempt::Done)
+}
+
+static EXTRACTING_NEXT: AtomicBool = AtomicBool::new(false);
+
+fn slow_extract_next(
+    file: &Path,
+    name: &str,
+    dir: Option<&str>,
+    to: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    extract_then_pause(&EXTRACTING_NEXT, file, name, dir, to, dest)
+}
+
+/// A batch (dependency, then target): `msiexec` ran in the first plan; Ctrl+C during the
+/// second plan cancels it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_cancels_the_next_plan_after_msiexec_ran() {
+    let w = World::new().await;
+    let (url, sha) = w.serve("pkg-1.0.msi", ole_like(), None).await;
+    let first = w.plan(&manifest(&url, &sha, None));
+    let (url, sha) = w.serve("other-1.0.zip", fixture_zip(), None).await;
+    let second = w.plan_of("other", &manifest(&url, &sha, Some("pkg")));
+    let mut state = StateDb::open(&w.state_path).unwrap();
+    let mut ctx = w.ctx(&mut state, &no_progress);
+    ctx.msiexec = Some(Msiexec {
+        busy: never_busy,
+        launch: quick_admin,
+    });
+    let gate = ctx.launch.clone();
+    let mut ctrl_c = When(&EXTRACTING_NEXT, false);
+    let batch = async {
+        wingetrs::install::executor::execute_install_with(&first, &mut ctx, unsupported).await?;
+        wingetrs::install::executor::execute_install_with(&second, &mut ctx, slow_extract_next)
+            .await
+    };
+    let r = until_interrupted(batch, &mut ctrl_c, &gate, &|| {
+        panic!("o msiexec do plano anterior não trava o seguinte")
+    })
+    .await;
+    assert!(r.is_none(), "esperava cancelado: {r:?}");
+    assert!(ctrl_c.1);
+    assert!(w.layout.version_dir("app", "1.0").join("tool.txt").exists());
+    assert!(!w.layout.app_dir("other").exists());
     assert_eq!(w.apps(), 1);
 }
 
@@ -415,7 +520,7 @@ async fn stale_msiexec_work_dir_is_removed() {
 async fn closed_channel_never_cancels() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     drop(tx);
-    let gate = InstallerGate::default();
+    let gate = LaunchGate::default();
     let r = until_interrupted(
         async {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -429,7 +534,21 @@ async fn closed_channel_never_cancels() {
     assert_eq!(r, Some(7));
 }
 
+/// When `always_busy` was first asked.
+static FIRST_BUSY: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// Set when the queue kept asking after the cancel (it should stop at once).
+static WAITED_ON: AtomicBool = AtomicBool::new(false);
+
+/// Always busy, but a hang detector: asked again 5 s after the first time (2.5x the 2 s
+/// poll), it records that and frees the queue instead of letting it wait 600 s. A timeout
+/// around the test could not fire: the dropped install waits inside the poll, synchronously.
 fn always_busy() -> bool {
+    let first = *FIRST_BUSY.get_or_init(std::time::Instant::now);
+    // clock-ok: hang detector, 2.5x the poll
+    if first.elapsed() >= Duration::from_secs(5) {
+        WAITED_ON.store(true, Ordering::SeqCst);
+        return false;
+    }
     true
 }
 
@@ -440,18 +559,16 @@ fn must_not_launch(_: &Path, _: &Path, _: &Path) -> std::io::Result<Attempt> {
     Ok(Attempt::Done)
 }
 
-/// Ctrl+C while queued behind another installer: the install is cancelled and `msiexec` is
-/// never launched afterwards (the dropped install does not wait for the queue to run it).
+/// Ctrl+C while queued behind another installer: the install is cancelled at once and
+/// `msiexec` is never launched afterwards.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_while_queued_never_launches_msiexec() {
     let w = World::new().await;
     let (url, sha) = w.serve("pkg-1.0.msi", ole_like(), None).await;
     let plan = w.plan(&manifest(&url, &sha, None));
-    let gate = InstallerGate::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut state = StateDb::open(&w.state_path).unwrap();
     let progress = |ev: &ProgressEvent| {
-        gate.observe(ev);
         if matches!(ev, ProgressEvent::Phase(Phase::WaitingInstaller)) {
             let _ = tx.send(());
         }
@@ -461,6 +578,7 @@ async fn cancel_while_queued_never_launches_msiexec() {
         busy: always_busy,
         launch: must_not_launch,
     });
+    let gate = ctx.launch.clone();
     let r = until_interrupted(
         wingetrs::install::executor::execute_install_with(&plan, &mut ctx, unsupported),
         &mut rx,
@@ -469,11 +587,29 @@ async fn cancel_while_queued_never_launches_msiexec() {
     )
     .await;
     assert!(r.is_none(), "esperava cancelado: {r:?}");
+    assert!(
+        !WAITED_ON.load(Ordering::SeqCst),
+        "a fila seguiu esperando depois do Ctrl+C"
+    );
     assert!(!QUEUED_LAUNCHED.load(Ordering::SeqCst));
-    assert!(!gate.running());
+    assert!(gate.cancelled());
     let app_dir = w.layout.app_dir("app");
     assert!(!app_dir.join(".staging-1.0.msiexec").exists());
     assert!(!w.layout.staging_dir("app", "1.0").exists());
     assert!(!app_dir.exists());
     assert_eq!(w.apps(), 0);
+}
+
+#[test]
+fn exit_code_is_130_only_for_ctrl_c() {
+    assert_eq!(exit_code(&anyhow::Error::from(Cancelled)), 130);
+    assert_eq!(
+        exit_code(&anyhow::Error::from(Cancelled).context("instalar")),
+        130
+    );
+    assert_eq!(exit_code(&anyhow::anyhow!("cancelado pelo usuário")), 1);
+    assert_eq!(
+        exit_code(&anyhow::anyhow!("falhou").context("cancelado")),
+        1
+    );
 }

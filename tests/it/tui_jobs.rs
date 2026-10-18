@@ -164,6 +164,7 @@ impl World {
             in_use: &nothing_in_use,
             residue: ResidueScan::none(),
             msiexec: wingetrs::install::executor::Msiexec::DISABLED,
+            launch: Default::default(),
         }
     }
 }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -84,6 +84,53 @@ pub struct ExecCtx<'a> {
     pub in_use: InUseCheck<'a>,
     /// `Some` when this install may fall back to `msiexec /a` (authorized by the user).
     pub msiexec: Option<Msiexec>,
+    /// Who came first: the launch of `msiexec` or a cancellation (see [`LaunchGate`]).
+    pub launch: LaunchGate,
+}
+
+/// The one decision between launching `msiexec` and cancelling the install: whichever
+/// comes first wins, the other one is refused. Free at the start of each plan; once
+/// `msiexec` launched it stays launched (a 1618 relaunch included) until the next plan.
+/// Clones share the decision (the CLI keeps one, the executor and its worker others).
+#[derive(Debug, Clone, Default)]
+pub struct LaunchGate(Arc<AtomicU8>);
+
+const GATE_FREE: u8 = 0;
+const GATE_LAUNCHED: u8 = 1;
+const GATE_CANCELLED: u8 = 2;
+
+impl LaunchGate {
+    /// Taken by the worker right before each launch: `false` = the install was cancelled.
+    pub fn try_launch(&self) -> bool {
+        match self.cas(GATE_FREE, GATE_LAUNCHED) {
+            Ok(_) => true,
+            Err(now) => now == GATE_LAUNCHED,
+        }
+    }
+
+    /// Asked on Ctrl+C (and by a dropped install): `false` = `msiexec` already launched, the
+    /// install must run to its end.
+    pub fn try_cancel(&self) -> bool {
+        match self.cas(GATE_FREE, GATE_CANCELLED) {
+            Ok(_) => true,
+            Err(now) => now == GATE_CANCELLED,
+        }
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == GATE_CANCELLED
+    }
+
+    /// Each plan starts free: Ctrl+C cancels again until its own `msiexec` launches. (A
+    /// cancelled install is dropped at once, so no plan of it starts afterwards.)
+    pub fn next_plan(&self) {
+        self.0.store(GATE_FREE, Ordering::SeqCst);
+    }
+
+    fn cas(&self, from: u8, to: u8) -> Result<u8, u8> {
+        self.0
+            .compare_exchange(from, to, Ordering::SeqCst, Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -460,6 +507,7 @@ pub async fn execute_install_with(
         .state
         .get(&plan.app)
         .map_err(|e| fail_early(e.to_string()))?;
+    ctx.launch.next_plan();
     let mut run = Run {
         plan,
         previous,
@@ -704,15 +752,13 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             }
             // Phases of the `msiexec /a` fallback (waiting, each launch, importing).
             let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<Phase>();
-            // Set when the install is dropped: `msiexec` must not launch any more.
-            let cancel = Arc::new(AtomicBool::new(false));
             // The largest 7z takes ~10 s: off the runtime worker, like the download hashing.
             let work = {
                 let (extract, name) = (run.extract, source.file_name.clone());
                 let (dir, to) = (source.extract_dir.clone(), source.extract_to.clone());
                 let (msiexec, layout, app) = (ctx.msiexec, layout.clone(), app.to_string());
                 let staging = staging.clone();
-                let cancel = Arc::clone(&cancel);
+                let gate = ctx.launch.clone();
                 move || -> Result<(), Refused> {
                     let e = match extract(&file, &name, dir.as_deref(), to.as_deref(), &staging) {
                         Ok(()) => return Ok(()),
@@ -739,13 +785,13 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
                         // The receiver is gone only once the install stopped waiting.
                         let _ = phase_tx.send(p);
                     };
-                    extract_with_msiexec_until(m, &layout, &app, &source, &staging, &phase, &cancel)
+                    extract_with_msiexec_until(m, &layout, &app, &source, &staging, &phase, &gate)
                         .map_err(Refused::Failed)
                 }
             };
             tracing::info!("extraindo {}", source.file_name);
             let start = Instant::now();
-            let joined = AwaitWorker::spawn(work, staging, cancel).join();
+            let joined = AwaitWorker::spawn(work, staging, ctx.launch.clone()).join();
             tokio::pin!(joined);
             let joined = loop {
                 tokio::select! {
@@ -937,12 +983,19 @@ pub fn extract_with_msiexec(
     staging: &Path,
     phase: &dyn Fn(Phase),
 ) -> Result<(), String> {
-    let never = AtomicBool::new(false);
-    extract_with_msiexec_until(m, layout, app, source, staging, phase, &never)
+    extract_with_msiexec_until(
+        m,
+        layout,
+        app,
+        source,
+        staging,
+        phase,
+        &LaunchGate::default(),
+    )
 }
 
-/// [`extract_with_msiexec`] that gives up before each launch once `cancel` is set (the
-/// install was dropped while queued); a launched `msiexec` is always awaited.
+/// [`extract_with_msiexec`] that launches only through `gate`: once the install was
+/// cancelled it stops waiting and launches nothing; a launched `msiexec` is always awaited.
 fn extract_with_msiexec_until(
     m: Msiexec,
     layout: &Layout,
@@ -950,9 +1003,8 @@ fn extract_with_msiexec_until(
     source: &extract::ExtractSource<'_>,
     staging: &Path,
     phase: &dyn Fn(Phase),
-    cancel: &AtomicBool,
+    gate: &LaunchGate,
 ) -> Result<(), String> {
-    let cancelled = || cancel.load(Ordering::SeqCst);
     let mut work = staging.as_os_str().to_owned();
     work.push(MSIEXEC_SUFFIX);
     let work = PathBuf::from(work);
@@ -992,9 +1044,10 @@ fn extract_with_msiexec_until(
     let ran = msi_queue::run_queued(
         &msi_queue::POLICY,
         // A cancelled install stops waiting at once; the launch below then refuses.
-        &mut || !cancelled() && (m.busy)(),
+        &mut || !gate.cancelled() && (m.busy)(),
         &mut || {
-            if cancelled() {
+            // Right before the launch: from here a Ctrl+C is refused, or this refuses.
+            if !gate.try_launch() {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "instalação cancelada antes de o msiexec começar",
@@ -1059,15 +1112,15 @@ struct AwaitWorker<T> {
     handle: Option<tokio::task::JoinHandle<T>>,
     done: DoneFlag,
     staging: PathBuf,
-    /// Set by the drop, before waiting: tells the worker to stop before launching anything.
-    cancel: Arc<AtomicBool>,
+    /// Cancelled by the drop, before waiting: the worker launches nothing afterwards.
+    gate: LaunchGate,
 }
 
 impl<T: Send + 'static> AwaitWorker<T> {
     fn spawn(
         work: impl FnOnce() -> T + Send + 'static,
         staging: PathBuf,
-        cancel: Arc<AtomicBool>,
+        gate: LaunchGate,
     ) -> AwaitWorker<T> {
         let done: DoneFlag = Arc::new((Mutex::new(false), Condvar::new()));
         let signal = SignalDone(Arc::clone(&done));
@@ -1079,7 +1132,7 @@ impl<T: Send + 'static> AwaitWorker<T> {
             handle: Some(handle),
             done,
             staging,
-            cancel,
+            gate,
         }
     }
 
@@ -1099,7 +1152,8 @@ impl<T> Drop for AwaitWorker<T> {
         if self.handle.take().is_none() {
             return;
         }
-        self.cancel.store(true, Ordering::SeqCst);
+        // Refused when `msiexec` already runs: then the wait below is for it to end.
+        let _ = self.gate.try_cancel();
         let wait = || {
             let (lock, cvar) = &*self.done;
             let mut done = lock.lock().unwrap_or_else(|p| p.into_inner());

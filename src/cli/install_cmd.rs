@@ -1,8 +1,9 @@
 //! `install`, `uninstall`, `upgrade` and `repair`: plan, show, confirm, execute.
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
 use super::{Command, output, style};
+use crate::install::executor::LaunchGate;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
-use crate::install::progress::{Phase, ProgressEvent};
+use crate::install::progress::ProgressEvent;
 use crate::install::residue::{self, Confidence, Residue};
 use crate::install::target::Candidate;
 use crate::job_log::{JobInfo, JobLog, Outcome};
@@ -45,6 +46,12 @@ pub const UNCANCELLABLE: &str = "o Windows Installer não pode ser cancelado; es
 #[error("cancelado pelo usuário")]
 pub struct Cancelled;
 
+/// Exit code of a failed command: 130 when the user cancelled with Ctrl+C (even under a
+/// `.context()`), 1 otherwise.
+pub fn exit_code(e: &anyhow::Error) -> u8 {
+    if e.is::<Cancelled>() { 130 } else { 1 }
+}
+
 /// Requests to stop the running operation: Ctrl+C in production, a channel in tests.
 pub trait Interrupts {
     /// From now until [`Interrupts::release`], a request no longer ends the process: it
@@ -64,55 +71,36 @@ impl Interrupts for tokio::sync::mpsc::UnboundedReceiver<()> {
     }
 }
 
-/// Whether the Windows Installer started in this operation: from then on it cannot be
-/// cancelled. Fed with every progress event.
-#[derive(Debug, Default)]
-pub struct InstallerGate(AtomicBool);
-
-impl InstallerGate {
-    pub fn observe(&self, ev: &ProgressEvent) {
-        if let ProgressEvent::Phase(Phase::Installer { .. }) = ev {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    pub fn running(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-/// Runs `op` listening for interrupts. A request before the Windows Installer started drops
-/// `op` (the executor waits for its worker and removes the staging folder) and gives `None`;
-/// once it started, `refused` runs (once) and `op` goes on to its normal end. Interrupts are
-/// held until `op` is done or dropped, so a second Ctrl+C never cuts the cleanup short.
+/// Runs `op` listening for interrupts. A request that wins `gate` (no `msiexec` launched in
+/// the current plan) drops `op` (the executor waits for its worker and removes the staging
+/// folder) and gives `None`; once `msiexec` launched, `refused` runs (once) and `op` goes on
+/// to its normal end. Interrupts are held from here on and **not** released: the caller
+/// releases them once the job log is written, so a second Ctrl+C never cuts that short.
 pub async fn until_interrupted<T>(
     op: impl std::future::Future<Output = T>,
     interrupts: &mut impl Interrupts,
-    gate: &InstallerGate,
+    gate: &LaunchGate,
     refused: &dyn Fn(),
 ) -> Option<T> {
     interrupts.hold();
-    let out = {
-        tokio::pin!(op);
-        let mut told = false;
-        loop {
-            tokio::select! {
-                biased;
-                out = &mut op => break Some(out),
-                () = interrupts.next() => {
-                    if !gate.running() {
-                        break None;
-                    }
-                    if !told {
-                        told = true;
-                        refused();
-                    }
+    tokio::pin!(op);
+    let mut told = false;
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut op => return Some(out),
+            () = interrupts.next() => {
+                // Returning drops `op`, here, while interrupts are still held.
+                if gate.try_cancel() {
+                    return None;
+                }
+                if !told {
+                    told = true;
+                    refused();
                 }
             }
         }
-    };
-    interrupts.release();
-    out
+    }
 }
 
 /// Ends a job stopped by Ctrl+C.
@@ -459,15 +447,17 @@ fn finish_log<T, E: std::fmt::Display>(log: JobLog, result: &Result<T, E>, ok: &
 }
 
 /// Runs one of the operation commands. `interrupts` (Ctrl+C) are listened to only while the
-/// disk changes; `gate` must see every progress event of `ctx`.
+/// disk changes, deciding through `ctx.launch`.
 pub async fn execute(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
     cmd: Command,
     interrupts: &mut impl Interrupts,
-    gate: &InstallerGate,
 ) -> anyhow::Result<()> {
-    let stop = Stop { interrupts, gate };
+    let stop = Stop {
+        interrupts,
+        gate: &ctx.launch,
+    };
     match cmd {
         Command::Install {
             target,
@@ -522,12 +512,12 @@ pub async fn execute(
 /// What [`execute`] listens to while the disk changes.
 struct Stop<'a, I: Interrupts> {
     interrupts: &'a mut I,
-    gate: &'a InstallerGate,
+    gate: &'a LaunchGate,
 }
 
 impl<I: Interrupts> Stop<'_, I> {
     /// [`until_interrupted`], telling the user through `ui` when Ctrl+C cannot stop it.
-    async fn run<T>(self, ui: &dyn Ui, op: impl std::future::Future<Output = T>) -> Option<T> {
+    async fn run<T>(&mut self, ui: &dyn Ui, op: impl std::future::Future<Output = T>) -> Option<T> {
         until_interrupted(op, self.interrupts, self.gate, &|| ui.notice(UNCANCELLABLE)).await
     }
 }
@@ -617,7 +607,7 @@ async fn install(
     target: &str,
     bucket: Option<&str>,
     f: Flags,
-    stop: Stop<'_, impl Interrupts>,
+    mut stop: Stop<'_, impl Interrupts>,
 ) -> anyhow::Result<()> {
     let Some(cand) = choose(ctx, ui, target, bucket, f.yes)? else {
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
@@ -633,15 +623,20 @@ async fn install(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
+    // Held from before `job.start` until after `job.end`: the log always gets its end.
+    stop.interrupts.hold();
     let log = JobLog::start(JobInfo::for_plans("install", &plans));
     let applied = stop
         .run(ui, ops::apply_allowing(ctx, &plans, &f.allow()))
         .await;
     ui.end_progress();
     let Some(applied) = applied else {
-        return cancelled(log);
+        let r = cancelled(log);
+        stop.interrupts.release();
+        return r;
     };
     finish_log(log, &applied, "instalado");
+    stop.interrupts.release();
     applied?;
     for p in &plans {
         anstream::println!(
@@ -691,9 +686,9 @@ fn uninstall(
         cmd: None,
     });
     let removed = ops::uninstall(ctx, &plan);
-    stop.interrupts.release();
     ui.end_progress();
     finish_log(log, &removed, "removido");
+    stop.interrupts.release();
     let residues = removed?;
     anstream::println!(
         "{} {} {}",
@@ -772,7 +767,7 @@ async fn upgrade(
     all: bool,
     keep: bool,
     f: Flags,
-    stop: Stop<'_, impl Interrupts>,
+    mut stop: Stop<'_, impl Interrupts>,
 ) -> anyhow::Result<()> {
     let list = ops::upgradable(ctx)?;
     let pins = crate::pins::load(ctx.data);
@@ -851,15 +846,19 @@ async fn upgrade(
         anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
         return Ok(());
     }
+    stop.interrupts.hold();
     let log = JobLog::start(JobInfo::for_plans("upgrade", groups.iter().flatten()));
     let applied = stop
         .run(ui, ops::apply_groups_allowing(ctx, groups, &f.allow()))
         .await;
     ui.end_progress();
     let Some(applied) = applied else {
-        return cancelled(log);
+        let r = cancelled(log);
+        stop.interrupts.release();
+        return r;
     };
     finish_log(log, &applied, "atualizado");
+    stop.interrupts.release();
     for p in applied? {
         anstream::println!(
             "{} {} {}",
@@ -929,6 +928,7 @@ mod tests {
             in_use: &nothing_in_use,
             residue: ResidueScan::none(),
             msiexec: crate::install::executor::Msiexec::DISABLED,
+            launch: Default::default(),
         };
         let res = |name: &str, confidence, preselected| Residue {
             kind: ResidueKind::Folder {

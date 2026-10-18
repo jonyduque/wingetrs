@@ -40,16 +40,16 @@ fn main() -> std::process::ExitCode {
     let cli = parse();
     match wingetrs::cli::run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
-        // Ctrl+C: `Cancelado.` is already on screen; 130 is the usual code for it.
-        Err(e) if e.is::<wingetrs::cli::install_cmd::Cancelled>() => {
-            std::process::ExitCode::from(130)
-        }
         Err(e) => {
-            anstream::eprintln!(
-                "{} {e:#}",
-                wingetrs::cli::style::paint(wingetrs::cli::style::ERROR, "erro:")
-            );
-            std::process::ExitCode::FAILURE
+            let code = wingetrs::cli::install_cmd::exit_code(&e);
+            // Ctrl+C (130): `Cancelado.` is already on screen.
+            if code != 130 {
+                anstream::eprintln!(
+                    "{} {e:#}",
+                    wingetrs::cli::style::paint(wingetrs::cli::style::ERROR, "erro:")
+                );
+            }
+            std::process::ExitCode::from(code)
         }
     }
 }

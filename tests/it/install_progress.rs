@@ -181,6 +181,7 @@ impl Tool {
             progress,
             in_use: &nothing_in_use,
             msiexec: None,
+            launch: Default::default(),
         };
         wingetrs::install::executor::execute_install_with(&self.plan, &mut ctx, extract)
             .await
@@ -246,6 +247,7 @@ async fn uninstall_emits_removing_then_scanning() {
         in_use: &nothing_in_use,
         residue: ResidueScan::none(),
         msiexec: Msiexec::DISABLED,
+        launch: Default::default(),
     };
     let plan = ops::plan_uninstall(&ctx, "tool", false).unwrap();
     ops::uninstall(&ctx, &plan).unwrap();

@@ -83,5 +83,6 @@ pub fn build_ctx<'a>(
         in_use: &fs_win::files_in_use,
         residue,
         msiexec,
+        launch: Default::default(),
     }
 }
