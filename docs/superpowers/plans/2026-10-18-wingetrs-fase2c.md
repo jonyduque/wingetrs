@@ -915,6 +915,8 @@ Testes:
    - `Shortcut` ⇒ `target` dentro de `app_dir`; `link = shortcut_link(root, name)`; cria como `Step::Shortcut`.
 3. Os artefatos entram em `run.artifacts` e vão para o `state.db` no `RecordState` (a remoção da 2a desfaz).
 
+**Da revisão da Task 153 (2026-10-18): o efeito é dado não confiável (escrito por script de terceiro).** Antes de aplicar: (1) tamanho do `effects.jsonl` conferido antes de ler (teto 64 MiB); (2) `shortcut.name` (ex.: `..\..\Startup\x`), `shim.name`/`path`, `rm_shim.name` e cada entrada de PATH pelo `install::safepath` e dentro do app/raiz; (3) `set_env` e `add_path.var` só em variáveis permitidas (nunca `PATH` inteiro, `PSModulePath` só pela via do psmodule; lista explícita e teste); (4) `remove_path` com padrões `-like` como no Scoop, mas só removendo entradas dentro da raiz do wingetrs. Um teste de recusa por item.
+
 **Files:**
 - Modify: `src/install/executor.rs`, `src/install/planner.rs` (só visibilidade)
 - Test: `tests/it/install_script_effects.rs` (**já criado pelo orquestrador**; `World`/`FailAt` copiados; `FakeHost` que grava um `effects.jsonl` escolhido pelo teste e sai 0)
