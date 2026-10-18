@@ -392,6 +392,83 @@ async fn unsafe_module_names_refused_by_the_executor() {
         }
         s.try_install(&plan).await.unwrap_err();
         assert!(!s.layout.root().join("x").exists(), "{name:?} escaped");
+        assert!(!s.layout.modules().exists(), "{name:?} created modules");
         assert!(s.var().is_none(), "{name:?} touched PSModulePath");
     }
+}
+
+#[tokio::test]
+async fn renamed_module_on_upgrade_keeps_the_psmodulepath_entry() {
+    let s = setup().await;
+    s.set_var(r"C:\Z");
+    s.install(&s.plan("x", &s.manifest("1.0", "A", &["S"], false)))
+        .await;
+    s.install(&s.plan("x", &s.manifest("2.0", "B", &["S"], false)))
+        .await;
+    assert_eq!(s.link_target("B"), s.layout.current("x"));
+    assert!(std::fs::symlink_metadata(s.layout.modules().join("A")).is_err());
+    assert_eq!(s.var().unwrap().value, format!(r"{};C:\Z", s.modules()));
+}
+
+#[tokio::test]
+async fn expand_flag_and_literal_survive_install_and_removal() {
+    let s = setup().await;
+    let initial = r"%USERPROFILE%\x";
+    s.env
+        .set(
+            VAR,
+            &EnvValue {
+                value: initial.into(),
+                expand: true,
+            },
+        )
+        .unwrap();
+    s.install(&s.plan("a", &s.manifest("1.0", "ModA", &["SA"], false)))
+        .await;
+    s.install(&s.plan("b", &s.manifest("1.0", "ModB", &["SB"], false)))
+        .await;
+    let v = s.var().unwrap();
+    assert!(v.expand, "install keeps REG_EXPAND_SZ");
+    assert_eq!(v.value, format!(r"{};{initial}", s.modules()));
+    s.uninstall("a");
+    assert!(s.var().unwrap().expand);
+    s.uninstall("b");
+    assert_eq!(
+        s.var(),
+        Some(EnvValue {
+            value: initial.into(),
+            expand: true
+        }),
+        "removal keeps REG_EXPAND_SZ and the literal"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_with_different_case_of_the_name_works() {
+    let s = setup().await;
+    s.install(&s.plan("x", &s.manifest("1.0", "psfzf", &["S"], false)))
+        .await;
+    s.install(&s.plan("x", &s.manifest("2.0", "PSFzf", &["S"], false)))
+        .await;
+    assert_eq!(s.link_target("PSFzf"), s.layout.current("x"));
+}
+
+#[tokio::test]
+async fn failed_upgrade_keeps_the_previous_junction() {
+    let s = setup().await;
+    s.install(&s.plan("x", &s.manifest("1.0", "M", &["S"], false)))
+        .await;
+    let v2 = s.plan("x", &s.manifest("2.0", "M", &["S"], false));
+    let k = v2
+        .steps
+        .iter()
+        .position(|st| matches!(st, Step::PsModule { .. }))
+        .unwrap();
+    let mut ctx = s.ctx_with_hook(&FailAt(k + 1));
+    wingetrs::install::executor::execute_install(&v2, &mut ctx)
+        .await
+        .unwrap_err();
+    assert_eq!(s.link_target("M"), s.layout.current("x"));
+    assert!(s.layout.current("x").join("tool.exe").exists());
+    assert_eq!(s.state.get("x").unwrap().unwrap().0.version, "1.0");
 }

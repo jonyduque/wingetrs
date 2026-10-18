@@ -387,7 +387,7 @@ impl Run<'_> {
             .as_ref()?
             .1
             .iter()
-            .find(|a| a.kind == kind && a.target == target)
+            .find(|a| a.kind == kind && a.target.eq_ignore_ascii_case(target))
     }
 }
 
@@ -609,7 +609,12 @@ fn remove_upgrade_leftovers(run: &Run<'_>, ctx: &mut ExecCtx<'_>) {
         if kept {
             continue;
         }
-        if let Some((label, Err(e))) = remove_artifact(ctx, &run.plan.app, a, true) {
+        // A renamed module leaves its old junction, but the app still needs `PSModulePath`.
+        let keeps_module = run
+            .artifacts
+            .iter()
+            .any(|n| n.kind == ArtifactKind::PsModule);
+        if let Some((label, Err(e))) = remove_artifact(ctx, &run.plan.app, a, true, keeps_module) {
             tracing::warn!(
                 "{}: sobra da versão anterior ({label}) ficou: {e}",
                 run.plan.app
@@ -1445,7 +1450,12 @@ fn psmodule(run: &mut Run<'_>, ctx: &mut ExecCtx<'_>, name: &str) -> Result<(), 
 }
 
 /// Removes the junction of module `name`; the last module also leaves `PSModulePath`.
-fn remove_psmodule(ctx: &mut ExecCtx<'_>, app: &str, name: &str) -> Result<(), String> {
+fn remove_psmodule(
+    ctx: &mut ExecCtx<'_>,
+    app: &str,
+    name: &str,
+    app_keeps_module: bool,
+) -> Result<(), String> {
     let modules = ctx.layout.modules();
     check_component("módulo", name)?;
     let link_path = modules.join(name);
@@ -1467,7 +1477,7 @@ fn remove_psmodule(ctx: &mut ExecCtx<'_>, app: &str, name: &str) -> Result<(), S
         .into_iter()
         .filter(|a| a != app)
         .collect();
-    if others.is_empty() {
+    if others.is_empty() && !app_keeps_module {
         let env = ctx.effects.env;
         if let Some(cur) = env.get(PSMODULE_VAR).map_err(|e| e.to_string())? {
             let value = path_edit::path_remove(&cur.value, &modules.display().to_string());
@@ -1496,6 +1506,7 @@ fn remove_artifact(
     app: &str,
     a: &Artifact,
     remove_path: bool,
+    keeps_module: bool,
 ) -> Option<(String, Result<(), String>)> {
     let env = ctx.effects.env;
     Some(match a.kind {
@@ -1539,7 +1550,7 @@ fn remove_artifact(
         }
         ArtifactKind::PsModule => (
             format!("módulo PowerShell {}", a.target),
-            remove_psmodule(ctx, app, &a.target),
+            remove_psmodule(ctx, app, &a.target, keeps_module),
         ),
         ArtifactKind::Persist => return None,
     })
@@ -1563,7 +1574,8 @@ pub fn execute_uninstall(plan: &UninstallPlan, ctx: &mut ExecCtx<'_>) -> Result<
         return Err(ExecError::InUse(p.display().to_string()));
     }
     for (i, a) in plan.artifacts.iter().enumerate() {
-        if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry) {
+        if let Some((label, r)) = remove_artifact(ctx, &plan.app, a, plan.remove_path_entry, false)
+        {
             r.map_err(|m| fail(i, label, m))?;
         }
     }
