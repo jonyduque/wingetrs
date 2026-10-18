@@ -30,6 +30,7 @@ Os achados que mais voltaram da revisão no lote 2b (Tasks 116–128); confira c
 - **Scratchpad compartilhado:** arquivos de âncora/mutação e saídas temporárias levam o número da tarefa no nome (`t<N>-anchor.txt`); outro agente sobrescreveu a âncora da Task 155 com um nome genérico.
 - **Todo `.join(x)` com `x` vindo de manifesto, catálogo, registro ou rede** (id, versão, nome de módulo, nome de arquivo) passa antes por `install::safepath` como um componente só, e o resultado é conferido dentro da pasta-mãe (`parent() == Some(&base)`). Duas vezes em 2026-10-18 (Task 145: nome do psmodule; Task 177: id do winget aceitava `Pub.App.`/`NUL`). Liste no relatório cada `.join` com dado externo que você escreveu.
 - **Portão de consentimento ou segurança** (Tasks 161/162): liste cada caminho que leva à execução (item único, lote, nova tentativa, reserva msiexec, reenfileiramento do resto do lote, ajuste que pula o diálogo, tela pequena) e tenha um teste por caminho; a revisão achou o lote e a reserva sem teste e o resto do lote sumindo em silêncio.
+- **Texto PowerShell gerado pelo wingetrs** (Tasks 158, 191): todo literal entre aspas simples dobra `'` **e** `‘ ’ ‚ ‛` (U+2018–U+201B), e todo `.ps1` gravado leva BOM UTF-8 (sem BOM o 5.1 lê CP1252 e os bytes 0x91–0x94 viram aspas). Teste com `’` e com uma letra como `ő` (C5 91).
 - **Recusa nova em extrator/parser** (Task 138): rode contra o corpus real da sonda do formato (ou peça a sonda) antes de entregar; fixture sintética não prova que arquivos reais passam.
 
 #### Report contract
