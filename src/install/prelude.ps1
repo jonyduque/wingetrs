@@ -395,6 +395,21 @@ function __wr_effect($effect) {
     [System.IO.File]::AppendAllText($__wr_effects, $line + "`n", (New-Object System.Text.UTF8Encoding $false))
 }
 
+# internal: looks a variable up in this session's overlay, then in the seed JSON
+# ($__wr_env_seed); returns @(found, value) and never throws for an unknown name
+function __wr_env_lookup($Name) {
+    if ($null -eq $script:__wr_env_overlay) { $script:__wr_env_overlay = @{} }
+    if ($script:__wr_env_overlay.ContainsKey($Name)) {
+        return @($true, $script:__wr_env_overlay[$Name])
+    }
+    if (![string]::IsNullOrEmpty($__wr_env_seed)) {
+        $seed = ConvertFrom-Json -InputObject $__wr_env_seed -ErrorAction Stop
+        $prop = $seed.PSObject.Properties[$Name]
+        if ($null -ne $prop) { return @($true, $prop.Value) }
+    }
+    return @($false, $null)
+}
+
 # system.ps1:30 -- reads the seed JSON ($__wr_env_seed) overlaid by this session's writes
 function Get-EnvVar {
     param(
@@ -402,15 +417,8 @@ function Get-EnvVar {
         [switch]$Global
     )
     if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
-    if ($null -eq $script:__wr_env_overlay) { $script:__wr_env_overlay = @{} }
-    if ($script:__wr_env_overlay.ContainsKey($Name)) {
-        return $script:__wr_env_overlay[$Name]
-    }
-    if (![string]::IsNullOrEmpty($__wr_env_seed)) {
-        $seed = ConvertFrom-Json -InputObject $__wr_env_seed -ErrorAction Stop
-        $prop = $seed.PSObject.Properties[$Name]
-        if ($null -ne $prop) { return $prop.Value }
-    }
+    $found, $value = __wr_env_lookup $Name
+    if ($found) { return $value }
     throw ("Get-EnvVar: a vari" + [char]0xE1 + "vel '$Name' n" + [char]0xE3 + "o foi pr" + [char]0xE9 + "-carregada pelo wingetrs")
 }
 
@@ -428,7 +436,8 @@ function Set-EnvVar {
     $script:__wr_env_overlay[$Name] = $Value
 }
 
-# system.ps1:96 -- records add_path (prepend) and updates the session variable
+# system.ps1:96 -- records add_path (prepend, force) and updates the overlay (when the
+# variable is known) and the session variable, like the original
 function Add-Path {
     param(
         [string[]]$Path,
@@ -438,7 +447,15 @@ function Add-Path {
         [switch]$Quiet
     )
     if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
-    __wr_effect @{ op = 'add_path'; var = $TargetEnvVar; entries = [string[]]@($Path); prepend = $true }
+    __wr_effect @{ op = 'add_path'; var = $TargetEnvVar; entries = [string[]]@($Path); prepend = $true; force = [bool]$Force }
+    # future sessions (overlay); an unknown variable stays unknown
+    $found, $value = __wr_env_lookup $TargetEnvVar
+    if ($found) {
+        $inPath, $strippedPath = Split-PathLikeEnvVar $Path "$value"
+        if (!$inPath -or $Force) {
+            $script:__wr_env_overlay[$TargetEnvVar] = (@($Path) + @($strippedPath | Where-Object { $_ })) -join ';'
+        }
+    }
     # current session
     $session = (Get-Item -LiteralPath "env:$TargetEnvVar" -ErrorAction SilentlyContinue).Value
     $inPath, $strippedPath = Split-PathLikeEnvVar $Path "$session"
@@ -447,7 +464,8 @@ function Add-Path {
     }
 }
 
-# system.ps1:122 -- records remove_path and updates the session variable
+# system.ps1:122 -- records remove_path and updates the overlay (when the variable is
+# known) and the session variable; -PassThru returns what was in the stored value
 function Remove-Path {
     param(
         [string[]]$Path,
@@ -458,6 +476,15 @@ function Remove-Path {
     )
     if ($Global) { throw ('global n' + [char]0xE3 + 'o suportado pelo wingetrs') }
     __wr_effect @{ op = 'remove_path'; var = $TargetEnvVar; entries = [string[]]@($Path) }
+    # future sessions (overlay); an unknown variable stays unknown
+    $inPath = $null
+    $found, $value = __wr_env_lookup $TargetEnvVar
+    if ($found) {
+        $inPath, $strippedPath = Split-PathLikeEnvVar $Path "$value"
+        if ($inPath) {
+            $script:__wr_env_overlay[$TargetEnvVar] = if ($strippedPath) { $strippedPath } else { $null }
+        }
+    }
     # current session
     $session = (Get-Item -LiteralPath "env:$TargetEnvVar" -ErrorAction SilentlyContinue).Value
     $inSessionPath, $strippedPath = Split-PathLikeEnvVar $Path "$session"
@@ -469,7 +496,7 @@ function Remove-Path {
         }
     }
     if ($PassThru) {
-        return $inSessionPath
+        return $inPath
     }
 }
 

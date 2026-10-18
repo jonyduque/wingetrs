@@ -22,6 +22,8 @@ pub enum ScriptEffect {
         var: String,
         entries: Vec<String>,
         prepend: bool,
+        /// Move the entries to the front even if already present (`add_first_in_path`, `-Force`).
+        force: bool,
     },
     RemovePath {
         var: String,
@@ -61,42 +63,73 @@ struct OpOnly {
     op: String,
 }
 
+/// Required key whose value may be `null` (a plain `Option` field would accept a missing key).
+fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+
+// One struct per op: every key is required and unknown keys are refused. `op` is
+// declared only so `deny_unknown_fields` accepts it; its value was matched already.
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetEnvLine {
+    #[serde(rename = "op")]
+    _op: String,
     name: String,
+    #[serde(deserialize_with = "nullable")]
     value: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddPathLine {
+    #[serde(rename = "op")]
+    _op: String,
     var: String,
     entries: Vec<String>,
     prepend: bool,
+    force: bool,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RemovePathLine {
+    #[serde(rename = "op")]
+    _op: String,
     var: String,
     entries: Vec<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShimLine {
+    #[serde(rename = "op")]
+    _op: String,
     path: String,
     name: String,
+    #[serde(deserialize_with = "nullable")]
     args: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RmShimLine {
+    #[serde(rename = "op")]
+    _op: String,
     name: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShortcutLine {
+    #[serde(rename = "op")]
+    _op: String,
     target: String,
     name: String,
+    #[serde(deserialize_with = "nullable")]
     args: Option<String>,
+    #[serde(deserialize_with = "nullable")]
     icon: Option<String>,
 }
 
@@ -141,6 +174,7 @@ pub fn parse_effects(text: &str) -> Result<Vec<ScriptEffect>, EffectsError> {
                     var: l.var,
                     entries: l.entries,
                     prepend: l.prepend,
+                    force: l.force,
                 }
             }
             "remove_path" => {

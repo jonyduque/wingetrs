@@ -222,7 +222,8 @@ fn add_path_records_and_updates_session() {
         vec![ScriptEffect::AddPath {
             var: s("PATH"),
             entries: vec![format!(r"{dir}\bin")],
-            prepend: true
+            prepend: true,
+            force: false
         }]
     );
     // several entries in one call
@@ -233,7 +234,8 @@ fn add_path_records_and_updates_session() {
         vec![ScriptEffect::AddPath {
             var: s("PATH"),
             entries: vec![s(r"C:\a"), s(r"C:\b")],
-            prepend: true
+            prepend: true,
+            force: false
         }]
     );
 }
@@ -253,7 +255,8 @@ fn add_path_target_env_var() {
         vec![ScriptEffect::AddPath {
             var: s("PSModulePath"),
             entries: vec![s(r"C:\mods")],
-            prepend: true
+            prepend: true,
+            force: false
         }]
     );
 }
@@ -305,7 +308,8 @@ fn deprecated_aliases() {
             ScriptEffect::AddPath {
                 var: s("PATH"),
                 entries: vec![dir.clone()],
-                prepend: true
+                prepend: true,
+                force: true
             },
             ScriptEffect::RemovePath {
                 var: s("PATH"),
@@ -420,8 +424,38 @@ fn parser_limits_and_errors() {
     assert_eq!(parse_effects(&text), Err(EffectsError::TooMany));
     let text = format!("{ok}\n").repeat(1000);
     assert_eq!(parse_effects(&text).unwrap().len(), 1000);
-    let long = format!("{{\"op\":\"rm_shim\",\"name\":\"{}\"}}", "a".repeat(65_537));
+    // exact limit: a whole line of 65 536 bytes is accepted, 65 537 is refused
+    let wrap = r#"{"op":"rm_shim","name":""}"#.len();
+    let at_limit = format!(
+        "{{\"op\":\"rm_shim\",\"name\":\"{}\"}}",
+        "a".repeat(65_536 - wrap)
+    );
+    assert_eq!(at_limit.len(), 65_536);
+    assert_eq!(parse_effects(&at_limit).unwrap().len(), 1);
+    let long = format!(
+        "{{\"op\":\"rm_shim\",\"name\":\"{}\"}}",
+        "a".repeat(65_537 - wrap)
+    );
+    assert_eq!(long.len(), 65_537);
     assert_eq!(parse_effects(&long), Err(EffectsError::TooLong(1)));
+    // every key is required (a nullable one too) and unknown keys are refused
+    for bad in [
+        r#"{"op":"set_env","name":"PATH"}"#,
+        r#"{"op":"set_env","name":"A","value":"v","extra":1}"#,
+        r#"{"op":"add_path","var":"PATH","entries":["C:/a"],"prepend":true}"#,
+        r#"{"op":"add_path","var":"PATH","entries":["C:/a"],"prepend":true,"force":false,"x":0}"#,
+        r#"{"op":"remove_path","var":"PATH"}"#,
+        r#"{"op":"remove_path","var":"PATH","entries":[],"force":true}"#,
+        r#"{"op":"shim","path":"C:/x.exe","name":"x"}"#,
+        r#"{"op":"shim","path":"C:/x.exe","name":"x","args":null,"global":true}"#,
+        r#"{"op":"rm_shim"}"#,
+        r#"{"op":"rm_shim","name":"x","app":"y"}"#,
+        r#"{"op":"shortcut","target":"C:/a.exe","name":"A","args":null}"#,
+        r#"{"op":"shortcut","target":"C:/a.exe","name":"A","icon":null}"#,
+        r#"{"op":"shortcut","target":"C:/a.exe","name":"A","args":null,"icon":null,"dir":"x"}"#,
+    ] {
+        assert_eq!(parse_effects(bad), Err(EffectsError::Invalid(1)), "{bad}");
+    }
     let text = format!("\u{feff}{ok}\n");
     assert_eq!(
         parse_effects(&text),
@@ -445,7 +479,7 @@ fn parser_limits_and_errors() {
     let all = [
         r#"{"op":"set_env","name":"A","value":"v"}"#,
         r#"{"op":"set_env","name":"A","value":null}"#,
-        r#"{"op":"add_path","var":"PATH","entries":["C:\\a"],"prepend":true}"#,
+        r#"{"op":"add_path","var":"PATH","entries":["C:\\a"],"prepend":true,"force":false}"#,
         r#"{"op":"remove_path","var":"PATH","entries":["C:\\a","C:\\b"]}"#,
         r#"{"op":"shim","path":"C:\\x.exe","name":"x","args":null}"#,
         r#"{"op":"rm_shim","name":"x"}"#,
@@ -466,7 +500,8 @@ fn parser_limits_and_errors() {
             ScriptEffect::AddPath {
                 var: s("PATH"),
                 entries: vec![s(r"C:\a")],
-                prepend: true
+                prepend: true,
+                force: false
             },
             ScriptEffect::RemovePath {
                 var: s("PATH"),
@@ -491,4 +526,97 @@ fn parser_limits_and_errors() {
 #[test]
 fn prelude_still_ascii() {
     assert!(PRELUDE.is_ascii());
+}
+
+fn add(var: &str, entry: &str, force: bool) -> ScriptEffect {
+    ScriptEffect::AddPath {
+        var: s(var),
+        entries: vec![s(entry)],
+        prepend: true,
+        force,
+    }
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn add_path_force_flag() {
+    let d = dirs();
+    let o = run(
+        &d,
+        r"$env:PATH = 'C:\x;C:\a'
+Add-Path -Path 'C:\a'; $env:PATH
+add_first_in_path 'C:\a' $false; $env:PATH
+Add-Path -Path 'C:\x' -Force; $env:PATH",
+    );
+    assert_eq!(o.code, 0, "{}", o.out);
+    assert_eq!(
+        lines(&o),
+        vec![r"C:\x;C:\a", r"C:\a;C:\x", r"C:\x;C:\a"],
+        "{}",
+        o.out
+    );
+    assert_eq!(
+        o.effects,
+        vec![
+            add("PATH", r"C:\a", false),
+            add("PATH", r"C:\a", true),
+            add("PATH", r"C:\x", true),
+        ]
+    );
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn path_overlay_and_passthru() {
+    let d = dirs();
+    let seed = r#"{"PATH":"C:\\a;C:\\b","EMPTY":null}"#;
+    // the session PATH differs from the stored value: -PassThru reports the stored one
+    let o = run_seed(
+        &d,
+        Some(seed),
+        r"$env:PATH = 'C:\s'
+'p1=' + (Remove-Path -Path 'C:\b' -PassThru)
+'g1=' + (Get-EnvVar 'PATH')
+'p2=' + (Remove-Path -Path 'C:\s' -PassThru)
+Add-Path -Path 'C:\n'; 'g2=' + (Get-EnvVar 'PATH')
+Add-Path -Path 'C:\a'; 'g3=' + (Get-EnvVar 'PATH')
+add_first_in_path 'C:\a' $false; 'g4=' + (Get-EnvVar 'PATH')
+Remove-Path -Path 'C:\a','C:\n'; if ($null -eq (Get-EnvVar 'PATH')) { 'g5=null' }
+Add-Path -Path 'C:\e' -TargetEnvVar 'EMPTY'; 'g6=' + (Get-EnvVar 'EMPTY')
+Add-Path -Path 'C:\q' -TargetEnvVar 'UNK'; try { Get-EnvVar 'UNK' } catch { 'unk' }
+if ($null -eq (Remove-Path -Path 'C:\q' -TargetEnvVar 'UNK2' -PassThru)) { 'p3=null' }",
+    );
+    assert_eq!(o.code, 0, "{}", o.out);
+    assert_eq!(
+        lines(&o),
+        vec![
+            r"p1=C:\b",
+            r"g1=C:\a",
+            "p2=",
+            r"g2=C:\n;C:\a",
+            r"g3=C:\n;C:\a",
+            r"g4=C:\a;C:\n",
+            "g5=null",
+            r"g6=C:\e",
+            "unk",
+            "p3=null",
+        ],
+        "{}",
+        o.out
+    );
+    assert_eq!(o.effects.len(), 9);
+}
+
+/// `shim` only records the effect: the executor keeps the shims dir on the PATH
+/// (`EnsureShimsOnPath`); the prelude never puts the target's folder on it.
+#[test]
+fn shim_body_never_touches_path() {
+    let start = PRELUDE.find("function shim(").expect("shim defined");
+    let body = &PRELUDE[start..];
+    let end = body.find("\n}").expect("shim body closed");
+    let body = &body[..end];
+    assert!(body.contains("__wr_effect @{ op = 'shim'"), "{body}");
+    for bad in ["Add-Path", "add_first_in_path", "env:PATH", "Set-EnvVar"] {
+        assert!(!body.contains(bad), "shim body contains {bad}: {body}");
+    }
 }
