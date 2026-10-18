@@ -512,6 +512,10 @@ impl DepWalk<'_> {
                 .to_string(),
         })?;
         self.stack.push(id.clone());
+        // Helpers come before declared dependencies (scoop lib/depends.ps1:45).
+        for h in &manifest.helpers {
+            self.visit("main", &format!("main/{}", h.app()))?;
+        }
         for d in &manifest.depends {
             self.visit(&bucket, d)?;
         }
@@ -557,6 +561,9 @@ pub fn plan_for(
         seen: HashSet::new(),
         out: Vec::new(),
     };
+    for h in &target.helpers {
+        walk.visit(&bucket, &format!("main/{}", h.app()))?;
+    }
     for d in &target.depends {
         walk.visit(&bucket, d)?;
     }
@@ -788,7 +795,14 @@ fn dependents(ctx: &OpsCtx<'_>, state: &StateDb, app: &str) -> Result<Vec<String
             let name = d.rsplit_once('/').map_or(d.as_str(), |(_, n)| n);
             name.eq_ignore_ascii_case(app)
         });
-        if depends_on_app {
+        let uses_helper = match manifest::resolve(&raw, Arch::host()) {
+            Ok(m) => m.helpers.iter().any(|h| h.app().eq_ignore_ascii_case(app)),
+            Err(e) => {
+                tracing::warn!("{}: manifesto não resolvido ({e}); só `depends`", rec.app);
+                false
+            }
+        };
+        if depends_on_app || uses_helper {
             out.push(rec.app);
         }
     }
