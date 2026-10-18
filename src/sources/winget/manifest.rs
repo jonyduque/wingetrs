@@ -23,6 +23,36 @@ pub struct MergedManifest {
     /// Upgraded only when asked for by name, never by "upgrade all"; an installer's own value wins.
     pub require_explicit_upgrade: Option<bool>,
     #[serde(default)]
+    pub nested_installer_type: Option<String>,
+    #[serde(default)]
+    pub nested_installer_files: Option<Vec<NestedInstallerFile>>,
+    #[serde(default)]
+    pub installer_locale: Option<String>,
+    #[serde(default)]
+    pub platform: Option<Vec<String>>,
+    #[serde(default, rename = "MinimumOSVersion")]
+    pub minimum_os_version: Option<String>,
+    #[serde(default)]
+    pub install_modes: Option<Vec<String>>,
+    #[serde(default)]
+    pub installer_switches: Option<InstallerSwitches>,
+    #[serde(default)]
+    pub installer_success_codes: Option<Vec<i64>>,
+    #[serde(default)]
+    pub expected_return_codes: Option<Vec<ExpectedReturnCode>>,
+    #[serde(default)]
+    pub elevation_requirement: Option<String>,
+    #[serde(default)]
+    pub product_code: Option<String>,
+    #[serde(default)]
+    pub package_family_name: Option<String>,
+    #[serde(default)]
+    pub apps_and_features_entries: Option<Vec<ArpEntry>>,
+    #[serde(default)]
+    pub dependencies: Option<Dependencies>,
+    #[serde(default)]
+    pub agreements: Vec<Agreement>,
+    #[serde(default)]
     pub installers: Vec<Installer>,
     #[serde(default)]
     pub icons: Vec<Icon>,
@@ -72,6 +102,211 @@ pub struct Installer {
     pub require_explicit_upgrade: Option<bool>,
     pub installer_url: String,
     pub installer_sha256: String,
+    #[serde(default)]
+    pub nested_installer_type: Option<String>,
+    #[serde(default)]
+    pub nested_installer_files: Option<Vec<NestedInstallerFile>>,
+    #[serde(default)]
+    pub installer_locale: Option<String>,
+    #[serde(default)]
+    pub platform: Option<Vec<String>>,
+    #[serde(default, rename = "MinimumOSVersion")]
+    pub minimum_os_version: Option<String>,
+    #[serde(default)]
+    pub install_modes: Option<Vec<String>>,
+    #[serde(default)]
+    pub installer_switches: Option<InstallerSwitches>,
+    #[serde(default)]
+    pub installer_success_codes: Option<Vec<i64>>,
+    #[serde(default)]
+    pub expected_return_codes: Option<Vec<ExpectedReturnCode>>,
+    #[serde(default)]
+    pub elevation_requirement: Option<String>,
+    #[serde(default)]
+    pub product_code: Option<String>,
+    #[serde(default)]
+    pub package_family_name: Option<String>,
+    #[serde(default)]
+    pub apps_and_features_entries: Option<Vec<ArpEntry>>,
+    #[serde(default)]
+    pub dependencies: Option<Dependencies>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct InstallerSwitches {
+    #[serde(default)]
+    pub silent: Option<String>,
+    #[serde(default)]
+    pub silent_with_progress: Option<String>,
+    #[serde(default)]
+    pub interactive: Option<String>,
+    #[serde(default)]
+    pub install_location: Option<String>,
+    #[serde(default)]
+    pub log: Option<String>,
+    #[serde(default)]
+    pub upgrade: Option<String>,
+    #[serde(default)]
+    pub custom: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ExpectedReturnCode {
+    #[serde(default)]
+    pub installer_return_code: i64,
+    #[serde(default)]
+    pub return_response: String,
+    #[serde(default)]
+    pub return_response_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PackageDependency {
+    #[serde(default)]
+    pub package_identifier: String,
+    #[serde(default)]
+    pub minimum_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Dependencies {
+    #[serde(default)]
+    pub windows_features: Vec<String>,
+    #[serde(default)]
+    pub windows_libraries: Vec<String>,
+    #[serde(default)]
+    pub package_dependencies: Vec<PackageDependency>,
+    #[serde(default)]
+    pub external_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Agreement {
+    #[serde(default)]
+    pub agreement_label: Option<String>,
+    #[serde(default)]
+    pub agreement: Option<String>,
+    #[serde(default)]
+    pub agreement_url: Option<String>,
+}
+
+/// One `AppsAndFeaturesEntries` item.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ArpEntry {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub display_version: Option<String>,
+    #[serde(default)]
+    pub product_code: Option<String>,
+    #[serde(default)]
+    pub upgrade_code: Option<String>,
+    #[serde(default)]
+    pub installer_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct NestedInstallerFile {
+    #[serde(default)]
+    pub relative_file_path: String,
+    #[serde(default)]
+    pub portable_command_alias: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallerKind {
+    Msi,
+    Wix,
+    Burn,
+    Inno,
+    Nullsoft,
+    Msix,
+    Appx,
+    Exe,
+    Zip,
+    Portable,
+    Font,
+    Pwa,
+    Msstore,
+    Unknown(String),
+}
+
+impl InstallerKind {
+    /// Case-insensitive; `None` or empty yields `Unknown("")`.
+    pub fn parse(s: Option<&str>) -> InstallerKind {
+        let raw = s.unwrap_or("");
+        match raw.to_ascii_lowercase().as_str() {
+            "msi" => InstallerKind::Msi,
+            "wix" => InstallerKind::Wix,
+            "burn" => InstallerKind::Burn,
+            "inno" => InstallerKind::Inno,
+            "nullsoft" => InstallerKind::Nullsoft,
+            "msix" => InstallerKind::Msix,
+            "appx" => InstallerKind::Appx,
+            "exe" => InstallerKind::Exe,
+            "zip" => InstallerKind::Zip,
+            "portable" => InstallerKind::Portable,
+            "font" => InstallerKind::Font,
+            "pwa" => InstallerKind::Pwa,
+            "msstore" => InstallerKind::Msstore,
+            _ => InstallerKind::Unknown(raw.to_string()),
+        }
+    }
+
+    /// Lowercase name as written in manifests.
+    pub fn name(&self) -> &str {
+        match self {
+            InstallerKind::Msi => "msi",
+            InstallerKind::Wix => "wix",
+            InstallerKind::Burn => "burn",
+            InstallerKind::Inno => "inno",
+            InstallerKind::Nullsoft => "nullsoft",
+            InstallerKind::Msix => "msix",
+            InstallerKind::Appx => "appx",
+            InstallerKind::Exe => "exe",
+            InstallerKind::Zip => "zip",
+            InstallerKind::Portable => "portable",
+            InstallerKind::Font => "font",
+            InstallerKind::Pwa => "pwa",
+            InstallerKind::Msstore => "msstore",
+            InstallerKind::Unknown(s) => s,
+        }
+    }
+}
+
+/// An installer with every root-level default already applied.
+#[derive(Debug, Clone)]
+pub struct EffectiveInstaller {
+    pub architecture: String,
+    pub kind: InstallerKind,
+    pub nested_kind: Option<InstallerKind>,
+    pub nested_files: Vec<NestedInstallerFile>,
+    pub scope: Option<String>,
+    pub locale: Option<String>,
+    pub platform: Vec<String>,
+    pub minimum_os_version: Option<String>,
+    pub install_modes: Vec<String>,
+    pub switches: InstallerSwitches,
+    pub success_codes: Vec<i64>,
+    pub expected_codes: Vec<ExpectedReturnCode>,
+    pub upgrade_behavior: Option<String>,
+    pub require_explicit_upgrade: bool,
+    pub elevation: Option<String>,
+    pub product_code: Option<String>,
+    pub package_family_name: Option<String>,
+    pub arp_entries: Vec<ArpEntry>,
+    pub dependencies: Option<Dependencies>,
+    pub url: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +323,92 @@ pub fn parse(bytes: &[u8]) -> Result<MergedManifest, ManifestError> {
 }
 
 impl MergedManifest {
+    /// One entry per installer, in manifest order; each field is the installer's own value
+    /// or else the root's (switches merge key by key; dependencies replace as a whole).
+    pub fn effective(&self) -> Vec<EffectiveInstaller> {
+        let root = self;
+        self.installers
+            .iter()
+            .map(|i| {
+                let ri = root.installer_switches.clone().unwrap_or_default();
+                let ii = i.installer_switches.clone().unwrap_or_default();
+                let switches = InstallerSwitches {
+                    silent: ii.silent.or(ri.silent),
+                    silent_with_progress: ii.silent_with_progress.or(ri.silent_with_progress),
+                    interactive: ii.interactive.or(ri.interactive),
+                    install_location: ii.install_location.or(ri.install_location),
+                    log: ii.log.or(ri.log),
+                    upgrade: ii.upgrade.or(ri.upgrade),
+                    custom: ii.custom.or(ri.custom),
+                };
+                let kind = i.installer_type.clone().or(root.installer_type.clone());
+                let nested = i
+                    .nested_installer_type
+                    .clone()
+                    .or(root.nested_installer_type.clone());
+                EffectiveInstaller {
+                    architecture: i.architecture.clone(),
+                    kind: InstallerKind::parse(kind.as_deref()),
+                    nested_kind: nested.as_deref().map(|n| InstallerKind::parse(Some(n))),
+                    nested_files: i
+                        .nested_installer_files
+                        .clone()
+                        .or(root.nested_installer_files.clone())
+                        .unwrap_or_default(),
+                    scope: i.scope.clone().or(root.scope.clone()),
+                    locale: i.installer_locale.clone().or(root.installer_locale.clone()),
+                    platform: i
+                        .platform
+                        .clone()
+                        .or(root.platform.clone())
+                        .unwrap_or_default(),
+                    minimum_os_version: i
+                        .minimum_os_version
+                        .clone()
+                        .or(root.minimum_os_version.clone()),
+                    install_modes: i
+                        .install_modes
+                        .clone()
+                        .or(root.install_modes.clone())
+                        .unwrap_or_default(),
+                    switches,
+                    success_codes: i
+                        .installer_success_codes
+                        .clone()
+                        .or(root.installer_success_codes.clone())
+                        .unwrap_or_default(),
+                    expected_codes: i
+                        .expected_return_codes
+                        .clone()
+                        .or(root.expected_return_codes.clone())
+                        .unwrap_or_default(),
+                    upgrade_behavior: i.upgrade_behavior.clone().or(root.upgrade_behavior.clone()),
+                    require_explicit_upgrade: i
+                        .require_explicit_upgrade
+                        .or(root.require_explicit_upgrade)
+                        .unwrap_or(false),
+                    elevation: i
+                        .elevation_requirement
+                        .clone()
+                        .or(root.elevation_requirement.clone()),
+                    product_code: i.product_code.clone().or(root.product_code.clone()),
+                    package_family_name: i
+                        .package_family_name
+                        .clone()
+                        .or(root.package_family_name.clone()),
+                    arp_entries: i
+                        .apps_and_features_entries
+                        .clone()
+                        .or(root.apps_and_features_entries.clone())
+                        .unwrap_or_default(),
+                    dependencies: i.dependencies.clone().or(root.dependencies.clone()),
+                    url: i.installer_url.clone(),
+                    sha256: i.installer_sha256.clone(),
+                }
+            })
+            .collect()
+    }
+
     pub fn into_details(self, available_versions: Vec<String>) -> PackageDetails {
         let root_type = self.installer_type;
         let root_scope = self.scope;
