@@ -336,6 +336,8 @@ struct Gate {
     kinds: BTreeMap<String, usize>,
     /// Manifests whose verdict rises only because of `HiddenCode` flags.
     hidden_changed: [usize; 2],
+    /// Manifests whose verdict rises only because of the prelude rules (review of 153).
+    prelude_changed: [usize; 2],
 }
 
 impl Gate {
@@ -354,15 +356,25 @@ impl Gate {
                 .max()
                 .unwrap_or(Verdict::Confirm);
             *self.by_verdict[i].entry(verdict).or_default() += 1;
-            let without_hidden = reports
-                .iter()
-                .flat_map(|(_, r)| r.flags.iter())
-                .filter(|f| f.kind != FlagKind::HiddenCode)
-                .map(|f| f.verdict)
-                .max()
-                .unwrap_or(Verdict::Confirm);
-            if without_hidden != verdict {
+            let without = |excluded: &[FlagKind]| {
+                reports
+                    .iter()
+                    .flat_map(|(_, r)| r.flags.iter())
+                    .filter(|f| !excluded.contains(&f.kind))
+                    .map(|f| f.verdict)
+                    .max()
+                    .unwrap_or(Verdict::Confirm)
+            };
+            if without(&[FlagKind::HiddenCode]) != verdict {
                 self.hidden_changed[i] += 1;
+            }
+            let prelude_kinds = [
+                FlagKind::PreludeInternal,
+                FlagKind::PreludeRedefinition,
+                FlagKind::EnvironmentVariable,
+            ];
+            if without(&prelude_kinds) != verdict {
+                self.prelude_changed[i] += 1;
             }
             if i == 1 {
                 let kinds: BTreeSet<String> = reports
@@ -379,27 +391,28 @@ impl Gate {
     fn print(&self) {
         let resolved = self.total - self.unresolved;
         println!(
-            "\n## Veredito do portão estático (`script_scan`, Task 150)\n\n{} manifestos S-hook; {} não resolvem para x64 e ficam de fora. Veredito do manifesto = o pior entre os seus scripts. Nada foi executado. Última coluna: manifestos cujo veredito sobe só por `HiddenCode` (regra de recusa vista apenas em comentário ou here-string).\n",
+            "\n## Veredito do portão estático (`script_scan`, Task 150)\n\n{} manifestos S-hook; {} não resolvem para x64 e ficam de fora. Veredito do manifesto = o pior entre os seus scripts. Nada foi executado. Última coluna: manifestos cujo veredito sobe só por `HiddenCode` (regra de recusa vista apenas em comentário ou here-string) e só pelas regras do prelúdio (`__wr`, redefinição de função do prelúdio, `SetEnvironmentVariable`).\n",
             self.total, self.unresolved
         );
         println!(
-            "| funções do Scoop suportadas | Confirm | ConfirmStrong | Refuse | mudam por HiddenCode |"
+            "| funções do Scoop suportadas | Confirm | ConfirmStrong | Refuse | mudam por HiddenCode | mudam pelas regras do prelúdio |"
         );
-        println!("|---|---:|---:|---:|---:|");
+        println!("|---|---:|---:|---:|---:|---:|");
         let labels = [
             "nenhuma (`&[]`)".to_string(),
             format!("todas ({})", SCOOP_FUNCTIONS.len()),
         ];
-        for ((label, tally), changed) in
-            labels.iter().zip(&self.by_verdict).zip(self.hidden_changed)
+        let changed = self.hidden_changed.into_iter().zip(self.prelude_changed);
+        for ((label, tally), (hidden, prelude)) in labels.iter().zip(&self.by_verdict).zip(changed)
         {
             let col = |v: Verdict| pct(tally.get(&v).copied().unwrap_or(0), resolved);
             println!(
-                "| {label} | {} | {} | {} | {} |",
+                "| {label} | {} | {} | {} | {} | {} |",
                 col(Verdict::Confirm),
                 col(Verdict::ConfirmStrong),
                 col(Verdict::Refuse),
-                pct(changed, resolved)
+                pct(hidden, resolved),
+                pct(prelude, resolved)
             );
         }
         let mut kinds: Vec<(&String, &usize)> = self.kinds.iter().collect();

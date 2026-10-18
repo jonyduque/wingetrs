@@ -526,6 +526,76 @@ fn program_files_write_through_aliases_and_dotnet() {
     }
 }
 
+/// Refused with exactly one flag, of kind `k`.
+fn refused_only_by(s: &str, k: FlagKind) {
+    let r = scan(s, SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", kinds(&r));
+    assert_eq!(kinds(&r), vec![k], "{s}");
+}
+
+#[test]
+fn prelude_internals_refused() {
+    for s in [
+        "__wr_effect env_set X 1",
+        "$__wr_effects = 'x'",
+        "Write-Output ${__wr_effects}",
+        "Get-Item function:__wr_effect",
+        "Get-Variable __wr*",
+    ] {
+        refused_only_by(s, FlagKind::PreludeInternal);
+    }
+    let r = scan("Get-Variable __wr*", SUP);
+    assert_eq!(
+        r.flags[0].detail,
+        "mexe nos internos do prelúdio do wingetrs (__wr)"
+    );
+}
+
+#[test]
+fn prelude_redefinition_refused() {
+    for s in [
+        "function ensure($d) { $d }",
+        "function global:Ensure { }",
+        "filter info { $_ }",
+        "Set-Item function:ensure { }",
+        "New-Item -Path function:appdir -Value { 'x' }",
+        "Remove-Item function:Get-HelperPath",
+        "${function:ensure} = { }",
+    ] {
+        refused_only_by(s, FlagKind::PreludeRedefinition);
+    }
+    let r = scan("function global:Ensure { }", SUP);
+    assert_eq!(
+        r.flags[0].detail,
+        "redefine a função do prelúdio do wingetrs: ensure"
+    );
+    // Own helper functions and reading a non-prelude function are fine.
+    for s in ["function my_helper { }", "Get-Item function:my_helper"] {
+        let r = scan(s, SUP);
+        assert!(r.flags.is_empty(), "{s}: {:?}", kinds(&r));
+    }
+}
+
+#[test]
+fn set_environment_variable_target_decides() {
+    for s in [
+        "[Environment]::SetEnvironmentVariable('X', 'v', 'User')",
+        "[System.Environment]::SetEnvironmentVariable(\"X\", $v, \"Machine\")",
+        "[Environment]::SetEnvironmentVariable('X', 'v', [EnvironmentVariableTarget]::User)",
+        "[Environment]::SetEnvironmentVariable('X', (Get-Thing 'a', 'b'), 'user')",
+    ] {
+        refused_only_by(s, FlagKind::EnvironmentVariable);
+    }
+    for s in [
+        "[Environment]::SetEnvironmentVariable('X', 'v')",
+        "[Environment]::SetEnvironmentVariable('X', 'User, Machine', 'Process')",
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", kinds(&r));
+        assert_eq!(kinds(&r), vec![FlagKind::EnvironmentVariable], "{s}");
+    }
+}
+
 #[test]
 fn variables_lowercase_without_dollar() {
     let r = scan(r#"Copy-Item "$Dir\x" "$env:APPDATA\y" $Persist_Dir"#, SUP);

@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use super::classify_2c::commands_in;
 use super::manifest::{HookKind, InstallerSpec, Resolved};
+use super::prelude::PRELUDE_FUNCTIONS;
 
 /// Functions defined in Scoop's `lib/*.ps1` (`function <name>`, `global:` prefix dropped),
 /// read from ~/scoop/apps/scoop/current/lib at ScoopInstaller/Scoop commit
@@ -300,6 +301,12 @@ pub enum FlagKind {
     AbsolutePath,
     /// A refusal rule that matches only with comments and here-strings kept.
     HiddenCode,
+    /// Touches the prelude's internals (`__wr_effect`, `$__wr_effects`, ...).
+    PreludeInternal,
+    /// Redefines or removes a prelude function.
+    PreludeRedefinition,
+    /// `[Environment]::SetEnvironmentVariable(...)`.
+    EnvironmentVariable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,6 +422,10 @@ const D_DOWNLOAD: &str = "baixa arquivos da internet por conta própria";
 const D_REG_USER: &str = "mexe no registro do usuário (HKCU ou reg)";
 const D_TASK: &str = "cria ou mexe em tarefa agendada ou serviço do Windows";
 const D_ABSOLUTE: &str = "caminho absoluto fora da pasta do app";
+const D_PRELUDE_INTERNAL: &str = "mexe nos internos do prelúdio do wingetrs (__wr)";
+const D_ENV_PERSISTENT: &str =
+    "grava variável de ambiente do usuário ou da máquina por [Environment]::SetEnvironmentVariable";
+const D_ENV_PROCESS: &str = "muda variável de ambiente por [Environment]::SetEnvironmentVariable";
 const D_HIDDEN: &str = "possível código escondido em comentário ou here-string";
 
 /// Scans one script. `supported` lists the Scoop functions the wingetrs prelude implements
@@ -492,7 +503,7 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
     // Line-based rules, on the text without comments and here-string bodies.
     for (i, l) in lines.iter().enumerate() {
         for (kind, verdict, detail) in line_rules(l, calls_reg) {
-            push(kind, verdict, detail, i + 1);
+            push(kind, verdict, &detail, i + 1);
         }
     }
     // Fail closed: the comment/here-string stripping may disagree with pwsh about where
@@ -526,7 +537,7 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
 }
 
 /// The line rules matched by one (lowercase, backtick-free) line.
-fn line_rules(l: &str, calls_reg: bool) -> Vec<(FlagKind, Verdict, &'static str)> {
+fn line_rules(l: &str, calls_reg: bool) -> Vec<(FlagKind, Verdict, String)> {
     let ws: Vec<&str> = words(l).collect();
     let any = |set: &[&str]| ws.iter().any(|w| set.contains(w));
     let contains = |set: &[&str]| set.iter().any(|s| l.contains(s));
@@ -572,7 +583,127 @@ fn line_rules(l: &str, calls_reg: bool) -> Vec<(FlagKind, Verdict, &'static str)
     if contains(USER_DIRS) || has_absolute_literal(l) {
         out.push((FlagKind::AbsolutePath, Verdict::ConfirmStrong, D_ABSOLUTE));
     }
+    let mut out: Vec<(FlagKind, Verdict, String)> = out
+        .into_iter()
+        .map(|(k, v, d)| (k, v, d.to_string()))
+        .collect();
+    if l.contains("__wr") {
+        out.push((
+            FlagKind::PreludeInternal,
+            Verdict::Refuse,
+            D_PRELUDE_INTERNAL.to_string(),
+        ));
+    }
+    for name in redefined_prelude_functions(l) {
+        out.push((
+            FlagKind::PreludeRedefinition,
+            Verdict::Refuse,
+            format!("redefine a função do prelúdio do wingetrs: {name}"),
+        ));
+    }
+    if let Some(persistent) = set_environment_variable(l) {
+        let (verdict, detail) = if persistent {
+            (Verdict::Refuse, D_ENV_PERSISTENT)
+        } else {
+            (Verdict::ConfirmStrong, D_ENV_PROCESS)
+        };
+        out.push((FlagKind::EnvironmentVariable, verdict, detail.to_string()));
+    }
     out
+}
+
+/// Prelude functions (canonical spelling) that a (lowercase) line redefines or removes:
+/// `function <name>`/`filter <name>` (scope prefix such as `global:` ignored), or
+/// `function:<name>` used with `Set-Item`/`New-Item`/`Remove-Item` (or their aliases) or
+/// as a `$function:<name>`/`${function:<name>}` variable.
+fn redefined_prelude_functions(l: &str) -> Vec<&'static str> {
+    let canon = |name: &str| -> Option<&'static str> {
+        let name = name.rsplit(':').next().unwrap_or(name);
+        PRELUDE_FUNCTIONS
+            .iter()
+            .copied()
+            .find(|f| f.eq_ignore_ascii_case(name))
+    };
+    let mut out = Vec::new();
+    let tokens: Vec<&str> = l
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '{' | '(' | '|'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    for pair in tokens.windows(2) {
+        if (pair[0] == "function" || pair[0] == "filter")
+            && let Some(f) = canon(pair[1])
+        {
+            out.push(f);
+        }
+    }
+    let item_cmd = words(l).any(|w| {
+        matches!(
+            w,
+            "set-item" | "new-item" | "remove-item" | "si" | "ni" | "ri" | "rm" | "del" | "erase"
+        )
+    });
+    let mut from = 0;
+    while let Some(pos) = l[from..].find("function:") {
+        let at = from + pos;
+        from = at + "function:".len();
+        let name: String = l[from..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':'))
+            .collect();
+        let before = &l[..at];
+        let variable = before.ends_with('$') || before.ends_with("${");
+        if (item_cmd || variable)
+            && let Some(f) = canon(&name)
+        {
+            out.push(f);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// `Some(persistent)` when a (lowercase) line calls
+/// `[Environment]::SetEnvironmentVariable(` / `[System.Environment]::...`: persistent when
+/// the third argument names the `User` or `Machine` target or `[EnvironmentVariableTarget]`.
+fn set_environment_variable(l: &str) -> Option<bool> {
+    let at = l.find("environment]::setenvironmentvariable(")?;
+    let args = &l[at + "environment]::setenvironmentvariable(".len()..];
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut index = 0usize;
+    let mut third = String::new();
+    for c in args.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' if depth == 0 => break,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    index += 1;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        if index == 2 {
+            third.push(c);
+        }
+    }
+    let third = third.trim();
+    let persistent = [
+        "'user'",
+        "\"user\"",
+        "'machine'",
+        "\"machine\"",
+        "environmentvariabletarget]",
+    ]
+    .iter()
+    .any(|t| third.contains(t));
+    Some(persistent)
 }
 
 /// One report per script present in the manifest, in [`HookKind`] order.
