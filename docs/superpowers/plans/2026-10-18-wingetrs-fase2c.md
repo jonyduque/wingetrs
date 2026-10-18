@@ -1007,6 +1007,8 @@ Testes:
 4. Upgrade: `InstalledInfo` ganha `pub old_manifest: Option<Resolved>` (`ops::plan_for` preenche com `installed_manifest(..)` + `resolve(.., Arch::host())`; ausente ⇒ `None`). Passos novos, depois das extrações e antes de `Promote`: `Step::UpgradeUninstallHook { kind, script }` (`PreUninstall`, depois `UninstallerScript`, depois `PostUninstall`) e `Step::UpgradeRunUninstaller { file, args }` entre o `PreUninstall` e o `UninstallerScript`. Contexto: `op = Update`, `version = plan.version` (nova), `old_version = plan.upgrade_from`, `version_dir` = pasta da versão antiga, `manifest_path` = cópia do manifesto antigo na pasta de trabalho. Os hooks de instalação da nova continuam com `$cmd = 'update'`.
 5. Falha da instalação nova depois que os hooks antigos rodaram ⇒ a mensagem acrescenta `"; os scripts de desinstalação da versão antiga já rodaram e não foram desfeitos"`.
 
+**Da revisão da Task 151 (2026-10-18):** confira no `scoop-update.ps1` (e6aa3b3) se a atualização roda o desinstalador (`uninstaller.file`/`script`) da versão antiga antes de instalar a nova; se rodar, esta tarefa faz o mesmo (com o manifesto gravado da versão antiga, nunca o do catálogo), com teste da ordem.
+
 **Files:**
 - Modify: `src/install/plan.rs`, `src/install/planner.rs`, `src/install/executor.rs`, `src/install/ops.rs`, `tests/it/install_planner.rs`, `tests/it/install_executor.rs` (só o campo novo de `InstalledInfo`)
 - Test: `tests/it/uninstall_scripts.rs` (**já criado pelo orquestrador**; `FakeHost` e `World` copiados)
