@@ -1043,3 +1043,48 @@ Testes (`tests/it/wi_portable.rs`, wiremock + zip montado no teste):
 6. `--location`: fora desta fase.
 7. Ambiente elevado: **lista branca na Task 180** (revisão de segurança): nada herdado do usuário; variáveis só de KnownFolder e constantes, PATH só de pastas do sistema, `TEMP`/`TMP` na pasta de execução protegida. Propriedades MSI por lista fechada; parâmetros de outros tipos sem caminho fora da pasta de execução.
 8. Task 189: **aguarda o usuário** (proposta: fazer depois da 188, sempre ligada, com o motor nativo).
+
+
+### Task 190: Correções da revisão de fase do lado elevado (2d)
+
+**Modelo:** opus (revisor opus). Origem: revisão de fase inteira do `bridge-worker` em 2026-10-18 (orquestrador). O achado Critical da mesma revisão (SHA vindo do próprio pedido) é decisão do usuário e **não** entra aqui.
+
+#### Where this fits
+
+- `src/winget_install/switches.rs` (~:130 `fill_log`) e `src/bridge/worker.rs` (~:261–264 `is_log`): `<LOGPATH>` sem aspas é aceito e substituído sem aspas; a pasta de staging (`C:\Program Files\wingetrs\staging\…`) sempre tem espaço.
+- `src/bridge/elevate_win.rs` (~:628 `run_winget`) → `src/bridge/spawn_win.rs` (~:191–192 `run_in`): o winget elevado herda o ambiente do worker (sem `env_clear`), que vem de `HKCU\Environment`.
+- `src/winget_install/elevated_rules.rs` (~:413–418 `still_orphan`): decide "órfão" por um caminho que pode estar numa pasta que o usuário grava.
+- `src/bridge/staging_win.rs` (~:242–247): `FILE_FLAG_OPEN_REPARSE_POINT` só protege o último componente de `source`.
+- `src/bridge/arp_ops_win.rs` (~:289–301): desinstalador NSIS/Inno que se copia para TEMP e sai; `RunDir` é solto com o filho ainda rodando.
+- Regra do `CLAUDE.md` "Código que roda elevado" (ambiente montado do zero, DACL provada, lista fechada).
+
+#### What binds this task
+
+1. **`<LOGPATH>` com aspas:** o worker só aceita o marcador entre aspas (`"<LOGPATH>"`, como já faz o caminho MSI) **ou** `fill_log` põe as aspas; escolha uma das duas e aplique a todos os tipos (Inno `/LOG=`, Burn/exe `/log`, `/key:`). Caminho com espaço nunca chega partido ao instalador.
+2. **winget elevado com ambiente do zero:** `run_winget` usa `env_clear()` + o mesmo `installer_env(sys, <RunDir>\tmp)` dos instaladores, com `TEMP`/`TMP` dentro de um `RunDir` de staging (criado e apagado como nos instaladores). Nenhuma variável vem do ambiente do worker.
+3. **Órfão só com pasta de admin:** `still_orphan` só devolve verdadeiro quando o ancestral existente mais próximo do caminho ausente passa por `sddl_admin_only` (o mesmo usado na DACL do staging/ARP); senão, não é órfão (motivo no log).
+4. **`source` sem reparse no meio:** abrir cada componente de `source` sem seguir reparse point (ou exigir que `source` fique sob a pasta de dados conhecida do wingetrs, lista fechada) e recusar hard link (`nNumberOfLinks > 1`).
+5. **Desinstalador que se copia:** esperar por um job object com os processos filhos antes de soltar o `RunDir`; o código de saída é o do último processo relevante do job (documente a escolha).
+
+#### Tests (literais)
+
+- `log_placeholder_with_space_stays_one_argument`: staging com espaço; para Inno, Burn e exe, a linha de comando montada tem o caminho do log inteiro entre aspas (um argumento só ao dividir com `split_command`).
+- `bare_log_placeholder_refused_or_quoted` (conforme a escolha do item 1): teste que falha só nessa regra.
+- `winget_env_is_built_from_scratch`: com uma variável plantada no ambiente do processo de teste (`WINGETRS_TEST_PLANTED=1`) e `TEMP` apontando para uma pasta qualquer, o ambiente montado para o winget não tem a variável e o `TEMP` fica dentro do `RunDir`.
+- `orphan_in_user_folder_is_not_orphan`: caminho ausente cujo ancestral tem DACL com escrita para outro SID ⇒ não órfão (DACL simulada pelo mesmo ponto de injeção dos testes de `sddl_admin_only`).
+- `source_with_junction_in_middle_refused` e `source_hard_link_refused` (tempdir; sem tocar `Program Files`).
+- `job_waits_for_copied_uninstaller`: `.cmd` em tempdir que inicia um filho que dorme 1 s e sai antes; o `RunDir` só some depois do filho.
+
+Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) tirar o `env_clear()` do `run_winget`; (b) aceitar `<LOGPATH>` sem aspas; (c) `still_orphan` sem a checagem de DACL.
+
+**Files:**
+- Modify: `src/bridge/worker.rs`, `src/bridge/elevate_win.rs`, `src/bridge/spawn_win.rs`, `src/bridge/staging_win.rs`, `src/bridge/arp_ops_win.rs`, `src/winget_install/switches.rs`, `src/winget_install/elevated_rules.rs`
+- Test: os módulos de teste existentes desses arquivos em `tests/it/` (não crie módulo novo sem necessidade; se criar, a linha `mod` entra por âncora).
+
+#### Checks beyond the steps
+
+1. Testes nunca rodam instalador real, `runas`, winget real, nem tocam ARP/`Program Files` reais.
+2. Outro agente edita `src/install/{runner.rs,script_scan.rs,prelude.ps1}` e testes de scripts: não toque nesses arquivos.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(bridge): phase review of the elevated side (log quoting, winget env, orphan DACL, reparse, job wait)`
