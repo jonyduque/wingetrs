@@ -782,6 +782,8 @@ Testes (`tests/it/wi_orphans.rs`; `ArpRegistry` falso que escreve o `.reg` progr
 5. `pub fn backup_folders(folders: &[PathBuf], dest: &Path) -> Vec<String>` copia cada pasta para `backups\<ts>\<app>\<n>-<nome da pasta>`, recursivo, **sem seguir pontos de reanálise** (pula junções e links, registra cada pulo), devolve os erros.
 6. `pub fn remove_registry_only(..)`: só com `registry_only_allowed`; exporta e confere o `.reg` como os órfãos (`export_args`, `check_export`); HKCU ⇒ `delete_user_key`; HKLM ⇒ `elevated.delete_arp_key(hive, key, Duplicate)`.
 
+**Da revisão de segurança da Task 182 (2026-10-18):** o auxiliar elevado só apaga uma chave HKLM como "duplicada" se outra chave HKLM com o mesmo nome tiver `DisplayVersion` estritamente maior; HKCU nunca autoriza apagar HKLM (o usuário controla HKCU). Consequência para o caso Kindle (HKLM 2.8.3 + HKCU 2.9.1): a opção C ("remover só o registro") não se aplica à chave HKLM; a tarefa oferece a opção A (rodar o desinstalador antigo, com aviso e cópia das pastas) e explica por que a C não está disponível. Teste do caso.
+
 **Files:**
 - Create: `src/winget_install/uninstall.rs` (já existe com uma linha `//!`)
 - Test: `tests/it/wi_uninstall_flow.rs` (**já criado pelo orquestrador** com uma linha `//!`; não edite `tests/it/main.rs`)
