@@ -20,7 +20,7 @@ Verifique, nesta ordem:
 7. **Relatório:** SHAs existem (`git cat-file -t <sha>` = `commit`); saída do gate/mutações/benchmarks parece real; benchmarks com `-Baseline`; número sem comando colado não conta.
 8. Consulte `docs/ARMADILHAS.md` quando o diff tocar algo listado lá.
 
-Use `git show --stat` primeiro, depois só os hunks relevantes; `rust-analyzer symbols < arquivo` para outline. Não rode benchmarks a menos que o foco peça (a máquina pode estar ocupada por outra tarefa). Não deixe processos em segundo plano.
+Use `git show --stat` primeiro, depois só os hunks relevantes; `rust-analyzer symbols < arquivo` para outline. Não rode benchmarks a menos que o foco peça (a máquina pode estar ocupada por outra tarefa). Não deixe processos em segundo plano. Nunca crie `git worktree` nem outro diretório de build: se o checkout não compilar por trabalho de outro agente, espere alguns minutos e tente de novo, e diga no relatório o que não conseguiu rodar. `cargo test` aceita um filtro só.
 
 Saída (máx. 25 linhas):
 
