@@ -1169,6 +1169,7 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
     let chars: Vec<char> = script.chars().collect();
     let n = chars.len();
     let mut mask = vec![false; n];
+    let mut last_close: Option<usize> = None;
     let mut i = 0;
     // Same tokenizing as `blank`: the keyword counts only in code.
     while i < n {
@@ -1215,10 +1216,23 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
                             .eq_ignore_ascii_case(k)
                         && chars.get(end).is_none_or(|c| !is_word(*c))
                 });
-                match keyword.filter(|_| starts_word) {
+                // Statement position only: after a command name, `&`, `=`, `,`, `(`, `|` or a
+                // `}` on the same line, `if` is an argument and the `{...}` after it is a live
+                // scriptblock literal (`& { ... } if ($global) { ... }` runs it).
+                let before = (0..i)
+                    .rev()
+                    .find(|&k| !matches!(chars[k], ' ' | '\t' | '\r'));
+                let statement = match keyword {
+                    Some("if") => before.is_none_or(|k| matches!(chars[k], '\n' | ';' | '{')),
+                    // `elseif` only right after the `}` of a block this mask covers.
+                    Some(_) => before.is_some() && before == last_close,
+                    None => false,
+                };
+                match keyword.filter(|_| starts_word && statement) {
                     Some(k) => match global_block(&chars, i + k.len()) {
                         Some((open, close)) => {
                             mask[open + 1..close].iter_mut().for_each(|m| *m = true);
+                            last_close = Some(close);
                             i = close + 1;
                         }
                         None => i += k.len(),

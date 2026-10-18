@@ -737,7 +737,7 @@ fn global_block_forms_that_are_informational() {
     for s in [
         format!("if ($Global) {{ {HKLM} }}"),
         format!("if (  $GLOBAL  ) {{ {HKLM} }}"),
-        format!("if ($x) {{ $y = 1 }} elseif ($global) {{ {HKLM} }}"),
+        format!("if ($global) {{ $y = 1 }} elseif ($global) {{ {HKLM} }}"),
         format!("if ($global)\n{{\n    {HKLM}\n}}"),
         format!("if ($global -and   $x -eq 1) {{ {HKLM} }}"),
         format!("if ($global) {{\n    # machine-wide\n    {HKLM}\n}}"),
@@ -772,6 +772,9 @@ fn global_block_doubts_fail_closed() {
         format!("if ($global:x) {{ {HKLM} }}"),
         format!("if ($script:global) {{ {HKLM} }}"),
         format!("if ($global\n) {{ {HKLM} }}"),
+        // `elseif` only right after a masked block.
+        format!("if ($x) {{ $y = 1 }} elseif ($global) {{ {HKLM} }}"),
+        format!("elseif ($global) {{ {HKLM} }}"),
         // Opening brace two lines below the condition.
         format!("if ($global)\n\n{{ {HKLM} }}"),
         // No closing brace.
@@ -888,5 +891,31 @@ fn own_global_forms() {
     ] {
         let r = scan(s, SUP);
         assert!(!has(&r, FlagKind::GlobalName), "{s}: {:?}", kinds(&r));
+    }
+}
+
+#[test]
+fn global_block_only_in_statement_position() {
+    // In argument position `if` is a string and the `{...}` is a live scriptblock.
+    for s in [
+        format!("& {{ param($a,$b,$c) & $c }} if ($global) {{ {HKLM} }}"),
+        format!("Write-Output if ($global) {{ {HKLM} }}"),
+        format!("$x = if ($global) {{ {HKLM} }}"),
+        format!("f -p if ($global) {{ {HKLM} }}"),
+        format!("f | g if ($global) {{ {HKLM} }}"),
+        format!("f a, if ($global) {{ {HKLM} }}"),
+        format!(". if ($global) {{ {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+    }
+    for s in [
+        format!("$a = 1; if ($global) {{ {HKLM} }}"),
+        format!("$a = 1\n  if ($global) {{ {HKLM} }}"),
+        format!("& {{ if ($global) {{ {HKLM} }} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert!(informational(&r), "{s}: {:?}", r.flags);
     }
 }
