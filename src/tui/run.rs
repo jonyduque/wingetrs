@@ -123,6 +123,24 @@ struct Ctx {
     pwsh: String,
     /// The session's elevated helper for machine-wide winget upgrades (one UAC per session).
     elevated: crate::bridge::elevated::ElevatedBridge,
+    /// Launch gate of the native winget job in progress (`Cmd::CancelNative`, quitting).
+    winget_gate: std::sync::Mutex<Option<crate::install::executor::LaunchGate>>,
+}
+
+impl Ctx {
+    /// Cancels the native winget job in progress unless its installer already launched.
+    fn cancel_native(&self) {
+        let gate = self
+            .winget_gate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(gate) = gate
+            && !gate.try_cancel()
+        {
+            tracing::info!("native winget job already launched; it runs to its end");
+        }
+    }
 }
 
 /// This executable, for the elevated helper. Unknown: logged, and the empty path makes the
@@ -267,6 +285,7 @@ async fn event_loop(
         elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(
             crate::bridge::elevated::SystemTransport::new(helper_exe()),
         )),
+        winget_gate: std::sync::Mutex::new(None),
     });
     let _helper = HelperShutdown(Arc::clone(&ctx));
     ctx.http
@@ -348,7 +367,12 @@ async fn event_loop(
         }
         for cmd in last_details_only(cmds) {
             match cmd {
-                Cmd::Quit => return Ok(()),
+                Cmd::Quit => {
+                    // A native job not launched yet never launches after the TUI is gone.
+                    ctx.cancel_native();
+                    return Ok(());
+                }
+                Cmd::CancelNative => ctx.cancel_native(),
                 Cmd::SetMouseCapture(on) => {
                     let _ = if on {
                         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)
@@ -1733,7 +1757,9 @@ fn spawn_winget(ctx: &Arc<Ctx>, action: Action) {
             }
         };
         let logged = action.clone();
-        let result = with_winget(c, &progress, |env| {
+        let gate = crate::install::executor::LaunchGate::default();
+        *c.winget_gate.lock().unwrap_or_else(|p| p.into_inner()) = Some(gate.clone());
+        let result = with_winget(c, &progress, gate, |env| {
             handle.block_on(jobs::run_winget_action(env, action))
         })
         .map_err(|e| {
@@ -1766,6 +1792,7 @@ fn user_env(name: &str) -> Option<String> {
 fn with_winget<R>(
     c: &Ctx,
     progress: crate::install::download::Progress<'_>,
+    gate: crate::install::executor::LaunchGate,
     f: impl FnOnce(&jobs::WingetEnv<'_>) -> R,
 ) -> Result<R, String> {
     use crate::winget_install::launch_win::ShellLauncher;
@@ -1777,7 +1804,7 @@ fn with_winget<R>(
         &c.http,
         LockWait::NoWait,
         progress,
-        crate::install::executor::LaunchGate::default(),
+        gate,
         &c.elevated,
     )
     .map_err(|e| format!("msiexec.exe não encontrado: {e}"))?;
@@ -1812,6 +1839,7 @@ fn with_winget<R>(
 fn with_winget<R>(
     _c: &Ctx,
     _progress: crate::install::download::Progress<'_>,
+    _gate: crate::install::executor::LaunchGate,
     _f: impl FnOnce(&jobs::WingetEnv<'_>) -> R,
 ) -> Result<R, String> {
     Err("instalar e remover só funciona no Windows".to_string())

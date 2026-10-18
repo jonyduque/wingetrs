@@ -526,6 +526,16 @@ fn upgrade_fail(e: UpgradeError) -> InstallFail {
     }
 }
 
+/// Takes the launch gate (a quit confirmed before this cancels the removal: nothing runs) and
+/// announces the removal's phase, after which it is not stopped.
+fn start_removal(env: &WingetEnv<'_>, p: Phase) -> Result<(), InstallFail> {
+    if !env.install.gate.try_launch() {
+        return Err(InstallFail::Other(WingetOpsError::Cancelled.to_string()));
+    }
+    phase_of(env, p);
+    Ok(())
+}
+
 fn phase_of(env: &WingetEnv<'_>, p: Phase) {
     (env.install.progress)(&ProgressEvent::Phase(p));
 }
@@ -625,7 +635,9 @@ async fn run_winget_inner(
             };
             let hklm =
                 matches!(&plan.target, UninstallTarget::Arp { hive, .. } if *hive != Hive::User);
-            phase_of(env, removal_phase(hklm, &plan.name));
+            if let Err(f) = start_removal(env, removal_phase(hklm, &plan.name)) {
+                return failed(f);
+            }
             match remove_registry_only(
                 &plan,
                 env.registry,
@@ -653,7 +665,9 @@ async fn run_winget_inner(
                 Ok(l) => l,
                 Err(e) => return failed(winget_fail(e)),
             };
-            phase_of(env, removal_phase(o.hive != Hive::User, &o.name));
+            if let Err(f) = start_removal(env, removal_phase(o.hive != Hive::User, &o.name)) {
+                return failed(f);
+            }
             match remove_orphan(
                 env.registry,
                 env.install.elevated,
@@ -710,10 +724,12 @@ fn winget_uninstall(
             }
         }
     }
-    phase_of(
+    if let Err(f) = start_removal(
         env,
         removal_phase(plan.elevation == Elevation::Helper, &plan.name),
-    );
+    ) {
+        return failed(f);
+    }
     match uninstall(&env.uninstall, plan) {
         Ok(r) if r.status == UninstallStatus::Removed && r.warning.is_none() => {
             let mut summary = format!("{} removido", plan.name);

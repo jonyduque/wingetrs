@@ -15,8 +15,8 @@ use wingetrs::installed::Hive;
 use wingetrs::installed::correlate::{Correlation, ListRow, OtherRecord, UpdateState};
 use wingetrs::sources::winget::manifest::{self, MergedManifest};
 use wingetrs::tui::app::{
-    Action, App, BACKUP_ITEM, Cmd, Modal, Msg, REGISTRY_ONLY_ITEM, Running, Tab, job_uncancellable,
-    update,
+    Action, App, BACKUP_ITEM, Cmd, Modal, Msg, NATIVE_QUIT, REGISTRY_ONLY_ITEM, Running, Tab,
+    job_uncancellable, update,
 };
 use wingetrs::tui::jobs::{ProgressThrottle, progress_msg};
 use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
@@ -64,9 +64,14 @@ fn host() -> Host {
 
 /// A manifest with one x64 installer (as `wi_install_flow::manifest_of`).
 fn manifest_of(kind: &str, scope: &str) -> MergedManifest {
+    manifest_with(kind, scope, "")
+}
+
+/// `manifest_of` with `root` at the top of the manifest.
+fn manifest_with(kind: &str, scope: &str, root: &str) -> MergedManifest {
     let sha = "a".repeat(64);
     let yaml = format!(
-        "PackageIdentifier: Pub.App\nPackageVersion: '1.0'\nPackageName: Contoso App\nPublisher: Contoso\nInstallers:\n- Architecture: x64\n  InstallerType: {kind}\n  Scope: {scope}\n  InstallerUrl: https://h/setup\n  InstallerSha256: {sha}\n"
+        "PackageIdentifier: Pub.App\nPackageVersion: '1.0'\nPackageName: Contoso App\nPublisher: Contoso\n{root}Installers:\n- Architecture: x64\n  InstallerType: {kind}\n  Scope: {scope}\n  InstallerUrl: https://h/setup\n  InstallerSha256: {sha}\n"
     );
     manifest::parse(yaml.as_bytes()).unwrap()
 }
@@ -550,27 +555,39 @@ fn kindle_items() {
     );
 }
 
+/// `UserFolders` comes from the known folders: an `APPDATA` planted in the environment of a
+/// child process (this test, run again) changes nothing; this binary's environment is never
+/// changed.
 #[cfg(windows)]
 #[test]
 fn user_folders_ignore_planted_appdata() {
     use wingetrs::winget_install::folders_win::user_folders;
+    const CHILD: &str = "WINGETRS_T187_CHILD";
     let root = PathBuf::from(r"C:\dados\wingetrs");
-    let before = user_folders(&root).unwrap();
-    let fake = std::env::temp_dir().join("t187-fake-appdata");
-    let old = std::env::var_os("APPDATA");
-    // SAFETY: only this test changes APPDATA, and it puts it back below.
-    unsafe { std::env::set_var("APPDATA", &fake) };
-    let after = user_folders(&root);
-    match old {
-        // SAFETY: as above.
-        Some(v) => unsafe { std::env::set_var("APPDATA", v) },
-        // SAFETY: as above.
-        None => unsafe { std::env::remove_var("APPDATA") },
+    let mine = user_folders(&root).unwrap();
+    if std::env::var_os(CHILD).is_some() {
+        println!("T187 {}", mine.app_data.display());
+        return;
     }
-    let after = after.unwrap();
-    assert_eq!(after, before);
-    assert_ne!(after.app_data, fake);
-    assert_eq!(after.wingetrs_root, root);
+    assert_eq!(mine.wingetrs_root, root);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "wi_tui::user_folders_ignore_planted_appdata",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env("APPDATA", r"C:\t187-planted\Roaming")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("t187-planted"), "{text}");
+    assert!(
+        text.contains(&format!("T187 {}", mine.app_data.display())),
+        "{text}"
+    );
 }
 
 #[test]
@@ -649,4 +666,194 @@ fn upgrade_native_follows_engine() {
     let mut none = on_installed(vec![row]);
     update(&mut none, key(KeyCode::Enter));
     assert_eq!(menu_items(&none)[0].0, "Atualizar (via winget)");
+}
+
+const EULA: &str = "Agreements:\n- AgreementLabel: EULA\n  AgreementUrl: https://x/eula\n";
+
+fn plan_from(m: &MergedManifest, from: Option<&str>) -> WingetPlan {
+    match plan(
+        m,
+        &host(),
+        ScopeWanted::Prefer(Scope::User),
+        from.map(str::to_string),
+    )
+    .unwrap()
+    {
+        PlanOrBridge::Native(p) => p,
+        PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+    }
+}
+
+fn ctrl_c() -> Msg {
+    Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+}
+
+#[test]
+fn licenses_always_confirm_native() {
+    let with_eula = plan_from(&manifest_with("inno", "user", EULA), None);
+    let mut a = search_app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    update(&mut a, key(KeyCode::Char('i')));
+    update(
+        &mut a,
+        Msg::WingetInstallPlanned {
+            bridge: Ok((bridge_job(), Vec::new())),
+            native: Ok(PlanOrBridge::Native(with_eula.clone())),
+        },
+    );
+    let text = confirm_text(&a);
+    assert!(text.contains("Licença: EULA — https://x/eula"), "{text}");
+    assert_eq!(confirm_actions(&a), vec![Action::WingetInstall(with_eula)]);
+    // Without agreements, "never ask" queues it at once.
+    let plain = plan_from(&manifest_of("inno", "user"), None);
+    let mut q = search_app();
+    q.settings.behavior.confirm = ConfirmMode::Never;
+    update(&mut q, key(KeyCode::Char('i')));
+    assert_eq!(
+        update(
+            &mut q,
+            Msg::WingetInstallPlanned {
+                bridge: Ok((bridge_job(), Vec::new())),
+                native: Ok(PlanOrBridge::Native(plain.clone())),
+            },
+        ),
+        vec![Cmd::Execute(Action::WingetInstall(plain))]
+    );
+
+    // The native upgrade too.
+    let upgrade = plan_from(&manifest_with("inno", "user", EULA), Some("0.9"));
+    let row = ListRow {
+        correlation: Correlation::Matched {
+            source: "winget".into(),
+            package_id: "Pub.App".into(),
+            rule: wingetrs::installed::correlate::Rule::ProductCode,
+        },
+        latest: Some("1.0".into()),
+        state: UpdateState::Available {
+            latest: "1.0".into(),
+        },
+        installed_version: Some("0.9".into()),
+        ..installed_row("Contoso App", "arp/hkcu/Contoso", "arp")
+    };
+    let mut u = on_installed(vec![row]);
+    u.settings.behavior.confirm = ConfirmMode::Never;
+    update(
+        &mut u,
+        Msg::NativeUpgradeLoaded {
+            app_key: "arp/hkcu/Contoso".into(),
+            latest: "1.0".into(),
+            plan: upgrade.clone(),
+        },
+    );
+    update(&mut u, key(KeyCode::Enter));
+    assert!(pick(&mut u, "Atualizar").is_empty());
+    let text = confirm_text(&u);
+    assert!(text.contains("Licença: EULA — https://x/eula"), "{text}");
+    assert_eq!(
+        confirm_actions(&u),
+        vec![Action::WingetUpgrade {
+            plan: upgrade,
+            row_key: "arp/hkcu/Contoso".into(),
+        }]
+    );
+}
+
+#[test]
+fn bridge_reason_toasts_without_confirmation() {
+    let mut a = search_app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    update(&mut a, key(KeyCode::Char('i')));
+    let cmds = update(
+        &mut a,
+        Msg::WingetInstallPlanned {
+            bridge: Ok((bridge_job(), Vec::new())),
+            native: Ok(PlanOrBridge::Bridge("instalador burn".into())),
+        },
+    );
+    assert_eq!(cmds, vec![Cmd::Execute(Action::Bridge(bridge_job()))]);
+    assert!(a.modal.is_none());
+    assert!(
+        a.toasts
+            .iter()
+            .any(|t| t.text == "Pelo winget: instalador burn"),
+        "{:?}",
+        a.toasts.iter().map(|t| &t.text).collect::<Vec<_>>()
+    );
+}
+
+fn running(action: Action) -> App {
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.running = Some(Running {
+        id: 1,
+        label: "x".into(),
+        progress: None,
+        action: Some(action),
+    });
+    a
+}
+
+fn removing(name: &str) -> Msg {
+    Msg::InstallPhase(Phase::Removing { app: name.into() })
+}
+
+#[test]
+fn launched_removal_is_uncancellable() {
+    let plan = UninstallPlan {
+        shared: None,
+        ..kindle_plan(false)
+    };
+    for action in [
+        Action::WingetUninstall(plan.clone()),
+        Action::WingetRegistryOnly(plan),
+        Action::RemoveOrphan(orphan()),
+    ] {
+        let mut a = running(action.clone());
+        assert!(!job_uncancellable(&a), "{action:?}");
+        update(&mut a, removing("Kindle"));
+        assert!(job_uncancellable(&a), "{action:?}");
+        assert!(update(&mut a, ctrl_c()).is_empty());
+        match &a.modal {
+            Some(Modal::ConfirmQuit { text }) => assert_eq!(text, NATIVE_QUIT),
+            _ => panic!("quit dialog not open"),
+        }
+        // A second Ctrl+C does not leave it behind, nor does it cancel anything.
+        assert!(!update(&mut a, ctrl_c()).contains(&Cmd::Quit));
+        let cmds = update(&mut a, key(KeyCode::Enter));
+        assert!(!cmds.contains(&Cmd::CancelNative), "{cmds:?}");
+        assert!(a.quit_after_running);
+    }
+    // Not a native removal: the phase does not lock it.
+    let mut s = running(Action::Bridge(bridge_job()));
+    update(&mut s, removing("7zip"));
+    assert!(!job_uncancellable(&s));
+}
+
+#[test]
+fn quitting_cancels_native_job_before_launch() {
+    use wingetrs::install::executor::LaunchGate;
+    let install = Action::WingetInstall(native("inno", Scope::User));
+    // Downloading: confirming the quit cancels the job's launch gate.
+    let mut a = running(install.clone());
+    assert!(update(&mut a, ctrl_c()).is_empty());
+    assert_eq!(update(&mut a, key(KeyCode::Enter)), vec![Cmd::CancelNative]);
+    // A second Ctrl+C cancels it too, then quits.
+    let mut b = running(install.clone());
+    update(&mut b, ctrl_c());
+    assert_eq!(update(&mut b, ctrl_c()), vec![Cmd::CancelNative, Cmd::Quit]);
+    // Launched: nothing to cancel.
+    let mut c = running(install);
+    update(
+        &mut c,
+        Msg::InstallPhase(Phase::RunningInstaller { name: "x".into() }),
+    );
+    update(&mut c, ctrl_c());
+    assert!(update(&mut c, key(KeyCode::Enter)).is_empty());
+    // Not a native job: never sent.
+    let mut d = running(Action::Bridge(bridge_job()));
+    update(&mut d, ctrl_c());
+    assert!(update(&mut d, key(KeyCode::Enter)).is_empty());
+    // The gate the cancel goes to: once cancelled, the installer is never launched.
+    let gate = LaunchGate::default();
+    assert!(gate.try_cancel());
+    assert!(!gate.try_launch());
 }

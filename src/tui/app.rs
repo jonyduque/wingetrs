@@ -302,6 +302,10 @@ pub const MSIEXEC_NOTE: &str = "Usa o Windows Installer (msiexec /a). Não pode 
 pub const MSIEXEC_QUIT: &str =
     "O Windows Installer ainda está trabalhando; o wingetrs vai esperar ele terminar.";
 
+/// Text of the quit dialog once a native winget installer or uninstaller was launched.
+pub const NATIVE_QUIT: &str =
+    "O instalador ou desinstalador já foi iniciado; o wingetrs vai esperar ele terminar.";
+
 /// Download/extract progress shown while an operation runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunProgress {
@@ -562,6 +566,9 @@ pub enum Cmd {
         keep: bool,
     },
     Execute(Action),
+    /// Cancel the native winget job in progress through its `LaunchGate` (refused once its
+    /// installer launched).
+    CancelNative,
     /// Answer with `Msg::RetryQueue` after `BUSY_RETRY`.
     RetryQueue,
     CleanResidues {
@@ -1850,11 +1857,23 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             if let Some(r) = &mut app.running {
                 // A native winget installer, like `msiexec /a`, cannot be stopped once running;
                 // `WaitingElevation` comes after the launch gate (the elevated one may run).
+                // A native removal announces `Removing` right before its uninstaller (or the
+                // registry deletion) starts: from then on it is not stopped either.
+                let native_removal = matches!(
+                    r.action,
+                    Some(
+                        Action::WingetUninstall(_)
+                            | Action::WingetRegistryOnly(_)
+                            | Action::RemoveOrphan(_)
+                    )
+                );
                 if matches!(
                     phase,
                     crate::install::progress::Phase::RunningInstaller { .. }
                         | crate::install::progress::Phase::WaitingElevation
-                ) {
+                ) || (native_removal
+                    && matches!(phase, crate::install::progress::Phase::Removing { .. }))
+                {
                     app.installer_running = true;
                 }
                 let same = r
@@ -2006,7 +2025,9 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
     let quit_asked = matches!(app.modal, Some(Modal::ConfirmQuit { .. }));
     if ctrl_c && (quit_asked || app.quit_after_running) && !job_uncancellable(app) {
-        return vec![Cmd::Quit];
+        let mut cmds = cancel_native(app);
+        cmds.push(Cmd::Quit);
+        return cmds;
     }
     if app.modal.is_some() {
         return on_modal_key(app, key);
@@ -2341,11 +2362,7 @@ fn row_orphans(r: &ListRow) -> Vec<(usize, Orphan)> {
 /// Asks before removing an orphan record, whatever the `confirm` setting: its one item starts
 /// unchecked.
 fn ask_orphan(app: &mut App, o: Orphan) -> Vec<Cmd> {
-    let action = Action::RemoveOrphan(o);
-    if !needs_confirm(app.settings.behavior.confirm, &action) {
-        return enqueue(app, action);
-    }
-    let modal = confirm_modal(app, vec![action], Vec::new(), None);
+    let modal = confirm_modal(app, vec![Action::RemoveOrphan(o)], Vec::new(), None);
     open_modal(app, modal);
     Vec::new()
 }
@@ -3658,10 +3675,6 @@ fn residue_item(r: &Residue) -> PickerItem {
 
 /// Whether a ready plan asks before executing, per the `confirm` setting.
 pub fn needs_confirm(mode: ConfirmMode, action: &Action) -> bool {
-    // An orphan record is removed only when the user marks it, whatever the setting.
-    if matches!(action, Action::RemoveOrphan(_)) {
-        return true;
-    }
     match mode {
         ConfirmMode::Always => true,
         ConfirmMode::Removals => matches!(
@@ -3755,7 +3768,16 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
     }
     let n = app.queue.len();
     if job_uncancellable(app) {
-        let mut text = MSIEXEC_QUIT.to_string();
+        let native = app
+            .running
+            .as_ref()
+            .and_then(|r| r.action.as_ref())
+            .is_some_and(crate::tui::jobs::is_winget_action);
+        let mut text = if native {
+            NATIVE_QUIT.to_string()
+        } else {
+            MSIEXEC_QUIT.to_string()
+        };
         if n > 0 {
             text.push_str(&format!(" Sair cancela as {n} operações na fila."));
         }
@@ -3782,6 +3804,21 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
     }
     app.modal = Some(Modal::ConfirmQuit { text });
     Vec::new()
+}
+
+/// `Cmd::CancelNative` when the job in progress is a native winget one whose installer has
+/// not launched (its `LaunchGate` then refuses the launch).
+fn cancel_native(app: &App) -> Vec<Cmd> {
+    let native = app
+        .running
+        .as_ref()
+        .and_then(|r| r.action.as_ref())
+        .is_some_and(crate::tui::jobs::is_winget_action);
+    if native && !job_uncancellable(app) {
+        vec![Cmd::CancelNative]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The job in progress launched `msiexec /a`, which cannot be cancelled: quitting waits for
@@ -3946,6 +3983,8 @@ fn on_winget_install_planned(
                 Ok((job, agreements)) => {
                     let action = Action::Bridge(job);
                     if agreements.is_empty() && !needs_confirm(confirm, &action) {
+                        // No confirmation to show the reason in: a toast says it.
+                        app.push_toast(ToastKind::Info, format!("Pelo winget: {why}"));
                         return enqueue(app, action);
                     }
                     let mut notes = vec![format!("Pelo winget: {why}")];
@@ -4308,10 +4347,13 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         }
         Modal::ConfirmQuit { text } => match key.code {
             KeyCode::Enter => {
-                // Quit: the pending ones are dropped, the one in progress is waited for.
+                // Quit: the pending ones are dropped, the one in progress is waited for (a
+                // native winget job not launched yet is cancelled: it never launches).
                 app.queue.clear();
                 app.quit_after_running = true;
-                pump(app)
+                let mut cmds = cancel_native(app);
+                cmds.extend(pump(app));
+                cmds
             }
             KeyCode::Esc => Vec::new(),
             _ => {
