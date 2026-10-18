@@ -5,13 +5,15 @@
 
 use std::collections::BTreeSet;
 
-use super::ops::{InstallReport, WingetCtx, WingetOpsError, install};
+use super::ops::{InstallReport, WingetCtx, WingetOpsError, install, install_locked, lock_install};
 use super::plan::{PlanOrBridge, WingetPlan, plan};
-use super::select::{Host, Refusal, Scope, ScopeWanted};
+use super::select::{Host, Refusal, Scope, ScopeWanted, arch_rank};
 use super::switches::install_args;
 use super::uninstall::{UninstallCtx, UninstallPlan, UninstallStatus, uninstall};
+use super::uninstall_cmd::ArpDetails;
 use crate::config::{DefaultScope, WingetEngine};
 use crate::core::version::Version;
+use crate::installed::Hive;
 use crate::installed::correlate::{InstallScope, ListRow, UpdateState};
 use crate::sources::winget::manifest::{EffectiveInstaller, InstallerKind, MergedManifest};
 
@@ -70,28 +72,121 @@ pub fn upgrade_scope(installed: Option<InstallScope>, default: DefaultScope) -> 
     }
 }
 
+/// What the registry says about the installed app (winget's `CurrentlyInstalledType` and
+/// installed architecture); both optional: unknown means no preference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InstalledFacts {
+    /// winget architecture name of the installed app (`x86`, `x64`).
+    pub arch: Option<&'static str>,
+    pub kind: Option<InstalledKind>,
+}
+
+/// Installer families that replace each other (winget's compatibility sets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledKind {
+    /// inno, nullsoft, exe, burn
+    Exe,
+    /// msi, wix
+    Msi,
+    /// msix, msstore
+    Msix,
+}
+
+// GetCompatibilitySet in winget-cli src/AppInstallerCommonCore/Manifest/ManifestCommon.cpp.
+fn kind_of(k: &InstallerKind) -> Option<InstalledKind> {
+    match k {
+        InstallerKind::Inno
+        | InstallerKind::Nullsoft
+        | InstallerKind::Exe
+        | InstallerKind::Burn => Some(InstalledKind::Exe),
+        InstallerKind::Wix | InstallerKind::Msi => Some(InstalledKind::Msi),
+        InstallerKind::Msix | InstallerKind::Appx | InstallerKind::Msstore => {
+            Some(InstalledKind::Msix)
+        }
+        _ => None,
+    }
+}
+
+/// Facts from the ARP record: the view gives the architecture (HKCU says nothing), the
+/// `WindowsInstaller` value or an `_is1` key name gives the type.
+pub fn installed_facts(d: &ArpDetails) -> InstalledFacts {
+    let kind = if d.windows_installer {
+        Some(InstalledKind::Msi)
+    } else if d.key.to_ascii_lowercase().ends_with("_is1") {
+        Some(InstalledKind::Exe)
+    } else {
+        None
+    };
+    let arch = match d.hive {
+        Hive::MachineX86 => Some("x86"),
+        Hive::MachineX64 => Some("x64"),
+        Hive::User => None,
+    };
+    InstalledFacts { arch, kind }
+}
+
 /// The plan for an upgrade of `installed` to `manifest`. Like winget, installers that say
 /// `UpgradeBehavior: deny` are skipped while another one fits (the denial is final only when
-/// every installer denies), so both engines pick the same installer for the same request.
-// Rule of winget-cli src/AppInstallerCLICore/Workflows/UpdateFlow.cpp (deny) and
-// ManifestComparator.cpp (installed scope); `bridge::winget_applicability` is the other path.
+/// every installer that runs here denies), installers of a type that cannot replace the
+/// installed one are filtered out, and the installed architecture is preferred (an x86 app on
+/// an x64 machine stays x86): both engines pick the same installer for the same request.
+// Rules of winget-cli src/AppInstallerCLICore/Workflows/UpdateFlow.cpp (deny) and
+// src/AppInstallerCommonCore/Manifest/ManifestComparator.cpp (InstalledScopeFilter,
+// InstalledTypeFilter, allowed architectures); `bridge::winget_applicability` is the other path.
 pub fn plan_upgrade(
     manifest: &MergedManifest,
     host: &Host,
     wanted: ScopeWanted,
     installed: &str,
+    facts: &InstalledFacts,
 ) -> Result<PlanOrBridge, Refusal> {
+    let from = Some(installed.to_string());
     let mut kept = manifest.clone();
+    kept.installers
+        .retain(|i| arch_rank(&i.architecture, &host.arch).is_some());
+    if kept.installers.is_empty() {
+        // Nothing runs here: the planner gives the architecture refusal.
+        return plan(manifest, host, wanted, from);
+    }
     kept.installers.retain(|i| {
         !i.upgrade_behavior
             .as_deref()
             .or(manifest.upgrade_behavior.as_deref())
             .is_some_and(|b| b.trim().eq_ignore_ascii_case("deny"))
     });
-    if kept.installers.is_empty() && !manifest.installers.is_empty() {
+    if kept.installers.is_empty() {
         return Err(Refusal(UpgradeError::Denied.to_string()));
     }
-    plan(&kept, host, wanted, Some(installed.to_string()))
+    if let Some(want) = facts.kind {
+        let root = manifest.apps_and_features_entries.as_deref().unwrap_or(&[]);
+        kept.installers.retain(|i| {
+            let own = InstallerKind::parse(
+                i.installer_type
+                    .as_deref()
+                    .or(manifest.installer_type.as_deref()),
+            );
+            let entries = i.apps_and_features_entries.as_deref().unwrap_or(root);
+            kind_of(&own) == Some(want)
+                || entries.iter().any(|e| {
+                    kind_of(&InstallerKind::parse(e.installer_type.as_deref())) == Some(want)
+                })
+        });
+        if kept.installers.is_empty() {
+            return Err(Refusal(
+                "nenhum instalador do catálogo é compatível com o tipo instalado".to_string(),
+            ));
+        }
+    }
+    if let Some(arch) = facts.arch
+        && kept
+            .installers
+            .iter()
+            .any(|i| i.architecture.eq_ignore_ascii_case(arch))
+    {
+        kept.installers
+            .retain(|i| i.architecture.eq_ignore_ascii_case(arch));
+    }
+    plan(&kept, host, wanted, from)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +203,8 @@ pub enum UpgradeError {
     Uninstall(String),
     #[error("a versão anterior não foi removida ({0}); a instalação nova não rodou")]
     NotRemoved(String),
+    #[error("a versão anterior foi removida e a nova não instalou: {0}")]
+    InstallAfterRemoval(WingetOpsError),
     #[error(transparent)]
     Install(#[from] WingetOpsError),
 }
@@ -138,17 +235,9 @@ pub async fn upgrade(
         UpgradeRoute::Denied | UpgradeRoute::InPlace => Ok(install(wctx, plan).await?),
         UpgradeRoute::UninstallFirst => {
             let previous = previous.ok_or(UpgradeError::NoUninstallPlan)?;
-            let report = uninstall(uctx, previous).map_err(UpgradeError::Uninstall)?;
-            if report.status != UninstallStatus::Removed || report.warning.is_some() {
-                return Err(UpgradeError::NotRemoved(
-                    report
-                        .warning
-                        .unwrap_or_else(|| "o registro continua".to_string()),
-                ));
-            }
-            // A fresh install after the removal: no `Upgrade` switch.
+            // A fresh install after the removal: no `Upgrade` switch (built before removing
+            // anything, so a bad command line cannot leave the app removed).
             let mut fresh = plan.clone();
-            fresh.upgrade_from = None;
             if !matches!(
                 fresh.installer.kind,
                 InstallerKind::Msix | InstallerKind::Appx
@@ -163,7 +252,19 @@ pub async fn upgrade(
                     .map_err(WingetOpsError::from)?,
                 );
             }
-            Ok(install(wctx, &fresh).await?)
+            // Removal and install under one `install.lock`: nothing runs in between.
+            let lock = lock_install(&wctx.data.install_layout(), wctx.wait).await?;
+            let report = uninstall(uctx, previous).map_err(UpgradeError::Uninstall)?;
+            if report.status != UninstallStatus::Removed || report.warning.is_some() {
+                return Err(UpgradeError::NotRemoved(
+                    report
+                        .warning
+                        .unwrap_or_else(|| "o registro continua".to_string()),
+                ));
+            }
+            install_locked(wctx, &fresh, &lock)
+                .await
+                .map_err(UpgradeError::InstallAfterRemoval)
         }
     }
 }

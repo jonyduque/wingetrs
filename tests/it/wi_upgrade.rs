@@ -9,7 +9,7 @@ use std::time::Duration;
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
 use wingetrs::bridge::worker::{DeleteReason, InstallerRequest, MachineHive};
 use wingetrs::bridge::{Applicability, host_arch, winget_applicability};
-use wingetrs::cache::{DataDir, sha256_hex};
+use wingetrs::cache::{DataDir, UpdateLock, sha256_hex};
 use wingetrs::config::{DefaultScope, WingetEngine};
 use wingetrs::http::Http;
 use wingetrs::install::executor::LaunchGate;
@@ -20,8 +20,8 @@ use wingetrs::sources::winget::manifest::{self, MergedManifest};
 use wingetrs::update::LockWait;
 use wingetrs::winget_install::elevated_rules::KnownFolders;
 use wingetrs::winget_install::engine::{
-    Engine, UpgradeError, UpgradeRoute, choose_engine, plan_upgrade, upgrade, upgrade_all_targets,
-    upgrade_route, upgrade_scope,
+    Engine, InstalledFacts, InstalledKind, UpgradeError, UpgradeRoute, choose_engine,
+    installed_facts, plan_upgrade, upgrade, upgrade_all_targets, upgrade_route, upgrade_scope,
 };
 use wingetrs::winget_install::launch::{LaunchSpec, Launcher};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
@@ -255,12 +255,17 @@ fn native_agrees_with_winget_applicability() {
     for (label, entries) in cases {
         let m = manifest_with("inno", &entries, URL, SHA, "");
         let fit = winget_applicability(&m, user, host_arch()).applicability;
-        let native_ok =
-            match plan_upgrade(&m, &host(), upgrade_scope(user, DefaultScope::User), "0.9") {
-                Ok(PlanOrBridge::Native(p)) => upgrade_route(&p.installer) != UpgradeRoute::Denied,
-                Ok(PlanOrBridge::Bridge(_)) => panic!("{label}: bridge"),
-                Err(_) => false,
-            };
+        let native_ok = match plan_upgrade(
+            &m,
+            &host(),
+            upgrade_scope(user, DefaultScope::User),
+            "0.9",
+            &InstalledFacts::default(),
+        ) {
+            Ok(PlanOrBridge::Native(p)) => upgrade_route(&p.installer) != UpgradeRoute::Denied,
+            Ok(PlanOrBridge::Bridge(_)) => panic!("{label}: bridge"),
+            Err(_) => false,
+        };
         match fit {
             Applicability::Ok => assert!(native_ok, "{label}: winget accepts, native refuses"),
             Applicability::Denied | Applicability::ScopeMismatch { .. } => {
@@ -280,13 +285,20 @@ struct FakeLauncher {
     label: &'static str,
     events: Events,
     params: Mutex<Vec<String>>,
+    /// Exit code of the launched program.
+    code: i32,
+    /// `install.lock` path: each launch records whether another taker would be turned away.
+    lock_path: PathBuf,
+    lock_held: Mutex<Vec<bool>>,
 }
 
 impl Launcher for FakeLauncher {
     fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32> {
         self.events.lock().unwrap().push(self.label.to_string());
         self.params.lock().unwrap().push(spec.params.clone());
-        Ok(0)
+        let other = UpdateLock::try_acquire(&self.lock_path).unwrap();
+        self.lock_held.lock().unwrap().push(other.is_none());
+        Ok(self.code)
     }
 }
 
@@ -363,8 +375,8 @@ fn user_folders() -> UserFolders {
     }
 }
 
-fn previous_plan() -> UninstallPlan {
-    let d = ArpDetails {
+fn previous_arp() -> ArpDetails {
+    ArpDetails {
         hive: Hive::User,
         key: "App".to_string(),
         display_name: Some("App".to_string()),
@@ -378,7 +390,11 @@ fn previous_plan() -> UninstallPlan {
         bundle_cache_path: None,
         bundle_upgrade_code: None,
         install_location: None,
-    };
+    }
+}
+
+fn previous_plan() -> UninstallPlan {
+    let d = previous_arp();
     plan_uninstall(&d, false, &[], true, &known(), &user_folders(), &|_| false).unwrap()
 }
 
@@ -424,6 +440,9 @@ impl World {
             label,
             events: events.clone(),
             params: Mutex::new(Vec::new()),
+            code: 0,
+            lock_path: data.install_layout().install_lock(),
+            lock_held: Mutex::new(Vec::new()),
         };
         World {
             install: launcher("install"),
@@ -444,6 +463,10 @@ impl World {
     }
 
     async fn run(&self, p: &WingetPlan) -> Result<(), UpgradeError> {
+        self.run_with(p, &previous_plan()).await
+    }
+
+    async fn run_with(&self, p: &WingetPlan, previous: &UninstallPlan) -> Result<(), UpgradeError> {
         let msiexec = self._tmp.path().join("msiexec.exe");
         let wctx = WingetCtx {
             data: &self.data,
@@ -475,9 +498,7 @@ impl World {
             user_expand: &|_: &str| None,
             msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
         };
-        upgrade(&wctx, &uctx, p, Some(&previous_plan()))
-            .await
-            .map(|_| ())
+        upgrade(&wctx, &uctx, p, Some(previous)).await.map(|_| ())
     }
 
     fn events(&self) -> Vec<String> {
@@ -569,4 +590,144 @@ async fn missing_previous_version_is_an_error() {
     let err = w.run(&p).await.unwrap_err();
     assert!(matches!(err, UpgradeError::NoPrevious), "{err}");
     assert!(w.events().is_empty());
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn install_failing_after_removal_says_so() {
+    let mut w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    w.install.code = 1;
+    let p = w.plan(Some("0.9"));
+    let err = w.run(&p).await.unwrap_err();
+    assert!(matches!(err, UpgradeError::InstallAfterRemoval(_)), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("a versão anterior foi removida e a nova não instalou: "),
+        "{err}"
+    );
+    assert_eq!(w.events(), ["uninstall", "wait_key", "install"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removal_and_install_run_under_one_lock() {
+    let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    let p = w.plan(Some("0.9"));
+    w.run(&p).await.unwrap();
+    // Another taker is turned away while the uninstaller runs and while the installer runs.
+    assert_eq!(*w.uninstall.lock_held.lock().unwrap(), [true]);
+    assert_eq!(*w.install.lock_held.lock().unwrap(), [true]);
+    // Released at the end.
+    assert!(
+        UpdateLock::try_acquire(&w.data.install_layout().install_lock())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_error_stops_before_install() {
+    let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    let p = w.plan(Some("0.9"));
+    let mut prev = previous_plan();
+    prev.command = None;
+    let err = w.run_with(&p, &prev).await.unwrap_err();
+    assert!(matches!(err, UpgradeError::Uninstall(_)), "{err}");
+    assert!(w.events().is_empty());
+}
+
+fn arp(hive: Hive, key: &str, msi: bool) -> ArpDetails {
+    let mut d = previous_arp();
+    d.hive = hive;
+    d.key = key.to_string();
+    d.windows_installer = msi;
+    d
+}
+
+#[test]
+fn installed_facts_from_the_registry() {
+    let f = installed_facts(&arp(Hive::MachineX86, "{GUID}", true));
+    assert_eq!((f.arch, f.kind), (Some("x86"), Some(InstalledKind::Msi)));
+    let f = installed_facts(&arp(Hive::MachineX64, "App_is1", false));
+    assert_eq!((f.arch, f.kind), (Some("x64"), Some(InstalledKind::Exe)));
+    let f = installed_facts(&arp(Hive::User, "Other", false));
+    assert_eq!((f.arch, f.kind), (None, None));
+}
+
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// One installer line per `(arch, type, behavior)`; the URL ends with `/<arch>-<type>`.
+fn multi(entries: &[(&str, &str, Option<&str>)]) -> MergedManifest {
+    let mut yaml = "PackageIdentifier: Pub.App\nPackageVersion: '1.0'\nInstallers:\n".to_string();
+    for (arch, kind, behavior) in entries {
+        yaml += &format!("- Architecture: {arch}\n  InstallerType: {kind}\n");
+        if let Some(b) = behavior {
+            yaml += &format!("  UpgradeBehavior: {b}\n");
+        }
+        yaml += &format!(
+            "  InstallerUrl: https://example.invalid/{arch}-{kind}\n  InstallerSha256: {ZERO_SHA}\n"
+        );
+    }
+    manifest::parse(yaml.as_bytes()).unwrap()
+}
+
+fn x64_host() -> Host {
+    Host {
+        arch: "x64".into(),
+        ..host()
+    }
+}
+
+fn upgrade_url(m: &MergedManifest, facts: &InstalledFacts) -> Result<String, Refusal> {
+    let wanted = ScopeWanted::Prefer(Scope::User);
+    match plan_upgrade(m, &x64_host(), wanted, "0.9", facts)? {
+        PlanOrBridge::Native(p) => Ok(p.installer.url),
+        PlanOrBridge::Bridge(w) => panic!("{w}"),
+    }
+}
+
+#[test]
+fn installed_architecture_is_kept() {
+    let m = multi(&[("x64", "inno", None), ("x86", "inno", None)]);
+    // Without facts the native architecture wins; an x86 install stays x86.
+    assert!(
+        upgrade_url(&m, &InstalledFacts::default())
+            .unwrap()
+            .ends_with("/x64-inno")
+    );
+    let x86 = installed_facts(&arp(Hive::MachineX86, "App_is1", false));
+    assert!(upgrade_url(&m, &x86).unwrap().ends_with("/x86-inno"));
+    // An installed architecture the manifest does not offer changes nothing.
+    let arm = InstalledFacts {
+        arch: Some("arm64"),
+        kind: None,
+    };
+    assert!(upgrade_url(&m, &arm).unwrap().ends_with("/x64-inno"));
+}
+
+#[test]
+fn installed_type_filters_installers() {
+    let m = multi(&[("x64", "msi", None), ("x64", "inno", None)]);
+    let facts = |kind| InstalledFacts {
+        arch: None,
+        kind: Some(kind),
+    };
+    assert!(
+        upgrade_url(&m, &facts(InstalledKind::Exe))
+            .unwrap()
+            .ends_with("/x64-inno")
+    );
+    assert!(
+        upgrade_url(&m, &facts(InstalledKind::Msi))
+            .unwrap()
+            .ends_with("/x64-msi")
+    );
+    assert!(upgrade_url(&m, &facts(InstalledKind::Msix)).is_err());
+}
+
+#[test]
+fn deny_is_judged_among_installers_that_run_here() {
+    // The only x64 installer denies; the arm64 one does not run on x64: denied.
+    let m = multi(&[("x64", "inno", Some("deny")), ("arm64", "inno", None)]);
+    let r = upgrade_url(&m, &InstalledFacts::default());
+    assert!(r.unwrap_err().0.contains("não permite atualizar"));
+    let fit = winget_applicability(&m, None, "x64").applicability;
+    assert_eq!(fit, Applicability::Denied);
 }

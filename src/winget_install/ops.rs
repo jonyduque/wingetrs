@@ -127,7 +127,8 @@ fn installer_log(data: &DataDir, plan: &WingetPlan) -> Result<PathBuf, WingetOps
     Ok(data.log_dir().join("installers").join(name))
 }
 
-async fn lock_install(layout: &Layout, wait: LockWait) -> Result<UpdateLock, WingetOpsError> {
+/// Takes `install.lock` (held for a whole flow; `install_locked` runs under it).
+pub async fn lock_install(layout: &Layout, wait: LockWait) -> Result<UpdateLock, WingetOpsError> {
     let path = layout.install_lock();
     let timeout = match wait {
         LockWait::Block(d) => d,
@@ -188,8 +189,18 @@ pub async fn install(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
 ) -> Result<InstallReport, WingetOpsError> {
+    let lock = lock_install(&ctx.data.install_layout(), ctx.wait).await?;
+    install_locked(ctx, plan, &lock).await
+}
+
+/// [`install`] under an `install.lock` the caller already holds (a removal and an install that
+/// must not be interleaved with another operation).
+pub async fn install_locked(
+    ctx: &WingetCtx<'_>,
+    plan: &WingetPlan,
+    _install_lock: &UpdateLock,
+) -> Result<InstallReport, WingetOpsError> {
     let layout = ctx.data.install_layout();
-    let _install_lock = lock_install(&layout, ctx.wait).await?;
     phase(ctx, Phase::Preparing);
     let mut file = fetch_installer(
         ctx.http,

@@ -68,7 +68,7 @@ fn runs_on(arch: &str) -> &'static [&'static str] {
 }
 
 /// 0 = native, 1 = neutral, then the fallbacks in order; `None` = does not run here.
-fn arch_rank(installer: &str, host_arch: &str) -> Option<usize> {
+pub(crate) fn arch_rank(installer: &str, host_arch: &str) -> Option<usize> {
     let list = runs_on(&host_arch.to_ascii_lowercase());
     if installer.eq_ignore_ascii_case("neutral") {
         return Some(1);
