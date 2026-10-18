@@ -1756,10 +1756,12 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::InstallPhase(phase) => {
             if let Some(r) = &mut app.running {
-                // A native winget installer, like `msiexec /a`, cannot be stopped once running.
+                // A native winget installer, like `msiexec /a`, cannot be stopped once running;
+                // `WaitingElevation` comes after the launch gate (the elevated one may run).
                 if matches!(
                     phase,
                     crate::install::progress::Phase::RunningInstaller { .. }
+                        | crate::install::progress::Phase::WaitingElevation
                 ) {
                     app.installer_running = true;
                 }

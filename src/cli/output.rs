@@ -802,10 +802,9 @@ impl Phases {
                 | Phase::Recording
                 | Phase::Removing { .. }
                 | Phase::Scanning
-                | Phase::WaitingElevation
                 | Phase::Verifying => {}
                 // The native installer cannot be cancelled either; it has no log to follow.
-                Phase::RunningInstaller { .. } => {
+                Phase::RunningInstaller { .. } | Phase::WaitingElevation => {
                     main = format!("{spin} {}", phase_status(phase, elapsed));
                 }
             }

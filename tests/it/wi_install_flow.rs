@@ -688,12 +688,18 @@ fn consumers_show_new_phases() {
         assert!(shown.contains(&phase_title(p)), "{shown}");
         assert_eq!(
             shown.contains("não pode ser cancelado"),
-            *p == running,
+            *p != Phase::Verifying,
             "{shown}"
         );
     }
     line.finish();
-    assert!(phase_title(&Phase::WaitingElevation).starts_with("Aguardando o UAC"));
+    assert!(
+        phase_title(&Phase::WaitingElevation)
+            .starts_with("Aguardando o UAC ou o instalador elevado")
+    );
+    assert!(
+        phase_status(&Phase::WaitingElevation, Duration::ZERO).contains("não pode ser cancelado")
+    );
     assert_eq!(
         phase_title(&running),
         "Instalador de X rodando (pode abrir janelas)"
@@ -708,8 +714,11 @@ fn consumers_show_new_phases() {
         progress: None,
         action: None,
     });
-    update(&mut a, Msg::InstallPhase(Phase::WaitingElevation));
+    update(&mut a, Msg::InstallPhase(Phase::Verifying));
     assert!(!a.installer_running);
+    // Sent after the launch gate: the elevated installer may already run.
+    update(&mut a, Msg::InstallPhase(Phase::WaitingElevation));
+    assert!(a.installer_running);
     update(&mut a, Msg::InstallPhase(running));
     assert!(a.installer_running);
     let text = wingetrs::tui::view::running_text(&a, glyphs).unwrap();
@@ -767,4 +776,73 @@ async fn msix_failure_is_an_error() {
     let ctx = ctx!(env);
     let e = install(&ctx, &p).await.unwrap_err();
     assert!(e.to_string().contains("versão mais nova"), "{e}");
+}
+
+#[test]
+fn helper_params_outside_allowlist_go_to_bridge() {
+    let sha = "a".repeat(64);
+    let custom = |c: &str| {
+        format!(
+            "  InstallerSwitches:
+    Custom: '{c}'
+"
+        )
+    };
+    let refused = manifest_of(
+        "inno",
+        Some("machine"),
+        "https://h/s.exe",
+        &sha,
+        &custom("/INVENTED"),
+        "",
+    );
+    match plan(&refused, &host(), ScopeWanted::Prefer(Scope::Machine), None).unwrap() {
+        PlanOrBridge::Bridge(why) => assert_eq!(
+            why,
+            "parâmetros do instalador fora da lista permitida para elevação: /INVENTED"
+        ),
+        PlanOrBridge::Native(p) => panic!("native: {p}"),
+    }
+    let accepted = manifest_of(
+        "inno",
+        Some("machine"),
+        "https://h/s.exe",
+        &sha,
+        &custom("/NOCANCEL"),
+        "",
+    );
+    let p = native(&accepted, Scope::Machine);
+    assert!(p.command.unwrap().args.contains("/NOCANCEL"));
+    // The same custom switch does not matter unelevated.
+    let user = manifest_of(
+        "inno",
+        Some("user"),
+        "https://h/s.exe",
+        &sha,
+        &custom("/INVENTED"),
+        "",
+    );
+    native(&user, Scope::User);
+}
+
+#[tokio::test]
+async fn exit_3010_is_ok_reboot() {
+    let env = Env::new();
+    env.launcher.codes.lock().unwrap().push_back(3010);
+    let (_s, p, _) = served_plan("msi", Some("user"), Scope::User, "", "").await;
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await.unwrap();
+    assert_eq!(r.outcome, Outcome::OkReboot { initiated: false });
+    assert_eq!(env.launcher.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn msix_cancel_before_launch() {
+    let env = Env::new();
+    let (_s, p, _) = served_plan("msix", None, Scope::User, "", "").await;
+    assert!(env.gate.try_cancel());
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await;
+    assert!(matches!(r, Err(WingetOpsError::Cancelled)), "{r:?}");
+    assert_eq!(env.calls(), (0, 0, 0));
 }

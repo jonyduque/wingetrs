@@ -4,6 +4,9 @@
 use super::launch::{Elevation, install_elevation};
 use super::select::{Host, Refusal, ScopeWanted, Verdict, choose};
 use super::switches::{CommandLine, Mode, Program, install_args, mode_for};
+use crate::bridge::worker::{
+    ElevatedKind, InstallerRequest, exe_params_allowed, msi_params_allowed_in,
+};
 use crate::sources::winget::manifest::{
     Agreement, EffectiveInstaller, InstallerKind, MergedManifest,
 };
@@ -65,6 +68,12 @@ pub fn plan(
         )
     };
     let elevation = install_elevation(&inst.kind, inst.scope.as_deref(), inst.elevation.as_deref());
+    if elevation == Elevation::Helper
+        && let Some(cmd) = &command
+        && let Err(why) = helper_accepts(&inst, cmd)
+    {
+        return Ok(PlanOrBridge::Bridge(why));
+    }
     let name = manifest
         .package_name
         .as_deref()
@@ -86,6 +95,99 @@ pub fn plan(
         agreements: manifest.agreements.clone(),
         upgrade_from,
     }))
+}
+
+/// The helper's type for an installer that runs elevated (Task 180); `None` for the others.
+pub fn elevated_kind(kind: &InstallerKind) -> Option<ElevatedKind> {
+    Some(match kind {
+        InstallerKind::Msi => ElevatedKind::Msi,
+        InstallerKind::Wix => ElevatedKind::Wix,
+        InstallerKind::Burn => ElevatedKind::Burn,
+        InstallerKind::Inno => ElevatedKind::Inno,
+        InstallerKind::Nullsoft => ElevatedKind::Nullsoft,
+        InstallerKind::Exe => ElevatedKind::Exe,
+        _ => return None,
+    })
+}
+
+/// Folders the plan lets an install folder parameter point into: none (the helper's
+/// `Program Files` list is not known here), so such parameters go to the bridge.
+const NO_PROGRAM_FILES: &[String] = &[];
+
+/// Runs the helper's own request check (Task 180) on what the plan would send, before
+/// anything is downloaded; the reason (Portuguese) when the helper would refuse it.
+fn helper_accepts(inst: &EffectiveInstaller, cmd: &CommandLine) -> Result<(), String> {
+    let Some(kind) = elevated_kind(&inst.kind) else {
+        return Err(format!(
+            "tipo {} sem auxiliar elevado: instalado pelo winget",
+            inst.kind.name()
+        ));
+    };
+    let sha = inst.sha256.trim().to_ascii_lowercase();
+    let req = InstallerRequest {
+        // Stand-in for the blob path the flow will send (same shape: `...\blobs\<sha>`).
+        source: format!(r"C:\wingetrs\blobs\{sha}"),
+        sha256: sha,
+        file_name: format!("installer.{}", if kind.is_msi() { "msi" } else { "exe" }),
+        kind,
+        params: cmd.args.clone(),
+    };
+    match req.check(NO_PROGRAM_FILES) {
+        Ok(()) => Ok(()),
+        Err(reason) => match refused_token(kind, &cmd.args) {
+            Some(token) => Err(format!("{reason} para elevação: {token}")),
+            None => Err(format!("{reason} (elevação)")),
+        },
+    }
+}
+
+/// `params` split on spaces outside double quotes.
+fn tokens(params: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted) = (None, false);
+    for (i, c) in params.char_indices() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                start.get_or_insert(i);
+            }
+            ' ' if !quoted => {
+                if let Some(s) = start.take() {
+                    out.push(&params[s..i]);
+                }
+            }
+            _ => {
+                start.get_or_insert(i);
+            }
+        }
+    }
+    if let Some(s) = start {
+        out.push(&params[s..]);
+    }
+    out
+}
+
+/// The first token the allowlist turns down: where the accepted prefix stops growing (a
+/// switch that takes the next token as its value is given that token too).
+fn refused_token(kind: ElevatedKind, params: &str) -> Option<String> {
+    let allowed = |p: &str| {
+        if kind.is_msi() {
+            msi_params_allowed_in(p, NO_PROGRAM_FILES)
+        } else {
+            exe_params_allowed(kind, p, NO_PROGRAM_FILES)
+        }
+    };
+    let toks = tokens(params);
+    let prefix = |n: usize| toks[..n].join(" ");
+    let mut ok = 0;
+    for n in 1..=toks.len() {
+        if allowed(&prefix(n)) {
+            ok = n;
+        } else if n > ok + 1 {
+            break;
+        }
+    }
+    toks.get(ok).map(|t| t.to_string())
 }
 
 /// One line of text, at most `max` characters.

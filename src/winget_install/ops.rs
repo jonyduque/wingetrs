@@ -11,11 +11,11 @@ use super::codes::{self, Category, Outcome, UAC_REFUSED};
 use super::fetch::{FetchError, Materialized, fetch_installer};
 use super::launch::{Elevation, LaunchSpec, Launcher, Show};
 use super::msix::{self, MsixOps};
-use super::plan::WingetPlan;
+use super::plan::{WingetPlan, elevated_kind};
 use super::post_check::find_installed;
 use super::switches::{self, ArgsError, CommandLine, Program};
 use crate::bridge::elevated::{ElevatedError, ElevatedRunner};
-use crate::bridge::worker::{ElevatedKind, InstallerRequest};
+use crate::bridge::worker::InstallerRequest;
 use crate::cache::{DataDir, UpdateLock};
 use crate::http::Http;
 use crate::install::download::Progress;
@@ -159,18 +159,6 @@ fn verify(_file: &mut Materialized) -> Result<(), FetchError> {
     ))
 }
 
-fn elevated_kind(kind: &InstallerKind) -> Option<ElevatedKind> {
-    Some(match kind {
-        InstallerKind::Msi => ElevatedKind::Msi,
-        InstallerKind::Wix => ElevatedKind::Wix,
-        InstallerKind::Burn => ElevatedKind::Burn,
-        InstallerKind::Inno => ElevatedKind::Inno,
-        InstallerKind::Nullsoft => ElevatedKind::Nullsoft,
-        InstallerKind::Exe => ElevatedKind::Exe,
-        _ => return None,
-    })
-}
-
 /// Installer types whose runs go through the Windows Installer queue (1618 retried).
 fn queued(kind: &InstallerKind) -> bool {
     matches!(
@@ -191,6 +179,11 @@ struct Ran {
 }
 
 /// Downloads, verifies and runs the plan's installer, then looks for the installed app.
+///
+/// Blocks its thread while the installer runs (locks, launcher, helper, package manager are
+/// synchronous): call it only from a dedicated thread or `block_on` there — the TUI runs jobs
+/// in `spawn_blocking` + `Handle::block_on`, the CLI with `block_on` — never from a task
+/// sharing the runtime's worker threads.
 pub async fn install(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
