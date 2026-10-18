@@ -302,3 +302,104 @@ fn bucket_remove_deletes_scripts_dir() {
     assert!(!data.buckets_dir().join("x").exists());
     assert!(data.buckets_dir().join("main").join("scripts").is_dir());
 }
+
+#[test]
+fn marker_is_removed_before_the_swap_starts() {
+    let d = tempfile::tempdir().unwrap();
+    let scripts = d.path().join("scripts");
+    std::fs::create_dir_all(&scripts).unwrap();
+    std::fs::write(scripts.join("old.reg"), b"O").unwrap();
+    std::fs::write(d.path().join(".scripts-ok"), b"").unwrap();
+    std::fs::write(d.path().join(".scripts-new-T"), b"in the way").unwrap();
+    assert!(write_scripts(d.path(), &new_files(), "T").is_err());
+    assert!(!d.path().join(".scripts-ok").exists());
+    assert_eq!(std::fs::read(scripts.join("old.reg")).unwrap(), b"O");
+}
+
+#[test]
+fn stale_staging_of_other_tags_is_removed() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join(".scripts-old-111")).unwrap();
+    std::fs::create_dir_all(d.path().join(".scripts-new-222").join("x")).unwrap();
+    write_scripts(d.path(), &new_files(), "T").unwrap();
+    assert!(leftovers(d.path()).is_empty());
+}
+
+#[test]
+fn duplicates_and_file_dir_conflicts_are_skipped_rest_kept() {
+    let reg = tar::EntryType::Regular;
+    let tgz = tarball(&[
+        ("Main-master/scripts/A.reg", reg, b"1", None),
+        ("Main-master/scripts/a.reg", reg, b"2", None),
+        ("Main-master/scripts/A.reg", reg, b"3", None),
+        ("Main-master/scripts/d", reg, b"4", None),
+        ("Main-master/scripts/d/f", reg, b"5", None),
+        ("Main-master/scripts/e/f", reg, b"6", None),
+        ("Main-master/scripts/e", reg, b"7", None),
+        ("Main-master/scripts/ok.reg", reg, b"8", None),
+    ]);
+    let imp = read_tarball(&tgz).unwrap();
+    let got: Vec<&str> = imp.scripts.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(got, vec!["A.reg", "d", "e/f", "ok.reg"]);
+    assert_eq!(imp.skipped.len(), 4, "{:?}", imp.skipped);
+}
+
+#[test]
+fn skipped_notes_are_capped() {
+    let names: Vec<String> = (0..2005)
+        .map(|i| format!("Main-master/scripts/aux{i}/../x"))
+        .collect();
+    let items: Vec<Item<'_>> = names
+        .iter()
+        .map(|n| (n.as_str(), tar::EntryType::Regular, &b"x"[..], None))
+        .collect();
+    let imp = read_tarball(&tarball(&items)).unwrap();
+    assert_eq!(imp.skipped.len(), 2001);
+    assert_eq!(imp.skipped.last().unwrap(), "scripts: mais 5 ignorados");
+}
+
+#[tokio::test]
+async fn missing_marker_downloads_even_when_the_bucket_is_fresh() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/main.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(TGZ.to_vec()))
+        .mount(&s)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let url = format!("{}/main.tgz", s.uri());
+    let mut st = HttpState::default();
+    st.set(
+        &url,
+        HttpEntry {
+            etag: Some("\"s1\"".into()),
+            checked_at: wingetrs::cache::now_unix(),
+            ..Default::default()
+        },
+    );
+    st.save(&data.http_state_path()).unwrap();
+    let ep = Endpoints {
+        winget_index: format!("{}/w.msix", s.uri()),
+        scoop: vec![("main".into(), url)],
+    };
+    run_update(
+        &data,
+        &ep,
+        &Http::new().unwrap(),
+        false,
+        LockWait::from_env(),
+    )
+    .await
+    .unwrap();
+    let n = s
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/main.tgz")
+        .count();
+    assert_eq!(n, 1);
+    assert!(data.buckets_dir().join("main").join(".scripts-ok").exists());
+}

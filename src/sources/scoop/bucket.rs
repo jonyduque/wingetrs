@@ -17,6 +17,16 @@ pub struct BucketImport {
 
 const MAX_SCRIPT_FILES: usize = 2000;
 const MAX_SCRIPT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SCRIPT_NOTES: usize = 2000;
+
+/// Notes a skipped script, up to a cap; the excess is only counted.
+fn note_skipped(skipped: &mut Vec<String>, overflow: &mut usize, note: String) {
+    if skipped.len() < MAX_SCRIPT_NOTES {
+        skipped.push(note);
+    } else {
+        *overflow += 1;
+    }
+}
 
 pub fn bucket_url(bucket: &str) -> Result<&'static str, ScoopError> {
     match bucket {
@@ -59,6 +69,10 @@ pub fn read_tarball(tar_gz: &[u8]) -> Result<BucketImport, ScoopError> {
     let mut scripts: Vec<(String, Vec<u8>)> = Vec::new();
     let mut script_bytes = 0u64;
     let mut limit_hit = false;
+    let mut overflow = 0usize;
+    // Lowercased paths already taken (Windows is case-insensitive) and their parent folders.
+    let mut seen_files = std::collections::HashSet::new();
+    let mut seen_dirs = std::collections::HashSet::new();
     let entries = archive
         .entries()
         .map_err(|e| ScoopError::Tar(e.to_string()))?;
@@ -76,14 +90,25 @@ pub fn read_tarball(tar_gz: &[u8]) -> Result<BucketImport, ScoopError> {
                     continue;
                 }
                 if !kind.is_file() {
-                    skipped.push(format!("scripts/{rel}"));
+                    note_skipped(&mut skipped, &mut overflow, format!("scripts/{rel}"));
                     continue;
                 }
                 let Some(parts) = safe_components(rel) else {
-                    skipped.push(format!("scripts/{rel}"));
+                    note_skipped(&mut skipped, &mut overflow, format!("scripts/{rel}"));
                     continue;
                 };
                 if parts.is_empty() {
+                    continue;
+                }
+                let lower: Vec<String> = parts.iter().map(|p| p.to_lowercase()).collect();
+                let full = lower.join("/");
+                let prefixes: Vec<String> =
+                    (1..lower.len()).map(|n| lower[..n].join("/")).collect();
+                if seen_files.contains(&full)
+                    || seen_dirs.contains(&full)
+                    || prefixes.iter().any(|p| seen_files.contains(p))
+                {
+                    note_skipped(&mut skipped, &mut overflow, format!("scripts/{rel}"));
                     continue;
                 }
                 let size = entry.size();
@@ -102,6 +127,8 @@ pub fn read_tarball(tar_gz: &[u8]) -> Result<BucketImport, ScoopError> {
                     .read_to_end(&mut buf)
                     .map_err(|e| ScoopError::Tar(e.to_string()))?;
                 script_bytes += buf.len() as u64;
+                seen_files.insert(full);
+                seen_dirs.extend(prefixes);
                 scripts.push((parts.join("/"), buf));
             }
             continue;
@@ -116,6 +143,9 @@ pub fn read_tarball(tar_gz: &[u8]) -> Result<BucketImport, ScoopError> {
             Ok(p) => packages.push(p),
             Err(_) => skipped.push(file),
         }
+    }
+    if overflow > 0 {
+        skipped.push(format!("scripts: mais {overflow} ignorados"));
     }
     Ok(BucketImport {
         packages,
@@ -157,6 +187,13 @@ pub fn write_scripts(
     let new_dir = bucket_dir.join(format!(".scripts-new-{tag}"));
     let old_dir = bucket_dir.join(format!(".scripts-old-{tag}"));
     let live = bucket_dir.join("scripts");
+    // Drop the marker first: from here until the swap is done, `scripts/` may be missing.
+    match std::fs::remove_file(bucket_dir.join(".scripts-ok")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    remove_stale_staging(bucket_dir, &[&new_dir, &old_dir]);
     let result = stage_and_swap(bucket_dir, files, &new_dir, &old_dir, &live);
     if result.is_err() {
         // A leftover that is not a directory (or not ours) is left alone by remove_dir_all.
@@ -164,6 +201,22 @@ pub fn write_scripts(
         return result;
     }
     std::fs::write(bucket_dir.join(".scripts-ok"), b"")
+}
+
+/// Removes `.scripts-new-*`/`.scripts-old-*` left by a dead run (other tags). Best effort.
+fn remove_stale_staging(bucket_dir: &Path, keep: &[&Path]) {
+    let Ok(rd) = std::fs::read_dir(bucket_dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let p = e.path();
+        if (name.starts_with(".scripts-new-") || name.starts_with(".scripts-old-"))
+            && !keep.contains(&p.as_path())
+        {
+            let _ = std::fs::remove_dir_all(&p).or_else(|_| std::fs::remove_file(&p));
+        }
+    }
 }
 
 fn stage_and_swap(
@@ -194,8 +247,8 @@ fn stage_and_swap(
         crate::fs_retry::retry("renomear", live, || std::fs::rename(live, old_dir))?;
     }
     if let Err(e) = crate::fs_retry::retry("renomear", new_dir, || std::fs::rename(new_dir, live)) {
-        if had_old {
-            let _ = std::fs::rename(old_dir, live);
+        if had_old && let Err(r) = std::fs::rename(old_dir, live) {
+            tracing::warn!(error = %r, "could not restore the old scripts folder");
         }
         return Err(e);
     }

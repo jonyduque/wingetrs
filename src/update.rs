@@ -220,14 +220,16 @@ pub async fn run_update(
 
     let fetches = jobs.iter().map(|job| {
         let mut prev = state.get(job.url).cloned();
+        let mut missing_marker = false;
         // Without the marker the stored `scripts/` is missing or incomplete: refetch the tarball.
         if let Some(dir) = job.bucket.and_then(|b| bucket_dir(data, b)) {
             let marker = dir.join(".scripts-ok");
             if !marker.exists() {
                 prev = None;
+                missing_marker = true;
             }
         }
-        let skip = !force && !needs_refresh(&state, &[job.url], now);
+        let skip = !force && !missing_marker && !needs_refresh(&state, &[job.url], now);
         let span = tracing::debug_span!("update.fetch", source = %job.source);
         async move {
             if skip {

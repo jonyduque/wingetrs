@@ -451,6 +451,12 @@ fn seed_state_and_index(data: &DataDir, ep: &Endpoints, checked_at: i64) {
             },
         );
     }
+    // A bucket without the scripts marker is refetched even when fresh.
+    for (b, _) in &ep.scoop {
+        let dir = data.buckets_dir().join(b);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".scripts-ok"), b"").unwrap();
+    }
     st.save(&data.http_state_path()).unwrap();
     wingetrs::catalog::index_file::write(
         &Catalog::open_in_memory().unwrap(),
