@@ -1035,5 +1035,5 @@ Testes (`tests/it/wi_portable.rs`, wiremock + zip montado no teste):
 4. Escopo na ponte: **resolvido na Task 176** (passa `--scope machine` quando o Ajustes pede; sem instalador para máquina ⇒ uma tentativa sem `--scope`, com aviso).
 5. `upgrade --all`: continua só com apps do wingetrs (BACKLOG).
 6. `--location`: fora desta fase.
-7. Ambiente elevado: **saneado na Task 180** (`TEMP`/`TMP` na pasta de execução protegida).
+7. Ambiente elevado: **lista branca na Task 180** (revisão de segurança): nada herdado do usuário; variáveis só de KnownFolder e constantes, PATH só de pastas do sistema, `TEMP`/`TMP` na pasta de execução protegida. Propriedades MSI por lista fechada; parâmetros de outros tipos sem caminho fora da pasta de execução.
 8. Task 189: **aguarda o usuário** (proposta: fazer depois da 188, sempre ligada, com o motor nativo).
