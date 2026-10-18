@@ -330,6 +330,61 @@ Installers:
         winget_applicability(&m, user, host_arch()).applicability,
         Applicability::Ok
     ));
+
+    // The only arch-compatible installer is unsupported here and a second one (other
+    // architecture) is denied: native and bridge must give the same answer (not Ok).
+    let other = "neutral";
+    let a = host_arch();
+    let yaml = [
+        "PackageIdentifier: Pub.App
+PackageVersion: '1.0'
+Installers:
+"
+        .to_string(),
+        format!(
+            "- Architecture: {a}
+  InstallerType: inno
+"
+        ),
+        format!(
+            "  InstallerUrl: {URL}
+  InstallerSha256: {SHA}
+"
+        ),
+        format!(
+            "  UnsupportedOSArchitectures:
+  - {a}
+"
+        ),
+        format!(
+            "- Architecture: {other}
+  InstallerType: inno
+"
+        ),
+        format!(
+            "  UpgradeBehavior: deny
+  InstallerUrl: {URL}
+  InstallerSha256: {SHA}
+"
+        ),
+    ]
+    .concat();
+    let m = manifest::parse(yaml.as_bytes()).unwrap();
+    let denied_only = manifest_with("inno", &[(None, Some("deny"))], URL, SHA, "");
+    let refusal = |m: &MergedManifest| match plan_upgrade(
+        m,
+        &host(),
+        upgrade_scope(user, DefaultScope::User),
+        "0.9",
+        &InstalledFacts::default(),
+    ) {
+        Err(e) => e.0,
+        Ok(_) => panic!("native accepts"),
+    };
+    // the unsupported installer is dropped before the deny rule: the answer is "denied"
+    assert_eq!(refusal(&m), refusal(&denied_only));
+    let fit = winget_applicability(&m, user, host_arch()).applicability;
+    assert!(matches!(fit, Applicability::Denied), "bridge: {fit:?}");
 }
 
 // ---- upgrade flow ----

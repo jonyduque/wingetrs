@@ -11,7 +11,7 @@ use super::ops::{
 };
 use super::plan::{PlanOrBridge, WingetPlan, plan};
 use super::post_check::version_warning;
-use super::select::{Host, Refusal, Scope, ScopeWanted, arch_rank};
+use super::select::{Host, Refusal, Scope, ScopeWanted, arch_applicable};
 use super::switches::install_args;
 use super::uninstall::{MsiQueue, UninstallCtx, UninstallPlan, UninstallStatus, uninstall_queued};
 use super::uninstall_cmd::ArpDetails;
@@ -177,8 +177,17 @@ pub fn plan_upgrade(
 ) -> Result<PlanOrBridge, Refusal> {
     let from = Some(installed.to_string());
     let mut kept = manifest.clone();
-    kept.installers
-        .retain(|i| arch_rank(&i.architecture, &host.arch).is_some());
+    kept.installers.retain(|i| {
+        let unsupported = i
+            .unsupported_os_architectures
+            .as_ref()
+            .or(manifest.unsupported_os_architectures.as_ref());
+        arch_applicable(
+            &i.architecture,
+            unsupported.map_or(&[], Vec::as_slice),
+            &host.arch,
+        )
+    });
     if kept.installers.is_empty() {
         // Nothing runs here: the planner gives the architecture refusal.
         return plan(manifest, host, wanted, from);
