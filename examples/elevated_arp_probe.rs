@@ -81,6 +81,7 @@ mod probe {
             program: &Path,
             _args: &str,
             also_checked: &[PathBuf],
+            _on_line: &mut dyn FnMut(&str),
         ) -> std::io::Result<i32> {
             let mut all = vec![program.to_path_buf()];
             all.extend_from_slice(also_checked);
