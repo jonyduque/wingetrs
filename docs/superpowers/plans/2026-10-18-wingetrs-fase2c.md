@@ -1220,3 +1220,52 @@ Testes:
 3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `docs(report): phase 2c validation (oracle before/after, script host cost)`
+
+### Task 164: `$global` constante e blocos `if ($global)` informativos (opção E)
+
+**Modelo:** opus (revisor opus). Decisão do usuário em 2026-10-18, depois da Task 163 (relatório `docs/superpowers/reports/2026-10-18-fase2c-validacao.md`, seção 3).
+
+#### Where this fits
+
+- `src/install/runner.rs`: `runner_ps1` (~:205) grava `$global = $false` como linha comum (vem de `put("global", VarValue::Bool(false))`, ~:103) e roda o hook com `Invoke-Command ([scriptblock]::Create($__wr_hook))` (escopo filho).
+- `src/install/prelude.ps1`: funções com parâmetro `$global` (`appsdir`, `shimdir`, `modulesdir`, `appdir`, `versiondir`, `currentdir`, `persistdir`, `installed`, `env`, ~:42–112 e ~:504) e com `[switch]$Global` (~:82, ~:417, ~:430, ~:445, ~:473); todas jogam erro se o valor for verdadeiro.
+- `src/install/script_scan.rs`: `scan` (~:433) e `line_rules` (~:542) aplicam as regras linha a linha sobre o texto sem comentários e sem here-strings, e de novo sobre a linha crua (fail closed, ~:515).
+- Testes existentes: `tests/it/script_scan.rs` (`global_switch_refused` ~:77, `global_passthrough_only_with_the_exact_variable` ~:481), `tests/it/script_runner.rs`, `tests/it/prelude_core.rs`.
+- Oráculo: `examples/oracle_2c.rs` (Task 163: 1318/1403 planejam, 77 recusados, 38 só por código dentro de `if ($global)`).
+
+**Sonda do orquestrador (2026-10-18, pwsh 7.6 e PowerShell 5.1):** com `Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global`, 14 formas de mudar o valor (atribuição, `$script:`/`$local:`/`$global:`, `${global}`, `Set-Variable -Force`, `-Scope Local`, `New-Variable -Force`, `Remove-Variable -Force`, `iex`, escopo aninhado, `Invoke-Command` de scriptblock, provider `variable:`, `foreach ($global in ...)`) dão erro ou deixam `False`. **Mas** qualquer função com parâmetro chamado `global` passa a dar erro na chamada (mesmo com `$false` ou sem argumento). Com `[Alias('global')]` num parâmetro de outro nome (`$__wr_g`), `f 'x' $global`, `f 'x' -global $global`, `sw -Global:$global` e `sw -Global` funcionam (a variável dentro da função é `$__wr_g`). Sem `AllScope`, `$global = $true` no escopo filho cria outra variável e o bloco roda: `AllScope` é obrigatório.
+
+#### What binds this task
+
+1. **Runner:** `$global` deixa de ser linha comum. `runner_ps1` grava, antes do dot-source do prelúdio, `Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global` (e não grava mais `$global = $false`). Os outros nomes do contrato não mudam.
+2. **Prelúdio:** todo parâmetro `$global`/`$Global` do `prelude.ps1` vira `[Alias('global')]$__wr_g` (ou `[Alias('Global')][switch]$__wr_gs` nos switches), mantendo a posição; o corpo testa a variável nova e continua jogando o mesmo erro se for verdadeira. Nenhum `$global` como parâmetro, laço ou atribuição sobra no prelúdio (teste que lê o texto).
+3. **Portão:** `scan` acha os blocos `if (<cond>) { ... }` (e `elseif (<cond>) { ... }`) cuja condição é exatamente `$global` ou começa com `$global -and ` (sem diferenciar maiúsculas; espaços livres). As linhas **dentro** desses blocos geram `Flag` com `verdict: Confirm` e `detail` "só roda em instalação global; não roda no wingetrs (<motivo original>)", em vez do veredito original. O `else` e tudo fora do bloco continuam com as regras de hoje.
+4. **Fail closed:** se o portão não consegue delimitar o bloco com certeza (chave de abertura fora da mesma linha da condição ou da seguinte, chaves desbalanceadas, here-string, string ou comentário com `{`/`}` dentro do bloco, condição com `-or`, `-not`, `!`, parênteses extras), o bloco **não** é tratado como morto: as linhas seguem as regras de hoje.
+5. **Portão, novas recusas:** o script do manifesto que **declara** parâmetro, laço (`foreach ($global`), `param(... $global ...)` ou função com parâmetro `global` recebe `Flag` `Refuse` com detail "usa `$global` como nome próprio (incompatível com o `$global` fixo do wingetrs)". Atribuição a `global` já cai no erro do PowerShell; não precisa de regra, mas meça no oráculo quantos manifestos a teriam.
+6. **Oráculo:** rode `oracle_2c` de novo; relate no relatório da tarefa o novo total que planeja (esperado ~1356/1403, +38 da Task 163) e quantos caem na regra do item 5. Se o número divergir de +38, explique cada diferença.
+
+#### Tests (literais)
+
+- `runner_global_is_constant`: o texto de `runner_ps1` contém `Set-Variable -Name global -Value $false -Option Constant,AllScope -Scope Global` antes da linha do dot-source e não contém `$global = `.
+- `prelude_has_no_global_parameter`: nenhuma linha do `prelude.ps1` casa `(?i)\$global\b` fora de `[Alias('global')]`/`[Alias('Global')]` e de comentários.
+- `global_block_is_informational`: `if ($global) { $c = $c -replace 'HKEY_CURRENT_USER', 'HKEY_LOCAL_MACHINE' }` ⇒ veredito do relatório `Confirm`, um `Flag` com detail começando por "só roda em instalação global".
+- `global_block_multiline`: o mesmo com `if ($global) {` numa linha, o corpo na seguinte e `}` na terceira.
+- `global_block_else_still_scanned`: `if ($global) { ... } else { Set-ItemProperty 'HKLM:\Software\X' ... }` ⇒ `Refuse` pela linha do `else`.
+- `global_and_condition`: `if ($global -and $x) { HKLM... }` ⇒ informativo; `if ($global -or $x) { HKLM... }` ⇒ `Refuse`; `if (!$global) { HKLM... }` ⇒ `Refuse`.
+- `global_block_unbalanced_fails_closed`: `if ($global) { "}" ; HKLM... }` (chave dentro de string) ⇒ `Refuse`.
+- `own_global_parameter_refused`: `function f($global) { }` e `foreach ($global in $a) { }` ⇒ `Refuse` com o detail do item 5.
+- `#[ignore = "live: pwsh"] constant_global_blocks_reassignment` em `tests/it/script_host_live.rs`: runner real com hook `$global = $true; if ($global) { New-Item (Join-Path $dir 'RAN') }` ⇒ o hook falha e o arquivo `RAN` não existe na pasta temporária.
+
+Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) trocar `Constant,AllScope` por `Constant` no runner; (b) aceitar `-or` como condição de bloco morto; (c) desligar o fail closed da chave dentro de string.
+
+**Files:**
+- Modify: `src/install/runner.rs`, `src/install/prelude.ps1`, `src/install/script_scan.rs`, `examples/oracle_2c.rs`
+- Test: `tests/it/script_scan.rs`, `tests/it/script_runner.rs`, `tests/it/prelude_core.rs`, `tests/it/script_host_live.rs`
+
+#### Checks beyond the steps
+
+1. Os testes do prelúdio que já existem (grupos 1–3) passam sem mudar asserção.
+2. Saída real do oráculo colada no relatório.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(scripts): constant $global and informational if ($global) blocks`
