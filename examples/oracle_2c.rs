@@ -10,7 +10,7 @@ use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
 use wingetrs::install::classify_2c::{SubCase, classify, script_commands};
 use wingetrs::install::manifest::{Arch, resolve};
-use wingetrs::install::script_scan::{SCOOP_FUNCTIONS, Verdict, scan_manifest};
+use wingetrs::install::script_scan::{FlagKind, SCOOP_FUNCTIONS, Verdict, scan_manifest};
 
 /// Approved verbs (`Get-Verb`, PowerShell 7.6.7): `Verb-Noun` with one of them counts as a
 /// cmdlet when it is not a Scoop function.
@@ -334,6 +334,8 @@ struct Gate {
     by_verdict: [BTreeMap<Verdict, usize>; 2],
     /// Flag kind -> manifests with it (`supported = SCOOP_FUNCTIONS`).
     kinds: BTreeMap<String, usize>,
+    /// Manifests whose verdict rises only because of `HiddenCode` flags.
+    hidden_changed: [usize; 2],
 }
 
 impl Gate {
@@ -352,6 +354,16 @@ impl Gate {
                 .max()
                 .unwrap_or(Verdict::Confirm);
             *self.by_verdict[i].entry(verdict).or_default() += 1;
+            let without_hidden = reports
+                .iter()
+                .flat_map(|(_, r)| r.flags.iter())
+                .filter(|f| f.kind != FlagKind::HiddenCode)
+                .map(|f| f.verdict)
+                .max()
+                .unwrap_or(Verdict::Confirm);
+            if without_hidden != verdict {
+                self.hidden_changed[i] += 1;
+            }
             if i == 1 {
                 let kinds: BTreeSet<String> = reports
                     .iter()
@@ -367,34 +379,32 @@ impl Gate {
     fn print(&self) {
         let resolved = self.total - self.unresolved;
         println!(
-            "
-## Veredito do portão estático (`script_scan`, Task 150)
-
-{} manifestos S-hook; {} não resolvem para x64 e ficam de fora. Veredito do manifesto = o pior entre os seus scripts. Nada foi executado.
-",
+            "\n## Veredito do portão estático (`script_scan`, Task 150)\n\n{} manifestos S-hook; {} não resolvem para x64 e ficam de fora. Veredito do manifesto = o pior entre os seus scripts. Nada foi executado. Última coluna: manifestos cujo veredito sobe só por `HiddenCode` (regra de recusa vista apenas em comentário ou here-string).\n",
             self.total, self.unresolved
         );
-        println!("| funções do Scoop suportadas | Confirm | ConfirmStrong | Refuse |");
-        println!("|---|---:|---:|---:|");
+        println!(
+            "| funções do Scoop suportadas | Confirm | ConfirmStrong | Refuse | mudam por HiddenCode |"
+        );
+        println!("|---|---:|---:|---:|---:|");
         let labels = [
             "nenhuma (`&[]`)".to_string(),
             format!("todas ({})", SCOOP_FUNCTIONS.len()),
         ];
-        for (label, tally) in labels.iter().zip(&self.by_verdict) {
+        for ((label, tally), changed) in
+            labels.iter().zip(&self.by_verdict).zip(self.hidden_changed)
+        {
             let col = |v: Verdict| pct(tally.get(&v).copied().unwrap_or(0), resolved);
             println!(
-                "| {label} | {} | {} | {} |",
+                "| {label} | {} | {} | {} | {} |",
                 col(Verdict::Confirm),
                 col(Verdict::ConfirmStrong),
-                col(Verdict::Refuse)
+                col(Verdict::Refuse),
+                pct(changed, resolved)
             );
         }
         let mut kinds: Vec<(&String, &usize)> = self.kinds.iter().collect();
         kinds.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        println!(
-            "
-| flag (com todas as funções suportadas) | manifestos |"
-        );
+        println!("\n| flag (com todas as funções suportadas) | manifestos |");
         println!("|---|---:|");
         for (k, n) in kinds {
             println!("| {k} | {} |", pct(*n, resolved));

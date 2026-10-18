@@ -56,8 +56,15 @@ fn hklm_refused() {
 #[test]
 fn hklm_in_comment_ignored() {
     let r = scan("# HKLM:\\x\nRemove-Item x", SUP);
-    assert_eq!(r.verdict, Verdict::Confirm, "{:?}", kinds(&r));
-    assert!(r.flags.is_empty());
+    // Fails closed (review of ce3af24): a refusal rule seen only inside a comment asks
+    // for a strong confirmation, never a refusal.
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", kinds(&r));
+    assert_eq!(kinds(&r), vec![FlagKind::HiddenCode]);
+    assert_eq!(
+        r.flags[0].detail,
+        "possível código escondido em comentário ou here-string: mexe no registro da máquina (HKLM)"
+    );
+    assert_eq!(r.flags[0].line, 1);
 }
 
 #[test]
@@ -365,8 +372,8 @@ fn near_misses_not_flagged() {
         "Write-Host 'Index 1'",
         "$global:x = 1",
         r#"Get-Thing -Path "$persist_dir\bin" -Global:$Global -Force"#,
-        "Remove-Item x # HKLM:\\y",
-        "<# iex\nHKLM:\\x #>\nRemove-Item x",
+        "Remove-Item x # iex",
+        "<# iex\nInvoke-WebRequest #>\nRemove-Item x",
         "Write-Host \"#notacomment iex\"",
     ] {
         let r = scan(s, SUP);
@@ -379,6 +386,45 @@ fn near_misses_not_flagged() {
     // `#` inside a string is not a comment: the string content still counts.
     let r = scan("Write-Host \"#notacomment iex\"", SUP);
     assert!(has(&r, FlagKind::DynamicCode));
+}
+
+#[test]
+fn refusal_hidden_in_here_string_is_strong_not_refuse() {
+    let r = scan("$t = @'\nHKLM:\\x\n'@\nSet-Content \"$dir\\a.reg\" $t", SUP);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", kinds(&r));
+    assert_eq!(kinds(&r), vec![FlagKind::HiddenCode]);
+    assert_eq!(r.flags[0].line, 2);
+}
+
+#[test]
+fn hash_bypass_still_refused_without_hidden_flag() {
+    let r = scan(
+        "$x =#@'\nStart-Process \"$dir\\x.exe\" -Verb RunAs\n'@'",
+        SUP,
+    );
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", kinds(&r));
+    assert!(!has(&r, FlagKind::HiddenCode), "{:?}", kinds(&r));
+    // Same rule in the clean line and in a trailing comment: one refusal, no hidden flag.
+    let r = scan("Set-ItemProperty 'HKLM:\\X' a 1 # HKLM:", SUP);
+    assert_eq!(kinds(&r), vec![FlagKind::Hklm]);
+}
+
+#[test]
+fn ambiguous_comment_start_fails_closed() {
+    // Whether `<#` glued to a word opens a block comment is ambiguous; the stripper
+    // hides the RunAs line, the raw text still shows it.
+    let r = scan("Get-Thing a<#b\nStart-Process x -Verb RunAs", SUP);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", kinds(&r));
+    let f = r
+        .flags
+        .iter()
+        .find(|f| f.kind == FlagKind::HiddenCode)
+        .unwrap();
+    assert_eq!(
+        f.detail,
+        "possível código escondido em comentário ou here-string: pede elevação (RunAs/sudo)"
+    );
+    assert_eq!(f.line, 2);
 }
 
 #[test]

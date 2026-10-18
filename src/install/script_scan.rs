@@ -298,6 +298,8 @@ pub enum FlagKind {
     RegistryUser,
     ScheduledTaskOrService,
     AbsolutePath,
+    /// A refusal rule that matches only with comments and here-strings kept.
+    HiddenCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +415,7 @@ const D_DOWNLOAD: &str = "baixa arquivos da internet por conta própria";
 const D_REG_USER: &str = "mexe no registro do usuário (HKCU ou reg)";
 const D_TASK: &str = "cria ou mexe em tarefa agendada ou serviço do Windows";
 const D_ABSOLUTE: &str = "caminho absoluto fora da pasta do app";
+const D_HIDDEN: &str = "possível código escondido em comentário ou here-string";
 
 /// Scans one script. `supported` lists the Scoop functions the wingetrs prelude implements
 /// (compared case-insensitively); any other name of [`SCOOP_FUNCTIONS`] is refused.
@@ -488,67 +491,26 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
 
     // Line-based rules, on the text without comments and here-string bodies.
     for (i, l) in lines.iter().enumerate() {
-        let line = i + 1;
-        let ws: Vec<&str> = words(l).collect();
-        let any = |set: &[&str]| ws.iter().any(|w| set.contains(w));
-        let contains = |set: &[&str]| set.iter().any(|s| l.contains(s));
-
-        if any(&["runas", "-runas"]) {
-            push(FlagKind::Elevation, Verdict::Refuse, D_ELEVATION, line);
+        for (kind, verdict, detail) in line_rules(l, calls_reg) {
+            push(kind, verdict, detail, i + 1);
         }
-        let hklm_dotnet = contains(&["registry]::localmachine", "registryhive]::localmachine"])
-            || (l.contains("openbasekey") && l.contains("localmachine"));
-        if contains(&["hklm:", "hklm\\", "hkey_local_machine"]) || hklm_dotnet {
-            push(FlagKind::Hklm, Verdict::Refuse, D_HKLM, line);
-        }
-        if global_switch(l) {
-            push(FlagKind::GlobalSwitch, Verdict::Refuse, D_GLOBAL, line);
-        }
-        if (any(WRITE_CMDLETS) || contains(WRITE_TEXT)) && contains(SYSTEM_DIRS) {
-            push(FlagKind::SystemWrite, Verdict::Refuse, D_SYSTEM, line);
-        }
-        if any(&["start-process", "saps", "start"]) && any(&["msiexec", "msiexec.exe"]) {
-            push(FlagKind::Msiexec, Verdict::Refuse, D_MSIEXEC, line);
-        }
-        if any(&["iex", "invoke-expression"])
-            || l.contains("[scriptblock]::create")
-            || invokes_variable(l)
-        {
-            push(
-                FlagKind::DynamicCode,
-                Verdict::ConfirmStrong,
-                D_DYNAMIC,
-                line,
-            );
-        }
-        if any(DOWNLOAD_WORDS) || contains(DOWNLOAD_TEXT) {
-            push(FlagKind::Download, Verdict::ConfirmStrong, D_DOWNLOAD, line);
-        }
-        let reg_exe = calls_reg && any(&["reg", "reg.exe"]) && any(&["import", "add", "delete"]);
-        let reg_cmdlet = any(REG_CMDLETS) && contains(&["hkcu:", "hkey_current_user"]);
-        if reg_exe || reg_cmdlet {
-            push(
-                FlagKind::RegistryUser,
-                Verdict::ConfirmStrong,
-                D_REG_USER,
-                line,
-            );
-        }
-        if any(TASK_WORDS) {
-            push(
-                FlagKind::ScheduledTaskOrService,
-                Verdict::ConfirmStrong,
-                D_TASK,
-                line,
-            );
-        }
-        if contains(USER_DIRS) || has_absolute_literal(l) {
-            push(
-                FlagKind::AbsolutePath,
-                Verdict::ConfirmStrong,
-                D_ABSOLUTE,
-                line,
-            );
+    }
+    // Fail closed: the comment/here-string stripping may disagree with pwsh about where
+    // a comment starts. A refusal rule that matches only in the raw line (comments and
+    // here-strings kept) still asks for a strong confirmation.
+    let raw_lines = script
+        .lines()
+        .map(|l| l.replace('`', "").to_ascii_lowercase());
+    for (i, raw) in raw_lines.enumerate() {
+        let clean = lines
+            .get(i)
+            .map(|l| line_rules(l, calls_reg))
+            .unwrap_or_default();
+        for (kind, verdict, detail) in line_rules(&raw, calls_reg) {
+            if verdict == Verdict::Refuse && !clean.iter().any(|c| c.0 == kind) {
+                let detail = format!("{D_HIDDEN}: {detail}");
+                push(FlagKind::HiddenCode, Verdict::ConfirmStrong, &detail, i + 1);
+            }
         }
     }
 
@@ -561,6 +523,56 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
         flags,
         verdict,
     }
+}
+
+/// The line rules matched by one (lowercase, backtick-free) line.
+fn line_rules(l: &str, calls_reg: bool) -> Vec<(FlagKind, Verdict, &'static str)> {
+    let ws: Vec<&str> = words(l).collect();
+    let any = |set: &[&str]| ws.iter().any(|w| set.contains(w));
+    let contains = |set: &[&str]| set.iter().any(|s| l.contains(s));
+    let mut out = Vec::new();
+    if any(&["runas", "-runas"]) {
+        out.push((FlagKind::Elevation, Verdict::Refuse, D_ELEVATION));
+    }
+    let hklm_dotnet = contains(&["registry]::localmachine", "registryhive]::localmachine"])
+        || (l.contains("openbasekey") && l.contains("localmachine"));
+    if contains(&["hklm:", "hklm\\", "hkey_local_machine"]) || hklm_dotnet {
+        out.push((FlagKind::Hklm, Verdict::Refuse, D_HKLM));
+    }
+    if global_switch(l) {
+        out.push((FlagKind::GlobalSwitch, Verdict::Refuse, D_GLOBAL));
+    }
+    if (any(WRITE_CMDLETS) || contains(WRITE_TEXT)) && contains(SYSTEM_DIRS) {
+        out.push((FlagKind::SystemWrite, Verdict::Refuse, D_SYSTEM));
+    }
+    if any(&["start-process", "saps", "start"]) && any(&["msiexec", "msiexec.exe"]) {
+        out.push((FlagKind::Msiexec, Verdict::Refuse, D_MSIEXEC));
+    }
+    if any(&["iex", "invoke-expression"])
+        || l.contains("[scriptblock]::create")
+        || invokes_variable(l)
+    {
+        out.push((FlagKind::DynamicCode, Verdict::ConfirmStrong, D_DYNAMIC));
+    }
+    if any(DOWNLOAD_WORDS) || contains(DOWNLOAD_TEXT) {
+        out.push((FlagKind::Download, Verdict::ConfirmStrong, D_DOWNLOAD));
+    }
+    let reg_exe = calls_reg && any(&["reg", "reg.exe"]) && any(&["import", "add", "delete"]);
+    let reg_cmdlet = any(REG_CMDLETS) && contains(&["hkcu:", "hkey_current_user"]);
+    if reg_exe || reg_cmdlet {
+        out.push((FlagKind::RegistryUser, Verdict::ConfirmStrong, D_REG_USER));
+    }
+    if any(TASK_WORDS) {
+        out.push((
+            FlagKind::ScheduledTaskOrService,
+            Verdict::ConfirmStrong,
+            D_TASK,
+        ));
+    }
+    if contains(USER_DIRS) || has_absolute_literal(l) {
+        out.push((FlagKind::AbsolutePath, Verdict::ConfirmStrong, D_ABSOLUTE));
+    }
+    out
 }
 
 /// One report per script present in the manifest, in [`HookKind`] order.
