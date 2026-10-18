@@ -214,9 +214,6 @@ pub fn refuse_2c(m: &Resolved) -> Result<(), PlanError> {
     if m.uninstaller.is_some() {
         return refuse("uninstaller");
     }
-    if m.psmodule.is_some() {
-        return refuse("psmodule");
-    }
     if m.innosetup {
         return Err(PlanError::Unsupported(
             "usa innosetup: suportado na fase 2c".into(),
@@ -303,6 +300,16 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
                 .map(|i| join_rel(&current, i))
                 .transpose()?,
         }));
+    }
+    if let Some(p) = &m.psmodule {
+        // Defense in depth: the manifest parser already checked it.
+        match safepath::safe_components(&p.name) {
+            Some(c) if c.len() == 1 && c[0] == p.name => {}
+            _ => return Err(PlanError::UnsafePath(format!("psmodule.name: {}", p.name))),
+        }
+        steps.push(Step::PsModule {
+            name: p.name.clone(),
+        });
     }
     for (name, value) in &m.env_set {
         steps.push(Step::EnvSet {

@@ -48,6 +48,7 @@ fn step_order_is_the_executor_contract() {
             Step::LinkCurrent => "current",
             Step::Shim(_) => "shim",
             Step::Shortcut(_) => "shortcut",
+            Step::PsModule { .. } => "psmodule",
             Step::EnvSet { .. } => "envset",
             Step::EnvAddPath { .. } => "envpath",
             Step::EnsureShimsOnPath => "path",

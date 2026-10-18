@@ -276,6 +276,7 @@ fn step_kind(step: &Step) -> &'static str {
         Step::LinkCurrent => "link",
         Step::Shim(_) => "shim",
         Step::Shortcut(_) => "shortcut",
+        Step::PsModule { .. } => "psmodule",
         Step::EnvSet { .. } => "env",
         Step::EnvAddPath { .. } => "path",
         Step::EnsureShimsOnPath => "shims_path",
@@ -302,6 +303,7 @@ fn step_phase(step: &Step, plan: &InstallPlan) -> Option<Phase> {
         Step::LinkCurrent
         | Step::Shim(_)
         | Step::Shortcut(_)
+        | Step::PsModule { .. }
         | Step::EnvSet { .. }
         | Step::EnvAddPath { .. }
         | Step::EnsureShimsOnPath => Some(Phase::Linking),
@@ -319,6 +321,7 @@ fn step_label(step: &Step) -> String {
         Step::LinkCurrent => "apontar current".into(),
         Step::Shim(s) => format!("comando {}", s.name),
         Step::Shortcut(s) => format!("atalho {}", s.link.display()),
+        Step::PsModule { name } => format!("módulo PowerShell {name}"),
         Step::EnvSet { name, .. } => format!("variável {name}"),
         Step::EnvAddPath { entry } => format!("PATH {}", entry.display()),
         Step::EnsureShimsOnPath => "shims no PATH".into(),
@@ -900,6 +903,7 @@ async fn run_step(run: &mut Run<'_>, step: &Step, ctx: &mut ExecCtx<'_>) -> Resu
             });
             Ok(())
         }
+        Step::PsModule { name } => psmodule(run, ctx, name),
         Step::EnvSet { name, value } => {
             let env = ctx.effects.env;
             let before = env.get(name).map_err(|e| e.to_string())?;
@@ -1362,6 +1366,128 @@ fn persist(run: &mut Run<'_>, spec: &PersistSpec, layout: &Layout) -> Result<(),
     Ok(())
 }
 
+/// User variable listing PowerShell module folders.
+const PSMODULE_VAR: &str = "PSModulePath";
+
+/// Scoop `lib/psmodules.ps1` `install_psmodule` + `ensure_in_psmodulepath`: junction
+/// `<modules>\<name>` -> `current`, and `<modules>` first in the user `PSModulePath`.
+fn psmodule(run: &mut Run<'_>, ctx: &mut ExecCtx<'_>, name: &str) -> Result<(), String> {
+    let layout = ctx.layout;
+    let app = run.plan.app.as_str();
+    let modules = layout.modules();
+    check_component("módulo", name)?;
+    let link_path = modules.join(name);
+    if link_path.parent() != Some(modules.as_path()) {
+        return Err(format!("nome inseguro de módulo: {name}"));
+    }
+    run.ensure_dirs(&modules)?;
+    if let Some(owner) = owner_of(ctx.state, app, ArtifactKind::PsModule, name)? {
+        return Err(format!("o módulo {name} pertence a {owner}"));
+    }
+    match fs::symlink_metadata(&link_path) {
+        Ok(m) => {
+            let ours = m.file_type().is_symlink()
+                && run
+                    .previous_artifact(ArtifactKind::PsModule, name)
+                    .is_some();
+            if !ours {
+                return Err(format!(
+                    "{} já existe e não é do wingetrs",
+                    link_path.display()
+                ));
+            }
+            let previous = link::target(&link_path).map_err(|e| io_msg(&link_path, e))?;
+            run.push(Undo::RestoreCurrent {
+                link: link_path.clone(),
+                previous: Some(previous),
+            });
+            link::remove(&link_path).map_err(|e| io_msg(&link_path, e))?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_msg(&link_path, e)),
+    }
+    link::create(&layout.current(app), &link_path).map_err(|e| io_msg(&link_path, e))?;
+    run.push(Undo::RemovePath(link_path));
+    run.artifacts.push(Artifact {
+        kind: ArtifactKind::PsModule,
+        target: name.to_string(),
+        previous: None,
+    });
+
+    let env = ctx.effects.env;
+    let before = env.get(PSMODULE_VAR).map_err(|e| e.to_string())?;
+    let base = match &before {
+        Some(v) => v.value.clone(),
+        None => {
+            let profile = std::env::var_os("USERPROFILE").unwrap_or_default();
+            Path::new(&profile)
+                .join(r"Documents\WindowsPowerShell\Modules")
+                .display()
+                .to_string()
+        }
+    };
+    let modules_s = modules.display().to_string();
+    if path_edit::path_contains(&base, &modules_s) {
+        return Ok(());
+    }
+    run.push(Undo::RestoreEnv {
+        name: PSMODULE_VAR.to_string(),
+        previous: before.clone(),
+    });
+    env.set(
+        PSMODULE_VAR,
+        &EnvValue {
+            value: format!("{};{}", modules.display(), base),
+            expand: before.is_some_and(|v| v.expand),
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Removes the junction of module `name`; the last module also leaves `PSModulePath`.
+fn remove_psmodule(ctx: &mut ExecCtx<'_>, app: &str, name: &str) -> Result<(), String> {
+    let modules = ctx.layout.modules();
+    check_component("módulo", name)?;
+    let link_path = modules.join(name);
+    if link_path.parent() != Some(modules.as_path()) {
+        return Err(format!("nome inseguro de módulo: {name}"));
+    }
+    match fs::symlink_metadata(&link_path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            link::remove(&link_path).map_err(|e| io_msg(&link_path, e))?
+        }
+        Ok(_) => return Err(format!("{} não é uma junção", link_path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_msg(&link_path, e)),
+    }
+    let others: Vec<String> = ctx
+        .state
+        .apps_with_artifact(ArtifactKind::PsModule)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|a| a != app)
+        .collect();
+    if others.is_empty() {
+        let env = ctx.effects.env;
+        if let Some(cur) = env.get(PSMODULE_VAR).map_err(|e| e.to_string())? {
+            let value = path_edit::path_remove(&cur.value, &modules.display().to_string());
+            if value.is_empty() {
+                env.remove(PSMODULE_VAR).map_err(|e| e.to_string())?;
+            } else {
+                env.set(
+                    PSMODULE_VAR,
+                    &EnvValue {
+                        value,
+                        expand: cur.expand,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Removes one recorded artifact of `app` (step label and result); `None` for persist,
 /// which uninstall handles as a whole. A PATH entry goes only when no other app records it,
 /// and the variable itself goes if nothing is left in it.
@@ -1411,6 +1537,10 @@ fn remove_artifact(
             };
             (format!("PATH {}", a.target), r)
         }
+        ArtifactKind::PsModule => (
+            format!("módulo PowerShell {}", a.target),
+            remove_psmodule(ctx, app, &a.target),
+        ),
         ArtifactKind::Persist => return None,
     })
 }

@@ -34,6 +34,10 @@ impl Layout {
     pub fn shims(&self) -> PathBuf {
         self.root.join("shims")
     }
+    /// Folder of PowerShell module junctions (`psmodule`).
+    pub fn modules(&self) -> PathBuf {
+        self.root.join("modules")
+    }
     pub fn launcher(&self) -> PathBuf {
         self.shims().join(".launcher").join("shim.exe")
     }

@@ -64,6 +64,10 @@ pub enum Step {
     LinkCurrent,
     Shim(ShimSpec),
     Shortcut(ShortcutSpec),
+    /// Junction `<root>\modules\<name>` -> `current`, and `modules` in the user `PSModulePath`.
+    PsModule {
+        name: String,
+    },
     EnvSet {
         name: String,
         value: String,
@@ -172,6 +176,7 @@ fn artifact_kind(k: crate::install::state::ArtifactKind) -> &'static str {
         K::Persist => "dados persistentes",
         K::Path => "entrada no PATH",
         K::Env => "variável de ambiente",
+        K::PsModule => "módulo PowerShell",
     }
 }
 
@@ -290,6 +295,12 @@ impl InstallPlan {
                 }
                 line
             }
+            Step::PsModule { name } => format!(
+                "Ligar módulo PowerShell {} -> {} e garantir {} no PSModulePath do usuário",
+                l.modules().join(name).display(),
+                l.current(app).display(),
+                l.modules().display()
+            ),
             Step::EnvSet { name, value } => {
                 format!("Definir variável de usuário {name} = {value}")
             }
