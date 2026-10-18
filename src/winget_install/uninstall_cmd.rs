@@ -47,6 +47,7 @@ pub struct UninstallCommand {
 pub fn valid_arp_key(key: &str) -> bool {
     !key.is_empty()
         && !key.contains(['\\', '/'])
+        && !key.chars().any(char::is_control)
         && key.chars().count() <= 255
         && key != "."
         && key != ".."

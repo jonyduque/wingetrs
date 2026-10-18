@@ -154,7 +154,7 @@ fn split_command_agrees_with_missing_uninstaller() {
 
 #[test]
 fn valid_arp_key_cases() {
-    for bad in ["", "a\\b", "a/b", "..", "."] {
+    for bad in ["", "a\\b", "a/b", "..", ".", "a\0b", "a\nb", "a\x7fb"] {
         assert!(!valid_arp_key(bad), "{bad}");
     }
     assert!(!valid_arp_key(&"a".repeat(256)));
@@ -170,8 +170,11 @@ fn valid_arp_key_cases() {
 fn live_split_matches_shell() {
     use wingetrs::winget_install::arp_read_win::shell_split;
     // The shell only splits commands whose program exists: use real copies in a temp dir.
-    let dir = std::env::temp_dir().join(format!("wingetrs t172 {}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let guard = tempfile::Builder::new()
+        .prefix("wingetrs t172 ")
+        .tempdir()
+        .expect("temp dir");
+    let dir = guard.path().to_path_buf();
     let sys = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_default())
         .join("System32")
         .join("cmd.exe");
@@ -194,5 +197,38 @@ fn live_split_matches_shell() {
             "{c}"
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn inno_is1_suffix_ignores_case() {
+    let mut d = details("App_IS1");
+    d.inno_app_path = Some(r"C:\P".into());
+    d.uninstall_string = Some(r#""C:\P\unins000.exe""#.into());
+    assert_eq!(cmd(&d, false).rule, Rule::Inno);
+}
+
+#[test]
+fn burn_by_upgrade_code_alone() {
+    let mut d = details("{abc}");
+    d.bundle_upgrade_code = Some("{u}".into());
+    d.uninstall_string = Some(r#""C:\P\setup.exe" /uninstall"#.into());
+    assert_eq!(cmd(&d, false).rule, Rule::Burn);
+}
+
+#[test]
+fn stronger_signal_always_wins() {
+    let q = Some(r#""C:\Q\q.exe" /s"#.to_string());
+    let u = Some(r#""C:\P\unins000.exe""#.to_string());
+    let mut d = details("App_is1");
+    d.inno_app_path = Some(r"C:\P".into());
+    d.uninstall_string = u.clone();
+    d.quiet_uninstall_string = q;
+    assert_eq!(cmd(&d, true).rule, Rule::Quiet);
+    d.quiet_uninstall_string = None;
+    d.bundle_cache_path = Some(r"C:\B".into());
+    assert_eq!(cmd(&d, true).rule, Rule::Inno);
+    let mut b = details("{abc}");
+    b.bundle_cache_path = Some(r"C:\B".into());
+    b.uninstall_string = u;
+    assert_eq!(cmd(&b, true).rule, Rule::Burn);
 }
