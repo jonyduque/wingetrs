@@ -1212,25 +1212,13 @@ fn native_upgrade(
     q: &ApplicabilityQuery,
     default: crate::config::DefaultScope,
 ) -> Option<crate::winget_install::plan::WingetPlan> {
-    use crate::winget_install::engine::{
-        InstalledFacts, InstalledKind, installed_facts, plan_upgrade, upgrade_scope,
-    };
+    use crate::winget_install::engine::{plan_upgrade, upgrade_scope};
     use crate::winget_install::plan::PlanOrBridge;
-    use crate::winget_install::uninstall::{UninstallTarget, target_of};
     let installed = q.installed.as_deref()?;
-    let facts = match target_of(&q.app_key)? {
-        UninstallTarget::Arp { hive, key } => {
-            crate::winget_install::arp_read_win::read_details(hive, &key)
-                .ok()
-                .flatten()
-                .map(|d| installed_facts(&d))
-                .unwrap_or_default()
-        }
-        UninstallTarget::Msix { .. } => InstalledFacts {
-            arch: None,
-            kind: Some(InstalledKind::Msix),
-        },
-    };
+    // A record that names no removal target has no native upgrade either.
+    crate::winget_install::uninstall::target_of(&q.app_key)?;
+    // One function for the CLI and the TUI (Task 193).
+    let facts = crate::winget_install::previous_win::installed_facts(&q.app_key);
     let host = crate::winget_install::host_win::current();
     match plan_upgrade(
         manifest,
@@ -1821,7 +1809,7 @@ fn with_winget<R>(
     };
     let backups = c.data.install_layout().backups();
     let previous = |row_key: &str, plan: &crate::winget_install::plan::WingetPlan| {
-        previous_plan(c.data.root(), row_key, plan)
+        crate::winget_install::previous_win::previous_plan(c.data.root(), row_key, plan)
     };
     let env = jobs::WingetEnv {
         install,
@@ -1843,43 +1831,6 @@ fn with_winget<R>(
     _f: impl FnOnce(&jobs::WingetEnv<'_>) -> R,
 ) -> Result<R, String> {
     Err("instalar e remover só funciona no Windows".to_string())
-}
-
-/// The plan removing the installed record `row_key` before an `uninstallPrevious` upgrade
-/// (the NSIS hint from the new plan's installer type).
-#[cfg(windows)]
-fn previous_plan(
-    root: &std::path::Path,
-    row_key: &str,
-    plan: &crate::winget_install::plan::WingetPlan,
-) -> Result<crate::winget_install::uninstall::UninstallPlan, String> {
-    use crate::sources::winget::manifest::InstallerKind;
-    use crate::winget_install::uninstall::{UninstallTarget, plan_uninstall, target_of};
-    match target_of(row_key) {
-        Some(UninstallTarget::Arp { hive, key }) => {
-            let d = crate::winget_install::arp_read_win::read_details(hive, &key)
-                .map_err(|e| format!("registro ilegível ({key}): {e}"))?
-                .ok_or_else(|| format!("o registro {key} não existe mais"))?;
-            let k = crate::bridge::arp_ops_win::known_folders()
-                .map_err(|e| format!("pastas do sistema ilegíveis: {e}"))?;
-            let u = crate::winget_install::folders_win::user_folders(root)
-                .map_err(|e| format!("pastas do usuário ilegíveis: {e}"))?;
-            let nsis = plan.installer.kind == InstallerKind::Nullsoft;
-            let is_dir = |p: &str| std::path::Path::new(p).is_dir();
-            plan_uninstall(&d, nsis, &[], true, &k, &u, &is_dir)
-        }
-        Some(UninstallTarget::Msix { family }) => {
-            Ok(crate::winget_install::uninstall::UninstallPlan {
-                target: UninstallTarget::Msix { family },
-                name: plan.name.clone(),
-                version: plan.upgrade_from.clone(),
-                command: None,
-                elevation: crate::winget_install::launch::Elevation::Never,
-                shared: None,
-            })
-        }
-        None => Err(format!("registro inválido: {row_key}")),
-    }
 }
 
 /// Wakes the queue after `BUSY_RETRY`, like the details debounce: the sleep is awaited in

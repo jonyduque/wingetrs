@@ -99,7 +99,16 @@ impl WingetFlows for NoWinget {
     ) -> anyhow::Result<Result<PlanOrBridge, Refusal>> {
         unreachable!("winget")
     }
-    async fn install(&self, _: &WingetPlan) -> Result<InstallReport, WingetOpsError> {
+    fn gate(&self) -> wingetrs::install::executor::LaunchGate {
+        unreachable!("winget")
+    }
+    fn progress(&self) -> wingetrs::cli::winget_cmd::Sink {
+        unreachable!("winget")
+    }
+    fn install(
+        &self,
+        _: &WingetPlan,
+    ) -> wingetrs::cli::winget_cmd::Op<Result<InstallReport, WingetOpsError>> {
         unreachable!("winget")
     }
     async fn install_bridge<I: Interrupts>(
@@ -115,10 +124,32 @@ impl WingetFlows for NoWinget {
     fn installed(&self) -> anyhow::Result<Vec<ListRow>> {
         unreachable!("winget")
     }
-    fn plan_uninstall(&self, _: &ListRow, _: &UninstallTarget) -> Result<UninstallPlan, String> {
+    async fn plan_uninstall(
+        &self,
+        _: &ListRow,
+        _: &UninstallTarget,
+    ) -> Result<UninstallPlan, String> {
         unreachable!("winget")
     }
-    fn uninstall(&self, _: &UninstallPlan) -> Result<UninstallReport, String> {
+    fn lock_install(
+        &self,
+    ) -> wingetrs::cli::winget_cmd::Op<Result<wingetrs::cli::winget_cmd::Held, String>> {
+        unreachable!("winget")
+    }
+    fn uninstall(
+        &self,
+        _: &UninstallPlan,
+    ) -> wingetrs::cli::winget_cmd::Op<Result<UninstallReport, String>> {
+        unreachable!("winget")
+    }
+    fn remove_registry_only(
+        &self,
+        _: &UninstallPlan,
+        _: &str,
+    ) -> wingetrs::cli::winget_cmd::Op<Result<PathBuf, String>> {
+        unreachable!("winget")
+    }
+    fn free_space(&self) -> fn(&Path) -> Option<u64> {
         unreachable!("winget")
     }
     fn pins(&self) -> BTreeSet<String> {
@@ -132,11 +163,11 @@ impl WingetFlows for NoWinget {
     ) -> anyhow::Result<(Result<PlanOrBridge, Refusal>, Option<UninstallPlan>)> {
         unreachable!("winget")
     }
-    async fn upgrade(
+    fn upgrade(
         &self,
         _: &WingetPlan,
         _: Option<&UninstallPlan>,
-    ) -> Result<InstallReport, UpgradeError> {
+    ) -> wingetrs::cli::winget_cmd::Op<Result<InstallReport, UpgradeError>> {
         unreachable!("winget")
     }
     fn upgrade_bridge(&self, _: &BridgeJob, _: &mut dyn FnMut(&str)) -> Result<Done, InstallFail> {

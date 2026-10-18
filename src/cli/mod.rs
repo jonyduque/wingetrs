@@ -186,7 +186,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Instala um app de um bucket do Scoop, ou um pacote do winget pelo próprio winget
+    /// Instala um app de um bucket do Scoop ou um pacote do winget (pelo wingetrs ou pelo winget, conforme as Configurações)
     #[command(
         override_usage = "wingetrs install [OPÇÕES] <ALVO>",
         help_template = HELP_TEMPLATE,

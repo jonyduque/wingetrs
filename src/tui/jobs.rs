@@ -23,8 +23,8 @@ use crate::winget_install::ops::{self as winget_ops, WingetCtx, WingetOpsError};
 use crate::winget_install::orphans::{ArpRegistry, remove_orphan};
 use crate::winget_install::plan::WingetPlan as NativePlan;
 use crate::winget_install::uninstall::{
-    BackupLimits, KEY_STAYED, UninstallCtx, UninstallPlan as WingetUninstallPlan, UninstallStatus,
-    UninstallTarget, backup_folders, remove_registry_only, uninstall,
+    BackupLimits, KEY_STAYED, MsiQueue, UninstallCtx, UninstallPlan as WingetUninstallPlan,
+    UninstallStatus, UninstallTarget, backup_folders, remove_registry_only, uninstall_queued,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -803,7 +803,7 @@ fn winget_uninstall(
     ) {
         return failed(f);
     }
-    match uninstall(&env.uninstall, plan) {
+    match uninstall_queued(&env.uninstall, Some(&MsiQueue::of(&env.install)), plan) {
         Ok(r) if r.status == UninstallStatus::Removed && r.warning.is_none() => {
             let mut summary = format!("{} removido", plan.name);
             if let Some(dest) = copied {

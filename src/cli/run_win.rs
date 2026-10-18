@@ -1,15 +1,19 @@
 //! Runs the operation commands against the production context.
 use super::Command;
-use super::install_cmd::{self, Flags, Interrupts, Stop, TtyUi, Ui};
-use super::winget_cmd::{self, HelperShutdown, WingetFlows};
+use super::install_cmd::{self, Flags, Interrupts, LineProgress, Stop, TtyUi, Ui};
+use super::winget_cmd::{self, Held, HelperShutdown, Op, Sink, WingetFlows};
 use crate::bridge::BridgeJob;
+use crate::bridge::elevated::ElevatedBridge;
 use crate::bridge::worker::ScopeArg;
 use crate::cache::{BlobStore, DataDir};
 use crate::catalog::Catalog;
 use crate::config::{Behavior, Config};
 use crate::http::Http;
+use crate::install::download::Progress;
+use crate::install::executor::LaunchGate;
 use crate::install::ops::OpsCtx;
 use crate::install::prod_win::{ProdEffects, build_ctx};
+use crate::install::progress::ProgressEvent;
 use crate::install::target::Candidate;
 use crate::installed::correlate::{ListRow, correlate};
 use crate::installed::{Hive, InstalledApp};
@@ -18,24 +22,26 @@ use crate::tui::app::{Done, InstallFail};
 use crate::update::LockWait;
 use crate::winget_install::arp_read_win::read_details;
 use crate::winget_install::engine::{
-    self, UpgradeError, UpgradeRoute, installed_facts, plan_upgrade, upgrade_route,
+    self, UpgradeError, UpgradeRoute, plan_upgrade, upgrade_route,
 };
-use crate::winget_install::launch::Elevation;
-use crate::winget_install::launch_win::{ShellLauncher, msiexec_path};
+use crate::winget_install::launch_win::ShellLauncher;
 use crate::winget_install::msix_win::SystemMsix;
 use crate::winget_install::ops::{self as wops, InstallReport, WingetCtx, WingetOpsError};
 use crate::winget_install::orphans::{self, Orphan};
 use crate::winget_install::orphans_win::SystemArp;
 use crate::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
+use crate::winget_install::previous::{Removal, manifest_nsis};
 use crate::winget_install::select::{Refusal, ScopeWanted};
 use crate::winget_install::uninstall::{
-    self, SystemClock, UninstallCtx, UninstallPlan, UninstallReport, UninstallTarget, target_of,
+    self, MsiQueue, SystemClock, UninstallCtx, UninstallPlan, UninstallReport, UninstallTarget,
+    target_of,
 };
 use crate::winget_install::uninstall_cmd::ArpDetails;
-use crate::winget_install::{folders_win, host_win, prod_win};
+use crate::winget_install::{folders_win, host_win, previous_win, prod_win};
 use anyhow::Context;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub async fn run(
     cmd: Command,
@@ -54,6 +60,7 @@ pub async fn run(
         ctx: &ctx,
         behavior: cfg.behavior,
         helper: HelperShutdown::for_this_exe(),
+        line: Arc::clone(&line),
     };
     let mut ctrl_c = ConsoleCtrlC::default();
     let result = install_cmd::execute(&ctx, &ui, cmd, &mut ctrl_c, &flows).await;
@@ -67,6 +74,37 @@ struct ProdFlows<'c, 'a> {
     ctx: &'c OpsCtx<'a>,
     behavior: Behavior,
     helper: HelperShutdown,
+    /// The progress line (owned copies of it go to the operations' threads).
+    line: Arc<LineProgress>,
+}
+
+/// What a native operation takes to its own thread (see `winget_cmd::Op`).
+#[derive(Clone)]
+struct Owned {
+    data: DataDir,
+    http: Http,
+    wait: LockWait,
+    gate: LaunchGate,
+    helper: Arc<ElevatedBridge>,
+    line: Arc<LineProgress>,
+}
+
+impl Owned {
+    fn update(&self, ev: &ProgressEvent) {
+        self.line.update(ev);
+    }
+
+    fn wctx<'a>(&'a self, progress: Progress<'a>) -> Result<WingetCtx<'a>, WingetOpsError> {
+        prod_win::build(
+            &self.data,
+            &self.http,
+            self.wait,
+            progress,
+            self.gate.clone(),
+            &*self.helper,
+        )
+        .map_err(|e| WingetOpsError::Io(e.to_string()))
+    }
 }
 
 fn scan(data: &DataDir) -> Vec<InstalledApp> {
@@ -84,10 +122,6 @@ fn key_exists(hive: Hive, key: &str) -> bool {
 
 fn user_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
-}
-
-fn is_dir(p: &str) -> bool {
-    Path::new(p).is_dir()
 }
 
 impl ProdFlows<'_, '_> {
@@ -114,16 +148,15 @@ impl ProdFlows<'_, '_> {
         Ok(m)
     }
 
-    fn wctx(&self) -> Result<WingetCtx<'_>, WingetOpsError> {
-        prod_win::build(
-            self.ctx.data,
-            self.ctx.http,
-            self.ctx.wait,
-            self.ctx.progress,
-            self.ctx.launch.clone(),
-            &self.helper.0,
-        )
-        .map_err(|e| WingetOpsError::Io(e.to_string()))
+    fn owned(&self) -> Owned {
+        Owned {
+            data: self.ctx.data.clone(),
+            http: self.ctx.http.clone(),
+            wait: self.ctx.wait,
+            gate: self.ctx.launch.clone(),
+            helper: Arc::clone(&self.helper.0),
+            line: Arc::clone(&self.line),
+        }
     }
 
     /// The ARP records of `row` other than the main one.
@@ -154,8 +187,24 @@ impl WingetFlows for ProdFlows<'_, '_> {
         Ok(plan(&m, &host_win::current(), wanted, None))
     }
 
-    async fn install(&self, plan: &WingetPlan) -> Result<InstallReport, WingetOpsError> {
-        wops::install(&self.wctx()?, plan).await
+    fn gate(&self) -> LaunchGate {
+        self.ctx.launch.clone()
+    }
+
+    fn progress(&self) -> Sink {
+        let line = Arc::clone(&self.line);
+        Arc::new(move |ev: &ProgressEvent| line.update(ev))
+    }
+
+    fn install(&self, plan: &WingetPlan) -> Op<Result<InstallReport, WingetOpsError>> {
+        let o = self.owned();
+        let plan = plan.clone();
+        Box::new(move || {
+            Box::pin(async move {
+                let progress = |ev: &ProgressEvent| o.update(ev);
+                wops::install(&o.wctx(&progress)?, &plan).await
+            })
+        })
     }
 
     async fn install_bridge<I: Interrupts>(
@@ -184,47 +233,89 @@ impl WingetFlows for ProdFlows<'_, '_> {
         )?)
     }
 
-    fn plan_uninstall(
+    async fn plan_uninstall(
         &self,
         row: &ListRow,
-        target: &UninstallTarget,
+        _target: &UninstallTarget,
     ) -> Result<UninstallPlan, String> {
-        match target {
-            UninstallTarget::Msix { .. } => Ok(UninstallPlan {
-                target: target.clone(),
-                name: row.name.clone(),
-                version: row.installed_version.clone(),
-                command: None,
-                elevation: Elevation::Never,
-                shared: None,
-            }),
-            UninstallTarget::Arp { hive, key } => {
-                let d = read_details(*hive, key)
-                    .map_err(|e| format!("registro ilegível ({key}): {e}"))?
-                    .ok_or_else(|| format!("o registro {key} não existe mais"))?;
-                let k = crate::bridge::arp_ops_win::known_folders()
-                    .map_err(|e| format!("pastas do sistema ilegíveis: {e}"))?;
-                let u = folders_win::user_folders(self.ctx.data.root())
-                    .map_err(|e| format!("pastas do usuário ilegíveis: {e}"))?;
-                // No manifest is read for a removal: the NSIS hint stays off.
-                uninstall::plan_uninstall(&d, false, &self.others(row), true, &k, &u, &is_dir)
+        // The NSIS hint from the matched package's manifest (unreadable: no hint).
+        let nsis = match winget_cmd::winget_id(row) {
+            Some(id) => match self.manifest("winget", id).await {
+                Ok(m) => manifest_nsis(&m),
+                Err(e) => {
+                    tracing::warn!(app = %row.name, "manifest for the NSIS hint not read: {e:#}");
+                    false
+                }
+            },
+            None => false,
+        };
+        let others = self.others(row);
+        let r = Removal {
+            name: &row.name,
+            version: row.installed_version.clone(),
+            nsis,
+            others: &others,
+            is_main: true,
+        };
+        let mut plan = previous_win::removal_plan(self.ctx.data.root(), &row.app_key, r)?;
+        // Measured as the TUI does: the size is shown with the folders.
+        if let Some(shared) = &mut plan.shared {
+            match uninstall::measure_folders(&shared.folders) {
+                Ok(size) => shared.size = Some(size),
+                Err(e) => tracing::warn!(app = %plan.name, "data folders not measured: {e}"),
             }
         }
+        Ok(plan)
     }
 
-    fn uninstall(&self, plan: &UninstallPlan) -> Result<UninstallReport, String> {
-        let msiexec = msiexec_path().map_err(|e| format!("msiexec.exe não encontrado: {e}"))?;
-        let clock = SystemClock::new();
-        let u = UninstallCtx {
-            launcher: &ShellLauncher,
-            elevated: &self.helper.0,
-            msix: &SystemMsix,
-            key_exists: &key_exists,
-            clock: &clock,
-            user_expand: &user_env,
-            msiexec: &msiexec,
-        };
-        uninstall::uninstall(&u, plan)
+    fn lock_install(&self) -> Op<Result<Held, String>> {
+        let (data, wait) = (self.ctx.data.clone(), self.ctx.wait);
+        Box::new(move || {
+            Box::pin(async move {
+                wops::lock_install(&data.install_layout(), wait)
+                    .await
+                    .map(|l| Box::new(l) as Held)
+                    .map_err(|e| e.to_string())
+            })
+        })
+    }
+
+    fn uninstall(&self, plan: &UninstallPlan) -> Op<Result<UninstallReport, String>> {
+        let o = self.owned();
+        let plan = plan.clone();
+        Box::new(move || {
+            Box::pin(async move {
+                let progress = |ev: &ProgressEvent| o.update(ev);
+                let w = o
+                    .wctx(&progress)
+                    .map_err(|e| format!("msiexec.exe não encontrado: {e}"))?;
+                let clock = SystemClock::new();
+                let u = UninstallCtx {
+                    launcher: &ShellLauncher,
+                    elevated: &*o.helper,
+                    msix: &SystemMsix,
+                    key_exists: &key_exists,
+                    clock: &clock,
+                    user_expand: &user_env,
+                    msiexec: &w.msiexec,
+                };
+                winget_cmd::run_uninstaller(&u, &MsiQueue::of(&w), &plan, &progress)
+            })
+        })
+    }
+
+    fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> Op<Result<PathBuf, String>> {
+        let (helper, backups) = (Arc::clone(&self.helper.0), self.backups());
+        let (plan, ts) = (plan.clone(), ts.to_string());
+        Box::new(move || {
+            Box::pin(async move {
+                uninstall::remove_registry_only(&plan, &SystemArp, &*helper, &backups, &ts)
+            })
+        })
+    }
+
+    fn free_space(&self) -> fn(&Path) -> Option<u64> {
+        folders_win::free_space
     }
 
     fn pins(&self) -> BTreeSet<String> {
@@ -242,41 +333,47 @@ impl WingetFlows for ProdFlows<'_, '_> {
             .installed_version
             .as_deref()
             .with_context(|| format!("{}: versão instalada desconhecida", row.name))?;
-        let target = target_of(&row.app_key);
-        let details = match &target {
-            Some(UninstallTarget::Arp { hive, key }) => read_details(*hive, key).ok().flatten(),
-            _ => None,
-        };
-        let facts = details.as_ref().map(installed_facts).unwrap_or_default();
+        // One function for the CLI and the TUI (Task 193).
+        let facts = previous_win::installed_facts(&row.app_key);
         let planned = plan_upgrade(&m, &host_win::current(), wanted, installed, &facts);
-        let previous = match (&planned, &target) {
-            (Ok(PlanOrBridge::Native(p)), Some(t))
+        let previous = match &planned {
+            Ok(PlanOrBridge::Native(p))
                 if upgrade_route(&p.installer) == UpgradeRoute::UninstallFirst =>
             {
-                Some(self.plan_uninstall(row, t).map_err(anyhow::Error::msg)?)
+                Some(
+                    previous_win::previous_plan(self.ctx.data.root(), &row.app_key, p)
+                        .map_err(anyhow::Error::msg)?,
+                )
             }
             _ => None,
         };
         Ok((planned, previous))
     }
 
-    async fn upgrade(
+    fn upgrade(
         &self,
         plan: &WingetPlan,
         previous: Option<&UninstallPlan>,
-    ) -> Result<InstallReport, UpgradeError> {
-        let w = self.wctx()?;
-        let clock = SystemClock::new();
-        let u = UninstallCtx {
-            launcher: &ShellLauncher,
-            elevated: &self.helper.0,
-            msix: &SystemMsix,
-            key_exists: &key_exists,
-            clock: &clock,
-            user_expand: &user_env,
-            msiexec: &w.msiexec,
-        };
-        engine::upgrade(&w, &u, plan, previous).await
+    ) -> Op<Result<InstallReport, UpgradeError>> {
+        let o = self.owned();
+        let (plan, previous) = (plan.clone(), previous.cloned());
+        Box::new(move || {
+            Box::pin(async move {
+                let progress = |ev: &ProgressEvent| o.update(ev);
+                let w = o.wctx(&progress)?;
+                let clock = SystemClock::new();
+                let u = UninstallCtx {
+                    launcher: &ShellLauncher,
+                    elevated: &*o.helper,
+                    msix: &SystemMsix,
+                    key_exists: &key_exists,
+                    clock: &clock,
+                    user_expand: &user_env,
+                    msiexec: &w.msiexec,
+                };
+                engine::upgrade(&w, &u, &plan, previous.as_ref()).await
+            })
+        })
     }
 
     fn upgrade_bridge(
@@ -306,7 +403,7 @@ impl WingetFlows for ProdFlows<'_, '_> {
     }
 
     fn remove_orphan(&self, o: &Orphan, ts: &str) -> Result<PathBuf, String> {
-        orphans::remove_orphan(&SystemArp, &self.helper.0, &self.backups(), ts, o)
+        orphans::remove_orphan(&SystemArp, &*self.helper.0, &self.backups(), ts, o)
     }
 }
 

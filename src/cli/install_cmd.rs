@@ -534,7 +534,7 @@ pub async fn execute(
                 allow_msiexec: false,
                 allow_scripts,
             };
-            uninstall(ctx, ui, &target, purge, f, stop, winget)
+            uninstall(ctx, ui, &target, purge, f, stop, winget).await
         }
         Command::Upgrade {
             target,
@@ -738,7 +738,7 @@ async fn install(
     Ok(())
 }
 
-fn uninstall(
+async fn uninstall(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
     target: &str,
@@ -752,7 +752,8 @@ fn uninstall(
     let plan = match ops::plan_uninstall(ctx, app, purge) {
         // Not an app of wingetrs: one of the Windows list (ARP, MSIX).
         Err(ops::OpsError::NotInstalled(_)) => {
-            return winget_cmd::uninstall(winget, ui, target, purge, f, stop, &mut stdout_line);
+            return winget_cmd::uninstall(winget, ui, target, purge, f, stop, &mut stdout_line)
+                .await;
         }
         other => other?,
     };
