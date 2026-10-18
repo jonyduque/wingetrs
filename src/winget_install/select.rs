@@ -105,6 +105,16 @@ pub(crate) fn arch_rank(installer: &str, host_arch: &str) -> Option<usize> {
     Some(if pos == 0 { 0 } else { pos + 1 })
 }
 
+/// The one architecture rule for native and bridge: the installer runs on `host_arch` and
+/// does not list it in `UnsupportedOSArchitectures`.
+// IsSystemArchitectureUnsupportedByInstaller + IsApplicableArchitecture, ManifestComparator.cpp.
+pub fn arch_applicable(installer_arch: &str, unsupported: &[String], host_arch: &str) -> bool {
+    !unsupported
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(host_arch))
+        && arch_rank(installer_arch, host_arch).is_some()
+}
+
 fn parse_scope(s: &Option<String>) -> Option<Scope> {
     match s.as_deref() {
         Some(s) if s.eq_ignore_ascii_case("user") => Some(Scope::User),
@@ -265,31 +275,27 @@ pub fn choose(
 ) -> Result<Selection, Refusal> {
     let (ScopeWanted::Prefer(pref) | ScopeWanted::Only(pref)) = wanted;
 
-    // Installers that declare the system architecture unsupported are dropped first.
-    // IsSystemArchitectureUnsupportedByInstaller, ManifestComparator.cpp.
-    let supported: Vec<(usize, &EffectiveInstaller)> = installers
+    let by_arch: Vec<(usize, &EffectiveInstaller)> = installers
         .iter()
         .enumerate()
         .filter(|(_, i)| {
-            !i.unsupported_os_architectures
-                .iter()
-                .any(|a| a.eq_ignore_ascii_case(&host.arch))
+            arch_applicable(&i.architecture, &i.unsupported_os_architectures, &host.arch)
         })
         .collect();
-    let by_arch: Vec<(usize, &EffectiveInstaller)> = supported
-        .iter()
-        .copied()
-        .filter(|(_, i)| arch_rank(&i.architecture, &host.arch).is_some())
-        .collect();
     if by_arch.is_empty() {
-        return Err(Refusal(if supported.len() < installers.len() {
-            format!(
-                "o instalador declara esta arquitetura ({}) como não suportada",
-                host.arch
-            )
-        } else {
-            format!("nenhum instalador para esta arquitetura ({})", host.arch)
-        }));
+        return Err(Refusal(
+            if installers
+                .iter()
+                .any(|i| arch_rank(&i.architecture, &host.arch).is_some())
+            {
+                format!(
+                    "o instalador declara esta arquitetura ({}) como não suportada",
+                    host.arch
+                )
+            } else {
+                format!("nenhum instalador para esta arquitetura ({})", host.arch)
+            },
+        ));
     }
 
     // Minimum OS version; remember why installers were turned away. No Platform filter:

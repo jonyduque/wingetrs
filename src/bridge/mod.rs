@@ -146,19 +146,7 @@ pub fn host_arch() -> &'static str {
     }
 }
 
-/// Installer architectures that run on `arch`, as `install::manifest::Arch::preference`
-/// (plus winget's `neutral`).
-fn runs_on(installer: &str, arch: &str) -> bool {
-    let ok: &[&str] = match arch {
-        "x64" => &["x64", "x86"],
-        "x86" => &["x86"],
-        "arm64" => &["arm64", "x64", "x86"],
-        _ => &[],
-    };
-    installer.eq_ignore_ascii_case("neutral")
-        || installer.eq_ignore_ascii_case(arch)
-        || ok.iter().any(|a| installer.eq_ignore_ascii_case(a))
-}
+use crate::winget_install::select::arch_applicable;
 
 fn parse_scope(s: Option<&str>) -> Option<InstallScope> {
     match s {
@@ -191,7 +179,7 @@ pub fn install_job(
     let fit: Vec<_> = manifest
         .effective()
         .into_iter()
-        .filter(|i| runs_on(&i.architecture, arch))
+        .filter(|i| arch_applicable(&i.architecture, &i.unsupported_os_architectures, arch))
         .collect();
     let machine_only = !fit.is_empty()
         && fit
@@ -277,7 +265,17 @@ pub fn winget_applicability(
     let candidates: Vec<_> = manifest
         .installers
         .iter()
-        .filter(|i| runs_on(&i.architecture, arch))
+        .filter(|i| {
+            let unsupported = i
+                .unsupported_os_architectures
+                .as_ref()
+                .or(manifest.unsupported_os_architectures.as_ref());
+            arch_applicable(
+                &i.architecture,
+                unsupported.map_or(&[], Vec::as_slice),
+                arch,
+            )
+        })
         .collect();
     let explicit_only = candidates.iter().any(|i| {
         i.require_explicit_upgrade

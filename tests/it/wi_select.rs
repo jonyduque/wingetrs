@@ -333,3 +333,31 @@ fn unsupported_os_architecture_excluded() {
     // another host architecture is unaffected
     assert_eq!(idx(&items, &host("x64"), PU), 0);
 }
+
+#[test]
+fn empty_language_list_ignores_locale() {
+    // no preference at all: locale never decides (ManifestComparator.cpp:650-653), so the
+    // unspecified installer is not weakly preferred over en-US and the first one stays
+    let h = Host {
+        locale: wingetrs::winget_install::select::Languages::default(),
+        ..host("x64")
+    };
+    let items = [
+        inst("x64", ""),
+        inst(
+            "x64",
+            "  InstallerLocale: en-US
+",
+        ),
+    ];
+    assert_eq!(idx(&items, &h, PU), 0);
+    let items = [
+        inst(
+            "x64",
+            "  InstallerLocale: en-US
+",
+        ),
+        inst("x64", ""),
+    ];
+    assert_eq!(idx(&items, &h, PU), 0);
+}

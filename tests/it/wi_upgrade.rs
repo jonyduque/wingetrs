@@ -274,6 +274,62 @@ fn native_agrees_with_winget_applicability() {
             Applicability::Unknown => panic!("{label}: unknown"),
         }
     }
+
+    // System architecture listed in UnsupportedOSArchitectures: both sides refuse
+    // (installer-level and root-level lists).
+    let extra = format!(
+        "  UnsupportedOSArchitectures:
+  - {}
+",
+        host_arch()
+    );
+    let m = manifest_with("inno", &[(None, None)], URL, SHA, &extra);
+    let native = plan_upgrade(
+        &m,
+        &host(),
+        upgrade_scope(user, DefaultScope::User),
+        "0.9",
+        &InstalledFacts::default(),
+    );
+    assert!(
+        native.is_err(),
+        "native accepts an unsupported architecture"
+    );
+    let fit = winget_applicability(&m, user, host_arch()).applicability;
+    assert!(
+        !matches!(fit, Applicability::Ok),
+        "bridge accepts an unsupported architecture: {fit:?}"
+    );
+    let root = format!(
+        "UnsupportedOSArchitectures:
+- {}
+",
+        host_arch()
+    );
+    let m = manifest_with("inno", &[(None, None)], URL, SHA, "");
+    let yaml_root = manifest::parse(
+        format!(
+            "{root}PackageIdentifier: Pub.App
+PackageVersion: '1.0'
+Installers:
+- Architecture: {}
+  InstallerType: inno
+  InstallerUrl: {URL}
+  InstallerSha256: {SHA}
+",
+            host_arch()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(!matches!(
+        winget_applicability(&yaml_root, user, host_arch()).applicability,
+        Applicability::Ok
+    ));
+    assert!(matches!(
+        winget_applicability(&m, user, host_arch()).applicability,
+        Applicability::Ok
+    ));
 }
 
 // ---- upgrade flow ----
