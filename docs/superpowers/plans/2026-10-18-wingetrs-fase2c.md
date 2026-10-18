@@ -917,6 +917,8 @@ Testes:
 
 **Da revisão da Task 153 (2026-10-18): o efeito é dado não confiável (escrito por script de terceiro).** Antes de aplicar: (1) tamanho do `effects.jsonl` conferido antes de ler (teto 64 MiB); (2) `shortcut.name` (ex.: `..\..\Startup\x`), `shim.name`/`path`, `rm_shim.name` e cada entrada de PATH pelo `install::safepath` e dentro do app/raiz; (3) `set_env` e `add_path.var` só em variáveis permitidas (nunca `PATH` inteiro, `PSModulePath` só pela via do psmodule; lista explícita e teste); (4) `remove_path` com padrões `-like` como no Scoop, mas só removendo entradas dentro da raiz do wingetrs. Um teste de recusa por item.
 
+**Da revisão da Task 156 (2026-10-18):** acrescente em tests/it/install_scripts.rs (ou no seu arquivo de teste) um caso de recusa de hook vindo de variante de arquitetura (`architecture.64bit.post_install: "scoop install x"` ⇒ `PlanError::ScriptRefused`).
+
 **Files:**
 - Modify: `src/install/executor.rs`, `src/install/planner.rs` (só visibilidade)
 - Test: `tests/it/install_script_effects.rs` (**já criado pelo orquestrador**; `World`/`FailAt` copiados; `FakeHost` que grava um `effects.jsonl` escolhido pelo teste e sai 0)
@@ -1057,6 +1059,8 @@ Testes:
 5. Teste ao vivo em `tests/it/script_host_live.rs` com `#[ignore = "live: roda o PowerShell real com script sintético"]`: hook sintético grava um arquivo em `$dir` e chama `Add-Path`; confere `effects.jsonl`, que `%USERPROFILE%\scoop` não mudou (listagem do primeiro nível antes e depois) e que o `HKCU` real não foi tocado (`WINGETRS_TEST_ENV_KEY`). **Agentes não rodam esse teste sem pedido do usuário.**
 
 **Da revisão da Task 146 (2026-10-18):** `run_spec` herda o ambiente do usuário (o programa é absoluto, mas um filho acha ferramentas pelo PATH do usuário). Esta tarefa decide o ambiente do processo que ela lança: `PATH` fixo (`%SystemRoot%\System32` por KnownFolder + as pastas do próprio app/auxiliar), sem herdar o PATH do usuário, salvo motivo medido; teste do ambiente montado.
+
+**Da revisão da Task 156 (2026-10-18):** o host não consulta o `LaunchGate`; um Ctrl+C durante um hook bloqueia até o PowerShell terminar e o log do drop diz "cancelada durante a extração". Nesta tarefa: Ctrl+C antes de lançar o pwsh cancela; depois de lançado, o hook roda até o fim (como o msiexec, sem matar), com aviso; o texto do log do drop fica genérico ("cancelada durante um passo em andamento"). Teste com o `fake_pwsh.cmd`.
 
 **Files:**
 - Create: `src/install/script_policy.rs`, `src/install/script_host_win.rs` (**o orquestrador cria com `//!` e `pub mod`**)
