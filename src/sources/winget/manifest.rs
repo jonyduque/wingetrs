@@ -132,7 +132,7 @@ pub struct Installer {
     pub dependencies: Option<Dependencies>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct InstallerSwitches {
     #[serde(default)]
@@ -151,7 +151,7 @@ pub struct InstallerSwitches {
     pub custom: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ExpectedReturnCode {
     #[serde(default)]
@@ -162,7 +162,7 @@ pub struct ExpectedReturnCode {
     pub return_response_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct PackageDependency {
     #[serde(default)]
@@ -171,7 +171,7 @@ pub struct PackageDependency {
     pub minimum_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Dependencies {
     #[serde(default)]
@@ -184,7 +184,7 @@ pub struct Dependencies {
     pub external_dependencies: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Agreement {
     #[serde(default)]
@@ -196,7 +196,7 @@ pub struct Agreement {
 }
 
 /// One `AppsAndFeaturesEntries` item.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ArpEntry {
     #[serde(default)]
@@ -213,7 +213,7 @@ pub struct ArpEntry {
     pub installer_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct NestedInstallerFile {
     #[serde(default)]
@@ -284,7 +284,7 @@ impl InstallerKind {
 }
 
 /// An installer with every root-level default already applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveInstaller {
     pub architecture: String,
     pub kind: InstallerKind,

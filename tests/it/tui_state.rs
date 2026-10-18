@@ -2293,13 +2293,8 @@ fn enter_in_installed_opens_actions_menu() {
     let items = menu_items(&foreign);
     assert!(!items[0].1);
     assert_eq!(items[0].2.as_deref(), Some("instalado fora do wingetrs"));
-    assert!(!items[1].1);
-    assert!(
-        items[1]
-            .2
-            .as_deref()
-            .is_some_and(|n| n.contains("wingetrs"))
-    );
+    // An ARP record is removed natively (Task 187).
+    assert_eq!(items[1], ("Remover".to_string(), true, None));
     assert!(update(&mut foreign, key(KeyCode::Esc)).is_empty());
     assert!(foreign.modal.is_none());
 

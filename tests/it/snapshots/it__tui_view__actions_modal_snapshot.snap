@@ -1,6 +1,6 @@
 ---
-source: tests/tui_view.rs
-assertion_line: 308
+source: tests/it/tui_view.rs
+assertion_line: 311
 expression: "render(&a, 100, 16)"
 ---
 "╭───────────╮╭────────────╮╭────────────────╮╭─────────╮                                            "
@@ -9,13 +9,13 @@ expression: "render(&a, 100, 16)"
 "╭ ripgrep ─────────────────────────────────────────────────────────────────────────────────────────╮"
 "│                                                                                                  │"
 "│    (instalado fora do wingetrs) Atualizar                                                        │"
-"│    (só apps instalados pelo wingetrs podem ser removidos ou atualizados aqui) Remover            │"
+"│    Remover                                                                                       │"
 "│  > Fixar versão                                                                                  │"
 "│    Marcar                                                                                        │"
 "│  Enter escolhe · Esc cancela                                                                     │"
 "│                                                                                                  │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "│                                                      │                                           │"
-"│                                                      │  Fixar                                    │"
+"│                                                      │  Remover (u)   Fixar                      │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
 " 1 de 1                                                                                             "

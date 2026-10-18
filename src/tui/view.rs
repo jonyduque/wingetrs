@@ -849,7 +849,7 @@ fn details_lines(app: &App, theme: &Theme, g: &Glyphs) -> (Vec<Line<'static>>, u
     {
         out.push(Line::from(Span::styled(
             format!(
-                "Sobra provável: o desinstalador {path} não existe. A limpeza fica para a fase 2d."
+                "Sobra provável: o desinstalador {path} não existe. Use \"Remover registro órfão\" no menu."
             ),
             theme.alert(),
         )));

@@ -12,9 +12,19 @@ use crate::install::plan::InstallPlan;
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue};
 use crate::install::state::StateDb;
+use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
+use crate::winget_install::engine::{self, UpgradeError, UpgradeRoute, upgrade_route};
+use crate::winget_install::launch::Elevation;
+use crate::winget_install::ops::{self as winget_ops, WingetCtx, WingetOpsError};
+use crate::winget_install::orphans::{ArpRegistry, remove_orphan};
+use crate::winget_install::plan::WingetPlan as NativePlan;
+use crate::winget_install::uninstall::{
+    BackupLimits, KEY_STAYED, UninstallCtx, UninstallPlan as WingetUninstallPlan, UninstallStatus,
+    UninstallTarget, backup_folders, remove_registry_only, uninstall,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -364,6 +374,48 @@ fn action_info(action: &Action) -> Option<JobInfo> {
             cmd: None,
         }),
         Action::Bridge(_) => None,
+        Action::WingetInstall(p) => Some(winget_info("install", p, None)),
+        Action::WingetUpgrade { plan, .. } => {
+            Some(winget_info("upgrade", plan, plan.upgrade_from.clone()))
+        }
+        Action::WingetUninstall(p) | Action::WingetRegistryOnly(p) => Some(JobInfo {
+            kind: "remove",
+            tool: "wingetrs",
+            target: record_of(&p.target),
+            name: p.name.clone(),
+            from: p.version.clone(),
+            to: None,
+            cmd: None,
+        }),
+        Action::RemoveOrphan(o) => Some(JobInfo {
+            kind: "remove",
+            tool: "wingetrs",
+            target: o.key.clone(),
+            name: o.name.clone(),
+            from: None,
+            to: None,
+            cmd: None,
+        }),
+    }
+}
+
+fn winget_info(kind: &'static str, p: &NativePlan, from: Option<String>) -> JobInfo {
+    JobInfo {
+        kind,
+        tool: "wingetrs",
+        target: p.id.clone(),
+        name: p.name.clone(),
+        from,
+        to: Some(p.version.clone()),
+        cmd: None,
+    }
+}
+
+/// The registry key or package family a native removal acts on.
+fn record_of(t: &UninstallTarget) -> String {
+    match t {
+        UninstallTarget::Arp { key, .. } => key.clone(),
+        UninstallTarget::Msix { family } => family.clone(),
     }
 }
 
@@ -424,6 +476,267 @@ async fn run_action_inner(o: &OpsCtx<'_>, action: Action) -> Result<Done, Instal
             job.name,
             job.tool.name()
         ))),
+        // Run by `run_winget_action`, without the scoop ops context.
+        other => Err(InstallFail::Other(format!(
+            "{}: ação nativa do winget fora do seu executor",
+            other.label()
+        ))),
+    }
+}
+
+/// Whether `action` is a native winget job (`run_winget_action`), not one of the own scoop
+/// installer nor of the bridge.
+pub fn is_winget_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::WingetInstall(_)
+            | Action::WingetUninstall(_)
+            | Action::WingetRegistryOnly(_)
+            | Action::WingetUpgrade { .. }
+            | Action::RemoveOrphan(_)
+    )
+}
+
+/// What a native winget job needs from the outside world (production in `run.rs`, fakes in
+/// tests). `install.elevated` is the session's helper: one UAC per session for everything.
+pub struct WingetEnv<'a> {
+    pub install: WingetCtx<'a>,
+    pub uninstall: UninstallCtx<'a>,
+    pub registry: &'a dyn ArpRegistry,
+    /// `install::layout::Layout::backups` (the `.reg` exports and the folder copies).
+    pub backups: &'a Path,
+    pub free_space: &'a dyn Fn(&Path) -> Option<u64>,
+    /// The plan removing the installed record `row_key` before an `uninstallPrevious` upgrade.
+    pub previous: &'a dyn Fn(&str, &NativePlan) -> Result<WingetUninstallPlan, String>,
+    /// Name of this run's backup folder (a timestamp).
+    pub stamp: String,
+}
+
+fn winget_fail(e: WingetOpsError) -> InstallFail {
+    match e {
+        WingetOpsError::Busy => InstallFail::Busy,
+        other => InstallFail::Other(other.to_string()),
+    }
+}
+
+fn upgrade_fail(e: UpgradeError) -> InstallFail {
+    match e {
+        UpgradeError::Install(WingetOpsError::Busy) => InstallFail::Busy,
+        other => InstallFail::Other(other.to_string()),
+    }
+}
+
+fn phase_of(env: &WingetEnv<'_>, p: Phase) {
+    (env.install.progress)(&ProgressEvent::Phase(p));
+}
+
+/// The phase while a removal runs: the UAC (and the elevated helper) or the removal itself.
+fn removal_phase(elevated: bool, name: &str) -> Phase {
+    if elevated {
+        Phase::WaitingElevation
+    } else {
+        Phase::Removing {
+            app: name.to_string(),
+        }
+    }
+}
+
+/// The outcome of a native install or upgrade: a warning (the app did not show up) is an
+/// error without effect, never "Instalado".
+fn install_done(
+    verb: &str,
+    name: &str,
+    report: crate::winget_install::ops::InstallReport,
+) -> (Result<Done, InstallFail>, Outcome) {
+    match report.warning {
+        Some(w) => (
+            Err(InstallFail::Other(format!("{name}: {w}"))),
+            Outcome::NoEffect,
+        ),
+        None => (
+            Ok(Done {
+                summary: format!("{verb}: {name}"),
+                residues: None,
+            }),
+            Outcome::Ok,
+        ),
+    }
+}
+
+/// Executes a confirmed native winget action and logs it as a job.
+pub async fn run_winget_action(env: &WingetEnv<'_>, action: Action) -> Result<Done, InstallFail> {
+    let log = action_info(&action).map(JobLog::start);
+    let (result, outcome) = run_winget_inner(env, action).await;
+    if let Some(log) = log {
+        match &result {
+            Ok(done) => log.finish(outcome, &done.summary),
+            Err(fail) => {
+                let (failed, detail) = fail_log(fail);
+                let outcome = if outcome == Outcome::Ok {
+                    failed
+                } else {
+                    outcome
+                };
+                log.finish(outcome, &detail);
+            }
+        }
+    }
+    result
+}
+
+async fn run_winget_inner(
+    env: &WingetEnv<'_>,
+    action: Action,
+) -> (Result<Done, InstallFail>, Outcome) {
+    let failed = |f: InstallFail| (Err(f), Outcome::Ok);
+    match action {
+        Action::WingetInstall(plan) => match winget_ops::install(&env.install, &plan).await {
+            Ok(r) => install_done("Instalado", &plan.name, r),
+            Err(e) => failed(winget_fail(e)),
+        },
+        Action::WingetUpgrade { plan, row_key } => {
+            let previous = if upgrade_route(&plan.installer) == UpgradeRoute::UninstallFirst {
+                match (env.previous)(&row_key, &plan) {
+                    Ok(p) => Some(p),
+                    Err(e) => return failed(InstallFail::Other(e)),
+                }
+            } else {
+                None
+            };
+            match engine::upgrade(&env.install, &env.uninstall, &plan, previous.as_ref()).await {
+                Ok(r) => install_done("Atualizado", &plan.name, r),
+                Err(e) => failed(upgrade_fail(e)),
+            }
+        }
+        Action::WingetUninstall(plan) => {
+            // Nothing else of wingetrs runs meanwhile (as an upgrade's removal).
+            let layout = env.install.data.install_layout();
+            let _lock = match winget_ops::lock_install(&layout, env.install.wait).await {
+                Ok(l) => l,
+                Err(e) => return failed(winget_fail(e)),
+            };
+            winget_uninstall(env, &plan)
+        }
+        Action::WingetRegistryOnly(plan) => {
+            let layout = env.install.data.install_layout();
+            let _lock = match winget_ops::lock_install(&layout, env.install.wait).await {
+                Ok(l) => l,
+                Err(e) => return failed(winget_fail(e)),
+            };
+            let hklm =
+                matches!(&plan.target, UninstallTarget::Arp { hive, .. } if *hive != Hive::User);
+            phase_of(env, removal_phase(hklm, &plan.name));
+            match remove_registry_only(
+                &plan,
+                env.registry,
+                env.install.elevated,
+                env.backups,
+                &env.stamp,
+            ) {
+                Ok(file) => (
+                    Ok(Done {
+                        summary: format!(
+                            "Registro de {} removido (cópia em {})",
+                            plan.name,
+                            file.display()
+                        ),
+                        residues: None,
+                    }),
+                    Outcome::Ok,
+                ),
+                Err(e) => failed(InstallFail::Other(format!("{}: {e}", plan.name))),
+            }
+        }
+        Action::RemoveOrphan(o) => {
+            let layout = env.install.data.install_layout();
+            let _lock = match winget_ops::lock_install(&layout, env.install.wait).await {
+                Ok(l) => l,
+                Err(e) => return failed(winget_fail(e)),
+            };
+            phase_of(env, removal_phase(o.hive != Hive::User, &o.name));
+            match remove_orphan(
+                env.registry,
+                env.install.elevated,
+                env.backups,
+                &env.stamp,
+                &o,
+            ) {
+                Ok(file) => (
+                    Ok(Done {
+                        summary: format!(
+                            "Registro órfão de {} removido (cópia em {})",
+                            o.name,
+                            file.display()
+                        ),
+                        residues: None,
+                    }),
+                    Outcome::Ok,
+                ),
+                Err(e) => failed(InstallFail::Other(format!("{}: {e}", o.name))),
+            }
+        }
+        other => failed(InstallFail::Other(format!(
+            "{}: não é uma ação nativa do winget",
+            other.label()
+        ))),
+    }
+}
+
+/// Copies the shared data folders (when the plan still has them: the user kept the option),
+/// then runs the uninstaller. A refused copy removes nothing.
+fn winget_uninstall(
+    env: &WingetEnv<'_>,
+    plan: &WingetUninstallPlan,
+) -> (Result<Done, InstallFail>, Outcome) {
+    let failed = |f: InstallFail| (Err(f), Outcome::Ok);
+    let mut copied = None;
+    if let Some(shared) = &plan.shared
+        && !shared.folders.is_empty()
+    {
+        let dest = env.backups.join(format!("{}-pastas", env.stamp));
+        let limits = BackupLimits::standard(env.free_space);
+        match backup_folders(&shared.folders, &dest, &limits) {
+            Ok(notes) => {
+                for n in &notes {
+                    tracing::warn!(app = %plan.name, "backup: {n}");
+                }
+                copied = Some(dest);
+            }
+            Err(e) => {
+                return failed(InstallFail::Other(format!(
+                    "{}: cópia das pastas recusada ({e}); nada foi removido",
+                    plan.name
+                )));
+            }
+        }
+    }
+    phase_of(
+        env,
+        removal_phase(plan.elevation == Elevation::Helper, &plan.name),
+    );
+    match uninstall(&env.uninstall, plan) {
+        Ok(r) if r.status == UninstallStatus::Removed && r.warning.is_none() => {
+            let mut summary = format!("{} removido", plan.name);
+            if let Some(dest) = copied {
+                summary.push_str(&format!(" (pastas copiadas para {})", dest.display()));
+            }
+            (
+                Ok(Done {
+                    summary,
+                    residues: None,
+                }),
+                Outcome::Ok,
+            )
+        }
+        Ok(r) => (
+            Err(InstallFail::Other(format!(
+                "{}: {}",
+                plan.name,
+                r.warning.unwrap_or_else(|| KEY_STAYED.to_string())
+            ))),
+            r.status.job_outcome(),
+        ),
+        Err(e) => failed(InstallFail::Other(format!("{}: {e}", plan.name))),
     }
 }
 

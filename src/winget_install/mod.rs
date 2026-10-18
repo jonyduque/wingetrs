@@ -7,6 +7,8 @@ pub mod elevated_rules;
 pub mod engine;
 pub mod fetch;
 #[cfg(windows)]
+pub mod folders_win;
+#[cfg(windows)]
 pub mod host_win;
 pub mod launch;
 #[cfg(windows)]

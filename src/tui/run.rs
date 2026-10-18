@@ -248,6 +248,7 @@ async fn event_loop(
     let pwsh = crate::bridge::find_pwsh(std::env::var_os("PATH").as_deref());
     app.scoop_root = scoop_root.clone().unwrap_or_default();
     app.pwsh.clone_from(&pwsh);
+    app.backups_dir = data.install_layout().backups();
     let (tx, mut rx) = unbounded_channel::<Msg>();
     let ctx = Arc::new(Ctx {
         data,
@@ -387,6 +388,20 @@ async fn event_loop(
                     });
                 }
                 Cmd::PlanWingetInstall { id } => spawn_winget_plan(&ctx, id),
+                Cmd::PlanWingetUninstall {
+                    app_key,
+                    name,
+                    others,
+                    is_main,
+                } => spawn_job(&ctx, move |c, _| {
+                    Msg::WingetUninstallPlanned(plan_winget_uninstall(
+                        c.data.root(),
+                        &app_key,
+                        &name,
+                        &others,
+                        is_main,
+                    ))
+                }),
                 Cmd::PlanRemove { app, purge } => {
                     spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app, purge));
                 }
@@ -1072,12 +1087,22 @@ fn spawn_applicability(ctx: &Arc<Ctx>, rows: Vec<ApplicabilityQuery>) {
                     }
                     let ctx = Arc::clone(&ctx);
                     tasks.spawn(async move {
-                        let result = applicability(&ctx, &q).await.map_err(|e| format!("{e:#}"));
+                        let (result, native) = match applicability(&ctx, &q).await {
+                            Ok((fit, native)) => (Ok(fit), native),
+                            Err(e) => (Err(format!("{e:#}")), None),
+                        };
                         let _ = ctx.tx.send(Msg::ApplicabilityLoaded {
-                            app_key: q.app_key,
-                            latest: q.latest,
+                            app_key: q.app_key.clone(),
+                            latest: q.latest.clone(),
                             result,
                         });
+                        if let Some(plan) = native {
+                            let _ = ctx.tx.send(Msg::NativeUpgradeLoaded {
+                                app_key: q.app_key,
+                                latest: q.latest,
+                                plan,
+                            });
+                        }
                         drop(slot);
                     });
                 }
@@ -1106,11 +1131,15 @@ fn spawn_applicability(ctx: &Arc<Ctx>, rows: Vec<ApplicabilityQuery>) {
     });
 }
 
-/// The manifest of the row's catalog version, judged for this machine and the row's scope.
+/// The manifest of the row's catalog version, judged for this machine and the row's scope,
+/// and the native upgrade plan when the native planner would run it.
 async fn applicability(
     ctx: &Ctx,
     q: &ApplicabilityQuery,
-) -> anyhow::Result<crate::bridge::WingetFit> {
+) -> anyhow::Result<(
+    crate::bridge::WingetFit,
+    Option<crate::winget_install::plan::WingetPlan>,
+)> {
     let pkg = read_package(ctx, "winget", &q.package_id).await?;
     let hash = pkg
         .winget_hash
@@ -1126,11 +1155,85 @@ async fn applicability(
         Some(&q.latest),
     )
     .await?;
-    Ok(crate::bridge::winget_applicability(
-        &manifest,
-        q.scope,
-        crate::bridge::host_arch(),
-    ))
+    let fit = crate::bridge::winget_applicability(&manifest, q.scope, crate::bridge::host_arch());
+    let native = native_upgrade(&manifest, q, current_behavior(ctx).default_scope);
+    Ok((fit, native))
+}
+
+/// The Settings as saved now (a config that does not load: the ones of this session).
+fn current_behavior(ctx: &Ctx) -> crate::config::Behavior {
+    match Config::load(&ctx.data.config_path()) {
+        Ok(cfg) => cfg.behavior,
+        Err(e) => {
+            tracing::warn!(error = %e, "config unreadable; using the settings already loaded");
+            ctx.cfg.behavior
+        }
+    }
+}
+
+/// `ScopeWanted` of a new install from the Settings default.
+fn install_scope(d: crate::config::DefaultScope) -> crate::winget_install::select::ScopeWanted {
+    use crate::winget_install::select::{Scope, ScopeWanted};
+    ScopeWanted::Prefer(match d {
+        crate::config::DefaultScope::Machine => Scope::Machine,
+        crate::config::DefaultScope::User => Scope::User,
+    })
+}
+
+/// The native upgrade plan of the row (its installed scope, type and architecture), when the
+/// native planner runs it; `None` sends the upgrade to winget.
+#[cfg(windows)]
+fn native_upgrade(
+    manifest: &crate::sources::winget::manifest::MergedManifest,
+    q: &ApplicabilityQuery,
+    default: crate::config::DefaultScope,
+) -> Option<crate::winget_install::plan::WingetPlan> {
+    use crate::winget_install::engine::{
+        InstalledFacts, InstalledKind, installed_facts, plan_upgrade, upgrade_scope,
+    };
+    use crate::winget_install::plan::PlanOrBridge;
+    use crate::winget_install::uninstall::{UninstallTarget, target_of};
+    let installed = q.installed.as_deref()?;
+    let facts = match target_of(&q.app_key)? {
+        UninstallTarget::Arp { hive, key } => {
+            crate::winget_install::arp_read_win::read_details(hive, &key)
+                .ok()
+                .flatten()
+                .map(|d| installed_facts(&d))
+                .unwrap_or_default()
+        }
+        UninstallTarget::Msix { .. } => InstalledFacts {
+            arch: None,
+            kind: Some(InstalledKind::Msix),
+        },
+    };
+    let host = crate::winget_install::host_win::current();
+    match plan_upgrade(
+        manifest,
+        &host,
+        upgrade_scope(q.scope, default),
+        installed,
+        &facts,
+    ) {
+        Ok(PlanOrBridge::Native(p)) => Some(p),
+        Ok(PlanOrBridge::Bridge(why)) => {
+            tracing::debug!(app_key = %q.app_key, %why, "native upgrade goes to winget");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(app_key = %q.app_key, why = %e.0, "native upgrade refused");
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn native_upgrade(
+    _manifest: &crate::sources::winget::manifest::MergedManifest,
+    _q: &ApplicabilityQuery,
+    _default: crate::config::DefaultScope,
+) -> Option<crate::winget_install::plan::WingetPlan> {
+    None
 }
 
 /// Plans a winget install through the bridge off the event loop (`Msg::WingetPlanned`).
@@ -1138,9 +1241,17 @@ fn spawn_winget_plan(ctx: &Arc<Ctx>, id: String) {
     let ctx = Arc::clone(ctx);
     tokio::spawn(async move {
         let c = Arc::clone(&ctx);
-        let work = tokio::spawn(async move { plan_winget_install(&c, &id).await });
+        let work = tokio::spawn(async move {
+            let bridge = plan_winget_install(&c, &id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let native = plan_native_install(&c, &id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            Msg::WingetInstallPlanned { bridge, native }
+        });
         let msg = match work.await {
-            Ok(r) => Msg::WingetPlanned(r.map_err(|e| format!("{e:#}"))),
+            Ok(msg) => msg,
             Err(e) if e.is_panic() => Msg::Panicked(e.into_panic()),
             Err(e) => Msg::WingetPlanned(Err(e.to_string())),
         };
@@ -1173,6 +1284,115 @@ async fn plan_winget_install(
         .map(|a| crate::bridge::agreement_line(a, false))
         .collect();
     Ok((plan.job, notes))
+}
+
+/// The native install plan of winget package `id` (its catalog version) for this machine and
+/// the Settings default scope; a refusal is an `Err` with the planner's reason.
+async fn plan_native_install(
+    ctx: &Ctx,
+    id: &str,
+) -> anyhow::Result<crate::winget_install::plan::PlanOrBridge> {
+    let pkg = read_package(ctx, "winget", id).await?;
+    let hash = pkg
+        .winget_hash
+        .as_deref()
+        .context("pacote winget sem hash de manifesto")?;
+    let blobs = BlobStore::new(ctx.data.blobs_dir());
+    let (manifest, _) = crate::sources::winget::details::merged_manifest(
+        &ctx.http,
+        &blobs,
+        crate::sources::winget::CDN_BASE,
+        &pkg.entry.id,
+        hash,
+        Some(&pkg.entry.version),
+    )
+    .await?;
+    let wanted = install_scope(current_behavior(ctx).default_scope);
+    native_install(&manifest, wanted).map_err(anyhow::Error::msg)
+}
+
+#[cfg(windows)]
+fn native_install(
+    manifest: &crate::sources::winget::manifest::MergedManifest,
+    wanted: crate::winget_install::select::ScopeWanted,
+) -> Result<crate::winget_install::plan::PlanOrBridge, String> {
+    let host = crate::winget_install::host_win::current();
+    crate::winget_install::plan::plan(manifest, &host, wanted, None).map_err(|e| e.0)
+}
+
+#[cfg(not(windows))]
+fn native_install(
+    _manifest: &crate::sources::winget::manifest::MergedManifest,
+    _wanted: crate::winget_install::select::ScopeWanted,
+) -> Result<crate::winget_install::plan::PlanOrBridge, String> {
+    Err("instalar pelo wingetrs só funciona no Windows".to_string())
+}
+
+/// The native removal plan of the record `app_key` (`name` when it is an MSIX package);
+/// `others` are the app's other ARP records (the shared-data warning), `is_main` whether this
+/// is the principal one. The size of the shared folders is measured here, off the UI.
+#[cfg(windows)]
+fn plan_winget_uninstall(
+    root: &std::path::Path,
+    app_key: &str,
+    name: &str,
+    others: &[String],
+    is_main: bool,
+) -> Result<crate::winget_install::uninstall::UninstallPlan, String> {
+    use crate::winget_install::arp_read_win::read_details;
+    use crate::winget_install::launch::Elevation;
+    use crate::winget_install::uninstall::{
+        UninstallPlan, UninstallTarget, measure_folders, plan_uninstall, target_of,
+    };
+    let target = target_of(app_key).ok_or_else(|| format!("registro inválido: {app_key}"))?;
+    let (hive, key) = match target {
+        UninstallTarget::Msix { family } => {
+            return Ok(UninstallPlan {
+                target: UninstallTarget::Msix { family },
+                name: name.to_string(),
+                version: None,
+                command: None,
+                elevation: Elevation::Never,
+                shared: None,
+            });
+        }
+        UninstallTarget::Arp { hive, key } => (hive, key),
+    };
+    let d = read_details(hive, &key)
+        .map_err(|e| format!("registro ilegível ({key}): {e}"))?
+        .ok_or_else(|| format!("o registro {key} não existe mais"))?;
+    let others: Vec<_> = others
+        .iter()
+        .filter_map(|k| match target_of(k)? {
+            UninstallTarget::Arp { hive, key } => read_details(hive, &key).ok()?,
+            UninstallTarget::Msix { .. } => None,
+        })
+        .collect();
+    let k = crate::bridge::arp_ops_win::known_folders()
+        .map_err(|e| format!("pastas do sistema ilegíveis: {e}"))?;
+    let u = crate::winget_install::folders_win::user_folders(root)
+        .map_err(|e| format!("pastas do usuário ilegíveis: {e}"))?;
+    let is_dir = |p: &str| std::path::Path::new(p).is_dir();
+    // No manifest is read for a removal: the NSIS hint stays off.
+    let mut plan = plan_uninstall(&d, false, &others, is_main, &k, &u, &is_dir)?;
+    if let Some(shared) = &mut plan.shared {
+        match measure_folders(&shared.folders) {
+            Ok(size) => shared.size = Some(size),
+            Err(e) => tracing::warn!(app = %plan.name, "data folders not measured: {e}"),
+        }
+    }
+    Ok(plan)
+}
+
+#[cfg(not(windows))]
+fn plan_winget_uninstall(
+    _root: &std::path::Path,
+    _app_key: &str,
+    _name: &str,
+    _others: &[String],
+    _is_main: bool,
+) -> Result<crate::winget_install::uninstall::UninstallPlan, String> {
+    Err("remover só funciona no Windows".to_string())
 }
 
 /// The catalog entry of `source`/`id`, read off the runtime threads.
@@ -1477,6 +1697,9 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
     if let Action::Bridge(job) = action {
         return spawn_bridge(ctx, job);
     }
+    if jobs::is_winget_action(&action) {
+        return spawn_winget(ctx, action);
+    }
     spawn_job(ctx, move |c, handle| {
         let tx = c.tx.clone();
         let throttle = jobs::ProgressThrottle::new(Instant::now());
@@ -1496,6 +1719,139 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
         .and_then(|r| r);
         Msg::InstallFinished(result)
     });
+}
+
+/// Runs a native winget action on a blocking thread (the installer and the uninstaller block
+/// it), with the session's elevated helper; the TUI never waits for `install.lock`.
+fn spawn_winget(ctx: &Arc<Ctx>, action: Action) {
+    spawn_job(ctx, move |c, handle| {
+        let tx = c.tx.clone();
+        let throttle = jobs::ProgressThrottle::new(Instant::now());
+        let progress = move |ev: &crate::install::progress::ProgressEvent| {
+            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), ev) {
+                let _ = tx.send(msg);
+            }
+        };
+        let logged = action.clone();
+        let result = with_winget(c, &progress, |env| {
+            handle.block_on(jobs::run_winget_action(env, action))
+        })
+        .map_err(|e| {
+            jobs::log_not_started(&logged, &e);
+            InstallFail::Other(e)
+        })
+        .and_then(|r| r);
+        Msg::InstallFinished(result)
+    });
+}
+
+/// The record still there (a read error counts as there: never "removed" by mistake).
+#[cfg(windows)]
+fn key_exists(hive: crate::installed::Hive, key: &str) -> bool {
+    !matches!(
+        crate::winget_install::arp_read_win::read_details(hive, key),
+        Ok(None)
+    )
+}
+
+/// One variable of this (unelevated) user's environment, for unelevated uninstallers.
+#[cfg(windows)]
+fn user_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Runs `f` with the production winget environment: the real launcher, package manager,
+/// registry and helper (`Ctx.elevated`: one UAC per session for everything).
+#[cfg(windows)]
+fn with_winget<R>(
+    c: &Ctx,
+    progress: crate::install::download::Progress<'_>,
+    f: impl FnOnce(&jobs::WingetEnv<'_>) -> R,
+) -> Result<R, String> {
+    use crate::winget_install::launch_win::ShellLauncher;
+    use crate::winget_install::msix_win::SystemMsix;
+    use crate::winget_install::orphans_win::SystemArp;
+    use crate::winget_install::uninstall::{SystemClock, UninstallCtx};
+    let install = crate::winget_install::prod_win::build(
+        &c.data,
+        &c.http,
+        LockWait::NoWait,
+        progress,
+        crate::install::executor::LaunchGate::default(),
+        &c.elevated,
+    )
+    .map_err(|e| format!("msiexec.exe não encontrado: {e}"))?;
+    let msiexec = install.msiexec.clone();
+    let clock = SystemClock::new();
+    let uninstall = UninstallCtx {
+        launcher: &ShellLauncher,
+        elevated: &c.elevated,
+        msix: &SystemMsix,
+        key_exists: &key_exists,
+        clock: &clock,
+        user_expand: &user_env,
+        msiexec: &msiexec,
+    };
+    let backups = c.data.install_layout().backups();
+    let previous = |row_key: &str, plan: &crate::winget_install::plan::WingetPlan| {
+        previous_plan(c.data.root(), row_key, plan)
+    };
+    let env = jobs::WingetEnv {
+        install,
+        uninstall,
+        registry: &SystemArp,
+        backups: &backups,
+        free_space: &crate::winget_install::folders_win::free_space,
+        previous: &previous,
+        stamp: now_unix().to_string(),
+    };
+    Ok(f(&env))
+}
+
+#[cfg(not(windows))]
+fn with_winget<R>(
+    _c: &Ctx,
+    _progress: crate::install::download::Progress<'_>,
+    _f: impl FnOnce(&jobs::WingetEnv<'_>) -> R,
+) -> Result<R, String> {
+    Err("instalar e remover só funciona no Windows".to_string())
+}
+
+/// The plan removing the installed record `row_key` before an `uninstallPrevious` upgrade
+/// (the NSIS hint from the new plan's installer type).
+#[cfg(windows)]
+fn previous_plan(
+    root: &std::path::Path,
+    row_key: &str,
+    plan: &crate::winget_install::plan::WingetPlan,
+) -> Result<crate::winget_install::uninstall::UninstallPlan, String> {
+    use crate::sources::winget::manifest::InstallerKind;
+    use crate::winget_install::uninstall::{UninstallTarget, plan_uninstall, target_of};
+    match target_of(row_key) {
+        Some(UninstallTarget::Arp { hive, key }) => {
+            let d = crate::winget_install::arp_read_win::read_details(hive, &key)
+                .map_err(|e| format!("registro ilegível ({key}): {e}"))?
+                .ok_or_else(|| format!("o registro {key} não existe mais"))?;
+            let k = crate::bridge::arp_ops_win::known_folders()
+                .map_err(|e| format!("pastas do sistema ilegíveis: {e}"))?;
+            let u = crate::winget_install::folders_win::user_folders(root)
+                .map_err(|e| format!("pastas do usuário ilegíveis: {e}"))?;
+            let nsis = plan.installer.kind == InstallerKind::Nullsoft;
+            let is_dir = |p: &str| std::path::Path::new(p).is_dir();
+            plan_uninstall(&d, nsis, &[], true, &k, &u, &is_dir)
+        }
+        Some(UninstallTarget::Msix { family }) => {
+            Ok(crate::winget_install::uninstall::UninstallPlan {
+                target: UninstallTarget::Msix { family },
+                name: plan.name.clone(),
+                version: plan.upgrade_from.clone(),
+                command: None,
+                elevation: crate::winget_install::launch::Elevation::Never,
+                shared: None,
+            })
+        }
+        None => Err(format!("registro inválido: {row_key}")),
+    }
 }
 
 /// Wakes the queue after `BUSY_RETRY`, like the details debounce: the sleep is awaited in

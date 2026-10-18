@@ -15,7 +15,7 @@ use crate::sources::winget::manifest::{
 const AGREEMENT_TEXT_MAX: usize = 200;
 
 /// Everything the install flow needs, decided before anything is downloaded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WingetPlan {
     pub id: String,
     pub name: String,

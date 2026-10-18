@@ -1,7 +1,7 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
 use crate::bridge::{self, BridgeJob, BridgeOp, NOT_OURS_NOTE, PINNED_NOTE, Tool, WingetFit};
 use crate::catalog::search::{SearchHit, SearchIndex};
-use crate::config::{Behavior, Config, ConfirmMode, ResidueMode};
+use crate::config::{Behavior, Config, ConfirmMode, ResidueMode, WingetEngine};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
@@ -16,6 +16,13 @@ use crate::tui::picker::{PickOutcome, Picker, PickerItem};
 use crate::tui::settings::{SettingId, SettingsState, glyphs_name};
 use crate::tui::theme::GlyphSet;
 use crate::update::{Outcome, SourceReport};
+use crate::winget_install::engine::{Engine, choose_engine};
+use crate::winget_install::orphans::Orphan;
+use crate::winget_install::plan::{PlanOrBridge, WingetPlan};
+use crate::winget_install::select::Refusal;
+use crate::winget_install::uninstall::{
+    UninstallPlan as WingetUninstallPlan, UninstallTarget, target_of,
+};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -140,6 +147,21 @@ pub enum Msg {
     /// Result of `Cmd::PlanWingetInstall`: the bridge job and one note per license agreement
     /// (`Licença: <label> — <url>`).
     WingetPlanned(Result<(BridgeJob, Vec<String>), String>),
+    /// Result of `Cmd::PlanWingetInstall`: the bridge job (with its license notes) and the
+    /// native planner's answer; the Settings engine chooses between them (`choose_engine`).
+    WingetInstallPlanned {
+        bridge: Result<(BridgeJob, Vec<String>), String>,
+        native: Result<PlanOrBridge, String>,
+    },
+    /// Result of `Cmd::PlanWingetUninstall`.
+    WingetUninstallPlanned(Result<WingetUninstallPlan, String>),
+    /// The native upgrade of `app_key` to `latest`, sent after its applicability when the
+    /// native planner would run it.
+    NativeUpgradeLoaded {
+        app_key: String,
+        latest: String,
+        plan: WingetPlan,
+    },
     /// Results of a `Cmd::PlanBatch`, in the order of its items.
     BatchPlanned(Vec<Result<Planned, String>>),
     /// Download/extract progress of the running operation.
@@ -180,6 +202,8 @@ pub enum Msg {
 }
 
 /// What the user is asked to confirm, or to choose from.
+// Matched once when the plan arrives; boxing the action would only change its shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Planned {
     Ready {
@@ -191,6 +215,8 @@ pub enum Planned {
 }
 
 /// A confirmed operation, executed by the runtime under `install.lock`.
+// Built once per confirmation and moved along; boxing would only change the brief's shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// One plan list per app (dependencies first), applied in order.
@@ -203,10 +229,24 @@ pub enum Action {
         groups: Vec<Vec<InstallPlan>>,
         app: String,
     },
+    /// Native install of a winget package.
+    WingetInstall(WingetPlan),
+    /// Native uninstall of an ARP or MSIX record (with the folder backup when
+    /// `shared.folders` is not empty).
+    WingetUninstall(WingetUninstallPlan),
+    /// Option C of the shared-data case: removes only the registry record (no uninstaller).
+    WingetRegistryOnly(WingetUninstallPlan),
+    /// Native upgrade of the installed record `row_key` (`overrides::app_key`).
+    WingetUpgrade {
+        plan: WingetPlan,
+        row_key: String,
+    },
+    /// Exports and deletes an ARP record whose uninstaller is gone.
+    RemoveOrphan(Orphan),
 }
 
 impl Action {
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             Action::Apply(groups) => {
                 let apps: Vec<&str> = groups.iter().flatten().map(|p| p.app.as_str()).collect();
@@ -225,6 +265,11 @@ impl Action {
                     format!("Atualizando {} via {}", job.name, job.tool.name())
                 }
             },
+            Action::WingetInstall(p) => format!("Instalando {}", p.name),
+            Action::WingetUninstall(p) => format!("Removendo {}", p.name),
+            Action::WingetRegistryOnly(p) => format!("Removendo o registro de {}", p.name),
+            Action::WingetUpgrade { plan, .. } => format!("Atualizando {}", plan.name),
+            Action::RemoveOrphan(o) => format!("Removendo registro órfão de {}", o.name),
         }
     }
 }
@@ -313,6 +358,11 @@ pub enum Target {
     Ours(String, String),
     /// Boxed: the job carries two version strings and `Modal` would grow.
     Bridge(Box<BridgeJob>),
+    /// Native winget upgrade of the record `row_key` (engine `wingetrs`, native plan known).
+    Native {
+        plan: Box<WingetPlan>,
+        row_key: String,
+    },
 }
 
 /// Whether the bridge tools exist; `None` until the startup check answers (enabled meanwhile:
@@ -389,6 +439,9 @@ pub enum Modal {
         choice: Option<RowChoice>,
         /// What each picker item does (empty when `marked`).
         ids: Vec<ActionId>,
+        /// The row the menu acts on (winget removal and orphan records); `None` when `marked`
+        /// or in Search.
+        row: Option<Box<ListRow>>,
     },
     Residues {
         picker: Picker,
@@ -417,6 +470,11 @@ pub enum ActionId {
     Choose,
     UndoChoice,
     ToggleMark,
+    /// Remove the record `n` of the row (0: the row's own, `n`: `others[n - 1]`), which is
+    /// not the principal one when `n > 0`.
+    RemoveRecord(usize),
+    /// Remove the orphan record `n` of the row (numbered as `RemoveRecord`).
+    RemoveOrphan(usize),
 }
 
 /// Extra item of the actions menu that acts on the correlation of the selected installed row.
@@ -440,8 +498,12 @@ pub struct ApplicabilityQuery {
     /// Catalog version whose manifest decides.
     pub latest: String,
     pub scope: Option<InstallScope>,
+    /// Installed version (the native upgrade plan starts from it).
+    pub installed: Option<String>,
 }
 
+// Executed right away by the event loop; boxing `Execute` would only change its shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     Quit,
@@ -475,6 +537,15 @@ pub enum Cmd {
     /// answers with `Msg::WingetPlanned`.
     PlanWingetInstall {
         id: String,
+    },
+    /// Plan the native uninstall of the installed record `app_key` (`name` for a record that
+    /// cannot be read); `others` are the other records of the same app, `is_main` whether this
+    /// is the principal one. Answers with `Msg::WingetUninstallPlanned`.
+    PlanWingetUninstall {
+        app_key: String,
+        name: String,
+        others: Vec<String>,
+        is_main: bool,
     },
     /// `purge`: also delete the app's persistent data (setting at key time).
     PlanRemove {
@@ -697,6 +768,10 @@ pub struct App {
     pub pwsh: String,
     /// When the bridge upgrade in progress started or last printed a line.
     pub bridge_last_line: Option<Instant>,
+    /// Native upgrade plans by `app_key`, with the catalog version each is for.
+    pub native_upgrades: HashMap<String, (String, WingetPlan)>,
+    /// Where `.reg` backups go (`install::layout::Layout::backups`), shown in confirmations.
+    pub backups_dir: PathBuf,
 }
 
 /// Identity of a marked row: `(origin, name)` in Installed and Updates,
@@ -710,8 +785,9 @@ struct Batch {
     labels: Vec<String>,
     skipped: Vec<String>,
     hidden: usize,
-    /// Bridge upgrades of the marked rows, queued after the planned actions.
-    bridges: Vec<BridgeJob>,
+    /// Upgrades of the marked rows that need no plan (bridge or native), queued after the
+    /// planned actions.
+    bridges: Vec<Action>,
     /// Marked rows the action does not apply to.
     left_out: usize,
 }
@@ -817,6 +893,8 @@ impl App {
             scoop_root: PathBuf::new(),
             pwsh: "pwsh".to_string(),
             bridge_last_line: None,
+            native_upgrades: HashMap::new(),
+            backups_dir: PathBuf::new(),
         };
         app.research();
         app
@@ -1523,6 +1601,8 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             latest,
             result,
         } => {
+            // A native plan, if any, follows this verdict.
+            app.native_upgrades.remove(&app_key);
             match result {
                 Ok(fit) => {
                     app.applicability.insert(app_key, (latest, fit));
@@ -1732,6 +1812,18 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Planned(result) => on_planned(app, result),
         Msg::WingetPlanned(result) => on_winget_planned(app, result),
+        Msg::WingetInstallPlanned { bridge, native } => {
+            on_winget_install_planned(app, bridge, native)
+        }
+        Msg::WingetUninstallPlanned(result) => on_winget_uninstall_planned(app, result),
+        Msg::NativeUpgradeLoaded {
+            app_key,
+            latest,
+            plan,
+        } => {
+            app.native_upgrades.insert(app_key, (latest, plan));
+            refresh_open_actions(app)
+        }
         Msg::BatchPlanned(results) => on_batch_planned(app, results),
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
@@ -2175,15 +2267,87 @@ fn remove_selected(app: &mut App) -> Vec<Cmd> {
 
 /// Plans removing the selected app alone, whatever the marks.
 fn remove_one(app: &mut App) -> Vec<Cmd> {
-    let name = match app.installed_view().get(app.selected) {
-        None => return Vec::new(),
-        Some(r) if r.origin == "wingetrs" => r.name.clone(),
-        Some(_) => {
-            app.push_toast(ToastKind::Warning, NOT_OURS);
-            return Vec::new();
-        }
+    let Some(r) = app.installed_view().get(app.selected).map(|r| (*r).clone()) else {
+        return Vec::new();
     };
-    plan_remove(app, name)
+    match r.origin.as_str() {
+        "wingetrs" => plan_remove(app, r.name),
+        "arp" | "msix" => plan_winget_remove(app, &r, 0),
+        _ => {
+            app.push_toast(ToastKind::Warning, NOT_OURS);
+            Vec::new()
+        }
+    }
+}
+
+/// Whether wingetrs removes a record of this origin natively (ARP and MSIX).
+fn winget_removable(origin: &str) -> bool {
+    matches!(origin, "arp" | "msix")
+}
+
+/// Plans the native removal of record `n` of `r` (0: its own, `n`: `others[n - 1]`); the
+/// other ARP records of the app go along for the shared-data check.
+fn plan_winget_remove(app: &mut App, r: &ListRow, n: usize) -> Vec<Cmd> {
+    let records: Vec<(&str, &str)> = std::iter::once((r.app_key.as_str(), r.origin.as_str()))
+        .chain(
+            r.others
+                .iter()
+                .map(|o| (o.app_key.as_str(), o.origin.as_str())),
+        )
+        .collect();
+    let Some(&(app_key, _)) = records.get(n) else {
+        return Vec::new();
+    };
+    let others = records
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, origin))| *i != n && *origin == "arp")
+        .map(|(_, (k, _))| k.to_string())
+        .collect();
+    let cmd = Cmd::PlanWingetUninstall {
+        app_key: app_key.to_string(),
+        name: r.name.clone(),
+        others,
+        is_main: n == 0,
+    };
+    start_planning(app, cmd)
+}
+
+/// The orphan records of `r` (numbered as `ActionId::RemoveOrphan`): its own and the others'
+/// ARP records whose uninstaller is gone.
+fn row_orphans(r: &ListRow) -> Vec<(usize, Orphan)> {
+    let own = std::iter::once((r.app_key.as_str(), &r.stale));
+    let others = r.others.iter().map(|o| (o.app_key.as_str(), &o.stale));
+    own.chain(others)
+        .enumerate()
+        .filter_map(|(i, (app_key, stale))| {
+            let missing = stale.clone()?;
+            match target_of(app_key)? {
+                UninstallTarget::Arp { hive, key } => Some((
+                    i,
+                    Orphan {
+                        hive,
+                        key,
+                        name: r.name.clone(),
+                        missing,
+                    },
+                )),
+                UninstallTarget::Msix { .. } => None,
+            }
+        })
+        .collect()
+}
+
+/// Asks before removing an orphan record, whatever the `confirm` setting: its one item starts
+/// unchecked.
+fn ask_orphan(app: &mut App, o: Orphan) -> Vec<Cmd> {
+    let action = Action::RemoveOrphan(o);
+    if !needs_confirm(app.settings.behavior.confirm, &action) {
+        return enqueue(app, action);
+    }
+    let modal = confirm_modal(app, vec![action], Vec::new(), None);
+    open_modal(app, modal);
+    Vec::new()
 }
 
 /// The one rule for who can be upgraded (actions menu, `U`, `Enter` in Updates, marked
@@ -2206,6 +2370,17 @@ fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, Cow<'static, str>> {
         };
     }
     let job = bridge::bridge_target(r, &app.pins)?;
+    if job.tool == Tool::Winget
+        && app.settings.behavior.winget_engine == WingetEngine::Wingetrs
+        && let UpdateState::Available { latest } = &r.state
+        && let Some((version, plan)) = app.native_upgrades.get(&r.app_key)
+        && version == latest
+    {
+        return Ok(Target::Native {
+            plan: Box::new(plan.clone()),
+            row_key: r.app_key.clone(),
+        });
+    }
     if job.tool == Tool::Winget
         && let Some(note) = app
             .winget_fit(r)
@@ -2238,6 +2413,7 @@ fn applicability_cmd(app: &App) -> Option<Cmd> {
                 package_id: job.target,
                 latest: job.available?,
                 scope: r.scope,
+                installed: r.installed_version.clone(),
             })
         })
         .collect();
@@ -2352,9 +2528,116 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     checked: true,
                 });
             }
+            Action::WingetInstall(p) | Action::WingetUpgrade { plan: p, .. } => {
+                items.push(ConfirmItem {
+                    name: p.name.clone(),
+                    key: Some(("winget".to_string(), p.id.clone())),
+                    from: p.upgrade_from.clone(),
+                    to: Some(p.version.clone()),
+                    manager: "wingetrs",
+                    checked: true,
+                });
+            }
+            Action::WingetUninstall(p) | Action::WingetRegistryOnly(p) => {
+                items.push(ConfirmItem {
+                    name: p.name.clone(),
+                    key: None,
+                    from: p.version.clone(),
+                    to: None,
+                    manager: "wingetrs",
+                    checked: true,
+                });
+                let (backup, registry_only) = match action {
+                    Action::WingetUninstall(p) => uninstall_options(p),
+                    _ => (false, false),
+                };
+                if backup {
+                    items.push(option_item(BACKUP_ITEM, true));
+                }
+                if registry_only {
+                    items.push(option_item(REGISTRY_ONLY_ITEM, false));
+                }
+            }
+            Action::RemoveOrphan(o) => items.push(ConfirmItem {
+                name: format!("Remover registro órfão de {}", o.name),
+                key: None,
+                from: None,
+                to: None,
+                manager: "",
+                // Never pre-selected: the user marks it.
+                checked: false,
+            }),
         }
     }
     items
+}
+
+/// Item of a removal that copies the app's data folders first.
+pub const BACKUP_ITEM: &str = "Copiar pastas para backups antes";
+/// Item of a removal that deletes only the registry record (option C).
+pub const REGISTRY_ONLY_ITEM: &str = "Remover só o registro";
+
+/// An option of the item above it (no icon, versions or manager).
+fn option_item(name: &str, checked: bool) -> ConfirmItem {
+    ConfirmItem {
+        name: name.to_string(),
+        key: None,
+        from: None,
+        to: None,
+        manager: "",
+        checked,
+    }
+}
+
+/// The options a native removal offers: copy the data folders first (when another
+/// installation shares them), and remove only the registry record (when allowed).
+fn uninstall_options(p: &WingetUninstallPlan) -> (bool, bool) {
+    match &p.shared {
+        Some(s) => (!s.folders.is_empty(), s.registry_only_allowed),
+        None => (false, false),
+    }
+}
+
+/// How many confirmation items `action` has (an `Apply` has one per non-empty group).
+fn item_count(action: &Action) -> usize {
+    match action {
+        Action::Apply(groups) => groups.iter().filter(|g| !g.is_empty()).count(),
+        Action::WingetUninstall(p) => {
+            let (backup, registry_only) = uninstall_options(p);
+            1 + usize::from(backup) + usize::from(registry_only)
+        }
+        _ => 1,
+    }
+}
+
+/// The notes of `action` in its confirmation (several lines for a native plan).
+fn action_notes(app: &App, action: &Action) -> Vec<String> {
+    let lines = |text: String| -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    match action {
+        Action::Bridge(job) => vec![bridge_note(job.tool).to_string()],
+        Action::ApplyMsiexec { .. } => vec![MSIEXEC_NOTE.to_string()],
+        Action::Remove(p) if p.purge => vec![format!(
+            "Os dados persistentes de {} serão APAGADOS (purge).",
+            p.app
+        )],
+        Action::WingetInstall(p) | Action::WingetUpgrade { plan: p, .. } => lines(p.to_string()),
+        Action::WingetUninstall(p) => lines(p.to_string()),
+        Action::RemoveOrphan(o) => vec![
+            format!("O desinstalador de {} não existe: {}", o.name, o.missing),
+            "O app pode ter mudado de lugar (ex.: Steam em outra pasta).".to_string(),
+            format!(
+                "O registro é exportado antes para um .reg em {}",
+                app.backups_dir.display()
+            ),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// The confirmation of `actions`: one item per package, the bridge and purge warnings, then
@@ -2366,15 +2649,7 @@ fn confirm_modal(
     clear_marks: Option<Tab>,
 ) -> Modal {
     let mut all: Vec<String> = Vec::new();
-    for action in &actions {
-        let note = match action {
-            Action::Bridge(job) => bridge_note(job.tool).to_string(),
-            Action::ApplyMsiexec { .. } => MSIEXEC_NOTE.to_string(),
-            Action::Remove(p) if p.purge => {
-                format!("Os dados persistentes de {} serão APAGADOS (purge).", p.app)
-            }
-            _ => continue,
-        };
+    for note in actions.iter().flat_map(|a| action_notes(app, a)) {
         if !all.contains(&note) {
             all.push(note);
         }
@@ -2407,8 +2682,10 @@ fn apply_groups<'a>(
                     out.push((checked.next().unwrap_or(false), g.as_slice()));
                 }
             }
-            _ => {
-                checked.next();
+            other => {
+                for _ in 0..item_count(other) {
+                    checked.next();
+                }
             }
         }
     }
@@ -2467,6 +2744,24 @@ fn checked_actions(items: &[ConfirmItem], actions: Vec<Action>) -> Vec<Action> {
                     out.push(Action::Apply(kept));
                 }
             }
+            Action::WingetUninstall(mut p) => {
+                let (backup, registry_only) = uninstall_options(&p);
+                let main = checked.next().unwrap_or(false);
+                let keep_backup = backup && checked.next().unwrap_or(false);
+                let only_record = registry_only && checked.next().unwrap_or(false);
+                if !main {
+                    continue;
+                }
+                if only_record {
+                    out.push(Action::WingetRegistryOnly(p));
+                    continue;
+                }
+                if !keep_backup && let Some(s) = &mut p.shared {
+                    // Unchecked copy: nothing is copied before the uninstaller runs.
+                    s.folders.clear();
+                }
+                out.push(Action::WingetUninstall(p));
+            }
             other => {
                 if checked.next().unwrap_or(false) {
                     out.push(other);
@@ -2484,6 +2779,29 @@ fn start_bridge(app: &mut App, job: BridgeJob) -> Vec<Cmd> {
         return enqueue(app, action);
     }
     let modal = confirm_modal(app, vec![action], Vec::new(), None);
+    open_modal(app, modal);
+    Vec::new()
+}
+
+/// A native winget action: confirmed per `confirm`, and always when the user has something
+/// to read or choose (license agreements, `notes`, the shared-data options); else queued.
+fn start_ready(
+    app: &mut App,
+    action: Action,
+    confirm: ConfirmMode,
+    notes: Vec<String>,
+) -> Vec<Cmd> {
+    let must_show = match &action {
+        Action::WingetInstall(p) | Action::WingetUpgrade { plan: p, .. } => {
+            !p.agreements.is_empty()
+        }
+        Action::WingetUninstall(p) => p.shared.is_some(),
+        _ => false,
+    };
+    if notes.is_empty() && !must_show && !needs_confirm(confirm, &action) {
+        return enqueue(app, action);
+    }
+    let modal = confirm_modal(app, vec![action], notes, None);
     open_modal(app, modal);
     Vec::new()
 }
@@ -2538,6 +2856,18 @@ fn upgrade_one(app: &mut App) -> Vec<Cmd> {
     match target {
         Ok(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
         Ok(Target::Bridge(job)) => start_bridge(app, *job),
+        Ok(Target::Native { plan, row_key }) => {
+            let confirm = app.settings.behavior.confirm;
+            start_ready(
+                app,
+                Action::WingetUpgrade {
+                    plan: *plan,
+                    row_key,
+                },
+                confirm,
+                Vec::new(),
+            )
+        }
         Err(note) if note == PINNED_NOTE => {
             app.push_toast(ToastKind::Warning, "versão fixada (desafixe no menu)");
             Vec::new()
@@ -2589,7 +2919,7 @@ fn report_left_out(app: &mut App, skipped: &[String], hidden: usize) {
 fn start_batch(
     app: &mut App,
     items: Vec<(String, Cmd)>,
-    bridges: Vec<BridgeJob>,
+    bridges: Vec<Action>,
     skipped: Vec<String>,
     hidden: usize,
     left_out: usize,
@@ -2629,12 +2959,12 @@ fn start_batch(
 fn confirm_batch(
     app: &mut App,
     mut actions: Vec<Action>,
-    bridges: Vec<BridgeJob>,
+    bridges: Vec<Action>,
     confirm: ConfirmMode,
     tab: Tab,
     left_out: usize,
 ) -> Vec<Cmd> {
-    actions.extend(bridges.into_iter().map(Action::Bridge));
+    actions.extend(bridges);
     if actions.is_empty() {
         toast_left_out(app, left_out);
         return Vec::new();
@@ -2699,7 +3029,11 @@ fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize, left_out: usize)
                     keep,
                 },
             )),
-            Ok(Target::Bridge(job)) => bridges.push(*job),
+            Ok(Target::Bridge(job)) => bridges.push(Action::Bridge(*job)),
+            Ok(Target::Native { plan, row_key }) => bridges.push(Action::WingetUpgrade {
+                plan: *plan,
+                row_key,
+            }),
             Err(_) => skipped.push(r.name.clone()),
         }
     }
@@ -2755,6 +3089,7 @@ fn open_actions(app: &mut App) -> Vec<Cmd> {
             marked: true,
             choice: None,
             ids: Vec::new(),
+            row: None,
         });
         return Vec::new();
     }
@@ -2815,15 +3150,35 @@ fn installed_actions(
         ),
         (
             "Remover".to_string(),
-            (r.origin != "wingetrs").then(|| NOT_OURS.to_string()),
+            (r.origin != "wingetrs" && !winget_removable(&r.origin)).then(|| NOT_OURS.to_string()),
             ActionId::Remove,
         ),
-        (
-            if pinned { "Desafixar" } else { "Fixar versão" }.to_string(),
-            None,
-            ActionId::Pin,
-        ),
     ];
+    // The other records of the same app, each removable on its own.
+    for (i, o) in r.others.iter().enumerate() {
+        if winget_removable(&o.origin) {
+            items.push((
+                format!("Remover o registro {}", o.location),
+                None,
+                ActionId::RemoveRecord(i + 1),
+            ));
+        }
+    }
+    for (i, _) in row_orphans(r) {
+        let label = match i {
+            0 => "Remover registro órfão".to_string(),
+            _ => format!(
+                "Remover registro órfão ({})",
+                r.others.get(i - 1).map_or("", |o| o.location.as_str())
+            ),
+        };
+        items.push((label, None, ActionId::RemoveOrphan(i)));
+    }
+    items.push((
+        if pinned { "Desafixar" } else { "Fixar versão" }.to_string(),
+        None,
+        ActionId::Pin,
+    ));
     match row_choice(r) {
         Some(RowChoice::Choose { .. }) => items.insert(
             0,
@@ -2966,7 +3321,9 @@ pub fn buttons(app: &App) -> Vec<(String, ActionId)> {
             ActionId::Pin => "Fixar",
             ActionId::Choose => "Correspondência",
             ActionId::UndoChoice => "Desfazer correspondência",
-            ActionId::ToggleMark => continue,
+            ActionId::ToggleMark | ActionId::RemoveRecord(_) | ActionId::RemoveOrphan(_) => {
+                continue;
+            }
         };
         let key = match (app.tab, id) {
             (Tab::Search, ActionId::Install) | (Tab::Updates, ActionId::Upgrade) => Some("enter"),
@@ -3115,6 +3472,7 @@ fn open_item_menu(app: &mut App) -> Vec<Cmd> {
         marked: false,
         choice: None,
         ids,
+        row: None,
     };
     if app.tab == Tab::Search
         && let Some(e) = app
@@ -3139,9 +3497,11 @@ fn open_item_menu(app: &mut App) -> Vec<Cmd> {
             remove,
             pin,
             choice,
+            row,
             ..
         } = &mut modal
         {
+            *row = Some(Box::new(r.clone()));
             *name = r.name.clone();
             *upgrade = upgrade_target(app, r).ok();
             *remove = (r.origin == "wingetrs").then(|| r.name.clone());
@@ -3161,15 +3521,37 @@ fn run_action(
     remove: Option<String>,
     pin: Option<(String, bool)>,
     choice: Option<RowChoice>,
+    row: Option<Box<ListRow>>,
 ) -> Vec<Cmd> {
     match id {
         ActionId::Install => install_one(app),
         ActionId::Upgrade => match upgrade {
             Some(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
             Some(Target::Bridge(job)) => start_bridge(app, *job),
+            Some(Target::Native { plan, row_key }) => {
+                let confirm = app.settings.behavior.confirm;
+                let action = Action::WingetUpgrade {
+                    plan: *plan,
+                    row_key,
+                };
+                start_ready(app, action, confirm, Vec::new())
+            }
             None => Vec::new(),
         },
-        ActionId::Remove => remove.map_or_else(Vec::new, |target| plan_remove(app, target)),
+        ActionId::Remove => match (remove, row) {
+            (Some(target), _) => plan_remove(app, target),
+            (None, Some(r)) if winget_removable(&r.origin) => plan_winget_remove(app, &r, 0),
+            _ => Vec::new(),
+        },
+        ActionId::RemoveRecord(n) => row.map_or_else(Vec::new, |r| plan_winget_remove(app, &r, n)),
+        ActionId::RemoveOrphan(n) => {
+            let orphan = row.and_then(|r| {
+                row_orphans(&r)
+                    .into_iter()
+                    .find_map(|(i, o)| (i == n).then_some(o))
+            });
+            orphan.map_or_else(Vec::new, |o| ask_orphan(app, o))
+        }
         ActionId::Pin => match pin {
             Some((key, pinned)) => {
                 // Applied now; `Msg::PinSaved` reverts it if the write fails.
@@ -3276,9 +3658,16 @@ fn residue_item(r: &Residue) -> PickerItem {
 
 /// Whether a ready plan asks before executing, per the `confirm` setting.
 pub fn needs_confirm(mode: ConfirmMode, action: &Action) -> bool {
+    // An orphan record is removed only when the user marks it, whatever the setting.
+    if matches!(action, Action::RemoveOrphan(_)) {
+        return true;
+    }
     match mode {
         ConfirmMode::Always => true,
-        ConfirmMode::Removals => matches!(action, Action::Remove(_)),
+        ConfirmMode::Removals => matches!(
+            action,
+            Action::Remove(_) | Action::WingetUninstall(_) | Action::WingetRegistryOnly(_)
+        ),
         ConfirmMode::Never => false,
     }
 }
@@ -3521,6 +3910,81 @@ fn on_winget_planned(app: &mut App, result: Result<(BridgeJob, Vec<String>), Str
         Err(message) => app.push_toast(ToastKind::Error, message),
     }
     Vec::new()
+}
+
+/// The winget install planned by `Cmd::PlanWingetInstall` with both engines' answers: the
+/// Settings engine chooses (`choose_engine`); native ⇒ the plan's text in the confirmation,
+/// bridge ⇒ the bridge job, with why it goes through winget when it was not the setting.
+fn on_winget_install_planned(
+    app: &mut App,
+    bridge: Result<(BridgeJob, Vec<String>), String>,
+    native: Result<PlanOrBridge, String>,
+) -> Vec<Cmd> {
+    let engine = app.settings.behavior.winget_engine;
+    match choose_engine(engine, native.map_err(Refusal)) {
+        Ok(Engine::Native(plan)) => {
+            app.planning = false;
+            app.status = None;
+            let confirm = app
+                .planning_confirm
+                .take()
+                .unwrap_or(app.settings.behavior.confirm);
+            start_ready(app, Action::WingetInstall(plan), confirm, Vec::new())
+        }
+        Ok(Engine::Bridge(why)) => {
+            let Some(why) = why else {
+                return on_winget_planned(app, bridge);
+            };
+            // The reason shows only in a confirmation; it never forces one.
+            app.planning = false;
+            app.status = None;
+            let confirm = app
+                .planning_confirm
+                .take()
+                .unwrap_or(app.settings.behavior.confirm);
+            match bridge {
+                Ok((job, agreements)) => {
+                    let action = Action::Bridge(job);
+                    if agreements.is_empty() && !needs_confirm(confirm, &action) {
+                        return enqueue(app, action);
+                    }
+                    let mut notes = vec![format!("Pelo winget: {why}")];
+                    notes.extend(agreements);
+                    let modal = confirm_modal(app, vec![action], notes, None);
+                    open_modal(app, modal);
+                }
+                Err(message) => app.push_toast(ToastKind::Error, message),
+            }
+            Vec::new()
+        }
+        Err(Refusal(why)) => {
+            app.planning = false;
+            app.status = None;
+            app.planning_confirm = None;
+            app.push_toast(ToastKind::Error, why);
+            Vec::new()
+        }
+    }
+}
+
+/// The native removal planned by `Cmd::PlanWingetUninstall`.
+fn on_winget_uninstall_planned(
+    app: &mut App,
+    result: Result<WingetUninstallPlan, String>,
+) -> Vec<Cmd> {
+    app.planning = false;
+    app.status = None;
+    let confirm = app
+        .planning_confirm
+        .take()
+        .unwrap_or(app.settings.behavior.confirm);
+    match result {
+        Ok(plan) => start_ready(app, Action::WingetUninstall(plan), confirm, Vec::new()),
+        Err(message) => {
+            app.push_toast(ToastKind::Error, message);
+            Vec::new()
+        }
+    }
 }
 
 /// Results of a batch plan: one confirmation for all the plans, then everything is queued.
@@ -3896,6 +4360,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             marked,
             choice,
             ids,
+            row,
         } => match picker.key(key) {
             PickOutcome::Pending => {
                 app.modal = Some(Modal::Actions {
@@ -3907,6 +4372,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     marked,
                     choice,
                     ids,
+                    row,
                 });
                 Vec::new()
             }
@@ -3918,7 +4384,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             },
             PickOutcome::Picked(chosen) => {
                 match chosen.first().and_then(|&i| ids.get(i)).copied() {
-                    Some(id) => run_action(app, id, upgrade, remove, pin, choice),
+                    Some(id) => run_action(app, id, upgrade, remove, pin, choice, row),
                     None => Vec::new(),
                 }
             }
