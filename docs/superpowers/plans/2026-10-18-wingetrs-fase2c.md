@@ -362,6 +362,8 @@ Testes:
 5. Executor `Step::ExtractInno`: exe = `layout.current("innounp").join("innounp.exe")`; ausente ⇒ passo falha com `"innounp não está instalado (auxiliar do bucket main)"` sem chamar o corredor. Destino temporário novo `<staging>\.inno-<index>`; roda `ctx.runners.innounp` no worker bloqueante (mesmo padrão do `Extract`, com `catch_decoder` em volta da leitura); conta arquivos; `check_exit`; move o conteúdo para o staging respeitando o `extract_to` (via `safe_components`) com `merge_into` (passe a `pub(crate)`). Qualquer erro ⇒ apaga o temporário e o passo falha (rollback). Fase `Phase::Extracting { file }`, rótulo `"extrair [n] (Inno Setup)"`.
 6. O innounp real nunca roda em teste: os testes injetam `ToolRun` falsos (um `fn` por teste, contador `static` próprio de cada teste) que leem o `-d<dest>` dos argumentos e criam arquivos lá.
 
+**Da revisão da Task 146 (2026-10-18):** `run_spec` herda o ambiente do usuário (o programa é absoluto, mas um filho acha ferramentas pelo PATH do usuário). Esta tarefa decide o ambiente do processo que ela lança: `PATH` fixo (`%SystemRoot%\System32` por KnownFolder + as pastas do próprio app/auxiliar), sem herdar o PATH do usuário, salvo motivo medido; teste do ambiente montado.
+
 **Files:**
 - Create: `src/install/inno.rs`, `src/install/inno_win.rs` (**o orquestrador cria os arquivos com uma linha `//!` e as linhas `pub mod` em `src/install/mod.rs`**)
 - Modify: `src/install/plan.rs`, `src/install/planner.rs`, `src/install/executor.rs`, `src/install/extract.rs` (só a visibilidade de `merge_into`), `src/install/ops.rs`, `src/install/prod_win.rs`, `src/cli/install_cmd.rs`, `tests/it/cli_cancel.rs`, `tests/it/install_executor.rs`, `tests/it/install_progress.rs`, `tests/it/install_ops.rs`, `tests/it/tui_jobs.rs` (só a linha `runners`)
@@ -1049,6 +1051,8 @@ Testes:
 3. `build_ctx`: com `WINGETRS_TEST_ENV_KEY` ⇒ `scripts: None`; senão `Some(Arc::new(PwshHost::locate()))`.
 4. `scripts/check_rules.ps1`: regra nova — `PwshHost` só aparece em `src/install/script_host_win.rs`, `src/install/prod_win.rs` e, em `tests/`, só em `tests/it/script_host_live.rs`, onde todo `#[test]`/`#[tokio::test]` vem seguido de `#[ignore = "live:`. Prove com violação plantada (inclusive num arquivo de uma linha) e restaure.
 5. Teste ao vivo em `tests/it/script_host_live.rs` com `#[ignore = "live: roda o PowerShell real com script sintético"]`: hook sintético grava um arquivo em `$dir` e chama `Add-Path`; confere `effects.jsonl`, que `%USERPROFILE%\scoop` não mudou (listagem do primeiro nível antes e depois) e que o `HKCU` real não foi tocado (`WINGETRS_TEST_ENV_KEY`). **Agentes não rodam esse teste sem pedido do usuário.**
+
+**Da revisão da Task 146 (2026-10-18):** `run_spec` herda o ambiente do usuário (o programa é absoluto, mas um filho acha ferramentas pelo PATH do usuário). Esta tarefa decide o ambiente do processo que ela lança: `PATH` fixo (`%SystemRoot%\System32` por KnownFolder + as pastas do próprio app/auxiliar), sem herdar o PATH do usuário, salvo motivo medido; teste do ambiente montado.
 
 **Files:**
 - Create: `src/install/script_policy.rs`, `src/install/script_host_win.rs` (**o orquestrador cria com `//!` e `pub mod`**)
