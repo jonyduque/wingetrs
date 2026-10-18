@@ -204,6 +204,28 @@ fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// `name version`, or only `name` when it already carries the version (`CrystalDiskMark
+/// 9.0.3`, as many ARP display names do). Shared by the CLI and the TUI texts.
+pub fn name_version(name: &str, version: Option<&str>) -> String {
+    match version.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v)
+            if !name
+                .split_whitespace()
+                .any(|w| w == v || w.trim_start_matches(['v', 'V']) == v) =>
+        {
+            format!("{name} {v}")
+        }
+        _ => name.to_string(),
+    }
+}
+
+/// The planner's reason for the bridge without its "instalado pelo winget" ending, for a line
+/// that already says it goes through winget (CLI `Instalando pelo winget: …`, TUI `Pelo
+/// winget: …`).
+pub fn bridge_reason(why: &str) -> &str {
+    why.strip_suffix(": instalado pelo winget").unwrap_or(why)
+}
+
 impl std::fmt::Display for WingetPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let scope = self
@@ -214,9 +236,8 @@ impl std::fmt::Display for WingetPlan {
             .unwrap_or("escopo do instalador");
         writeln!(
             f,
-            "{} {} ({}, {scope})",
-            self.name,
-            self.version,
+            "{} ({}, {scope})",
+            name_version(&self.name, Some(&self.version)),
             self.installer.kind.name()
         )?;
         write!(f, "Instalador: {}", self.installer.url)?;

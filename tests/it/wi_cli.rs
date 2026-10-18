@@ -1333,19 +1333,25 @@ async fn winget_dry_run_shows_url_and_sha256() {
 #[test]
 fn winget_wording_says_things_once() {
     assert_eq!(
-        winget_cmd::bridge_why("tipo zip: instalado pelo winget"),
+        wingetrs::winget_install::plan::bridge_reason("tipo zip: instalado pelo winget"),
         "tipo zip"
     );
-    assert_eq!(winget_cmd::bridge_why("outro motivo"), "outro motivo");
     assert_eq!(
-        winget_cmd::name_version("CrystalDiskMark 9.0.3", Some("9.0.3")),
+        wingetrs::winget_install::plan::bridge_reason("outro motivo"),
+        "outro motivo"
+    );
+    assert_eq!(
+        wingetrs::winget_install::plan::name_version("CrystalDiskMark 9.0.3", Some("9.0.3")),
         "CrystalDiskMark 9.0.3"
     );
     assert_eq!(
-        winget_cmd::name_version("CrystalDiskMark", Some("9.0.3")),
+        wingetrs::winget_install::plan::name_version("CrystalDiskMark", Some("9.0.3")),
         "CrystalDiskMark 9.0.3"
     );
-    assert_eq!(winget_cmd::name_version("App", None), "App");
+    assert_eq!(
+        wingetrs::winget_install::plan::name_version("App", None),
+        "App"
+    );
     // jq installed by winget: its uninstaller is winget itself, not a window.
     let plan = UninstallPlan {
         target: UninstallTarget::Arp {
@@ -1363,13 +1369,13 @@ fn winget_wording_says_things_once() {
         elevation: Elevation::Never,
         shared: None,
     };
-    let text = winget_cmd::uninstall_text(&plan);
+    let text = plan.to_string();
     assert!(text.starts_with("Desinstalar jq 1.7.1\n"), "{text}");
     assert!(!text.contains("abre a janela"), "{text}");
     assert!(text.contains("remove pelo winget"), "{text}");
     let mut other = plan.clone();
     other.command.as_mut().unwrap().program = r"C:\jq\uninst.exe".into();
-    assert!(winget_cmd::uninstall_text(&other).contains("abre a janela do desinstalador"));
+    assert!(other.to_string().contains("abre a janela do desinstalador"));
 
     let mut root = Cli::command();
     root.build();

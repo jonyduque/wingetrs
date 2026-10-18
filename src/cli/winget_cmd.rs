@@ -14,7 +14,7 @@ use crate::install::ops::OpsCtx;
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::target::Candidate;
 use crate::installed::Hive;
-use crate::installed::correlate::{Correlation, InstallScope, ListRow};
+use crate::installed::correlate::{InstallScope, ListRow};
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::sources::winget::manifest::Agreement;
 use crate::tui::app::{Done, InstallFail};
@@ -24,7 +24,7 @@ use crate::winget_install::engine::{Engine, UpgradeError, choose_engine, upgrade
 use crate::winget_install::launch::Elevation;
 use crate::winget_install::ops::{InstallReport, WingetOpsError};
 use crate::winget_install::orphans::Orphan;
-use crate::winget_install::plan::{PlanOrBridge, WingetPlan};
+use crate::winget_install::plan::{PlanOrBridge, WingetPlan, bridge_reason, name_version};
 use crate::winget_install::select::{Refusal, Scope, ScopeWanted};
 use crate::winget_install::uninstall::{
     BackupLimits, MsiQueue, SharedData, UninstallCtx, UninstallPlan, UninstallReport,
@@ -401,27 +401,6 @@ async fn run_native<E: std::fmt::Display + Send + 'static>(
     out.map_err(|e| anyhow!("{e}"))
 }
 
-/// `name version`, or only `name` when it already carries the version (`CrystalDiskMark
-/// 9.0.3`, as many ARP display names do).
-pub fn name_version(name: &str, version: Option<&str>) -> String {
-    match version.map(str::trim).filter(|v| !v.is_empty()) {
-        Some(v)
-            if !name
-                .split_whitespace()
-                .any(|w| w == v || w.trim_start_matches(['v', 'V']) == v) =>
-        {
-            format!("{name} {v}")
-        }
-        _ => name.to_string(),
-    }
-}
-
-/// The planner's reason for the bridge without its "instalado pelo winget" ending (the line
-/// already says it).
-pub fn bridge_why(why: &str) -> &str {
-    why.strip_suffix(": instalado pelo winget").unwrap_or(why)
-}
-
 /// The native plan as shown; `--dry-run` adds the installer's SHA-256 (URL, hash and staging
 /// appear only there, as in the Scoop dry run).
 pub fn native_text(plan: &WingetPlan, f: Flags) -> String {
@@ -430,32 +409,6 @@ pub fn native_text(plan: &WingetPlan, f: Flags) -> String {
         text.push_str(&format!("\nSHA-256: {}", plan.installer.sha256));
     }
     text
-}
-
-/// The removal plan as shown: the version once, and an uninstaller that is `winget` itself
-/// (a portable app winget installed) is said to go through winget, not to open a window.
-pub fn uninstall_text(plan: &UninstallPlan) -> String {
-    let text = plan.to_string();
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    if let Some(first) = lines.first_mut() {
-        *first = format!(
-            "Desinstalar {}",
-            name_version(&plan.name, plan.version.as_deref())
-        );
-    }
-    let by_winget = plan.command.as_ref().is_some_and(|c| {
-        Path::new(c.program.trim().trim_matches('"'))
-            .file_stem()
-            .is_some_and(|s| s.eq_ignore_ascii_case("winget"))
-    });
-    if by_winget {
-        for l in &mut lines {
-            if l.trim() == "abre a janela do desinstalador" {
-                *l = "  remove pelo winget (pode mostrar o progresso dele)".to_string();
-            }
-        }
-    }
-    lines.join("\n")
 }
 
 /// `Instalado:`/`Atualizado:`, or the "did not show up" warning in yellow; then the reboot.
@@ -504,7 +457,7 @@ pub async fn install<F: WingetFlows>(
     let plan = match engine {
         Engine::Bridge(why) => {
             if let Some(why) = why {
-                say(&format!("Instalando pelo winget: {}", bridge_why(&why)));
+                say(&format!("Instalando pelo winget: {}", bridge_reason(&why)));
             }
             return flows.install_bridge(ui, cand, scope, f, stop).await;
         }
@@ -545,13 +498,8 @@ pub async fn install<F: WingetFlows>(
 }
 
 /// The winget package a row was matched to.
-pub(super) fn winget_id(r: &ListRow) -> Option<&str> {
-    match &r.correlation {
-        Correlation::Matched {
-            source, package_id, ..
-        } if source == "winget" => Some(package_id),
-        _ => None,
-    }
+fn winget_id(r: &ListRow) -> Option<&str> {
+    crate::winget_install::previous::winget_package(r)
 }
 
 /// The installed row (ARP or MSIX) named `target`: by matched winget id or by name, both
@@ -636,7 +584,7 @@ pub async fn uninstall<F: WingetFlows>(
         .plan_uninstall(row, &t)
         .await
         .map_err(anyhow::Error::msg)?;
-    say(uninstall_text(&plan).trim_end());
+    say(plan.to_string().trim_end());
     if f.dry_run {
         say("Simulação: nada foi alterado.");
         return Ok(());
@@ -943,7 +891,7 @@ pub async fn upgrade<F: WingetFlows>(
     let plan = match engine {
         Engine::Bridge(why) => {
             if let Some(why) = why {
-                say(&format!("Atualizando pelo winget: {}", bridge_why(&why)));
+                say(&format!("Atualizando pelo winget: {}", bridge_reason(&why)));
             }
             return upgrade_bridge(flows, ui, row, f, stop, say);
         }

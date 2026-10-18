@@ -30,13 +30,11 @@ use crate::winget_install::ops::{self as wops, InstallReport, WingetCtx, WingetO
 use crate::winget_install::orphans::{self, Orphan};
 use crate::winget_install::orphans_win::SystemArp;
 use crate::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
-use crate::winget_install::previous::{Removal, manifest_nsis};
+use crate::winget_install::previous::RemovalRequest;
 use crate::winget_install::select::{Refusal, ScopeWanted};
 use crate::winget_install::uninstall::{
     self, MsiQueue, SystemClock, UninstallCtx, UninstallPlan, UninstallReport, UninstallTarget,
-    target_of,
 };
-use crate::winget_install::uninstall_cmd::ArpDetails;
 use crate::winget_install::{folders_win, host_win, previous_win, prod_win};
 use anyhow::Context;
 use std::collections::BTreeSet;
@@ -158,17 +156,6 @@ impl ProdFlows<'_, '_> {
             line: Arc::clone(&self.line),
         }
     }
-
-    /// The ARP records of `row` other than the main one.
-    fn others(&self, row: &ListRow) -> Vec<ArpDetails> {
-        row.others
-            .iter()
-            .filter_map(|o| match target_of(&o.app_key) {
-                Some(UninstallTarget::Arp { hive, key }) => read_details(hive, &key).ok()?,
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 impl WingetFlows for ProdFlows<'_, '_> {
@@ -238,34 +225,19 @@ impl WingetFlows for ProdFlows<'_, '_> {
         row: &ListRow,
         _target: &UninstallTarget,
     ) -> Result<UninstallPlan, String> {
-        // The NSIS hint from the matched package's manifest (unreadable: no hint).
-        let nsis = match winget_cmd::winget_id(row) {
+        // The same request and plan as the TUI's (`Cmd::PlanWingetUninstall`).
+        let req = RemovalRequest::of_row(row);
+        let manifest = match &req.package {
             Some(id) => match self.manifest("winget", id).await {
-                Ok(m) => manifest_nsis(&m),
+                Ok(m) => Some(m),
                 Err(e) => {
                     tracing::warn!(app = %row.name, "manifest for the NSIS hint not read: {e:#}");
-                    false
+                    None
                 }
             },
-            None => false,
+            None => None,
         };
-        let others = self.others(row);
-        let r = Removal {
-            name: &row.name,
-            version: row.installed_version.clone(),
-            nsis,
-            others: &others,
-            is_main: true,
-        };
-        let mut plan = previous_win::removal_plan(self.ctx.data.root(), &row.app_key, r)?;
-        // Measured as the TUI does: the size is shown with the folders.
-        if let Some(shared) = &mut plan.shared {
-            match uninstall::measure_folders(&shared.folders) {
-                Ok(size) => shared.size = Some(size),
-                Err(e) => tracing::warn!(app = %plan.name, "data folders not measured: {e}"),
-            }
-        }
-        Ok(plan)
+        previous_win::plain_removal_plan(self.ctx.data.root(), &req, manifest.as_ref())
     }
 
     fn lock_install(&self) -> Op<Result<Held, String>> {

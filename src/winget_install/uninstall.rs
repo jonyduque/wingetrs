@@ -114,11 +114,11 @@ pub fn human_size(bytes: u64) -> String {
 
 impl fmt::Display for UninstallPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Desinstalar {}", self.name)?;
-        if let Some(v) = &self.version {
-            write!(f, " {v}")?;
-        }
-        writeln!(f)?;
+        writeln!(
+            f,
+            "Desinstalar {}",
+            super::plan::name_version(&self.name, self.version.as_deref())
+        )?;
         match (&self.target, &self.command) {
             (UninstallTarget::Msix { family }, _) => {
                 writeln!(f, "  remove o pacote MSIX {family} (só deste usuário)")?;
@@ -132,8 +132,13 @@ impl fmt::Display for UninstallPlan {
         if self.elevation == Elevation::Helper {
             writeln!(f, "  pede UAC")?;
         }
-        if self.command.as_ref().is_some_and(|c| c.interactive) {
-            writeln!(f, "  abre a janela do desinstalador")?;
+        match &self.command {
+            // A portable app winget installed: its uninstaller is winget itself.
+            Some(c) if is_winget(&c.program) => {
+                writeln!(f, "  remove pelo winget (pode mostrar o progresso dele)")?;
+            }
+            Some(c) if c.interactive => writeln!(f, "  abre a janela do desinstalador")?,
+            _ => {}
         }
         if let Some(s) = &self.shared {
             writeln!(
@@ -163,6 +168,13 @@ impl fmt::Display for UninstallPlan {
         }
         Ok(())
     }
+}
+
+/// Whether a registered uninstaller program is `winget` (by name, any case, quoted or not).
+fn is_winget(program: &str) -> bool {
+    Path::new(program.trim().trim_matches('"'))
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("winget"))
 }
 
 fn non_blank(s: &Option<String>) -> Option<&str> {

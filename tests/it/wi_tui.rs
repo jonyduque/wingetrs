@@ -24,6 +24,7 @@ use wingetrs::tui::view::view;
 use wingetrs::winget_install::launch::Elevation;
 use wingetrs::winget_install::orphans::Orphan;
 use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
+use wingetrs::winget_install::previous::RemovalRequest;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
 use wingetrs::winget_install::uninstall::{SharedData, UninstallPlan, UninstallTarget};
 
@@ -331,24 +332,28 @@ fn remove_enabled_for_arp_and_msix_rows() {
         assert_eq!(remove, ("Remover".to_string(), true, None), "{origin}");
         assert_eq!(
             pick(&mut a, "Remover"),
-            vec![Cmd::PlanWingetUninstall {
+            vec![Cmd::PlanWingetUninstall(RemovalRequest {
                 app_key: app_key.into(),
                 name: "Foo".into(),
+                version: Some("1".into()),
+                package: None,
                 others: Vec::new(),
                 is_main: true,
-            }],
+            })],
             "{origin}"
         );
         // `u` plans the same removal.
         let mut u = on_installed(vec![installed_row("Foo", app_key, origin)]);
         assert_eq!(
             update(&mut u, key(KeyCode::Char('u'))),
-            vec![Cmd::PlanWingetUninstall {
+            vec![Cmd::PlanWingetUninstall(RemovalRequest {
                 app_key: app_key.into(),
                 name: "Foo".into(),
+                version: Some("1".into()),
+                package: None,
                 others: Vec::new(),
                 is_main: true,
-            }],
+            })],
             "{origin}"
         );
     }
@@ -496,12 +501,14 @@ fn kindle_items() {
     update(&mut a, key(KeyCode::Enter));
     assert_eq!(
         pick(&mut a, "Remover o registro HKLM (32 bits)"),
-        vec![Cmd::PlanWingetUninstall {
+        vec![Cmd::PlanWingetUninstall(RemovalRequest {
             app_key: "arp/hklm32/Kindle".into(),
             name: "Kindle".into(),
+            version: Some("1.30".into()),
+            package: None,
             others: vec!["arp/hkcu/Kindle".into()],
             is_main: false,
-        }]
+        })]
     );
     update(&mut a, Msg::WingetUninstallPlanned(Ok(kindle_plan(true))));
     assert_eq!(
@@ -529,12 +536,14 @@ fn kindle_items() {
     update(&mut m, key(KeyCode::Enter));
     assert_eq!(
         pick(&mut m, "Remover"),
-        vec![Cmd::PlanWingetUninstall {
+        vec![Cmd::PlanWingetUninstall(RemovalRequest {
             app_key: "arp/hkcu/Kindle".into(),
             name: "Kindle".into(),
+            version: Some("1".into()),
+            package: None,
             others: vec!["arp/hklm32/Kindle".into()],
             is_main: true,
-        }]
+        })]
     );
     // The shared-data choice is shown even with "never ask".
     update(&mut m, Msg::WingetUninstallPlanned(Ok(kindle_plan(false))));
@@ -856,4 +865,83 @@ fn quitting_cancels_native_job_before_launch() {
     let gate = LaunchGate::default();
     assert!(gate.try_cancel());
     assert!(!gate.try_launch());
+}
+
+/// Task 193: the TUI and the CLI plan the same removal of the same nullsoft ARP row (one
+/// request, one planning function, the NSIS hint from the manifest in both).
+#[test]
+fn tui_and_cli_plan_the_same_nullsoft_removal() {
+    use wingetrs::installed::correlate::Rule as MatchRule;
+    use wingetrs::winget_install::elevated_rules::KnownFolders;
+    use wingetrs::winget_install::previous::plain_removal_plan;
+    use wingetrs::winget_install::uninstall::UserFolders;
+    use wingetrs::winget_install::uninstall_cmd::{ArpDetails, Rule};
+    let row = ListRow {
+        correlation: Correlation::Matched {
+            source: "winget".into(),
+            package_id: "Pub.App".into(),
+            rule: MatchRule::ProductCode,
+        },
+        ..kindle_row()
+    };
+    let mut a = on_installed(vec![row.clone()]);
+    update(&mut a, key(KeyCode::Enter));
+    let cmds = pick(&mut a, "Remover");
+    let [Cmd::PlanWingetUninstall(tui)] = cmds.as_slice() else {
+        panic!("{cmds:?}")
+    };
+    let cli = RemovalRequest::of_row(&row);
+    assert_eq!(*tui, cli);
+    assert_eq!(cli.package.as_deref(), Some("Pub.App"));
+
+    let yaml = format!(
+        "PackageIdentifier: Pub.App\nPackageVersion: '1.0'\nPackageName: Kindle\nPublisher: Amazon\nInstallers:\n- Architecture: x64\n  InstallerType: nullsoft\n  InstallerUrl: https://h/setup.exe\n  InstallerSha256: {}\n",
+        "a".repeat(64)
+    );
+    let m = manifest::parse(yaml.as_bytes()).unwrap();
+    let details = |hive: Hive, key: &str| -> Result<Option<ArpDetails>, String> {
+        Ok(Some(ArpDetails {
+            hive,
+            key: key.to_string(),
+            display_name: Some("Kindle".into()),
+            publisher: Some("Amazon".into()),
+            display_version: Some("1".into()),
+            windows_installer: false,
+            system_component: false,
+            quiet_uninstall_string: None,
+            uninstall_string: Some(r#""C:\Users\u\AppData\Local\Kindle\uninst.exe""#.into()),
+            inno_app_path: None,
+            bundle_cache_path: None,
+            bundle_upgrade_code: None,
+            install_location: None,
+        }))
+    };
+    let folders = || {
+        Ok((
+            KnownFolders {
+                program_files: PathBuf::from(r"C:\Program Files"),
+                program_files_x86: PathBuf::from(r"C:\Program Files (x86)"),
+                system_root: PathBuf::from(r"C:\Windows"),
+                program_data: PathBuf::from(r"C:\ProgramData"),
+                user_profiles: PathBuf::from(r"C:\Users"),
+            },
+            UserFolders {
+                local_app_data: PathBuf::from(r"C:\Users\u\AppData\Local"),
+                app_data: PathBuf::from(r"C:\Users\u\AppData\Roaming"),
+                documents: PathBuf::from(r"C:\Users\u\Documents"),
+                wingetrs_root: PathBuf::from(r"C:\Users\u\AppData\Local\wingetrs"),
+            },
+        ))
+    };
+    let tui_plan = plain_removal_plan(tui, Some(&m), &details, &folders, &|_| false).unwrap();
+    let cli_plan = plain_removal_plan(&cli, Some(&m), &details, &folders, &|_| false).unwrap();
+    assert_eq!(tui_plan, cli_plan);
+    let c = cli_plan.command.as_ref().unwrap();
+    assert_eq!((c.rule, c.interactive), (Rule::Nsis, false), "{c:?}");
+    assert!(c.args.contains("/S"), "{c:?}");
+    // The other ARP record makes the data shared, in both.
+    assert!(cli_plan.shared.is_some());
+    // Without a readable manifest there is no hint (the plain uninstaller).
+    let no_hint = plain_removal_plan(&cli, None, &details, &folders, &|_| false).unwrap();
+    assert_eq!(no_hint.command.unwrap().rule, Rule::Interactive);
 }

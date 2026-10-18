@@ -412,19 +412,8 @@ async fn event_loop(
                     });
                 }
                 Cmd::PlanWingetInstall { id } => spawn_winget_plan(&ctx, id),
-                Cmd::PlanWingetUninstall {
-                    app_key,
-                    name,
-                    others,
-                    is_main,
-                } => spawn_job(&ctx, move |c, _| {
-                    Msg::WingetUninstallPlanned(plan_winget_uninstall(
-                        c.data.root(),
-                        &app_key,
-                        &name,
-                        &others,
-                        is_main,
-                    ))
+                Cmd::PlanWingetUninstall(req) => spawn_job(&ctx, move |c, h| {
+                    Msg::WingetUninstallPlanned(plan_winget_uninstall(c, h, &req))
                 }),
                 Cmd::PlanRemove { app, purge } => {
                     spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app, purge));
@@ -1304,6 +1293,16 @@ async fn plan_native_install(
     ctx: &Ctx,
     id: &str,
 ) -> anyhow::Result<crate::winget_install::plan::PlanOrBridge> {
+    let manifest = winget_manifest(ctx, id).await?;
+    let wanted = install_scope(current_behavior(ctx).default_scope);
+    native_install(&manifest, wanted).map_err(anyhow::Error::msg)
+}
+
+/// The merged manifest of the catalog version of winget package `id`.
+async fn winget_manifest(
+    ctx: &Ctx,
+    id: &str,
+) -> anyhow::Result<crate::sources::winget::manifest::MergedManifest> {
     let pkg = read_package(ctx, "winget", id).await?;
     let hash = pkg
         .winget_hash
@@ -1319,8 +1318,7 @@ async fn plan_native_install(
         Some(&pkg.entry.version),
     )
     .await?;
-    let wanted = install_scope(current_behavior(ctx).default_scope);
-    native_install(&manifest, wanted).map_err(anyhow::Error::msg)
+    Ok(manifest)
 }
 
 #[cfg(windows)]
@@ -1340,69 +1338,32 @@ fn native_install(
     Err("instalar pelo wingetrs só funciona no Windows".to_string())
 }
 
-/// The native removal plan of the record `app_key` (`name` when it is an MSIX package);
-/// `others` are the app's other ARP records (the shared-data warning), `is_main` whether this
-/// is the principal one. The size of the shared folders is measured here, off the UI.
+/// The native removal plan of `req` (`winget_install::previous::plain_removal_plan`, the same
+/// as the CLI's), on a job thread: the NSIS hint from the matched package's manifest.
 #[cfg(windows)]
 fn plan_winget_uninstall(
-    root: &std::path::Path,
-    app_key: &str,
-    name: &str,
-    others: &[String],
-    is_main: bool,
+    c: &Ctx,
+    h: &tokio::runtime::Handle,
+    req: &crate::winget_install::previous::RemovalRequest,
 ) -> Result<crate::winget_install::uninstall::UninstallPlan, String> {
-    use crate::winget_install::arp_read_win::read_details;
-    use crate::winget_install::launch::Elevation;
-    use crate::winget_install::uninstall::{
-        UninstallPlan, UninstallTarget, measure_folders, plan_uninstall, target_of,
-    };
-    let target = target_of(app_key).ok_or_else(|| format!("registro inválido: {app_key}"))?;
-    let (hive, key) = match target {
-        UninstallTarget::Msix { family } => {
-            return Ok(UninstallPlan {
-                target: UninstallTarget::Msix { family },
-                name: name.to_string(),
-                version: None,
-                command: None,
-                elevation: Elevation::Never,
-                shared: None,
-            });
-        }
-        UninstallTarget::Arp { hive, key } => (hive, key),
-    };
-    let d = read_details(hive, &key)
-        .map_err(|e| format!("registro ilegível ({key}): {e}"))?
-        .ok_or_else(|| format!("o registro {key} não existe mais"))?;
-    let others: Vec<_> = others
-        .iter()
-        .filter_map(|k| match target_of(k)? {
-            UninstallTarget::Arp { hive, key } => read_details(hive, &key).ok()?,
-            UninstallTarget::Msix { .. } => None,
-        })
-        .collect();
-    let k = crate::bridge::arp_ops_win::known_folders()
-        .map_err(|e| format!("pastas do sistema ilegíveis: {e}"))?;
-    let u = crate::winget_install::folders_win::user_folders(root)
-        .map_err(|e| format!("pastas do usuário ilegíveis: {e}"))?;
-    let is_dir = |p: &str| std::path::Path::new(p).is_dir();
-    // No manifest is read for a removal: the NSIS hint stays off.
-    let mut plan = plan_uninstall(&d, false, &others, is_main, &k, &u, &is_dir)?;
-    if let Some(shared) = &mut plan.shared {
-        match measure_folders(&shared.folders) {
-            Ok(size) => shared.size = Some(size),
-            Err(e) => tracing::warn!(app = %plan.name, "data folders not measured: {e}"),
-        }
-    }
-    Ok(plan)
+    let manifest = req
+        .package
+        .as_deref()
+        .and_then(|id| match h.block_on(winget_manifest(c, id)) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                tracing::warn!(app = %req.name, "manifest for the NSIS hint not read: {e:#}");
+                None
+            }
+        });
+    crate::winget_install::previous_win::plain_removal_plan(c.data.root(), req, manifest.as_ref())
 }
 
 #[cfg(not(windows))]
 fn plan_winget_uninstall(
-    _root: &std::path::Path,
-    _app_key: &str,
-    _name: &str,
-    _others: &[String],
-    _is_main: bool,
+    _c: &Ctx,
+    _h: &tokio::runtime::Handle,
+    _req: &crate::winget_install::previous::RemovalRequest,
 ) -> Result<crate::winget_install::uninstall::UninstallPlan, String> {
     Err("remover só funciona no Windows".to_string())
 }

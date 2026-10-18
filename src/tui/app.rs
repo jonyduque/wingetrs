@@ -608,12 +608,8 @@ pub enum Cmd {
     /// Plan the native uninstall of the installed record `app_key` (`name` for a record that
     /// cannot be read); `others` are the other records of the same app, `is_main` whether this
     /// is the principal one. Answers with `Msg::WingetUninstallPlanned`.
-    PlanWingetUninstall {
-        app_key: String,
-        name: String,
-        others: Vec<String>,
-        is_main: bool,
-    },
+    /// The same request as the CLI's (`RemovalRequest::of_row` for the principal record).
+    PlanWingetUninstall(crate::winget_install::previous::RemovalRequest),
     /// `purge`: also delete the app's persistent data (setting at key time).
     PlanRemove {
         app: String,
@@ -2376,28 +2372,37 @@ fn winget_removable(origin: &str) -> bool {
 /// Plans the native removal of record `n` of `r` (0: its own, `n`: `others[n - 1]`); the
 /// other ARP records of the app go along for the shared-data check.
 fn plan_winget_remove(app: &mut App, r: &ListRow, n: usize) -> Vec<Cmd> {
-    let records: Vec<(&str, &str)> = std::iter::once((r.app_key.as_str(), r.origin.as_str()))
-        .chain(
-            r.others
-                .iter()
-                .map(|o| (o.app_key.as_str(), o.origin.as_str())),
+    type Record<'a> = (&'a str, &'a str, Option<&'a String>);
+    let records: Vec<Record<'_>> = std::iter::once((
+        r.app_key.as_str(),
+        r.origin.as_str(),
+        r.installed_version.as_ref(),
+    ))
+    .chain(r.others.iter().map(|o| {
+        (
+            o.app_key.as_str(),
+            o.origin.as_str(),
+            o.installed_version.as_ref(),
         )
-        .collect();
-    let Some(&(app_key, _)) = records.get(n) else {
+    }))
+    .collect();
+    let Some(&(app_key, _, version)) = records.get(n) else {
         return Vec::new();
     };
     let others = records
         .iter()
         .enumerate()
-        .filter(|(i, (_, origin))| *i != n && *origin == "arp")
-        .map(|(_, (k, _))| k.to_string())
+        .filter(|(i, (_, origin, _))| *i != n && *origin == "arp")
+        .map(|(_, (k, _, _))| k.to_string())
         .collect();
-    let cmd = Cmd::PlanWingetUninstall {
+    let cmd = Cmd::PlanWingetUninstall(crate::winget_install::previous::RemovalRequest {
         app_key: app_key.to_string(),
         name: r.name.clone(),
+        version: version.cloned(),
+        package: crate::winget_install::previous::winget_package(r).map(str::to_string),
         others,
         is_main: n == 0,
-    };
+    });
     start_planning(app, cmd)
 }
 
@@ -4272,10 +4277,19 @@ fn on_winget_install_planned(
                     let action = Action::Bridge(job);
                     if agreements.is_empty() && !needs_confirm(confirm, &action) {
                         // No confirmation to show the reason in: a toast says it.
-                        app.push_toast(ToastKind::Info, format!("Pelo winget: {why}"));
+                        app.push_toast(
+                            ToastKind::Info,
+                            format!(
+                                "Pelo winget: {}",
+                                crate::winget_install::plan::bridge_reason(&why)
+                            ),
+                        );
                         return enqueue(app, action);
                     }
-                    let mut notes = vec![format!("Pelo winget: {why}")];
+                    let mut notes = vec![format!(
+                        "Pelo winget: {}",
+                        crate::winget_install::plan::bridge_reason(&why)
+                    )];
                     notes.extend(agreements);
                     let modal = confirm_modal(app, vec![action], notes, None);
                     open_modal(app, modal);

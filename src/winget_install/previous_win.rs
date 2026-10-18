@@ -1,6 +1,7 @@
 //! [`previous`](super::previous) against this machine's registry and known folders.
 use super::previous;
 use crate::installed::Hive;
+use crate::sources::winget::manifest::MergedManifest;
 use crate::winget_install::elevated_rules::KnownFolders;
 use crate::winget_install::engine::InstalledFacts;
 use crate::winget_install::plan::WingetPlan;
@@ -39,11 +40,11 @@ pub fn previous_plan(
     previous::previous_plan(row_key, plan, &read, &|| folders(root), &is_dir)
 }
 
-/// [`previous::removal_plan`] of the record `row_key` (`root`: the wingetrs data root).
-pub fn removal_plan(
+/// [`previous::plain_removal_plan`] against this machine (`root`: the wingetrs data root).
+pub fn plain_removal_plan(
     root: &Path,
-    row_key: &str,
-    r: previous::Removal<'_>,
+    req: &previous::RemovalRequest,
+    manifest: Option<&MergedManifest>,
 ) -> Result<UninstallPlan, String> {
-    previous::removal_plan(row_key, r, &read, &|| folders(root), &is_dir)
+    previous::plain_removal_plan(req, manifest, &read, &|| folders(root), &is_dir)
 }
