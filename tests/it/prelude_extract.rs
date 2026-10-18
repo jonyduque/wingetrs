@@ -488,3 +488,165 @@ fn persist_rejects_paths_outside() {
     assert_eq!(std::fs::read_dir(&app).unwrap().count(), 0);
     assert!(!pdir.exists());
 }
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn inno_installer_inside_destination_does_not_count() {
+    let d = dirs();
+    let rec = d.work.join("rec.txt");
+    std::fs::create_dir_all(&d.dest).unwrap();
+    let inst = d.dest.join("setup.exe");
+    std::fs::write(&inst, b"x").unwrap();
+    let h = fake(&d, "innounp.cmd", &rec, "", 0);
+    let o = run(
+        &d,
+        &[("innounp", &h)],
+        &format!(
+            "Expand-InnoArchive -Path '{}' -DestinationPath '{}'",
+            inst.display(),
+            d.dest.display()
+        ),
+    );
+    assert_ne!(o.code, 0, "{}", o.out);
+    assert!(o.out.contains("nenhum arquivo extraído"), "{}", o.out);
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn dark_manifest_names_cannot_leave_their_folder() {
+    let d = dirs();
+    let rec = d.work.join("rec.txt");
+    let h = fake(&d, "dark.cmd", &rec, "", 0);
+    let arc = d.work.join("a.exe");
+    let (ux, ac) = (d.dest.join("UX"), d.dest.join("AttachedContainer"));
+    std::fs::create_dir_all(&ux).unwrap();
+    std::fs::create_dir_all(&ac).unwrap();
+    std::fs::write(ac.join("a0"), b"0").unwrap();
+    std::fs::write(ux.join("a"), b"a").unwrap();
+    std::fs::write(ac.join("p"), b"p").unwrap();
+    std::fs::write(d.dest.join("x"), b"outside-ux").unwrap();
+    std::fs::write(d.dest.join("x2"), b"outside-payload").unwrap();
+    std::fs::write(
+        ux.join("manifest.xml"),
+        "<BurnManifest><UX><Payload SourcePath=\"a\" FilePath=\"b\"/>\
+         <Payload SourcePath=\"..\\x\" FilePath=\"y\"/></UX>\
+         <Payload SourcePath=\"p\" FilePath=\"q\"/>\
+         <Payload SourcePath=\"..\\x2\" FilePath=\"y2\"/></BurnManifest>",
+    )
+    .unwrap();
+    let o = run(
+        &d,
+        &[("dark", &h)],
+        &format!(
+            "Expand-DarkArchive -Path '{}' -DestinationPath '{}'",
+            arc.display(),
+            d.dest.display()
+        ),
+    );
+    assert_eq!(o.code, 0, "{}", o.out);
+    // safe entries are renamed, the ones that leave their folder are skipped
+    assert!(ux.join("b").exists() && ac.join("q").exists(), "{}", o.out);
+    assert!(d.dest.join("x").exists() && !d.dest.join("y").exists());
+    assert!(d.dest.join("x2").exists() && !d.dest.join("y2").exists());
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn inner_tar_name_cannot_leave_destination() {
+    let d = dirs();
+    let rec = d.work.join("rec.txt");
+    // lists "..\a.tar"; any call whose arguments mention a.tar (the recursion) exits 9
+    let extra = "echo %* | findstr /c:\"a.tar\" >nul && exit /b 9\r\necho ..\\a.tar";
+    let h = fake(&d, "7z.cmd", &rec, extra, 0);
+    let arc = d.work.join("x.tgz");
+    let o = run(
+        &d,
+        &[("7zip", &h)],
+        &format!(
+            "Expand-7zipArchive -Path '{}' -DestinationPath '{}'",
+            arc.display(),
+            d.dest.display()
+        ),
+    );
+    assert_ne!(o.code, 0, "{}", o.out);
+    assert!(o.out.contains("inseguro"), "{}", o.out);
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn safe_rel_refuses_reserved_empty_and_trailing() {
+    let d = dirs();
+    let cases = [
+        "CON",
+        "a\\nul.txt",
+        "COM1",
+        "lpt9.x",
+        "a.",
+        "a ",
+        "",
+        "..\\x",
+        "C:x",
+        "\\x",
+        "a\\..\\b",
+        "sub",
+        "a\\b.txt",
+        "{app}\\x",
+        "console",
+        "com10",
+    ];
+    let list = cases
+        .iter()
+        .map(|c| format!("'{c}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let o = run(
+        &d,
+        &[],
+        &format!(
+            "foreach ($c in @({list})) {{ try {{ [void](__wr_safe_rel $c); 'ok' }} catch {{ 'refused' }} }}"
+        ),
+    );
+    assert_eq!(o.code, 0, "{}", o.out);
+    let want: Vec<&str> = std::iter::repeat_n("refused", 11)
+        .chain(std::iter::repeat_n("ok", 5))
+        .collect();
+    assert_eq!(lines(&o), want, "{}", o.out);
+}
+
+#[test]
+#[ignore = "live: roda pwsh real"]
+fn expand_7zip_removal_deletes_split_parts_only() {
+    let d = dirs();
+    let rec = d.work.join("rec.txt");
+    let h = fake(&d, "7z.cmd", &rec, "", 0);
+    let w = &d.work;
+    for n in [
+        "a.7z.001",
+        "a.7z.002",
+        "b.7z.001",
+        "x.part1.rar",
+        "x.part2.rar",
+        "y.part1.rar",
+    ] {
+        std::fs::write(w.join(n), b"x").unwrap();
+    }
+    for first in ["a.7z.001", "x.part1.rar"] {
+        let o = run(
+            &d,
+            &[("7zip", &h)],
+            &format!(
+                "Expand-7zipArchive -Path '{}' -DestinationPath '{}' -Removal",
+                w.join(first).display(),
+                d.dest.display()
+            ),
+        );
+        assert_eq!(o.code, 0, "{}", o.out);
+    }
+    let left = |n: &str| w.join(n).exists();
+    assert!(!left("a.7z.001") && !left("a.7z.002"));
+    assert!(!left("x.part1.rar") && !left("x.part2.rar"));
+    assert!(
+        left("b.7z.001") && left("y.part1.rar"),
+        "unrelated parts stay"
+    );
+}

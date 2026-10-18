@@ -578,9 +578,12 @@ function __wr_helper($name) {
 # rooted paths, drives, UNC and alternate streams (install::safepath rule)
 function __wr_safe_rel($p) {
     $s = "$p"
-    if ($s.Contains(':') -or $s -match '^[\\/]' -or $s -match '(^|[\\/])\.\.([\\/]|$)') {
-        throw ('caminho inseguro: ' + $s)
+    $bad = [string]::IsNullOrEmpty($s) -or $s.Contains(':') -or $s -match '^[\\/]' -or $s -match '(^|[\\/])\.\.([\\/]|$)'
+    foreach ($c in ($s -split '[\\/]')) {
+        # reserved device names (with or without extension), trailing dot or space
+        if ($c -match '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$' -or $c -match '[. ]$') { $bad = $true }
     }
+    if ($bad) { throw ('caminho inseguro: ' + $s) }
     return $s
 }
 
@@ -778,8 +781,16 @@ function Expand-7zipArchive {
         Remove-Item $LogPath -Force
     }
     if ($Removal) {
-        # remove the original archive file
-        Remove-Item $Path -Force
+        if (($Path -replace '.*\.([^\.]*)$', '$1') -eq '001') {
+            # remove split 7-zip archive parts
+            Get-ChildItem "$($Path -replace '\.[^\.]*$', '').???" | Remove-Item -Force
+        } elseif (($Path -replace '.*\.part(\d+)\.rar$', '$1')[-1] -eq '1') {
+            # remove split RAR archive parts
+            Get-ChildItem "$($Path -replace '\.part(\d+)\.rar$', '').part*.rar" | Remove-Item -Force
+        } else {
+            # remove the original archive file
+            Remove-Item $Path -Force
+        }
     }
 }
 
@@ -869,7 +880,9 @@ function Expand-InnoArchive {
     }
     __wr_run $InnoPath $ArgList $LogPath $Path
     # innounp exits 0 with no files when the filter matches nothing (probe D4)
-    $count = @(Get-ChildItem -LiteralPath $DestinationPath -Recurse -File -Force -ErrorAction SilentlyContinue).Count
+    # (the destination may already hold the installer itself and the log: they do not count)
+    $skip = @((Get-AbsolutePath $Path), (Get-AbsolutePath $LogPath))
+    $count = @(Get-ChildItem -LiteralPath $DestinationPath -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $skip -notcontains $_.FullName }).Count
     if ($count -eq 0) {
         throw ('innounp: nenhum arquivo extra' + [char]0xED + 'do')
     }
@@ -948,11 +961,11 @@ function Expand-DarkArchive {
             $Xml = [xml](Get-Content -Raw "$DestinationPath\UX\manifest.xml" -Encoding utf8)
             # names come from the installer: skip any that leave their folder
             $Xml.BurnManifest.UX.Payload | ForEach-Object {
-                try { [void](__wr_safe_rel $_.SourcePath); [void](__wr_safe_rel $_.FilePath) } catch { return }
+                try { [void](__wr_safe_rel $_.SourcePath); [void](__wr_safe_rel $_.FilePath) } catch { return } # ux
                 Rename-Item "$DestinationPath\UX\$($_.SourcePath)" $_.FilePath -ErrorAction Ignore
             }
             $Xml.BurnManifest.Payload | ForEach-Object {
-                try { [void](__wr_safe_rel $_.SourcePath); [void](__wr_safe_rel $_.FilePath) } catch { return }
+                try { [void](__wr_safe_rel $_.SourcePath); [void](__wr_safe_rel $_.FilePath) } catch { return } # payload
                 Rename-Item "$DestinationPath\AttachedContainer\$($_.SourcePath)" $_.FilePath -ErrorAction Ignore
             }
         }
