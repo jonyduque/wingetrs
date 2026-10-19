@@ -1037,3 +1037,36 @@ fn installer_mode_same_switches_in_cli_and_tui_plans() {
         }
     }
 }
+
+/// Task 196 review: the user refuses the first installer's UAC; the next one in the batch
+/// still runs (with its own prompt).
+#[test]
+fn tui_batch_refused_uac_still_runs_the_next() {
+    use wingetrs::tui::app::InstallFail;
+    use wingetrs::winget_install::codes::UAC_REFUSED;
+    let first = native("msi", Scope::Machine);
+    let mut second = native("inno", Scope::Machine);
+    second.name = "Outro App".into();
+    let mut a = search_app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    for p in [&first, &second] {
+        update(&mut a, key(KeyCode::Char('i')));
+        update(
+            &mut a,
+            Msg::WingetInstallPlanned {
+                bridge: Ok((bridge_job(), Vec::new())),
+                native: Ok(PlanOrBridge::Native(p.clone())),
+            },
+        );
+    }
+    assert_eq!(a.queue.len(), 1);
+    let cmds = update(
+        &mut a,
+        Msg::InstallFinished(Err(InstallFail::Other(UAC_REFUSED.into()))),
+    );
+    assert!(
+        cmds.contains(&Cmd::Execute(Action::WingetInstall(second.clone()))),
+        "{cmds:?}"
+    );
+    assert!(a.queue.is_empty());
+}

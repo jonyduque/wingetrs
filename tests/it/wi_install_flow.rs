@@ -1083,3 +1083,67 @@ async fn runas_refuses_params_outside_the_allowlist() {
     assert!(matches!(e, WingetOpsError::Elevated(_)), "{e:?}");
     assert_eq!(env.launcher.calls.lock().unwrap().len(), 0);
 }
+
+/// `mklink /J link target`.
+fn junction(link: &Path, target: &Path) {
+    let ok = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "mklink /J");
+}
+
+/// Task 196 review: a junction anywhere from the data root down to the installer (it could be
+/// re-pointed after the hash check) is refused before anything launches.
+#[tokio::test]
+async fn junction_in_the_installer_chain_is_refused() {
+    for depth in [&["installers"][..], &["installers", "Pub.App"][..]] {
+        let env = Env::new();
+        let elsewhere = env.tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let mut parent = env.root().to_path_buf();
+        for d in &depth[..depth.len() - 1] {
+            parent.push(d);
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        junction(&parent.join(depth[depth.len() - 1]), &elsewhere);
+        let (_s, p, _) = served_plan("inno", Some("machine"), Scope::Machine, "", "").await;
+        let ctx = ctx!(env);
+        let r = install(&ctx, &p).await;
+        assert!(
+            matches!(&r, Err(WingetOpsError::Fetch(e)) if e.to_string().contains("reanálise")),
+            "{depth:?}: {r:?}"
+        );
+        assert_eq!(env.launcher.calls.lock().unwrap().len(), 0, "{depth:?}");
+    }
+}
+
+/// Task 196 review: the elevated launch gets the held file's final path (here the data root
+/// is written with a `..`, which the final path no longer has) and System32 as its folder.
+#[tokio::test]
+async fn runas_gets_the_final_path_and_system32() {
+    let mut env = Env::new();
+    env.data = DataDir::new(env.tmp.path().join("x").join("..").join("root"));
+    let (_s, p, _) = served_plan("inno", Some("machine"), Scope::Machine, "", "").await;
+    let ctx = ctx!(env);
+    install(&ctx, &p).await.unwrap();
+    let calls = env.launcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].verb, Verb::RunAs);
+    let tmp = std::fs::canonicalize(env.tmp.path()).unwrap();
+    let tmp = tmp.to_str().unwrap();
+    let tmp = tmp.strip_prefix(r"\\?\").unwrap_or(tmp).to_string();
+    let want = Path::new(&tmp)
+        .join("root")
+        .join("installers")
+        .join("Pub.App")
+        .join("1.0")
+        .join("Pub.App-1.0.exe");
+    assert_eq!(calls[0].program, want);
+    assert_ne!(calls[0].program, env.materialized("exe"));
+    assert_eq!(calls[0].dir.as_deref(), env.msiexec.parent());
+}

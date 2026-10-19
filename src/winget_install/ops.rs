@@ -401,18 +401,30 @@ fn run_command(
             (Some(log), args)
         }
     };
+    // Elevated: the held file's final path (no folder above it is a reparse point, all held)
+    // and System32 as the working folder, never the user's download folder.
+    let (target, dir) = match verb {
+        Verb::RunAs => (
+            file.launch_path(),
+            ctx.msiexec.parent().map(Path::to_path_buf),
+        ),
+        Verb::Open => (
+            file.path().to_path_buf(),
+            file.path().parent().map(Path::to_path_buf),
+        ),
+    };
     let (program, params) = match cmd.program {
         Program::Msiexec => (
             ctx.msiexec.clone(),
-            switches::msiexec_params(file.path(), &args),
+            switches::msiexec_params(&target, &args),
         ),
-        Program::Installer => (file.path().to_path_buf(), args),
+        Program::Installer => (target, args),
     };
     switches::validate(&params)?;
     let spec = LaunchSpec {
         program,
         params,
-        dir: file.path().parent().map(Path::to_path_buf),
+        dir,
         show: Show::Normal,
         verb,
     };
@@ -482,10 +494,8 @@ fn elevation_allowed(
             "o instalador elevado não grava log (elevação)".into(),
         ));
     }
+    // `fetch` already required 64 hex digits.
     let sha = file.sha256();
-    if !one_component(sha) {
-        return Err(FetchError::BadSha.into());
-    }
     let req = InstallerRequest {
         // The download cache's name for the file (the shape the allowlist expects).
         source: format!(r"C:\wingetrs\blobs\{sha}"),

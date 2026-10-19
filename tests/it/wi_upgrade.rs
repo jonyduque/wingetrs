@@ -23,7 +23,7 @@ use wingetrs::winget_install::engine::{
     Engine, InstalledFacts, InstalledKind, UpgradeError, UpgradeRoute, choose_engine,
     installed_facts, plan_upgrade, upgrade, upgrade_all_targets, upgrade_route, upgrade_scope,
 };
-use wingetrs::winget_install::launch::{LaunchSpec, Launcher};
+use wingetrs::winget_install::launch::{Elevation, LaunchSpec, Launcher, Verb};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::ops::{InstallReport, WingetCtx, WingetOpsError};
 use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
@@ -399,6 +399,7 @@ struct FakeLauncher {
     label: &'static str,
     events: Events,
     params: Mutex<Vec<String>>,
+    verbs: Mutex<Vec<Verb>>,
     /// Exit code of the launched program.
     code: i32,
     /// `install.lock` path: each launch records whether another taker would be turned away.
@@ -422,6 +423,7 @@ impl Launcher for FakeLauncher {
         }
         self.events.lock().unwrap().push(self.label.to_string());
         self.params.lock().unwrap().push(spec.params.clone());
+        self.verbs.lock().unwrap().push(spec.verb);
         let other = UpdateLock::try_acquire(&self.lock_path).unwrap();
         self.lock_held.lock().unwrap().push(other.is_none());
         Ok(self.code)
@@ -553,6 +555,16 @@ impl wiremock::Respond for Served {
 
 impl World {
     async fn new(kind: &str, behavior: Option<&str>, extra: &str, key_stays: bool) -> World {
+        World::new_scoped(kind, behavior, extra, key_stays, "user").await
+    }
+
+    async fn new_scoped(
+        kind: &str,
+        behavior: Option<&str>,
+        extra: &str,
+        key_stays: bool,
+        scope: &str,
+    ) -> World {
         let tmp = tempfile::tempdir().unwrap();
         let data = DataDir::new(tmp.path().join("root"));
         let bytes = body();
@@ -569,7 +581,7 @@ impl World {
             .await;
         let manifest = manifest_with(
             kind,
-            &[(Some("user"), behavior)],
+            &[(Some(scope), behavior)],
             &format!("{}/setup", server.uri()),
             &sha,
             extra,
@@ -579,6 +591,7 @@ impl World {
             label,
             events: events.clone(),
             params: Mutex::new(Vec::new()),
+            verbs: Mutex::new(Vec::new()),
             code: 0,
             lock_path: data.install_layout().install_lock(),
             lock_held: Mutex::new(Vec::new()),
@@ -1118,4 +1131,26 @@ fn upgrade_follows_installer_mode() {
     let progress = args(InstallerMode::Progress);
     assert!(progress.contains("/passive"), "{progress}");
     assert!(!progress.contains("/quiet"), "{progress}");
+}
+
+/// Task 196 review: the fresh install after removing the previous version of a machine-scope
+/// installer is rebuilt for its elevation: `runas`, no log switch, and it succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_first_machine_install_runs_elevated_without_log() {
+    let w = World::new_scoped("inno", Some("uninstallPrevious"), "", false, "machine").await;
+    let p = native(&w.manifest, ScopeWanted::Only(Scope::Machine), Some("0.9"));
+    assert_eq!(p.elevation, Elevation::Helper);
+    let r = w.run(&p).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        w.events(),
+        ["fetch", "launch_gate", "uninstall", "wait_key", "install"]
+    );
+    assert_eq!(*w.install.verbs.lock().unwrap(), [Verb::RunAs]);
+    let params = w.install.params.lock().unwrap().clone();
+    let low = params[0].to_ascii_lowercase();
+    assert!(
+        !low.contains("/log") && !low.contains("<logpath>"),
+        "{params:?}"
+    );
 }

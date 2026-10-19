@@ -52,8 +52,13 @@ pub fn extension(kind: &InstallerKind) -> &'static str {
 pub struct Materialized {
     path: PathBuf,
     sha256: String,
+    /// The data root: the folders from it down to `path` are held by `verify`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    root: PathBuf,
     #[cfg(windows)]
     verified: Option<super::verified_win::VerifiedFile>,
+    #[cfg(windows)]
+    folders: Vec<std::fs::File>,
 }
 
 impl Materialized {
@@ -64,27 +69,44 @@ impl Materialized {
     pub fn sha256(&self) -> &str {
         &self.sha256
     }
-    /// Opens the file share-deny and checks its SHA-256 through that handle; the handle lives
-    /// as long as `self` (reopening replaces it).
+    /// Holds the folders from the data root down (none may be a reparse point), opens the file
+    /// share-deny without following a reparse point and checks its SHA-256 through that
+    /// handle; the handles live as long as `self` (reopening replaces them).
     #[cfg(windows)]
     pub fn verify(&mut self) -> Result<&super::verified_win::VerifiedFile, FetchError> {
         self.verified = None;
+        self.folders = super::verified_win::hold_chain(&self.root, &self.path)?;
         let v = super::verified_win::VerifiedFile::open(&self.path, &self.sha256)?;
         Ok(self.verified.insert(v))
+    }
+
+    /// The path an elevated launch is given: the held file's final path once verified.
+    pub fn launch_path(&self) -> PathBuf {
+        #[cfg(windows)]
+        if let Some(v) = &self.verified {
+            return v.final_path().to_path_buf();
+        }
+        self.path.clone()
     }
 
     /// Closes the share-deny handle: from then on the file may change on disk. Called only
     /// once the installer process has ended (Task 196).
     pub fn release(&mut self) {
         #[cfg(windows)]
-        drop(self.verified.take());
+        {
+            drop(self.verified.take());
+            self.folders.clear();
+        }
     }
 }
 
 impl Drop for Materialized {
     fn drop(&mut self) {
         #[cfg(windows)]
-        drop(self.verified.take());
+        {
+            drop(self.verified.take());
+            self.folders.clear();
+        }
         if let Err(e) = std::fs::remove_file(&self.path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -231,8 +253,11 @@ pub async fn fetch_installer_until(
     Ok(Materialized {
         path: target,
         sha256: sha,
+        root: data.root().to_path_buf(),
         #[cfg(windows)]
         verified: None,
+        #[cfg(windows)]
+        folders: Vec::new(),
     })
 }
 
