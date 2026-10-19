@@ -388,8 +388,7 @@ async fn event_loop(
                 refresh_msg |= matches!(msg, Msg::RefreshFinished(_));
             })
             .collect();
-        let cmds = clock_turn(&mut app, Instant::now(), batch);
-        helper_notice.show(&mut app);
+        let cmds = loop_turn(&mut app, Instant::now(), batch, &helper_notice);
         if app.icon_protocol != protocol_now {
             // The Ícones setting changed: encode with the new protocol from here on.
             protocol_now = app.icon_protocol;
@@ -532,6 +531,13 @@ async fn event_loop(
             })?;
         }
     }
+}
+
+/// `clock_turn`, then the elevated helper's folder refusal, if one is waiting (a toast).
+pub fn loop_turn(app: &mut App, now: Instant, msgs: Vec<Msg>, notice: &HelperNotice) -> Vec<Cmd> {
+    let cmds = clock_turn(app, now, msgs);
+    notice.show(app);
+    cmds
 }
 
 /// One loop turn: sets the toast clock to `now`, then applies the batch in order.

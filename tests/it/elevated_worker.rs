@@ -737,7 +737,10 @@ mod helper_folder {
         assert_eq!(woken.load(Ordering::SeqCst), 1, "once per session");
         let mut app =
             wingetrs::tui::app::App::new(Vec::new(), wingetrs::tui::theme::GlyphSet::Ascii);
-        notice.show(&mut app);
+        // Shown by the loop turn (once), not only by `show`.
+        let _ =
+            wingetrs::tui::run::loop_turn(&mut app, std::time::Instant::now(), Vec::new(), &notice);
+        assert_eq!(app.toasts.len(), 1, "the loop turn shows the refusal");
         notice.show(&mut app);
         let toasts: Vec<_> = app
             .toasts
@@ -813,8 +816,13 @@ mod helper_folder {
             during: &dyn Fn(),
         ) -> (std::io::Error, Vec<(PathBuf, String)>) {
             let mut calls = Vec::new();
-            let mut launcher = |p: &Path, args: &str| -> std::io::Result<OwnedHandle> {
-                calls.push((p.to_path_buf(), args.to_string()));
+            let mut launcher = |l: &elevate_win::HelperLaunch| -> std::io::Result<OwnedHandle> {
+                // The helper starts in System32, never in the user's current folder.
+                let sys32 = wingetrs::bridge::staging_win::SystemEnv::query()
+                    .unwrap()
+                    .system32;
+                assert_eq!(l.dir, sys32);
+                calls.push((l.exe.clone(), l.args.clone()));
                 during();
                 Err(std::io::Error::other("lançador falso"))
             };
@@ -844,6 +852,32 @@ mod helper_folder {
             let (e, calls) = start(&exe, &sddl_of, &|| {});
             assert!(calls.is_empty(), "{calls:?}");
             assert_eq!(e.to_string(), helper_folder::refusal_text(&bin));
+            // A folder further up (the grandparent) writable by Users: refused as well.
+            let top = dir.path().to_path_buf();
+            let sddl_of = |p: &Path, _: &std::fs::File| {
+                Ok(if p == top { USERS_WRITE } else { ADMIN }.to_string())
+            };
+            let (e, calls) = start(&exe, &sddl_of, &|| {});
+            assert!(calls.is_empty(), "{calls:?}");
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            assert_eq!(e.to_string(), helper_folder::refusal_text(&bin));
+        }
+
+        #[test]
+        fn worker_hardens_the_process_before_anything_else() {
+            let count = AtomicUsize::new(0);
+            let harden = || -> std::io::Result<()> {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            };
+            // Hardening runs first, even for a request refused right after.
+            let e = elevate_win::worker_main_with("bad", 1, &harden).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            // Its failure stops the helper.
+            let failing = || -> std::io::Result<()> { Err(std::io::Error::other("sem endurecer")) };
+            let e = elevate_win::worker_main_with("bad", 1, &failing).unwrap_err();
+            assert_eq!(e.to_string(), "sem endurecer");
         }
 
         #[test]

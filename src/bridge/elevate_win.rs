@@ -31,6 +31,9 @@ use windows::Win32::System::Com::{
     COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::LibraryLoader::{
+    LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
@@ -273,20 +276,31 @@ fn create_pipe(name: &str) -> std::io::Result<OwnedHandle> {
     })
 }
 
-/// Starts `exe args` elevated through UAC (hidden); the process handle. The user saying no is
+/// One UAC launch of the helper: `exe args`, started in `dir` (System32, so neither the user's
+/// current folder nor a relative name reaches the elevated process).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperLaunch {
+    pub exe: PathBuf,
+    pub args: String,
+    pub dir: PathBuf,
+}
+
+/// Starts `spec` elevated through UAC (hidden); the process handle. The user saying no is
 /// `ErrorKind::PermissionDenied`.
-fn launch(exe: &Path, args: &str) -> std::io::Result<OwnedHandle> {
+fn launch(spec: &HelperLaunch) -> std::io::Result<OwnedHandle> {
     // ShellExecuteEx wants COM; a thread already in another apartment is fine as it is.
     // SAFETY: paired with CoUninitialize below when it succeeded.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    let file = HSTRING::from(exe.as_os_str());
-    let params = HSTRING::from(args);
+    let file = HSTRING::from(spec.exe.as_os_str());
+    let params = HSTRING::from(spec.args.as_str());
+    let dir = HSTRING::from(spec.dir.as_os_str());
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
         lpVerb: w!("runas"),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
+        lpDirectory: PCWSTR(dir.as_ptr()),
         nShow: SW_HIDE.0,
         ..Default::default()
     };
@@ -418,11 +432,12 @@ pub fn start(exe: &Path) -> std::io::Result<PipeHelper> {
 /// open without write or delete sharing, and the folders without delete sharing, until
 /// `launcher` returns. A DLL the helper loads from its own folder is covered by the same
 /// check: nobody else may create a file there. Otherwise no UAC prompt and the error is
-/// `helper_folder::refusal_text`; no variable, setting or flag skips this.
+/// `helper_folder::refusal_text`; no variable, setting or flag skips this. The helper starts
+/// in System32 (from the known folder).
 pub fn start_with(
     exe: &Path,
     sddl_of: super::arp_ops_win::SddlOf<'_>,
-    launcher: &mut dyn FnMut(&Path, &str) -> std::io::Result<OwnedHandle>,
+    launcher: &mut dyn FnMut(&HelperLaunch) -> std::io::Result<OwnedHandle>,
 ) -> std::io::Result<PipeHelper> {
     let folder = exe.parent().unwrap_or(exe);
     let held = super::arp_ops_win::hold_admin_chain_with(exe, sddl_of).map_err(|e| {
@@ -432,11 +447,16 @@ pub fn start_with(
             super::helper_folder::refusal_text(folder),
         )
     })?;
+    let system32 = super::staging_win::SystemEnv::query()?.system32;
     let name = format!("{PIPE_PREFIX}{}", random_hex()?);
     let pipe = create_pipe(&name)?;
     // SAFETY: no arguments.
     let me = unsafe { GetCurrentProcessId() };
-    let process = launcher(exe, &format!("bridge-worker --pipe {name} --parent {me}"));
+    let process = launcher(&HelperLaunch {
+        exe: exe.to_path_buf(),
+        args: format!("bridge-worker --pipe {name} --parent {me}"),
+        dir: system32,
+    });
     drop(held);
     let process = process?;
     accept(&pipe, &process, CONNECT_LIMIT)?;
@@ -506,6 +526,26 @@ impl Drop for ParentWatch {
 /// `wingetrs bridge-worker`: connects to `pipe`, checks that its server is `parent`, and serves
 /// it with the real bridge exec until it quits, closes or the parent exits.
 pub fn worker_main(pipe: &str, parent: u32) -> std::io::Result<()> {
+    worker_main_with(pipe, parent, &harden_process)
+}
+
+/// Hardening of the elevated helper, before anything else runs: DLLs are loaded from System32
+/// only (never from the user's PATH or current folder, for a missing or delay-loaded DLL), and
+/// the current folder is System32 (from the known folder).
+pub fn harden_process() -> std::io::Result<()> {
+    // SAFETY: plain process-wide setting.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) }.map_err(|e| io_err(&e))?;
+    std::env::set_current_dir(super::staging_win::SystemEnv::query()?.system32)
+}
+
+/// `worker_main` with the process hardening done by `harden`, first; its failure stops the
+/// helper before the pipe is opened.
+pub fn worker_main_with(
+    pipe: &str,
+    parent: u32,
+    harden: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    harden()?;
     if !valid_pipe_name(pipe) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
