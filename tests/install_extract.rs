@@ -764,6 +764,18 @@ mod cab_files {
     /// Uncompressed single-folder cabinet; `flags` = CFHEADER flags (1 prev, 2 next);
     /// `ifolder` = CFFILE iFolder of every entry.
     fn cab_bytes(entries: &[(&str, &[u8])], flags: u16, ifolder: u16) -> Vec<u8> {
+        cab_typed(entries, flags, ifolder, 0, None)
+    }
+
+    /// `ctype` = CFFOLDER typeCompress; `stored` = the CFDATA payload when it differs from
+    /// the plain bodies (MSZIP: `CK` + raw deflate of them).
+    fn cab_typed(
+        entries: &[(&str, &[u8])],
+        flags: u16,
+        ifolder: u16,
+        ctype: u16,
+        stored: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut extra = Vec::new();
         if flags & 1 != 0 {
             extra.extend_from_slice(b"prev.cab\0disk1\0");
@@ -784,6 +796,8 @@ mod cab_files {
             data.extend_from_slice(body);
         }
         let data_off = files_off + files.len();
+        let uncompressed = data.len();
+        let data = stored.map_or(data, <[u8]>::to_vec);
         let total = data_off + 8 + data.len();
         let mut out = Vec::new();
         out.extend_from_slice(b"MSCF\0\0\0\0");
@@ -799,11 +813,11 @@ mod cab_files {
         out.extend_from_slice(&extra);
         out.extend_from_slice(&(data_off as u32).to_le_bytes());
         out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&ctype.to_le_bytes());
         out.extend_from_slice(&files);
         out.extend_from_slice(&[0u8; 4]);
         out.extend_from_slice(&(data.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(uncompressed as u16).to_le_bytes());
         out.extend_from_slice(&data);
         out
     }
@@ -931,5 +945,61 @@ mod cab_files {
         );
         assert!(matches!(r, Err(ExtractError::TooLarge { .. })), "{r:?}");
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn cab_quantum_refused() {
+        let d = tempfile::tempdir().unwrap();
+        // typeCompress: Quantum (2), level 4, memory 16: valid for the parser.
+        let f = put(
+            d.path(),
+            "q.cab",
+            &cab_typed(&[("a.txt", b"hi")], 0, 0, 0x1042, None),
+        );
+        let out = d.path().join("out");
+        let r = extract(&f, "q.cab", None, None, &out);
+        assert!(
+            matches!(&r, Err(ExtractError::Unsupported(m)) if m.contains("Quantum")),
+            "{r:?}"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn cab_same_bytes_both_names() {
+        let d = tempfile::tempdir().unwrap();
+        let bytes = cab_ok(&[("a.txt", b"one"), (r"d\b.txt", b"two")]);
+        let mut trees = Vec::new();
+        for name in ["x.cab", "x.7z"] {
+            let f = put(d.path(), name, &bytes);
+            let out = d.path().join(format!("out-{name}"));
+            extract(&f, name, None, None, &out).unwrap();
+            trees.push((
+                std::fs::read(out.join("a.txt")).unwrap(),
+                std::fs::read(out.join("d").join("b.txt")).unwrap(),
+            ));
+        }
+        assert_eq!(trees[0], trees[1]);
+        assert_eq!(trees[0].1, b"two");
+    }
+
+    #[test]
+    fn cab_mszip_extracts() {
+        use std::io::Write;
+        let body = b"mszip body mszip body mszip body".repeat(20);
+        let mut enc =
+            flate2::write::DeflateEncoder::new(b"CK".to_vec(), flate2::Compression::default());
+        enc.write_all(&body).unwrap();
+        let stored = enc.finish().unwrap();
+        assert!(stored.len() < body.len());
+        let d = tempfile::tempdir().unwrap();
+        let f = put(
+            d.path(),
+            "z.7z",
+            &cab_typed(&[("big.txt", &body)], 0, 0, 1, Some(&stored)),
+        );
+        let out = d.path().join("out");
+        extract(&f, "z.7z", None, None, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("big.txt")).unwrap(), body);
     }
 }
