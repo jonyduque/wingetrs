@@ -4,14 +4,15 @@ Commits:
 acb6c7d feat(cli): every output line goes through the formatter
 d4d5ba3 feat(cli): dry-run plans and winget lines styled by output.rs
 dd8d2ec feat(cli): winget plan as numbered steps, URL and hash only in --dry-run
+57eb86a fix: task 199 review, output rule without holes, removal plan as steps
 
 Gate:
 ```
-[OK]   rules 10s
-[OK]   rules-selftest 29s
-[OK]   fmt 5s
-[OK]   clippy 41s
-[OK]   test (1888 passed, 87 ignored) 84s
+[OK]   rules 11s
+[OK]   rules-selftest 35s
+[OK]   fmt 3s
+[OK]   clippy 21s
+[OK]   test (1892 passed, 87 ignored) 87s
 [OK]   gate verde
 ```
 
@@ -67,6 +68,26 @@ $ wingetrs install 7zip.7zip   (sem --dry-run, sem --yes, stdin/stdout sem termi
 [exit 1]
 ```
 Rodada 3, decisões: `WingetPlan::{title, steps, dry_run_details}` em `src/winget_install/plan.rs`; o `Display` virou título + passos e é o que a TUI lista (`action_notes`), e a CLI numera os mesmos `steps()` (`output::winget_plan_text`); teste `wi_tui::tui_confirmation_and_cli_plan_list_the_same_steps` compara as duas listas na ordem. Constantes `ADMIN_PROMPT*`/`RUN_FOLDER_NOTE` capitalizadas ("Roda numa pasta temporária do wingetrs"), `UNINSTALL_FIRST_NOTE` nova. Testes antigos ajustados de propósito: `wi_install_flow` (escopo "máquina", URL só em `dry_run_details`), `wi_tui` ("máquina"/"usuário"), `wi_upgrade` (maiúsculas), `wi_cli` (passos numerados). O plano de remoção ARP/MSIX (`UninstallPlan`) não mudou de forma.
+
+- Revisão (rodada 4):
+  - Regra sem furos: `scripts/mutate.ps1 -Path scripts/check_rules.ps1` (padrão novo `\b(e?println!|e?print!|dbg!)\(|\bstd(out|err)\(\)` -> o antigo `…|\bstd(out|err)\(\)\s*\.lock\(\)`), `-TestCommand 'pwsh -File scripts/check_rules_selftest.ps1'`:
+    `[OK] mutação PEGA: 'Pattern = '\b(e?println!|e?print!|dbg!)\(|\bstd(out|err)\(\)'' -> 'Pattern = '\b(e?println!|e?print!)\(|\bstd(out|err)\(\)\s*\.lock\(\)'' fez o teste falhar (exit 1).`
+    Selftest com o padrão antigo (plantado à mão e restaurado):
+    ```
+      [stdout sem trava fora do seletor] exit 0, esperado 1
+      [stdout guardado e writeln] exit 0, esperado 1
+      [stdout write_all] exit 0, esperado 1
+      [writeln em anstream::stdout] exit 0, esperado 1
+      [dbg em cli/x.rs] exit 0, esperado 1
+      [lock na linha seguinte] exit 0, esperado 1
+    ```
+    Selftest com o padrão novo: `[OK] check_rules: 36 casos plantados`.
+  - `[OK] mutação PEGA: '        for step in self.steps() {' -> '        for step in self.steps().into_iter().skip(1) {' fez o teste falhar (exit 101).` (`src/winget_install/uninstall.rs`, `wi_tui::tui_confirmation_and_cli_uninstall_list_the_same_steps`)
+  - `[OK] mutação PEGA: '            widths[0] = widths[0].saturating_sub(total - room).max(floor);' -> '' fez o teste falhar (exit 101).` (`cli_color::long_names_fit_the_terminal`)
+  - `[OK] mutação PEGA: '        _ if !tty => 0,' -> '        _ if false => 0,' fez o teste falhar (exit 101).` (`style::tests::glyphs_follow_each_stream`)
+  - `[OK] mutação PEGA: '            "rode de novo sem --scope",' -> '            "",' fez o teste falhar (exit 101).` (`cli_install::scope_on_a_scoop_app_says_what_to_do`)
+
+Revisão (rodada 4), decisões: a regra cobre qualquer `stdout()`/`stderr()` (std::io ou anstream, com ou sem lock) e `dbg!` em `src/cli/`, exceto `emit.rs` e `picker.rs`; os testes de TTY passaram a `emit::stdout_is_terminal`/`stderr_is_terminal`. `emit::progress()` é `pub(super)` e devolve `Progress`, que não implementa `Write` (só `erase`/`line_above`/`redraw`/`flush`). `UninstallPlan::{title, steps, dry_run_details}` (comando registrado só no `--dry-run`, passos com maiúscula, "⚠ Pede permissão de administrador (UAC)"); o `Display` é título + passos e a TUI lista ele; `output::plan_text` e a lista de rótulos saíram. Tabelas: num TTY a 1ª coluna (nomes) cede o que falta para caber em `colunas - 1`, com `…`, mínimo 8 ou o cabeçalho; fora de TTY nada é cortado. Glifos: `style::on_stderr` escolhe o conjunto de stderr (`emit::err_with`, `emit::error`). Sem teste próprio: os `Advice` de `--purge` e da versão fixada no caminho winget (mesma forma do `--scope`, que tem teste).
 
 Rodada 2, saída real (release, não TTY):
 ```
