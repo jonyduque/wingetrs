@@ -1327,3 +1327,19 @@ Mutação obrigatória: `mode_for` ignorar o ajuste ⇒ teste PEGA.
 2. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat(winget-install): silent-with-progress by default, installer_mode setting`
+
+### Task 202: Lado elevado confere o hash pelo catálogo assinado e roda da pasta de staging (opção B, depois da 2d)
+
+**Modelo:** opus (revisor opus), com sonda antes. Decisão do usuário em 2026-10-19 ("Mitigar agora, B depois"): a revisão da Task 196 achou que o instalador elevado por `runas` roda de uma pasta que o usuário grava (`%LOCALAPPDATA%\wingetrs\installers`), então uma DLL plantada ao lado (ou no TEMP onde Inno/Burn extraem) carrega como administrador. A Task 196 mitigou (pasta de trabalho System32, caminho final pelo handle, cadeia sem junção, pasta nova e vazia por execução): risco igual ao do winget. Esta tarefa fecha o risco e devolve um UAC por sessão.
+
+#### What binds this task
+
+1. Sonda (relatório antes do código): como verificar a assinatura Authenticode do `source2.msix` no lado elevado (`WinVerifyTrust` com a política da Microsoft), onde fica o índice dentro dele, como achar o hash do manifesto pelo id/versão, e o tamanho/tempo de baixar e abrir o msix elevado.
+2. O pedido do pipe passa a ser só `{id, versão, índice do instalador, escopo}`. O auxiliar baixa (ou lê de uma cópia que ele mesmo grava no staging) o `source2.msix`, confere a assinatura, acha o manifesto e o hash dele, baixa o manifesto, confere, escolhe o instalador pelo índice e tira dele o SHA-256 e a URL. Nada disso vem do lado não elevado.
+3. O instalador é baixado pelo auxiliar para `<Program Files>\wingetrs\staging\<aleatório>\` (DACL só admin), conferido, e roda de lá com `TEMP`/`TMP` dentro do staging e ambiente montado do zero (como a Task 190 faz para o winget).
+4. A ponte de UAC por instalador da Task 196 continua como reserva quando a sonda mostrar que algo não dá (registre o motivo).
+5. Testes nunca baixam nem rodam nada real: msix e manifesto sintéticos com assinatura de teste (ou o verificador injetado), servidor `wiremock`.
+
+**Files:** definidos pela sonda (provável `src/bridge/worker.rs`, `src/bridge/staging_win.rs`, `src/bridge/catalog_verify_win.rs` novo, `src/winget_install/ops.rs`).
+
+**Commit:** `feat(bridge): elevated side derives the installer hash from the signed catalog and runs it from admin-only staging`
