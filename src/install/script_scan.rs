@@ -450,6 +450,7 @@ const D_GLOBAL_NAME: &str =
 /// Detail of a flag found only inside an `if ($global) { ... }` body.
 const D_CALLED: &str = "roda um arquivo que não é mostrado";
 const D_ALIAS: &str = "redefine comando por apelido";
+const D_PROGRAM: &str = "roda um programa do pacote";
 
 fn global_only(detail: &str) -> String {
     format!("só roda em instalação global; não roda no wingetrs ({detail})")
@@ -602,6 +603,16 @@ fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, St
     for (part, in_dead) in [(&live_text, false), (&dead_text, true)] {
         for (i, l) in part.lines().enumerate() {
             for target in called_files(&l.replace('`', "")) {
+                if let Some(name) = package_program(&target) {
+                    let detail = format!("{D_PROGRAM}: {name}");
+                    push_at(
+                        FlagKind::CalledFile,
+                        Verdict::Confirm,
+                        &detail,
+                        (i + 1, in_dead),
+                    );
+                    continue;
+                }
                 let detail = format!("{D_CALLED}: {}", target);
                 push_at(
                     FlagKind::CalledFile,
@@ -1267,6 +1278,25 @@ fn called_files(line: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The file name when a call target is the package's own program: a `.exe`/`.com` under
+/// `$dir` or `$persist_dir` (downloaded with its hash checked), every component through
+/// `safepath`. Scripts, interpreters (`.cmd`, `.bat`, `.vbs`, `.js`, ...), names without an
+/// extension and anything elsewhere are not.
+fn package_program(target: &str) -> Option<String> {
+    let t = target.replace('/', "\\");
+    let lower = t.to_ascii_lowercase();
+    let rel = ["$dir\\", "${dir}\\", "$persist_dir\\", "${persist_dir}\\"]
+        .iter()
+        .find(|p| lower.starts_with(*p))
+        .map(|p| &t[p.len()..])?;
+    if rel.contains(['$', '"', '\'']) {
+        return None;
+    }
+    let name = super::safepath::safe_components(rel)?.pop()?;
+    let ext = name.rsplit_once('.')?.1.to_ascii_lowercase();
+    matches!(ext.as_str(), "exe" | "com").then_some(name)
 }
 
 /// The file named at `chars[j]` (see [`called_files`]).
@@ -2000,10 +2030,9 @@ fn mask_killer(chars: &[char]) -> bool {
     if MASK_KILLERS.iter().any(|w| lower.contains(w)) {
         return true;
     }
-    if lower
-        .lines()
-        .any(|l| invokes_variable(l) || !called_files(l).is_empty())
-    {
+    if lower.lines().any(|l| {
+        invokes_variable(l) || called_files(l).iter().any(|t| package_program(t).is_none())
+    }) {
         return true;
     }
     let word = |c: char| c.is_alphanumeric() || c == '_';

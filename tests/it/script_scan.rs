@@ -363,8 +363,8 @@ fn alternate_spellings_flagged() {
 
 #[test]
 fn near_misses_not_flagged() {
-    // `& "$dir\x.exe" /S` was here until Task 192: running a file is now `CalledFile`.
     for s in [
+        r#"& "$dir\x.exe" /S"#,
         r#"Copy-Item "$dir\curl.exe" "$dir\bin""#,
         "$iex = 1",
         r"Get-ItemProperty 'HKCU:\Software\X'",
@@ -378,8 +378,12 @@ fn near_misses_not_flagged() {
         "Write-Host \"#notacomment iex\"",
     ] {
         let r = scan(s, SUP);
-        let unexpected: Vec<FlagKind> = kinds(&r)
-            .into_iter()
+        // Task 192: the package's own program gets an informational `CalledFile`.
+        let unexpected: Vec<FlagKind> = r
+            .flags
+            .iter()
+            .filter(|f| !(f.kind == FlagKind::CalledFile && f.verdict == Verdict::Confirm))
+            .map(|f| f.kind)
             .filter(|k| !(s.starts_with("Write-Host \"#") && *k == FlagKind::DynamicCode))
             .collect();
         assert!(unexpected.is_empty(), "{s}: {unexpected:?}");
@@ -1303,4 +1307,59 @@ fn called_file_disables_global_masking() {
     let s = "if ($global) { Set-ItemProperty 'HKLM:\\X' -Name a -Value 1 }\n. \"$dir\\x.ps1\"\n";
     let r = scan(s, SUP);
     assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+}
+
+#[test]
+fn package_program_call_is_confirm() {
+    for (s, name) in [
+        (r#"& "$dir\setup.exe" /S"#, "setup.exe"),
+        (r#"& "$persist_dir\tool.com""#, "tool.com"),
+        (r#"& '$dir\bin\X.EXE' --quiet"#, "X.EXE"),
+    ] {
+        let r = scan(s, SUP);
+        let f = called_flag(&r).unwrap_or_else(|| panic!("{s}: {:?}", r.flags));
+        assert_eq!(f.verdict, Verdict::Confirm, "{s}");
+        assert_eq!(
+            f.detail,
+            format!("roda um programa do pacote: {name}"),
+            "{s}"
+        );
+        assert_eq!(r.verdict, Verdict::Confirm, "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn script_or_interpreter_call_stays_confirm_strong() {
+    for ext in ["ps1", "psm1", "cmd", "bat", "vbs", "js", "wsf", "hta"] {
+        let s = format!(r#"& "$dir\tool.{ext}""#);
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        assert_eq!(
+            called_flag(&r).unwrap().verdict,
+            Verdict::ConfirmStrong,
+            "{s}"
+        );
+    }
+    let r = scan(r#"& "$dir\tool""#, SUP);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", r.flags);
+}
+
+#[test]
+fn program_outside_package_stays_confirm_strong() {
+    for s in [
+        r#"& "C:\Tools\x.exe""#,
+        r#"& "$env:TEMP\x.exe""#,
+        r#"& "$bucketsdir\extras\scripts\x.exe""#,
+        r#"& "$dir\..\x.exe""#,
+        r#"& "$dir\$name.exe""#,
+        r#"& "$dirx\x.exe""#,
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        assert_eq!(
+            called_flag(&r).unwrap().verdict,
+            Verdict::ConfirmStrong,
+            "{s}"
+        );
+    }
 }
