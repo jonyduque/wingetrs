@@ -1188,6 +1188,11 @@ fn call_quoted_path_is_confirm_strong() {
         r". .\helper.ps1",
         r"&.\tools\install.cmd",
         r#"if ($x) { & "C:\Tools\x.exe" }"#,
+        r#"&("$dir\x.ps1")"#,
+        r#"& ("$dir\x.ps1")"#,
+        r#".("$dir\x.ps1")"#,
+        r#". ("$dir\x.ps1")"#,
+        r"& (Join-Path $dir x.ps1)",
     ] {
         let r = scan(s, SUP);
         assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
@@ -1314,7 +1319,8 @@ fn package_program_call_is_confirm() {
     for (s, name) in [
         (r#"& "$dir\setup.exe" /S"#, "setup.exe"),
         (r#"& "$persist_dir\tool.com""#, "tool.com"),
-        (r#"& '$dir\bin\X.EXE' --quiet"#, "X.EXE"),
+        (r#"& "$dir\bin\X.EXE" --quiet"#, "X.EXE"),
+        (r"$dir\x.exe /S", "x.exe"),
     ] {
         let r = scan(s, SUP);
         let f = called_flag(&r).unwrap_or_else(|| panic!("{s}: {:?}", r.flags));
@@ -1361,5 +1367,161 @@ fn program_outside_package_stays_confirm_strong() {
             Verdict::ConfirmStrong,
             "{s}"
         );
+    }
+}
+
+#[test]
+fn computed_call_target_is_confirm_strong() {
+    for s in [
+        r#"&("$dir\x.exe")"#,
+        r"& (Join-Path $dir x.exe)",
+        r#". ("$dir\x.ps1")"#,
+    ] {
+        let r = scan(s, SUP);
+        let f = called_flag(&r).unwrap_or_else(|| panic!("{s}: {:?}", r.flags));
+        assert_eq!(f.verdict, Verdict::ConfirmStrong, "{s}");
+        assert_eq!(
+            f.detail, "roda um arquivo ou comando calculado na hora",
+            "{s}"
+        );
+    }
+}
+
+#[test]
+fn path_in_command_position_is_a_call() {
+    for s in [
+        r".\x.ps1",
+        "./x.cmd",
+        r"..\x.ps1",
+        r"Push-Location $dir; .\setup.ps1",
+        r"if ($true) { .\setup.cmd }",
+        r"C:\Tools\x.exe /S",
+        r"$dir\x.cmd",
+        r"ensure 'x' && .\x.ps1",
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        assert_eq!(
+            called_flag(&r).unwrap().verdict,
+            Verdict::ConfirmStrong,
+            "{s}"
+        );
+    }
+    // Arguments are not commands.
+    for s in [
+        r"Copy-Item .\a .\b",
+        r#"$x = "$dir\a.ps1""#,
+        r"Get-Thing -Path $dir\x.ps1",
+        r#"$v = "$dir\bin;$dir\lib;$dir\fonts".Replace('\','\\')"#,
+        r"$p = '$dir;.\x.ps1'",
+    ] {
+        let r = scan(s, SUP);
+        assert!(called_flag(&r).is_none(), "{s}: {:?}", r.flags);
+    }
+    // A `$dir` path is resolved like `& "$dir\..."`.
+    let t = bucket_root("ok.ps1", "ensure 'x'\n", true);
+    let roots = CallRoots {
+        dir: Some(t.path().join("buckets").join("extras").join("scripts")),
+        ..CallRoots::default()
+    };
+    let (r, called) = scan_called(r"$dir\ok.ps1", SUP, &roots);
+    assert_eq!(
+        (r.verdict, called.len()),
+        (Verdict::Confirm, 1),
+        "{:?}",
+        r.flags
+    );
+}
+
+#[test]
+fn file_run_by_another_program_is_confirm_strong() {
+    for s in [
+        r#"Start-Process "$dir\x.ps1""#,
+        r#"Start-Process -FilePath "$dir\x.cmd" -Wait"#,
+        r#"saps "$dir\x.bat""#,
+        r#"start "$dir\x.cmd""#,
+        r#"powershell -File "$dir\x.ps1""#,
+        r#"powershell.exe -ExecutionPolicy Bypass -File "$dir\x.ps1""#,
+        r#"pwsh -File "$dir\x.ps1""#,
+        r#"cmd /c "$dir\x.bat""#,
+        "cmd /c x.bat",
+        r#"cmd.exe /c "$dir\x.cmd""#,
+        r#"Invoke-Item "$dir\x.ps1""#,
+        r#"ii "$dir\x.cmd""#,
+        r#"Import-Module "$dir\x.psm1""#,
+        r#"ipmo "$dir\x.psm1""#,
+        r#"wscript "$dir\x.vbs""#,
+        r#"cscript //nologo "$dir\x.js""#,
+        r#"mshta "$dir\x.hta""#,
+        r#"rundll32 "$dir\x.dll",Entry"#,
+        r#"regsvr32 /s "$dir\x.dll""#,
+        r#"mshta "$dir\x.exe""#,
+        r#"[Diagnostics.Process]::Start("$dir\x.cmd")"#,
+        r#"[System.Diagnostics.Process]::Start("$dir\x.ps1")"#,
+        r#"Start-Process '$dir\x.exe'"#,
+        r#"if ($x) { Start-Process "$dir\x.cmd" }"#,
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        let f = called_flag(&r).unwrap_or_else(|| panic!("{s}: {:?}", r.flags));
+        assert!(
+            f.detail
+                .starts_with("roda um arquivo que não é mostrado por outro programa"),
+            "{s}: {}",
+            f.detail
+        );
+    }
+    // The package's own program (double-quoted `.exe` in `$dir`) and plain commands are not.
+    for s in [
+        r#"Start-Process "$dir\x.exe" -ArgumentList '/S' -Wait"#,
+        r#"Start-Process -FilePath "$dir\setup.exe" -ArgumentList "/D=$dir""#,
+        r#"[System.Diagnostics.Process]::Start("$dir\x.exe")"#,
+        r#"pwsh -NoProfile -Command "Get-Date""#,
+        "Write-Host 'start the app'",
+        "Start-Sleep 1",
+    ] {
+        let r = scan(s, SUP);
+        assert!(called_flag(&r).is_none(), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn package_program_needs_double_quotes_and_a_file_name() {
+    for s in [r"& '$dir\x.exe'", r#"& "$dir\x.exe\""#] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn junction_out_of_base_stays_unresolved() {
+    let t = bucket_root("ok.ps1", "ensure 'x'\n", true);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("evil.ps1"), "ensure 'x'\n").unwrap();
+    let scripts = t.path().join("buckets").join("extras").join("scripts");
+    wingetrs::install::link::create(outside.path(), &scripts.join("j")).unwrap();
+    let dir = t.path().join("app");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ok.ps1"), "ensure 'x'\n").unwrap();
+    wingetrs::install::link::create(outside.path(), &dir.join("j")).unwrap();
+    let roots = CallRoots {
+        dir: Some(dir.clone()),
+        ..CallRoots::new(t.path(), None)
+    };
+    for s in [
+        r#". "$bucketsdir\extras\scripts\j\evil.ps1""#,
+        r#"& "$dir\j\evil.ps1""#,
+    ] {
+        let (r, called) = scan_called(s, SUP, &roots);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        assert!(called.is_empty(), "{s}");
+    }
+    // The same roots resolve a file that stays inside.
+    for s in [
+        r#". "$bucketsdir\extras\scripts\ok.ps1""#,
+        r#"& "$dir\ok.ps1""#,
+    ] {
+        let (r, called) = scan_called(s, SUP, &roots);
+        assert_eq!((r.verdict, called.len()), (Verdict::Confirm, 1), "{s}");
     }
 }

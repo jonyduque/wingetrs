@@ -451,6 +451,8 @@ const D_GLOBAL_NAME: &str =
 const D_CALLED: &str = "roda um arquivo que não é mostrado";
 const D_ALIAS: &str = "redefine comando por apelido";
 const D_PROGRAM: &str = "roda um programa do pacote";
+const D_COMPUTED: &str = "roda um arquivo ou comando calculado na hora";
+const D_LAUNCHED: &str = "roda um arquivo que não é mostrado por outro programa";
 
 fn global_only(detail: &str) -> String {
     format!("só roda em instalação global; não roda no wingetrs ({detail})")
@@ -602,8 +604,8 @@ fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, St
     let mut calls = Vec::new();
     for (part, in_dead) in [(&live_text, false), (&dead_text, true)] {
         for (i, l) in part.lines().enumerate() {
-            for target in called_files(&l.replace('`', "")) {
-                if let Some(name) = package_program(&target) {
+            for call in called_files(&l.replace('`', "")) {
+                if let Some(name) = call.package_program() {
                     let detail = format!("{D_PROGRAM}: {name}");
                     push_at(
                         FlagKind::CalledFile,
@@ -613,6 +615,18 @@ fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, St
                     );
                     continue;
                 }
+                let (target, expands) = match call {
+                    Call::File { target, expands } => (target, expands),
+                    Call::Computed => {
+                        push_at(
+                            FlagKind::CalledFile,
+                            Verdict::ConfirmStrong,
+                            D_COMPUTED,
+                            (i + 1, in_dead),
+                        );
+                        continue;
+                    }
+                };
                 let detail = format!("{D_CALLED}: {}", target);
                 push_at(
                     FlagKind::CalledFile,
@@ -620,7 +634,8 @@ fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, St
                     &detail,
                     (i + 1, in_dead),
                 );
-                if !in_dead {
+                // A single-quoted `'$dir\x.ps1'` is not expanded: never resolved.
+                if !in_dead && expands {
                     calls.push((i + 1, target));
                 }
             }
@@ -693,6 +708,13 @@ fn line_rules(l: &str, calls_reg: bool) -> Vec<(FlagKind, Verdict, String)> {
         .into_iter()
         .map(|(k, v, d)| (k, v, d.to_string()))
         .collect();
+    if let Some((launcher, file)) = launched_file(l) {
+        out.push((
+            FlagKind::CalledFile,
+            Verdict::ConfirmStrong,
+            format!("{D_LAUNCHED} ({launcher}): {file}"),
+        ));
+    }
     if l.contains("__wr") {
         out.push((
             FlagKind::PreludeInternal,
@@ -1246,46 +1268,129 @@ fn invokes_variable(line: &str) -> bool {
     })
 }
 
-/// Targets of `& <string or path>` and of `. <string or path>` (dot-sourcing at command
-/// position) on one backtick-free line: the string's content, or the bare path as written.
-/// A bare word without `\`/`/` that does not end in `.ps1` is a command (`& git`), and a
-/// `$` target is [`invokes_variable`]'s. A match inside a string only asks for more care.
-fn called_files(line: &str) -> Vec<String> {
+/// One thing a line runs by `&`, `.` or a path in command position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Call {
+    /// The target as written; `expands`: double-quoted or bare (PowerShell expands `$dir`),
+    /// not a single-quoted literal.
+    File { target: String, expands: bool },
+    /// `& (...)`, `. (...)`: the file or command is computed at run time.
+    Computed,
+}
+
+impl Call {
+    /// The file name when this runs the package's own program (see [`package_program`]).
+    fn package_program(&self) -> Option<String> {
+        match self {
+            Call::File {
+                target,
+                expands: true,
+            } => package_program(target),
+            _ => None,
+        }
+    }
+}
+
+/// What a backtick-free line runs: `& <string or path>`, `. <string or path>` (dot-sourcing
+/// at command position), `& (...)`/`. (...)`, and a path in command position (`.\x.ps1`,
+/// `..\x`, `C:\x.exe`, `$dir\x.exe`). A bare word without `\`/`/` that does not end in `.ps1`
+/// after `&` is a command (`& git`), and a `$` target is [`invokes_variable`]'s. A match
+/// inside a string only asks for more care.
+fn called_files(line: &str) -> Vec<Call> {
     let chars: Vec<char> = line.chars().collect();
     let blank = |c: char| matches!(c, ' ' | '\t');
+    // The last non-blank char before `i` starts a statement (`&&` too, not a lone `&`).
+    let command_position = |i: usize, after_call: bool| -> bool {
+        let Some(b) = (0..i).rev().find(|&k| !blank(chars[k])) else {
+            return true;
+        };
+        match chars[b] {
+            ';' | '|' | '{' | '(' => true,
+            '&' => after_call || b.checked_sub(1).is_some_and(|p| chars[p] == '&'),
+            _ => false,
+        }
+    };
+    // Inside a quoted string (counted from the line start) a path is text, not a command:
+    // `"$dir\bin;$dir\lib"`. Only the command-position rule uses this; `&`/`.` do not.
+    let mut in_string = Vec::with_capacity(chars.len());
+    let mut quote: Option<char> = None;
+    for &c in &chars {
+        in_string.push(quote.is_some());
+        match quote {
+            Some(q) if c == q => quote = None,
+            None if c == '"' || c == '\'' => quote = Some(c),
+            _ => {}
+        }
+    }
     let mut out = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
         let prev = i.checked_sub(1).map(|p| chars[p]);
         let next = chars.get(i + 1).copied();
         let operator = match c {
             '&' => prev != Some('&') && next != Some('&'),
-            '.' => {
-                let before = chars[..i].iter().rev().find(|c| !blank(**c));
-                before.is_none_or(|b| matches!(b, ';' | '|' | '{' | '(' | '&'))
-                    && next.is_some_and(blank)
-            }
+            '.' => command_position(i, true) && next.is_some_and(|n| blank(n) || n == '('),
             _ => false,
         };
-        if !operator {
+        if operator {
+            let mut j = i + 1;
+            while j < chars.len() && blank(chars[j]) {
+                j += 1;
+            }
+            if chars.get(j) == Some(&'(') {
+                out.push(Call::Computed);
+            } else if let Some(t) = call_target(&chars, j) {
+                out.push(t);
+            }
             continue;
         }
-        let mut j = i + 1;
-        while j < chars.len() && blank(chars[j]) {
-            j += 1;
-        }
-        if let Some(t) = call_target(&chars, j) {
-            out.push(t);
+        if !blank(c)
+            && !in_string[i]
+            && command_position(i, false)
+            && let Some(word) = statement_path(&chars, i)
+        {
+            out.push(Call::File {
+                target: word,
+                expands: true,
+            });
         }
     }
     out
 }
 
+/// The bare path starting at `chars[i]` when it is one PowerShell runs as a command:
+/// `.\`, `..\`, `./`, `../`, a drive `X:\`, `$dir\`, `$persist_dir\` (also `${...}`).
+fn statement_path(chars: &[char], i: usize) -> Option<String> {
+    let end = (i..chars.len())
+        .find(|&k| chars[k].is_whitespace() || matches!(chars[k], ';' | '|' | ')' | '}'))
+        .unwrap_or(chars.len());
+    let word: String = chars[i..end].iter().collect();
+    let lower = word.to_ascii_lowercase().replace('/', "\\");
+    let drive = {
+        let b = lower.as_bytes();
+        b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+    };
+    let prefixed = [
+        ".\\",
+        "..\\",
+        "$dir\\",
+        "${dir}\\",
+        "$persist_dir\\",
+        "${persist_dir}\\",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p) && lower.len() > p.len());
+    (drive || prefixed).then_some(word)
+}
+
 /// The file name when a call target is the package's own program: a `.exe`/`.com` under
 /// `$dir` or `$persist_dir` (downloaded with its hash checked), every component through
 /// `safepath`. Scripts, interpreters (`.cmd`, `.bat`, `.vbs`, `.js`, ...), names without an
-/// extension and anything elsewhere are not.
+/// extension, a trailing `\` and anything elsewhere are not.
 fn package_program(target: &str) -> Option<String> {
     let t = target.replace('/', "\\");
+    if t.ends_with('\\') {
+        return None;
+    }
     let lower = t.to_ascii_lowercase();
     let rel = ["$dir\\", "${dir}\\", "$persist_dir\\", "${persist_dir}\\"]
         .iter()
@@ -1300,7 +1405,7 @@ fn package_program(target: &str) -> Option<String> {
 }
 
 /// The file named at `chars[j]` (see [`called_files`]).
-fn call_target(chars: &[char], j: usize) -> Option<String> {
+fn call_target(chars: &[char], j: usize) -> Option<Call> {
     let first = *chars.get(j)?;
     if first == '\'' || first == '"' {
         let mut s = String::new();
@@ -1318,7 +1423,10 @@ fn call_target(chars: &[char], j: usize) -> Option<String> {
             s.push(chars[k]);
             k += 1;
         }
-        return Some(s);
+        return Some(Call::File {
+            target: s,
+            expands: first == '"',
+        });
     }
     if matches!(first, '$' | '{' | '(' | '@') {
         return None;
@@ -1328,7 +1436,108 @@ fn call_target(chars: &[char], j: usize) -> Option<String> {
         .unwrap_or(chars.len());
     let word: String = chars[j..end].iter().collect();
     let path = word.contains(['\\', '/']) || word.to_ascii_lowercase().ends_with(".ps1");
-    path.then_some(word)
+    path.then_some(Call::File {
+        target: word,
+        expands: true,
+    })
+}
+
+/// Programs that run a file given as an argument (`cmd /c x.bat`, `Start-Process x.ps1`).
+const LAUNCHERS: &[&str] = &[
+    "start-process",
+    "saps",
+    "start",
+    "powershell",
+    "powershell.exe",
+    "pwsh",
+    "pwsh.exe",
+    "cmd",
+    "cmd.exe",
+    "invoke-item",
+    "ii",
+    "import-module",
+    "ipmo",
+    "wscript",
+    "wscript.exe",
+    "cscript",
+    "cscript.exe",
+];
+/// Launchers that are never the package's program at work: always a strong confirmation.
+const ALWAYS_STRONG_LAUNCHERS: &[&str] = &[
+    "mshta",
+    "mshta.exe",
+    "rundll32",
+    "rundll32.exe",
+    "regsvr32",
+    "regsvr32.exe",
+];
+const PROCESS_START: &str = "diagnostics.process]::start(";
+
+/// `(launcher, argument)` when a (lowercase, backtick-free) line hands a file to another
+/// program: a launcher in command position with a file argument (has `\`, `/` or an
+/// extension; switches skipped) that is not the package's program (`"$dir\x.exe"`,
+/// double-quoted). `mshta`/`rundll32`/`regsvr32` always; `[Diagnostics.Process]::Start(`
+/// unless its only file argument is the package's program.
+fn launched_file(l: &str) -> Option<(String, String)> {
+    let file_arg = |tok: &str| -> Option<(String, bool)> {
+        let quoted = tok.trim_start_matches(['(', '{', '@']).starts_with('"');
+        let t = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | '(' | ')' | '{' | '}' | '@'));
+        if t.is_empty() || t.starts_with(['-', '/']) {
+            return None;
+        }
+        let ext = t.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+        let has_ext = !ext.is_empty()
+            && ext.len() <= 4
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && ext.chars().any(|c| c.is_ascii_alphabetic());
+        let has_sep = t.contains(['\\', '/']);
+        let variable_only = t.starts_with('$') && !has_sep;
+        (!variable_only && (has_sep || has_ext)).then(|| (t.to_string(), quoted))
+    };
+    let program = |(t, quoted): &(String, bool)| *quoted && package_program(t).is_some();
+    let tokens = |s: &str| -> Vec<String> {
+        s.split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    if let Some(at) = l.find(PROCESS_START) {
+        let args: Vec<(String, bool)> = tokens(&l[at + PROCESS_START.len()..])
+            .iter()
+            .filter_map(|t| file_arg(t))
+            .collect();
+        if args.first().is_none_or(|a| !program(a)) {
+            let what = args.first().map(|a| a.0.clone()).unwrap_or_default();
+            return Some(("[diagnostics.process]::start".into(), what));
+        }
+    }
+    for stmt in l.split([';', '|']) {
+        let toks = tokens(stmt);
+        for (k, raw) in toks.iter().enumerate() {
+            let word = raw.trim_start_matches(['{', '(', '&']);
+            let start = k == 0
+                || toks[k - 1] == "&"
+                || toks[k - 1].ends_with(['{', '('])
+                || word.len() < raw.len();
+            if !start {
+                continue;
+            }
+            let always = ALWAYS_STRONG_LAUNCHERS.contains(&word);
+            if !always && !LAUNCHERS.contains(&word) {
+                continue;
+            }
+            let args: Vec<(String, bool)> =
+                toks[k + 1..].iter().filter_map(|t| file_arg(t)).collect();
+            if always {
+                let what = args.first().map(|a| a.0.clone()).unwrap_or_default();
+                return Some((word.to_string(), what));
+            }
+            if let Some(a) = args.iter().find(|a| !program(a)) {
+                return Some((word.to_string(), a.0.clone()));
+            }
+        }
+    }
+    None
 }
 /// A drive path `X:\` not glued to a longer name (`HKCU:\` is not one), or a UNC `\\host`.
 fn has_absolute_literal(line: &str) -> bool {
@@ -2031,7 +2240,10 @@ fn mask_killer(chars: &[char]) -> bool {
         return true;
     }
     if lower.lines().any(|l| {
-        invokes_variable(l) || called_files(l).iter().any(|t| package_program(t).is_none())
+        invokes_variable(l)
+            || called_files(l)
+                .iter()
+                .any(|c| c.package_program().is_none())
     }) {
         return true;
     }
