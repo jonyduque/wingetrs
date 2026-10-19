@@ -120,12 +120,14 @@ fn save_settings_writes_fields() {
     let b = Behavior {
         winget_engine: WingetEngine::Winget,
         default_scope: DefaultScope::Machine,
+        installer_mode: InstallerMode::Silent,
         ..Behavior::default()
     };
     wingetrs::tui::jobs::save_settings(&p, b, None, None, None, "dark").unwrap();
     let text = std::fs::read_to_string(&p).unwrap();
     assert!(text.contains("winget_engine = \"winget\""), "{text}");
     assert!(text.contains("default_scope = \"machine\""), "{text}");
+    assert!(text.contains("installer_mode = \"silent\""), "{text}");
 }
 
 #[test]

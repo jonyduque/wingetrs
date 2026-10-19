@@ -1,6 +1,6 @@
 Status: DONE_WITH_CONCERNS
 
-Commits: (SHA preenchido abaixo pelo git log)
+Commits: 0a52205 feat(winget-install): silent-with-progress by default, installer_mode setting; mais o commit de correção da revisão (fmt do plan.rs, teste da cláusula silent_with_progress, asserção installer_mode no save).
 
 Gate: `pwsh -File scripts/verify.ps1` parou em `[FAIL] fmt exit 1` por `src/install/script_scan.rs:1610` (Task 164, arquivo alheio). rules e rules-selftest OK. Provado o meu: `cargo test --quiet --test it -- wi_ elevated_install config` => `test result: ok. 316 passed; 0 failed; 5 ignored`; `cargo clippy --all-targets` sem avisos nos meus arquivos.
 
@@ -16,3 +16,8 @@ Decisions:
 Concerns:
 - O ajuste NÃO está ligado em: `engine::plan_upgrade` (engine.rs, 196), `tui/run.rs::native_install`/`native_upgrade` (197), `cli/run_win.rs::plan_upgrade`. Esses caminhos usam o padrão `progress` e ignoram `installer_mode=silent` até o orquestrador passar `behavior.installer_mode` a `plan_with_mode`.
 - A cópia de trabalho de `wi_install_flow.rs` (edição da 196) não contém mais o teste msi que ajustei; o commit leva só a troca de 1 linha sobre o HEAD.
+
+Mutation proofs (saída real):
+[OK] mutação PEGA: 'if setting == InstallerMode::Progress' -> 'if false' fez o teste falhar (exit 101).
+[OK] mutação PEGA: '        && (has_defaults || present(&sw.silent_with_progress).is_some())' -> '        && (has_defaults)' fez o teste falhar (exit 101).
+Nota: `wi_install_flow` e `wi_tui::installer_mode_same_switches_in_cli_and_tui_plans` falham na árvore de trabalho por edição em andamento das Tasks 196/197, não por esta tarefa; wi_switches, wi_settings e config passam (43 passed).

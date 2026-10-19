@@ -308,3 +308,20 @@ fn progress_setting_uses_manifest_progress_switch() {
         r#"/passive /x /log "<LOGPATH>""#
     );
 }
+
+#[test]
+fn exe_with_both_switches_follows_the_setting() {
+    let both = InstallerSwitches {
+        silent: Some("/q".into()),
+        silent_with_progress: Some("/p".into()),
+        ..sw()
+    };
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &both, InstallerMode::Progress),
+        Mode::SilentWithProgress
+    );
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &both, InstallerMode::Silent),
+        Mode::Silent
+    );
+}

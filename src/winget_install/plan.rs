@@ -3,11 +3,11 @@
 
 use super::launch::{Elevation, install_elevation};
 use super::select::{Host, Refusal, ScopeWanted, Verdict, choose};
-use crate::config::InstallerMode;
 use super::switches::{CommandLine, Mode, Program, install_args, mode_for};
 use crate::bridge::worker::{
     ElevatedKind, InstallerRequest, exe_params_allowed, msi_params_allowed_in,
 };
+use crate::config::InstallerMode;
 use crate::sources::winget::manifest::{
     Agreement, EffectiveInstaller, InstallerKind, MergedManifest,
 };
@@ -273,12 +273,11 @@ impl std::fmt::Display for WingetPlan {
             write!(f, "\npede UAC")?;
         }
         if self.interactive {
-            write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;        } else if self.command.is_some() {
+            write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;
+        } else if self.command.is_some() {
             match self.mode {
-                Mode::SilentWithProgress => write!(f, "
-mostra o progresso do instalador")?,
-                Mode::Silent => write!(f, "
-sem janela")?,
+                Mode::SilentWithProgress => write!(f, "\nmostra o progresso do instalador")?,
+                Mode::Silent => write!(f, "\nsem janela")?,
                 Mode::Interactive => {}
             }
         }
