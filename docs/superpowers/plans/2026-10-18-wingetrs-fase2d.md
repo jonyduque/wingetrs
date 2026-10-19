@@ -1343,3 +1343,34 @@ Mutação obrigatória: `mode_for` ignorar o ajuste ⇒ teste PEGA.
 **Files:** definidos pela sonda (provável `src/bridge/worker.rs`, `src/bridge/staging_win.rs`, `src/bridge/catalog_verify_win.rs` novo, `src/winget_install/ops.rs`).
 
 **Commit:** `feat(bridge): elevated side derives the installer hash from the signed catalog and runs it from admin-only staging`
+
+### Task 203: Defeitos do pré-teste do roteiro final (planos e textos)
+
+**Modelo:** opus (revisor opus). Origem: pré-teste `--dry-run` do roteiro da prova ao vivo em 2026-10-19 (commit 1edc8f0, relatório `docs/superpowers/reports/2026-10-18-prova-ao-vivo-roteiro.md`).
+
+#### Where this fits
+
+- Planos com passos numerados: `WingetPlan::steps()`/`dry_run_details()` e o plano de remoção ARP/MSIX (Task 199), lidos pela CLI (`src/cli/output.rs`) e pela TUI; passos de modo em `src/winget_install/plan.rs` e `switches.rs` (`mode_for`, Task 198); lista branca do auxiliar em `src/bridge/worker.rs` (literais exatos `/norestart`, `InstallAllUsers=1`, Task 190); motivos do portão em `src/install/script_scan.rs`.
+
+#### What binds this task
+
+1. `uninstall jqlang.jq --dry-run`: comando pela ponte (`winget uninstall --product-code`) não mostra "Abre a janela do desinstalador"; mostra "Remove pelo winget".
+2. `install PeterPawlowski.foobar2000 --dry-run`: NSIS (`/S` nos dois modos) mostra "Sem janela", nunca "Mostra o progresso do instalador". O passo de modo sai do switch efetivamente escolhido, não do ajuste.
+3. `install M2Team.NanaZip --dry-run`: MSIX tem passos numerados ("Instala pelo Windows (pacote MSIX), sem janela", escopo).
+4. `install sharkdp.hyperfine --dry-run`: plano da ponte tem passos numerados e título de plano ("Instala pelo winget (zip)"), nunca "Instalando…" numa simulação.
+5. `uninstall "Amazon Kindle" --dry-run`: avisos de pastas compartilhadas saem em bloco próprio de aviso (⚠), separados dos passos.
+6. Remoção (Graphviz, CrystalDiskMark, Notepad++): o passo "⚠ Pede permissão de administrador" vem antes de "Roda o desinstalador", como na instalação.
+7. `install JAMSoftware.TreeSize.Free --dry-run`: `elevatesSelf`/`elevationRequired` gera o passo "⚠ O instalador pode pedir permissão de administrador".
+8. `install main/python --dry-run`: motivo do portão repetido ("usa -Global (…); usa -Global (…)") sai uma vez só (deduplicar motivos iguais, mantendo a primeira linha).
+9. `install Python.Python.3.12 --scope machine --dry-run`: `PrependPath=1` e `PrependPath=0` entram como literais exatos na lista branca do auxiliar (como `InstallAllUsers=1`); nada de prefixo.
+10. `install tumic0.GPXSee --dry-run`: SHA-256 mostrado sempre em maiúsculas.
+11. Um teste por item, com o texto do passo; os passos da CLI e da TUI continuam iguais (teste de equivalência existente).
+
+**Files:** `src/winget_install/{plan,uninstall,switches}.rs`, `src/cli/output.rs`, `src/bridge/worker.rs` (só as entradas novas), `src/install/script_scan.rs` (só a deduplicação), `src/tui/*` se precisar; testes `wi_*`, `cli_*`, `elevated_*`, `script_scan`.
+
+#### Checks beyond the steps
+
+1. Reexecute os 10 comandos `--dry-run` com `target/release/wingetrs.exe` e cole a saída no relatório (nada instalado).
+2. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix: plan texts from the final dry-run preflight`
