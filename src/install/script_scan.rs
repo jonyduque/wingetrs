@@ -1650,6 +1650,10 @@ const MASK_KILLERS: &[&str] = &[
     "get-command",
     "new-module",
     "import-module",
+    // Parameter defaults (`$PSDefaultParameterValues['ForEach-Object:Parallel']`, also
+    // through `Set-Variable PSDefaultParameterValues`) rebind a plain `| % { }`.
+    "psdefaultparametervalues",
+    "psboundparameters",
 ];
 
 /// Words of [`MASK_KILLERS`] that would false-match as substrings (`sal` in `salt`):

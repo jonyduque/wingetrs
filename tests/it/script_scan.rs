@@ -1128,3 +1128,23 @@ fn mask_killer_words_disable_masking() {
         assert!(informational(&r), "{s}: {:?}", r.flags);
     }
 }
+
+#[test]
+fn parameter_defaults_disable_masking() {
+    for extra in [
+        "$PSDefaultParameterValues['ForEach-Object:Parallel'] = $true",
+        "Set-Variable -Name PSDefaultParameterValues -Value @{}",
+        "$PSBoundParameters.Clear()",
+    ] {
+        let s = format!("{extra}\n{SEVENZIP_SHAPE}");
+        let r = scan(&s, SUP);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+        assert!(
+            r.flags
+                .iter()
+                .any(|f| f.kind == FlagKind::Hklm && f.verdict == Verdict::Refuse),
+            "{s}: {:?}",
+            r.flags
+        );
+    }
+}
