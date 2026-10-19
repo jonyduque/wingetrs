@@ -1,0 +1,26 @@
+---
+source: tests/it/cli_color.rs
+expression: s
+---
+$ wingetrs search 7zip
+Nome   Id         Versão  Fonte
+7-Zip  7zip.7zip  26.04   winget
+7zip   7zip       26.04   scoop:main
+$ wingetrs show 7zip --source scoop
+Nome: 7zip
+Id: 7zip
+Versão: 26.04
+Fonte: scoop
+Descrição: A multi-format file archiver with high compression ratios.
+Página: https://www.7-zip.org
+Licença: BSD-2-Clause, BSD-3-Clause, LGPL-2.1-or-later
+Versões: 26.04
+Instalador: x64 scoop user https://github.com/ip7z/7zip/releases/download/26.04/7z2604-x64.msi
+Instalador: x86 scoop user https://github.com/ip7z/7zip/releases/download/26.04/7z2604.msi
+Instalador: arm64 scoop user https://github.com/ip7z/7zip/releases/download/26.04/7z2604-arm64.exe
+$ wingetrs show nao.existe
+✗ pacote não encontrado: nao.existe
+→ procure o id com `wingetrs search <termo>`
+$ wingetrs bucket list
+main    ScoopInstaller/Main
+extras  ScoopInstaller/Extras

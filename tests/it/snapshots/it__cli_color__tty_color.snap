@@ -1,0 +1,37 @@
+---
+source: tests/it/cli_color.rs
+expression: visible(&color)
+---
+␛[32m✓␛[0m ␛[34mwinget␛[0m: ␛[32mem dia␛[0m
+␛[32m✓␛[0m ␛[34mwinget␛[0m: sem mudanças
+␛[32m✓␛[0m ␛[34mwinget␛[0m: ␛[1m28␛[0m ␛[32mpacotes␛[0m (␛[1m1␛[0m ignorados)
+␛[1m␛[31m✗␛[0m ␛[34mwinget␛[0m: ␛[1m␛[31mfalhou:␛[0m HTTP 500
+-- search
+␛[1m␛[35mNome␛[0m   ␛[1m␛[35mId␛[0m         ␛[1m␛[35mVersão␛[0m  ␛[1m␛[35mFonte␛[0m
+␛[1m7-Zip␛[0m  ␛[36m7zip.7zip␛[0m  24.08   ␛[34mwinget␛[0m
+-- show
+␛[1m␛[35mNome␛[0m: ␛[1m7zip␛[0m
+␛[1m␛[35mId␛[0m: ␛[36m7zip␛[0m
+␛[1m␛[35mVersão␛[0m: 24.08
+␛[1m␛[35mFonte␛[0m: ␛[34mscoop␛[0m
+␛[1m␛[35mDescrição␛[0m: A multi-format file archiver
+␛[1m␛[35mPágina␛[0m: https://www.7-zip.org/
+␛[1m␛[35mLicença␛[0m: LGPL-2.1-or-later
+-- list
+␛[1m␛[35mNome␛[0m  ␛[1m␛[35mId␛[0m   ␛[1m␛[35mInstalada␛[0m  ␛[1m␛[35mDisponível␛[0m  ␛[1m␛[35mFonte␛[0m   ␛[1m␛[35mOrigem␛[0m
+␛[1mAção␛[0m  ␛[36mA.B␛[0m  1.0        ␛[1m␛[32m2.0␛[0m         ␛[34mwinget␛[0m  ␛[90marp␛[0m
+
+␛[1m1␛[0m instalados: ␛[1m1␛[0m correlacionados, ␛[1m0␛[0m ambíguos, ␛[1m0␛[0m não correlacionados
+-- upgrade
+␛[1msolo␛[0m  1.0  ␛[90m→␛[0m  ␛[1m␛[32m2.0␛[0m
+␛[1mfixo␛[0m ␛[90m(fixado)␛[0m
+␛[90m→␛[0m use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`
+-- install / uninstall / cleanup
+␛[32m✓ Instalado:␛[0m ␛[1msolo␛[0m 1.0
+␛[33m⚠ aviso:␛[0m o desinstalador do app não rodou
+␛[33m⚠ Cancelado.␛[0m
+Simulação: nada foi alterado.
+␛[1m␛[31m✗ Erro:␛[0m App A: negado
+-- erro
+␛[1m␛[31m✗␛[0m nenhum pacote encontrado para 'x'
+␛[90m→␛[0m você quis dizer: ␛[36mxz␛[0m?

@@ -372,14 +372,19 @@ async fn bucket_add_list_rm_round_trip() {
         assert!(o.status.success(), "{args:?}: {}", text(&o.stderr));
         text(&o.stdout)
     };
+    // One aligned row per bucket: name, then repository.
+    let has = |listed: &str, row: [&str; 2]| listed.lines().any(|l| l.split_whitespace().eq(row));
     let listed = ok(&["bucket", "list"]);
-    assert!(listed.contains("main  ScoopInstaller/Main"), "{listed}");
+    assert!(has(&listed, ["main", "ScoopInstaller/Main"]), "{listed}");
     // A repository that is not well known needs --yes without a terminal.
     let o =
         tokio::task::block_in_place(|| lab.run(&["bucket", "add", "mine", "someone/scoop-mine"]));
     assert!(!o.status.success());
     ok(&["bucket", "add", "mine", "someone/scoop-mine", "--yes"]);
-    assert!(ok(&["bucket", "list"]).contains("mine  someone/scoop-mine"));
+    assert!(has(
+        &ok(&["bucket", "list"]),
+        ["mine", "someone/scoop-mine"]
+    ));
     ok(&["bucket", "rm", "mine"]);
     assert!(!ok(&["bucket", "list"]).contains("mine"));
 }
@@ -475,7 +480,7 @@ async fn cli_upgrade_pinned_app_refuses() {
     assert!(!out.status.success());
     assert!(
         text(&out.stderr)
-            .contains("solo está com a versão fixada; desafixe na TUI (menu de ações)"),
+            .contains("solo está com a versão fixada\n→ desafixe na TUI (menu de ações)"),
         "{}",
         text(&out.stderr)
     );

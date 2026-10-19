@@ -1,0 +1,37 @@
+---
+source: tests/it/cli_color.rs
+expression: plain
+---
+✓ winget: em dia
+✓ winget: sem mudanças
+✓ winget: 28 pacotes (1 ignorados)
+✗ winget: falhou: HTTP 500
+-- search
+Nome   Id         Versão  Fonte
+7-Zip  7zip.7zip  24.08   winget
+-- show
+Nome: 7zip
+Id: 7zip
+Versão: 24.08
+Fonte: scoop
+Descrição: A multi-format file archiver
+Página: https://www.7-zip.org/
+Licença: LGPL-2.1-or-later
+-- list
+Nome  Id   Instalada  Disponível  Fonte   Origem
+Ação  A.B  1.0        2.0         winget  arp
+
+1 instalados: 1 correlacionados, 0 ambíguos, 0 não correlacionados
+-- upgrade
+solo  1.0  →  2.0
+fixo (fixado)
+→ use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`
+-- install / uninstall / cleanup
+✓ Instalado: solo 1.0
+⚠ aviso: o desinstalador do app não rodou
+⚠ Cancelado.
+Simulação: nada foi alterado.
+✗ Erro: App A: negado
+-- erro
+✗ nenhum pacote encontrado para 'x'
+→ você quis dizer: xz?

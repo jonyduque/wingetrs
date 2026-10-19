@@ -20,6 +20,8 @@ pub const OK: Style = fg(AnsiColor::Green);
 pub const WARN: Style = fg(AnsiColor::Yellow);
 pub const ERROR: Style = fg(AnsiColor::Red).effects(Effects::BOLD);
 pub const DIM: Style = fg(AnsiColor::BrightBlack);
+/// File and folder paths.
+pub const PATH: Style = fg(AnsiColor::Cyan).effects(Effects::ITALIC);
 /// Keys and flags in the help.
 pub const KEY: Style = fg(AnsiColor::Cyan).effects(Effects::BOLD);
 pub const PLACEHOLDER: Style = fg(AnsiColor::BrightBlack);
@@ -41,6 +43,33 @@ pub enum ColorArg {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Glyph set of the status lines: 0 = unicode (default, and always off a terminal), 1 = nerd,
+/// 2 = ascii.
+static GLYPHS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The glyphs of the status lines (`✓`, `⚠`, `✗`, `→` in the unicode set).
+pub fn glyphs() -> &'static crate::tui::theme::Glyphs {
+    use crate::tui::theme::{GlyphSet, Glyphs};
+    Glyphs::for_set(match GLYPHS.load(Ordering::Relaxed) {
+        1 => GlyphSet::Nerd,
+        2 => GlyphSet::Ascii,
+        _ => GlyphSet::Unicode,
+    })
+}
+
+/// Uses `set` for the status lines when stdout is a terminal; off a terminal they stay unicode
+/// (a log or a pipe is read without the Nerd font).
+pub fn init_glyphs(set: crate::tui::theme::GlyphSet) {
+    use crate::tui::theme::GlyphSet;
+    let n = match set {
+        _ if !std::io::stdout().is_terminal() => 0,
+        GlyphSet::Nerd => 1,
+        GlyphSet::Ascii => 2,
+        GlyphSet::Unicode => 0,
+    };
+    GLYPHS.store(n, Ordering::Relaxed);
+}
 
 std::thread_local! {
     static OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };

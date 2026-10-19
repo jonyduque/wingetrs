@@ -2,7 +2,7 @@
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
 use super::picker::{self, StdTerm, Term};
 use super::winget_cmd::{self, CleanupArgs, WingetFlows};
-use super::{Command, output, style};
+use super::{Command, emit, output};
 use crate::install::executor::LaunchGate;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
 use crate::install::progress::ProgressEvent;
@@ -14,7 +14,6 @@ use crate::tui::picker::PickerItem;
 use crate::tui::theme::Glyphs;
 use anyhow::bail;
 use output::{Phases, ThirdParty};
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -47,7 +46,7 @@ pub trait Ui {
     /// A line of the command's result on stdout (e.g. the output of winget or scoop through
     /// the bridge), printed above the progress line, which stays on stderr.
     fn output(&self, text: &str) {
-        anstream::println!("{text}");
+        emit::out(text);
     }
 }
 
@@ -124,7 +123,7 @@ pub async fn until_interrupted<T>(
 /// Ends a job stopped by Ctrl+C.
 fn cancelled(log: JobLog) -> anyhow::Result<()> {
     log.finish(Outcome::Cancelled, "Ctrl+C");
-    anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
+    emit::out(&output::cancelled());
     Err(Cancelled.into())
 }
 
@@ -312,25 +311,23 @@ impl ProgressState {
             .unwrap_or(output::LINE_COLUMNS + 1)
             .saturating_sub(1)
             .max(20);
-        let mut err = std::io::stderr().lock();
+        let mut err = emit::stderr();
         // `finish` sets `closed` before erasing under this same lock, so no late redraw.
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        // Progress is cosmetic: a broken stderr must not fail the install.
         if let Some(notice) = notice {
             let width = self.drawn.swap(0, Ordering::Relaxed);
-            let _ = writeln!(err, "\r{:<width$}\r{notice}", "");
+            emit::line_above(&mut err, width, &notice);
         }
         let Some((main, warn)) = parts else {
-            let _ = err.flush();
+            emit::flush(&mut err);
             return;
         };
         let (main, warn) = fit_cols(main, warn, cols);
         let len = main.chars().count() + warn.chars().count();
-        let pad = " ".repeat(self.drawn.load(Ordering::Relaxed).saturating_sub(len));
-        let _ = write!(err, "\r{main}{}{pad}", style::paint(style::WARN, &warn));
-        let _ = err.flush();
+        let pad = self.drawn.load(Ordering::Relaxed).saturating_sub(len);
+        emit::redraw(&mut err, &output::progress_line(&main, &warn), pad);
         self.drawn.store(len, Ordering::Relaxed);
     }
 
@@ -398,7 +395,7 @@ impl LineProgress {
                 .unwrap_or_else(|p| p.into_inner())
                 .line(ev);
             if let Some(line) = line {
-                let _ = writeln!(std::io::stderr().lock(), "{line}");
+                emit::err(&line);
             }
             return;
         }
@@ -413,7 +410,7 @@ impl LineProgress {
             return;
         }
         if !self.tty {
-            let _ = writeln!(std::io::stderr().lock(), "{text}");
+            emit::err(text);
             return;
         }
         *self.state.notice.lock().unwrap_or_else(|p| p.into_inner()) = Some(text.to_string());
@@ -424,17 +421,12 @@ impl LineProgress {
     /// drawn again on the next tick, so the two never share a row.
     pub fn stdout_line(&self, text: &str) {
         if !self.tty || self.state.closed.load(Ordering::Relaxed) {
-            anstream::println!("{text}");
+            emit::out(text);
             return;
         }
-        let mut err = std::io::stderr().lock();
-        let width = self.state.drawn.swap(0, Ordering::Relaxed);
-        if width > 0 {
-            let _ = write!(err, "\r{:<width$}\r", "");
-            let _ = err.flush();
-        }
-        anstream::println!("{text}");
-        let _ = std::io::stdout().flush();
+        let mut err = emit::stderr();
+        emit::erase(&mut err, self.state.drawn.swap(0, Ordering::Relaxed));
+        emit::out_flushed(text);
         drop(err);
         self.state.draw();
     }
@@ -481,9 +473,7 @@ impl LineProgress {
         }
         let width = self.state.drawn.swap(0, Ordering::Relaxed);
         if width > 0 {
-            let mut err = std::io::stderr().lock();
-            let _ = write!(err, "\r{:<width$}\r", "");
-            let _ = err.flush();
+            emit::erase(&mut emit::stderr(), width);
         }
     }
 }
@@ -526,9 +516,9 @@ fn third_party_gate(code: &[(String, Vec<ThirdParty>)], f: Flags) -> anyhow::Res
     if needs_scripts && (f.dry_run || f.allow_scripts) {
         for (app, items) in code {
             if code.len() > 1 {
-                anstream::println!("{}:", style::paint(style::NAME, app));
+                emit::out(&format!("{}:", output::name(app)));
             }
-            anstream::print!("{}", output::third_party_block(items));
+            emit::out_block(&output::third_party_block(items));
         }
     }
     if f.dry_run {
@@ -537,7 +527,7 @@ fn third_party_gate(code: &[(String, Vec<ThirdParty>)], f: Flags) -> anyhow::Res
     if needs_scripts && !f.allow_scripts {
         let apps: Vec<&str> = code.iter().map(|(app, _)| app.as_str()).collect();
         let items = code.iter().flat_map(|(_, items)| items);
-        bail!("{}", output::third_party_refusal(&apps, items));
+        return Err(output::third_party_refusal(&apps, items).into());
     }
     Ok(())
 }
@@ -558,7 +548,9 @@ pub(super) fn proceed(ui: &dyn Ui, f: Flags) -> anyhow::Result<bool> {
         return Ok(true);
     }
     if !ui.interactive() {
-        bail!("a confirmação exige um terminal interativo; use --yes");
+        return Err(
+            output::Advice::new("a confirmação exige um terminal interativo", "use --yes").into(),
+        );
     }
     ui.confirm("Continuar?")
 }
@@ -635,7 +627,7 @@ pub async fn execute(
             upgrade(ctx, ui, target.as_deref(), all, keep, f, stop, winget).await
         }
         Command::Repair => {
-            anstream::print!("{}", output::repair_text(&ops::repair(ctx)?));
+            emit::out_block(&output::repair_text(&ops::repair(ctx)?));
             Ok(())
         }
         Command::Cleanup {
@@ -656,7 +648,7 @@ pub async fn execute(
 
 /// One line on stdout (the `Say` of the winget commands).
 fn stdout_line(line: &str) {
-    anstream::println!("{line}");
+    emit::out(line);
 }
 
 /// What [`execute`] listens to while the disk changes.
@@ -694,9 +686,7 @@ fn choose(
 ) -> anyhow::Result<Option<Candidate>> {
     match ops::resolve_target(ctx, target, bucket)? {
         Resolution::One(c) => Ok(Some(c)),
-        Resolution::NotFound { suggestions } => {
-            bail!("{}", output::not_found_text(target, &suggestions))
-        }
+        Resolution::NotFound { suggestions } => Err(output::not_found(target, &suggestions).into()),
         Resolution::Many(mut found) => {
             // Never pick on the user's behalf: `--yes` and a missing terminal both fail.
             if yes || !ui.interactive() {
@@ -736,22 +726,19 @@ fn print_plans(
     };
     for p in plans {
         if f.dry_run {
-            anstream::println!("{p}");
+            emit::out(&p.to_string());
             if let Some(hint) = output::msi_hint(p, f.allow_msiexec) {
-                anstream::println!("{}", style::paint(style::DIM, hint));
+                emit::out(&output::dim(hint));
             }
         } else {
             let layout = crate::install::layout::Layout::new(p.root.clone());
-            anstream::print!(
-                "{}",
-                output::plan_summary(
-                    p,
-                    &layout,
-                    ui.glyphs(),
-                    user_path.as_deref(),
-                    f.allow_msiexec
-                )
-            );
+            emit::out_block(&output::plan_summary(
+                p,
+                &layout,
+                ui.glyphs(),
+                user_path.as_deref(),
+                f.allow_msiexec,
+            ));
         }
     }
 }
@@ -761,7 +748,7 @@ fn print_terminal_hint(plan: &crate::install::plan::InstallPlan) {
     let layout = crate::install::layout::Layout::new(plan.root.clone());
     let path = std::env::var_os("PATH");
     if let Some(hint) = output::new_terminal_hint(plan, &layout, path.as_deref()) {
-        anstream::println!("{hint}");
+        emit::out(&hint);
     }
 }
 
@@ -777,7 +764,7 @@ async fn install(
     winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
     let Some(cand) = choose(ctx, ui, target, bucket, f.yes)? else {
-        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
+        emit::out(&output::cancelled());
         return Ok(());
     };
     if cand.entry.source == crate::core::SourceKind::Winget {
@@ -790,11 +777,11 @@ async fn install(
     print_plans(ctx, ui, &plans, f);
     third_party_gate(&plans_code(plans.iter()), f)?;
     if f.dry_run {
-        anstream::println!("Simulação: nada foi alterado.");
+        emit::out(output::DRY_RUN_DONE);
         return Ok(());
     }
     if !proceed(ui, f)? {
-        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
+        emit::out(&output::cancelled());
         return Ok(());
     }
     // Held from before `job.start` until after `job.end`: the log always gets its end.
@@ -811,12 +798,10 @@ async fn install(
     stop.interrupts.release();
     applied?;
     for p in &plans {
-        anstream::println!(
-            "{} {} {}",
-            style::paint(style::OK, "Instalado:"),
-            p.app,
-            p.version
-        );
+        emit::out(&output::success(
+            "Instalado:",
+            &output::app_version(&p.app, &p.version),
+        ));
         print_terminal_hint(p);
     }
     Ok(())
@@ -841,10 +826,11 @@ async fn uninstall(
         }
         other => other?,
     };
-    anstream::print!(
-        "{}",
-        output::uninstall_plan_text(&plan, &ctx.data.install_layout(), ui.glyphs())
-    );
+    emit::out_block(&output::uninstall_plan_text(
+        &plan,
+        &ctx.data.install_layout(),
+        ui.glyphs(),
+    ));
     let (manifest, shown_sha) = ops::uninstall_manifest(ctx, &plan)?;
     let layout = ctx.data.install_layout();
     let vdir = layout.version_dir(&plan.app, &plan.version);
@@ -857,11 +843,11 @@ async fn uninstall(
         .collect();
     third_party_gate(&code, f)?;
     if f.dry_run {
-        anstream::println!("Simulação: nada foi alterado.");
+        emit::out(output::DRY_RUN_DONE);
         return Ok(());
     }
     if !proceed(ui, f)? {
-        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
+        emit::out(&output::cancelled());
         return Ok(());
     }
     // Ctrl+C before this point ends the process with nothing removed. From here the removal
@@ -883,14 +869,12 @@ async fn uninstall(
     finish_log(log, &removed, "removido");
     stop.interrupts.release();
     let removed = removed?;
-    anstream::println!(
-        "{} {} {}",
-        style::paint(style::OK, "Desinstalado:"),
-        plan.app,
-        plan.version
-    );
+    emit::out(&output::success(
+        "Desinstalado:",
+        &output::app_version(&plan.app, &plan.version),
+    ));
     for note in &removed.notes {
-        anstream::eprintln!("{} {note}", style::paint(style::WARN, "aviso:"));
+        emit::err(&output::warning(note));
     }
     clean_residues(ctx, ui, &plan.app, &removed.residues, f.yes)
 }
@@ -929,28 +913,19 @@ fn clean_residues(
             None => Vec::new(),
         }
     } else {
-        anstream::println!(
-            "Resíduos encontrados (nada foi removido; use --yes para os de confiança alta):"
-        );
-        for r in residues {
-            anstream::println!("  {}", output::residue_label(r));
-        }
+        emit::out_block(&output::residues_left(residues));
         return Ok(());
     };
     if selected.is_empty() {
-        anstream::println!("Nenhum resíduo removido.");
+        emit::out("Nenhum resíduo removido.");
         return Ok(());
     }
     let backups = ctx.data.install_layout().backups();
     let results = residue::clean(&selected, app, &ctx.effects, &backups);
     for (r, res) in selected.iter().zip(results) {
         match res {
-            Ok(()) => anstream::println!(
-                "{} {}",
-                style::paint(style::OK, "Removido:"),
-                output::residue_label(r)
-            ),
-            Err(e) => anstream::eprintln!("{} {e}", style::paint(style::WARN, "aviso:")),
+            Ok(()) => emit::out(&output::success("Removido:", &output::residue_label(r))),
+            Err(e) => emit::err(&output::warning(&e.to_string())),
         }
     }
     Ok(())
@@ -980,7 +955,11 @@ async fn upgrade(
                 bail!("{app}: {reason}");
             }
             if crate::pins::is_pinned(&pins, "wingetrs", t) {
-                bail!("{t} está com a versão fixada; desafixe na TUI (menu de ações)");
+                return Err(output::Advice::new(
+                    format!("{t} está com a versão fixada"),
+                    "desafixe na TUI (menu de ações)",
+                )
+                .into());
             }
             let found: Vec<_> = list
                 .upgradable
@@ -993,35 +972,27 @@ async fn upgrade(
                     let whole = target.unwrap_or(t);
                     return winget_cmd::upgrade(winget, ui, whole, f, stop, &mut stdout_line).await;
                 }
-                anstream::println!("{t} já está na versão mais recente.");
+                emit::out(&output::up_to_date(t));
                 return Ok(());
             }
             found
         }
         None => {
             for (app, reason) in &list.skipped {
-                anstream::eprintln!("{} {app}: {reason}", style::paint(style::WARN, "aviso:"));
+                emit::err(&output::warning(&format!("{app}: {reason}")));
             }
             if !all {
-                anstream::print!("{}", output::upgrades_text(&list.upgradable));
-                for app in &pinned {
-                    anstream::println!("{app} (fixado)");
-                }
-                if list.upgradable.is_empty() {
-                    anstream::println!("Nada para atualizar.");
-                } else {
-                    anstream::println!("Use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`.");
-                }
+                emit::out_block(&output::upgrades_listing(&list.upgradable, &pinned));
                 return Ok(());
             }
             for app in &pinned {
-                anstream::println!("fixado, pulado: {app}");
+                emit::out(&output::pinned_skipped(app));
             }
             list.upgradable
         }
     };
     if chosen.is_empty() {
-        anstream::println!("Nada para atualizar.");
+        emit::out(output::NOTHING_TO_UPGRADE);
         return Ok(());
     }
     let mut groups = Vec::new();
@@ -1040,11 +1011,11 @@ async fn upgrade(
     }
     third_party_gate(&plans_code(groups.iter().flatten()), f)?;
     if f.dry_run {
-        anstream::println!("Simulação: nada foi alterado.");
+        emit::out(output::DRY_RUN_DONE);
         return Ok(());
     }
     if !proceed(ui, f)? {
-        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
+        emit::out(&output::cancelled());
         return Ok(());
     }
     stop.interrupts.hold();
@@ -1061,12 +1032,10 @@ async fn upgrade(
     finish_log(log, &applied, "atualizado");
     stop.interrupts.release();
     for p in applied? {
-        anstream::println!(
-            "{} {} {}",
-            style::paint(style::OK, "Atualizado:"),
-            p.app,
-            p.version
-        );
+        emit::out(&output::success(
+            "Atualizado:",
+            &output::app_version(&p.app, &p.version),
+        ));
         print_terminal_hint(&p);
     }
     Ok(())

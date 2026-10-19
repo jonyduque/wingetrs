@@ -203,3 +203,252 @@ fn help_plain_when_piped() {
     assert!(text.contains("Exemplos"), "{text}");
     assert!(!text.contains('\x1b'), "{text:?}");
 }
+/// Every byte the binary wrote, stdout then stderr.
+fn both(o: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn error_has_action_line() {
+    use wingetrs::cli::output::{Advice, error_report};
+    use wingetrs::cli::style::with_enabled;
+    let e: anyhow::Error =
+        Advice::new("a confirmação exige um terminal interativo", "use --yes").into();
+    // The one-line form stays for logs and the job log.
+    assert_eq!(
+        e.to_string(),
+        "a confirmação exige um terminal interativo; use --yes"
+    );
+    assert_eq!(
+        with_enabled(false, || error_report(&e, false)),
+        "✗ a confirmação exige um terminal interativo\n→ use --yes\n"
+    );
+    // No action: one line.
+    let e = anyhow::anyhow!("falhou");
+    assert_eq!(
+        with_enabled(false, || error_report(&e, false)),
+        "✗ falhou\n"
+    );
+    // The causes only with -v; without it, how to see them.
+    let e = anyhow::anyhow!("raiz").context("topo");
+    assert_eq!(
+        with_enabled(false, || error_report(&e, false)),
+        "✗ topo\n→ rode de novo com -v para ver a causa\n"
+    );
+    assert_eq!(
+        with_enabled(false, || error_report(&e, true)),
+        "✗ topo\n  causa: raiz\n"
+    );
+    // An `Advice` under a context is a cause, never the headline.
+    let e = anyhow::Error::from(Advice::new("a", "b")).context("c");
+    assert!(with_enabled(false, || error_report(&e, false)).starts_with("✗ c\n"));
+    // The binary: what failed, then what to do, on stderr; nothing on stdout.
+    let env = Env::new().await;
+    let out = tokio::task::block_in_place(|| env.run(&["show", "nao.existe"], &[]));
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "✗ pacote não encontrado: nao.existe\n→ procure o id com `wingetrs search <termo>`\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_ansi_when_not_tty() {
+    let env = Env::new().await;
+    let cmds: [&[&str]; 4] = [
+        &["search", "", "-n", "100"],
+        &["show", "7zip", "--source", "scoop"],
+        &["show", "nao.existe"],
+        &["bucket", "list"],
+    ];
+    // Piped; NO_COLOR over a forced color; `--color never` over CLICOLOR_FORCE.
+    type Mode<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
+    let modes: [Mode; 3] = [
+        (&[], &[]),
+        (&[], &[("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")]),
+        (&["--color", "never"], &[("CLICOLOR_FORCE", "1")]),
+    ];
+    for cmd in cmds {
+        for (flags, vars) in modes {
+            let args: Vec<&str> = cmd.iter().chain(flags).copied().collect();
+            let out = tokio::task::block_in_place(|| env.run(&args, vars));
+            let text = both(&out);
+            assert!(!text.is_empty(), "{args:?}");
+            assert!(!text.contains('\x1b'), "{args:?} {vars:?}: {text:?}");
+        }
+    }
+    // The same command with color forced does paint (the check above can see ANSI).
+    let out = tokio::task::block_in_place(|| {
+        env.run(&["show", "nao.existe"], &[("CLICOLOR_FORCE", "1")])
+    });
+    assert!(both(&out).contains('\x1b'));
+}
+
+#[test]
+fn wide_chars_align_table() {
+    use wingetrs::cli::{output::search_table, style::with_enabled};
+    use wingetrs::core::PackageEntry;
+    // 10 columns in 5 chars; 4 columns in 6 chars (combining marks); 2 columns.
+    let names = ["漢字アプリ", "Ac\u{327}a\u{303}o", "ab"];
+    let rows: Vec<PackageEntry> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| PackageEntry {
+            name: (*n).into(),
+            id: format!("Pub.Id{i}"),
+            version: "1.0".into(),
+            source: wingetrs::core::SourceKind::Winget,
+            source_name: "winget".into(),
+            moniker: None,
+            publisher: None,
+            description: None,
+            tags: vec![],
+            commands: vec![],
+        })
+        .collect();
+    let width = |s: &str| ratatui::text::Span::raw(s).width();
+    for on in [false, true] {
+        let table = with_enabled(on, || search_table(&rows));
+        let plain = anstream::adapter::strip_str(&table).to_string();
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(lines.len(), 4, "{plain}");
+        // The Id column starts at column 12 (widest name 10 + 2) on every line.
+        for (line, id) in lines.iter().zip(["Id", "Pub.Id0", "Pub.Id1", "Pub.Id2"]) {
+            let at = line.find(id).unwrap();
+            assert_eq!(width(&line[..at]), 12, "{line:?}");
+        }
+    }
+}
+
+/// `\x1b` made visible, so a colored snapshot reads as text.
+fn visible(s: &str) -> String {
+    s.replace('\x1b', "␛")
+}
+
+/// The formatted output of each command, in the ways it reaches a terminal: colored (TTY) and
+/// plain on a TTY (`NO_COLOR`); `snapshots_not_tty` has the binary, piped.
+#[test]
+fn snapshots_tty_color_and_plain() {
+    use wingetrs::cli::output;
+    use wingetrs::cli::style::with_enabled;
+    use wingetrs::core::{PackageDetails, PackageEntry, SourceKind};
+    use wingetrs::installed::correlate::{Correlation, ListRow, Rule, UpdateState};
+    use wingetrs::update::{Outcome, SourceReport};
+    let reports = [
+        Outcome::Fresh,
+        Outcome::Unchanged,
+        Outcome::Updated {
+            packages: 28,
+            skipped: 1,
+        },
+        Outcome::Failed {
+            message: "HTTP 500".into(),
+            offline: false,
+        },
+    ];
+    let entry = PackageEntry {
+        name: "7-Zip".into(),
+        id: "7zip.7zip".into(),
+        version: "24.08".into(),
+        source: SourceKind::Winget,
+        source_name: "winget".into(),
+        moniker: None,
+        publisher: None,
+        description: None,
+        tags: vec![],
+        commands: vec![],
+    };
+    let details = PackageDetails {
+        source: SourceKind::Scoop,
+        id: "7zip".into(),
+        name: "7zip".into(),
+        version: "24.08".into(),
+        publisher: None,
+        description: Some("A multi-format file archiver".into()),
+        homepage: Some("https://www.7-zip.org/".into()),
+        license: Some("LGPL-2.1-or-later".into()),
+        tags: vec![],
+        installers: vec![],
+        available_versions: vec![],
+        icon: None,
+    };
+    let row = ListRow {
+        name: "Ação".into(),
+        origin: "arp".into(),
+        installed_version: Some("1.0".into()),
+        correlation: Correlation::Matched {
+            source: "winget".into(),
+            package_id: "A.B".into(),
+            rule: Rule::ProductCode,
+        },
+        state: UpdateState::Available {
+            latest: "2.0".into(),
+        },
+        ..Default::default()
+    };
+    let upgrades = [("solo".to_string(), "1.0".to_string(), "2.0".to_string())];
+    let render = || {
+        let mut s = String::new();
+        for o in &reports {
+            let r = SourceReport {
+                source: "winget".into(),
+                outcome: o.clone(),
+            };
+            s.push_str(&output::report_line(&r));
+            s.push('\n');
+        }
+        s.push_str("-- search\n");
+        s.push_str(&output::search_table(std::slice::from_ref(&entry)));
+        s.push_str("-- show\n");
+        s.push_str(&output::details_text(&details));
+        s.push_str("-- list\n");
+        s.push_str(&output::list_text(std::slice::from_ref(&row), false));
+        s.push_str("-- upgrade\n");
+        s.push_str(&output::upgrades_listing(&upgrades, &["fixo".to_string()]));
+        s.push_str("-- install / uninstall / cleanup\n");
+        for line in [
+            output::success("Instalado:", &output::app_version("solo", "1.0")),
+            output::warning("o desinstalador do app não rodou"),
+            output::cancelled(),
+            output::DRY_RUN_DONE.to_string(),
+            output::failed_item("App A: negado"),
+        ] {
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s.push_str("-- erro\n");
+        let failure: anyhow::Error = output::not_found("x", &["xz".into()]).into();
+        s.push_str(&output::error_report(&failure, false));
+        s
+    };
+    let color = with_enabled(true, render);
+    let plain = with_enabled(false, render);
+    assert!(color.contains('\x1b'));
+    assert!(!plain.contains('\x1b'));
+    // Color never changes the text.
+    assert_eq!(anstream::adapter::strip_str(&color).to_string(), plain);
+    insta::assert_snapshot!("tty_color", visible(&color));
+    insta::assert_snapshot!("tty_plain", plain);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshots_not_tty() {
+    let env = Env::new().await;
+    let mut s = String::new();
+    for args in [
+        &["search", "7zip"][..],
+        &["show", "7zip", "--source", "scoop"],
+        &["show", "nao.existe"],
+        &["bucket", "list"],
+    ] {
+        let out = tokio::task::block_in_place(|| env.run(args, &[]));
+        s.push_str(&format!("$ wingetrs {}\n", args.join(" ")));
+        s.push_str(&both(&out));
+    }
+    insta::assert_snapshot!("not_tty", s);
+}

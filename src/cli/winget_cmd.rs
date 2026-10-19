@@ -3,7 +3,7 @@
 //! Platform-neutral: every real effect arrives through [`WingetFlows`] (production:
 //! `run_win::ProdFlows`), every prompt through `Ui`, every printed line through a `Say`.
 use super::install_cmd::{Cancelled, Flags, Interrupts, Stop, Ui, proceed, uncancellable};
-use super::style;
+use super::{emit, output};
 use crate::bridge::elevated::{ElevatedBridge, SystemTransport, Transport};
 use crate::bridge::helper_folder::NoticeTransport;
 use crate::bridge::worker::ScopeArg;
@@ -65,7 +65,12 @@ pub type RecordRemover = Box<dyn FnOnce(&dyn Fn(&ProgressEvent)) -> Result<PathB
 /// Said once when Ctrl+C arrives before anything was launched.
 pub const CANCELLING_NOTICE: &str = "cancelando: nada foi iniciado; esperando a etapa atual parar";
 
-/// `--yes` on a removal whose data folders another installation shares (Kindle, D6).
+/// What fails when a removal shares data folders with another installation (Kindle, D6) and
+/// nobody can choose.
+const SHARED_DATA: &str = "este app compartilha dados com outros";
+
+/// `--yes` on a removal whose data folders another installation shares: the one-line form of
+/// the error (`Advice` of [`SHARED_DATA`] and its action).
 pub const SHARED_YES_REFUSED: &str =
     "este app compartilha dados com outros; rode sem --yes para escolher";
 
@@ -92,7 +97,7 @@ impl HelperShutdown {
 
     /// The helper started through `inner`; the folder refusal is printed once (`helper_notice`).
     pub fn with_transport(inner: Box<dyn Transport>) -> HelperShutdown {
-        let notice = Box::new(|text: &str| anstream::println!("{}", helper_notice(text)));
+        let notice = Box::new(|text: &str| emit::out(&helper_notice(text)));
         HelperShutdown(Arc::new(ElevatedBridge::new(Box::new(
             NoticeTransport::new(inner, notice),
         ))))
@@ -118,7 +123,7 @@ pub fn install_plan(
 
 /// The CLI line of a refused helper start (`helper_folder::refusal_text`, as the TUI shows it).
 pub fn helper_notice(text: &str) -> String {
-    style::paint(style::WARN, text)
+    output::warn_text(text)
 }
 
 impl Drop for HelperShutdown {
@@ -187,25 +192,28 @@ pub(super) async fn install_bridge(
         agreements,
         scope_fallback,
     } = plan;
-    anstream::println!("{} via winget", name_version(&job.name, Some(&version)));
+    emit::out(&output::via_winget(&name_version(
+        &job.name,
+        Some(&version),
+    )));
     if !f.yes || f.dry_run {
         for line in agreement_lines(&agreements, false) {
-            anstream::println!("{line}");
+            emit::out(&line);
         }
     }
     if f.dry_run {
         let (program, args) = bridge::command(&job, Path::new(""), "");
-        anstream::println!("{}", bridge::command_text(&program, &args));
-        anstream::println!("Simulação: nada foi alterado.");
+        emit::out(&output::dim(&bridge::command_text(&program, &args)));
+        emit::out(output::DRY_RUN_DONE);
         return Ok(());
     }
     if !proceed(ui, f)? {
-        anstream::println!("{}", style::paint(style::WARN, "Cancelado."));
+        emit::out(&output::cancelled());
         return Ok(());
     }
     if f.yes {
         for line in agreement_lines(&agreements, true) {
-            anstream::println!("{line}");
+            emit::out(&line);
         }
     }
     let msi_lock = ctx.data.install_layout().msi_lock();
@@ -233,11 +241,7 @@ pub fn run_install_bridge<I: Interrupts>(
     stop.interrupts.release();
     match result {
         Ok(done) => {
-            ui.output(&format!(
-                "{} {}",
-                style::paint(style::OK, "Instalado:"),
-                done.summary
-            ));
+            ui.output(&output::success("Instalado:", &done.summary));
             Ok(())
         }
         Err(InstallFail::Other(message)) => bail!("{message}"),
@@ -344,11 +348,11 @@ fn refused(r: Refusal) -> anyhow::Error {
 fn show_and_confirm(ui: &dyn Ui, text: &str, f: Flags, say: Say<'_>) -> anyhow::Result<bool> {
     say(text.trim_end());
     if f.dry_run {
-        say("Simulação: nada foi alterado.");
+        say(output::DRY_RUN_DONE);
         return Ok(false);
     }
     if !proceed(ui, f)? {
-        say(&style::paint(style::WARN, "Cancelado."));
+        say(&output::cancelled());
         return Ok(false);
     }
     Ok(true)
@@ -418,7 +422,7 @@ async fn run_native<E: std::fmt::Display + Send + 'static>(
         Some(out) if !gate.cancelled() => out,
         _ => {
             log.finish(Outcome::Cancelled, "Ctrl+C");
-            say(&style::paint(style::WARN, "Cancelado."));
+            say(&output::cancelled());
             stop.interrupts.release();
             return Err(Cancelled.into());
         }
@@ -447,11 +451,10 @@ pub fn native_text(plan: &WingetPlan, f: Flags) -> String {
 /// `Instalado:`/`Atualizado:`, or the "did not show up" warning in yellow; then the reboot.
 fn print_report(r: &InstallReport, done: &str, plan: &WingetPlan, say: Say<'_>) {
     match &r.warning {
-        Some(w) => say(&format!("{} {w}", style::paint(style::WARN, "aviso:"))),
-        None => say(&format!(
-            "{} {}",
-            style::paint(style::OK, done),
-            name_version(&plan.name, Some(&plan.version))
+        Some(w) => say(&output::warning(w)),
+        None => say(&output::success(
+            done,
+            &name_version(&plan.name, Some(&plan.version)),
         )),
     }
     if let codes::Outcome::OkReboot { initiated } = r.outcome {
@@ -597,7 +600,7 @@ pub async fn uninstall<F: WingetFlows>(
 ) -> anyhow::Result<()> {
     let rows = flows.installed()?;
     let Some(row) = pick_row(ui, &rows, target, f.yes)? else {
-        say(&style::paint(style::WARN, "Cancelado."));
+        say(&output::cancelled());
         return Ok(());
     };
     if purge {
@@ -619,11 +622,11 @@ pub async fn uninstall<F: WingetFlows>(
         .map_err(anyhow::Error::msg)?;
     say(plan.to_string().trim_end());
     if f.dry_run {
-        say("Simulação: nada foi alterado.");
+        say(output::DRY_RUN_DONE);
         return Ok(());
     }
     let Some(choice) = removal_choice(ui, &plan, f)? else {
-        say(&style::paint(style::WARN, "Cancelado."));
+        say(&output::cancelled());
         return Ok(());
     };
     run_removal(flows, ui, stop, &row.app_key, plan, choice, say).await
@@ -649,10 +652,10 @@ fn removal_choice(
         return Ok(proceed(ui, f)?.then_some(RemovalChoice::Remove));
     };
     if f.yes {
-        bail!("{SHARED_YES_REFUSED}");
+        return Err(output::Advice::new(SHARED_DATA, "rode sem --yes para escolher").into());
     }
     if !ui.interactive() {
-        bail!("este app compartilha dados com outros; rode num terminal para escolher");
+        return Err(output::Advice::new(SHARED_DATA, "rode num terminal para escolher").into());
     }
     let item = |label: &str, detail: String| PickerItem {
         label: label.to_string(),
@@ -736,7 +739,7 @@ async fn run_removal<F: WingetFlows>(
         Some(out) if !gate.cancelled() && !matches!(out, Err(RemovalError::Cancelled)) => out,
         _ => {
             log.finish(Outcome::Cancelled, "Ctrl+C");
-            say(&style::paint(style::WARN, "Cancelado."));
+            say(&output::cancelled());
             stop.interrupts.release();
             return Err(Cancelled.into());
         }
@@ -754,14 +757,16 @@ async fn run_removal<F: WingetFlows>(
         Removed::App { report, copied } => {
             print_uninstalled(&report, &plan, &mut *say);
             if let Some(dest) = copied {
-                say(&format!("Pastas copiadas para {}", dest.display()));
+                say(&format!("Pastas copiadas para {}", output::path(&dest)));
             }
         }
-        Removed::Record(file) => say(&format!(
-            "{} registro de {} (cópia em {})",
-            style::paint(style::OK, "Removido:"),
-            plan.name,
-            file.display()
+        Removed::Record(file) => say(&output::success(
+            "Removido:",
+            &format!(
+                "registro de {} (cópia em {})",
+                output::name(&plan.name),
+                output::path(&file)
+            ),
         )),
     }
     Ok(())
@@ -770,17 +775,14 @@ async fn run_removal<F: WingetFlows>(
 fn print_uninstalled(r: &UninstallReport, plan: &UninstallPlan, say: Say<'_>) {
     match (r.status, &r.warning) {
         (UninstallStatus::Removed, None) => {
-            say(&format!(
-                "{} {}",
-                style::paint(style::OK, "Desinstalado:"),
-                name_version(&plan.name, plan.version.as_deref())
+            say(&output::success(
+                "Desinstalado:",
+                &name_version(&plan.name, plan.version.as_deref()),
             ));
         }
-        (_, w) => say(&format!(
-            "{} {}",
-            style::paint(style::WARN, "aviso:"),
+        (_, w) => say(&output::warning(
             w.as_deref()
-                .unwrap_or(crate::winget_install::uninstall::KEY_STAYED)
+                .unwrap_or(crate::winget_install::uninstall::KEY_STAYED),
         )),
     }
     if let Some(initiated) = r.reboot {
@@ -800,7 +802,7 @@ pub async fn upgrade<F: WingetFlows>(
 ) -> anyhow::Result<()> {
     let rows = flows.installed()?;
     let Some(row) = pick_row(ui, &rows, target, f.yes)? else {
-        say(&style::paint(style::WARN, "Cancelado."));
+        say(&output::cancelled());
         return Ok(());
     };
     let Some(id) = winget_id(row) else {
@@ -903,11 +905,7 @@ fn upgrade_bridge<F: WingetFlows>(
     stop.interrupts.release();
     match result {
         Ok(done) => {
-            say(&format!(
-                "{} {}",
-                style::paint(style::OK, "Atualizado:"),
-                done.summary
-            ));
+            say(&output::success("Atualizado:", &done.summary));
             Ok(())
         }
         Err(InstallFail::Other(message)) => bail!("{message}"),
@@ -941,7 +939,7 @@ pub fn cleanup<F: WingetFlows>(
     say: Say<'_>,
 ) -> anyhow::Result<()> {
     if !a.orphans {
-        bail!("diga o que limpar: --orphans");
+        return Err(output::Advice::new("diga o que limpar", "use --orphans").into());
     }
     let found = flows.orphans()?;
     if found.is_empty() {
@@ -960,10 +958,10 @@ pub fn cleanup<F: WingetFlows>(
     let ts = format!("orphans-{}", crate::cache::now_unix());
     say(&format!(
         "Antes de apagar, cada registro é exportado para um .reg em {}",
-        flows.backups().join(&ts).display()
+        output::path(&flows.backups().join(&ts))
     ));
     if a.dry_run {
-        say("Simulação: nada foi alterado.");
+        say(output::DRY_RUN_DONE);
         return Ok(());
     }
     let chosen: Vec<&Orphan> = if a.yes {
@@ -1003,19 +1001,13 @@ pub fn cleanup<F: WingetFlows>(
     let mut failed = 0usize;
     for (o, result) in results {
         match result {
-            Ok(file) => say(&format!(
-                "{} {} (backup {})",
-                style::paint(style::OK, "Removido:"),
-                o.name,
-                file.display()
+            Ok(file) => say(&output::success(
+                "Removido:",
+                &format!("{} (backup {})", o.name, output::path(&file)),
             )),
             Err(e) => {
                 failed += 1;
-                say(&format!(
-                    "{} {}: {e}",
-                    style::paint(style::ERROR, "Erro:"),
-                    o.name
-                ));
+                say(&output::failed_item(&format!("{}: {e}", o.name)));
             }
         }
     }

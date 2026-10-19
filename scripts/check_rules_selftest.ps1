@@ -47,6 +47,14 @@ $testCases = @(
     @{ Name = 'build_ctx em teste ao vivo'; File = 'it/other.rs'; Text = "#[test]`n#[ignore = `"live: x`"]`nfn t() { let _ = build_ctx(a); }"; Want = 0 },
     @{ Name = 'build_ctx em ajudante depois de teste ao vivo'; File = 'it/other.rs'; Text = "#[test]`n#[ignore = `"live: x`"]`nfn t() {}`nfn helper() { let _ = build_ctx(a); }"; Want = 1 }
 )
+# Task 199: output of src/cli/ only through cli/emit.rs (file under <case>/, text, expected exit).
+$cliCases = @(
+    @{ Name = 'println em cli/x.rs'; File = 'src/cli/x.rs'; Text = 'fn f() { anstream::println!("x"); }'; Want = 1 },
+    @{ Name = 'eprint em cli/x.rs'; File = 'src/cli/x.rs'; Text = 'fn f() { eprint!("x"); }'; Want = 1 },
+    @{ Name = 'stderr travado em cli/x.rs'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = std::io::stderr().lock(); }'; Want = 1 },
+    @{ Name = 'println em cli/emit.rs'; File = 'src/cli/emit.rs'; Text = 'fn f() { anstream::println!("x"); }'; Want = 0 },
+    @{ Name = 'stdout sem trava no seletor'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = std::io::stdout(); }'; Want = 0 }
+)
 $base = Join-Path ([IO.Path]::GetTempPath()) ("check_rules_selftest-" + [guid]::NewGuid())
 $bad = @()
 try {
@@ -82,9 +90,18 @@ try {
         pwsh -NoProfile -File $checker -Path $src -TestsDir $tests *> $null
         if ($LASTEXITCODE -ne $c.Want) { $bad += "  [$($c.Name)] exit $LASTEXITCODE, esperado $($c.Want)" }
     }
+    foreach ($c in $cliCases) {
+        $n++
+        $dir = Join-Path $base "case$n"
+        $file = Join-Path $dir $c.File
+        New-Item -ItemType Directory -Force (Split-Path -Parent $file) | Out-Null
+        [IO.File]::WriteAllText($file, $c.Text)
+        pwsh -NoProfile -File $checker -Path $dir *> $null
+        if ($LASTEXITCODE -ne $c.Want) { $bad += "  [$($c.Name)] exit $LASTEXITCODE, esperado $($c.Want)" }
+    }
 } finally {
     Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
 }
 if ($bad.Count -gt 0) { $bad; exit 1 }
-"[OK] check_rules: $($cases.Count + $testCases.Count + 2) casos plantados"
+"[OK] check_rules: $($cases.Count + $testCases.Count + $cliCases.Count + 2) casos plantados"
 exit 0

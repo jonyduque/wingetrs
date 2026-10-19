@@ -18,7 +18,10 @@ $rules = @(
     @{ Name = 'join engole panico'; Pattern = '\.join\(\)\s*\.(ok\(\)|unwrap_or_default\(\)|unwrap_or\()'; Skip = '' },
     @{ Name = 'join engole panico (if let Ok)'; Pattern = 'if let Ok\([^)]*\)\s*=\s*[\w.]*\.join\(\)'; Skip = '' },
     # The TUI owns the terminal: stdout only from main.rs and cli/.
-    @{ Name = 'println fora de main/cli'; Pattern = '\b(e?println!|e?print!)\('; Skip = '^src[\\/](main\.rs|cli[\\/])' },
+    @{ Name = 'println fora de main/cli'; Pattern = '\b(e?println!|e?print!)\('; Skip = '(^|[\\/])src[\\/](main\.rs|cli[\\/])' },
+    # Task 199: inside cli/ every line goes out through emit.rs, with its text from output.rs
+    # (glyph, color, alignment in one place). A locked stdout/stderr is a print by another name.
+    @{ Name = 'saida do CLI fora de cli/emit.rs'; Pattern = '\b(e?println!|e?print!)\(|\bstd(out|err)\(\)\s*\.lock\(\)'; Skip = '^(?!(.*[\\/])?src[\\/]cli[\\/])|(^|[\\/])src[\\/]cli[\\/]emit\.rs$' },
     # Platform code lives in *_win.rs behind cfg on the module, never inline.
     @{ Name = 'cfg!(windows) na logica'; Pattern = 'cfg!\(\s*windows\s*\)'; Skip = '' },
     # Colors only through theme tokens.

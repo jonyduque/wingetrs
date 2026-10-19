@@ -1,6 +1,6 @@
 //! Text rendering for CLI commands; colored through `style::paint` when color is on.
 use super::style::{
-    DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, WARN, paint,
+    self, DIM, ERROR, HEADER, ID, NAME, NEW_VERSION, OK, SOURCE, Style, VERSION, WARN, paint,
 };
 use crate::core::{PackageDetails, PackageEntry};
 use crate::install::layout::Layout;
@@ -17,18 +17,128 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// `text` painted, then padded to `width` columns counted on the plain text.
+/// Terminal columns of `text`: wide (CJK, emoji) count two, combining marks none.
+pub fn columns(text: &str) -> usize {
+    ratatui::text::Span::raw(text).width()
+}
+
+/// `text` painted, then padded to `width` terminal columns counted on the plain text.
 fn pad(style: Style, text: &str, width: usize) -> String {
-    let pad = " ".repeat(width.saturating_sub(text.chars().count()));
+    let pad = " ".repeat(width.saturating_sub(columns(text)));
     format!("{}{pad}", paint(style, text))
 }
 
-/// Prints `value` as pretty JSON, never colored.
-pub fn print_json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
-    use std::io::Write;
-    let text = serde_json::to_string_pretty(value)?;
-    writeln!(std::io::stdout().lock(), "{text}")?;
-    Ok(())
+/// A success line: `✓ Instalado: rest` (glyph and label in the success color).
+pub fn success(label: &str, rest: &str) -> String {
+    let head = paint(OK, &format!("{} {label}", style::glyphs().toast_ok));
+    if rest.is_empty() {
+        head
+    } else {
+        format!("{head} {rest}")
+    }
+}
+
+/// A warning line: `⚠ aviso: text`.
+pub fn warning(text: &str) -> String {
+    let head = paint(WARN, &format!("{} aviso:", style::glyphs().toast_warn));
+    format!("{head} {text}")
+}
+
+/// Text in the warning color, without glyph (notices said in full sentences).
+pub fn warn_text(text: &str) -> String {
+    paint(WARN, text)
+}
+
+/// One item of a batch that failed: `✗ Erro: text`.
+pub fn failed_item(text: &str) -> String {
+    let head = paint(ERROR, &format!("{} Erro:", style::glyphs().toast_err));
+    format!("{head} {text}")
+}
+
+/// `install` of a winget package through the bridge: `<name version> via winget`.
+pub fn via_winget(name_version: &str) -> String {
+    format!("{} {}", paint(NAME, name_version), paint(DIM, "via winget"))
+}
+
+/// The line of an operation the user stopped or declined: `⚠ Cancelado.`
+pub fn cancelled() -> String {
+    paint(WARN, &format!("{} Cancelado.", style::glyphs().toast_warn))
+}
+
+/// The last line of a `--dry-run`.
+pub const DRY_RUN_DONE: &str = "Simulação: nada foi alterado.";
+
+/// What the user can do next: `→ text` (the arrow dimmed; the text keeps its own styles).
+pub fn action(text: &str) -> String {
+    format!("{} {text}", paint(DIM, style::glyphs().arrow))
+}
+
+/// A count in bold.
+fn bold_count(n: usize) -> String {
+    paint(NAME, &n.to_string())
+}
+
+/// A package, app or bucket name in bold.
+pub fn name(text: &str) -> String {
+    paint(NAME, text)
+}
+
+/// `bucket list`: `name  owner/repo`, one per line.
+pub fn buckets_text(rows: &[(String, String)]) -> String {
+    let cells: Vec<[String; 2]> = rows.iter().map(|(n, r)| [n.clone(), r.clone()]).collect();
+    table(None, [NAME, ID], &cells)
+}
+
+/// A path of the disk, in its own style.
+pub fn path(p: &Path) -> String {
+    paint(style::PATH, &p.display().to_string())
+}
+
+/// A failure the user can act on: [`error_report`] shows `what` and then `→ todo` on a line of
+/// its own. `Display` keeps the one-line form `what; todo` (logs, job log, tests).
+#[derive(Debug, thiserror::Error)]
+#[error("{what}; {todo}")]
+pub struct Advice {
+    pub what: String,
+    pub todo: String,
+}
+
+impl Advice {
+    pub fn new(what: impl Into<String>, todo: impl Into<String>) -> Advice {
+        Advice {
+            what: what.into(),
+            todo: todo.into(),
+        }
+    }
+}
+
+/// The error of a failed command, for stderr: `✗ <what failed>`, then `→ <what to do>` when
+/// there is an action ([`Advice`]). The causes of the `anyhow` chain only with `-v`; without
+/// it a chain says how to see them.
+pub fn error_report(e: &anyhow::Error, verbose: bool) -> String {
+    let g = style::glyphs();
+    // Only the outermost error: an `Advice` under a `.context()` is a cause.
+    let top = e.chain().next().and_then(|c| c.downcast_ref::<Advice>());
+    let (what, todo) = match top {
+        Some(a) => (a.what.clone(), Some(a.todo.as_str())),
+        None => (e.to_string(), None),
+    };
+    let mut s = format!("{} {what}\n", paint(ERROR, g.toast_err));
+    if let Some(todo) = todo {
+        s.push_str(&action(todo));
+        s.push('\n');
+    }
+    let causes: Vec<String> = e.chain().skip(1).map(ToString::to_string).collect();
+    if verbose {
+        for c in &causes {
+            s.push_str(&paint(DIM, &format!("  causa: {c}")));
+            s.push('\n');
+        }
+    } else if !causes.is_empty() {
+        s.push_str(&action("rode de novo com -v para ver a causa"));
+        s.push('\n');
+    }
+    s
 }
 
 /// `Nome  Id  Versão  Fonte` with aligned columns.
@@ -93,25 +203,42 @@ pub fn details_text(d: &PackageDetails) -> String {
 }
 
 pub fn report_line(r: &SourceReport) -> String {
+    let g = style::glyphs();
     let src = paint(SOURCE, &r.source.to_string());
+    let ok = paint(OK, g.toast_ok);
     match &r.outcome {
-        Outcome::Fresh => format!("{src}: {}", paint(OK, "em dia")),
-        Outcome::Unchanged => format!("{src}: sem mudanças"),
+        Outcome::Fresh => format!("{ok} {src}: {}", paint(OK, "em dia")),
+        Outcome::Unchanged => format!("{ok} {src}: sem mudanças"),
         Outcome::Updated { packages, skipped } => {
-            let n = paint(OK, &format!("{packages} pacotes"));
-            format!("{src}: {n} ({skipped} ignorados)")
+            let n = paint(NAME, &packages.to_string());
+            format!(
+                "{ok} {src}: {n} {} ({} ignorados)",
+                paint(OK, "pacotes"),
+                paint(NAME, &skipped.to_string())
+            )
         }
         Outcome::Failed { message: m, .. } => {
-            format!("{src}: {} {m}", paint(ERROR, "falhou:"))
+            let (x, failed) = (paint(ERROR, g.toast_err), paint(ERROR, "falhou:"));
+            format!("{x} {src}: {failed} {m}")
         }
     }
 }
 
 fn aligned<const N: usize>(header: [&str; N], styles: [Style; N], cells: &[[String; N]]) -> String {
-    let mut widths = header.map(|h| h.chars().count());
+    table(Some(header), styles, cells)
+}
+
+/// Columns padded to the widest cell (terminal columns, so wide chars and accents align),
+/// joined by two spaces; the header, when given, in `HEADER`.
+fn table<const N: usize>(
+    header: Option<[&str; N]>,
+    styles: [Style; N],
+    cells: &[[String; N]],
+) -> String {
+    let mut widths = header.map_or([0; N], |h| h.map(columns));
     for r in cells {
         for (w, c) in widths.iter_mut().zip(r) {
-            *w = (*w).max(c.chars().count());
+            *w = (*w).max(columns(c));
         }
     }
     let line = |r: &[&str], styles: [Style; N]| {
@@ -123,8 +250,11 @@ fn aligned<const N: usize>(header: [&str; N], styles: [Style; N], cells: &[[Stri
             .collect();
         parts.join("  ").trim_end().to_string()
     };
-    let mut out = line(&header, [HEADER; N]);
-    out.push('\n');
+    let mut out = String::new();
+    if let Some(header) = header {
+        out.push_str(&line(&header, [HEADER; N]));
+        out.push('\n');
+    }
     for r in cells {
         let refs: Vec<&str> = r.iter().map(String::as_str).collect();
         out.push_str(&line(&refs, styles));
@@ -226,17 +356,21 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
             if items.is_empty() {
                 continue;
             }
-            out.push_str(&format!("\n{} ({}):\n", paint(HEADER, title), items.len()));
+            out.push_str(&format!(
+                "\n{} ({}):\n",
+                paint(HEADER, title),
+                bold_count(items.len())
+            ));
             for i in items {
                 out.push_str(&format!("  {i}\n"));
             }
         }
         out.push_str(&format!(
             "\n{} instalados: {} correlacionados, {} ambíguos, {} não correlacionados\n",
-            rows.len(),
-            cells.len(),
-            ambiguous.len(),
-            unmatched.len()
+            bold_count(rows.len()),
+            bold_count(cells.len()),
+            bold_count(ambiguous.len()),
+            bold_count(unmatched.len())
         ));
     }
     out
@@ -258,19 +392,14 @@ pub fn ambiguous_text(target: &str, candidates: &[String]) -> String {
     s
 }
 
-/// Error text for a target that is not in the catalog.
-pub fn not_found_text(query: &str, suggestions: &[String]) -> String {
+/// The error of a target that is not in the catalog, with the close names as the action.
+pub fn not_found(query: &str, suggestions: &[String]) -> Advice {
+    let what = format!("nenhum pacote encontrado para '{query}'");
     if suggestions.is_empty() {
-        format!("nenhum pacote encontrado para '{query}'")
+        Advice::new(what, "procure o nome com `wingetrs search <termo>`")
     } else {
-        format!(
-            "nenhum pacote encontrado para '{query}'; você quis dizer: {}?",
-            suggestions
-                .iter()
-                .map(|x| paint(ID, x))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let names: Vec<String> = suggestions.iter().map(|x| paint(ID, x)).collect();
+        Advice::new(what, format!("você quis dizer: {}?", names.join(", ")))
     }
 }
 
@@ -314,12 +443,13 @@ pub fn uninstall_plan_text(
         match plan.path_users.iter().find(|(t, _)| *t == a.target) {
             Some((_, users)) => lines.push(format!(
                 "PATH do usuário mantém {} (ainda usado por: {})",
-                a.target,
+                paint(style::PATH, &a.target),
                 users.join(", ")
             )),
             None if plan.remove_path_entry => lines.push(format!(
                 "PATH do usuário {} remove {}",
-                glyphs.arrow, a.target
+                glyphs.arrow,
+                paint(style::PATH, &a.target)
             )),
             None => {}
         }
@@ -414,17 +544,13 @@ pub fn plan_summary(
                 lines.push(format!("Variável de usuário {name} = {value}"));
             }
             Step::EnvAddPath { entry } if !on_path(&entry.display().to_string()) => {
-                lines.push(format!(
-                    "PATH do usuário {} {}",
-                    glyphs.arrow,
-                    entry.display()
-                ));
+                lines.push(format!("PATH do usuário {} {}", glyphs.arrow, path(entry)));
             }
             Step::EnsureShimsOnPath if !on_path(&layout.shims().display().to_string()) => {
                 lines.push(format!(
                     "PATH do usuário {} {}",
                     glyphs.arrow,
-                    layout.shims().display()
+                    path(&layout.shims())
                 ));
             }
             Step::RemoveOldVersion { version } => {
@@ -519,16 +645,78 @@ pub fn residue_label(r: &crate::install::residue::Residue) -> String {
 
 /// `app  de -> para` lines for the upgrade listing.
 pub fn upgrades_text(rows: &[(String, String, String)]) -> String {
-    let mut s = String::new();
-    for (app, from, to) in rows {
+    let arrow = style::glyphs().arrow;
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|(app, from, to)| [app.clone(), from.clone(), arrow.to_string(), to.clone()])
+        .collect();
+    table(None, [NAME, VERSION, DIM, NEW_VERSION], &cells)
+}
+
+/// `upgrade` without `--all` and without an app: what has a newer version, the pinned apps,
+/// and how to go on.
+pub fn upgrades_listing(rows: &[(String, String, String)], pinned: &[String]) -> String {
+    let mut s = upgrades_text(rows);
+    for app in pinned {
         s.push_str(&format!(
-            "{}  {} -> {}\n",
+            "{} {}\n",
             paint(NAME, app),
-            paint(VERSION, from),
-            paint(NEW_VERSION, to)
+            paint(DIM, "(fixado)")
         ));
     }
+    if rows.is_empty() {
+        s.push_str(NOTHING_TO_UPGRADE);
+    } else {
+        s.push_str(&action(
+            "use `wingetrs upgrade --all` ou `wingetrs upgrade <app>`",
+        ));
+    }
+    s.push('\n');
     s
+}
+
+/// Nothing has a newer version.
+pub const NOTHING_TO_UPGRADE: &str = "Nada para atualizar.";
+
+/// `upgrade --all` skips a pinned app.
+pub fn pinned_skipped(app: &str) -> String {
+    paint(DIM, &format!("fixado, pulado: {app}"))
+}
+
+/// `upgrade <app>` of an app already at the newest version.
+pub fn up_to_date(app: &str) -> String {
+    format!(
+        "{} {} já está na versão mais recente.",
+        paint(OK, style::glyphs().toast_ok),
+        paint(NAME, app)
+    )
+}
+
+/// `app version`, the name in bold.
+pub fn app_version(app: &str, version: &str) -> String {
+    format!("{} {}", paint(NAME, app), paint(VERSION, version))
+}
+
+/// Dimmed text (hints that need no action).
+pub fn dim(text: &str) -> String {
+    paint(DIM, text)
+}
+
+/// Residues found after a removal without a terminal and without `--yes`.
+pub fn residues_left(residues: &[crate::install::residue::Residue]) -> String {
+    let mut s = warning("resíduos encontrados (nada foi removido)");
+    s.push('\n');
+    for r in residues {
+        s.push_str(&format!("  {}\n", residue_label(r)));
+    }
+    s.push_str(&action("use --yes para remover os de confiança alta"));
+    s.push('\n');
+    s
+}
+
+/// The animated progress line: `main`, then its warning (`sem dados há N s`) in yellow.
+pub fn progress_line(main: &str, warn: &str) -> String {
+    format!("{main}{}", paint(WARN, warn))
 }
 
 /// One piece of third-party code an operation runs, as the confirmation shows it.
@@ -814,12 +1002,15 @@ pub fn third_party_block(items: &[ThirdParty]) -> String {
 pub fn third_party_refusal<'a>(
     apps: &[&str],
     items: impl Iterator<Item = &'a ThirdParty>,
-) -> String {
+) -> Advice {
     let what: Vec<String> = items.map(ThirdParty::label).collect();
-    format!(
-        "{} roda código de terceiros ({}); revise com --dry-run e rode de novo com --allow-scripts",
-        apps.join(", "),
-        what.join(", ")
+    Advice::new(
+        format!(
+            "{} roda código de terceiros ({})",
+            apps.join(", "),
+            what.join(", ")
+        ),
+        "revise com --dry-run e rode de novo com --allow-scripts",
     )
 }
 

@@ -38,16 +38,14 @@ fn parse() -> wingetrs::cli::Cli {
 
 fn main() -> std::process::ExitCode {
     let cli = parse();
+    let verbose = cli.verbose > 0;
     match wingetrs::cli::run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             let code = wingetrs::cli::install_cmd::exit_code(&e);
             // Ctrl+C (130): `Cancelado.` is already on screen.
             if code != 130 {
-                anstream::eprintln!(
-                    "{} {e:#}",
-                    wingetrs::cli::style::paint(wingetrs::cli::style::ERROR, "erro:")
-                );
+                wingetrs::cli::emit::error(&e, verbose);
             }
             std::process::ExitCode::from(code)
         }

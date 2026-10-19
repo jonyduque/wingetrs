@@ -1,4 +1,5 @@
 //! Command line interface.
+pub mod emit;
 pub mod install_cmd;
 pub mod output;
 pub mod picker;
@@ -572,7 +573,11 @@ async fn ensure_catalog_ran(
                     tracing::warn!("{}: {m}", r.source);
                 }
             }
-            anyhow::bail!("sem catálogo local e sem rede");
+            return Err(output::Advice::new(
+                "sem catálogo local e sem rede",
+                "conecte-se à internet e rode `wingetrs update`",
+            )
+            .into());
         }
         return Ok((catalog, true));
     }
@@ -600,7 +605,7 @@ fn search_best(
 
 fn print_reports(reports: &[SourceReport]) {
     for r in reports {
-        anstream::println!("{}", output::report_line(r));
+        emit::out(&output::report_line(r));
     }
 }
 
@@ -753,9 +758,9 @@ async fn run_async(
             {
                 let _print = tracing::debug_span!("search.print").entered();
                 if json {
-                    output::print_json(&rows)?;
+                    emit::json(&rows)?;
                 } else {
-                    anstream::print!("{}", output::search_table(&rows));
+                    emit::out_block(&output::search_table(&rows));
                 }
             }
             // The process exits next: skip closing the db.
@@ -775,15 +780,22 @@ async fn run_async(
                 found.retain(|p| p.entry.source == k);
             }
             let pkg = match found.len() {
-                0 => anyhow::bail!("pacote não encontrado: {id}"),
+                0 => {
+                    return Err(output::Advice::new(
+                        format!("pacote não encontrado: {id}"),
+                        "procure o id com `wingetrs search <termo>`",
+                    )
+                    .into());
+                }
                 1 => found.remove(0),
                 _ => {
                     let names: Vec<_> =
                         found.iter().map(|p| p.entry.source_name.as_str()).collect();
-                    anyhow::bail!(
-                        "pacote ambíguo: {id} existe em {}; use --source",
-                        names.join(", ")
+                    return Err(output::Advice::new(
+                        format!("pacote ambíguo: {id} existe em {}", names.join(", ")),
+                        "use --source",
                     )
+                    .into());
                 }
             };
             let details = match pkg.entry.source {
@@ -809,9 +821,9 @@ async fn run_async(
                 }
             };
             if json {
-                output::print_json(&details)?;
+                emit::json(&details)?;
             } else {
-                anstream::print!("{}", output::details_text(&details));
+                emit::out_block(&output::details_text(&details));
             }
             Ok(())
         }
@@ -877,9 +889,9 @@ async fn run_async(
             }
             crate::installed::timed("output", || {
                 if json {
-                    output::print_json(&rows)?;
+                    emit::json(&rows)?;
                 } else {
-                    anstream::print!("{}", output::list_text(&rows, upgradable));
+                    emit::out_block(&output::list_text(&rows, upgradable));
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
@@ -922,9 +934,13 @@ pub fn bucket_add(
     let spec = match (url, buckets::known_repo(name)) {
         (Some(u), _) => u,
         (None, Some(known)) => known.to_string(),
-        (None, None) => anyhow::bail!(
-            "o bucket {name} não é conhecido; informe o repositório: wingetrs bucket add {name} <owner/repo>"
-        ),
+        (None, None) => {
+            return Err(output::Advice::new(
+                format!("o bucket {name} não é conhecido"),
+                format!("informe o repositório: wingetrs bucket add {name} <owner/repo>"),
+            )
+            .into());
+        }
     };
     match buckets::add(cfg, name, &spec, yes) {
         Err(BucketError::NeedsConfirmation { name, repo }) if ui.interactive() => {
@@ -945,28 +961,27 @@ fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::
     use crate::buckets;
     match action {
         BucketAction::List => {
-            for (name, repo) in buckets::resolved(&cfg)? {
-                anstream::println!("{name}  {repo}");
-            }
+            emit::out_block(&output::buckets_text(&buckets::resolved(&cfg)?));
             Ok(())
         }
         BucketAction::Add { name, url, yes } => {
             let ui = install_cmd::TtyUi::new(&cfg);
-            let say = &mut |l: &str| anstream::println!("{l}");
+            let say = &mut |l: &str| emit::out(l);
             if !bucket_add(&ui, &mut cfg, &name, url, yes, say)? {
                 return Ok(());
             }
             cfg.save(&data.config_path())?;
-            anstream::println!(
-                "Bucket {name} adicionado. Rode `wingetrs update` para baixar o catálogo."
-            );
+            emit::out(&output::success("Bucket adicionado:", &output::name(&name)));
+            emit::out(&output::action(
+                "rode `wingetrs update` para baixar o catálogo",
+            ));
             Ok(())
         }
         BucketAction::Rm { name } => {
             let state_db = data.install_layout().state_db();
             buckets::remove_and_cleanup(data, &mut cfg, &name, &state_db)?;
             cfg.save(&data.config_path())?;
-            anstream::println!("Bucket {name} removido.");
+            emit::out(&output::success("Bucket removido:", &output::name(&name)));
             Ok(())
         }
     }
@@ -1021,20 +1036,22 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     let after_log = std::time::Instant::now();
     let cfg =
         tracing::debug_span!("startup.config").in_scope(|| Config::load(&data.config_path()))?;
+    // Glyphs: flag > config.toml > nerd.
+    let glyphs = match cli.glyphs {
+        Some(GlyphArg::Nerd) => GlyphSet::Nerd,
+        Some(GlyphArg::Unicode) => GlyphSet::Unicode,
+        Some(GlyphArg::Ascii) => GlyphSet::Ascii,
+        None => match cfg.glyphs.as_str() {
+            "unicode" => GlyphSet::Unicode,
+            "ascii" => GlyphSet::Ascii,
+            _ => GlyphSet::Nerd,
+        },
+    };
     if cli.command.is_none() {
-        // The TUI builds its own runtime; glyphs: flag > config.toml > nerd.
-        let glyphs = match cli.glyphs {
-            Some(GlyphArg::Nerd) => GlyphSet::Nerd,
-            Some(GlyphArg::Unicode) => GlyphSet::Unicode,
-            Some(GlyphArg::Ascii) => GlyphSet::Ascii,
-            None => match cfg.glyphs.as_str() {
-                "unicode" => GlyphSet::Unicode,
-                "ascii" => GlyphSet::Ascii,
-                _ => GlyphSet::Nerd,
-            },
-        };
+        // The TUI builds its own runtime.
         return crate::tui::run::run(glyphs, cli.glyphs.is_some());
     }
+    style::init_glyphs(glyphs);
     let rt = tracing::debug_span!("startup.runtime").in_scope(tokio::runtime::Runtime::new)?;
     let result = rt.block_on(run_async(cli, data, cfg, early, after_log));
     tracing::debug_span!("startup.runtime_drop").in_scope(|| drop(rt));
