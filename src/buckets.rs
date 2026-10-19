@@ -25,7 +25,9 @@ pub enum BucketError {
     InvalidRepo(String),
     #[error("nome de bucket inválido: {0}")]
     InvalidName(String),
-    #[error("o bucket {name} ({repo}) não é conhecido; confirme num terminal ou rode de novo com --yes")]
+    #[error(
+        "o bucket {name} ({repo}) não é conhecido; confirme num terminal ou rode de novo com --yes"
+    )]
     NeedsConfirmation { name: String, repo: String },
     #[error("o bucket {0} já existe com outro repositório")]
     Exists(String),
