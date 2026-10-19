@@ -98,6 +98,15 @@ pub fn install_elevation(
     Elevation::Never
 }
 
+/// Whether an installer wingetrs launches unelevated asks for its own UAC prompt: its
+/// `ElevationRequirement` is `elevatesSelf` or `elevationRequired` (a `user` scope keeps those
+/// unelevated, see [`install_elevation`]); any letter case.
+pub fn self_elevates(requirement: Option<&str>) -> bool {
+    requirement.is_some_and(|r| {
+        r.eq_ignore_ascii_case("elevatesSelf") || r.eq_ignore_ascii_case("elevationRequired")
+    })
+}
+
 /// Whether an uninstall runs through the elevated helper: per-user entries never; machine
 /// entries when they go through `msiexec` or the uninstaller sits in an administrator folder.
 pub fn uninstall_elevation(hive: Hive, msiexec: bool, program_in_admin_folder: bool) -> Elevation {

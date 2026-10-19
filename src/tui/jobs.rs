@@ -116,7 +116,9 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::Verifying
             | Phase::CopyingFolders
             | Phase::Uninstalling { .. }
-            | Phase::CheckingRemoval { .. }),
+            | Phase::CheckingRemoval { .. }
+            | Phase::SelfElevating { .. }
+            | Phase::Bridge { .. }),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }

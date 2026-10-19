@@ -538,6 +538,8 @@ struct World {
     gate: LaunchGate,
     /// Version of the app the post-install scan finds (`None`: the scan finds nothing).
     found_version: Option<String>,
+    /// Every phase the upgrade reported, in order.
+    phases: Mutex<Vec<wingetrs::install::progress::Phase>>,
 }
 
 /// Serves the installer and records `fetch` for each request.
@@ -611,6 +613,7 @@ impl World {
             manifest,
             gate,
             found_version: None,
+            phases: Mutex::new(Vec::new()),
         }
     }
 
@@ -652,7 +655,11 @@ impl World {
             data: &self.data,
             http: &self.http,
             wait: LockWait::Block(Duration::from_secs(30)),
-            progress: &|_: &ProgressEvent| {},
+            progress: &|ev: &ProgressEvent| {
+                if let ProgressEvent::Phase(p) = ev {
+                    self.phases.lock().unwrap().push(p.clone());
+                }
+            },
             gate: self.gate.clone(),
             launcher: &self.install,
             elevated: &NoElevated,
@@ -685,6 +692,60 @@ impl World {
     fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
     }
+}
+
+/// Task 201: an `uninstallPrevious` upgrade shows a phase from the first instant (before the
+/// `install.lock` wait) and the removal's phases (uninstaller, record watch) before the new
+/// installer's.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_previous_shows_removal_phases() {
+    use wingetrs::install::progress::Phase;
+    let w = World::new("inno", Some("uninstallPrevious"), "", false).await;
+    let p = w.plan(Some("0.9"));
+    // Another operation holds `install.lock`: the first phase shows while it is awaited.
+    let held = UpdateLock::try_acquire(&w.data.install_layout().install_lock())
+        .unwrap()
+        .unwrap();
+    let watch = async {
+        let first = async {
+            loop {
+                let phases = w.phases.lock().unwrap().clone();
+                if !phases.is_empty() {
+                    break phases;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let seen = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .unwrap_or_default();
+        drop(held);
+        seen
+    };
+    let (r, seen) = tokio::join!(w.run(&p), watch);
+    r.unwrap();
+    assert_eq!(seen, [Phase::Preparing], "while the lock was held");
+    let phases = w.phases.lock().unwrap().clone();
+    let previous = previous_plan();
+    let at = |want: &Phase| {
+        phases
+            .iter()
+            .position(|p| p == want)
+            .unwrap_or_else(|| panic!("{want:?} missing: {phases:?}"))
+    };
+    let uninstalling = at(&Phase::Uninstalling {
+        name: previous.name.clone(),
+    });
+    let checking = at(&Phase::CheckingRemoval {
+        name: previous.name.clone(),
+    });
+    let installing = at(&Phase::RunningInstaller {
+        name: p.name.clone(),
+    });
+    assert!(
+        uninstalling < checking && checking < installing,
+        "{phases:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

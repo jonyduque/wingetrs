@@ -1936,6 +1936,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                         | crate::install::progress::Phase::WaitingElevation
                         | crate::install::progress::Phase::Uninstalling { .. }
                         | crate::install::progress::Phase::CheckingRemoval { .. }
+                        | crate::install::progress::Phase::SelfElevating { .. }
                 ) || (native_removal
                     && matches!(phase, crate::install::progress::Phase::Removing { .. }))
                 {
@@ -1963,7 +1964,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::BridgeLine(line) => {
             if app.bridge_last_line.is_some() {
                 app.bridge_last_line = Some(app.now);
-                set_bridge_line(app, &line);
+                on_bridge_line(app, &line);
             }
             Vec::new()
         }
@@ -2664,9 +2665,9 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
 }
 
 /// Item of a removal that copies the app's data folders first.
-pub const BACKUP_ITEM: &str = "Copiar pastas para backups antes";
+pub const BACKUP_ITEM: &str = crate::winget_install::removal::BACKUP_THEN_REMOVE_LABEL;
 /// Item of a removal that deletes only the registry record (option C).
-pub const REGISTRY_ONLY_ITEM: &str = "Remover só o registro";
+pub const REGISTRY_ONLY_ITEM: &str = crate::winget_install::removal::REGISTRY_ONLY_LABEL;
 
 /// An option of the item above it (no icon, versions or manager).
 fn option_item(name: &str, checked: bool) -> ConfirmItem {
@@ -3097,6 +3098,29 @@ fn start_ready(
 }
 
 /// Shows `line` as the progress of the bridge upgrade in progress.
+/// A bridge output line, as the CLI reads it (`progress::bridge_line`): the UAC notice
+/// becomes the phase with its clock; other lines go to the label.
+fn on_bridge_line(app: &mut App, line: &str) {
+    let Some(r) = &mut app.running else {
+        return;
+    };
+    let Some(Action::Bridge(job)) = &r.action else {
+        return;
+    };
+    let current = r
+        .progress
+        .as_ref()
+        .and_then(|p| p.phase.as_ref())
+        .map(|(p, _)| p);
+    let (next, show) = crate::install::progress::bridge_line(line, current, job.tool.name());
+    if let Some(p) = next {
+        r.progress = Some(phase_progress(p, app.now));
+    }
+    if show {
+        set_bridge_line(app, line);
+    }
+}
+
 fn set_bridge_line(app: &mut App, line: &str) {
     if let Some(r) = &mut app.running
         && let Some(action @ Action::Bridge(_)) = &r.action
@@ -3989,10 +4013,20 @@ fn can_start(app: &App) -> bool {
 
 fn start(app: &mut App, q: Queued) -> Vec<Cmd> {
     app.bridge_last_line = matches!(q.action, Action::Bridge(_)).then_some(app.now);
+    // A bridge job reports only lines: its phase (spinner and clock) starts now.
+    let progress = match &q.action {
+        Action::Bridge(job) => Some(phase_progress(
+            crate::install::progress::Phase::Bridge {
+                tool: job.tool.name().to_string(),
+            },
+            app.now,
+        )),
+        _ => None,
+    };
     app.running = Some(Running {
         id: q.id,
         label: q.label,
-        progress: None,
+        progress,
         action: Some(q.action.clone()),
     });
     vec![Cmd::Execute(q.action)]

@@ -40,7 +40,11 @@ impl NoticeTransport {
 
 impl Transport for NoticeTransport {
     fn start(&self) -> Result<Box<dyn Helper>, String> {
-        self.inner.start().inspect_err(|e| {
+        self.start_with_notice(&mut || {})
+    }
+
+    fn start_with_notice(&self, notice: &mut dyn FnMut()) -> Result<Box<dyn Helper>, String> {
+        self.inner.start_with_notice(notice).inspect_err(|e| {
             if is_refusal(e) && !self.told.swap(true, Ordering::SeqCst) {
                 (self.notice)(e);
             }

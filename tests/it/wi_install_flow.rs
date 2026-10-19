@@ -921,7 +921,8 @@ fn consumers_show_new_phases() {
     }
     line.finish();
     assert!(
-        phase_title(&Phase::WaitingElevation).starts_with("Aguardando permissão de administrador")
+        phase_title(&Phase::WaitingElevation)
+            .starts_with(wingetrs::install::progress::ELEVATION_NOTICE)
     );
     assert!(
         phase_status(&Phase::WaitingElevation, Duration::ZERO).contains("não pode ser cancelado")

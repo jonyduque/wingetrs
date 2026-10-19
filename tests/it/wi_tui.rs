@@ -451,7 +451,7 @@ fn status_bar_waiting_uac_text() {
     let bar = screen.lines().last().unwrap();
     assert!(bar.contains("Instalando Contoso App"), "{bar}");
     assert!(
-        bar.contains("Aguardando permissão de administrador"),
+        bar.contains(wingetrs::install::progress::ELEVATION_NOTICE),
         "{bar}"
     );
     assert!(bar.contains("não pode ser cancelado"), "{bar}");
@@ -527,8 +527,15 @@ fn kindle_items() {
             (REGISTRY_ONLY_ITEM.to_string(), false),
         ]
     );
-    assert_eq!(BACKUP_ITEM, "Copiar pastas para backups antes");
-    assert_eq!(REGISTRY_ONLY_ITEM, "Remover só o registro");
+    // The same words as the CLI selector (one place: `removal`).
+    assert_eq!(
+        BACKUP_ITEM,
+        wingetrs::winget_install::removal::BACKUP_THEN_REMOVE_LABEL
+    );
+    assert_eq!(
+        REGISTRY_ONLY_ITEM,
+        wingetrs::winget_install::removal::REGISTRY_ONLY_LABEL
+    );
     // Marking "only the registry" replaces the uninstaller.
     update(&mut a, key(KeyCode::Down));
     update(&mut a, key(KeyCode::Down));

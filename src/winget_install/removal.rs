@@ -2,7 +2,7 @@
 //! of the shared data folders, the launch gate, the phase, then the uninstaller (queued on
 //! `msi.lock`) or the registry-only removal.
 use crate::install::executor::LaunchGate;
-use crate::install::progress::{Phase, ProgressEvent};
+use crate::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, Phase, ProgressEvent};
 use crate::installed::Hive;
 use crate::winget_install::launch::Elevation;
 use crate::winget_install::ops::WingetOpsError;
@@ -56,6 +56,14 @@ impl std::fmt::Display for RemovalError {
         }
     }
 }
+
+/// The removal choices of an app sharing data with another installation, the same words in
+/// the CLI selector and the TUI confirmation (the TUI shows the first and third as options of
+/// the item; unmarking the first is "remove without copying", Esc cancels).
+pub const BACKUP_THEN_REMOVE_LABEL: &str = "Backup das pastas e remover";
+pub const REMOVE_LABEL: &str = "Remover sem copiar";
+pub const REGISTRY_ONLY_LABEL: &str = "Só o registro";
+pub const CANCEL_LABEL: &str = "Cancelar";
 
 /// What the removal reports to and takes from its caller.
 pub struct Steps<'a> {
@@ -182,11 +190,22 @@ pub fn run_uninstaller(
         }
         (u.key_exists)(hive, key)
     };
-    // The helper waits for what the uninstaller left running (Task 190): say so instead of
-    // keeping the UAC text on screen.
+    // The helper's UAC prompt (Task 201): the notice right before it, the uninstaller's phase
+    // once the helper runs. The helper waits for what the uninstaller left running (Task 190):
+    // say so instead of keeping the UAC text on screen.
     let helper_line = |line: &str| {
-        if line == crate::bridge::worker::WAITING_UNINSTALLER {
-            progress(&ProgressEvent::Phase(waiting_uninstaller_phase(&plan.name)));
+        let phase = match line {
+            ELEVATION_NOTICE => Some(Phase::WaitingElevation),
+            ELEVATION_GRANTED => Some(Phase::Uninstalling {
+                name: plan.name.clone(),
+            }),
+            crate::bridge::worker::WAITING_UNINSTALLER => {
+                Some(waiting_uninstaller_phase(&plan.name))
+            }
+            _ => None,
+        };
+        if let Some(p) = phase {
+            progress(&ProgressEvent::Phase(p));
         }
         (u.helper_line)(line)
     };

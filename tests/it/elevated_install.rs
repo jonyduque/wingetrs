@@ -491,6 +491,10 @@ fn folder_refusal_is_not_a_refused_uac() {
             self.1.fetch_add(1, Ordering::SeqCst);
             Err(self.0.clone())
         }
+        // Refused before any prompt opens: no UAC notice (Task 201).
+        fn start_with_notice(&self, _: &mut dyn FnMut()) -> Result<Box<dyn Helper>, String> {
+            self.start()
+        }
     }
     let text = refusal_text(Path::new(r"C:\Users\u\Downloads"));
     let starts = Arc::new(AtomicUsize::new(0));

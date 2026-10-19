@@ -4,6 +4,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Shown, the same in the CLI and the TUI, before every UAC prompt wingetrs opens or a
+/// self-elevating installer opens (Task 201), with the clock running until it is answered.
+pub const ELEVATION_NOTICE: &str = "Aguardando autorização para executar como administrador";
+/// A refused UAC prompt (the CLI and the TUI say it the same way).
+pub const ELEVATION_REFUSED: &str = "Permissão de administrador recusada.";
+/// Progress line of the elevated helper once its UAC prompt was accepted (or the session's
+/// helper already runs): the phase leaves [`ELEVATION_NOTICE`].
+pub const ELEVATION_GRANTED: &str = "permissão de administrador concedida";
+
 /// One report through `download::Progress`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
@@ -52,6 +61,11 @@ pub enum Phase {
     Uninstalling { name: String },
     /// Native removal: waiting (up to two minutes) for the record of `name` to go away.
     CheckingRemoval { name: String },
+    /// Native winget install: the installer of `name` runs unelevated and asks for its own UAC
+    /// (`ElevationRequirement` `elevatesSelf`/`elevationRequired`); cannot be cancelled.
+    SelfElevating { name: String },
+    /// Bridge: `tool` (winget or scoop) is running the job; cannot be cancelled.
+    Bridge { tool: String },
 }
 
 /// Format name shown next to the file being extracted.
@@ -84,9 +98,9 @@ pub fn phase_title(phase: &Phase) -> String {
         Phase::Recording => "Registrando".into(),
         Phase::Removing { app } => format!("Removendo {app}"),
         Phase::Scanning => "Procurando resíduos".into(),
-        Phase::WaitingElevation => {
-            "Aguardando permissão de administrador (UAC) ou o programa elevado; se o UAC não aparecer, clique no escudo piscando na barra de tarefas".into()
-        }
+        Phase::WaitingElevation => format!(
+            "{ELEVATION_NOTICE} (se o UAC não aparecer, clique no escudo piscando na barra de tarefas)"
+        ),
         Phase::RunningInstaller { name } => {
             format!("Instalador de {name} rodando (pode abrir janelas)")
         }
@@ -98,6 +112,10 @@ pub fn phase_title(phase: &Phase) -> String {
         Phase::CheckingRemoval { name } => {
             format!("Conferindo a remoção de {name} (até 2 min)")
         }
+        Phase::SelfElevating { name } => {
+            format!("{ELEVATION_NOTICE} · instalador de {name} rodando (pode abrir janelas)")
+        }
+        Phase::Bridge { tool } => format!("{tool} rodando (pode abrir janelas)"),
     }
 }
 
@@ -122,7 +140,9 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::RunningInstaller { .. }
         | Phase::WaitingElevation
         | Phase::Uninstalling { .. }
-        | Phase::CheckingRemoval { .. } => format!("{text} · não pode ser cancelado"),
+        | Phase::CheckingRemoval { .. }
+        | Phase::SelfElevating { .. }
+        | Phase::Bridge { .. } => format!("{text} · não pode ser cancelado"),
         Phase::Preparing
         | Phase::WaitingInstaller
         | Phase::Extracting { .. }
@@ -134,4 +154,18 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::Verifying
         | Phase::CopyingFolders => text,
     }
+}
+
+/// A bridge output line as progress, the same in the CLI and the TUI: [`ELEVATION_NOTICE`]
+/// enters [`Phase::WaitingElevation`] (and is not shown as a line: the phase says it); the
+/// first other line after it returns to `Bridge { tool }`. The phase to enter (`None` keeps
+/// `current`) and whether the line is shown.
+pub fn bridge_line(line: &str, current: Option<&Phase>, tool: &str) -> (Option<Phase>, bool) {
+    if line == ELEVATION_NOTICE {
+        return (Some(Phase::WaitingElevation), false);
+    }
+    let back = matches!(current, Some(Phase::WaitingElevation)).then(|| Phase::Bridge {
+        tool: tool.to_string(),
+    });
+    (back, true)
 }

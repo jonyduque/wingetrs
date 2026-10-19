@@ -736,3 +736,570 @@ fn tui_status_shows_phase_and_clock() {
     let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
     assert!(text.ends_with("Colocando os arquivos · 00:10"), "{text}");
 }
+// ---- Task 201: every path's first phase, and the notice before every UAC prompt ----
+
+use wingetrs::bridge::elevated::{
+    ElevatedBridge, ElevatedError, ElevatedRunner, Helper, REFUSED_NOTE, Transport,
+};
+use wingetrs::bridge::worker::MachineHive;
+use wingetrs::bridge::{BridgeJob, BridgeOp, Tool as BridgeTool};
+use wingetrs::install::executor::LaunchGate;
+use wingetrs::install::progress::{
+    ELEVATION_GRANTED, ELEVATION_NOTICE, ELEVATION_REFUSED, phase_status, phase_title,
+};
+use wingetrs::installed::correlate::InstallScope;
+use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Verb};
+use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
+use wingetrs::winget_install::ops::{WingetCtx, WingetOpsError};
+use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan};
+use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
+use wingetrs::winget_install::uninstall::{UninstallPlan, UninstallTarget};
+use wingetrs::winget_install::uninstall_cmd::Rule;
+
+type Trace = std::sync::Arc<Mutex<Vec<String>>>;
+
+/// Records each launch (with its verb) into the shared trace; the installer "succeeds".
+struct TraceLauncher(Trace);
+
+impl Launcher for TraceLauncher {
+    fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("launch {:?}", spec.verb));
+        Ok(0)
+    }
+}
+
+/// No install flow asks the session's helper anything.
+struct NoHelper;
+impl ElevatedRunner for NoHelper {}
+
+struct NoMsix;
+impl MsixOps for NoMsix {
+    fn add(&self, _file: &Path) -> Result<AddResult, MsixError> {
+        Ok(AddResult::Installed)
+    }
+    fn remove(&self, _family: &str) -> Result<usize, MsixError> {
+        Ok(0)
+    }
+}
+
+/// A served winget installer of `kind` and its native plan.
+struct Native {
+    _server: MockServer,
+    t: tempfile::TempDir,
+    data: DataDir,
+    http: Http,
+    plan: WingetPlan,
+    trace: Trace,
+}
+
+impl Native {
+    async fn new(kind: &str, scope: Option<&str>, wanted: Scope, extra: &str) -> Native {
+        let body: Vec<u8> = (0..64 * 1024).map(|i| (i * 31 % 251) as u8).collect();
+        let sha = hex::encode(Sha256::digest(&body));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/setup"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(&server)
+            .await;
+        let scope = scope.map_or(String::new(), |s| format!("  Scope: {s}\n"));
+        let yaml = format!(
+            "PackageIdentifier: Pub.App\nPackageVersion: '1.0'\nPackageName: Contoso App\nPublisher: Contoso\nInstallers:\n- Architecture: x64\n  InstallerType: {kind}\n{scope}  InstallerUrl: {}/setup\n  InstallerSha256: {sha}\n{extra}",
+            server.uri()
+        );
+        let m = wingetrs::sources::winget::manifest::parse(yaml.as_bytes()).unwrap();
+        let host = Host {
+            arch: "x64".into(),
+            os: [10, 0, 22631, 0],
+            locale: "pt-BR".into(),
+        };
+        let plan = match wingetrs::winget_install::plan::plan(
+            &m,
+            &host,
+            ScopeWanted::Prefer(wanted),
+            None,
+        )
+        .unwrap()
+        {
+            PlanOrBridge::Native(p) => p,
+            PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        };
+        let t = tempfile::tempdir().unwrap();
+        let data = DataDir::new(t.path().join("root"));
+        Native {
+            _server: server,
+            t,
+            data,
+            http: Http::new().unwrap(),
+            plan,
+            trace: Trace::default(),
+        }
+    }
+
+    /// Runs the native install with `wait`; phases and launches land in `self.trace`.
+    async fn install(&self, wait: LockWait) -> Result<(), WingetOpsError> {
+        let launcher = TraceLauncher(std::sync::Arc::clone(&self.trace));
+        let trace = std::sync::Arc::clone(&self.trace);
+        let progress = move |ev: &ProgressEvent| {
+            if let ProgressEvent::Phase(p) = ev {
+                trace.lock().unwrap().push(format!("{p:?}"));
+            }
+        };
+        let ctx = WingetCtx {
+            data: &self.data,
+            http: &self.http,
+            wait,
+            progress: &progress,
+            gate: LaunchGate::default(),
+            launcher: &launcher,
+            elevated: &NoHelper,
+            msix: &NoMsix,
+            scan: &Vec::new,
+            msiexec: self.t.path().join("System32").join("msiexec.exe"),
+            busy: &|| false,
+            sleep: &|_| {},
+        };
+        wingetrs::winget_install::ops::install(&ctx, &self.plan)
+            .await
+            .map(|_| ())
+    }
+
+    fn trace(&self) -> Vec<String> {
+        self.trace.lock().unwrap().clone()
+    }
+}
+
+fn bridge_job(scope: Option<InstallScope>) -> BridgeJob {
+    BridgeJob {
+        op: BridgeOp::Upgrade,
+        tool: BridgeTool::Winget,
+        target: "Pub.App".into(),
+        name: "Contoso App".into(),
+        installed: Some("1.0".into()),
+        available: Some("2.0".into()),
+        scope,
+    }
+}
+
+/// A started helper whose channel is empty: enough to see the start.
+struct IdleHelper {
+    reader: Cursor<Vec<u8>>,
+    writer: Vec<u8>,
+}
+
+impl Helper for IdleHelper {
+    fn reader(&mut self) -> &mut dyn std::io::BufRead {
+        &mut self.reader
+    }
+    fn writer(&mut self) -> &mut dyn Write {
+        &mut self.writer
+    }
+    fn wait_exit(&mut self, _limit: Duration) -> bool {
+        true
+    }
+    fn alive(&mut self) -> bool {
+        true
+    }
+}
+
+/// The UAC prompt of the helper: recorded in the trace; accepted or refused.
+struct UacTransport {
+    trace: Trace,
+    refuse: bool,
+}
+
+impl Transport for UacTransport {
+    fn start(&self) -> Result<Box<dyn Helper>, String> {
+        self.trace.lock().unwrap().push("uac".into());
+        if self.refuse {
+            Err("recusado".into())
+        } else {
+            Ok(Box::new(IdleHelper {
+                reader: Cursor::new(Vec::new()),
+                writer: Vec::new(),
+            }))
+        }
+    }
+}
+
+/// The trace of `exec_for` of `job` on `bridge`: its lines, after what the transport recorded.
+fn exec_for_lines(bridge: &ElevatedBridge, job: &BridgeJob, trace: &Trace) -> bool {
+    let mut unused = |_: &str, _: &[String], _: &mut dyn FnMut(&str)| Ok((0, Vec::new()));
+    let chosen = bridge.exec_for(job, &mut unused, &mut |l: &str| {
+        trace.lock().unwrap().push(l.to_string())
+    });
+    chosen.elevated()
+}
+
+#[tokio::test]
+async fn every_path_emits_first_phase_immediately() {
+    // Scoop install: `Preparando` before the `install.lock` wait (held: NoWait gives up).
+    let tool = Tool::new().await;
+    let catalog = wingetrs::catalog::Catalog::open_in_memory().unwrap();
+    let events: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let record = |ev: &ProgressEvent| events.lock().unwrap().push(trace_line(ev));
+    let ctx = OpsCtx {
+        data: &tool.data,
+        http: &tool.http,
+        catalog: &catalog,
+        effects: tool.effects(),
+        wait: LockWait::NoWait,
+        progress: &record,
+        in_use: &nothing_in_use,
+        residue: ResidueScan::none(),
+        msiexec: Msiexec::DISABLED,
+        launch: Default::default(),
+        runners: wingetrs::install::executor::Runners::disabled(),
+    };
+    let held = wingetrs::cache::UpdateLock::try_acquire(&tool.layout.install_lock())
+        .unwrap()
+        .unwrap();
+    let r = ops::apply(&ctx, std::slice::from_ref(&tool.plan)).await;
+    assert!(r.is_err(), "the lock is held");
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("{:?}", Phase::Preparing)],
+        "scoop install"
+    );
+    drop(held);
+
+    // Scoop uninstall: `Removendo` before the lock wait.
+    tool.install(&|_| {}, wingetrs::install::extract::extract)
+        .await;
+    let plan = ops::plan_uninstall(&ctx, "tool", false).unwrap();
+    events.lock().unwrap().clear();
+    let held = wingetrs::cache::UpdateLock::try_acquire(&tool.layout.install_lock())
+        .unwrap()
+        .unwrap();
+    assert!(ops::uninstall(&ctx, &plan).is_err(), "the lock is held");
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("{:?}", Phase::Removing { app: "tool".into() })],
+        "scoop uninstall"
+    );
+    drop(held);
+
+    // Native winget install (exe and MSI alike; MSIX shares the path): `Preparando` before
+    // the `install.lock` wait.
+    let n = Native::new("inno", Some("user"), Scope::User, "").await;
+    let held = wingetrs::cache::UpdateLock::try_acquire(&n.data.install_layout().install_lock())
+        .unwrap()
+        .unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(30), n.install(LockWait::NoWait))
+        .await
+        .expect("NoWait never waits");
+    assert!(matches!(r, Err(WingetOpsError::Busy)), "{r:?}");
+    assert_eq!(
+        n.trace(),
+        [format!("{:?}", Phase::Preparing)],
+        "winget install"
+    );
+    drop(held);
+
+    // Native removal: `Preparando` while the lock is still awaited.
+    let events: Mutex<Vec<ProgressEvent>> = Mutex::new(Vec::new());
+    let progress = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
+    let gate = LaunchGate::default();
+    let steps = wingetrs::winget_install::removal::Steps {
+        gate: &gate,
+        progress: &progress,
+        backups: Path::new("backups"),
+        stamp: "1",
+        free_space: &|_| None,
+    };
+    let plan = UninstallPlan {
+        target: UninstallTarget::Msix {
+            family: "Pub.App_8wekyb3d8bbwe".into(),
+        },
+        name: "Contoso App".into(),
+        version: None,
+        command: None,
+        elevation: wingetrs::winget_install::launch::Elevation::Never,
+        shared: None,
+    };
+    let removal = wingetrs::winget_install::removal::remove(
+        &steps,
+        std::future::pending::<Result<(), WingetOpsError>>(),
+        &plan,
+        wingetrs::winget_install::removal::RemovalChoice::Remove,
+        |_| unreachable!("the lock never came"),
+        || unreachable!("the lock never came"),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), removal)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [ProgressEvent::Phase(Phase::Preparing)],
+        "winget removal"
+    );
+
+    // Bridge, CLI: the tool's phase before the tool runs.
+    let events: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let progress = |ev: &ProgressEvent| events.lock().unwrap().push(trace_line(ev));
+    wingetrs::cli::output::bridge_progress(&progress, &|_| {}, "winget", |_| {
+        events.lock().unwrap().push("run".into());
+    });
+    let bridge = Phase::Bridge {
+        tool: "winget".into(),
+    };
+    assert_eq!(
+        *events.lock().unwrap(),
+        [format!("{bridge:?}"), "run".to_string()],
+        "bridge (CLI)"
+    );
+
+    // Bridge, TUI: the job's clock runs from its start, before any line.
+    use wingetrs::tui::app::{Action, App, Msg, Queued, update};
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    let base = Instant::now();
+    a.now = base;
+    a.queue.push_back(Queued {
+        id: 1,
+        label: "Atualizar Contoso App".into(),
+        action: Action::Bridge(bridge_job(None)),
+    });
+    update(&mut a, Msg::RetryQueue);
+    a.now = base + Duration::from_secs(2);
+    let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(
+        text.ends_with(&phase_status(&bridge, Duration::from_secs(2))),
+        "bridge (TUI): {text}"
+    );
+    assert!(text.contains("· 00:02 · não pode ser cancelado"), "{text}");
+}
+
+#[tokio::test]
+async fn elevation_notice_before_every_uac() {
+    // The session's helper (bridge jobs): the notice, then the UAC prompt, then "granted".
+    let trace = Trace::default();
+    let bridge = ElevatedBridge::new(Box::new(UacTransport {
+        trace: std::sync::Arc::clone(&trace),
+        refuse: false,
+    }));
+    let job = bridge_job(Some(InstallScope::Machine));
+    assert!(exec_for_lines(&bridge, &job, &trace));
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [ELEVATION_NOTICE, "uac", ELEVATION_GRANTED],
+        "helper of a bridge job"
+    );
+    // The helper runs: no second prompt, no second notice.
+    trace.lock().unwrap().clear();
+    assert!(exec_for_lines(&bridge, &job, &trace));
+    assert!(trace.lock().unwrap().is_empty(), "{trace:?}");
+
+    // The helper of a removal (HKLM uninstaller): the notice before its UAC prompt.
+    let trace = Trace::default();
+    let bridge = ElevatedBridge::new(Box::new(UacTransport {
+        trace: std::sync::Arc::clone(&trace),
+        refuse: false,
+    }));
+    let _lost = bridge.run_uninstaller_lines(
+        MachineHive::Hklm64,
+        "{K}",
+        Rule::Msi,
+        false,
+        &mut |l: &str| trace.lock().unwrap().push(l.to_string()),
+    );
+    let seen = trace.lock().unwrap().clone();
+    assert_eq!(
+        seen[..3],
+        [ELEVATION_NOTICE, "uac", ELEVATION_GRANTED],
+        "helper of a removal: {seen:?}"
+    );
+
+    // Refused: the notice, the prompt, then the refusal (the job runs unelevated).
+    let trace = Trace::default();
+    let bridge = ElevatedBridge::new(Box::new(UacTransport {
+        trace: std::sync::Arc::clone(&trace),
+        refuse: true,
+    }));
+    assert!(!exec_for_lines(&bridge, &job, &trace));
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [ELEVATION_NOTICE, "uac", REFUSED_NOTE]
+    );
+    assert!(REFUSED_NOTE.starts_with(ELEVATION_REFUSED));
+    let refused = bridge
+        .run_uninstaller_lines(MachineHive::Hklm64, "{K}", Rule::Msi, false, &mut |_| {})
+        .unwrap_err();
+    assert_eq!(refused, ElevatedError::Refused);
+    assert_eq!(refused.to_string(), ELEVATION_REFUSED);
+
+    // Refused before any prompt opens (wingetrs outside an admin-only folder): no notice,
+    // also through the CLI's wrapper.
+    struct BeforePrompt;
+    impl Transport for BeforePrompt {
+        fn start(&self) -> Result<Box<dyn Helper>, String> {
+            Err(wingetrs::bridge::helper_folder::refusal_text(Path::new(
+                r"C:\Users\u\Downloads",
+            )))
+        }
+        fn start_with_notice(&self, _: &mut dyn FnMut()) -> Result<Box<dyn Helper>, String> {
+            self.start()
+        }
+    }
+    let trace = Trace::default();
+    let bridge = ElevatedBridge::new(Box::new(
+        wingetrs::bridge::helper_folder::NoticeTransport::new(
+            Box::new(BeforePrompt),
+            Box::new(|_| {}),
+        ),
+    ));
+    assert!(!exec_for_lines(&bridge, &job, &trace));
+    let seen = trace.lock().unwrap().clone();
+    assert!(!seen.iter().any(|l| l == ELEVATION_NOTICE), "{seen:?}");
+
+    // `runas` per installer: the notice phase before the launch.
+    let n = Native::new("inno", Some("machine"), Scope::Machine, "").await;
+    n.install(LockWait::Block(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    let trace = n.trace();
+    let at = |what: &str| {
+        trace
+            .iter()
+            .position(|l| l == what)
+            .unwrap_or_else(|| panic!("{what} missing: {trace:?}"))
+    };
+    let waiting = format!("{:?}", Phase::WaitingElevation);
+    assert!(
+        at(&waiting) < at(&format!("launch {:?}", Verb::RunAs)),
+        "{trace:?}"
+    );
+    assert!(phase_title(&Phase::WaitingElevation).starts_with(ELEVATION_NOTICE));
+
+    // An installer that elevates itself (`elevatesSelf`; `elevationRequired` with a user
+    // scope): launched unelevated, the notice in its phase before the launch.
+    for (scope, wanted, requirement) in [
+        (None, Scope::User, "elevatesSelf"),
+        (Some("user"), Scope::User, "elevationRequired"),
+    ] {
+        let extra = format!("  ElevationRequirement: {requirement}\n");
+        let n = Native::new("inno", scope, wanted, &extra).await;
+        n.install(LockWait::Block(Duration::from_secs(30)))
+            .await
+            .unwrap();
+        let trace = n.trace();
+        let phase = Phase::SelfElevating {
+            name: "Contoso App".into(),
+        };
+        let at = |what: &str| {
+            trace
+                .iter()
+                .position(|l| l == what)
+                .unwrap_or_else(|| panic!("{what} missing: {trace:?}"))
+        };
+        assert!(
+            at(&format!("{phase:?}")) < at(&format!("launch {:?}", Verb::Open)),
+            "{requirement}: {trace:?}"
+        );
+        assert!(phase_title(&phase).starts_with(ELEVATION_NOTICE));
+        assert!(phase_status(&phase, Duration::ZERO).ends_with("não pode ser cancelado"));
+    }
+
+    // Neither: no notice.
+    let n = Native::new("inno", Some("user"), Scope::User, "").await;
+    n.install(LockWait::Block(Duration::from_secs(30)))
+        .await
+        .unwrap();
+    let trace = n.trace();
+    assert!(
+        !trace.iter().any(|l| l.contains("Elevat")),
+        "no prompt, no notice: {trace:?}"
+    );
+}
+
+#[test]
+fn elevation_notice_same_text_cli_tui() {
+    use wingetrs::tui::app::{Action, App, Msg, Queued, Running, update};
+    let base = Instant::now();
+
+    // CLI: the progress line of the phase.
+    let mut ph = Phases::new();
+    ph.update_at(&ProgressEvent::Phase(Phase::WaitingElevation), base);
+    let cli = ph
+        .line_at(0, ascii(), base + Duration::from_secs(4))
+        .unwrap();
+    assert!(cli.contains(ELEVATION_NOTICE), "{cli}");
+    assert!(cli.contains("· 00:04"), "{cli}");
+
+    // TUI: the status bar of a native job.
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.now = base;
+    a.running = Some(Running {
+        id: 1,
+        label: "Instalar Contoso App".into(),
+        progress: None,
+        action: None,
+    });
+    update(&mut a, Msg::InstallPhase(Phase::WaitingElevation));
+    a.now = base + Duration::from_secs(4);
+    let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(tui.contains(ELEVATION_NOTICE), "{tui}");
+    assert!(tui.contains("· 00:04"), "{tui}");
+
+    // Bridge, CLI: the helper's notice line becomes the phase (not a printed line); the next
+    // line goes back to the tool's phase.
+    let shown: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let ph = Mutex::new(Phases::new());
+    let progress = |ev: &ProgressEvent| ph.lock().unwrap().update_at(ev, base);
+    wingetrs::cli::output::bridge_progress(
+        &progress,
+        &|l: &str| shown.lock().unwrap().push(l.to_string()),
+        "winget",
+        |on_line| {
+            on_line(ELEVATION_NOTICE);
+            let line = ph
+                .lock()
+                .unwrap()
+                .line_at(0, ascii(), base + Duration::from_secs(1))
+                .unwrap();
+            assert!(line.contains(ELEVATION_NOTICE), "{line}");
+            on_line(ELEVATION_GRANTED);
+        },
+    );
+    let line = ph
+        .lock()
+        .unwrap()
+        .line_at(0, ascii(), base + Duration::from_secs(1))
+        .unwrap();
+    assert!(line.contains("winget rodando"), "{line}");
+    assert_eq!(
+        *shown.lock().unwrap(),
+        [format!("  {ELEVATION_GRANTED}")],
+        "the notice is the phase, not a line"
+    );
+
+    // Bridge, TUI: the same notice line becomes the status bar's phase, with its clock.
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.now = base;
+    a.queue.push_back(Queued {
+        id: 1,
+        label: "Atualizar Contoso App".into(),
+        action: Action::Bridge(bridge_job(Some(InstallScope::Machine))),
+    });
+    update(&mut a, Msg::RetryQueue);
+    update(&mut a, Msg::BridgeLine(ELEVATION_NOTICE.to_string()));
+    a.now = base + Duration::from_secs(4);
+    let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(tui.contains(ELEVATION_NOTICE), "{tui}");
+    assert!(tui.contains("· 00:04"), "{tui}");
+    update(&mut a, Msg::BridgeLine(ELEVATION_GRANTED.to_string()));
+    let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(!tui.contains(ELEVATION_NOTICE), "{tui}");
+    assert!(tui.contains(ELEVATION_GRANTED), "{tui}");
+
+    // A refused prompt reads the same on both sides.
+    assert_eq!(
+        wingetrs::winget_install::codes::UAC_REFUSED,
+        ELEVATION_REFUSED
+    );
+    assert_eq!(WingetOpsError::UacRefused.to_string(), ELEVATION_REFUSED);
+}

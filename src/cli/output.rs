@@ -988,7 +988,9 @@ impl Phases {
                 | Phase::Verifying
                 | Phase::CopyingFolders
                 | Phase::Uninstalling { .. }
-                | Phase::CheckingRemoval { .. },
+                | Phase::CheckingRemoval { .. }
+                | Phase::SelfElevating { .. }
+                | Phase::Bridge { .. },
                 _,
             ))
             | None => None,
@@ -1047,7 +1049,9 @@ impl Phases {
                 | Phase::Verifying
                 | Phase::CopyingFolders
                 | Phase::Uninstalling { .. }
-                | Phase::CheckingRemoval { .. },
+                | Phase::CheckingRemoval { .. }
+                | Phase::SelfElevating { .. }
+                | Phase::Bridge { .. },
                 _,
             ))
             | None => return None,
@@ -1123,7 +1127,9 @@ impl Phases {
                 Phase::RunningInstaller { .. }
                 | Phase::WaitingElevation
                 | Phase::Uninstalling { .. }
-                | Phase::CheckingRemoval { .. } => {
+                | Phase::CheckingRemoval { .. }
+                | Phase::SelfElevating { .. }
+                | Phase::Bridge { .. } => {
                     main = format!("{spin} {}", phase_status(phase, elapsed));
                     if elapsed >= NATIVE_QUIET && !matches!(phase, Phase::CheckingRemoval { .. }) {
                         warn = format!(
@@ -1192,6 +1198,32 @@ impl Phases {
         let rate = latest.saturating_sub(anchor.1) as f64 / secs;
         (secs >= 0.5 && rate > 0.0).then_some(rate)
     }
+}
+
+/// Runs a bridge job (`run` gets the tool's line sink) with the CLI's progress: `Bridge { tool }`
+/// from the first instant, then each output line through `progress::bridge_line` (the
+/// elevation notice becomes the phase, with its clock; other lines go to `notice`, above the
+/// progress line). The caller ends the progress line afterwards.
+pub fn bridge_progress<R>(
+    progress: &dyn Fn(&ProgressEvent),
+    notice: &dyn Fn(&str),
+    tool: &str,
+    run: impl FnOnce(&mut dyn FnMut(&str)) -> R,
+) -> R {
+    let mut current = Phase::Bridge {
+        tool: tool.to_string(),
+    };
+    progress(&ProgressEvent::Phase(current.clone()));
+    run(&mut |line: &str| {
+        let (next, show) = crate::install::progress::bridge_line(line, Some(&current), tool);
+        if let Some(p) = next {
+            current = p;
+            progress(&ProgressEvent::Phase(current.clone()));
+        }
+        if show {
+            notice(&format!("  {line}"));
+        }
+    })
 }
 
 /// Progress for a stderr that is not a terminal: one plain line per phase change (no `\r`,

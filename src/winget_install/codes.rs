@@ -3,7 +3,7 @@
 use crate::sources::winget::manifest::{ExpectedReturnCode, InstallerKind};
 
 /// Shown when the user declines the UAC prompt.
-pub const UAC_REFUSED: &str = "Permissão de administrador recusada.";
+pub const UAC_REFUSED: &str = crate::install::progress::ELEVATION_REFUSED;
 
 /// Port of `ExpectedReturnCodeEnum` (ManifestCommon.cpp) plus `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

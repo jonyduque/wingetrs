@@ -11,11 +11,13 @@ use super::ops::{
 };
 use super::plan::{PlanOrBridge, WingetPlan, command_for, plan_with_mode};
 use super::post_check::version_warning;
+use super::removal::{run_uninstaller, uninstaller_phase};
 use super::select::{Host, Refusal, Scope, ScopeWanted, arch_applicable};
-use super::uninstall::{MsiQueue, UninstallCtx, UninstallPlan, UninstallStatus, uninstall_queued};
+use super::uninstall::{MsiQueue, UninstallCtx, UninstallPlan, UninstallStatus};
 use super::uninstall_cmd::ArpDetails;
 use crate::config::{DefaultScope, InstallerMode, WingetEngine};
 use crate::core::version::Version;
+use crate::install::progress::{Phase, ProgressEvent};
 use crate::installed::Hive;
 use crate::installed::correlate::{InstallScope, ListRow, UpdateState};
 use crate::sources::winget::manifest::{EffectiveInstaller, InstallerKind, MergedManifest};
@@ -292,6 +294,8 @@ pub async fn upgrade(
                         .map_err(WingetOpsError::from)?,
                 );
             }
+            // A live line from the first instant: the `install.lock` wait is silent.
+            (wctx.progress)(&ProgressEvent::Phase(Phase::Preparing));
             // Removal and install under one `install.lock`: nothing runs in between.
             let lock = lock_install_for(&wctx.data.install_layout(), wctx.wait, &wctx.gate).await?;
             // Like winget: the new installer is downloaded and verified (and kept open, so it
@@ -301,7 +305,10 @@ pub async fn upgrade(
             if !wctx.gate.try_launch() {
                 return Err(WingetOpsError::Cancelled.into());
             }
-            let removed = uninstall_queued(uctx, Some(&MsiQueue::of(wctx)), previous)
+            // The same phases as a removal: the uninstaller (or the helper's UAC notice), then
+            // the record watch.
+            (wctx.progress)(&ProgressEvent::Phase(uninstaller_phase(previous)));
+            let removed = run_uninstaller(uctx, &MsiQueue::of(wctx), previous, wctx.progress)
                 .map_err(UpgradeError::Uninstall)?;
             if removed.status != UninstallStatus::Removed || removed.warning.is_some() {
                 return Err(UpgradeError::NotRemoved(

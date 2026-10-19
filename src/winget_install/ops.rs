@@ -234,6 +234,8 @@ pub async fn install(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
 ) -> Result<InstallReport, WingetOpsError> {
+    // A live line from the first instant: the `install.lock` wait is silent.
+    phase(ctx, Phase::Preparing);
     let lock = lock_install_for(&ctx.data.install_layout(), ctx.wait, &ctx.gate).await?;
     install_locked(ctx, plan, &lock).await
 }
@@ -431,6 +433,9 @@ fn run_command(
         verb,
     };
     let name = plan.name.clone();
+    // An unelevated installer whose manifest says it elevates itself opens its own UAC prompt:
+    // the notice stays with its phase (Task 201).
+    let asks_uac = super::launch::self_elevates(plan.installer.elevation.as_deref());
     let mut once: Box<RunOnce<'_>> = Box::new(move || {
         let running = Phase::RunningInstaller { name: name.clone() };
         let launched = match verb {
@@ -439,6 +444,10 @@ fn run_command(
                 phase(ctx, Phase::WaitingElevation);
                 ctx.launcher
                     .run_started(&spec, &mut || phase(ctx, running.clone()))
+            }
+            Verb::Open if asks_uac => {
+                phase(ctx, Phase::SelfElevating { name: name.clone() });
+                ctx.launcher.run(&spec)
             }
             Verb::Open => {
                 phase(ctx, running);

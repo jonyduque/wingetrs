@@ -1189,3 +1189,68 @@ fn helper_wait_line_shows_the_waiting_phase() {
         [wingetrs::bridge::worker::WAITING_UNINSTALLER]
     );
 }
+
+/// Task 201: the helper's UAC notice line shows the notice phase; once the helper runs, the
+/// uninstaller's phase replaces it (the notice never stays on screen during the uninstall).
+#[test]
+fn helper_uac_lines_show_notice_then_uninstaller() {
+    use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, Phase, ProgressEvent};
+    use wingetrs::winget_install::removal::run_uninstaller;
+
+    /// `FakeElevated` whose helper opens its UAC prompt first.
+    struct Prompting(FakeElevated);
+    impl ElevatedRunner for Prompting {
+        fn run_uninstaller_lines(
+            &self,
+            hive: MachineHive,
+            key: &str,
+            rule: Rule,
+            nsis_hint: bool,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<i32, ElevatedError> {
+            on_line(ELEVATION_NOTICE);
+            on_line(ELEVATION_GRANTED);
+            self.0.run_uninstaller(hive, key, rule, nsis_hint)
+        }
+    }
+
+    let d = kindle(Hive::MachineX64, "Kindle", "2.8.3");
+    let p = plan_uninstall(&d, true, &[], true, &known(), &user(), &no_folders).unwrap();
+    assert_eq!(p.elevation, Elevation::Helper);
+    let elevated = Prompting(FakeElevated::default());
+    let launcher = FakeLauncher::new(0);
+    let msix = FakeMsix::default();
+    let clock = FakeClock::default();
+    let gone = |_: Hive, _: &str| false;
+    let ctx = UninstallCtx {
+        launcher: &launcher,
+        elevated: &elevated,
+        msix: &msix,
+        key_exists: &gone,
+        clock: &clock,
+        user_expand: &user_env,
+        msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+        helper_line: &|_| {},
+    };
+    let dir = tempfile::TempDir::new().unwrap();
+    let queue = MsiQueue {
+        lock: dir.path().join("msi.lock"),
+        busy: &|| false,
+        sleep: &|_| {},
+    };
+    let events = Mutex::new(Vec::new());
+    let progress = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
+    run_uninstaller(&ctx, &queue, &p, &progress).unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            ProgressEvent::Phase(Phase::WaitingElevation),
+            ProgressEvent::Phase(Phase::Uninstalling {
+                name: p.name.clone()
+            }),
+            ProgressEvent::Phase(Phase::CheckingRemoval {
+                name: p.name.clone()
+            }),
+        ]
+    );
+}

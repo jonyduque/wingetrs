@@ -1192,6 +1192,19 @@ async fn cli_kindle_backup_then_remove() {
             "Cancelar".to_string(),
         ]
     );
+    // The TUI's confirmation offers the same words (one place: `removal`).
+    {
+        use wingetrs::tui::app::{BACKUP_ITEM, REGISTRY_ONLY_ITEM};
+        use wingetrs::winget_install::removal::{
+            BACKUP_THEN_REMOVE_LABEL, CANCEL_LABEL, REGISTRY_ONLY_LABEL, REMOVE_LABEL,
+        };
+        assert_eq!(
+            ui.picked_items.borrow()[0],
+            [BACKUP_THEN_REMOVE_LABEL, REMOVE_LABEL, CANCEL_LABEL]
+        );
+        assert_eq!(BACKUP_ITEM, BACKUP_THEN_REMOVE_LABEL);
+        assert_eq!(REGISTRY_ONLY_ITEM, REGISTRY_ONLY_LABEL);
+    }
     // Copied under `install.lock`, before the uninstaller ran.
     assert_eq!(
         *fake.steps.lock().unwrap(),

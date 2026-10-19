@@ -212,14 +212,23 @@ pub(super) async fn install_bridge(
     let mut exec = run_tool;
     let exec: BridgeExec<'_> = &mut exec;
     stop.interrupts.hold();
-    let result = crate::tui::jobs::run_bridge_install(
-        helper,
-        &job,
-        scope_fallback,
-        &msi_lock,
-        exec,
-        &mut |line: &str| anstream::println!("  {line}"),
+    // Spinner and clock from the first instant; the UAC notice becomes the phase.
+    let result = super::output::bridge_progress(
+        ctx.progress,
+        &|line: &str| ui.notice(line),
+        job.tool.name(),
+        |on_line| {
+            crate::tui::jobs::run_bridge_install(
+                helper,
+                &job,
+                scope_fallback,
+                &msi_lock,
+                exec,
+                on_line,
+            )
+        },
     );
+    ui.end_progress();
     stop.interrupts.release();
     match result {
         Ok(done) => {
@@ -645,23 +654,23 @@ fn removal_choice(
         let size = shared.size.map(|s| human_size(s.bytes)).unwrap_or_default();
         options.push((
             RemovalChoice::BackupThenRemove,
-            item("Backup das pastas e remover", size),
+            item(removal::BACKUP_THEN_REMOVE_LABEL, size),
         ));
     }
     options.push((
         RemovalChoice::Remove,
-        item("Remover sem copiar", String::new()),
+        item(removal::REMOVE_LABEL, String::new()),
     ));
     if shared.registry_only_allowed {
         options.push((
             RemovalChoice::RegistryOnly,
-            item("Só o registro", String::new()),
+            item(removal::REGISTRY_ONLY_LABEL, String::new()),
         ));
     }
     let items = options
         .iter()
         .map(|(_, i)| i.clone())
-        .chain(std::iter::once(item("Cancelar", String::new())))
+        .chain(std::iter::once(item(removal::CANCEL_LABEL, String::new())))
         .collect();
     Ok(ui
         .pick(items)?
@@ -871,7 +880,15 @@ fn upgrade_bridge<F: WingetFlows>(
         return Ok(());
     }
     stop.interrupts.hold();
-    let result = flows.upgrade_bridge(&job, &mut |line: &str| say(&format!("  {line}")));
+    // Spinner and clock from the first instant; the UAC notice becomes the phase.
+    let progress = flows.progress();
+    let result = super::output::bridge_progress(
+        &*progress,
+        &|line: &str| ui.notice(line),
+        job.tool.name(),
+        |on_line| flows.upgrade_bridge(&job, on_line),
+    );
+    ui.end_progress();
     stop.interrupts.release();
     match result {
         Ok(done) => {

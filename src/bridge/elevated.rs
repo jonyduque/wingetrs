@@ -6,6 +6,7 @@
 use super::helper_folder::is_refusal;
 use super::worker::{self, DeleteReason, MachineHive, Reply, Request};
 use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
+use crate::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, ELEVATION_REFUSED};
 use crate::installed::correlate::InstallScope;
 use crate::winget_install::uninstall_cmd::Rule;
 use std::io::{BufRead, Write};
@@ -13,8 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
-/// Progress line of a machine-wide job whose elevation was refused.
-pub const REFUSED_NOTE: &str = "sem permissão de administrador: atualizando sem elevar";
+/// Progress line of a machine-wide job whose elevation was refused (starts with
+/// `progress::ELEVATION_REFUSED`, as every refused UAC prompt).
+pub const REFUSED_NOTE: &str = "Permissão de administrador recusada. Atualizando sem elevar.";
 
 /// The channel to a started helper.
 pub trait Helper: Send {
@@ -29,6 +31,13 @@ pub trait Helper: Send {
 /// Starts the helper (the one UAC prompt) and connects to it; `Err` carries the reason.
 pub trait Transport: Send + Sync {
     fn start(&self) -> Result<Box<dyn Helper>, String>;
+
+    /// `start`, calling `notice` right before the UAC prompt opens (Task 201), never when
+    /// starting is refused before any prompt. By default `notice` comes right before `start`.
+    fn start_with_notice(&self, notice: &mut dyn FnMut()) -> Result<Box<dyn Helper>, String> {
+        notice();
+        self.start()
+    }
 }
 
 enum State {
@@ -83,7 +92,9 @@ impl ElevatedBridge {
 
     /// The exec for `job`: the helper for a winget job installed for the whole machine, unless
     /// elevation was refused this session; `current` otherwise. The first such job starts the
-    /// helper; a refusal is told on `on_line` once and never asked again.
+    /// helper: `progress::ELEVATION_NOTICE` on `on_line` right before the UAC prompt, then
+    /// `ELEVATION_GRANTED` once accepted; a refusal is told on `on_line` once and never asked
+    /// again.
     pub fn exec_for<'a>(
         &'a self,
         job: &'a BridgeJob,
@@ -93,8 +104,13 @@ impl ElevatedBridge {
         let wanted = job.tool == Tool::Winget && job.scope == Some(InstallScope::Machine);
         let elevated = wanted && {
             let mut state = self.lock();
-            match self.ensure_started(&mut state) {
-                Ok(()) => true,
+            match self.ensure_started(&mut state, on_line) {
+                Ok(started) => {
+                    if started {
+                        on_line(ELEVATION_GRANTED);
+                    }
+                    true
+                }
                 Err((_, false)) => false,
                 Err((e, true)) => {
                     tracing::warn!(error = %e, "bridge: elevation refused; running unelevated");
@@ -121,9 +137,15 @@ impl ElevatedBridge {
     }
 
     /// Makes `state` `Running`: a helper that exited (idle) is dropped and a new one started
-    /// (a new UAC prompt). `Err((reason, true))` when starting failed now (the state becomes
-    /// `Refused`), `Err((reason, false))` when it was refused before.
-    fn ensure_started(&self, state: &mut State) -> Result<(), (String, bool)> {
+    /// (a new UAC prompt, announced on `notice` with `progress::ELEVATION_NOTICE` right before
+    /// it). `Ok(true)` when a helper was started now. `Err((reason, true))` when starting
+    /// failed now (the state becomes `Refused`), `Err((reason, false))` when it was refused
+    /// before.
+    fn ensure_started(
+        &self,
+        state: &mut State,
+        notice: &mut dyn FnMut(&str),
+    ) -> Result<bool, (String, bool)> {
         if let State::Running(helper) = state
             && !helper.alive()
         {
@@ -131,19 +153,24 @@ impl ElevatedBridge {
             *state = State::NotStarted;
         }
         match state {
-            State::Running(_) => Ok(()),
+            State::Running(_) => Ok(false),
             State::Refused(reason) => Err((reason.clone(), false)),
-            State::NotStarted => match self.transport.start() {
-                Ok(helper) => {
-                    tracing::info!("bridge: elevated helper started");
-                    *state = State::Running(helper);
-                    Ok(())
+            State::NotStarted => {
+                match self
+                    .transport
+                    .start_with_notice(&mut || notice(ELEVATION_NOTICE))
+                {
+                    Ok(helper) => {
+                        tracing::info!("bridge: elevated helper started");
+                        *state = State::Running(helper);
+                        Ok(true)
+                    }
+                    Err(e) => {
+                        *state = State::Refused(e.clone());
+                        Err((e, true))
+                    }
                 }
-                Err(e) => {
-                    *state = State::Refused(e.clone());
-                    Err((e, true))
-                }
-            },
+            }
         }
     }
 
@@ -197,8 +224,9 @@ impl ElevatedBridge {
             retried = true;
             tracing::warn!(error = %e, "bridge: request not sent; starting a new helper");
             *state = State::NotStarted;
-            if let Err((reason, _)) = self.ensure_started(state) {
-                return Err(Fail::Refused(reason));
+            match self.ensure_started(state, on_line) {
+                Ok(_) => on_line(ELEVATION_GRANTED),
+                Err((reason, _)) => return Err(Fail::Refused(reason)),
             }
         }
     }
@@ -280,7 +308,7 @@ impl std::fmt::Display for ElevatedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ElevatedError::NotAdminFolder(text) => f.write_str(text),
-            ElevatedError::Refused => f.write_str("sem permissão de administrador"),
+            ElevatedError::Refused => f.write_str(ELEVATION_REFUSED),
             ElevatedError::Lost(e) => write!(f, "auxiliar elevado perdido: {e}"),
             ElevatedError::Remote(e) => write!(f, "auxiliar elevado: {e}"),
         }
@@ -387,20 +415,23 @@ impl ElevatedRunner for ElevatedBridge {
 }
 
 impl ElevatedBridge {
-    /// Sends one request that needs the helper, starting it when needed (the one UAC prompt);
-    /// a refusal this session is final. The helper's exit code.
+    /// Sends one request that needs the helper, starting it when needed (the one UAC prompt,
+    /// `progress::ELEVATION_NOTICE` on `on_line` right before it); a refusal this session is
+    /// final. `ELEVATION_GRANTED` goes to `on_line` once the helper runs (started now or
+    /// already), so the caller's phase leaves the notice. The helper's exit code.
     fn ask_elevated(
         &self,
         request: &Request,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<i32, ElevatedError> {
         let mut state = self.lock();
-        if let Err((e, now)) = self.ensure_started(&mut state) {
+        if let Err((e, now)) = self.ensure_started(&mut state, on_line) {
             if now {
                 tracing::warn!(error = %e, "bridge: elevation refused");
             }
             return Err(ElevatedError::refused(e));
         }
+        on_line(ELEVATION_GRANTED);
         match self.ask_running(&mut state, request, on_line) {
             Ok(Ok((code, _))) => Ok(code),
             Ok(Err(e)) => Err(ElevatedError::Remote(e.to_string())),
@@ -500,7 +531,13 @@ impl SystemTransport {
 #[cfg(windows)]
 impl Transport for SystemTransport {
     fn start(&self) -> Result<Box<dyn Helper>, String> {
-        super::elevate_win::start(&self.exe)
+        self.start_with_notice(&mut || {})
+    }
+
+    /// The notice comes after the folder check, right before `ShellExecuteEx` opens the
+    /// prompt: a folder refusal shows no notice.
+    fn start_with_notice(&self, notice: &mut dyn FnMut()) -> Result<Box<dyn Helper>, String> {
+        super::elevate_win::start_noticed(&self.exe, notice)
             .map(|h| Box::new(h) as Box<dyn Helper>)
             .map_err(|e| e.to_string())
     }

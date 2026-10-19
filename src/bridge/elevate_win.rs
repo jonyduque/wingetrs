@@ -423,7 +423,20 @@ fn check_server(pipe: &OwnedHandle, parent: u32) -> std::io::Result<()> {
 /// must come from that very process. Only from a folder only administrators write (see
 /// `start_with`).
 pub fn start(exe: &Path) -> std::io::Result<PipeHelper> {
-    start_with(exe, &|_, f| super::arp_ops_win::handle_sddl(f), &mut launch)
+    start_noticed(exe, &mut || {})
+}
+
+/// [`start`], calling `notice` right before the UAC prompt opens (after the folder check, so a
+/// refused folder shows no notice; Task 201).
+pub fn start_noticed(exe: &Path, notice: &mut dyn FnMut()) -> std::io::Result<PipeHelper> {
+    start_with(
+        exe,
+        &|_, f| super::arp_ops_win::handle_sddl(f),
+        &mut |spec: &HelperLaunch| {
+            notice();
+            launch(spec)
+        },
+    )
 }
 
 /// `start` with the descriptors read by `sddl_of` and the UAC launch done by `launcher`.

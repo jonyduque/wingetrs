@@ -13,6 +13,7 @@ use wingetrs::bridge::elevated::{ElevatedBridge, Helper, REFUSED_NOTE, Transport
 use wingetrs::bridge::worker::{self, LINE_CAP, Reply, Request};
 use wingetrs::bridge::{self, BridgeJob, Tool};
 use wingetrs::install::layout::Layout;
+use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE};
 use wingetrs::installed::correlate::InstallScope;
 use wingetrs::tui::jobs;
 
@@ -421,7 +422,16 @@ fn machine_scope_goes_elevated_others_do_not() {
             &job(Tool::Winget, target, Some(InstallScope::Machine)),
         );
         r.unwrap();
-        assert_eq!(seen, ["elevado"], "{target}");
+        // Only the job that opens the UAC prompt carries its notice (Task 201).
+        if target == "A.A" {
+            assert_eq!(
+                seen,
+                [ELEVATION_NOTICE, ELEVATION_GRANTED, "elevado"],
+                "{target}"
+            );
+        } else {
+            assert_eq!(seen, ["elevado"], "{target}");
+        }
     }
     assert_eq!(
         t.starts.load(Ordering::SeqCst),
@@ -449,7 +459,7 @@ fn refused_elevation_falls_back_once() {
     let first = job(Tool::Winget, "A.A", Some(InstallScope::Machine));
     let (r, seen) = w.run(&bridge, &first);
     r.unwrap();
-    assert_eq!(seen, [REFUSED_NOTE, "atual"]);
+    assert_eq!(seen, [ELEVATION_NOTICE, REFUSED_NOTE, "atual"]);
     assert_eq!(w.current(), vec![winget_command("A.A")]);
     for target in ["B.B", "C.C"] {
         let (r, seen) = w.run(
@@ -483,7 +493,7 @@ fn a_lost_helper_fails_its_job_and_is_started_again() {
         &job(Tool::Winget, "B.B", Some(InstallScope::Machine)),
     );
     r.unwrap();
-    assert_eq!(seen, ["elevado"]);
+    assert_eq!(seen, [ELEVATION_NOTICE, ELEVATION_GRANTED, "elevado"]);
     assert_eq!(t.starts.load(Ordering::SeqCst), 2);
 }
 
@@ -499,7 +509,7 @@ fn a_helper_that_exited_idle_is_started_again() {
     t.exit_helper(0);
     let (r, seen) = w.run(&bridge, &machine("C.C"));
     r.unwrap();
-    assert_eq!(seen, ["elevado"]);
+    assert_eq!(seen, [ELEVATION_NOTICE, ELEVATION_GRANTED, "elevado"]);
     assert_eq!(t.starts.load(Ordering::SeqCst), 2, "a new elevation");
     assert_eq!(t.calls.lock().unwrap().len(), 3);
     assert!(w.current().is_empty());
@@ -517,7 +527,17 @@ fn an_unsendable_request_restarts_the_helper_once() {
     let bridge = ElevatedBridge::new(Box::new(t.clone()));
     let (r, seen) = w.run(&bridge, &machine("A.A"));
     r.unwrap();
-    assert_eq!(seen, ["elevado"]);
+    // Each of the two prompts carries its notice (Task 201).
+    assert_eq!(
+        seen,
+        [
+            ELEVATION_NOTICE,
+            ELEVATION_GRANTED,
+            ELEVATION_NOTICE,
+            ELEVATION_GRANTED,
+            "elevado"
+        ]
+    );
     assert_eq!(t.starts.load(Ordering::SeqCst), 2);
     assert_eq!(*t.calls.lock().unwrap(), vec![winget_command("A.A")]);
     // Every helper is gone at the send: one retry, never two, and the job fails.
