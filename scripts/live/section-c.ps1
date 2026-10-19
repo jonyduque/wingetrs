@@ -114,8 +114,8 @@ try {
     # C4
     $inst = @(
         @{ Id = 'C4a'; Pkg = 'JAMSoftware.TreeSize.Free'; Ask = @('Janela de progresso do Inno (/SILENT)?'); Uac = 'O instalador (elevatesSelf) pode pedir UAC sozinho: se aparecer, aceite e anote (não é do wingetrs).'; Notes = @('o próprio instalador pediu UAC? a linha disse "Aguardando autorização..." e depois "rodando o instalador (pode pedir autorização de administrador)"?') }
-        @{ Id = 'C4b'; Pkg = 'M2Team.NanaZip'; Ask = @('Nenhuma janela de instalador?'); Check = @{ Name = 'Get-AppxPackage *NanaZip* existe'; Test = { [bool](Get-AppxPackage -Name '*NanaZip*') } } }
-        @{ Id = 'C4c'; Pkg = 'SumatraPDF.SumatraPDF'; Ask = @('Sem janela (-s)?') }
+        @{ Id = 'C4b'; Pkg = 'M2Team.NanaZip'; Auto = 'yes'; Ask = @('Nenhuma janela de instalador?'); Check = @{ Name = 'Get-AppxPackage *NanaZip* existe'; Test = { [bool](Get-AppxPackage -Name '*NanaZip*') } } }
+        @{ Id = 'C4c'; Pkg = 'SumatraPDF.SumatraPDF'; Auto = 'yes'; Ask = @('Sem janela (-s)?') }
         @{ Id = 'C4d'; Pkg = 'Kumospace.Kumospace'; Ask = @('Abriu a janela do instalador (concluída por você)?'); Notes = @('hash divergente? (se sim, pule)') }
     )
     foreach ($i in $inst) {
@@ -128,6 +128,7 @@ try {
         if ($i["Uac"]) { $step.Uac = $i["Uac"] } else { $step.Uac = 'NÃO deve abrir UAC do wingetrs.' }
         if ($i["Notes"]) { $step.Notes = $i["Notes"] }
         if ($i["Check"]) { $step.Checks = @($i["Check"]) }
+        if ($i["Auto"]) { $step.Auto = $i["Auto"] }
         Invoke-Step $step
     }
     Invoke-Step @{
@@ -137,8 +138,8 @@ try {
     }
     foreach ($u in @(
             @{ Id = 'C4f'; Pkg = 'JAMSoftware.TreeSize.Free' }
-            @{ Id = 'C4g'; Pkg = 'M2Team.NanaZip'; Check = @{ Name = 'NanaZip removido (Get-AppxPackage vazio)'; Test = { -not (Get-AppxPackage -Name '*NanaZip*') } } }
-            @{ Id = 'C4h'; Pkg = 'SumatraPDF.SumatraPDF' }
+            @{ Id = 'C4g'; Pkg = 'M2Team.NanaZip'; Auto = 'yes'; Check = @{ Name = 'NanaZip removido (Get-AppxPackage vazio)'; Test = { -not (Get-AppxPackage -Name '*NanaZip*') } } }
+            @{ Id = 'C4h'; Pkg = 'SumatraPDF.SumatraPDF'; Auto = 'yes' }
             @{ Id = 'C4i'; Pkg = 'Kumospace.Kumospace' })) {
         $step = @{
             Id = $u.Id; Title = "Remover $($u.Pkg) (seletor: s)"; Mode = 'Attached'; Destructive = $true
@@ -149,6 +150,7 @@ try {
             Notes = @('abriu janela de desinstalador?')
         }
         if ($u["Check"]) { $step.Checks = @($u["Check"]) }
+        if ($u["Auto"]) { $step.Auto = $u["Auto"] }
         Invoke-Step $step
     }
 
@@ -160,7 +162,7 @@ try {
     }
     Invoke-Step @{
         Id = 'C5b'; Title = 'Instalar Sumatra 3.6 pelo winget (usuário)'; Mode = 'Attached'
-        Cmd = @('winget', 'install', '--id', 'SumatraPDF.SumatraPDF', '--version', '3.6', '--scope', 'user', '--exact', '--silent')
+        Cmd = @('winget', 'install', '--id', 'SumatraPDF.SumatraPDF', '--version', '3.6', '--exact', '--silent', '--accept-source-agreements', '--accept-package-agreements'); Auto = 'run'
     }
     Invoke-Step @{
         Id = 'C5c'; Title = 'Upgrade Sumatra (dry-run)'
@@ -173,7 +175,7 @@ try {
     }
     Invoke-Step @{
         Id = 'C5e'; Title = 'Instalar clippy 1.7.8 pelo winget'; Mode = 'Attached'
-        Cmd = @('winget', 'install', '--id', '0-don.clippy', '--version', '1.7.8', '--exact', '--silent')
+        Cmd = @('winget', 'install', '--id', '0-don.clippy', '--version', '1.7.8', '--exact', '--silent', '--accept-source-agreements', '--accept-package-agreements'); Auto = 'run'
     }
     Invoke-Step @{
         Id = 'C5f'; Title = 'Upgrade clippy (dry-run)'

@@ -29,6 +29,14 @@
       Notes              free-text prompts ("anote ...")
       Watch              $true: polls %LOCALAPPDATA%\wingetrs\installers\run-* while it runs
       After              scriptblock run after the step (e.g. save state); gets the record
+      Auto               automatic mode only: 'yes' runs an Attached wingetrs command captured,
+                         with --yes added; 'run' runs it captured as is; 'defer' leaves it to the user
+
+    Run modes (env WINGETRS_PROVA_MODE, set by run-all.ps1 -Auto / -Usuario):
+      auto     no prompts; Admin, Manual, Window, Parallel, Attached without Auto, and steps whose
+               Uac text does not start with "NÃO" are deferred (ids saved in state.json "deferred");
+               visual questions are recorded as "-" (not seen)
+      usuario  runs only the deferred steps, interactively
 
     Nothing here elevates by itself: Admin steps print the exact text for the user's elevated
     terminal and only use Start-Process -Verb RunAs after an explicit "s".
@@ -200,7 +208,10 @@ function Start-Section {
         DryRun = [bool]$DryRun; StartAt = $StartAt; Started = (-not $StartAt)
         Quit = $false; Results = [Collections.Generic.List[object]]::new()
         Log = Join-Path $run "section-$Name.log"; Began = Get-Date
+        RunMode = "$env:WINGETRS_PROVA_MODE".ToLowerInvariant()
     }
+    if ($script:Ctx.RunMode -notin '', 'auto', 'usuario') { throw "WINGETRS_PROVA_MODE inválido: $($script:Ctx.RunMode)" }
+    if ($script:Ctx.RunMode) { $script:Ctx.Title += " [modo $($script:Ctx.RunMode)]" }
     if (-not $DryRun) {
         New-Item -ItemType Directory -Force -Path $run | Out-Null
         Add-Content -LiteralPath $script:Ctx.Log -Value "`n##### Seção $Name iniciada em $(Get-Date -Format 's')" -Encoding utf8
@@ -325,7 +336,20 @@ function Stop-RunWatch($W) {
 }
 
 $script:StepKeys = @('Id', 'Title', 'Mode', 'Cmd', 'Cmd2', 'Between', 'Run', 'Show', 'AdminText', 'Instructions', 'Uac',
-    'Destructive', 'When', 'WhenWhy', 'ExpectExit', 'Expect', 'NotExpect', 'Checks', 'Ask', 'Notes', 'Watch', 'After')
+    'Destructive', 'When', 'WhenWhy', 'ExpectExit', 'Expect', 'NotExpect', 'Checks', 'Ask', 'Notes', 'Watch', 'After', 'Auto')
+
+# 'run' | 'yes' | 'defer' for the automatic mode.
+function Get-AutoPlan([hashtable]$S, [string]$Mode) {
+    if ($S.Auto) { return $S.Auto }
+    if ($S.Uac -and -not ([string]$S.Uac).StartsWith('NÃO')) { return 'defer' }
+    if ($Mode -in 'Admin', 'Manual', 'Window', 'Parallel', 'Attached') { return 'defer' }
+    'run'
+}
+
+function Get-Deferred {
+    $d = Get-State 'deferred'
+    if ($d) { @($d) } else { @() }
+}
 
 # A bug in a step (or in this runner) is recorded as a failed step and the section goes on.
 function Invoke-Step([hashtable]$Spec) {
@@ -356,6 +380,33 @@ function Invoke-StepCore([hashtable]$Spec) {
 
     if (-not $c.Started) {
         if ($S.Id -eq $c.StartAt) { $c.Started = $true } else { $rec.Status = 'pulado (antes de -StartAt)'; $c.Results.Add($rec); return }
+    }
+
+    $auto = $c.RunMode -eq 'auto'
+    $autoPlan = Get-AutoPlan $S $mode
+    if ($c.RunMode -eq 'usuario' -and (Get-Deferred) -notcontains $S.Id) {
+        $rec.Status = 'feito no modo automático'
+        $c.Results.Add($rec)
+        return
+    }
+    if ($auto -and $autoPlan -eq 'defer') {
+        Write-Host "  [$($c.Section) · $($S.Id)] adiado para o usuário: $($S.Title)" -ForegroundColor DarkYellow
+        $rec.Status = 'adiado para o usuário'
+        if (-not $c.DryRun) {
+            # An empty @() cast to [string[]] is $null, which List's constructor rejects.
+            $d = [Collections.Generic.List[string]]::new()
+            foreach ($x in @(Get-Deferred)) { $d.Add([string]$x) }
+            if (-not $d.Contains($S.Id)) { $d.Add($S.Id); Set-State 'deferred' $d.ToArray() }
+            Write-StepLog $rec
+        }
+        $c.Results.Add($rec)
+        return
+    }
+    if ($auto -and $mode -eq 'Attached') {
+        $mode = 'Capture'
+        if ($autoPlan -eq 'yes' -and $S.Cmd -notcontains '--yes') { $S.Cmd = @($S.Cmd) + '--yes' }
+        $display = Get-StepDisplay $S
+        $rec.Command = $display -join "`n"
     }
 
     Write-Banner "[$($c.Section) · $($S.Id)] $($S.Title)"
@@ -415,10 +466,10 @@ function Invoke-StepCore([hashtable]$Spec) {
         $ran = $true
     } else {
         $prompt = if ($mode -eq 'Manual') { '  [Enter] quando terminar · p pular · q sair' } else { '  [Enter] executar · p pular · q sair' }
-        $r = Read-Choice $prompt @('', 'p', 'q')
+        $r = if ($auto) { '' } else { Read-Choice $prompt @('', 'p', 'q') }
         if ($r -eq 'q') { $c.Quit = $true; $rec.Status = 'interrompido'; $c.Results.Add($rec); return }
         if ($r -eq 'p') { $rec.Status = 'pulado'; $c.Results.Add($rec); Write-StepLog $rec; return }
-        if ($S.Destructive) {
+        if ($S.Destructive -and -not $auto) {
             $y = Read-Choice '  Confirma? digite s para executar (Enter = pular)' @('', 's')
             if ($y -ne 's') { $rec.Status = 'pulado (não confirmado)'; $c.Results.Add($rec); Write-StepLog $rec; return }
         }
@@ -519,12 +570,13 @@ function Test-StepResult([hashtable]$S, $Rec, [string]$Mode, $Code) {
     foreach ($q in @($S.Ask)) { if ($q) { Ask-User $Rec $q } }
     foreach ($q in @($S.Notes)) {
         if (-not $q) { continue }
-        $a = Read-Host "  anote: $q (Enter = nada)"
+        $a = if ($script:Ctx.RunMode -eq 'auto') { '(modo automático: não anotado)' } else { Read-Host "  anote: $q (Enter = nada)" }
         $Rec.Notes.Add([pscustomobject]@{ Q = $q; A = $a })
     }
 }
 
 function Ask-User($Rec, [string]$Question) {
+    if ($script:Ctx.RunMode -eq 'auto') { $Rec.Answers.Add([pscustomobject]@{ Q = "$Question (modo automático: não visto)"; A = '-' }); return }
     $a = Read-Choice "  $Question (s/n, Enter = sem resposta)" @('s', 'n', '')
     $Rec.Answers.Add([pscustomobject]@{ Q = $Question; A = $(if ($a) { $a } else { '-' }) })
 }

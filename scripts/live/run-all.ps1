@@ -13,6 +13,8 @@
     pwsh -File scripts/live/run-all.ps1
     pwsh -File scripts/live/run-all.ps1 -From C
     pwsh -File scripts/live/run-all.ps1 -DryRun
+    pwsh -File scripts/live/run-all.ps1 -From B -Auto      # no prompts; UAC/visual steps deferred
+    pwsh -File scripts/live/run-all.ps1 -From C -Usuario   # only the deferred steps, interactive
 #>
 [CmdletBinding()]
 param(
@@ -20,10 +22,15 @@ param(
     [string]$RunDir,
     [string]$W = 'C:\Program Files\wingetrs\wingetrs.exe',
     [string]$Wdev,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Auto,
+    [switch]$Usuario
 )
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
+
+if ($Auto -and $Usuario) { Write-Output '[x] use -Auto ou -Usuario, não os dois'; exit 1 }
+$env:WINGETRS_PROVA_MODE = if ($Auto) { 'auto' } elseif ($Usuario) { 'usuario' } else { '' }
 
 $root = Join-Path $env:LOCALAPPDATA 'wingetrs-prova'
 if (-not $RunDir) {
@@ -46,7 +53,7 @@ if ($DryRun) { $common.DryRun = $true }
 
 $worst = 0
 foreach ($s in $sections) {
-    if (-not $DryRun) {
+    if (-not $DryRun -and -not $Auto) {
         $r = (Read-Host "Seção $s — Enter começa · q encerra (retome depois com -From $s)").Trim().ToLowerInvariant()
         if ($r -eq 'q') { Write-Output "Encerrado antes da seção $s. Retome com: pwsh -File scripts/live/run-all.ps1 -From $s -RunDir '$RunDir'"; exit 3 }
     }

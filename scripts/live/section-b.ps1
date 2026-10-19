@@ -66,7 +66,7 @@ try {
             'Script de terceiro (post_install), roda com os seus privilégios', 'Análise: pede confirmação', 'Remove-Item "$dir\pkginfo.ini" -Force')
     }
     Invoke-Step @{
-        Id = 'B3b'; Title = 'yori: instalar com --allow-scripts (seletor: s)'; Mode = 'Attached'
+        Id = 'B3b'; Title = 'yori: instalar com --allow-scripts (seletor: s)'; Mode = 'Attached'; Auto = 'yes'
         Cmd = @($W, 'install', 'main/yori', '--allow-scripts')
         Instructions = @('No seletor, aperte s.')
         Checks = @(
@@ -82,10 +82,10 @@ try {
         Id = 'B4a'; Title = '7zip: plano (dry-run)'
         Cmd = @($W, 'install', 'main/7zip', '--dry-run')
         Expect = @('Análise: pede confirmação', 'só roda em instalação global; não roda no wingetrs (mexe no registro da máquina (HKLM)) (linha 4)',
-            'uninstaller.script (na remoção)', 'Análise: pede atenção redobrada; revise antes de permitir', 'mexe no registro do usuário (HKCU ou reg) (linha 1)')
+            'uninstaller.script, na remoção', 'Análise: pede atenção redobrada; revise antes de permitir', 'mexe no registro do usuário (HKCU ou reg) (linha 1)')
     }
     Invoke-Step @{
-        Id = 'B4b'; Title = '7zip: instalar com --allow-scripts (seletor: s)'; Mode = 'Attached'
+        Id = 'B4b'; Title = '7zip: instalar com --allow-scripts (seletor: s)'; Mode = 'Attached'; Auto = 'yes'
         Cmd = @($W, 'install', 'main/7zip', '--allow-scripts')
         Instructions = @('No seletor, aperte s.')
         Checks = @(
@@ -146,7 +146,7 @@ try {
         Checks = @(@{ Name = 'apps\xming removido'; Test = { -not (Test-Path -LiteralPath (Join-Path $apps 'xming')) } })
     }
     Invoke-Step @{
-        Id = 'B6c'; Title = 'Remover yori (--purge, seletor: s)'; Mode = 'Attached'; Destructive = $true
+        Id = 'B6c'; Title = 'Remover yori (--purge, seletor: s)'; Mode = 'Attached'; Auto = 'yes'; Destructive = $true
         Cmd = @($W, 'uninstall', 'yori', '--allow-scripts', '--purge')
         Instructions = @('No seletor, aperte s.')
         Checks = @(
@@ -157,7 +157,7 @@ try {
         Ask = @('Mostrou o plano de remoção em passos e o seletor?')
     }
     Invoke-Step @{
-        Id = 'B6d'; Title = 'Remover 7zip (--purge, seletor: s)'; Mode = 'Attached'; Destructive = $true
+        Id = 'B6d'; Title = 'Remover 7zip (--purge, seletor: s)'; Mode = 'Attached'; Auto = 'yes'; Destructive = $true
         Cmd = @($W, 'uninstall', '7zip', '--allow-scripts', '--purge')
         Instructions = @('No seletor, aperte s. O uninstaller.script apaga HKCU\Software\7-Zip (o backup é restaurado logo depois).')
         Checks = @(@{ Name = 'apps\7zip removido'; Test = { -not (Test-Path -LiteralPath (Join-Path $apps '7zip')) } })
