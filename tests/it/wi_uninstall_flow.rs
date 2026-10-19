@@ -263,6 +263,7 @@ impl World {
             user_expand: &user_env,
             msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
             helper_line: &|_| {},
+            bridge: &no_bridge,
         };
         uninstall(&ctx, plan)
     }
@@ -1051,6 +1052,7 @@ fn run_queued_msi(codes: &[i32]) -> (Result<UninstallStatus, String>, Vec<bool>,
         user_expand: &user_env,
         msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
         helper_line: &|_| {},
+        bridge: &no_bridge,
     };
     let sleeps: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
     let sleep = |d: Duration| sleeps.lock().unwrap().push(d);
@@ -1112,6 +1114,7 @@ fn non_msi_uninstall_takes_no_msi_queue() {
         user_expand: &user_env,
         msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
         helper_line: &|_| {},
+        bridge: &no_bridge,
     };
     let queue = MsiQueue {
         lock: lock.clone(),
@@ -1169,6 +1172,7 @@ fn helper_wait_line_shows_the_waiting_phase() {
         user_expand: &user_env,
         msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
         helper_line: &|l: &str| seen.lock().unwrap().push(l.to_string()),
+        bridge: &no_bridge,
     };
     let dir = tempfile::TempDir::new().unwrap();
     let queue = MsiQueue {
@@ -1239,6 +1243,7 @@ fn helper_uac_lines_show_notice_then_uninstaller() {
         user_expand: &user_env,
         msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
         helper_line: &|_| {},
+        bridge: &no_bridge,
     };
     let dir = tempfile::TempDir::new().unwrap();
     let queue = MsiQueue {
@@ -1377,4 +1382,131 @@ fn removal_plan_uac_first_and_warnings_apart() {
     );
     let cli = with_enabled(false, || winget_uninstall_text(&p, false));
     assert!(!cli.contains('⚠'), "{cli}");
+}
+
+/// The bridge runner of an `UninstallCtx` whose uninstall never goes through winget.
+fn no_bridge(
+    _: &str,
+    _: &[String],
+    _: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    panic!("winget bridge not expected")
+}
+
+/// Task 203: the same ARP row (jq: `winget uninstall --product-code <id>`, unquoted) gives the
+/// plan "Remove pelo winget" and runs through the bridge's runner, once, with that id; never
+/// the native launcher nor the helper, never "desinstalador sem caminho absoluto". Through
+/// `removal::run_uninstaller`, what the CLI and the TUI both call.
+#[test]
+fn winget_record_plan_and_run_take_the_bridge() {
+    let id = "jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe";
+    for hive in [Hive::User, Hive::MachineX64] {
+        let mut d = details(hive, id);
+        d.display_name = Some("jq".to_string());
+        d.uninstall_string = Some(format!("winget uninstall --product-code {id}"));
+        let p = plan_uninstall(&d, false, &[], true, &known(), &user(), &no_folders).unwrap();
+        assert_eq!(
+            p.steps(),
+            vec!["Remove pelo winget (pode mostrar o progresso dele)".to_string()],
+            "{hive:?}"
+        );
+        let w = World::new(0, &[false]);
+        let key_exists = |h: Hive, k: &str| w.keys.exists(h, k);
+        let calls: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+        let bridge = |program: &str,
+                      args: &[String],
+                      _: &mut dyn FnMut(&str)|
+         -> std::io::Result<(i32, Vec<String>)> {
+            calls
+                .lock()
+                .unwrap()
+                .push((program.to_string(), args.to_vec()));
+            Ok((0, Vec::new()))
+        };
+        let ctx = UninstallCtx {
+            launcher: &w.launcher,
+            elevated: &w.elevated,
+            msix: &w.msix,
+            key_exists: &key_exists,
+            clock: &w.clock,
+            user_expand: &user_env,
+            msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+            helper_line: &|_| {},
+            bridge: &bridge,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = MsiQueue {
+            lock: tmp.path().join("msi.lock"),
+            busy: &|| false,
+            sleep: &|_| {},
+        };
+        let r =
+            wingetrs::winget_install::removal::run_uninstaller(&ctx, &queue, &p, &|_| {}).unwrap();
+        assert_eq!(r.status, UninstallStatus::Removed, "{hive:?}");
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{hive:?}");
+        assert_eq!(calls[0].0, "winget");
+        assert_eq!(
+            calls[0].1[..3],
+            [
+                "uninstall".to_string(),
+                "--product-code".to_string(),
+                id.to_string()
+            ]
+        );
+        assert_eq!(w.launcher.count(), 0, "{hive:?}");
+        assert_eq!(w.elevated.count(), 0, "{hive:?}");
+    }
+}
+
+/// Task 203: winget's failure is the removal's failure (its code), and a record whose line
+/// is not exactly `winget uninstall --product-code <plain id>` never reaches winget.
+#[test]
+fn winget_record_failure_and_other_lines() {
+    let id = "jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe";
+    let mut d = details(Hive::User, id);
+    d.uninstall_string = Some(format!("winget uninstall --product-code {id}"));
+    let p = plan(&d);
+    let w = World::new(0, &[true]);
+    let key_exists = |h: Hive, k: &str| w.keys.exists(h, k);
+    let failing =
+        |_: &str, _: &[String], _: &mut dyn FnMut(&str)| -> std::io::Result<(i32, Vec<String>)> {
+            Ok((
+                0x8A150014u32 as i32,
+                vec!["Nenhum pacote encontrado".to_string()],
+            ))
+        };
+    let ctx = UninstallCtx {
+        launcher: &w.launcher,
+        elevated: &w.elevated,
+        msix: &w.msix,
+        key_exists: &key_exists,
+        clock: &w.clock,
+        user_expand: &user_env,
+        msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
+        helper_line: &|_| {},
+        bridge: &failing,
+    };
+    let e = uninstall(&ctx, &p).unwrap_err();
+    assert!(e.contains("0x8A150014"), "{e}");
+    assert!(e.contains("Nenhum pacote encontrado"), "{e}");
+    assert_eq!(w.launcher.count(), 0);
+    for line in [
+        format!("winget uninstall --product-code {id} --force"),
+        format!("winget uninstall --id {id}"),
+        "winget uninstall --product-code a&b".to_string(),
+        format!("wingetx uninstall --product-code {id}"),
+    ] {
+        let mut d = details(Hive::User, id);
+        d.uninstall_string = Some(line.clone());
+        let p = plan(&d);
+        assert!(
+            !p.steps().iter().any(|s| s.contains("winget")),
+            "{line}: {:?}",
+            p.steps()
+        );
+        let w = World::new(0, &[false]);
+        // `no_bridge` panics: the line goes to the native checks.
+        let _ = w.run(&p);
+    }
 }

@@ -279,6 +279,7 @@ impl WingetFlows for ProdFlows<'_, '_> {
                 user_expand: &user_env,
                 msiexec: &w.msiexec,
                 helper_line: &|_| {},
+                bridge: &winget_cmd::run_tool,
             };
             removal::run_uninstaller(&u, &MsiQueue::of(&w), &plan, progress)
         })
@@ -358,6 +359,7 @@ impl WingetFlows for ProdFlows<'_, '_> {
                     user_expand: &user_env,
                     msiexec: &w.msiexec,
                     helper_line: &|_| {},
+                    bridge: &winget_cmd::run_tool,
                 };
                 engine::upgrade(&w, &u, &plan, previous.as_ref()).await
             })

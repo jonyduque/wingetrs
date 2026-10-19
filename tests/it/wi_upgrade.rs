@@ -685,6 +685,7 @@ impl World {
             user_expand: &|_: &str| None,
             msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
             helper_line: &|_| {},
+            bridge: &no_bridge,
         };
         upgrade(&wctx, &uctx, p, Some(previous)).await
     }
@@ -1214,4 +1215,13 @@ async fn uninstall_first_machine_install_runs_elevated_without_log() {
         !low.contains("/log") && !low.contains("<logpath>"),
         "{params:?}"
     );
+}
+
+/// The bridge runner of an `UninstallCtx` whose uninstall never goes through winget.
+fn no_bridge(
+    _: &str,
+    _: &[String],
+    _: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    panic!("winget bridge not expected")
 }

@@ -137,7 +137,7 @@ impl UninstallPlan {
                 out.push(format!("Remove o pacote MSIX {family} (só deste usuário)"));
             }
             // A portable app winget installed: its uninstaller is winget itself.
-            (UninstallTarget::Arp { .. }, Some(c)) if is_winget(&c.program) => {
+            (UninstallTarget::Arp { .. }, Some(c)) if winget_product_code(c).is_some() => {
                 out.push("Remove pelo winget (pode mostrar o progresso dele)".into());
             }
             (UninstallTarget::Arp { .. }, Some(c)) if c.interactive => {
@@ -205,18 +205,41 @@ impl fmt::Display for UninstallPlan {
     }
 }
 
-/// Whether a registered uninstaller program is `winget` (by name, any case, quoted or not),
-/// also when the registry wrote the whole line unquoted (`winget uninstall --product-code
-/// <id>`, which `split_command` keeps as the program: no `.exe` in it).
+/// Whether a program is `winget` (by file name, any case, quoted or not, with or without
+/// `.exe`).
 fn is_winget(program: &str) -> bool {
-    let p = program.trim();
-    let stem_is_winget = |s: &str| {
-        Path::new(s.trim_matches('"'))
-            .file_stem()
-            .is_some_and(|s| s.eq_ignore_ascii_case("winget"))
+    Path::new(program.trim().trim_matches('"'))
+        .file_stem()
+        .is_some_and(|s| s.eq_ignore_ascii_case("winget"))
+}
+
+/// The product code of a record whose uninstaller is `winget uninstall --product-code <id>`
+/// (what winget registers for the portable apps it installs, as jq), `None` for any other
+/// line. The one decision behind the plan's "Remove pelo winget" and the run through the
+/// bridge (Task 203): the registry line may be whole in `program` (unquoted, no `.exe`, as
+/// `split_command` leaves it) or split into `program` and `args`. Only that exact shape and a
+/// plain id pass: nothing else from the registry reaches winget's arguments.
+pub fn winget_product_code(c: &UninstallCommand) -> Option<String> {
+    let line = if c.args.trim().is_empty() {
+        c.program.trim().to_string()
+    } else {
+        if !is_winget(&c.program) {
+            return None;
+        }
+        format!("winget {}", c.args.trim())
     };
-    stem_is_winget(p)
-        || (!p.starts_with('"') && p.split_whitespace().next().is_some_and(stem_is_winget))
+    let mut t = line.split_whitespace();
+    let ok = t.next().is_some_and(is_winget)
+        && t.next()
+            .is_some_and(|v| v.eq_ignore_ascii_case("uninstall"))
+        && t.next()
+            .is_some_and(|v| v.eq_ignore_ascii_case("--product-code"));
+    let id = t.next().filter(|_| ok)?;
+    let plain = id.len() <= 255
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '{' | '}'));
+    (plain && t.next().is_none()).then(|| id.to_string())
 }
 
 fn non_blank(s: &Option<String>) -> Option<&str> {
@@ -325,7 +348,12 @@ pub fn plan_uninstall(
     let msiexec = command.rule == Rule::Msi;
     let admin =
         expand_known(&command.program, k).is_some_and(|p| in_admin_folder(Path::new(&p), k));
-    let elevation = uninstall_elevation(d.hive, msiexec, admin);
+    // winget asks for the uninstaller's own UAC itself when it needs one.
+    let elevation = if winget_product_code(&command).is_some() {
+        Elevation::Never
+    } else {
+        uninstall_elevation(d.hive, msiexec, admin)
+    };
     let shared = (!others.is_empty()).then(|| {
         let helper_refuses = d.hive != Hive::User && !elevated_duplicate(d, others);
         SharedData {
@@ -398,7 +426,14 @@ pub struct UninstallCtx<'a> {
     /// Each progress line of the elevated helper while it runs an uninstaller
     /// (`worker::WAITING_UNINSTALLER`, Task 190).
     pub helper_line: &'a dyn Fn(&str),
+    /// The bridge's tool runner (`(program, args, on_line)` -> exit code and last lines, as
+    /// `bridge::spawn_win::run`): runs `winget uninstall --product-code` (Task 203).
+    pub bridge: ToolRunner<'a>,
 }
+
+/// A runner of a bridge tool: `(program, args, on_line)` -> exit code and last lines.
+pub type ToolRunner<'a> =
+    &'a dyn Fn(&str, &[String], &mut dyn FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>;
 
 /// How the uninstall ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,6 +531,52 @@ pub fn uninstall(ctx: &UninstallCtx<'_>, plan: &UninstallPlan) -> Result<Uninsta
     uninstall_queued(ctx, None, plan)
 }
 
+/// `winget uninstall --product-code <id>` through the bridge's runner (unelevated: winget asks
+/// for the uninstaller's UAC itself), then the wait for the ARP key, as a native run.
+fn uninstall_by_winget(
+    ctx: &UninstallCtx<'_>,
+    id: &str,
+    hive: Hive,
+    key: &str,
+) -> Result<UninstallReport, String> {
+    let args: Vec<String> = [
+        "uninstall",
+        "--product-code",
+        id,
+        "--exact",
+        "--silent",
+        "--disable-interactivity",
+        "--accept-source-agreements",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let (code, tail) = (ctx.bridge)("winget", &args, &mut |line: &str| {
+        tracing::debug!(line, "winget uninstall");
+    })
+    .map_err(|e| format!("falha ao iniciar o winget: {e}"))?;
+    if code != 0 {
+        let last = tail.last().map(|l| format!(": {l}")).unwrap_or_default();
+        return Err(format!(
+            "winget uninstall terminou com o código 0x{:08X}{last}",
+            code as u32
+        ));
+    }
+    if wait_key_gone(ctx, hive, key) {
+        Ok(UninstallReport {
+            status: UninstallStatus::Removed,
+            warning: None,
+            reboot: None,
+        })
+    } else {
+        Ok(UninstallReport {
+            status: UninstallStatus::NoEffect,
+            warning: Some(KEY_STAYED.to_string()),
+            reboot: None,
+        })
+    }
+}
+
 /// One launch of the uninstaller (unelevated or through the helper); its exit code.
 fn launch_once(
     ctx: &UninstallCtx<'_>,
@@ -566,6 +647,11 @@ pub fn uninstall_queued(
         .command
         .as_ref()
         .ok_or_else(|| "sem desinstalador registrado".to_string())?;
+    // The plan says "Remove pelo winget" for this very decision: winget runs it, before any
+    // check of a native command (Task 203).
+    if let Some(id) = winget_product_code(c) {
+        return uninstall_by_winget(ctx, &id, hive, key);
+    }
     let msiexec = c.rule == Rule::Msi;
     let code = if msiexec {
         let _msi_lock = match queue {

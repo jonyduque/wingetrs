@@ -1613,6 +1613,7 @@ fn cli_uninstall_of_msi_waits_for_msi_lock() {
                 user_expand: &|_| None,
                 msiexec: Path::new(r"C:\Windows\System32\msiexec.exe"),
                 helper_line: &|_| {},
+                bridge: &no_bridge,
             };
             let queue = MsiQueue {
                 lock: lock.clone(),
@@ -2219,4 +2220,13 @@ fn bridge_plan_has_numbered_steps() {
     for text in [&dry, &confirm, &plain] {
         assert!(!text.contains("Instalando"), "{text}");
     }
+}
+
+/// The bridge runner of an `UninstallCtx` whose uninstall never goes through winget.
+fn no_bridge(
+    _: &str,
+    _: &[String],
+    _: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    panic!("winget bridge not expected")
 }

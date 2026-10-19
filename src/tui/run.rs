@@ -1837,6 +1837,7 @@ fn with_winget<R>(
         user_expand: &user_env,
         msiexec: &msiexec,
         helper_line: &|_| {},
+        bridge: &run_tool,
     };
     let backups = c.data.install_layout().backups();
     let previous = |row_key: &str, plan: &crate::winget_install::plan::WingetPlan| {

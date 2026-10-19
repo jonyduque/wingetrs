@@ -1152,6 +1152,7 @@ impl Native {
                 user_expand: &|_| None,
                 msiexec: &msiexec,
                 helper_line: &|_| {},
+                bridge: &no_bridge,
             },
             registry: &NoArp,
             backups: self.t.path(),
@@ -1505,4 +1506,13 @@ fn self_elevating_notice_gives_way_after_two_minutes() {
     let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
     assert!(!tui.contains(ELEVATION_NOTICE), "{tui}");
     assert!(tui.contains(SELF_ELEVATION_LATER), "{tui}");
+}
+
+/// The bridge runner of an `UninstallCtx` whose uninstall never goes through winget.
+fn no_bridge(
+    _: &str,
+    _: &[String],
+    _: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    panic!("winget bridge not expected")
 }
