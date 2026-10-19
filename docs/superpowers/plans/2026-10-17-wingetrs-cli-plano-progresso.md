@@ -221,6 +221,12 @@ Pedido literal: "Quero que todas as saídas do CLI sejam devidamente formatadas.
 
 **Files:** `src/cli/*`, `scripts/check_rules.ps1`, testes `tests/it/cli_*`.
 
+#### Checks beyond the steps
+
+1. Roda depois das Tasks 200 e 201 (mesmos arquivos do CLI); confira `git status` antes.
+2. Snapshots novos revisados à mão (nenhum texto some sem motivo).
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
 **Commit:** `feat(cli): every output line goes through the formatter`
 
 ### Task 200: Escolhas do CLI sempre como seletor no estilo TUI
@@ -247,6 +253,12 @@ Pedido literal: "Quero que todas as saídas do CLI sejam devidamente formatadas.
 
 **Files:** `src/cli/picker.rs` (ou novo `src/cli/select.rs`), `src/cli/install_cmd.rs`, `src/cli/winget_cmd.rs`, testes `tests/it/cli_*`.
 
+#### Checks beyond the steps
+
+1. A Task 201 edita `src/install/progress.rs`, `src/tui/*`, `src/winget_install/*` e `src/bridge/elevate_win.rs` em paralelo; `src/cli/output.rs` é da 201 nesta rodada (só os textos de fase): não edite. Commit só dos seus trechos.
+2. Nenhum teste lê o terminal real: eventos e backend injetados.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
 **Commit:** `feat(cli): every choice is an inline TUI selector`
 
 ### Task 201: Progresso em toda instalação, atualização e remoção; aviso de elevação
@@ -270,5 +282,11 @@ Pedido literal: "Quero que todas as saídas do CLI sejam devidamente formatadas.
 - `elevation_notice_before_every_uac` (worker, runas por instalador, elevatesSelf) e `elevation_notice_same_text_cli_tui`.
 
 **Files:** `src/install/progress.rs`, `src/cli/output.rs`, `src/tui/*` (barra de status e jobs), `src/winget_install/*`, `src/bridge/elevate_win.rs`; testes existentes.
+
+#### Checks beyond the steps
+
+1. A Task 200 edita `src/cli/picker.rs` (ou `select.rs`), `src/cli/install_cmd.rs` e `src/cli/winget_cmd.rs` (perguntas); nesses dois últimos faça só os trechos de progresso e commit só deles.
+2. Testes nunca abrem UAC real: lançador falso.
+3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat: progress on every install path and an elevation notice before every UAC`
