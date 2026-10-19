@@ -6,6 +6,7 @@ Commits:
 ```
 1ce073c fix: plan texts from the final dry-run preflight
 e302976 fix(winget_install): winget product-code records uninstall through the bridge
+30b3d8b fix(winget_install): UAC notice for machine records removed by winget
 ```
 
 Gate:
@@ -160,3 +161,14 @@ Concerns:
   - Mutação: `[OK] mutação PEGA: '    if let Some(id) = winget_product_code(c) {' -> '    if let Some(id) = winget_product_code(c).filter(|_| false) {' fez o teste falhar (exit 101).`
   - Gate da rodada 2: `[OK]   test (1903 passed, 87 ignored) 84s` / `[OK]   gate verde`.
 - O passo "O instalador pode pedir permissão de administrador" aparece em todo instalador não elevado com `elevatesSelf`/`elevationRequired`, inclusive `exe` sem escopo (`Elevation::Never`).
+
+## Rodada 3 (revisão: CHANGES_REQUESTED), commit `30b3d8b`
+
+- Registro HKLM removido pelo winget: o plano ganha o passo "⚠ O winget pode pedir permissão de administrador" (`WINGET_ADMIN_PROMPT`, com o glifo na CLI), e `removal::uninstaller_phase` emite `Phase::SelfElevating`: primeiro o aviso, e depois de `SELF_ELEVATION_WAIT` aparece `SELF_ELEVATION_LATER`. A decisão é `UninstallPlan::winget_may_elevate`. O teste `winget_record_plan_and_run_take_the_bridge` virou `#[tokio::test]`, roda `removal::remove` e confere o passo na CLI e no `Display` (TUI) e a fase por `phase_status`/`phase_text`, em HKCU e MachineX64.
+- Um id que começa com `-` é recusado. A linha `"C:\x\evil.exe" uninstall --product-code x` e o caso `-x` entraram em `winget_record_failure_and_other_lines`.
+- Mutações:
+  - `[OK] mutação PEGA: '} else if self.winget_may_elevate() {' -> '} else if false && self.winget_may_elevate() {' fez o teste falhar (exit 101).`
+  - `[OK] mutação PEGA: '} else if plan.winget_may_elevate() {' -> '} else if false && plan.winget_may_elevate() {' fez o teste falhar (exit 101).`
+  - `[OK] mutação PEGA: 'if !is_winget(&c.program) {' -> 'if false && !is_winget(&c.program) {' fez o teste falhar (exit 101).`
+  - `[OK] mutação PEGA: '&& !id.starts_with('-')' -> '&& true' fez o teste falhar (exit 101).`
+- Gate: `[OK]   test (1903 passed, 87 ignored) 81s` / `[OK]   gate verde`.
