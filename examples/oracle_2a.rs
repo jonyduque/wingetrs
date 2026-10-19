@@ -88,6 +88,7 @@ fn sub_case(raw: &str) -> Option<(String, bool)> {
         ArchiveKind::SevenZip => 5,
         ArchiveKind::Nupkg => 4,
         ArchiveKind::TarXz => 3,
+        ArchiveKind::Cab => 3,
         ArchiveKind::TarGz => 2,
         ArchiveKind::Zip => 1,
         ArchiveKind::Plain => 0,
@@ -101,6 +102,7 @@ fn sub_case(raw: &str) -> Option<(String, bool)> {
         ArchiveKind::Zip => "zip",
         ArchiveKind::TarGz => "tar.gz",
         ArchiveKind::TarXz => "tar.xz",
+        ArchiveKind::Cab => "cab",
         ArchiveKind::Nupkg => "nupkg",
         ArchiveKind::Plain => "plain",
         ArchiveKind::SevenZip | ArchiveKind::Msi => {

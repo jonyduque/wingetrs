@@ -90,6 +90,7 @@ pub fn engine_of(file_name: &str) -> String {
         Ok(K::Msi) => "MSI",
         Ok(K::Nupkg) => "nupkg",
         Ok(K::TarXz) => "tar.xz",
+        Ok(K::Cab) => "CAB",
         Ok(K::Plain) => "cópia",
         Err(ext) => ext,
     }

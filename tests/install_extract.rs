@@ -754,3 +754,182 @@ fn extraction_retries_a_held_file_until_it_is_released() {
     assert_eq!(std::fs::read(dest.join("x.txt")).unwrap(), b"new");
     assert!(held.lock().unwrap().is_none(), "the retry path never ran");
 }
+
+mod cab_files {
+    use std::path::Path;
+    use wingetrs::install::extract::{
+        DEFAULT_LIMITS, ExtractError, ExtractSource, Limits, extract, extract_all_with,
+    };
+
+    /// Uncompressed single-folder cabinet; `flags` = CFHEADER flags (1 prev, 2 next);
+    /// `ifolder` = CFFILE iFolder of every entry.
+    fn cab_bytes(entries: &[(&str, &[u8])], flags: u16, ifolder: u16) -> Vec<u8> {
+        let mut extra = Vec::new();
+        if flags & 1 != 0 {
+            extra.extend_from_slice(b"prev.cab\0disk1\0");
+        }
+        if flags & 2 != 0 {
+            extra.extend_from_slice(b"next.cab\0disk2\0");
+        }
+        let files_off = 36 + extra.len() + 8;
+        let mut files = Vec::new();
+        let mut data = Vec::new();
+        for (name, body) in entries {
+            files.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            files.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            files.extend_from_slice(&ifolder.to_le_bytes());
+            files.extend_from_slice(&[0u8; 6]);
+            files.extend_from_slice(name.as_bytes());
+            files.push(0);
+            data.extend_from_slice(body);
+        }
+        let data_off = files_off + files.len();
+        let total = data_off + 8 + data.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"MSCF\0\0\0\0");
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&(files_off as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&[3, 1]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&extra);
+        out.extend_from_slice(&(data_off as u32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&files);
+        out.extend_from_slice(&[0u8; 4]);
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn cab_ok(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        cab_bytes(entries, 0, 0)
+    }
+
+    fn put(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let f = dir.join(name);
+        std::fs::write(&f, bytes).unwrap();
+        f
+    }
+
+    #[test]
+    fn seven_z_named_cab_content_extracts() {
+        let d = tempfile::tempdir().unwrap();
+        let f = put(
+            d.path(),
+            "ypm.7z",
+            &cab_ok(&[("ypm.exe", b"MZ-body"), (r"sub\a.txt", b"hello")]),
+        );
+        let out = d.path().join("out");
+        extract(&f, "ypm.7z", None, None, &out).unwrap();
+        assert_eq!(std::fs::read(out.join("ypm.exe")).unwrap(), b"MZ-body");
+        assert_eq!(
+            std::fs::read(out.join("sub").join("a.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn cab_extension_extracts() {
+        let d = tempfile::tempdir().unwrap();
+        let f = put(d.path(), "x.cab", &cab_ok(&[("a.txt", b"hi")]));
+        let out = d.path().join("out");
+        extract(&f, "x.cab", None, Some("to"), &out).unwrap();
+        assert_eq!(std::fs::read(out.join("to").join("a.txt")).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn cab_multivolume_refused() {
+        for (flags, ifolder) in [(1u16, 0u16), (2, 0), (0, 0xFFFD), (0, 0xFFFE), (0, 0xFFFF)] {
+            let d = tempfile::tempdir().unwrap();
+            let f = put(
+                d.path(),
+                "m.cab",
+                &cab_bytes(&[("a.txt", b"hi")], flags, ifolder),
+            );
+            let out = d.path().join("out");
+            let r = extract(&f, "m.cab", None, None, &out);
+            assert!(
+                matches!(&r, Err(ExtractError::Unsupported(m)) if m.contains("vários volumes")),
+                "{flags} {ifolder:#x}: {r:?}"
+            );
+            assert!(!out.exists());
+        }
+    }
+
+    #[test]
+    fn cab_path_escape_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = put(
+            d.path(),
+            "e.cab",
+            &cab_ok(&[("ok.txt", b"1"), (r"..\x", b"2")]),
+        );
+        let out = d.path().join("out");
+        let r = extract(&f, "e.cab", None, None, &out);
+        assert!(matches!(r, Err(ExtractError::UnsafePath(_))), "{r:?}");
+        assert!(!out.exists());
+        assert!(!d.path().join("x").exists());
+    }
+
+    #[test]
+    fn cab_entry_cap_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = put(
+            d.path(),
+            "n.7z",
+            &cab_ok(&[("a", b"1"), ("b", b"2"), ("c", b"3")]),
+        );
+        let out = d.path().join("out");
+        let l = Limits {
+            max_entries: 2,
+            ..DEFAULT_LIMITS
+        };
+        let r = extract_all_with(
+            &[ExtractSource {
+                file: &f,
+                file_name: "n.7z",
+                extract_dir: None,
+                extract_to: None,
+            }],
+            &out,
+            &l,
+        );
+        assert!(
+            matches!(r, Err(ExtractError::TooManyEntries { .. })),
+            "{r:?}"
+        );
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn cab_byte_cap_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let f = put(d.path(), "b.cab", &cab_ok(&[("a", &[7u8; 4000])]));
+        let out = d.path().join("out");
+        let l = Limits {
+            ratio: 0,
+            floor: 100,
+            ceiling: 1 << 40,
+            max_entries: 100,
+        };
+        let r = extract_all_with(
+            &[ExtractSource {
+                file: &f,
+                file_name: "b.cab",
+                extract_dir: None,
+                extract_to: None,
+            }],
+            &out,
+            &l,
+        );
+        assert!(matches!(r, Err(ExtractError::TooLarge { .. })), "{r:?}");
+        assert!(!out.exists());
+    }
+}

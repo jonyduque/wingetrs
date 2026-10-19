@@ -12,6 +12,8 @@ const TABLE: &[(&str, Result<ArchiveKind, &str>)] = &[
     ("a.nupkg", Ok(Nupkg)),
     ("a.tar.xz", Ok(TarXz)),
     ("a.txz", Ok(TarXz)),
+    ("a.cab", Ok(Cab)),
+    ("A.CAB", Ok(Cab)),
     ("a.rar", Err(".rar")),
     ("a.tar.bz2", Err(".tar.bz2")),
     ("a.tbz2", Err(".tbz2")),
@@ -32,7 +34,7 @@ fn archive_kind_table() {
 
 #[test]
 fn supported_kinds() {
-    for k in [Zip, TarGz, Plain, Nupkg, TarXz, SevenZip, Msi] {
+    for k in [Zip, TarGz, Plain, Nupkg, TarXz, SevenZip, Msi, Cab] {
         assert!(k.supported(), "{k:?}");
     }
 }
@@ -43,7 +45,7 @@ fn engine_named_only_where_the_suffix_does_not_say_it() {
     assert_eq!(Msi.engine(), Some("MSI, sem executar o instalador"));
     assert_eq!(TarXz.engine(), Some("tar.xz"));
     assert_eq!(Nupkg.engine(), Some("zip"));
-    for k in [Zip, TarGz, Plain] {
+    for k in [Zip, TarGz, Cab, Plain] {
         assert_eq!(k.engine(), None, "{k:?}");
     }
 }
@@ -51,7 +53,7 @@ fn engine_named_only_where_the_suffix_does_not_say_it() {
 #[test]
 fn verb_matches_kind() {
     assert_eq!(Plain.verb(), "Copiar");
-    for k in [Zip, TarGz, SevenZip, Msi, Nupkg, TarXz] {
+    for k in [Zip, TarGz, SevenZip, Msi, Nupkg, TarXz, Cab] {
         assert_eq!(k.verb(), "Extrair", "{k:?}");
     }
 }

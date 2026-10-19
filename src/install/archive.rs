@@ -9,6 +9,7 @@ pub enum ArchiveKind {
     Msi,
     Nupkg,
     TarXz,
+    Cab,
     /// Not an archive: copied as is (`.exe`, `.ps1`, `.jar`, ...).
     Plain,
 }
@@ -29,6 +30,8 @@ impl ArchiveKind {
             Ok(ArchiveKind::Msi)
         } else if has(".nupkg") {
             Ok(ArchiveKind::Nupkg)
+        } else if has(".cab") {
+            Ok(ArchiveKind::Cab)
         } else if has(".tar.xz") || has(".txz") {
             Ok(ArchiveKind::TarXz)
         } else if has(".rar") {
@@ -54,6 +57,7 @@ impl ArchiveKind {
                 | ArchiveKind::Msi
                 | ArchiveKind::TarXz
                 | ArchiveKind::Nupkg
+                | ArchiveKind::Cab
                 | ArchiveKind::Plain
         )
     }
@@ -67,6 +71,7 @@ impl ArchiveKind {
             ArchiveKind::Msi => ".msi",
             ArchiveKind::Nupkg => ".nupkg",
             ArchiveKind::TarXz => ".tar.xz",
+            ArchiveKind::Cab => ".cab",
             ArchiveKind::Plain => "",
         }
     }
@@ -86,7 +91,7 @@ impl ArchiveKind {
             ArchiveKind::Msi => Some("MSI, sem executar o instalador"),
             ArchiveKind::TarXz => Some("tar.xz"),
             ArchiveKind::Nupkg => Some("zip"),
-            ArchiveKind::Zip | ArchiveKind::TarGz | ArchiveKind::Plain => None,
+            ArchiveKind::Zip | ArchiveKind::TarGz | ArchiveKind::Cab | ArchiveKind::Plain => None,
         }
     }
 }

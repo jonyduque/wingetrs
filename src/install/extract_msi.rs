@@ -169,7 +169,7 @@ pub(super) fn align_case(mut rel: Vec<String>, dir: &[String]) -> Vec<String> {
 }
 
 /// Writes one cabinet entry to `target`, or reads it to the end and charges it.
-fn place(
+pub(super) fn place(
     key: &str,
     target: Option<&Path>,
     data: &mut dyn Read,
@@ -203,10 +203,10 @@ fn place(
 }
 
 /// Counts the bytes read through it.
-struct Counted<'a> {
-    inner: &'a mut dyn Read,
-    n: u64,
-    failed: bool,
+pub(super) struct Counted<'a> {
+    pub(super) inner: &'a mut dyn Read,
+    pub(super) n: u64,
+    pub(super) failed: bool,
 }
 
 impl Read for Counted<'_> {
@@ -234,7 +234,7 @@ fn drain(data: &mut dyn Read, budget: &mut Budget) -> Result<(), ExtractError> {
 /// and size share their bytes (WiX stores identical files once): the span counts
 /// once, and each extra entry is charged the rewind it costs. Any other overlap
 /// and files past the most data the folder's blocks can hold are refused.
-fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
+pub(super) fn folder_gaps(folder: &FolderEntry) -> Result<u64, ExtractError> {
     let mut spans: Vec<(u64, u64)> = folder
         .file_entries()
         .map(|e| {
@@ -286,7 +286,7 @@ fn continued(pkg: &mut Pkg, name: &str) -> Result<bool, ExtractError> {
         .map_err(|e| ExtractError::Archive(format!("gabinete {name}: {e}")))
 }
 
-fn raw_continued<R: BufRead + Seek>(mut r: R) -> io::Result<bool> {
+pub(super) fn raw_continued<R: BufRead + Seek>(mut r: R) -> io::Result<bool> {
     let mut h = [0u8; 36];
     r.read_exact(&mut h)?;
     if u16::from_le_bytes([h[30], h[31]]) & CAB_SPANNED != 0 {

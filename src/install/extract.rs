@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs_retry;
 use crate::install::archive::ArchiveKind;
 use crate::install::extract_7z::{MAX_7Z_DICT, extract_7z};
+use crate::install::extract_cab::extract_cab;
 use crate::install::extract_msi::{align_case, extract_msi};
 use crate::install::safepath;
 use crate::install::sniff::{self, Sniffed};
@@ -390,6 +391,7 @@ fn extract_one(
             fs::copy(s.file, &target).map_err(io_at("copiar", &target))?;
             mapper.dir_seen = true;
         }
+        Ok(ArchiveKind::Cab) => extract_cab(s.file, tmp, mapper, limits)?,
         Ok(ArchiveKind::SevenZip) => extract_sniffed(s, tmp, mapper, limits)?,
         Ok(ArchiveKind::Msi) => {
             if !is_ole(s.file)? {
@@ -446,6 +448,10 @@ fn extract_sniffed(
         Sniffed::Zip => {
             tracing::info!(file = s.file_name, format = "zip", "arquivo .7z é um zip");
             extract_zip(s.file, tmp, mapper, limits)
+        }
+        Sniffed::Cab => {
+            tracing::info!(file = s.file_name, format = "cab", "arquivo .7z é um CAB");
+            extract_cab(s.file, tmp, mapper, limits)
         }
         Sniffed::Pe => {
             let start = sniff::pe_overlay_start(&head);

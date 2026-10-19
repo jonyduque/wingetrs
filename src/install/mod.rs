@@ -5,6 +5,7 @@ pub mod download;
 pub mod executor;
 pub mod extract;
 pub(crate) mod extract_7z;
+pub(crate) mod extract_cab;
 pub(crate) mod extract_msi;
 pub mod inno;
 pub mod installer_args;
