@@ -7,8 +7,8 @@ use crate::installed::Hive;
 use crate::winget_install::launch::Elevation;
 use crate::winget_install::ops::WingetOpsError;
 use crate::winget_install::uninstall::{
-    BackupLimits, MsiQueue, UninstallCtx, UninstallPlan, UninstallReport, UninstallTarget,
-    backup_folders, uninstall_queued,
+    BackupLimits, MsiQueue, UninstallCtx, UninstallPlan, UninstallReport, backup_folders,
+    uninstall_queued,
 };
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -118,7 +118,7 @@ pub async fn remove<L>(
     plan: &UninstallPlan,
     how: RemovalChoice,
     uninstall: impl FnOnce(&dyn Fn(&ProgressEvent)) -> Result<UninstallReport, String>,
-    registry_only: impl FnOnce() -> Result<PathBuf, String>,
+    registry_only: impl FnOnce(&dyn Fn(&ProgressEvent)) -> Result<PathBuf, String>,
 ) -> Result<Removed, RemovalError> {
     let phase = |p: Phase| (s.progress)(&ProgressEvent::Phase(p));
     phase(Phase::Preparing);
@@ -155,10 +155,12 @@ pub async fn remove<L>(
             if !s.gate.try_launch_for("remoção do registro") {
                 return Err(RemovalError::Cancelled);
             }
-            let hklm =
-                matches!(&plan.target, UninstallTarget::Arp { hive, .. } if *hive != Hive::User);
-            phase(removal_phase(hklm, &plan.name));
-            registry_only().map(Removed::Record).map_err(failed)
+            // `Removendo`; an HKLM key: the helper's UAC notice while its prompt is open
+            // (the remover reports it, Task 201).
+            phase(removal_phase(false, &plan.name));
+            registry_only(s.progress)
+                .map(Removed::Record)
+                .map_err(failed)
         }
         RemovalChoice::Remove | RemovalChoice::BackupThenRemove => {
             if !s.gate.try_launch_for("desinstalador") {

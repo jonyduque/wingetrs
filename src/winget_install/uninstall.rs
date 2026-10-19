@@ -802,6 +802,19 @@ pub fn remove_registry_only(
     backups: &Path,
     ts: &str,
 ) -> Result<PathBuf, String> {
+    remove_registry_only_with(plan, reg, elevated, backups, ts, &|_| {})
+}
+
+/// [`remove_registry_only`] reporting to `progress` (Task 201): an HKLM key goes through the
+/// helper, whose UAC prompt shows `WaitingElevation` until it runs, then `Removendo <name>`.
+pub fn remove_registry_only_with(
+    plan: &UninstallPlan,
+    reg: &dyn ArpRegistry,
+    elevated: &dyn ElevatedRunner,
+    backups: &Path,
+    ts: &str,
+    progress: &dyn Fn(&crate::install::progress::ProgressEvent),
+) -> Result<PathBuf, String> {
     let shared = plan
         .shared
         .as_ref()
@@ -832,9 +845,19 @@ pub fn remove_registry_only(
         None => reg
             .delete_user_key(key)
             .map_err(|e| format!("falha ao apagar {key}: {e}"))?,
-        Some(h) => elevated
-            .delete_arp_key(h, key, DeleteReason::Duplicate)
-            .map_err(|e| e.context(format!("falha ao apagar {key}")))?,
+        Some(h) => {
+            use crate::install::progress::{Phase, ProgressEvent, helper_line_phase};
+            let removing = Phase::Removing {
+                app: plan.name.clone(),
+            };
+            elevated
+                .delete_arp_key_lines(h, key, DeleteReason::Duplicate, &mut |line: &str| {
+                    if let Some(p) = helper_line_phase(line, &removing) {
+                        progress(&ProgressEvent::Phase(p));
+                    }
+                })
+                .map_err(|e| e.context(format!("falha ao apagar {key}")))?
+        }
     }
     Ok(file)
 }

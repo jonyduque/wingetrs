@@ -60,7 +60,7 @@ pub type Uninstaller =
     Box<dyn FnOnce(&dyn Fn(&ProgressEvent)) -> Result<UninstallReport, String> + Send>;
 
 /// The registry-only removal of a plan, run on the removal's thread (the `.reg` written).
-pub type RecordRemover = Box<dyn FnOnce() -> Result<PathBuf, String> + Send>;
+pub type RecordRemover = Box<dyn FnOnce(&dyn Fn(&ProgressEvent)) -> Result<PathBuf, String> + Send>;
 
 /// Said once when Ctrl+C arrives before anything was launched.
 pub const CANCELLING_NOTICE: &str = "cancelando: nada foi iniciado; esperando a etapa atual parar";
@@ -211,28 +211,33 @@ pub(super) async fn install_bridge(
     let msi_lock = ctx.data.install_layout().msi_lock();
     let mut exec = run_tool;
     let exec: BridgeExec<'_> = &mut exec;
+    run_install_bridge(ctx.progress, ui, stop, job.tool.name(), |on_line| {
+        crate::tui::jobs::run_bridge_install(helper, &job, scope_fallback, &msi_lock, exec, on_line)
+    })
+}
+
+/// The run of a confirmed install through the bridge (`run` is the tool's job, given its line
+/// sink): Ctrl+C held, `Bridge { tool }` with its clock from the first instant and the helper's
+/// UAC notice as a phase (stderr), the tool's own lines on stdout (`Ui::output`), then the
+/// result once the progress line ended.
+pub fn run_install_bridge<I: Interrupts>(
+    progress: &dyn Fn(&ProgressEvent),
+    ui: &dyn Ui,
+    stop: Stop<'_, I>,
+    tool: &str,
+    run: impl FnOnce(&mut dyn FnMut(&str)) -> Result<Done, InstallFail>,
+) -> anyhow::Result<()> {
     stop.interrupts.hold();
-    // Spinner and clock from the first instant; the UAC notice becomes the phase.
-    let result = super::output::bridge_progress(
-        ctx.progress,
-        &|line: &str| ui.output(line),
-        job.tool.name(),
-        |on_line| {
-            crate::tui::jobs::run_bridge_install(
-                helper,
-                &job,
-                scope_fallback,
-                &msi_lock,
-                exec,
-                on_line,
-            )
-        },
-    );
+    let result = super::output::bridge_progress(progress, &|line: &str| ui.output(line), tool, run);
     ui.end_progress();
     stop.interrupts.release();
     match result {
         Ok(done) => {
-            anstream::println!("{} {}", style::paint(style::OK, "Instalado:"), done.summary);
+            ui.output(&format!(
+                "{} {}",
+                style::paint(style::OK, "Instalado:"),
+                done.summary
+            ));
             Ok(())
         }
         Err(InstallFail::Other(message)) => bail!("{message}"),

@@ -1254,3 +1254,46 @@ fn helper_uac_lines_show_notice_then_uninstaller() {
         ]
     );
 }
+
+/// Task 201: the registry-only removal of an HKLM duplicate goes through the helper, whose UAC
+/// prompt shows the notice phase until it runs, then `Removendo`.
+#[test]
+fn registry_only_hklm_shows_uac_notice_phase() {
+    use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, Phase, ProgressEvent};
+    use wingetrs::winget_install::uninstall::remove_registry_only_with;
+
+    /// A helper that opens its UAC prompt before deleting.
+    struct Prompting(FakeElevated);
+    impl ElevatedRunner for Prompting {
+        fn delete_arp_key_lines(
+            &self,
+            hive: MachineHive,
+            key: &str,
+            reason: DeleteReason,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<(), ElevatedError> {
+            on_line(ELEVATION_NOTICE);
+            on_line(ELEVATION_GRANTED);
+            self.0.delete_arp_key(hive, key, reason)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let d = kindle(Hive::MachineX86, "Kindle", "2.8.3");
+    let p = plan_uninstall(&d, true, &newer(), false, &known(), &user(), &no_folders).unwrap();
+    let reg = FakeReg::new(Some(utf16le(&reg_text("HKEY_LOCAL_MACHINE", "Kindle"))));
+    let el = Prompting(FakeElevated::default());
+    let events = Mutex::new(Vec::new());
+    let progress = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
+    remove_registry_only_with(&p, &reg, &el, dir.path(), "ts", &progress).unwrap();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            ProgressEvent::Phase(Phase::WaitingElevation),
+            ProgressEvent::Phase(Phase::Removing {
+                app: p.name.clone()
+            }),
+        ]
+    );
+    assert_eq!(el.0.count(), 1);
+}

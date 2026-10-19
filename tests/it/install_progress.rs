@@ -1026,7 +1026,7 @@ async fn every_path_emits_first_phase_immediately() {
         &plan,
         wingetrs::winget_install::removal::RemovalChoice::Remove,
         |_| unreachable!("the lock never came"),
-        || unreachable!("the lock never came"),
+        |_| unreachable!("the lock never came"),
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(200), removal)

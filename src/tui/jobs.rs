@@ -24,7 +24,7 @@ use crate::winget_install::plan::WingetPlan as NativePlan;
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::uninstall::{
     KEY_STAYED, MsiQueue, UninstallCtx, UninstallPlan as WingetUninstallPlan, UninstallStatus,
-    UninstallTarget, remove_registry_only,
+    UninstallTarget, remove_registry_only_with,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -748,13 +748,14 @@ async fn winget_removal(
         plan,
         how,
         |p| removal::run_uninstaller(&env.uninstall, &queue, plan, p),
-        || {
-            remove_registry_only(
+        |p| {
+            remove_registry_only_with(
                 plan,
                 env.registry,
                 env.install.elevated,
                 env.backups,
                 &env.stamp,
+                p,
             )
         },
     )

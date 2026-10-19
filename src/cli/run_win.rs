@@ -286,8 +286,10 @@ impl WingetFlows for ProdFlows<'_, '_> {
     fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> RecordRemover {
         let (helper, backups) = (Arc::clone(&self.helper.0), self.backups());
         let (plan, ts) = (plan.clone(), ts.to_string());
-        Box::new(move || {
-            uninstall::remove_registry_only(&plan, &SystemArp, &*helper, &backups, &ts)
+        Box::new(move |progress: &dyn Fn(&ProgressEvent)| {
+            uninstall::remove_registry_only_with(
+                &plan, &SystemArp, &*helper, &backups, &ts, progress,
+            )
         })
     }
 

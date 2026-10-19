@@ -199,16 +199,27 @@ impl WingetFlows for Fake {
             })
         })
     }
+    /// winget installing through the session's helper (the production run, with a fake
+    /// tool): its UAC notice, then winget's own line.
     async fn install_bridge<I: Interrupts>(
         &self,
-        _: &dyn Ui,
-        _: &Candidate,
+        ui: &dyn Ui,
+        cand: &Candidate,
         _: Option<ScopeArg>,
         _: Flags,
-        _: Stop<'_, I>,
+        stop: Stop<'_, I>,
     ) -> anyhow::Result<()> {
         self.bridged.set(self.bridged.get() + 1);
-        Ok(())
+        let progress = self.progress();
+        winget_cmd::run_install_bridge(&*progress, ui, stop, "winget", |on_line| {
+            on_line(wingetrs::install::progress::ELEVATION_NOTICE);
+            on_line(wingetrs::install::progress::ELEVATION_GRANTED);
+            on_line("Baixando o instalador...");
+            Ok(Done {
+                summary: format!("{}: instalado via winget", cand.entry.name),
+                residues: None,
+            })
+        })
     }
     fn installed(&self) -> anyhow::Result<Vec<ListRow>> {
         Ok(self.rows.clone())
@@ -269,8 +280,13 @@ impl WingetFlows for Fake {
     fn remove_registry_only(&self, plan: &UninstallPlan, ts: &str) -> RecordRemover {
         let steps = Arc::clone(&self.steps);
         let file = self.backups.join(ts).join(format!("{}.reg", plan.name));
-        Box::new(move || {
+        let hklm = matches!(&plan.target, UninstallTarget::Arp { hive, .. } if *hive != Hive::User);
+        Box::new(move |progress: &dyn Fn(&ProgressEvent)| {
             steps.lock().unwrap().push("registry-only".into());
+            // As `uninstall::remove_registry_only_with` for an HKLM key: the helper's prompt.
+            if hklm {
+                progress(&ProgressEvent::Phase(Phase::WaitingElevation));
+            }
             Ok(file)
         })
     }
@@ -2019,4 +2035,74 @@ fn cleanup_hklm_orphan_shows_uac_notice() {
     );
     assert_eq!(ui.ended.get(), 1);
     assert!(out.iter().any(|l| l.contains("Removido: App M")), "{out:?}");
+}
+
+/// Task 201: an HKLM registry-only removal hands the progress to the remover, so the helper's
+/// UAC notice reaches the CLI's progress line.
+#[tokio::test]
+async fn cli_registry_only_hklm_shows_uac_notice() {
+    let t = TempDir::new().unwrap();
+    let mut fake = kindle(&t, true);
+    fake.rows = vec![row("Amazon Kindle", "arp/hklm32/Kindle", None)];
+    let ui = FakeUi {
+        interactive: true,
+        pick: Some(1),
+        ..Default::default()
+    };
+    let (r, _) = uninstall_with(&fake, &ui, Flags::default()).await;
+    r.unwrap();
+    assert_eq!(
+        *fake.steps.lock().unwrap(),
+        vec![
+            "phase:Preparando".to_string(),
+            "lock".to_string(),
+            "phase:Removendo Amazon Kindle".to_string(),
+            "registry-only".to_string(),
+            format!("phase:{}", phase_title(&Phase::WaitingElevation)),
+        ]
+    );
+}
+
+/// Task 201: `install` through winget shows the bridge's phase from the start (stderr), the
+/// helper's UAC notice as a phase (never a printed line), and winget's own lines on stdout.
+#[tokio::test]
+async fn bridge_install_progress_and_stdout() {
+    use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE};
+    let fake = Fake {
+        planned: Some(PlanOrBridge::Bridge(
+            "tipo zip: instalado pelo winget".into(),
+        )),
+        ..Default::default()
+    };
+    let ui = FakeUi::default();
+    let (_tx, mut rx) = quiet();
+    let (r, _) = install_with(&fake, &ui, &mut rx, yes()).await;
+    r.unwrap();
+    assert_eq!(fake.bridged.get(), 1);
+    let bridge = Phase::Bridge {
+        tool: "winget".into(),
+    };
+    let phases: Vec<Phase> = fake
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::Phase(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(phases, [bridge.clone(), Phase::WaitingElevation, bridge]);
+    let outputs = ui.outputs.borrow().clone();
+    assert_eq!(
+        outputs[..2],
+        [
+            format!("  {ELEVATION_GRANTED}"),
+            "  Baixando o instalador...".to_string()
+        ]
+    );
+    assert!(outputs[2].contains("Instalado:"), "{outputs:?}");
+    assert!(!outputs.iter().any(|l| l.contains(ELEVATION_NOTICE)));
+    assert!(ui.notices.borrow().is_empty(), "{:?}", ui.notices.borrow());
+    assert!(ui.ended.get() >= 1);
 }
