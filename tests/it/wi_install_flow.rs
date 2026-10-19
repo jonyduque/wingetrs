@@ -22,7 +22,7 @@ use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::ops::{WingetCtx, WingetOpsError, install};
 use wingetrs::winget_install::plan::{
-    ADMIN_PROMPT, ADMIN_PROMPT_MSI, PlanOrBridge, WingetPlan, plan,
+    ADMIN_PROMPT, ADMIN_PROMPT_MSI, PlanOrBridge, RUN_FOLDER_NOTE, WingetPlan, plan,
 };
 use wingetrs::winget_install::post_check::find_installed;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
@@ -47,6 +47,8 @@ struct FakeLauncher {
     /// While "running": try to rename and to delete the launched file; whether each worked.
     probe_hold: AtomicBool,
     probed: Mutex<Vec<(&'static str, bool)>>,
+    /// The names in the launched program's folder, while it "runs".
+    seen_in_dir: Mutex<Vec<Vec<String>>>,
     /// While "running": write this line to the installer log named in the parameters.
     log_line: Mutex<Option<String>>,
 }
@@ -75,6 +77,15 @@ impl Launcher for FakeLauncher {
             let mut probed = self.probed.lock().unwrap();
             probed.push(("rename", renamed));
             probed.push(("delete", deleted));
+        }
+        if let Some(dir) = spec.program.parent()
+            && let Ok(entries) = std::fs::read_dir(dir)
+        {
+            let mut names: Vec<String> = entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            self.seen_in_dir.lock().unwrap().push(names);
         }
         if let Some(text) = self.log_line.lock().unwrap().as_deref() {
             // UTF-16 with a BOM, as msiexec writes it.
@@ -440,13 +451,8 @@ async fn machine_installer_uses_runas_launcher() {
     let spec = &calls[0];
     assert_eq!(spec.verb, Verb::RunAs);
     assert_eq!(spec.program, ctx.msiexec);
-    let file = env.materialized("msi");
-    assert!(
-        spec.params
-            .starts_with(&format!("/i \"{}\" ", file.display())),
-        "{}",
-        spec.params
-    );
+    assert!(spec.params.starts_with("/i \""), "{}", spec.params);
+    assert!(is_run_copy(&quoted(&spec.params), "msi"), "{}", spec.params);
     assert!(spec.params.contains("/norestart"), "{}", spec.params);
     assert_no_log(&spec.params);
     assert_eq!(spec.show, Show::Normal);
@@ -472,7 +478,11 @@ async fn machine_installer_uses_runas_launcher() {
     let calls = env.launcher.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].verb, Verb::RunAs);
-    assert_eq!(calls[0].program, env.materialized("exe"));
+    assert!(
+        is_run_copy(&calls[0].program, "exe"),
+        "{}",
+        calls[0].program.display()
+    );
     assert_no_log(&calls[0].params);
     assert!(env.elevated.calls.lock().unwrap().is_empty());
 
@@ -490,6 +500,27 @@ async fn machine_installer_uses_runas_launcher() {
             .unwrap()
             .contains(&ProgressEvent::Phase(Phase::WaitingElevation))
     );
+}
+
+/// The first double-quoted run of `params` (msiexec's `/i "<file>"`).
+fn quoted(params: &str) -> PathBuf {
+    PathBuf::from(params.split('"').nth(1).unwrap_or(""))
+}
+
+/// Whether `p` is the copy of `Pub.App-1.0.<ext>` in a `installers\run-<32 hex>` folder.
+fn is_run_copy(p: &Path, ext: &str) -> bool {
+    let named = p.file_name().and_then(|n| n.to_str()) == Some(&format!("Pub.App-1.0.{ext}"));
+    let run = p.parent();
+    let in_run = run
+        .and_then(|r| r.file_name())
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix("run-"))
+        .is_some_and(|h| h.len() == 32 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+    let under = run
+        .and_then(|r| r.parent())
+        .and_then(|i| i.file_name())
+        .is_some_and(|n| n == "installers");
+    named && in_run && under
 }
 
 /// No log switch of any form (msiexec `/log`, `/l*v`, Inno `/LOG=`, the placeholder).
@@ -519,10 +550,7 @@ async fn runas_command_line_has_no_log() {
         assert_eq!(calls.len(), 1, "{kind}");
         assert_eq!(calls[0].verb, Verb::RunAs, "{kind}");
         assert!(
-            calls[0]
-                .params
-                .contains(&env.materialized(ext).display().to_string())
-                || calls[0].program == env.materialized(ext),
+            is_run_copy(&calls[0].program, ext) || is_run_copy(&quoted(&calls[0].params), ext),
             "{kind}"
         );
         assert_no_log(&calls[0].params);
@@ -707,6 +735,7 @@ fn plan_text_is_the_confirmation() {
     );
     let text = native(&msi, Scope::Machine).to_string();
     assert!(text.contains(ADMIN_PROMPT_MSI), "{text}");
+    assert!(text.contains(RUN_FOLDER_NOTE), "{text}");
     assert!(!text.contains(ADMIN_PROMPT), "{text}");
     let inno_machine = manifest_of("inno", Some("machine"), "https://h/setup.exe", &sha, "", "");
     let machine_text = native(&inno_machine, Scope::Machine).to_string();
@@ -720,6 +749,7 @@ fn plan_text_is_the_confirmation() {
     let text = native(&inno, Scope::User).to_string();
     assert!(!text.contains(ADMIN_PROMPT), "{text}");
     assert!(!text.contains(ADMIN_PROMPT_MSI), "{text}");
+    assert!(!text.contains(RUN_FOLDER_NOTE), "{text}");
     assert!(!text.contains("abre a janela"), "{text}");
 
     let exe = manifest_of("exe", None, "https://h/setup.exe", &sha, "", "");
@@ -1137,13 +1167,105 @@ async fn runas_gets_the_final_path_and_system32() {
     let tmp = std::fs::canonicalize(env.tmp.path()).unwrap();
     let tmp = tmp.to_str().unwrap();
     let tmp = tmp.strip_prefix(r"\\?\").unwrap_or(tmp).to_string();
-    let want = Path::new(&tmp)
-        .join("root")
-        .join("installers")
-        .join("Pub.App")
-        .join("1.0")
-        .join("Pub.App-1.0.exe");
-    assert_eq!(calls[0].program, want);
-    assert_ne!(calls[0].program, env.materialized("exe"));
+    let installers = Path::new(&tmp).join("root").join("installers");
+    let program = &calls[0].program;
+    assert_eq!(program.file_name().unwrap(), "Pub.App-1.0.exe");
+    let run = program.parent().unwrap();
+    assert_eq!(run.parent().unwrap(), installers, "{}", program.display());
+    assert_ne!(*program, env.materialized("exe"));
     assert_eq!(calls[0].dir.as_deref(), env.msiexec.parent());
+}
+
+/// Task 196 (user decision on DLL planting): the elevated installer runs from a fresh
+/// `installers\run-<32 hex>\` folder that holds only its copy, gone once it ended; the
+/// downloaded file's own folder is not where it runs.
+#[tokio::test]
+async fn runas_runs_from_a_fresh_run_folder() {
+    for kind in ["inno", "msi"] {
+        let env = Env::new();
+        let (_s, p, _) = served_plan(kind, Some("machine"), Scope::Machine, "", "").await;
+        let ctx = ctx!(env);
+        install(&ctx, &p).await.unwrap();
+        let calls = env.launcher.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{kind}");
+        let ext = if kind == "msi" { "msi" } else { "exe" };
+        let copy = match kind {
+            // msiexec /i "<copy>" ...
+            "msi" => PathBuf::from(calls[0].params.split('"').nth(1).unwrap()),
+            _ => calls[0].program.clone(),
+        };
+        assert_eq!(
+            copy.file_name().unwrap().to_str().unwrap(),
+            format!("Pub.App-1.0.{ext}")
+        );
+        let run = copy.parent().unwrap();
+        let name = run.file_name().unwrap().to_str().unwrap();
+        let hex = name
+            .strip_prefix("run-")
+            .unwrap_or_else(|| panic!("{name}"));
+        assert!(
+            hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{name}"
+        );
+        assert_eq!(
+            run.parent().unwrap().file_name().unwrap(),
+            "installers",
+            "{}",
+            run.display()
+        );
+        assert!(!run.exists(), "{kind}: run folder removed after the run");
+        if kind == "inno" {
+            assert_eq!(
+                *env.launcher.seen_in_dir.lock().unwrap(),
+                [vec![format!("Pub.App-1.0.{ext}")]],
+                "only the installer beside it"
+            );
+        }
+    }
+}
+
+/// Task 196: a run folder name that already exists (planted, or left behind) is refused and
+/// left alone; a fresh one holds the re-hashed copy and goes when dropped.
+#[test]
+fn run_folder_that_exists_is_refused() {
+    use wingetrs::winget_install::verified_win::RunCopy;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    let installers = root.join("installers");
+    std::fs::create_dir_all(&installers).unwrap();
+    let source = installers.join("setup.exe");
+    std::fs::write(&source, b"MZ t196").unwrap();
+    let sha = sha256_hex(b"MZ t196");
+    let name = format!("run-{}", "a".repeat(32));
+    let planted = installers.join(&name);
+    std::fs::create_dir(&planted).unwrap();
+    std::fs::write(planted.join("version.dll"), b"x").unwrap();
+    let r = RunCopy::create_named(&root, &name, &source, &sha);
+    assert!(r.is_err(), "{r:?}");
+    assert!(planted.join("version.dll").is_file(), "left alone");
+
+    let fresh = format!("run-{}", "b".repeat(32));
+    let run = RunCopy::create_named(&root, &fresh, &source, &sha).unwrap();
+    let dir = run.dir().to_path_buf();
+    assert_eq!(dir, installers.join(&fresh));
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["setup.exe"]);
+    assert!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("setup.exe"))
+            .is_err(),
+        "the copy is held denying writes"
+    );
+    drop(run);
+    assert!(!dir.exists());
+
+    // A wrong hash: refused, and the folder does not stay.
+    let other = format!("run-{}", "c".repeat(32));
+    let r = RunCopy::create_named(&root, &other, &source, &"0".repeat(64));
+    assert!(r.is_err());
+    assert!(!installers.join(&other).exists());
 }

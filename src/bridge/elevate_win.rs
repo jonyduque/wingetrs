@@ -188,7 +188,7 @@ impl Write for PipeIo {
 }
 
 /// 16 random bytes from the system RNG, as hex.
-pub(super) fn random_hex() -> std::io::Result<String> {
+pub(crate) fn random_hex() -> std::io::Result<String> {
     let mut bytes = [0u8; 16];
     // SAFETY: the buffer is ours; no algorithm handle with the system-preferred flag.
     unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }

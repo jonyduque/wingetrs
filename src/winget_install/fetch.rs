@@ -80,15 +80,6 @@ impl Materialized {
         Ok(self.verified.insert(v))
     }
 
-    /// The path an elevated launch is given: the held file's final path once verified.
-    pub fn launch_path(&self) -> PathBuf {
-        #[cfg(windows)]
-        if let Some(v) = &self.verified {
-            return v.final_path().to_path_buf();
-        }
-        self.path.clone()
-    }
-
     /// Closes the share-deny handle: from then on the file may change on disk. Called only
     /// once the installer process has ended (Task 196).
     pub fn release(&mut self) {

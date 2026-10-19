@@ -16,6 +16,8 @@ use crate::sources::winget::manifest::{
 
 /// Plan line of an installer that runs elevated: it asks for its own UAC (Task 196).
 pub const ADMIN_PROMPT: &str = "pede permissão de administrador para este instalador";
+/// Plan line of an elevated installer: it runs from a fresh folder holding only its copy.
+pub const RUN_FOLDER_NOTE: &str = "o instalador roda numa pasta temporária do wingetrs";
 /// The same line for msi/wix: the UAC prompt names the Windows Installer (`msiexec`), not the
 /// package's publisher; the verified file stays held until it ends, so it is the one that runs.
 pub const ADMIN_PROMPT_MSI: &str = "pede permissão de administrador para o Windows Installer";
@@ -305,6 +307,7 @@ impl std::fmt::Display for WingetPlan {
                 _ => ADMIN_PROMPT,
             };
             write!(f, "\n{prompt}")?;
+            write!(f, "\n{RUN_FOLDER_NOTE}")?;
         }
         if self.interactive {
             write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;

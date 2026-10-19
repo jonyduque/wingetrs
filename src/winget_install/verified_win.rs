@@ -161,3 +161,131 @@ impl VerifiedFile {
         &self.final_path
     }
 }
+
+/// Prefix of a run folder: `<root>\installers\run-<32 hex>`.
+pub const RUN_PREFIX: &str = "run-";
+/// Run folders older than this are removed before the next elevated run.
+pub const RUN_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// A fresh folder holding only a copy of the verified installer, for one elevated run (Task
+/// 196): nothing planted beside the downloaded file (a DLL the installer would load as admin)
+/// is next to the copy. The copy is re-hashed through a handle that denies write, delete and
+/// rename, the folders from the data root down are held (no reparse point), and the folder is
+/// removed when this is dropped.
+#[derive(Debug)]
+pub struct RunCopy {
+    dir: PathBuf,
+    file: Option<VerifiedFile>,
+    folders: Vec<File>,
+}
+
+impl RunCopy {
+    /// Copies `source` (already verified and held by the caller) into a new
+    /// `<root>\installers\run-<32 random hex>\`; stale run folders are pruned first.
+    pub fn create(root: &Path, source: &Path, sha256: &str) -> Result<RunCopy, FetchError> {
+        let installers = root.join("installers");
+        prune_runs(&installers, std::time::SystemTime::now());
+        let hex = crate::bridge::elevate_win::random_hex()
+            .map_err(|e| FetchError::Io(format!("gerador aleatório: {e}")))?;
+        RunCopy::create_named(root, &format!("{RUN_PREFIX}{hex}"), source, sha256)
+    }
+
+    /// `create` with the folder name `name` (one component); refused when the folder exists.
+    pub fn create_named(
+        root: &Path,
+        name: &str,
+        source: &Path,
+        sha256: &str,
+    ) -> Result<RunCopy, FetchError> {
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| FetchError::Io(format!("{}: sem nome", source.display())))?;
+        let dir = root.join("installers").join(name);
+        // `create_new`: an existing folder (planted or left behind) is never reused.
+        std::fs::create_dir(&dir).map_err(|e| FetchError::Io(format!("{}: {e}", dir.display())))?;
+        let mut run = RunCopy {
+            dir,
+            file: None,
+            folders: Vec::new(),
+        };
+        let copy = run.dir.join(file_name);
+        run.folders = hold_chain(root, &copy)?;
+        let io = |p: &Path, e: std::io::Error| FetchError::Io(format!("{}: {e}", p.display()));
+        {
+            let mut from = File::open(source).map_err(|e| io(source, e))?;
+            let mut to = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&copy)
+                .map_err(|e| io(&copy, e))?;
+            std::io::copy(&mut from, &mut to).map_err(|e| io(&copy, e))?;
+            to.sync_all().map_err(|e| io(&copy, e))?;
+        }
+        run.file = Some(VerifiedFile::open(&copy, sha256)?);
+        Ok(run)
+    }
+
+    /// The run folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The held copy's final path: what the elevated launch is given.
+    pub fn final_path(&self) -> &Path {
+        match &self.file {
+            Some(f) => f.final_path(),
+            None => &self.dir,
+        }
+    }
+}
+
+impl Drop for RunCopy {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        self.folders.clear();
+        if let Err(e) = std::fs::remove_dir_all(&self.dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "pasta de execução não apagada: {}", self.dir.display());
+        }
+    }
+}
+
+/// Removes the run folders in `installers` older than `RUN_STALE_AFTER` at `now` (only plain
+/// folders named like one); how many were removed.
+pub fn prune_runs(installers: &Path, now: std::time::SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(installers) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_run = name.to_str().is_some_and(|n| {
+            n.strip_prefix(RUN_PREFIX).is_some_and(|h| {
+                h.len() == 32 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+        });
+        if !is_run {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_attributes() & REPARSE != 0 {
+            continue;
+        }
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > RUN_STALE_AFTER);
+        if stale {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!(error = %e, "pasta de execução antiga não apagada"),
+            }
+        }
+    }
+    removed
+}

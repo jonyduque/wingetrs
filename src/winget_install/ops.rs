@@ -403,14 +403,16 @@ fn run_command(
     };
     // Elevated: the held file's final path (no folder above it is a reparse point, all held)
     // and System32 as the working folder, never the user's download folder.
-    let (target, dir) = match verb {
-        Verb::RunAs => (
-            file.launch_path(),
-            ctx.msiexec.parent().map(Path::to_path_buf),
-        ),
+    // `_run` (the fresh run folder holding only the copy) lives until the installer ended.
+    let (target, dir, _run) = match verb {
+        Verb::RunAs => {
+            let (copy, run) = elevated_copy(ctx, file)?;
+            (copy, ctx.msiexec.parent().map(Path::to_path_buf), Some(run))
+        }
         Verb::Open => (
             file.path().to_path_buf(),
             file.path().parent().map(Path::to_path_buf),
+            None,
         ),
     };
     let (program, params) = match cmd.program {
@@ -477,6 +479,27 @@ fn run_command(
 
     let tail = log.as_deref().map(read_tail).unwrap_or_default();
     Ok(Ran { code, log, tail })
+}
+
+/// A copy of the verified installer alone in a fresh `installers\run-<hex>\` folder, re-hashed
+/// and held (Task 196): what the elevated launch runs; the folder goes when the guard drops.
+#[cfg(windows)]
+fn elevated_copy(
+    ctx: &WingetCtx<'_>,
+    file: &Materialized,
+) -> Result<(PathBuf, super::verified_win::RunCopy), WingetOpsError> {
+    let run = super::verified_win::RunCopy::create(ctx.data.root(), file.path(), file.sha256())?;
+    Ok((run.final_path().to_path_buf(), run))
+}
+
+#[cfg(not(windows))]
+fn elevated_copy(
+    _ctx: &WingetCtx<'_>,
+    _file: &Materialized,
+) -> Result<(PathBuf, ()), WingetOpsError> {
+    Err(WingetOpsError::Io(
+        "instaladores elevados só rodam no Windows".into(),
+    ))
 }
 
 /// The elevation allowlist (the rules the helper applied before Task 196) on what an elevated
