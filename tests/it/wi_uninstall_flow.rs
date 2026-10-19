@@ -1396,20 +1396,40 @@ fn no_bridge(
 /// Task 203: the same ARP row (jq: `winget uninstall --product-code <id>`, unquoted) gives the
 /// plan "Remove pelo winget" and runs through the bridge's runner, once, with that id; never
 /// the native launcher nor the helper, never "desinstalador sem caminho absoluto". Through
-/// `removal::run_uninstaller`, what the CLI and the TUI both call.
-#[test]
-fn winget_record_plan_and_run_take_the_bridge() {
+/// `removal::remove`, what the CLI and the TUI both run. A machine record also says, in the
+/// plan (CLI and TUI text) and in the phase, that winget may open a UAC prompt itself.
+#[tokio::test]
+async fn winget_record_plan_and_run_take_the_bridge() {
+    use wingetrs::cli::{output::winget_uninstall_text, style::with_enabled};
+    use wingetrs::install::executor::LaunchGate;
+    use wingetrs::install::progress::{
+        ELEVATION_NOTICE, Phase, ProgressEvent, SELF_ELEVATION_LATER, SELF_ELEVATION_WAIT,
+        phase_status, phase_text,
+    };
+    use wingetrs::winget_install::removal::{
+        RemovalChoice, Removed, Steps, remove, run_uninstaller,
+    };
+    use wingetrs::winget_install::uninstall::WINGET_ADMIN_PROMPT;
     let id = "jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe";
+    let remove_step = "Remove pelo winget (pode mostrar o progresso dele)".to_string();
     for hive in [Hive::User, Hive::MachineX64] {
+        let machine = hive != Hive::User;
         let mut d = details(hive, id);
         d.display_name = Some("jq".to_string());
         d.uninstall_string = Some(format!("winget uninstall --product-code {id}"));
         let p = plan_uninstall(&d, false, &[], true, &known(), &user(), &no_folders).unwrap();
-        assert_eq!(
-            p.steps(),
-            vec!["Remove pelo winget (pode mostrar o progresso dele)".to_string()],
-            "{hive:?}"
-        );
+        let want = if machine {
+            vec![WINGET_ADMIN_PROMPT.to_string(), remove_step.clone()]
+        } else {
+            vec![remove_step.clone()]
+        };
+        assert_eq!(p.steps(), want, "{hive:?}");
+        let cli = with_enabled(false, || winget_uninstall_text(&p, false));
+        let tui = p.to_string();
+        let notice = "O winget pode pedir permissão de administrador";
+        assert_eq!(cli.contains(&format!("1. ⚠ {notice}")), machine, "{cli}");
+        assert_eq!(tui.contains(notice), machine, "{tui}");
+
         let w = World::new(0, &[false]);
         let key_exists = |h: Hive, k: &str| w.keys.exists(h, k);
         let calls: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
@@ -1440,9 +1460,34 @@ fn winget_record_plan_and_run_take_the_bridge() {
             busy: &|| false,
             sleep: &|_| {},
         };
-        let r =
-            wingetrs::winget_install::removal::run_uninstaller(&ctx, &queue, &p, &|_| {}).unwrap();
-        assert_eq!(r.status, UninstallStatus::Removed, "{hive:?}");
+        let phases: Mutex<Vec<Phase>> = Mutex::new(Vec::new());
+        let progress = |ev: &ProgressEvent| {
+            if let ProgressEvent::Phase(ph) = ev {
+                phases.lock().unwrap().push(ph.clone());
+            }
+        };
+        let gate = LaunchGate::default();
+        let steps = Steps {
+            gate: &gate,
+            progress: &progress,
+            backups: tmp.path(),
+            stamp: "1",
+            free_space: &|_| None,
+        };
+        let removed = remove(
+            &steps,
+            async { Ok::<(), wingetrs::winget_install::ops::WingetOpsError>(()) },
+            &p,
+            RemovalChoice::Remove,
+            |pr| run_uninstaller(&ctx, &queue, &p, pr),
+            |_| panic!("registry-only not chosen"),
+        )
+        .await
+        .unwrap();
+        let Removed::App { report, .. } = removed else {
+            panic!("not an app removal")
+        };
+        assert_eq!(report.status, UninstallStatus::Removed, "{hive:?}");
         let calls = calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 1, "{hive:?}");
         assert_eq!(calls[0].0, "winget");
@@ -1456,6 +1501,26 @@ fn winget_record_plan_and_run_take_the_bridge() {
         );
         assert_eq!(w.launcher.count(), 0, "{hive:?}");
         assert_eq!(w.elevated.count(), 0, "{hive:?}");
+        // The phase while winget runs: the UAC notice for a machine record (the CLI line and
+        // the TUI status bar both render it with `phase_text`/`phase_status`).
+        let phases = phases.lock().unwrap().clone();
+        let self_elevating = Phase::SelfElevating {
+            name: "jq".to_string(),
+        };
+        assert_eq!(phases.contains(&self_elevating), machine, "{phases:?}");
+        assert_eq!(
+            phases.contains(&Phase::Uninstalling {
+                name: "jq".to_string()
+            }),
+            !machine,
+            "{phases:?}"
+        );
+        if machine {
+            let early = phase_status(&self_elevating, std::time::Duration::ZERO);
+            assert!(early.contains(ELEVATION_NOTICE), "{early}");
+            let late = phase_text(&self_elevating, SELF_ELEVATION_WAIT);
+            assert!(late.contains(SELF_ELEVATION_LATER), "{late}");
+        }
     }
 }
 
@@ -1496,6 +1561,10 @@ fn winget_record_failure_and_other_lines() {
         format!("winget uninstall --id {id}"),
         "winget uninstall --product-code a&b".to_string(),
         format!("wingetx uninstall --product-code {id}"),
+        // Separate arguments: the program itself must be winget.
+        r#""C:\x\evil.exe" uninstall --product-code x"#.to_string(),
+        // An id winget would read as one of its options.
+        "winget uninstall --product-code -x".to_string(),
     ] {
         let mut d = details(Hive::User, id);
         d.uninstall_string = Some(line.clone());

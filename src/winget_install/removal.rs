@@ -95,10 +95,15 @@ pub fn waiting_uninstaller_phase(name: &str) -> Phase {
     }
 }
 
-/// The phase while the uninstaller of `plan` runs (the elevated helper: its UAC first).
+/// The phase while the uninstaller of `plan` runs (the elevated helper: its UAC first; winget
+/// on a machine record: the notice of a UAC it may open itself, as a self-elevating installer).
 pub fn uninstaller_phase(plan: &UninstallPlan) -> Phase {
     if plan.elevation == Elevation::Helper {
         Phase::WaitingElevation
+    } else if plan.winget_may_elevate() {
+        Phase::SelfElevating {
+            name: plan.name.clone(),
+        }
     } else {
         Phase::Uninstalling {
             name: plan.name.clone(),

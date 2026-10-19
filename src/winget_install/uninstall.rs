@@ -114,6 +114,9 @@ pub fn human_size(bytes: u64) -> String {
 
 /// Plan line of a removal that runs elevated (its own UAC).
 pub const UNINSTALL_ADMIN_PROMPT: &str = "Pede permissão de administrador (UAC)";
+/// Plan line of a machine record removed by winget: winget may open the uninstaller's UAC
+/// prompt itself (Task 203).
+pub const WINGET_ADMIN_PROMPT: &str = "O winget pode pedir permissão de administrador";
 
 impl UninstallPlan {
     /// `Desinstalar jq 1.7.1`: the first line of every confirmation (CLI and TUI).
@@ -131,6 +134,8 @@ impl UninstallPlan {
         let mut out = Vec::new();
         if self.elevation == Elevation::Helper {
             out.push(UNINSTALL_ADMIN_PROMPT.to_string());
+        } else if self.winget_may_elevate() {
+            out.push(WINGET_ADMIN_PROMPT.to_string());
         }
         match (&self.target, &self.command) {
             (UninstallTarget::Msix { family }, _) => {
@@ -151,6 +156,16 @@ impl UninstallPlan {
             }
         }
         out
+    }
+
+    /// A machine record (HKLM) removed by winget: winget, not wingetrs, may ask for the UAC.
+    pub fn winget_may_elevate(&self) -> bool {
+        match (&self.target, &self.command) {
+            (UninstallTarget::Arp { hive, .. }, Some(c)) => {
+                *hive != Hive::User && winget_product_code(c).is_some()
+            }
+            _ => false,
+        }
     }
 
     /// The shared-data warning (spec D6), apart from the steps (Task 203): the CLI prints it
@@ -235,7 +250,9 @@ pub fn winget_product_code(c: &UninstallCommand) -> Option<String> {
         && t.next()
             .is_some_and(|v| v.eq_ignore_ascii_case("--product-code"));
     let id = t.next().filter(|_| ok)?;
+    // A leading `-` would be read by winget as one of its options.
     let plain = id.len() <= 255
+        && !id.starts_with('-')
         && id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '{' | '}'));
