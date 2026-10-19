@@ -614,3 +614,227 @@ fn exit_code_is_130_only_for_ctrl_c() {
         1
     );
 }
+// ---- the inline selector (Task 200): keys and terminal injected, never the real one ----
+
+mod selector {
+    use crossterm::event::KeyCode::{self, Char, Down, Enter, Esc, Up};
+    use crossterm::event::{Event, KeyEvent, KeyModifiers};
+    use wingetrs::cli::picker::fake::{self, ScriptedTerm, ctrl_c, key};
+    use wingetrs::cli::picker::{self, LineKind};
+    use wingetrs::tui::picker::{Picker, PickerItem};
+    use wingetrs::tui::theme::{ColorDepth, GlyphSet, Glyphs, Theme};
+
+    fn items(labels: &[&str]) -> Vec<PickerItem> {
+        labels
+            .iter()
+            .map(|l| PickerItem {
+                label: l.to_string(),
+                detail: String::new(),
+                selectable: true,
+                note: None,
+            })
+            .collect()
+    }
+
+    fn theme() -> Theme {
+        Theme::new(true, ColorDepth::NoColor)
+    }
+
+    fn ascii() -> &'static Glyphs {
+        Glyphs::for_set(GlyphSet::Ascii)
+    }
+
+    /// One choice among `labels` answered with `keys`: (result, plain text, raw bytes).
+    fn one(keys: Vec<Event>, labels: &[&str]) -> (Option<usize>, String, String) {
+        let mut t = ScriptedTerm::new(keys);
+        let screen = t.screen();
+        let got = picker::select_one(&mut t, None, items(labels), None, &theme(), ascii()).unwrap();
+        let s = screen.lock().unwrap();
+        assert!(!s.raw, "raw mode left on");
+        assert_eq!(s.raw_enabled, 1);
+        let raw = String::from_utf8_lossy(&s.out).into_owned();
+        (got, fake::plain(&s.out), raw)
+    }
+
+    const HINT_ONE: &str = "setas movem · letra inicial ou Enter escolhe · Esc cancela";
+    const HINT_MANY: &str = "setas movem · Espaço marca · Enter confirma · Esc cancela";
+
+    #[test]
+    fn selector_arrows_and_enter_pick() {
+        let (got, text, raw) = one(
+            vec![key(Down), key(Down), key(Up), key(Enter)],
+            &["Alfa", "Beta", "Gama"],
+        );
+        assert_eq!(got, Some(1));
+        let first = format!("> Alfa\r\n  Beta\r\n  Gama\r\n{HINT_ONE}\r\n");
+        assert!(text.starts_with(&first), "{text:?}");
+        // Inline: never the alternate screen; the 4 lines are erased before the summary.
+        assert!(!raw.contains("\u{1b}[?1049h"), "{raw:?}");
+        assert!(raw.contains("\u{1b}[4A\u{1b}[1G\u{1b}[J"), "{raw:?}");
+        assert!(
+            text.ends_with(&format!("{HINT_ONE}\r\n> Beta\r\n")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn selector_esc_q_and_ctrl_c_cancel() {
+        for k in [key(Esc), key(Char('q')), ctrl_c()] {
+            let (got, text, _) = one(vec![key(Down), k.clone()], &["Alfa", "Beta"]);
+            assert_eq!(got, None, "{k:?}");
+            // Nothing is left on screen after a cancel: no summary line.
+            assert!(
+                text.ends_with(&format!("{HINT_ONE}\r\n")),
+                "{k:?}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_letter_picks_its_row() {
+        let (got, text, _) = one(vec![key(Char('G'))], &["Alfa", "Beta", "Gama"]);
+        assert_eq!(got, Some(2));
+        assert!(text.ends_with("> Gama\r\n"), "{text:?}");
+        let mut list = items(&[
+            "Copiar e remover",
+            "Cancelar",
+            "Remover",
+            "quieto",
+            "9 itens",
+        ]);
+        list.push(PickerItem {
+            selectable: false,
+            ..items(&["Zeta"])[0].clone()
+        });
+        assert_eq!(
+            picker::shortcuts(&list),
+            vec![None, None, Some('r'), None, Some('9'), None]
+        );
+    }
+
+    #[test]
+    fn selector_yes_no_defaults_to_no() {
+        let ask = |keys: Vec<Event>| {
+            let mut t = ScriptedTerm::new(keys);
+            let screen = t.screen();
+            let yes = picker::yes_no(&mut t, "Continuar?", &theme(), ascii()).unwrap();
+            let text = fake::plain(&screen.lock().unwrap().out);
+            (yes, text)
+        };
+        let (yes, text) = ask(vec![key(Enter)]);
+        assert!(!yes);
+        assert!(
+            text.starts_with("Continuar?\r\n  Sim\r\n> Não\r\n"),
+            "{text:?}"
+        );
+        assert!(text.ends_with("Continuar? Não\r\n"), "{text:?}");
+        let (yes, text) = ask(vec![key(Char('s'))]);
+        assert!(yes);
+        assert!(text.ends_with("Continuar? Sim\r\n"), "{text:?}");
+        assert!(ask(vec![key(Up), key(Enter)]).0);
+        assert!(!ask(vec![key(Char('n'))]).0);
+        assert!(!ask(vec![key(Esc)]).0);
+    }
+
+    #[test]
+    fn selector_space_marks_several() {
+        let many = |keys: Vec<Event>| {
+            let mut t = ScriptedTerm::new(keys);
+            let screen = t.screen();
+            let got = picker::select_many(
+                &mut t,
+                None,
+                items(&["Alfa", "Beta", "Gama"]),
+                &[true, false, false],
+                &theme(),
+                ascii(),
+            )
+            .unwrap();
+            (got, fake::plain(&screen.lock().unwrap().out))
+        };
+        let (got, text) = many(vec![key(Down), key(Char(' ')), key(Enter)]);
+        assert_eq!(got, Some(vec![0, 1]));
+        let first = format!("> [x] Alfa\r\n  [ ] Beta\r\n  [ ] Gama\r\n{HINT_MANY}\r\n");
+        assert!(text.starts_with(&first), "{text:?}");
+        assert!(text.ends_with("> Alfa, Beta\r\n"), "{text:?}");
+        // A letter moves the cursor (it does not confirm); Space then marks that row.
+        let (got, _) = many(vec![key(Char('g')), key(Char(' ')), key(Enter)]);
+        assert_eq!(got, Some(vec![0, 2]));
+        let (got, text) = many(vec![key(Char(' ')), key(Enter)]);
+        assert_eq!(got, Some(vec![]));
+        assert!(text.ends_with("> nenhum\r\n"), "{text:?}");
+        assert_eq!(many(vec![key(Esc)]).0, None);
+    }
+
+    #[test]
+    fn selector_frame_text() {
+        let mut list = items(&["a", "b", "c", "d", "e"]);
+        list[1].detail = "1.0".into();
+        list[1].note = Some("nota".into());
+        list[2].selectable = false;
+        let mut p = Picker::multi(list, &[false, true]);
+        for _ in 0..3 {
+            p.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        // Cursor on `e` (the disabled `c` is skipped); a 3-row window follows it.
+        let lines = picker::frame(&p, 3, Some("Quais?"), ascii());
+        let text: Vec<(&str, LineKind)> = lines.iter().map(|l| (l.text.as_str(), l.kind)).collect();
+        assert_eq!(
+            text,
+            vec![
+                ("Quais?", LineKind::Prompt),
+                ("  [ ] c", LineKind::Disabled),
+                ("  [ ] d", LineKind::Normal),
+                ("> [ ] e", LineKind::Current),
+                (HINT_MANY, LineKind::Hint),
+            ]
+        );
+        let p = Picker::multi(items(&["a", "b"]), &[false, true]);
+        let lines = picker::frame(&p, 5, None, ascii());
+        assert_eq!(lines[1].text, "  [x] b");
+        let mut list = items(&["a", "b"]);
+        list[1].detail = "1.0".into();
+        list[1].note = Some("nota".into());
+        let lines = picker::frame(&Picker::single(list), 5, None, ascii());
+        assert_eq!(lines[1].text, "  b  1.0  (nota)");
+    }
+
+    #[test]
+    fn selector_restores_terminal_on_panic() {
+        let mut t = ScriptedTerm::new(vec![key(Down)]);
+        t.panic_when_empty = true;
+        let screen = t.screen();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            picker::select_one(
+                &mut t,
+                None,
+                items(&["Alfa", "Beta"]),
+                None,
+                &theme(),
+                ascii(),
+            )
+        }));
+        assert!(r.is_err(), "the scripted read should have panicked");
+        let s = screen.lock().unwrap();
+        assert_eq!(s.raw_enabled, 1);
+        assert!(!s.raw, "raw mode left on after a panic");
+        let raw = String::from_utf8_lossy(&s.out);
+        // The drawing is erased and the cursor shown again.
+        assert!(
+            raw.ends_with("\u{1b}[3A\u{1b}[1G\u{1b}[J\u{1b}[?25h\u{1b}[0m"),
+            "{raw:?}"
+        );
+    }
+
+    #[test]
+    fn selector_without_terminal_refuses() {
+        let mut t = ScriptedTerm::new(vec![key(Enter)]);
+        t.interactive = false;
+        let screen = t.screen();
+        let e = picker::select_one(&mut t, None, items(&["Alfa"]), None, &theme(), ascii())
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+        let s = screen.lock().unwrap();
+        assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
+    }
+}

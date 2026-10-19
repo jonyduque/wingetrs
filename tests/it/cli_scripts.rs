@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::{CommandFactory, Parser};
+use crossterm::event::KeyCode::{Char, Enter, Esc};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use wingetrs::bridge::BridgeJob;
@@ -17,6 +18,7 @@ use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
 use wingetrs::cli::Cli;
 use wingetrs::cli::install_cmd::{self, Flags, Interrupts, Stop, Ui};
 use wingetrs::cli::output::ThirdParty;
+use wingetrs::cli::picker::fake::key;
 use wingetrs::cli::winget_cmd::WingetFlows;
 use wingetrs::config::Behavior;
 use wingetrs::core::SourceKind;
@@ -264,6 +266,11 @@ impl World {
 
     /// Puts `x <version>` in `scoop:main` (the manifest plus `extra`) and serves its zip.
     async fn publish(&mut self, version: &str, extra: serde_json::Value) {
+        self.publish_in("scoop:main", version, extra).await;
+    }
+
+    /// Puts `x <version>` in `source` (the manifest plus `extra`) and serves its zip.
+    async fn publish_in(&mut self, source: &str, version: &str, extra: serde_json::Value) {
         let zip = zip_of("pkg/x.exe", &fake_pe());
         let sha = hex::encode(Sha256::digest(&zip));
         let file = format!("x-{version}.zip");
@@ -291,7 +298,7 @@ impl World {
         };
         self.catalog
             .replace_source(
-                "scoop:main",
+                source,
                 SourceKind::Scoop,
                 version,
                 1,
@@ -328,7 +335,7 @@ impl World {
     }
 
     /// `wingetrs <args>` in process, with `ui`.
-    async fn run(&self, ui: &TestUi, args: &[&str]) -> anyhow::Result<()> {
+    async fn run(&self, ui: &dyn Ui, args: &[&str]) -> anyhow::Result<()> {
         let cli =
             Cli::try_parse_from(std::iter::once("wingetrs").chain(args.iter().copied())).unwrap();
         let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -984,4 +991,91 @@ fn removal_consent_shows_called_dir_script() {
             "arquivo chamado por pre_uninstall: $dir\\un.ps1"
         ]
     );
+}
+// ---- every question is the inline selector (Task 200) ----
+
+/// The real CLI `Ui` on a scripted terminal: `keys` answer, the drawing is kept.
+fn scripted_ui(
+    keys: Vec<crossterm::event::Event>,
+    interactive: bool,
+) -> (
+    install_cmd::TtyUi,
+    Arc<std::sync::Mutex<wingetrs::cli::picker::fake::Screen>>,
+) {
+    let mut term = wingetrs::cli::picker::fake::ScriptedTerm::new(keys);
+    term.interactive = interactive;
+    let screen = term.screen();
+    let cfg = wingetrs::config::Config {
+        glyphs: "ascii".into(),
+        ..Default::default()
+    };
+    (install_cmd::TtyUi::with_term(&cfg, Box::new(term)), screen)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_tty_never_prompts() {
+    let mut w = World::new().await;
+    w.publish("1.0", serde_json::json!({})).await;
+    let (ui, screen) = scripted_ui(vec![key(Char('s'))], false);
+    let e = w.run(&ui, &["install", "x"]).await.unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "a confirmação exige um terminal interativo; use --yes"
+    );
+    {
+        let s = screen.lock().unwrap();
+        assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
+    }
+    assert_eq!(w.installed(), None);
+    // `--yes` answers the confirmation without drawing anything.
+    w.run(&ui, &["install", "x", "--yes"]).await.unwrap();
+    assert_eq!(w.installed().as_deref(), Some("1.0"));
+    let s = screen.lock().unwrap();
+    assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continue_question_uses_selector() {
+    let mut w = World::new().await;
+    w.publish("1.0", serde_json::json!({})).await;
+    // Enter on the default answer ("Não"): nothing happens.
+    let (ui, screen) = scripted_ui(vec![key(Enter)], true);
+    w.run(&ui, &["install", "x"]).await.unwrap();
+    assert_eq!(w.installed(), None);
+    let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
+    assert!(
+        text.starts_with("Continuar?\r\n  Sim\r\n> Não\r\n"),
+        "{text:?}"
+    );
+    assert!(text.ends_with("Continuar? Não\r\n"), "{text:?}");
+    let (ui, screen) = scripted_ui(vec![key(Char('s'))], true);
+    w.run(&ui, &["install", "x"]).await.unwrap();
+    assert_eq!(w.installed().as_deref(), Some("1.0"));
+    assert!(!screen.lock().unwrap().raw);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_target_uses_selector() {
+    let mut w = World::new().await;
+    w.publish_in("scoop:main", "1.0", serde_json::json!({}))
+        .await;
+    w.publish_in("scoop:extras", "2.0", serde_json::json!({}))
+        .await;
+    // `m` picks `main/x` by its letter, then `s` answers "Continuar?".
+    let (ui, screen) = scripted_ui(vec![key(Char('m')), key(Char('s'))], true);
+    w.run(&ui, &["install", "x"]).await.unwrap();
+    assert_eq!(w.installed().as_deref(), Some("1.0"));
+    let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
+    assert!(text.contains("extras/x  2.0\r\n"), "{text:?}");
+    assert!(text.contains("> main/x\r\n"), "{text:?}");
+    // Esc cancels the pick: nothing more is asked.
+    let mut w = World::new().await;
+    w.publish_in("scoop:main", "1.0", serde_json::json!({}))
+        .await;
+    w.publish_in("scoop:extras", "2.0", serde_json::json!({}))
+        .await;
+    let (ui, screen) = scripted_ui(vec![key(Esc)], true);
+    w.run(&ui, &["install", "x"]).await.unwrap();
+    assert_eq!(w.installed(), None);
+    assert_eq!(screen.lock().unwrap().reads, 1);
 }

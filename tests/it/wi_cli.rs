@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::CommandFactory;
+use crossterm::event::Event;
+use crossterm::event::KeyCode::{Char, Down, Enter};
 use tempfile::TempDir;
 use wingetrs::bridge::BridgeJob;
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
@@ -18,6 +20,7 @@ use wingetrs::catalog::Catalog;
 use wingetrs::cli::Cli;
 use wingetrs::cli::install_cmd::{self, Flags, Interrupts, Stop, Ui};
 use wingetrs::cli::output::Phases;
+use wingetrs::cli::picker::fake::{Screen, ScriptedTerm, ctrl_c, key, plain};
 use wingetrs::cli::winget_cmd::{
     self, CleanupArgs, Held, Op, RecordRemover, Sink, Uninstaller, WingetFlows,
 };
@@ -377,7 +380,7 @@ fn yes() -> Flags {
     }
 }
 
-fn cleanup(fake: &Fake, ui: &FakeUi, a: CleanupArgs) -> (anyhow::Result<()>, Vec<String>) {
+fn cleanup(fake: &Fake, ui: &dyn Ui, a: CleanupArgs) -> (anyhow::Result<()>, Vec<String>) {
     let mut out = Vec::new();
     let r = winget_cmd::cleanup(fake, ui, a, &mut |l: &str| out.push(l.to_string()));
     (r, out)
@@ -1127,7 +1130,7 @@ fn kindle(t: &TempDir, registry_only: bool) -> Fake {
     }
 }
 
-async fn uninstall_with(fake: &Fake, ui: &FakeUi, f: Flags) -> (anyhow::Result<()>, Vec<String>) {
+async fn uninstall_with(fake: &Fake, ui: &dyn Ui, f: Flags) -> (anyhow::Result<()>, Vec<String>) {
     let (_tx, mut rx) = quiet();
     let gate = fake.gate.clone();
     let mut out = Vec::new();
@@ -1725,4 +1728,112 @@ async fn lock_install_for_gives_up_on_cancel() {
             .await
             .is_ok()
     );
+}
+// ---- every question is the inline selector (Task 200) ----
+
+/// The real CLI `Ui` on a scripted terminal: `keys` answer, the drawing is kept.
+fn scripted_ui(keys: Vec<Event>) -> (install_cmd::TtyUi, Arc<Mutex<Screen>>) {
+    let term = ScriptedTerm::new(keys);
+    let screen = term.screen();
+    let cfg = wingetrs::config::Config {
+        glyphs: "ascii".into(),
+        ..Default::default()
+    };
+    (install_cmd::TtyUi::with_term(&cfg, Box::new(term)), screen)
+}
+
+#[tokio::test]
+async fn kindle_question_uses_selector() {
+    let t = TempDir::new().unwrap();
+    let fake = kindle(&t, true);
+    let (ui, screen) = scripted_ui(vec![key(Down), key(Enter)]);
+    let (r, _) = uninstall_with(&fake, &ui, Flags::default()).await;
+    r.unwrap();
+    assert_eq!(
+        *fake.steps.lock().unwrap(),
+        vec![
+            "phase:Preparando".to_string(),
+            "lock".to_string(),
+            "phase:Removendo Amazon Kindle".to_string(),
+            "registry-only".to_string(),
+        ]
+    );
+    let text = plain(&screen.lock().unwrap().out);
+    assert!(
+        text.starts_with(
+            "> Remover sem copiar as pastas\r\n  Remover só o registro\r\n  Cancelar\r\n"
+        ),
+        "{text:?}"
+    );
+    assert!(text.contains("> Remover só o registro\r\n"), "{text:?}");
+    // Esc (or Ctrl+C) in the selector cancels: nothing locked or run.
+    let fake = kindle(&t, true);
+    let (ui, screen) = scripted_ui(vec![ctrl_c()]);
+    let (r, out) = uninstall_with(&fake, &ui, Flags::default()).await;
+    r.unwrap();
+    assert!(fake.steps.lock().unwrap().is_empty());
+    assert!(out.iter().any(|l| l.contains("Cancelado.")), "{out:?}");
+    assert!(!screen.lock().unwrap().raw);
+}
+
+#[test]
+fn orphans_question_uses_selector() {
+    let t = TempDir::new().unwrap();
+    let fake = Fake {
+        orphans: vec![orphan("A"), orphan("B"), orphan("C")],
+        backups: t.path().join("backups"),
+        ..Default::default()
+    };
+    let (ui, screen) = scripted_ui(vec![key(Down), key(Char(' ')), key(Enter)]);
+    let (r, _) = cleanup(
+        &fake,
+        &ui,
+        CleanupArgs {
+            orphans: true,
+            ..Default::default()
+        },
+    );
+    r.unwrap();
+    assert_eq!(*fake.removed.borrow(), vec!["B".to_string()]);
+    let text = plain(&screen.lock().unwrap().out);
+    assert!(text.starts_with("> [ ] App A  HKCU"), "{text:?}");
+    assert!(text.ends_with("> App B\r\n"), "{text:?}");
+}
+
+#[tokio::test]
+async fn ambiguous_installed_uses_selector() {
+    let fake = Fake {
+        rows: vec![
+            row("Amazon Kindle", "arp/hkcu/Kindle", None),
+            row("Amazon Kindle", "arp/hklm32/Kindle", None),
+        ],
+        ..Default::default()
+    };
+    let (_tx, mut rx) = quiet();
+    let gate = LaunchGate::default();
+    // Down + Enter picks the second record; Enter on "Continuar?" keeps the default "Não".
+    let (ui, screen) = scripted_ui(vec![key(Down), key(Enter), key(Enter)]);
+    winget_cmd::uninstall(
+        &fake,
+        &ui,
+        "Amazon Kindle",
+        false,
+        Flags::default(),
+        Stop::new(&mut rx, &gate),
+        &mut |_: &str| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *fake.planned_targets.borrow(),
+        vec![UninstallTarget::Arp {
+            hive: Hive::MachineX86,
+            key: "Kindle".into()
+        }]
+    );
+    assert!(fake.uninstalled.lock().unwrap().is_empty());
+    let s = screen.lock().unwrap();
+    assert_eq!(s.raw_enabled, 2, "two questions, both the selector");
+    let text = plain(&s.out);
+    assert!(text.contains("Continuar? Não\r\n"), "{text:?}");
 }

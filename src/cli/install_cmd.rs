@@ -1,5 +1,6 @@
 //! `install`, `uninstall`, `upgrade` and `repair`: plan, show, confirm, execute.
 //! Platform-neutral: every real effect arrives through `OpsCtx`, every prompt through `Ui`.
+use super::picker::{self, StdTerm, Term};
 use super::winget_cmd::{self, CleanupArgs, WingetFlows};
 use super::{Command, output, style};
 use crate::install::executor::LaunchGate;
@@ -120,12 +121,27 @@ pub struct TtyUi {
     theme: crate::tui::theme::Theme,
     glyphs: &'static Glyphs,
     progress: Arc<LineProgress>,
+    /// Where every question is drawn and answered (the process's terminal in production).
+    term: Mutex<Box<dyn Term + Send>>,
 }
 
 impl TtyUi {
     pub fn new(cfg: &crate::config::Config) -> TtyUi {
-        use crate::tui::theme::{GlyphSet, Theme, detect_depth};
         use std::io::IsTerminal;
+        TtyUi::build(
+            cfg,
+            Box::new(StdTerm::new()),
+            std::io::stderr().is_terminal(),
+        )
+    }
+
+    /// Questions go to `term` (tests inject keys there); the progress line stays plain.
+    pub fn with_term(cfg: &crate::config::Config, term: Box<dyn Term + Send>) -> TtyUi {
+        TtyUi::build(cfg, term, false)
+    }
+
+    fn build(cfg: &crate::config::Config, term: Box<dyn Term + Send>, tty: bool) -> TtyUi {
+        use crate::tui::theme::{GlyphSet, Theme, detect_depth};
         let set = match cfg.glyphs.as_str() {
             "unicode" => GlyphSet::Unicode,
             "ascii" => GlyphSet::Ascii,
@@ -133,7 +149,8 @@ impl TtyUi {
         };
         let glyphs = Glyphs::for_set(set);
         TtyUi {
-            progress: Arc::new(LineProgress::new(std::io::stderr().is_terminal(), glyphs)),
+            progress: Arc::new(LineProgress::new(tty, glyphs)),
+            term: Mutex::new(term),
             theme: Theme::new(
                 cfg.theme != "light",
                 detect_depth(
@@ -151,12 +168,12 @@ impl TtyUi {
     }
 }
 
-/// `s`, `sim`, `y`, `yes` (any case) confirm; anything else, including empty, declines.
-fn is_yes(answer: &str) -> bool {
-    matches!(
-        answer.trim().to_lowercase().as_str(),
-        "s" | "sim" | "y" | "yes"
-    )
+impl TtyUi {
+    fn term(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Box<dyn Term + Send>>> {
+        self.term
+            .lock()
+            .map_err(|_| anyhow::anyhow!("o terminal ficou indisponível"))
+    }
 }
 
 impl Ui for TtyUi {
@@ -173,19 +190,32 @@ impl Ui for TtyUi {
     }
 
     fn interactive(&self) -> bool {
-        super::picker::is_interactive()
+        match self.term.lock() {
+            Ok(t) => t.interactive(),
+            Err(_) => false,
+        }
     }
 
     fn confirm(&self, question: &str) -> anyhow::Result<bool> {
-        anstream::print!("{question} [s/N] ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        Ok(is_yes(&line))
+        let mut term = self.term()?;
+        Ok(picker::yes_no(
+            &mut **term,
+            question,
+            &self.theme,
+            self.glyphs,
+        )?)
     }
 
     fn pick(&self, items: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
-        Ok(super::picker::pick_inline(items, &self.theme, self.glyphs)?)
+        let mut term = self.term()?;
+        Ok(picker::select_one(
+            &mut **term,
+            None,
+            items,
+            None,
+            &self.theme,
+            self.glyphs,
+        )?)
     }
 
     fn pick_many(
@@ -193,7 +223,10 @@ impl Ui for TtyUi {
         items: Vec<PickerItem>,
         initial: &[bool],
     ) -> anyhow::Result<Option<Vec<usize>>> {
-        Ok(super::picker::pick_inline_multi(
+        let mut term = self.term()?;
+        Ok(picker::select_many(
+            &mut **term,
+            None,
             items,
             initial,
             &self.theme,
@@ -1070,15 +1103,23 @@ mod tests {
         // Without --yes and without a terminal nothing is removed.
         clean_residues(&ctx, &NoUi, "app", &residues, false).unwrap();
         assert_eq!(trash.dump().len(), 1);
+        // In a terminal the question is the selector: pre-marked rows, Space marks one more.
+        use crate::cli::picker::fake::{self, ScriptedTerm, key};
+        use crossterm::event::KeyCode::{Char, Down, Enter};
+        let term = ScriptedTerm::new(vec![key(Down), key(Down), key(Char(' ')), key(Enter)]);
+        let screen = term.screen();
+        let ui = TtyUi::with_term(&ascii_config(), Box::new(term));
+        clean_residues(&ctx, &ui, "app", &residues, false).unwrap();
+        assert_eq!(trash.dump().len(), 4);
+        let text = fake::plain(&screen.lock().unwrap().out);
+        assert!(text.starts_with("> [x] "), "{text:?}");
+        assert!(text.contains("  [ ] "), "{text:?}");
     }
 
-    #[test]
-    fn only_explicit_yes_answers_confirm() {
-        for a in ["s", "S\n", "sim", "y", "YES"] {
-            assert!(is_yes(a), "{a}");
-        }
-        for a in ["", "\n", "n", "não", "talvez"] {
-            assert!(!is_yes(a), "{a}");
+    fn ascii_config() -> crate::config::Config {
+        crate::config::Config {
+            glyphs: "ascii".into(),
+            ..Default::default()
         }
     }
 }
