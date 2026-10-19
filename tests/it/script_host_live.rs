@@ -100,8 +100,7 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(zip))
         .mount(&server)
         .await;
-    let hook =
-        r#"Set-Content -LiteralPath "$dir\marker.txt" -Value 'ok'; Add-Path -Path "$dir\bin""#;
+    let hook = r#"Set-Content -LiteralPath "$dir\marker.txt" -Value 'ok'; Set-Content -LiteralPath "$dir\orig.txt" -Value $original_dir -NoNewline; Add-Path -Path "$dir\bin""#;
     let manifest = serde_json::json!({
         "version": "1.0",
         "url": format!("{}/pkg.zip", server.uri()),
@@ -169,6 +168,7 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         .clone()
         .unwrap_or_else(|| panic!("the hook never ran: {result:?}"));
     assert!(marker, "the hook wrote into $dir: {result:?}");
+    // In post_install `$dir` is the `current` junction and `$original_dir` the version folder.
     let line = effects
         .lines()
         .find(|l| l.contains("add_path"))
@@ -177,7 +177,13 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
     assert_eq!(v["var"], "PATH");
     assert_eq!(
         v["entries"][0].as_str().unwrap(),
-        version_dir.join("bin").to_str().unwrap()
+        layout.current("app").join("bin").to_str().unwrap()
+    );
+    let orig = std::fs::read_to_string(version_dir.join("orig.txt")).unwrap_or_default();
+    assert_eq!(
+        orig,
+        version_dir.to_str().unwrap(),
+        "$original_dir is the version folder"
     );
     assert_eq!(scoop_listing(), scoop_before, "~/scoop untouched");
     // The effect was applied by wingetrs, to the test key only.
@@ -189,7 +195,7 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         .value;
     assert!(
         path.split(';')
-            .any(|e| e.eq_ignore_ascii_case(version_dir.join("bin").to_str().unwrap())),
+            .any(|e| e.eq_ignore_ascii_case(layout.current("app").join("bin").to_str().unwrap())),
         "{path}"
     );
 }
