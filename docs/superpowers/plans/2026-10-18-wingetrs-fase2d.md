@@ -1209,3 +1209,121 @@ Mutação obrigatória: ignorar `UnsupportedOSArchitectures` ⇒ teste PEGA.
 3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `fix(winget-install): preferred UI languages and unsupported architectures in installer selection`
+
+
+### Task 196: UAC próprio para cada instalador nativo de escopo máquina (decisão D)
+
+**Modelo:** opus (revisor opus). Decisão do usuário em 2026-10-18, depois da revisão de fase do lado elevado: o `RunInstaller` do `bridge-worker` confiava num SHA-256 vindo do próprio pedido (lado não elevado), então um processo malicioso do mesmo usuário rodava qualquer arquivo como administrador depois do único UAC da sessão. A ponte do winget, as desinstalações e a remoção de chaves continuam no auxiliar.
+
+#### Where this fits
+
+- `src/bridge/elevated.rs` ~:262–270: trait `ElevatedRunner::run_installer(&self, req: &InstallerRequest, on_line)`; implementação real ~:314 manda `Request::RunInstaller` ao worker.
+- `src/bridge/worker.rs` ~:38 (`Request::RunInstaller`), ~:705 (despacho), ~:788 (`run_installer`); `src/bridge/staging_win.rs` ~:634 (`run_installer`, staging em `Program Files\wingetrs\staging`).
+- `src/bridge/elevate_win.rs` ~:294: `ShellExecuteExW` com `runas` (hoje só para subir o worker).
+- `src/winget_install/verified_win.rs` ~:29: arquivo conferido aberto com handle que nega escrita, exclusão e renomeação.
+- `src/winget_install/ops.rs`/`engine.rs`: onde o fluxo nativo escolhe entre lançar sem elevação e chamar o `ElevatedRunner`.
+
+#### What binds this task
+
+1. **O worker deixa de aceitar `RunInstaller`:** a variante sai do protocolo (ou é recusada com erro fixo "operação removida"); o teste de protocolo prova que um pedido `run_installer` é recusado. `staging_win::run_installer` e o código só usado por ele saem (ou ficam sem chamador elevado; nada que rode elevado aceita mais caminho + SHA do pipe).
+2. **Instalador nativo que exige elevação:** o lado não elevado conferiu o SHA e mantém o handle que nega escrita/exclusão/renomeação; lança o próprio arquivo com `ShellExecuteExW` verbo `runas` (UAC por instalador; a janela do UAC mostra o editor do arquivo), com os parâmetros já montados pela lista branca de hoje, e espera o processo (`SEE_MASK_NOCLOSEPROCESS`). O handle só é solto depois que o processo termina.
+3. **UAC recusado** (1223) ⇒ `UacRefused` (Cancelled), como na Task 194. **Código de saída** pelo mesmo `classify_install`.
+4. **Progresso e texto:** fase "aguardando permissão de administrador" antes do UAC, depois a fase de instalação com "não pode ser cancelado"; o plano (CLI e TUI) diz "pede permissão de administrador para este instalador".
+5. **Lotes na TUI:** cada instalador de escopo máquina pede o próprio UAC, um de cada vez (fila), sem abrir dois UAC ao mesmo tempo.
+
+#### Tests (literais)
+
+- `worker_refuses_run_installer` (pedido JSON `{"op":"run_installer",...}` ⇒ erro, nada executado).
+- `machine_installer_uses_runas_launcher` (lançador falso registra verbo `runas`, caminho do arquivo conferido e parâmetros; nenhum pedido ao `ElevatedRunner`).
+- `runas_refused_is_cancelled` (lançador falso devolve 1223).
+- `verified_handle_held_until_exit` (o arquivo não pode ser apagado/renomeado enquanto o lançador falso não termina; tempdir).
+- `tui_batch_machine_installers_one_uac_at_a_time`.
+
+Mutações obrigatórias (cole `[OK] mutação PEGA`): (a) voltar a mandar `RunInstaller` ao worker; (b) soltar o handle antes do fim do processo.
+
+**Files:**
+- Modify: `src/bridge/elevated.rs`, `src/bridge/worker.rs`, `src/bridge/staging_win.rs`, `src/bridge/elevate_win.rs` (só o lançador `runas` de arquivo, se ficar aí), `src/winget_install/ops.rs`, `src/winget_install/engine.rs`, `src/winget_install/launch_win.rs`, `src/winget_install/plan.rs`, `src/tui/jobs.rs` (fila de UAC)
+- Test: módulos existentes (`elevated_*`, `wi_*`, `tui_jobs`).
+
+#### Checks beyond the steps
+
+1. Testes nunca usam `runas` real nem rodam instalador: lançador falso.
+2. `CLAUDE.md` (exceção da 2d) será atualizado pelo orquestrador; não edite.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(winget-install): per-installer UAC for native machine-scope installers; worker no longer runs installers`
+
+### Task 197: Auxiliar elevado só sobe de pasta que só o administrador grava (decisão 1)
+
+**Modelo:** opus (revisor opus). Decisão do usuário em 2026-10-18.
+
+#### Where this fits
+
+- `src/bridge/elevate_win.rs` ~:415: o worker é `current_exe()` (chamadores `src/tui/run.rs` ~:149, `src/cli/mod.rs` ~:498, `src/cli/winget_cmd.rs` ~:85), lançado com `runas` sem conferir a pasta.
+- `src/bridge/staging_win.rs`: `hold_plain_folders` (segura cada pasta desde a raiz sem seguir reparse) e `sddl_admin_only` (DACL só SYSTEM/Administradores/TrustedInstaller, sem ACE de escrita para outros SIDs) — reuse, não copie.
+- Regra do `CLAUDE.md` "Código que roda elevado": "pasta que só o administrador grava" se prova pela DACL do arquivo e de cada pasta acima.
+
+#### What binds this task
+
+1. Antes de qualquer `runas` do worker **e** do lançador por instalador da Task 196 (que roda o arquivo conferido, não o exe do wingetrs — este item vale só para o worker), conferir: o `wingetrs.exe` em execução e cada pasta acima dele têm DACL só de administrador (mesma função da 182) e nenhum é reparse point; o arquivo é aberto com handle que nega escrita/exclusão até o `runas` voltar.
+2. Falhou ⇒ não abre UAC; erro com texto fixo: "Para usar funções de administrador, o wingetrs precisa estar numa pasta que só o administrador grava (ex.: C:\Program Files\wingetrs). Ele está em <pasta>." CLI e TUI mostram o mesmo texto; a TUI mostra uma vez por sessão.
+3. Sem exceção por variável de ambiente, configuração ou flag.
+4. DLLs ao lado: a checagem da pasta já cobre (mesma DACL); documente no comentário.
+
+#### Tests (literais)
+
+- `worker_refused_from_user_writable_folder` (DACL simulada com ACE de escrita para Usuários ⇒ erro, lançador falso com 0 chamadas).
+- `worker_allowed_from_admin_folder` (DACL simulada só admin ⇒ 1 chamada).
+- `worker_refused_through_junction` (pasta acima é reparse point, tempdir).
+- `elevation_refusal_text_same_in_cli_and_tui`.
+
+Mutação obrigatória: tirar a checagem antes do `runas` ⇒ teste PEGA.
+
+**Files:**
+- Modify: `src/bridge/elevate_win.rs`, `src/bridge/staging_win.rs` (só expor o que precisar), `src/tui/run.rs`, `src/cli/mod.rs`, `src/cli/winget_cmd.rs`
+- Test: `elevated_*` existentes.
+
+#### Checks beyond the steps
+
+1. A Task 196 edita `src/bridge/{elevated,worker,staging_win}.rs` e `elevate_win.rs` (lançador por arquivo) em paralelo: em `elevate_win.rs` mexa só na função que sobe o worker; em `staging_win.rs` só torne pública a função existente. Não toque nos outros arquivos dela.
+2. Testes nunca usam `runas` real.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(bridge): elevated helper only from an admin-only folder`
+
+### Task 198: Instaladores nativos em "silencioso com progresso" por padrão, com ajuste (decisão 3)
+
+**Modelo:** sonnet (revisor opus). Decisão do usuário em 2026-10-18: seguir o winget (`SilentWithProgress`, ShellExecuteInstallerHandler.cpp:86-103), com ajuste nas configurações como o D2.
+
+#### Where this fits
+
+- `src/winget_install/switches.rs` ~:12 `enum Mode { Silent, SilentWithProgress, .. }`, ~:73–79 `mode_for` (hoje `Silent` salvo exe sem switch silencioso), ~:98–99 escolha do switch por modo.
+- `src/config.rs` ~:33–80: `winget_engine` e `default_scope` com desserialização tolerante (`lenient_engine`, `lenient_scope`) — copie o padrão.
+- Tela de ajustes da TUI onde `default_scope` aparece (procure por `default_scope` em `src/tui/`).
+
+#### What binds this task
+
+1. Novo ajuste `installer_mode` = `"progress"` (padrão) | `"silent"`, desserialização tolerante (valor desconhecido ⇒ `progress` com `tracing::warn!`), exposto na tela de ajustes da TUI como os outros dois.
+2. `mode_for` recebe o ajuste: `progress` ⇒ `SilentWithProgress` (switch `SilentWithProgress` do manifesto, senão o padrão do tipo: msi/wix `/passive`, inno `/SILENT`, nullsoft `/S`, burn `/passive`); `silent` ⇒ comportamento de hoje. Exe sem switch silencioso continua interativo nos dois.
+3. A lista branca do auxiliar (worker) e a da Task 190 aceitam os switches de progresso dos tipos (`/passive`, `/SILENT`) como literais exatos.
+4. Plano mostra o modo ("mostra o progresso do instalador" / "sem janela").
+
+#### Tests (literais)
+
+- `default_mode_is_silent_with_progress` (msi ⇒ `/passive`; inno ⇒ `/SILENT`).
+- `silent_setting_keeps_quiet` (msi ⇒ `/quiet`).
+- `unknown_installer_mode_falls_back_to_progress`.
+- `worker_allows_progress_switches_exactly` (`/passive` aceito, `/passivex` recusado).
+
+Mutação obrigatória: `mode_for` ignorar o ajuste ⇒ teste PEGA.
+
+**Files:**
+- Modify: `src/config.rs`, `src/winget_install/switches.rs`, `src/winget_install/plan.rs` (só a linha do modo), a tela de ajustes em `src/tui/`, e a lista branca em `src/bridge/worker.rs` (só as entradas novas)
+- Test: `wi_switches`, testes de config e de ajustes existentes.
+
+#### Checks beyond the steps
+
+1. Tasks 196/197 editam `src/bridge/*`, `ops.rs`, `engine.rs`, `launch_win.rs`, `tui/jobs.rs`, `tui/run.rs`, `cli/*`: em `worker.rs` e `plan.rs` faça só o hunk mínimo e commit só dele (`git apply --cached` se o arquivo tiver edição alheia).
+2. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(winget-install): silent-with-progress by default, installer_mode setting`
