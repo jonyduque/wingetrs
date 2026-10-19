@@ -3,14 +3,15 @@ Status: DONE
 Commits:
 acb6c7d feat(cli): every output line goes through the formatter
 d4d5ba3 feat(cli): dry-run plans and winget lines styled by output.rs
+dd8d2ec feat(cli): winget plan as numbered steps, URL and hash only in --dry-run
 
 Gate:
 ```
 [OK]   rules 10s
 [OK]   rules-selftest 29s
 [OK]   fmt 5s
-[OK]   clippy 23s
-[OK]   test (1887 passed, 87 ignored) 68s
+[OK]   clippy 41s
+[OK]   test (1888 passed, 87 ignored) 84s
 [OK]   gate verde
 ```
 
@@ -39,6 +40,33 @@ Mutation proofs:
   `[OK] mutação PEGA: '            emit::out_block(&output::install_plan_text(p, ui.glyphs()));' -> '            emit::out(&p.to_string());' fez o teste falhar (exit 101).` (`cli_color::snapshots_not_tty_dry_run`)
   `[OK] mutação PEGA: '            format!("{}{}", paint(HEADER, l), &body[l.len()..])' -> '            body.to_string()' fez o teste falhar (exit 101).` (`snapshots_tty_color_and_plain`, rótulos dos planos winget)
   `[OK] mutação PEGA: '                say(&output::cancelled());' -> '                say("Cancelado.");' fez o teste falhar (exit 101).` (`cli_scripts::`, `bucket add` cancelado)
+
+- Rodada 3 (plano winget):
+  `[OK] mutação PEGA: '    if dry_run {\n        for line in plan.dry_run_details() {' -> '    if true {…' fez o teste falhar` (`wi_`: URL/SHA-256 fora do `--dry-run`)
+  `[OK] mutação PEGA: '        for step in self.steps() {' -> '        for step in self.steps().into_iter().skip(1) {' fez o teste falhar (exit 101).` (`wi_tui::tui_confirmation_and_cli_plan_list_the_same_steps`)
+
+Rodada 3, saída real (release, não TTY, stdin nulo). A confirmação sem `--dry-run` é o binário real sem terminal e sem `--yes`: mostra o plano e para na pergunta (nada roda); a mesma confirmação com UI falsa está em `wi_cli::native_install_prints_plan_and_logs_agreements` e no snapshot `tty_plain` ("-- install (winget, confirmação)").
+```
+$ wingetrs install 7zip.7zip --dry-run
+7-Zip 26.04 (exe, máquina)
+  1. ⚠ Pede permissão de administrador para este instalador
+  2. Roda numa pasta temporária do wingetrs
+  3. Mostra o progresso do instalador
+  Instalador: https://www.7-zip.org/a/7z2604-x64.exe
+  Linha de comando: <instalador> /S
+  SHA-256: D54BF805F9F3704D1E8DB2FA3498AE7EF2DF0312B40B558E7C71C734430A665D
+Simulação: nada foi alterado.
+[exit 0]
+$ wingetrs install 7zip.7zip   (sem --dry-run, sem --yes, stdin/stdout sem terminal: para na confirmação)
+7-Zip 26.04 (exe, máquina)
+  1. ⚠ Pede permissão de administrador para este instalador
+  2. Roda numa pasta temporária do wingetrs
+  3. Mostra o progresso do instalador
+✗ a confirmação exige um terminal interativo
+→ use --yes
+[exit 1]
+```
+Rodada 3, decisões: `WingetPlan::{title, steps, dry_run_details}` em `src/winget_install/plan.rs`; o `Display` virou título + passos e é o que a TUI lista (`action_notes`), e a CLI numera os mesmos `steps()` (`output::winget_plan_text`); teste `wi_tui::tui_confirmation_and_cli_plan_list_the_same_steps` compara as duas listas na ordem. Constantes `ADMIN_PROMPT*`/`RUN_FOLDER_NOTE` capitalizadas ("Roda numa pasta temporária do wingetrs"), `UNINSTALL_FIRST_NOTE` nova. Testes antigos ajustados de propósito: `wi_install_flow` (escopo "máquina", URL só em `dry_run_details`), `wi_tui` ("máquina"/"usuário"), `wi_upgrade` (maiúsculas), `wi_cli` (passos numerados). O plano de remoção ARP/MSIX (`UninstallPlan`) não mudou de forma.
 
 Rodada 2, saída real (release, não TTY):
 ```
