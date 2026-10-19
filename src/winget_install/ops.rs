@@ -1,20 +1,22 @@
-//! Native install flow (Task 181): download, verify, launch (or elevate), classify the exit
-//! code and look for the app among the installed ones.
+//! Native install flow (Task 181): download, verify, launch (unelevated, or elevated through
+//! the installer's own UAC prompt, Task 196), classify the exit code and look for the app among
+//! the installed ones.
 //!
 //! Order: `install.lock` → download → hash again through a share-deny handle → `msi.lock`
-//! (command-line installers) → launch gate → launch → classify → post-check → record.
+//! (command-line installers) → launch gate → launch → share-deny handle released → classify →
+//! post-check → record.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::codes::{self, Category, Outcome, UAC_REFUSED};
 use super::fetch::{FetchError, Materialized, fetch_installer_until};
-use super::launch::{Elevation, LaunchSpec, Launcher, Show};
+use super::launch::{Elevation, LaunchSpec, Launcher, Show, Verb};
 use super::msix::{self, MsixOps};
 use super::plan::{WingetPlan, elevated_kind};
 use super::post_check::find_installed;
 use super::switches::{self, ArgsError, CommandLine, Program};
-use crate::bridge::elevated::{ElevatedError, ElevatedRunner};
+use crate::bridge::elevated::ElevatedRunner;
 use crate::bridge::worker::InstallerRequest;
 use crate::cache::{DataDir, UpdateLock};
 use crate::http::Http;
@@ -43,6 +45,7 @@ pub struct WingetCtx<'a> {
     /// Shared with the caller: Ctrl+C cancels through it until the installer is launched.
     pub gate: LaunchGate,
     pub launcher: &'a dyn Launcher,
+    /// The session's elevated helper (uninstallers and ARP keys; never an installer).
     pub elevated: &'a dyn ElevatedRunner,
     pub msix: &'a dyn MsixOps,
     pub scan: &'a (dyn Fn() -> Vec<InstalledApp> + Send + Sync),
@@ -60,7 +63,7 @@ pub struct InstallReport {
     pub found: Option<InstalledApp>,
     /// Set when the job must not be reported as "Instalado" (see [`NOT_FOUND_WARNING`]).
     pub warning: Option<String>,
-    /// The installer's log, when it wrote one (or the lines the elevated helper sent back).
+    /// The installer's log, when it wrote one.
     pub log: Option<PathBuf>,
 }
 
@@ -210,8 +213,8 @@ fn queued(kind: &InstallerKind) -> bool {
     )
 }
 
-/// One launch of the installer; gets the helper's log lines (cleared per attempt).
-type RunOnce<'a> = dyn FnMut(&mut Vec<String>) -> Result<i32, WingetOpsError> + 'a;
+/// One launch of the installer.
+type RunOnce<'a> = dyn FnMut() -> Result<i32, WingetOpsError> + 'a;
 
 /// One finished run of a command-line installer.
 struct Ran {
@@ -280,7 +283,7 @@ pub async fn fetch_verified(
 pub fn install_fetched(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
-    file: Materialized,
+    mut file: Materialized,
     _install_lock: &UpdateLock,
 ) -> Result<InstallReport, WingetOpsError> {
     let layout = ctx.data.install_layout();
@@ -290,7 +293,10 @@ pub fn install_fetched(
                 phase(ctx, Phase::WaitingInstaller)
             })
             .map_err(|e| WingetOpsError::Lock(e.to_string()))?;
-            let ran = run_command(ctx, plan, cmd, &file)?;
+            let ran = run_command(ctx, plan, cmd, &file);
+            // Only now, with the installer process ended, may the file change on disk.
+            file.release();
+            let ran = ran?;
             let outcome = codes::classify_install(
                 &plan.installer.kind,
                 ran.code,
@@ -363,97 +369,75 @@ pub fn install_fetched(
     })
 }
 
-/// Runs a command-line installer: through the elevated helper (`Helper`) with the blob as
-/// source and `<LOGPATH>` left for it, or unelevated with the log filled in. Windows
-/// Installer types wait for the mutex and retry 1618.
+/// Runs a command-line installer, with the log filled in: unelevated (`Never`), or elevated
+/// through its own UAC prompt (`Helper`: `runas` on the verified file, or on the absolute
+/// `msiexec` for msi/wix, with parameters the elevation allowlist accepts). The caller holds the
+/// verified file's share-deny handle for the whole run. Windows Installer types wait for the
+/// mutex and retry 1618.
 fn run_command(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
     cmd: &CommandLine,
     file: &Materialized,
 ) -> Result<Ran, WingetOpsError> {
-    let name = plan.name.clone();
-    let mut lines: Vec<String> = Vec::new();
-    let (log, mut once): (Option<PathBuf>, Box<RunOnce<'_>>) = match plan.elevation {
+    let verb = match plan.elevation {
         Elevation::Helper => {
-            let kind = elevated_kind(&plan.installer.kind).ok_or_else(|| {
-                WingetOpsError::Elevated("tipo de instalador sem auxiliar elevado".into())
-            })?;
-            let sha = file.sha256();
-            let file_name = file
-                .path()
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !one_component(sha) {
-                return Err(FetchError::BadSha.into());
-            }
-            let req = InstallerRequest {
-                source: ctx
-                    .data
-                    .blobs_dir()
-                    .join(sha)
-                    .to_string_lossy()
-                    .into_owned(),
-                sha256: sha.to_string(),
-                file_name,
-                kind,
-                params: cmd.args.clone(),
-            };
-            let run = move |lines: &mut Vec<String>| -> Result<i32, WingetOpsError> {
-                phase(ctx, Phase::WaitingElevation);
-                lines.clear();
-                ctx.elevated
-                    .run_installer(&req, &mut |l| lines.push(l.to_string()))
-                    .map_err(|e| match e {
-                        ElevatedError::Refused => WingetOpsError::UacRefused,
-                        other => WingetOpsError::Elevated(other.to_string()),
-                    })
-            };
-            (installer_log(ctx.data, plan).ok(), Box::new(run))
+            elevation_allowed(plan, cmd, file)?;
+            Verb::RunAs
         }
-        Elevation::Never => {
-            let log = installer_log(ctx.data, plan)?;
-            if let Some(dir) = log.parent() {
-                std::fs::create_dir_all(dir)
-                    .map_err(|e| WingetOpsError::Io(format!("{}: {e}", dir.display())))?;
-            }
-            let args = switches::fill_log(&cmd.args, &log)?;
-            let (program, params) = match cmd.program {
-                Program::Msiexec => (
-                    ctx.msiexec.clone(),
-                    switches::msiexec_params(file.path(), &args),
-                ),
-                Program::Installer => (file.path().to_path_buf(), args),
-            };
-            switches::validate(&params)?;
-            let spec = LaunchSpec {
-                program,
-                params,
-                dir: file.path().parent().map(Path::to_path_buf),
-                show: Show::Normal,
-            };
-            let name = name.clone();
-            let run = move |_: &mut Vec<String>| -> Result<i32, WingetOpsError> {
-                phase(ctx, Phase::RunningInstaller { name: name.clone() });
-                ctx.launcher.run(&spec).map_err(|e| {
-                    if uac_refused(&e) {
-                        WingetOpsError::UacRefused
-                    } else {
-                        WingetOpsError::Launch(e.to_string())
-                    }
-                })
-            };
-            (Some(log), Box::new(run))
-        }
+        Elevation::Never => Verb::Open,
     };
+    let log = installer_log(ctx.data, plan)?;
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| WingetOpsError::Io(format!("{}: {e}", dir.display())))?;
+    }
+    let args = switches::fill_log(&cmd.args, &log)?;
+    let (program, params) = match cmd.program {
+        Program::Msiexec => (
+            ctx.msiexec.clone(),
+            switches::msiexec_params(file.path(), &args),
+        ),
+        Program::Installer => (file.path().to_path_buf(), args),
+    };
+    switches::validate(&params)?;
+    let spec = LaunchSpec {
+        program,
+        params,
+        dir: file.path().parent().map(Path::to_path_buf),
+        show: Show::Normal,
+        verb,
+    };
+    let name = plan.name.clone();
+    let mut once: Box<RunOnce<'_>> = Box::new(move || {
+        let running = Phase::RunningInstaller { name: name.clone() };
+        let launched = match verb {
+            // The UAC prompt first; the installer's phase once its process exists.
+            Verb::RunAs => {
+                phase(ctx, Phase::WaitingElevation);
+                ctx.launcher
+                    .run_started(&spec, &mut || phase(ctx, running.clone()))
+            }
+            Verb::Open => {
+                phase(ctx, running);
+                ctx.launcher.run(&spec)
+            }
+        };
+        launched.map_err(|e| {
+            if uac_refused(&e) {
+                WingetOpsError::UacRefused
+            } else {
+                WingetOpsError::Launch(e.to_string())
+            }
+        })
+    });
 
     // The gate is taken right before each launch: a cancel before the first one wins.
-    let mut attempt = |lines: &mut Vec<String>| -> Result<i32, WingetOpsError> {
+    let mut attempt = || -> Result<i32, WingetOpsError> {
         if !ctx.gate.try_launch() {
             return Err(WingetOpsError::Cancelled);
         }
-        once(lines)
+        once()
     };
 
     let code = if queued(&plan.installer.kind) {
@@ -461,30 +445,49 @@ fn run_command(
             ctx.busy,
             ctx.sleep,
             &mut || phase(ctx, Phase::WaitingInstaller),
-            &mut || attempt(&mut lines),
+            &mut attempt,
         ) {
             Ok(c) => c,
             Err(Queued::Attempt(e)) => return Err(e),
             Err(Queued::Queue(text)) => return Err(WingetOpsError::Queue(text)),
         }
     } else {
-        attempt(&mut lines)?
+        attempt()?
     };
 
-    let (log, tail) = match plan.elevation {
-        Elevation::Helper => {
-            let tail = lines.join("\n");
-            let log = log.filter(|p| write_lines(p, &tail));
-            (log, tail)
-        }
-        Elevation::Never => {
-            let tail = log.as_deref().map(read_tail).unwrap_or_default();
-            (log, tail)
-        }
-    };
-    Ok(Ran { code, log, tail })
+    let tail = read_tail(&log);
+    Ok(Ran {
+        code,
+        log: Some(log),
+        tail,
+    })
 }
 
+/// The elevation allowlist (the rules the helper applied before Task 196) on what an elevated
+/// launch runs: the installer type, the verified file's SHA-256 and the parameters.
+fn elevation_allowed(
+    plan: &WingetPlan,
+    cmd: &CommandLine,
+    file: &Materialized,
+) -> Result<(), WingetOpsError> {
+    let kind = elevated_kind(&plan.installer.kind).ok_or_else(|| {
+        WingetOpsError::Elevated("tipo de instalador que não roda elevado".into())
+    })?;
+    let sha = file.sha256();
+    if !one_component(sha) {
+        return Err(FetchError::BadSha.into());
+    }
+    let req = InstallerRequest {
+        // The download cache's name for the file (the shape the allowlist expects).
+        source: format!(r"C:\wingetrs\blobs\{sha}"),
+        sha256: sha.to_string(),
+        file_name: format!("installer.{}", if kind.is_msi() { "msi" } else { "exe" }),
+        kind,
+        params: cmd.args.clone(),
+    };
+    req.check(&[])
+        .map_err(|reason| WingetOpsError::Elevated(format!("{reason} (elevação)")))
+}
 /// `ERROR_CANCELLED`: the user said no to the UAC prompt of a program that elevates itself.
 const ERROR_CANCELLED: i32 = 1223;
 
@@ -560,18 +563,6 @@ fn read_tail(path: &Path) -> String {
             )
         })
         .unwrap_or_default()
-}
-
-/// Saves the log lines sent back by the elevated helper; whether it worked.
-fn write_lines(path: &Path, text: &str) -> bool {
-    let r = path
-        .parent()
-        .map_or(Ok(()), std::fs::create_dir_all)
-        .and_then(|()| std::fs::write(path, text));
-    if let Err(e) = &r {
-        tracing::warn!(error = %e, "log do instalador não gravado: {}", path.display());
-    }
-    r.is_ok()
 }
 
 /// One `winget_ops` row in `state.db` (a hint for later; nothing decides on it).

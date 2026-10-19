@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use wingetrs::bridge::BridgeJob;
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
 use wingetrs::bridge::worker::ScopeArg;
-use wingetrs::bridge::worker::{DeleteReason, InstallerRequest, MachineHive};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive};
 use wingetrs::cache::DataDir;
 use wingetrs::catalog::Catalog;
 use wingetrs::cli::Cli;
@@ -1457,13 +1457,6 @@ impl Launcher for CountingLauncher {
 struct NoElevated;
 
 impl ElevatedRunner for NoElevated {
-    fn run_installer(
-        &self,
-        _: &InstallerRequest,
-        _: &mut dyn FnMut(&str),
-    ) -> Result<i32, ElevatedError> {
-        panic!("not used")
-    }
     fn run_uninstaller(
         &self,
         _: MachineHive,

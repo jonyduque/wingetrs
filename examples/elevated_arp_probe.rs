@@ -47,14 +47,6 @@ mod probe {
             panic!("unexpected run of {program}")
         }
 
-        fn run_installer(
-            &mut self,
-            _req: &worker::InstallerRequest,
-            _on_line: &mut dyn FnMut(&str),
-        ) -> std::io::Result<i32> {
-            panic!("unexpected installer")
-        }
-
         fn known_folders(&self) -> std::io::Result<KnownFolders> {
             arp_ops_win::known_folders()
         }

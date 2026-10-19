@@ -72,6 +72,13 @@ impl Materialized {
         let v = super::verified_win::VerifiedFile::open(&self.path, &self.sha256)?;
         Ok(self.verified.insert(v))
     }
+
+    /// Closes the share-deny handle: from then on the file may change on disk. Called only
+    /// once the installer process has ended (Task 196).
+    pub fn release(&mut self) {
+        #[cfg(windows)]
+        drop(self.verified.take());
+    }
 }
 
 impl Drop for Materialized {

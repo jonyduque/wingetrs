@@ -1169,7 +1169,13 @@ async fn applicability(
     )
     .await?;
     let fit = crate::bridge::winget_applicability(&manifest, q.scope, crate::bridge::host_arch());
-    let native = native_upgrade(&manifest, q, current_behavior(ctx).default_scope);
+    let behavior = current_behavior(ctx);
+    let native = native_upgrade(
+        &manifest,
+        q,
+        behavior.default_scope,
+        behavior.installer_mode,
+    );
     Ok((fit, native))
 }
 
@@ -1200,6 +1206,7 @@ fn native_upgrade(
     manifest: &crate::sources::winget::manifest::MergedManifest,
     q: &ApplicabilityQuery,
     default: crate::config::DefaultScope,
+    installer_mode: crate::config::InstallerMode,
 ) -> Option<crate::winget_install::plan::WingetPlan> {
     use crate::winget_install::engine::{plan_upgrade, upgrade_scope};
     use crate::winget_install::plan::PlanOrBridge;
@@ -1215,6 +1222,7 @@ fn native_upgrade(
         upgrade_scope(q.scope, default),
         installed,
         &facts,
+        installer_mode,
     ) {
         Ok(PlanOrBridge::Native(p)) => Some(p),
         Ok(PlanOrBridge::Bridge(why)) => {
@@ -1233,6 +1241,7 @@ fn native_upgrade(
     _manifest: &crate::sources::winget::manifest::MergedManifest,
     _q: &ApplicabilityQuery,
     _default: crate::config::DefaultScope,
+    _installer_mode: crate::config::InstallerMode,
 ) -> Option<crate::winget_install::plan::WingetPlan> {
     None
 }

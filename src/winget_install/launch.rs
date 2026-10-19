@@ -10,6 +10,25 @@ pub enum Show {
     Hidden,
 }
 
+/// How the shell starts the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    /// `open`: unelevated (a program that asks for UAC by itself still may).
+    Open,
+    /// `runas`: a UAC prompt for this one program, which then runs elevated (Task 196).
+    RunAs,
+}
+
+impl Verb {
+    /// The shell verb.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verb::Open => "open",
+            Verb::RunAs => "runas",
+        }
+    }
+}
+
 /// One program to start: absolute path, raw parameter string, optional working directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {
@@ -17,23 +36,33 @@ pub struct LaunchSpec {
     pub params: String,
     pub dir: Option<PathBuf>,
     pub show: Show,
+    pub verb: Verb,
 }
 
 /// Starts a program and waits for it to end; the exit code.
 pub trait Launcher: Send + Sync {
     fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32>;
+
+    /// `run`, calling `started` once the process exists (after the UAC prompt of
+    /// `Verb::RunAs`) and before waiting for it. By default `started` is called right before
+    /// `run`.
+    fn run_started(&self, spec: &LaunchSpec, started: &mut dyn FnMut()) -> std::io::Result<i32> {
+        started();
+        self.run(spec)
+    }
 }
 
-/// Who starts the program: this (unelevated) process, or the elevated helper.
+/// Whether the program runs elevated. For an install, `Helper` is the installer's own UAC
+/// prompt (`Verb::RunAs`, Task 196); for an uninstall, the elevated helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Elevation {
     Never,
     Helper,
 }
 
-/// Whether an install runs through the elevated helper, from the installer type, its `Scope`
-/// and its `ElevationRequirement` (all comparisons case-insensitive). A `user` scope never goes
-/// to the helper, not even with `elevationRequired`: elevated through another account it would
+/// Whether an install runs elevated (its own UAC prompt), from the installer type, its `Scope`
+/// and its `ElevationRequirement` (all comparisons case-insensitive). A `user` scope never runs
+/// elevated, not even with `elevationRequired`: elevated through another account it would
 /// install into the administrator's profile; the installer asks for UAC by itself. An unknown
 /// scope counts as absent.
 pub fn install_elevation(

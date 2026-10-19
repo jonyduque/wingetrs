@@ -525,8 +525,8 @@ pub fn worker_main(pipe: &str, parent: u32) -> std::io::Result<()> {
     super::worker::serve(&mut reader, &mut writer, &mut SystemOps)
 }
 
-/// The worker's real operations: winget (`run_winget`) and verified installers
-/// (`staging_win::run_installer`).
+/// The worker's real operations: winget (`run_winget`), HKLM uninstallers and ARP deletions
+/// (never an installer, Task 196).
 struct SystemOps;
 
 impl super::worker::WorkerOps for SystemOps {
@@ -547,14 +547,6 @@ impl super::worker::WorkerOps for SystemOps {
                 Vec::new()
             }
         }
-    }
-
-    fn run_installer(
-        &mut self,
-        req: &super::worker::InstallerRequest,
-        on_line: &mut dyn FnMut(&str),
-    ) -> std::io::Result<i32> {
-        super::staging_win::run_installer(req, on_line)
     }
 
     fn known_folders(

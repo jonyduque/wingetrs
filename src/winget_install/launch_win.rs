@@ -1,6 +1,7 @@
-//! ShellExecuteExW launcher (Task 178): starts a program unelevated with the shell's `open`
-//! verb, waits for it and returns its exit code; plus `is_elevated` and `msiexec_path`.
-use super::launch::{LaunchSpec, Launcher, Show};
+//! ShellExecuteExW launcher (Task 178): starts a program with the shell's `open` verb, or with
+//! `runas` (its own UAC prompt, Task 196), waits for it and returns its exit code; plus
+//! `is_elevated` and `msiexec_path`.
+use super::launch::{LaunchSpec, Launcher, Show, Verb};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use windows::Win32::Foundation::{ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0};
@@ -18,12 +19,36 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 use windows::core::{HSTRING, PCWSTR, w};
 
-/// Starts programs with `ShellExecuteExW` (verb `open`), never elevating on its own.
+/// Starts programs with `ShellExecuteExW`: verb `open` (never elevating on its own) or, for
+/// `Verb::RunAs`, `runas` (a UAC prompt for that one program).
 pub struct ShellLauncher;
 
 impl Launcher for ShellLauncher {
     fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32> {
-        in_sta(|| shell_run(spec))
+        in_sta(|| shell_run(spec, &mut || {}))
+    }
+
+    fn run_started(&self, spec: &LaunchSpec, started: &mut dyn FnMut()) -> std::io::Result<i32> {
+        // `started` runs on this thread (it may not be `Send`): the STA thread only signals.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                in_sta(|| {
+                    shell_run(spec, &mut || {
+                        // The receiver lives until the worker is joined.
+                        let _ = tx.send(());
+                    })
+                })
+            });
+            // A message once the process exists; none when the launch failed (sender dropped).
+            if rx.recv().is_ok() {
+                started();
+            }
+            match worker.join() {
+                Ok(v) => v,
+                Err(p) => std::panic::resume_unwind(p),
+            }
+        })
     }
 }
 
@@ -79,14 +104,17 @@ fn in_sta<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
-fn shell_run(spec: &LaunchSpec) -> std::io::Result<i32> {
+fn shell_run(spec: &LaunchSpec, started: &mut dyn FnMut()) -> std::io::Result<i32> {
     let file = HSTRING::from(spec.program.as_os_str());
     let params = HSTRING::from(spec.params.as_str());
     let dir = spec.dir.as_ref().map(|d| HSTRING::from(d.as_os_str()));
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
-        lpVerb: w!("open"),
+        lpVerb: match spec.verb {
+            Verb::Open => w!("open"),
+            Verb::RunAs => w!("runas"),
+        },
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
         lpDirectory: dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr())),
@@ -99,7 +127,7 @@ fn shell_run(spec: &LaunchSpec) -> std::io::Result<i32> {
     // SAFETY: the strings outlive the call.
     match unsafe { ShellExecuteExW(&mut info) } {
         Ok(()) => {}
-        // UAC refused for a program that elevates itself: the raw code, which
+        // UAC refused (`runas`, or a program that elevates itself): the raw code, which
         // `ops::uac_refused` turns into a cancellation.
         Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => {
             return Err(std::io::Error::from_raw_os_error(ERROR_CANCELLED.0 as i32));
@@ -113,6 +141,7 @@ fn shell_run(spec: &LaunchSpec) -> std::io::Result<i32> {
             spec.program.display()
         ))
     })?;
+    started();
     // SAFETY: the handle is open for the whole wait.
     let woke = unsafe { WaitForSingleObject(raw(&process), INFINITE) };
     if woke != WAIT_OBJECT_0 {

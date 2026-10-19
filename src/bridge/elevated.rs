@@ -1,7 +1,9 @@
-//! One elevated helper per session for machine-wide winget upgrades: the first such job asks
-//! for UAC once and starts `wingetrs bridge-worker`; later ones reuse it. A refusal is final
-//! for the session (the jobs run unelevated, as before). The Win32 side is `elevate_win`.
-use super::worker::{self, DeleteReason, InstallerRequest, MachineHive, Reply, Request};
+//! One elevated helper per session for machine-wide winget upgrades, HKLM uninstallers and ARP
+//! key deletions: the first such job asks for UAC once and starts `wingetrs bridge-worker`;
+//! later ones reuse it. A refusal is final for the session (the jobs run unelevated, as
+//! before). It never runs an installer: each native installer that needs elevation asks for
+//! its own UAC (Task 196). The Win32 side is `elevate_win`.
+use super::worker::{self, DeleteReason, MachineHive, Reply, Request};
 use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
 use crate::installed::correlate::InstallScope;
 use crate::winget_install::uninstall_cmd::Rule;
@@ -236,7 +238,7 @@ enum Fail {
     Refused(String),
 }
 
-/// Why an installer did not run through the helper.
+/// Why an operation did not run through the helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElevatedError {
     /// Elevation was refused (now or earlier this session): nothing ran.
@@ -259,15 +261,9 @@ impl std::fmt::Display for ElevatedError {
 
 impl std::error::Error for ElevatedError {}
 
-/// Runs a hash-verified installer elevated (Task 180).
+/// What the native flows ask the elevated helper (Task 182): uninstallers and ARP keys of
+/// HKLM. Installers never go through it (Task 196).
 pub trait ElevatedRunner: Send + Sync {
-    /// The installer's exit code; `on_line` gets the end of its log.
-    fn run_installer(
-        &self,
-        req: &InstallerRequest,
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<i32, ElevatedError>;
-
     /// Runs the uninstaller of an HKLM ARP entry (Task 182): the helper recomputes the command
     /// from the key and refuses when its rule is not `rule`. The uninstaller's exit code.
     fn run_uninstaller(
@@ -310,22 +306,6 @@ pub trait ElevatedRunner: Send + Sync {
 }
 
 impl ElevatedRunner for ElevatedBridge {
-    /// Starts the helper when needed (the one UAC prompt); a refusal this session is final.
-    fn run_installer(
-        &self,
-        req: &InstallerRequest,
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<i32, ElevatedError> {
-        let request = Request::RunInstaller {
-            source: req.source.clone(),
-            sha256: req.sha256.clone(),
-            file_name: req.file_name.clone(),
-            kind: req.kind,
-            params: req.params.clone(),
-        };
-        self.ask_elevated(&request, on_line)
-    }
-
     fn run_uninstaller(
         &self,
         hive: MachineHive,

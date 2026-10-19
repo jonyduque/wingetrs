@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
-use wingetrs::bridge::worker::{DeleteReason, InstallerRequest, MachineHive};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive};
 use wingetrs::installed::{Hive, InstallSource, InstalledApp};
 use wingetrs::winget_install::orphans::{
     ArpRegistry, Orphan, backup_file, check_export, check_export_in, export_args, orphans,
@@ -70,13 +70,6 @@ struct FakeElevated {
 }
 
 impl ElevatedRunner for FakeElevated {
-    fn run_installer(
-        &self,
-        _req: &InstallerRequest,
-        _on_line: &mut dyn FnMut(&str),
-    ) -> Result<i32, ElevatedError> {
-        panic!("not used");
-    }
     fn delete_arp_key(
         &self,
         hive: MachineHive,

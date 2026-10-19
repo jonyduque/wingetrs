@@ -313,7 +313,14 @@ impl WingetFlows for ProdFlows<'_, '_> {
             .with_context(|| format!("{}: versão instalada desconhecida", row.name))?;
         // One function for the CLI and the TUI (Task 193).
         let facts = previous_win::installed_facts(&row.app_key);
-        let planned = plan_upgrade(&m, &host_win::current(), wanted, installed, &facts);
+        let planned = plan_upgrade(
+            &m,
+            &host_win::current(),
+            wanted,
+            installed,
+            &facts,
+            self.behavior.installer_mode,
+        );
         let previous = match &planned {
             Ok(PlanOrBridge::Native(p))
                 if upgrade_route(&p.installer) == UpgradeRoute::UninstallFirst =>

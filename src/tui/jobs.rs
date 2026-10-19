@@ -558,7 +558,10 @@ pub fn is_winget_action(action: &Action) -> bool {
 }
 
 /// What a native winget job needs from the outside world (production in `run.rs`, fakes in
-/// tests). `install.elevated` is the session's helper: one UAC per session for everything.
+/// tests). `install.elevated` is the session's helper (uninstallers and ARP keys: one UAC per
+/// session). Each native installer that runs elevated asks for its own UAC (Task 196), one at a
+/// time: the queue runs one job at a time and every command-line installer launches under
+/// `msi.lock`, so two UAC prompts never open together, not even from another wingetrs.
 pub struct WingetEnv<'a> {
     pub install: WingetCtx<'a>,
     pub uninstall: UninstallCtx<'a>,

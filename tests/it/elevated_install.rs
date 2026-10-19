@@ -1,19 +1,14 @@
-//! Elevated helper runs a verified installer (Task 180).
+//! The elevation allowlist of installers (Task 180) and the helper that no longer runs them
+//! (Task 196).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use wingetrs::bridge::elevated::{
-    ElevatedBridge, ElevatedError, ElevatedRunner, Helper, Transport,
-};
 use wingetrs::bridge::worker::{
     self, ElevatedKind,
     ElevatedKind::{Burn, Exe, Inno, Nullsoft},
-    INSTALLER_LINE_MAX, INSTALLER_LINES, InstallerRequest, Reply, Request, ScopeArg, WorkerOps,
-    exe_params_allowed, msi_params_allowed, msi_params_allowed_in,
+    INSTALLER_REMOVED, InstallerRequest, Reply, Request, ScopeArg, WorkerOps, exe_params_allowed,
+    msi_params_allowed, msi_params_allowed_in,
 };
 use wingetrs::bridge::{self, BridgeJob, BridgeOp, Tool};
 use wingetrs::installed::correlate::InstallScope;
@@ -49,13 +44,10 @@ fn line(req: &Request) -> String {
     worker::encode(req).unwrap()
 }
 
-/// Operations that record every call; installers report `lines` and exit with `code`.
+/// Operations that record every winget run.
 #[derive(Default)]
 struct FakeOps {
     runs: Vec<(String, Vec<String>)>,
-    installers: Vec<InstallerRequest>,
-    lines: Vec<String>,
-    code: i32,
 }
 
 impl WorkerOps for FakeOps {
@@ -68,18 +60,6 @@ impl WorkerOps for FakeOps {
         self.runs.push((program.to_string(), args.to_vec()));
         on_line("winget");
         Ok((7, Vec::new()))
-    }
-
-    fn run_installer(
-        &mut self,
-        req: &InstallerRequest,
-        on_line: &mut dyn FnMut(&str),
-    ) -> std::io::Result<i32> {
-        self.installers.push(req.clone());
-        for l in &self.lines {
-            on_line(l);
-        }
-        Ok(self.code)
     }
 
     fn program_files(&self) -> Vec<String> {
@@ -99,58 +79,44 @@ fn serve_with(input: &str, ops: &mut FakeOps) -> (std::io::Result<()>, Vec<Reply
     (r, replies)
 }
 
+/// Task 196: the helper never runs an installer. A `run_installer` request with every field
+/// valid gets the fixed error and nothing runs; the channel stays open for the next request.
 #[test]
-fn run_installer_reaches_ops_with_fields() {
-    let mut ops = FakeOps {
-        lines: vec!["primeira".into(), "segunda".into()],
-        ..FakeOps::default()
-    };
-    let (r, replies) = serve_with(&line(&request(&valid())), &mut ops);
+fn worker_refuses_run_installer() {
+    let input = format!(
+        "{}{}",
+        line(&request(&valid())),
+        line(&Request::Upgrade {
+            target: "Git.Git".into()
+        })
+    );
+    let mut ops = FakeOps::default();
+    let (r, replies) = serve_with(&input, &mut ops);
     r.unwrap();
-    assert_eq!(ops.installers, vec![valid()]);
-    assert!(ops.runs.is_empty());
+    assert_eq!(ops.runs.len(), 1, "only the upgrade ran: {:?}", ops.runs);
+    assert_eq!(ops.runs[0].0, "winget", "{:?}", ops.runs);
+    assert!(
+        !ops.runs[0].1.iter().any(|a| a.contains("blobs")),
+        "{:?}",
+        ops.runs
+    );
     assert_eq!(
         replies,
         vec![
-            Reply::Line {
-                text: "primeira".into()
+            Reply::Error {
+                message: INSTALLER_REMOVED.into(),
+                not_found: false,
             },
             Reply::Line {
-                text: "segunda".into()
+                text: "winget".into(),
             },
-            Reply::End { code: 0 },
+            Reply::End { code: 7 },
         ]
     );
 }
 
 #[test]
-fn installer_lines_are_the_last_forty_and_clipped() {
-    let mut lines: Vec<String> = (1..=50).map(|i| format!("linha {i}")).collect();
-    lines.push("é".repeat(INSTALLER_LINE_MAX));
-    let mut ops = FakeOps {
-        lines,
-        code: 1603,
-        ..FakeOps::default()
-    };
-    let (r, replies) = serve_with(&line(&request(&valid())), &mut ops);
-    r.unwrap();
-    assert_eq!(replies.len(), INSTALLER_LINES + 1);
-    assert_eq!(
-        replies[0],
-        Reply::Line {
-            text: "linha 12".into()
-        }
-    );
-    let Reply::Line { text } = &replies[INSTALLER_LINES - 1] else {
-        panic!("{:?}", replies[INSTALLER_LINES - 1]);
-    };
-    assert!(text.len() <= INSTALLER_LINE_MAX && text.len() > INSTALLER_LINE_MAX - 2);
-    assert!(text.chars().all(|c| c == 'é'));
-    assert_eq!(replies[INSTALLER_LINES], Reply::End { code: 1603 });
-}
-
-#[test]
-fn bad_fields_never_reach_ops() {
+fn bad_fields_fail_the_elevation_check() {
     let with = |f: &dyn Fn(&mut InstallerRequest)| {
         let mut r = valid();
         f(&mut r);
@@ -209,8 +175,10 @@ fn bad_fields_never_reach_ops() {
         exe_params(r"/S /D=C:\Users\u\App"),
         exe_params(r"/LOG=C:\t.log"),
     ];
-    let mut input: String = bad.iter().map(|r| line(&request(r))).collect();
-    // Control: the last line is valid at every limit and does run.
+    for req in &bad {
+        assert!(req.check(&roots()).is_err(), "{req:?}");
+    }
+    // Control: valid at every limit.
     let edge = with(&|r| {
         r.kind = ElevatedKind::Exe;
         r.params = "/S".into();
@@ -222,28 +190,8 @@ fn bad_fields_never_reach_ops() {
         );
         r.sha256 = r.sha256.to_ascii_uppercase();
     });
-    input.push_str(&line(&request(&edge)));
-    let mut ops = FakeOps::default();
     assert_eq!(edge.source.len(), worker::SOURCE_MAX);
-    let (r, replies) = serve_with(&input, &mut ops);
-    r.unwrap();
-    assert_eq!(ops.installers, vec![edge], "only the control ran");
-    assert_eq!(replies.len(), bad.len() + 1, "{replies:?}");
-    for (reply, req) in replies.iter().zip(&bad) {
-        assert!(
-            matches!(
-                reply,
-                Reply::Error {
-                    not_found: false,
-                    ..
-                }
-            ),
-            "{req:?}: {reply:?}"
-        );
-    }
-    for req in &bad {
-        assert!(req.check(&roots()).is_err(), "{req:?}");
-    }
+    assert_eq!(edge.check(&roots()), Ok(()));
 }
 
 #[test]
@@ -447,7 +395,7 @@ fn stops_at(bad: &str) {
     let mut ops = FakeOps::default();
     let (r, replies) = serve_with(&input, &mut ops);
     assert!(r.is_err(), "{bad}");
-    assert!(ops.installers.is_empty() && ops.runs.is_empty(), "{bad}");
+    assert!(ops.runs.is_empty(), "{bad}");
     assert!(replies.is_empty(), "{bad}: {replies:?}");
 }
 
@@ -514,7 +462,6 @@ fn upgrade_and_install_still_work() {
             .windows(2)
             .any(|w| w == ["--scope", "machine"])
     );
-    assert!(ops.installers.is_empty());
     let one = [
         Reply::Line {
             text: "winget".into(),
@@ -524,129 +471,17 @@ fn upgrade_and_install_still_work() {
     assert_eq!(replies, [one.clone(), one].concat());
 }
 
-/// A helper played by a thread running `serve` with `FakeOps` over in-memory pipes.
-struct FakeHelper {
-    reader: BufReader<std::io::PipeReader>,
-    writer: Box<dyn Write + Send>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl FakeHelper {
-    fn spawn(seen: Arc<Mutex<Vec<InstallerRequest>>>) -> FakeHelper {
-        let (req_r, req_w) = std::io::pipe().unwrap();
-        let (resp_r, mut resp_w) = std::io::pipe().unwrap();
-        let thread = std::thread::spawn(move || {
-            let mut ops = FakeOps {
-                lines: vec!["log do instalador".into()],
-                code: 3010,
-                ..FakeOps::default()
-            };
-            let _ = worker::serve(&mut BufReader::new(req_r), &mut resp_w, &mut ops);
-            seen.lock().unwrap().extend(ops.installers);
-        });
-        FakeHelper {
-            reader: BufReader::new(resp_r),
-            writer: Box::new(req_w),
-            thread: Some(thread),
-        }
-    }
-}
-
-impl Helper for FakeHelper {
-    fn reader(&mut self) -> &mut dyn std::io::BufRead {
-        &mut self.reader
-    }
-    fn writer(&mut self) -> &mut dyn Write {
-        &mut self.writer
-    }
-    fn wait_exit(&mut self, _limit: Duration) -> bool {
-        true
-    }
-    fn alive(&mut self) -> bool {
-        true
-    }
-}
-
-impl Drop for FakeHelper {
-    fn drop(&mut self) {
-        self.writer = Box::new(std::io::sink());
-        if let Some(t) = self.thread.take()
-            && let Err(p) = t.join()
-            && !std::thread::panicking()
-        {
-            std::panic::resume_unwind(p);
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct FakeTransport {
-    starts: Arc<AtomicUsize>,
-    refuse: bool,
-    seen: Arc<Mutex<Vec<InstallerRequest>>>,
-}
-
-impl Transport for FakeTransport {
-    fn start(&self) -> Result<Box<dyn Helper>, String> {
-        self.starts.fetch_add(1, Ordering::SeqCst);
-        if self.refuse {
-            return Err("recusado".into());
-        }
-        Ok(Box::new(FakeHelper::spawn(Arc::clone(&self.seen))))
-    }
-}
-
-#[test]
-fn refused_runner_does_not_retry() {
-    let t = FakeTransport {
-        refuse: true,
-        ..FakeTransport::default()
-    };
-    let bridge = ElevatedBridge::new(Box::new(t.clone()));
-    let mut lines = Vec::new();
-    for _ in 0..2 {
-        let r = bridge.run_installer(&valid(), &mut |l: &str| lines.push(l.to_string()));
-        assert_eq!(r, Err(ElevatedError::Refused));
-    }
-    assert_eq!(
-        t.starts.load(Ordering::SeqCst),
-        1,
-        "one UAC prompt, never again"
-    );
-    assert!(lines.is_empty());
-}
-
-#[test]
-fn runner_relays_lines_code_and_remote_refusals() {
-    let t = FakeTransport::default();
-    let bridge = ElevatedBridge::new(Box::new(t.clone()));
-    let mut lines = Vec::new();
-    let r = bridge.run_installer(&valid(), &mut |l: &str| lines.push(l.to_string()));
-    assert_eq!(r, Ok(3010));
-    assert_eq!(lines, ["log do instalador"]);
-    let mut bad = valid();
-    bad.sha256 = "x".into();
-    let r = bridge.run_installer(&bad, &mut |_: &str| {});
-    assert!(
-        matches!(&r, Err(ElevatedError::Remote(m)) if m.contains("hash")),
-        "{r:?}"
-    );
-    assert_eq!(t.starts.load(Ordering::SeqCst), 1);
-    assert!(bridge.shutdown(Duration::from_secs(5)));
-    drop(bridge);
-    assert_eq!(*t.seen.lock().unwrap(), vec![valid()]);
-}
-
 #[cfg(windows)]
 mod win {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
-    use wingetrs::bridge::staging_win::{self, HASH_MISMATCH, RUN_SDDL, RunDir};
-    use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show};
+    use wingetrs::bridge::staging_win::{self, RUN_SDDL, RunDir};
+    use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
     use wingetrs::winget_install::launch_win::ShellLauncher;
+    use wingetrs::winget_install::switches;
     use wingetrs::winget_install::verified_win::VerifiedFile;
 
     /// `RUN_SDDL` plus the owner (the unelevated test user), who may then write inside.
@@ -664,33 +499,6 @@ mod win {
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect()
-    }
-
-    /// `bytes` saved as the download cache does: `<dir>\blobs\<sha256>`.
-    fn blob(dir: &Path, bytes: &[u8]) -> PathBuf {
-        let sha: String = Sha256::digest(bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let blobs = dir.join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-        let path = blobs.join(sha);
-        std::fs::write(&path, bytes).unwrap();
-        path
-    }
-
-    fn system32() -> PathBuf {
-        staging_win::SystemEnv::query().unwrap().system32
-    }
-
-    fn exe_request(source: &Path, params: &str) -> InstallerRequest {
-        InstallerRequest {
-            source: source.to_str().unwrap().into(),
-            sha256: sha_of(source),
-            file_name: "setup.exe".into(),
-            kind: ElevatedKind::Exe,
-            params: params.into(),
-        }
     }
 
     /// Premise of the design (brief step 0): a file held open by `VerifiedFile` (sharing only
@@ -717,59 +525,12 @@ mod win {
                 params: String::new(),
                 dir: Some(dir.path().to_path_buf()),
                 show: Show::Hidden,
+                verb: Verb::Open,
             })
             .unwrap();
         assert_eq!(code, 3);
         assert!(dir.path().join("ran.txt").is_file());
         drop(held);
-    }
-
-    #[test]
-    fn copy_then_verify_rejects_tampered_source() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let source = blob(dir.path(), b"MZ instalador falso");
-        let mut req = exe_request(&source, "/S");
-        let right = req.sha256.clone();
-        let other = dir.path().join("other");
-        std::fs::write(&other, b"MZ outro instalador").unwrap();
-        req.sha256 = sha_of(&other);
-        let e = staging_win::stage(&root, TEST_SDDL, &req).unwrap_err();
-        assert_eq!(e.to_string(), HASH_MISMATCH);
-        assert!(entries(&root).is_empty(), "the execution folder is gone");
-
-        req.sha256 = right.to_uppercase();
-        let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
-        let run = staged.run_dir().to_path_buf();
-        assert_eq!(staged.file(), run.join("setup.exe"));
-        assert_eq!(run.parent(), Some(root.as_path()));
-        assert_eq!(
-            std::fs::read(staged.file()).unwrap(),
-            b"MZ instalador falso"
-        );
-        assert!(run.join("tmp").is_dir());
-        assert!(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(staged.file())
-                .is_err(),
-            "the copy is held open denying writes"
-        );
-        drop(staged);
-        assert!(entries(&root).is_empty(), "removed after the run");
-        assert!(source.is_file(), "the user's file is left alone");
-    }
-
-    #[test]
-    fn copy_is_capped() {
-        let dir = TempDir::new().unwrap();
-        let source = dir.path().join("blob");
-        std::fs::write(&source, b"12345").unwrap();
-        let sha = sha_of(&source);
-        let e = staging_win::copy_hashed(&source, &dir.path().join("a"), &sha, 4).unwrap_err();
-        assert!(e.to_string().contains("maior que 4"), "{e}");
-        staging_win::copy_hashed(&source, &dir.path().join("b"), &sha, 5).unwrap();
     }
 
     #[test]
@@ -968,224 +729,6 @@ mod win {
         assert!(get("HTTP_PROXY").is_none() && get("USERNAME").is_none());
     }
 
-    #[test]
-    fn open_source_refuses_devices_and_reparse_points() {
-        // A device is never read (here the open itself fails on the null device).
-        assert!(staging_win::open_source(Path::new(r"\\.\NUL")).is_err());
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("target");
-        std::fs::create_dir(&target).unwrap();
-        junction(&dir.path().join("link"), &target);
-        assert!(staging_win::open_source(&dir.path().join("link")).is_err());
-        let file = blob(dir.path(), b"x");
-        let link = dir.path().join("file-link");
-        // A file symlink needs Developer Mode or the privilege; checked when available.
-        if std::os::windows::fs::symlink_file(&file, &link).is_ok() {
-            let e = staging_win::open_source(&link).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
-            assert!(e.to_string().contains("reanálise"), "{e}");
-        } else {
-            eprintln!("symlink_file indisponível: só a junção foi conferida");
-        }
-        staging_win::open_source(&file).unwrap();
-    }
-    #[test]
-    fn log_lines_read_utf16_and_cut_the_partial_first_line() {
-        let dir = TempDir::new().unwrap();
-        let utf16 = dir.path().join("msi.log");
-        let mut bytes = vec![0xFF, 0xFE];
-        bytes.extend(
-            "um\r\ndois\r\n\r\n"
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes),
-        );
-        std::fs::write(&utf16, bytes).unwrap();
-        assert_eq!(staging_win::log_lines(&utf16, 40).unwrap(), ["um", "dois"]);
-
-        let long = dir.path().join("inno.log");
-        let text: String = (0..2000).map(|i| format!("linha {i:04}\r\n")).collect();
-        std::fs::write(&long, &text).unwrap();
-        let lines = staging_win::log_lines(&long, 40).unwrap();
-        assert_eq!(lines.len(), 40);
-        assert_eq!(lines[39], "linha 1999");
-        assert_eq!(lines[0], "linha 1960");
-        let all = staging_win::log_lines(&long, usize::MAX).unwrap();
-        assert!(
-            all.iter().all(|l| l.len() == 10),
-            "no partial line: {:?}",
-            all[0]
-        );
-        assert!(
-            staging_win::log_lines(&dir.path().join("none.log"), 40)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// The full helper path minus elevation: a copy of `cmd.exe` as the "installer" reports
-    /// which file ran, its `TEMP`/`TMP` and its working folder through `<LOGPATH>`.
-    #[test]
-    fn staged_installer_runs_the_copy_with_its_own_temp() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let source = blob(
-            dir.path(),
-            &std::fs::read(system32().join("cmd.exe")).unwrap(),
-        );
-        let src = source.parent().unwrap().to_path_buf();
-        let req = exe_request(
-            &source,
-            // `!CMDCMDLINE!` (delayed expansion) is the command line as started, quotes and all.
-            r#"/v /c (echo !CMDCMDLINE!& set TEMP& set TMP& cd& set USERNAME& set PATH)> "<LOGPATH>""#,
-        );
-        // Staging is tested here, not validation: `cmd` needs free parameters.
-        let sys = staging_win::SystemEnv::query().unwrap();
-        let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
-        let run = staged.run_dir().to_path_buf();
-        let copy = staged.file().to_path_buf();
-        let mut lines = Vec::new();
-        let code = staging_win::run_staged(
-            &staged,
-            &req,
-            Path::new(r"C:\nao-usado\msiexec.exe"),
-            &sys,
-            &mut |l: &str| lines.push(l.to_string()),
-        )
-        .unwrap();
-        assert_eq!(code, 0, "{lines:?}");
-        let low = |s: &str| s.to_lowercase();
-        let cmdline = lines.first().unwrap_or_else(|| panic!("{lines:?}"));
-        assert!(
-            low(cmdline).starts_with(&low(&format!("\"{}\" ", copy.display()))),
-            "the copy ran: {cmdline}"
-        );
-        assert!(
-            !low(cmdline).contains(&low(src.to_str().unwrap())),
-            "{cmdline}"
-        );
-        let tmp = run.join("tmp");
-        let want = |k: &str| format!("{k}={}", tmp.display());
-        assert!(
-            lines.iter().any(|l| low(l) == low(&want("TEMP"))),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| low(l) == low(&want("TMP"))),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| low(l) == low(run.to_str().unwrap())),
-            "working folder: {lines:?}"
-        );
-        // Only the closed list reached it: no USERNAME, and the system PATH alone.
-        assert!(
-            !lines
-                .iter()
-                .any(|l| l.to_uppercase().starts_with("USERNAME=")),
-            "{lines:?}"
-        );
-        let path = staging_win::installer_env(&sys, &tmp)
-            .into_iter()
-            .find(|(k, _)| k == "PATH")
-            .unwrap()
-            .1;
-        let want_path = format!("PATH={}", path.to_str().unwrap());
-        assert!(lines.iter().any(|l| low(l) == low(&want_path)), "{lines:?}");
-        drop(staged);
-        assert!(entries(&root).is_empty());
-    }
-
-    #[test]
-    fn staged_installer_sends_the_last_forty_log_lines() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let source = blob(
-            dir.path(),
-            &std::fs::read(system32().join("cmd.exe")).unwrap(),
-        );
-        let req = exe_request(
-            &source,
-            r#"/c (for /l %i in (1,1,50) do @echo linha%i)> "<LOGPATH>" & exit /b 5"#,
-        );
-        let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
-        let mut lines = Vec::new();
-        let code = staging_win::run_staged(
-            &staged,
-            &req,
-            Path::new(r"C:\nao-usado\msiexec.exe"),
-            &staging_win::SystemEnv::query().unwrap(),
-            &mut |l: &str| lines.push(l.trim().to_string()),
-        )
-        .unwrap();
-        assert_eq!(code, 5);
-        let want: Vec<String> = (11..=50).map(|i| format!("linha{i}")).collect();
-        assert_eq!(lines, want);
-    }
-
-    #[test]
-    fn msi_command_runs_msiexec_on_the_copy() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        let source = blob(dir.path(), b"OLE falso");
-        let req = InstallerRequest {
-            source: source.to_str().unwrap().into(),
-            sha256: sha_of(&source),
-            file_name: "App-1.0.msi".into(),
-            kind: ElevatedKind::Wix,
-            params: r#"/quiet /norestart /log "<LOGPATH>""#.into(),
-        };
-        req.check(&[]).unwrap();
-        let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
-        let msiexec = Path::new(r"C:\Windows\System32\msiexec.exe");
-        let (program, params) = staging_win::command_for(&staged, &req, msiexec).unwrap();
-        assert_eq!(program, msiexec);
-        let run = staged.run_dir();
-        assert_eq!(
-            params,
-            format!(
-                r#"/i "{}" /quiet /norestart /log "{}""#,
-                run.join("App-1.0.msi").display(),
-                run.join("install.log").display()
-            )
-        );
-    }
-
-    /// Live: the real helper (one UAC prompt) installs the small MSI in `WINGETRS_TEST_MSI`.
-    #[test]
-    #[ignore = "live: pede UAC e instala um MSI de teste"]
-    fn live_run_installer_once() {
-        let msi = PathBuf::from(
-            std::env::var_os("WINGETRS_TEST_MSI")
-                .expect("WINGETRS_TEST_MSI=<caminho de um MSI pequeno>"),
-        );
-        // The helper only reads `...\blobs\<sha256>`, as the download cache names it.
-        let cache = TempDir::new().unwrap();
-        let msi = blob(cache.path(), &std::fs::read(&msi).unwrap());
-        let transport = wingetrs::bridge::elevated::SystemTransport::new(PathBuf::from(env!(
-            "CARGO_BIN_EXE_wingetrs"
-        )));
-        let bridge = ElevatedBridge::new(Box::new(transport));
-        let req = InstallerRequest {
-            source: msi.to_str().unwrap().into(),
-            sha256: sha_of(&msi),
-            file_name: "teste.msi".into(),
-            kind: ElevatedKind::Msi,
-            params: r#"/quiet /norestart /log "<LOGPATH>""#.into(),
-        };
-        let mut lines = Vec::new();
-        let r = bridge.run_installer(&req, &mut |l: &str| lines.push(l.to_string()));
-        println!("{r:?}\n{}", lines.join("\n"));
-        assert_eq!(r, Ok(0));
-        assert!(!lines.is_empty(), "log lines");
-        assert!(bridge.shutdown(Duration::from_secs(5)));
-        let root = PathBuf::from(r"C:\Program Files\wingetrs\staging");
-        let left: Vec<_> = std::fs::read_dir(&root).unwrap().collect();
-        assert!(left.is_empty(), "{left:?}");
-    }
-
     /// A command line split the way the C runtime splits `argv` (quotes group, `\"` is a
     /// quote, backslashes before a quote halve).
     fn split_command(line: &str) -> Vec<String> {
@@ -1232,14 +775,12 @@ mod win {
         args
     }
 
-    /// Task 190: with a staging folder holding a space, the log path reaches Inno, Burn and
-    /// exe installers as one argument, whether the manifest quoted `<LOGPATH>` or not.
+    /// Task 190, on the path of Task 196: with a log folder holding a space (a user profile
+    /// like `C:\Users\Ana Maria`), the log path reaches Inno, Burn and exe installers as one
+    /// argument, whether the manifest quoted `<LOGPATH>` or not.
     #[test]
     fn log_placeholder_with_space_stays_one_argument() {
-        let dir = TempDir::new().unwrap();
-        let root = dir.path().join("Program Files").join("staging");
-        std::fs::create_dir_all(&root).unwrap();
-        let source = blob(dir.path(), b"MZ t190");
+        let log = Path::new(r"C:\Users\Ana Maria\AppData\Local\wingetrs\log\installers\a.log");
         let cases = [
             (Inno, r#"/VERYSILENT /LOG="<LOGPATH>""#, "/LOG="),
             (Inno, "/VERYSILENT /LOG=<LOGPATH>", "/LOG="),
@@ -1250,16 +791,7 @@ mod win {
             (Exe, "/S /log <LOGPATH>", ""),
         ];
         for (kind, params, prefix) in cases {
-            let req = InstallerRequest {
-                kind,
-                ..exe_request(&source, params)
-            };
-            let staged = staging_win::stage(&root, TEST_SDDL, &req).unwrap();
-            let log = staged.run_dir().join(staging_win::LOG_NAME);
-            assert!(log.to_str().unwrap().contains(' '), "{}", log.display());
-            let (_, line) =
-                staging_win::command_for(&staged, &req, Path::new(r"C:\nao-usado\msiexec.exe"))
-                    .unwrap();
+            let line = switches::fill_log(params, log).unwrap();
             let args = split_command(&line);
             let want = format!("{prefix}{}", log.display());
             assert_eq!(
@@ -1269,7 +801,6 @@ mod win {
             );
         }
     }
-
     /// Task 190: the elevated winget gets an environment built from scratch: variables this
     /// process already has (cargo's `CARGO_PKG_NAME`, the user's `USERNAME`, its `TEMP`) do not
     /// reach it, and its `TEMP` is inside a fresh execution folder, removed afterwards. The
@@ -1317,43 +848,6 @@ mod win {
         assert_eq!(run.parent().unwrap(), root.as_path(), "{lines:?}");
         assert_eq!(run.file_name().unwrap().len(), 32);
         assert!(entries(&root).is_empty(), "execution folder removed");
-    }
-
-    /// Task 190: a junction in the middle of `source` (not only at its last component) is
-    /// refused.
-    #[test]
-    fn source_with_junction_in_middle_refused() {
-        let dir = TempDir::new().unwrap();
-        let real = dir.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let file = blob(&real, b"t190");
-        junction(&dir.path().join("link"), &real);
-        let via = dir
-            .path()
-            .join("link")
-            .join("blobs")
-            .join(file.file_name().unwrap());
-        assert!(via.is_file(), "the junction resolves");
-        let e = staging_win::open_source(&via).unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
-        assert!(e.to_string().contains("reanálise"), "{e}");
-        staging_win::open_source(&file).unwrap();
-    }
-
-    /// Task 190: a source with another hard link is refused (through either name).
-    #[test]
-    fn source_hard_link_refused() {
-        let dir = TempDir::new().unwrap();
-        let file = blob(dir.path(), b"t190 link");
-        let twin = dir.path().join("twin");
-        std::fs::hard_link(&file, &twin).unwrap();
-        for p in [&file, &twin] {
-            let e = staging_win::open_source(p).unwrap_err();
-            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
-            assert!(e.to_string().contains("hard link"), "{e}");
-        }
-        std::fs::remove_file(&twin).unwrap();
-        staging_win::open_source(&file).unwrap();
     }
 }
 

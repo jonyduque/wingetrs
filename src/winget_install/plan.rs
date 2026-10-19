@@ -12,6 +12,9 @@ use crate::sources::winget::manifest::{
     Agreement, EffectiveInstaller, InstallerKind, MergedManifest,
 };
 
+/// Plan line of an installer that runs elevated: it asks for its own UAC (Task 196).
+pub const ADMIN_PROMPT: &str = "pede permissão de administrador para este instalador";
+
 /// Longest agreement text shown when the agreement has no URL.
 const AGREEMENT_TEXT_MAX: usize = 200;
 
@@ -134,8 +137,9 @@ pub fn elevated_kind(kind: &InstallerKind) -> Option<ElevatedKind> {
 /// `Program Files` list is not known here), so such parameters go to the bridge.
 const NO_PROGRAM_FILES: &[String] = &[];
 
-/// Runs the helper's own request check (Task 180) on what the plan would send, before
-/// anything is downloaded; the reason (Portuguese) when the helper would refuse it.
+/// Runs the elevation allowlist (Task 180; applied before the installer's own UAC since Task
+/// 196) on what the plan would run, before anything is downloaded; the reason (Portuguese)
+/// when it would refuse it.
 fn helper_accepts(inst: &EffectiveInstaller, cmd: &CommandLine) -> Result<(), String> {
     let Some(kind) = elevated_kind(&inst.kind) else {
         return Err(format!(
@@ -270,7 +274,7 @@ impl std::fmt::Display for WingetPlan {
             }
         }
         if self.elevation == Elevation::Helper {
-            write!(f, "\npede UAC")?;
+            write!(f, "\n{ADMIN_PROMPT}")?;
         }
         if self.interactive {
             write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;

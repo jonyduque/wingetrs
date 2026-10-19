@@ -4,7 +4,7 @@
 //! registry-only removal of a record that is not the principal one.
 use super::codes::{self, Outcome};
 use super::elevated_rules::{KnownFolders, elevated_duplicate, expand_known, in_admin_folder};
-use super::launch::{Elevation, LaunchSpec, Launcher, Show, uninstall_elevation};
+use super::launch::{Elevation, LaunchSpec, Launcher, Show, Verb, uninstall_elevation};
 use super::msix::{self, MsixOps};
 use super::ops::{Queued, WingetCtx, retry_1618, uac_refused};
 use super::orphans::{ArpRegistry, Orphan, check_export_in, export_args, fresh_backup_file};
@@ -469,6 +469,7 @@ fn launch_once(
                 params: c.args.clone(),
                 dir: None,
                 show: Show::Normal,
+                verb: Verb::Open,
             };
             ctx.launcher.run(&spec).map_err(|e| {
                 if uac_refused(&e) {

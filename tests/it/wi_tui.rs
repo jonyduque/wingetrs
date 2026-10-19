@@ -23,7 +23,7 @@ use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
 use wingetrs::tui::view::view;
 use wingetrs::winget_install::launch::Elevation;
 use wingetrs::winget_install::orphans::Orphan;
-use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
+use wingetrs::winget_install::plan::{ADMIN_PROMPT, PlanOrBridge, WingetPlan, plan};
 use wingetrs::winget_install::previous::RemovalRequest;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
 use wingetrs::winget_install::uninstall::{SharedData, UninstallPlan, UninstallTarget};
@@ -221,7 +221,7 @@ fn confirm_shows_pede_uac_for_machine_plan() {
     );
     assert!(cmds.is_empty(), "{cmds:?}");
     let text = confirm_text(&a);
-    assert!(text.contains("pede UAC"), "{text}");
+    assert!(text.contains(ADMIN_PROMPT), "{text}");
     assert!(text.contains("Contoso App 1.0 (msi, machine)"), "{text}");
     assert_eq!(confirm_actions(&a), vec![Action::WingetInstall(machine)]);
 
@@ -236,7 +236,7 @@ fn confirm_shows_pede_uac_for_machine_plan() {
         },
     );
     let text = confirm_text(&b);
-    assert!(!text.contains("pede UAC"), "{text}");
+    assert!(!text.contains(ADMIN_PROMPT), "{text}");
     assert!(text.contains("Contoso App 1.0 (inno, user)"), "{text}");
 }
 
@@ -445,7 +445,10 @@ fn status_bar_waiting_uac_text() {
     let screen = render(&a, 200, 16);
     let bar = screen.lines().last().unwrap();
     assert!(bar.contains("Instalando Contoso App"), "{bar}");
-    assert!(bar.contains("Aguardando o UAC"), "{bar}");
+    assert!(
+        bar.contains("Aguardando permissão de administrador"),
+        "{bar}"
+    );
     assert!(bar.contains("não pode ser cancelado"), "{bar}");
 }
 
@@ -944,4 +947,88 @@ fn tui_and_cli_plan_the_same_nullsoft_removal() {
     // Without a readable manifest there is no hint (the plain uninstaller).
     let no_hint = plain_removal_plan(&cli, None, &details, &folders, &|_| false).unwrap();
     assert_eq!(no_hint.command.unwrap().rule, Rule::Interactive);
+}
+/// Task 196: each machine-scope installer asks for its own UAC inside its job, so two of them
+/// queued together run one after the other: the second starts only once the first finished
+/// (never two prompts open at once).
+#[test]
+fn tui_batch_machine_installers_one_uac_at_a_time() {
+    use wingetrs::tui::app::Done;
+    let first = native("msi", Scope::Machine);
+    let mut second = native("inno", Scope::Machine);
+    second.name = "Outro App".into();
+    for p in [&first, &second] {
+        assert_eq!(p.elevation, Elevation::Helper, "{}", p.name);
+    }
+    let mut a = search_app();
+    a.settings.behavior.confirm = ConfirmMode::Never;
+    let plan = |a: &mut App, p: &WingetPlan| {
+        update(a, key(KeyCode::Char('i')));
+        update(
+            a,
+            Msg::WingetInstallPlanned {
+                bridge: Ok((bridge_job(), Vec::new())),
+                native: Ok(PlanOrBridge::Native(p.clone())),
+            },
+        )
+    };
+    assert_eq!(
+        plan(&mut a, &first),
+        vec![Cmd::Execute(Action::WingetInstall(first.clone()))]
+    );
+    // The first one's UAC may be open now: the second waits in the queue.
+    let cmds = plan(&mut a, &second);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, Cmd::Execute(_))),
+        "{cmds:?}"
+    );
+    assert_eq!(a.queue.len(), 1);
+    let done = Done {
+        summary: "Instalado: Contoso App".into(),
+        residues: None,
+    };
+    let cmds = update(&mut a, Msg::InstallFinished(Ok(done)));
+    assert!(
+        cmds.contains(&Cmd::Execute(Action::WingetInstall(second.clone()))),
+        "{cmds:?}"
+    );
+    assert!(a.queue.is_empty());
+}
+
+/// Task 197 addendum: the TUI and the CLI plan a native install with the same switches for the
+/// `installer_mode` setting (one manifest, both modes).
+#[test]
+fn installer_mode_same_switches_in_cli_and_tui_plans() {
+    use wingetrs::config::{Behavior, InstallerMode};
+    let command = |p: Result<PlanOrBridge, String>| match p.unwrap() {
+        PlanOrBridge::Native(p) => format!("{:?}", p.command),
+        PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+    };
+    let wanted = ScopeWanted::Prefer(Scope::User);
+    for kind in ["inno", "nullsoft", "msi"] {
+        let m = manifest_of(kind, "user");
+        let mut seen = Vec::new();
+        for mode in [InstallerMode::Silent, InstallerMode::Progress] {
+            let behavior = Behavior {
+                installer_mode: mode,
+                ..Behavior::default()
+            };
+            let cli = command(
+                wingetrs::cli::winget_cmd::install_plan(&m, &host(), wanted, &behavior)
+                    .map_err(|e| e.0),
+            );
+            let tui = command(wingetrs::tui::run::native_install_on(
+                &m,
+                &host(),
+                wanted,
+                mode,
+            ));
+            assert_eq!(cli, tui, "{kind} {mode:?}");
+            seen.push(cli);
+        }
+        if kind == "msi" {
+            // `/quiet` vs `/passive` (NSIS has `/S` in both modes).
+            assert_ne!(seen[0], seen[1], "{kind}: the mode changes the switches");
+        }
+    }
 }

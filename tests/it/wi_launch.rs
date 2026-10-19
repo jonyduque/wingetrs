@@ -67,7 +67,7 @@ fn uninstall_elevation_rules() {
 #[cfg(windows)]
 mod win {
     use std::path::Path;
-    use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show};
+    use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
     use wingetrs::winget_install::launch_win::{ShellLauncher, is_elevated, msiexec_path};
 
     fn cmd(dir: &Path, body: &str) -> std::path::PathBuf {
@@ -82,6 +82,7 @@ mod win {
             params: params.to_string(),
             dir: None,
             show: Show::Hidden,
+            verb: Verb::Open,
         }
     }
 
@@ -114,6 +115,36 @@ mod win {
         let mut s = spec(p, "");
         s.dir = Some(work.path().to_path_buf());
         assert_eq!(ShellLauncher.run(&s).unwrap(), 5);
+    }
+
+    /// Task 196: `run_started` tells `started` once the process exists (before its end, which
+    /// the script waits on through a file the callback creates) and never when nothing started.
+    #[test]
+    fn run_started_signals_once_after_the_process_exists() {
+        let t = tempfile::tempdir().unwrap();
+        let go = t.path().join("go.txt");
+        // Exits 8 once `go.txt` exists (checked about once a second, 40 times), else 9.
+        let p = cmd(
+            t.path(),
+            "@echo off\r\nset n=0\r\n:loop\r\nif exist \"%~dp0go.txt\" exit /b 8\r\nset /a n+=1\r\n\
+             if %n% geq 40 exit /b 9\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop",
+        );
+        let mut seen = 0;
+        let code = ShellLauncher
+            .run_started(&spec(p, ""), &mut || {
+                seen += 1;
+                std::fs::write(&go, b"x").unwrap();
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(code, 8, "started was not called while the process ran");
+
+        let mut seen = 0;
+        let e = ShellLauncher
+            .run_started(&spec(t.path().join("nope.cmd"), ""), &mut || seen += 1)
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+        assert_eq!(seen, 0);
     }
 
     #[test]

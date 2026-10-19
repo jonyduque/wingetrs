@@ -9,13 +9,13 @@ use super::ops::{
     InstallReport, WingetCtx, WingetOpsError, fetch_verified, install, install_fetched,
     lock_install_for,
 };
-use super::plan::{PlanOrBridge, WingetPlan, plan};
+use super::plan::{PlanOrBridge, WingetPlan, plan_with_mode};
 use super::post_check::version_warning;
 use super::select::{Host, Refusal, Scope, ScopeWanted, arch_applicable};
 use super::switches::install_args;
 use super::uninstall::{MsiQueue, UninstallCtx, UninstallPlan, UninstallStatus, uninstall_queued};
 use super::uninstall_cmd::ArpDetails;
-use crate::config::{DefaultScope, WingetEngine};
+use crate::config::{DefaultScope, InstallerMode, WingetEngine};
 use crate::core::version::Version;
 use crate::installed::Hive;
 use crate::installed::correlate::{InstallScope, ListRow, UpdateState};
@@ -165,6 +165,7 @@ fn bundle_arch(d: &ArpDetails) -> Option<&'static str> {
 /// every installer that runs here denies), installers of a type that cannot replace the
 /// installed one are filtered out, and the installed architecture is preferred (an x86 app on
 /// an x64 machine stays x86): both engines pick the same installer for the same request.
+/// `installer_mode` is the setting (progress window or quiet), as for an install.
 // Rules of winget-cli src/AppInstallerCLICore/Workflows/UpdateFlow.cpp (deny) and
 // src/AppInstallerCommonCore/Manifest/ManifestComparator.cpp (InstalledScopeFilter,
 // InstalledTypeFilter, allowed architectures); `bridge::winget_applicability` is the other path.
@@ -174,6 +175,7 @@ pub fn plan_upgrade(
     wanted: ScopeWanted,
     installed: &str,
     facts: &InstalledFacts,
+    installer_mode: InstallerMode,
 ) -> Result<PlanOrBridge, Refusal> {
     let from = Some(installed.to_string());
     let mut kept = manifest.clone();
@@ -190,7 +192,7 @@ pub fn plan_upgrade(
     });
     if kept.installers.is_empty() {
         // Nothing runs here: the planner gives the architecture refusal.
-        return plan(manifest, host, wanted, from);
+        return plan_with_mode(manifest, host, wanted, from, installer_mode);
     }
     kept.installers.retain(|i| {
         !i.upgrade_behavior
@@ -230,7 +232,7 @@ pub fn plan_upgrade(
         kept.installers
             .retain(|i| i.architecture.eq_ignore_ascii_case(arch));
     }
-    plan(&kept, host, wanted, from)
+    plan_with_mode(&kept, host, wanted, from, installer_mode)
 }
 
 #[derive(Debug, thiserror::Error)]

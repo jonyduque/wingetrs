@@ -3,12 +3,12 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
-use wingetrs::bridge::worker::{ElevatedKind, InstallerRequest};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive};
 use wingetrs::cache::{DataDir, UpdateLock, sha256_hex};
 use wingetrs::http::Http;
 use wingetrs::install::executor::LaunchGate;
@@ -18,12 +18,13 @@ use wingetrs::sources::winget::manifest::{self, MergedManifest};
 use wingetrs::tui::theme::{GlyphSet, Glyphs};
 use wingetrs::update::LockWait;
 use wingetrs::winget_install::codes::{Outcome, UAC_REFUSED};
-use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show};
+use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::ops::{WingetCtx, WingetOpsError, install};
-use wingetrs::winget_install::plan::{PlanOrBridge, WingetPlan, plan};
+use wingetrs::winget_install::plan::{ADMIN_PROMPT, PlanOrBridge, WingetPlan, plan};
 use wingetrs::winget_install::post_check::find_installed;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
+use wingetrs::winget_install::uninstall_cmd::Rule;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -41,6 +42,17 @@ struct FakeLauncher {
     cancel_during_run: Mutex<Option<(LaunchGate, Option<bool>)>>,
     /// When set, the next launch fails with this OS error (nothing runs).
     os_error: Mutex<Option<i32>>,
+    /// While "running": try to rename and to delete the launched file; whether each worked.
+    probe_hold: AtomicBool,
+    probed: Mutex<Vec<(&'static str, bool)>>,
+    /// While "running": write this line to the installer log named in the parameters.
+    log_line: Mutex<Option<String>>,
+}
+
+/// The `/log "<path>"` of a filled command line.
+fn log_in(params: &str) -> PathBuf {
+    let (_, rest) = params.rsplit_once("/log \"").expect("a /log switch");
+    PathBuf::from(rest.split('"').next().unwrap())
 }
 
 impl Launcher for FakeLauncher {
@@ -53,32 +65,65 @@ impl Launcher for FakeLauncher {
         if let Some((gate, answer)) = self.cancel_during_run.lock().unwrap().as_mut() {
             *answer = Some(gate.try_cancel());
         }
+        if self.probe_hold.load(Ordering::SeqCst) {
+            let moved = spec.program.with_extension("moved");
+            let renamed = std::fs::rename(&spec.program, &moved).is_ok();
+            let from = if renamed { &moved } else { &spec.program };
+            let deleted = std::fs::remove_file(from).is_ok();
+            let mut probed = self.probed.lock().unwrap();
+            probed.push(("rename", renamed));
+            probed.push(("delete", deleted));
+        }
+        if let Some(text) = self.log_line.lock().unwrap().as_deref() {
+            // UTF-16 with a BOM, as msiexec writes it.
+            let mut bytes = vec![0xFF, 0xFE];
+            for u in format!("{text}\r\n").encode_utf16() {
+                bytes.extend(u.to_le_bytes());
+            }
+            std::fs::write(log_in(&spec.params), bytes).unwrap();
+        }
         Ok(self.codes.lock().unwrap().pop_front().unwrap_or(0))
     }
 }
 
+/// The session's helper: no install flow may ask it anything (Task 196).
 #[derive(Default)]
 struct FakeElevated {
-    calls: Mutex<Vec<InstallerRequest>>,
-    lines: Mutex<Vec<String>>,
-    results: Mutex<VecDeque<Result<i32, ElevatedError>>>,
+    calls: Mutex<Vec<String>>,
 }
 
 impl ElevatedRunner for FakeElevated {
-    fn run_installer(
+    fn run_uninstaller(
         &self,
-        req: &InstallerRequest,
-        on_line: &mut dyn FnMut(&str),
+        _hive: MachineHive,
+        key: &str,
+        _rule: Rule,
+        _nsis_hint: bool,
     ) -> Result<i32, ElevatedError> {
-        self.calls.lock().unwrap().push(req.clone());
-        on_line("MSI (s) fake log line");
-        for l in self.lines.lock().unwrap().iter() {
-            on_line(l);
-        }
-        self.results.lock().unwrap().pop_front().unwrap_or(Ok(0))
+        self.calls.lock().unwrap().push(format!("uninstall {key}"));
+        Err(ElevatedError::Remote("not used".into()))
+    }
+    fn run_uninstaller_lines(
+        &self,
+        _hive: MachineHive,
+        key: &str,
+        _rule: Rule,
+        _nsis_hint: bool,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        self.calls.lock().unwrap().push(format!("uninstall {key}"));
+        Err(ElevatedError::Remote("not used".into()))
+    }
+    fn delete_arp_key(
+        &self,
+        _hive: MachineHive,
+        key: &str,
+        _reason: DeleteReason,
+    ) -> Result<(), ElevatedError> {
+        self.calls.lock().unwrap().push(format!("delete {key}"));
+        Err(ElevatedError::Remote("not used".into()))
     }
 }
-
 #[derive(Default)]
 struct FakeMsix {
     adds: Mutex<Vec<PathBuf>>,
@@ -378,32 +423,102 @@ async fn exit_zero_not_found_warns() {
     );
 }
 
+/// Task 196: a machine-scope installer asks for its own UAC: `runas` on the verified file (on
+/// the absolute msiexec with `/i "<verified file>"` for an MSI), the allowlisted parameters
+/// with the log filled in, "waiting for permission" before the installer's phase; the
+/// session's helper is never asked anything.
 #[tokio::test]
-async fn machine_msi_goes_through_helper() {
+async fn machine_installer_uses_runas_launcher() {
     let env = Env::new();
-    let (_s, p, sha) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
+    let (_s, p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await.unwrap();
+    let calls = env.launcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let spec = &calls[0];
+    assert_eq!(spec.verb, Verb::RunAs);
+    assert_eq!(spec.program, ctx.msiexec);
+    let file = env.materialized("msi");
+    assert!(
+        spec.params
+            .starts_with(&format!("/i \"{}\" ", file.display())),
+        "{}",
+        spec.params
+    );
+    assert!(spec.params.contains("/norestart"), "{}", spec.params);
+    let log_dir = env.root().join("log").join("installers");
+    assert!(
+        spec.params
+            .contains(&format!("/log \"{}\\", log_dir.display())),
+        "{}",
+        spec.params
+    );
+    assert!(!spec.params.contains("<LOGPATH>"), "{}", spec.params);
+    assert_eq!(spec.show, Show::Normal);
+    assert!(r.log.is_some_and(|l| l.starts_with(&log_dir)));
+    assert!(env.elevated.calls.lock().unwrap().is_empty());
+    let events = env.events.lock().unwrap().clone();
+    let at = |p: Phase| {
+        events
+            .iter()
+            .position(|e| *e == ProgressEvent::Phase(p.clone()))
+            .unwrap_or_else(|| panic!("{p:?} missing: {events:?}"))
+    };
+    let running = Phase::RunningInstaller {
+        name: "Contoso App".into(),
+    };
+    assert!(at(Phase::WaitingElevation) < at(running), "{events:?}");
+
+    // An exe installer: `runas` on the verified file itself.
+    let env = Env::new();
+    let (_s, p, _) = served_plan("inno", Some("machine"), Scope::Machine, "", "").await;
     let ctx = ctx!(env);
     install(&ctx, &p).await.unwrap();
-    let calls = env.elevated.calls.lock().unwrap().clone();
+    let calls = env.launcher.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1);
-    let req = &calls[0];
-    assert_eq!(req.kind, ElevatedKind::Msi);
-    assert!(req.file_name.ends_with(".msi"), "{}", req.file_name);
-    assert!(req.params.contains("/passive /norestart"), "{}", req.params);
-    assert!(req.params.contains("<LOGPATH>"), "{}", req.params);
-    assert_eq!(req.sha256, sha);
-    // Task 180 contract: the source is the download cache's blob.
-    let blob = env.root().join("blobs").join(&sha);
-    assert_eq!(Path::new(&req.source), blob);
-    assert_eq!(env.launcher.calls.lock().unwrap().len(), 0);
+    assert_eq!(calls[0].verb, Verb::RunAs);
+    assert_eq!(calls[0].program, env.materialized("exe"));
+    assert!(calls[0].params.contains("/LOG=\""), "{}", calls[0].params);
+    assert!(env.elevated.calls.lock().unwrap().is_empty());
+
+    // A user-scope installer is not elevated.
+    let env = Env::new();
+    let (_s, p, _) = served_plan("inno", Some("user"), Scope::User, "", "").await;
+    let ctx = ctx!(env);
+    install(&ctx, &p).await.unwrap();
+    let calls = env.launcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].verb, Verb::Open);
     assert!(
-        env.events
+        !env.events
             .lock()
             .unwrap()
             .contains(&ProgressEvent::Phase(Phase::WaitingElevation))
     );
 }
 
+/// Task 196: the verified file cannot be renamed nor deleted while the elevated installer
+/// runs (the launcher has not returned), and is released (then removed) once it ended.
+#[tokio::test]
+async fn verified_handle_held_until_exit() {
+    let env = Env::new();
+    env.launcher.probe_hold.store(true, Ordering::SeqCst);
+    let (_s, p, _) = served_plan("inno", Some("machine"), Scope::Machine, "", "").await;
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await;
+    assert!(r.is_ok(), "{r:?}");
+    let calls = env.launcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].verb, Verb::RunAs);
+    assert_eq!(
+        *env.launcher.probed.lock().unwrap(),
+        [("rename", false), ("delete", false)],
+        "the verified file changed while the installer ran"
+    );
+    let file = env.materialized("exe");
+    assert!(!file.exists(), "released and removed after the run");
+    assert!(!file.with_extension("moved").exists());
+}
 #[tokio::test]
 async fn user_inno_runs_unelevated_with_filled_log() {
     let env = Env::new();
@@ -454,21 +569,23 @@ async fn unelevated_msi_uses_absolute_msiexec() {
     assert_eq!(env.elevated.calls.lock().unwrap().len(), 0);
 }
 
+/// Task 196: the user says no to the installer's own UAC prompt (`ERROR_CANCELLED`): the
+/// install is cancelled with the UAC message, nothing else is tried.
 #[tokio::test]
-async fn refused_elevation_fails_with_message() {
+async fn runas_refused_is_cancelled() {
     let env = Env::new();
-    env.elevated
-        .results
-        .lock()
-        .unwrap()
-        .push_back(Err(ElevatedError::Refused));
+    *env.launcher.os_error.lock().unwrap() = Some(1223);
     let (_s, p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
     let ctx = ctx!(env);
     let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::UacRefused), "{e:?}");
     assert_eq!(e.to_string(), UAC_REFUSED);
-    assert_eq!(env.launcher.calls.lock().unwrap().len(), 0);
+    let calls = env.launcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "no second prompt");
+    assert_eq!(calls[0].verb, Verb::RunAs);
+    assert!(env.elevated.calls.lock().unwrap().is_empty());
+    assert!(!env.root().join("state.db").exists());
 }
-
 #[tokio::test]
 async fn msi_1618_retries_then_succeeds() {
     let env = Env::new();
@@ -538,7 +655,7 @@ fn plan_text_is_the_confirmation() {
         eula,
     );
     let text = native(&msi, Scope::Machine).to_string();
-    assert!(text.contains("pede UAC"), "{text}");
+    assert!(text.contains(ADMIN_PROMPT), "{text}");
     assert!(text.contains("Licença: EULA — https://x/eula"), "{text}");
     assert!(text.contains("Contoso App 1.0 (msi, machine)"), "{text}");
     assert!(text.contains("Instalador: https://h/setup.msi"), "{text}");
@@ -546,7 +663,7 @@ fn plan_text_is_the_confirmation() {
 
     let inno = manifest_of("inno", Some("user"), "https://h/setup.exe", &sha, "", "");
     let text = native(&inno, Scope::User).to_string();
-    assert!(!text.contains("pede UAC"), "{text}");
+    assert!(!text.contains(ADMIN_PROMPT), "{text}");
     assert!(!text.contains("abre a janela"), "{text}");
 
     let exe = manifest_of("exe", None, "https://h/setup.exe", &sha, "", "");
@@ -718,8 +835,7 @@ fn consumers_show_new_phases() {
     }
     line.finish();
     assert!(
-        phase_title(&Phase::WaitingElevation)
-            .starts_with("Aguardando o UAC ou o instalador elevado")
+        phase_title(&Phase::WaitingElevation).starts_with("Aguardando permissão de administrador")
     );
     assert!(
         phase_status(&Phase::WaitingElevation, Duration::ZERO).contains("não pode ser cancelado")
@@ -769,12 +885,8 @@ async fn hold_msi_lock_while_running() {
 #[tokio::test]
 async fn elevated_msi_failure_carries_the_log_hint() {
     let env = Env::new();
-    env.elevated.results.lock().unwrap().push_back(Ok(1603));
-    env.elevated
-        .lines
-        .lock()
-        .unwrap()
-        .push("Error 1304. Error writing to file".into());
+    env.launcher.codes.lock().unwrap().push_back(1603);
+    *env.launcher.log_line.lock().unwrap() = Some("Error 1304. Error writing to file".into());
     let (_s, p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
     let ctx = ctx!(env);
     let e = install(&ctx, &p).await.unwrap_err();
@@ -787,8 +899,8 @@ async fn elevated_msi_failure_carries_the_log_hint() {
             .contains(wingetrs::install::msiexec_log::MAX_PATH_HINT),
         "{e}"
     );
+    assert_eq!(env.launcher.calls.lock().unwrap()[0].verb, Verb::RunAs);
 }
-
 #[tokio::test]
 async fn msix_failure_is_an_error() {
     let env = Env::new();
@@ -869,4 +981,22 @@ async fn msix_cancel_before_launch() {
     let r = install(&ctx, &p).await;
     assert!(matches!(r, Err(WingetOpsError::Cancelled)), "{r:?}");
     assert_eq!(env.calls(), (0, 0, 0));
+}
+
+/// Task 196: right before the UAC prompt the flow checks the elevation allowlist again; a plan
+/// whose parameters left it (built or changed elsewhere) launches nothing.
+#[tokio::test]
+async fn runas_refuses_params_outside_the_allowlist() {
+    let env = Env::new();
+    let (_s, mut p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
+    p.command
+        .as_mut()
+        .unwrap()
+        .args
+        .push_str(r" TRANSFORMS=C:\x.mst");
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::Elevated(_)), "{e:?}");
+    assert!(e.to_string().contains("elevação"), "{e}");
+    assert_eq!(env.launcher.calls.lock().unwrap().len(), 0);
 }

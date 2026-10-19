@@ -1,7 +1,8 @@
 //! Protocol and loop of the elevated bridge helper (`wingetrs bridge-worker`): one JSON object
 //! per line each way. The helper only ever runs `bridge::command` of a winget upgrade or install
-//! with a valid id, `bridge::winget_source_update`, or a hash-verified installer whose fields
-//! pass `InstallerRequest::check`; anything else is refused or closes the channel.
+//! with a valid id, `bridge::winget_source_update`, an HKLM uninstaller it recomputes from the
+//! key, or an ARP key deletion it checks again; anything else is refused or closes the channel.
+//! It never runs an installer (Task 196): a `run_installer` request gets a fixed error.
 use super::{BridgeJob, BridgeOp, Tool};
 use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
@@ -34,7 +35,9 @@ pub enum Request {
     // Struct variants, not unit ones: serde lets extra fields through on a unit variant of an
     // internally tagged enum even with `deny_unknown_fields`.
     SourceUpdate {},
-    /// Runs a hash-verified copy of the installer at `source` (Task 180).
+    /// Removed (Task 196): always answered with `INSTALLER_REMOVED`, nothing runs. The SHA-256
+    /// came from the unelevated side, so any same-user process could have run any file as
+    /// administrator; each installer now asks for its own UAC.
     RunInstaller {
         source: String,
         sha256: String,
@@ -133,7 +136,8 @@ impl ElevatedKind {
     }
 }
 
-/// The fields of a `RunInstaller` request.
+/// What an elevated installer launch runs, checked by `InstallerRequest::check` (the Task 180
+/// allowlist) on the unelevated side before the installer's own UAC prompt (Task 196).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallerRequest {
     /// Absolute path of the downloaded installer (in the user's folders; only read).
@@ -149,10 +153,12 @@ pub struct InstallerRequest {
 
 /// Longest `source` accepted, in bytes (the Win32 long path limit).
 pub const SOURCE_MAX: usize = 32_767;
-/// Most installer log lines sent back, from its end.
-pub const INSTALLER_LINES: usize = 40;
-/// Longest installer log line sent back, in bytes (escaped, it stays under `LINE_CAP`).
+/// Longest progress line of an uninstaller sent back, in bytes (escaped, it stays under
+/// `LINE_CAP`).
 pub const INSTALLER_LINE_MAX: usize = LINE_CAP / 8;
+/// The helper's answer to a `run_installer` request (Task 196).
+pub const INSTALLER_REMOVED: &str =
+    "operação removida: o auxiliar elevado não roda instaladores (cada um pede o próprio UAC)";
 
 impl InstallerRequest {
     /// Checks every field before anything touches the disk; the refusal reason otherwise.
@@ -489,8 +495,8 @@ pub fn msi_params_allowed_in(params: &str, program_files: &[String]) -> bool {
     true
 }
 
-/// What the helper does for each accepted request; the real one runs winget and installers
-/// (`elevate_win`), tests use fakes.
+/// What the helper does for each accepted request; the real one runs winget, uninstallers and
+/// ARP deletions (`elevate_win`), tests use fakes.
 pub trait WorkerOps {
     /// Runs `program args` (a winget command), relaying its output lines.
     fn run(
@@ -504,12 +510,6 @@ pub trait WorkerOps {
     fn program_files(&self) -> Vec<String> {
         Vec::new()
     }
-    /// Runs the verified copy of an installer; `on_line` gets the end of its log.
-    fn run_installer(
-        &mut self,
-        req: &InstallerRequest,
-        on_line: &mut dyn FnMut(&str),
-    ) -> std::io::Result<i32>;
     /// The known folders (never the environment). Unavailable by default.
     fn known_folders(&self) -> std::io::Result<KnownFolders> {
         Err(unsupported())
@@ -594,8 +594,8 @@ fn unsupported() -> std::io::Error {
     )
 }
 
-/// A winget exec (a `BridgeExec` closure) as operations: `run` calls it, and installers are
-/// refused without running anything.
+/// A winget exec (a `BridgeExec` closure) as operations: `run` calls it; the rest is
+/// unsupported.
 impl<F> WorkerOps for F
 where
     F: FnMut(&str, &[String], &mut dyn FnMut(&str)) -> std::io::Result<(i32, Vec<String>)>,
@@ -607,17 +607,6 @@ where
         on_line: &mut dyn FnMut(&str),
     ) -> std::io::Result<(i32, Vec<String>)> {
         self(program, args, on_line)
-    }
-
-    fn run_installer(
-        &mut self,
-        _req: &InstallerRequest,
-        _on_line: &mut dyn FnMut(&str),
-    ) -> std::io::Result<i32> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "este auxiliar não roda instaladores",
-        ))
     }
 }
 
@@ -702,21 +691,15 @@ pub fn serve(
                 run(writer, ops, &program, &args)?;
                 continue;
             }
-            Request::RunInstaller {
-                source,
-                sha256,
-                file_name,
-                kind,
-                params,
-            } => {
-                let req = InstallerRequest {
-                    source,
-                    sha256,
-                    file_name,
-                    kind,
-                    params,
-                };
-                run_installer(writer, ops, &req)?;
+            Request::RunInstaller { .. } => {
+                tracing::warn!("bridge worker: run_installer refused (removed operation)");
+                send(
+                    writer,
+                    &Reply::Error {
+                        message: INSTALLER_REMOVED.to_string(),
+                        not_found: false,
+                    },
+                )?;
                 continue;
             }
             Request::RunUninstaller {
@@ -781,44 +764,6 @@ fn clip(text: &str) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// Checks `req` and, when valid, runs it through `ops`; sends at most the last
-/// `INSTALLER_LINES` log lines it reported, then the end. A refused request runs nothing.
-fn run_installer(
-    writer: &mut dyn Write,
-    ops: &mut dyn WorkerOps,
-    req: &InstallerRequest,
-) -> std::io::Result<()> {
-    if let Err(reason) = req.check(&ops.program_files()) {
-        tracing::warn!(reason, "bridge worker: installer request refused");
-        return send(
-            writer,
-            &Reply::Error {
-                message: reason.to_string(),
-                not_found: false,
-            },
-        );
-    }
-    tracing::info!(kind = ?req.kind, file = %req.file_name, "bridge worker: running installer");
-    let mut tail = std::collections::VecDeque::with_capacity(INSTALLER_LINES);
-    let result = ops.run_installer(req, &mut |text: &str| {
-        if tail.len() == INSTALLER_LINES {
-            tail.pop_front();
-        }
-        tail.push_back(clip(text).to_string());
-    });
-    for text in tail {
-        send(writer, &Reply::Line { text })?;
-    }
-    let reply = match result {
-        Ok(code) => Reply::End { code },
-        Err(e) => Reply::Error {
-            message: e.to_string(),
-            not_found: e.kind() == std::io::ErrorKind::NotFound,
-        },
-    };
-    send(writer, &reply)
 }
 
 /// Runs one accepted command, relaying its lines and its end to `writer`.

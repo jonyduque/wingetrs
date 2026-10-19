@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
-use wingetrs::bridge::worker::{DeleteReason, InstallerRequest, MachineHive};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive};
 use wingetrs::bridge::{Applicability, host_arch, winget_applicability};
 use wingetrs::cache::{DataDir, UpdateLock, sha256_hex};
-use wingetrs::config::{DefaultScope, WingetEngine};
+use wingetrs::config::{DefaultScope, InstallerMode, WingetEngine};
 use wingetrs::http::Http;
 use wingetrs::install::executor::LaunchGate;
 use wingetrs::install::progress::ProgressEvent;
@@ -261,6 +261,7 @@ fn native_agrees_with_winget_applicability() {
             upgrade_scope(user, DefaultScope::User),
             "0.9",
             &InstalledFacts::default(),
+            InstallerMode::default(),
         ) {
             Ok(PlanOrBridge::Native(p)) => upgrade_route(&p.installer) != UpgradeRoute::Denied,
             Ok(PlanOrBridge::Bridge(_)) => panic!("{label}: bridge"),
@@ -290,6 +291,7 @@ fn native_agrees_with_winget_applicability() {
         upgrade_scope(user, DefaultScope::User),
         "0.9",
         &InstalledFacts::default(),
+        InstallerMode::default(),
     );
     assert!(
         native.is_err(),
@@ -377,6 +379,7 @@ Installers:
         upgrade_scope(user, DefaultScope::User),
         "0.9",
         &InstalledFacts::default(),
+        InstallerMode::default(),
     ) {
         Err(e) => e.0,
         Ok(_) => panic!("native accepts"),
@@ -428,13 +431,6 @@ impl Launcher for FakeLauncher {
 struct NoElevated;
 
 impl ElevatedRunner for NoElevated {
-    fn run_installer(
-        &self,
-        _req: &InstallerRequest,
-        _on_line: &mut dyn FnMut(&str),
-    ) -> Result<i32, ElevatedError> {
-        panic!("not used");
-    }
     fn run_uninstaller(
         &self,
         _hive: MachineHive,
@@ -963,7 +959,14 @@ fn x64_host() -> Host {
 
 fn upgrade_url(m: &MergedManifest, facts: &InstalledFacts) -> Result<String, Refusal> {
     let wanted = ScopeWanted::Prefer(Scope::User);
-    match plan_upgrade(m, &x64_host(), wanted, "0.9", facts)? {
+    match plan_upgrade(
+        m,
+        &x64_host(),
+        wanted,
+        "0.9",
+        facts,
+        InstallerMode::default(),
+    )? {
         PlanOrBridge::Native(p) => Ok(p.installer.url),
         PlanOrBridge::Bridge(w) => panic!("{w}"),
     }
@@ -1089,4 +1092,30 @@ fn burn_bundle_arch_is_not_the_registry_view() {
         installed_facts(&arp(Hive::MachineX86, "App_is1", false)).arch,
         Some("x86")
     );
+}
+
+/// Task 196 addendum: an upgrade follows the `installer_mode` setting like an install: `silent`
+/// gives `/quiet` for an MSI, the default (progress) `/passive`.
+#[test]
+fn upgrade_follows_installer_mode() {
+    let m = multi(&[("x64", "msi", None)]);
+    let args = |mode: InstallerMode| match plan_upgrade(
+        &m,
+        &x64_host(),
+        ScopeWanted::Prefer(Scope::User),
+        "0.9",
+        &InstalledFacts::default(),
+        mode,
+    )
+    .unwrap()
+    {
+        PlanOrBridge::Native(p) => p.command.unwrap().args,
+        PlanOrBridge::Bridge(w) => panic!("{w}"),
+    };
+    let quiet = args(InstallerMode::Silent);
+    assert!(quiet.contains("/quiet"), "{quiet}");
+    assert!(!quiet.contains("/passive"), "{quiet}");
+    let progress = args(InstallerMode::Progress);
+    assert!(progress.contains("/passive"), "{progress}");
+    assert!(!progress.contains("/quiet"), "{progress}");
 }

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
-use wingetrs::bridge::worker::{DeleteReason, InstallerRequest, MachineHive};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive};
 use wingetrs::installed::Hive;
 use wingetrs::winget_install::elevated_rules::KnownFolders;
 use wingetrs::winget_install::launch::{Elevation, LaunchSpec, Launcher, Show};
@@ -142,13 +142,6 @@ impl FakeElevated {
 }
 
 impl ElevatedRunner for FakeElevated {
-    fn run_installer(
-        &self,
-        _req: &InstallerRequest,
-        _on_line: &mut dyn FnMut(&str),
-    ) -> Result<i32, ElevatedError> {
-        panic!("not used");
-    }
     fn run_uninstaller(
         &self,
         hive: MachineHive,
@@ -1137,13 +1130,6 @@ fn helper_wait_line_shows_the_waiting_phase() {
     /// `FakeElevated` whose helper reports the wait before the exit code.
     struct Waiting(FakeElevated);
     impl ElevatedRunner for Waiting {
-        fn run_installer(
-            &self,
-            _req: &InstallerRequest,
-            _on_line: &mut dyn FnMut(&str),
-        ) -> Result<i32, ElevatedError> {
-            panic!("not used");
-        }
         fn run_uninstaller_lines(
             &self,
             hive: MachineHive,
