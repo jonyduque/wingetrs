@@ -15,12 +15,14 @@ use crate::sources::winget::manifest::{
 };
 
 /// Plan line of an installer that runs elevated: it asks for its own UAC (Task 196).
-pub const ADMIN_PROMPT: &str = "pede permissão de administrador para este instalador";
+pub const ADMIN_PROMPT: &str = "Pede permissão de administrador para este instalador";
 /// Plan line of an elevated installer: it runs from a fresh folder holding only its copy.
-pub const RUN_FOLDER_NOTE: &str = "o instalador roda numa pasta temporária do wingetrs";
+pub const RUN_FOLDER_NOTE: &str = "Roda numa pasta temporária do wingetrs";
 /// The same line for msi/wix: the UAC prompt names the Windows Installer (`msiexec`), not the
 /// package's publisher; the verified file stays held until it ends, so it is the one that runs.
-pub const ADMIN_PROMPT_MSI: &str = "pede permissão de administrador para o Windows Installer";
+pub const ADMIN_PROMPT_MSI: &str = "Pede permissão de administrador para o Windows Installer";
+/// Plan line of an upgrade that removes the installed version first.
+pub const UNINSTALL_FIRST_NOTE: &str = "Remove a versão instalada antes (o desinstalador pode abrir janela ou pedir permissão de administrador)";
 
 /// Longest agreement text shown when the agreement has no URL.
 const AGREEMENT_TEXT_MAX: usize = 200;
@@ -276,45 +278,45 @@ pub fn bridge_reason(why: &str) -> &str {
     why.strip_suffix(": instalado pelo winget").unwrap_or(why)
 }
 
-impl std::fmt::Display for WingetPlan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let scope = self
-            .installer
-            .scope
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("escopo do instalador");
-        writeln!(
-            f,
-            "{} ({}, {scope})",
+/// The installer's scope in the plan title: `usuário`, `máquina`, or the installer decides.
+fn scope_text(scope: Option<&str>) -> &str {
+    match scope.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("user") => "usuário",
+        Some(s) if s.eq_ignore_ascii_case("machine") => "máquina",
+        Some(s) if !s.is_empty() => s,
+        _ => "escopo do instalador",
+    }
+}
+
+impl WingetPlan {
+    /// `7-Zip 26.04 (exe, máquina)`: the first line of every confirmation (CLI and TUI).
+    pub fn title(&self) -> String {
+        format!(
+            "{} ({}, {})",
             name_version(&self.name, Some(&self.version)),
-            self.installer.kind.name()
-        )?;
-        write!(f, "Instalador: {}", self.installer.url)?;
-        if let Some(cmd) = &self.command {
-            let program = match cmd.program {
-                Program::Msiexec => "msiexec.exe /i \"<instalador>\"",
-                Program::Installer => "<instalador>",
-            };
-            write!(f, "\nLinha de comando: {program}")?;
-            if !cmd.args.is_empty() {
-                write!(f, " {}", cmd.args)?;
-            }
-        }
+            self.installer.kind.name(),
+            scope_text(self.installer.scope.as_deref())
+        )
+    }
+
+    /// What the user must consider before saying yes, one capitalized line each (UAC, the
+    /// temporary folder, the installer's window, the removal of the old version, licenses).
+    /// The CLI numbers them and the TUI lists them: both read this list.
+    pub fn steps(&self) -> Vec<String> {
+        let mut out = Vec::new();
         if self.elevation == Elevation::Helper {
-            let prompt = match self.command.as_ref().map(|c| c.program) {
-                Some(Program::Msiexec) => ADMIN_PROMPT_MSI,
-                _ => ADMIN_PROMPT,
-            };
-            write!(f, "\n{prompt}")?;
-            write!(f, "\n{RUN_FOLDER_NOTE}")?;
+            out.push(match self.command.as_ref().map(|c| c.program) {
+                Some(Program::Msiexec) => ADMIN_PROMPT_MSI.to_string(),
+                _ => ADMIN_PROMPT.to_string(),
+            });
+            out.push(RUN_FOLDER_NOTE.to_string());
         }
         if self.interactive {
-            write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;
+            out.push("Abre a janela do instalador (sem modo silencioso)".to_string());
         } else if self.command.is_some() {
             match self.mode {
-                Mode::SilentWithProgress => write!(f, "\nmostra o progresso do instalador")?,
-                Mode::Silent => write!(f, "\nsem janela")?,
+                Mode::SilentWithProgress => out.push("Mostra o progresso do instalador".into()),
+                Mode::Silent => out.push("Sem janela".into()),
                 Mode::Interactive => {}
             }
         }
@@ -322,11 +324,7 @@ impl std::fmt::Display for WingetPlan {
             && super::engine::upgrade_route(&self.installer)
                 == super::engine::UpgradeRoute::UninstallFirst
         {
-            write!(
-                f,
-                "\nremove a versão instalada antes (o desinstalador pode abrir janela ou pedir \
-                 permissão de administrador)"
-            )?;
+            out.push(UNINSTALL_FIRST_NOTE.to_string());
         }
         for a in &self.agreements {
             let label = a
@@ -335,14 +333,46 @@ impl std::fmt::Display for WingetPlan {
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .unwrap_or("Contrato");
-            write!(f, "\nLicença: {}", one_line(label, AGREEMENT_TEXT_MAX))?;
+            let mut line = format!("Licença: {}", one_line(label, AGREEMENT_TEXT_MAX));
             match (a.agreement_url.as_deref(), a.agreement.as_deref()) {
-                (Some(url), _) if !url.trim().is_empty() => write!(f, " — {}", url.trim())?,
+                (Some(url), _) if !url.trim().is_empty() => {
+                    line.push_str(&format!(" — {}", url.trim()));
+                }
                 (_, Some(text)) if !text.trim().is_empty() => {
-                    write!(f, " — {}", one_line(text, AGREEMENT_TEXT_MAX))?
+                    line.push_str(&format!(" — {}", one_line(text, AGREEMENT_TEXT_MAX)));
                 }
                 _ => {}
             }
+            out.push(line);
+        }
+        out
+    }
+
+    /// Only for `--dry-run`: the installer's URL, its command line and its SHA-256.
+    pub fn dry_run_details(&self) -> Vec<String> {
+        let mut out = vec![format!("Instalador: {}", self.installer.url)];
+        if let Some(cmd) = &self.command {
+            let program = match cmd.program {
+                Program::Msiexec => "msiexec.exe /i \"<instalador>\"",
+                Program::Installer => "<instalador>",
+            };
+            let mut line = format!("Linha de comando: {program}");
+            if !cmd.args.is_empty() {
+                line.push_str(&format!(" {}", cmd.args));
+            }
+            out.push(line);
+        }
+        out.push(format!("SHA-256: {}", self.installer.sha256));
+        out
+    }
+}
+
+/// The title, then one step per line (what the TUI confirmation lists; no URL nor command).
+impl std::fmt::Display for WingetPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.title())?;
+        for step in self.steps() {
+            write!(f, "\n{step}")?;
         }
         Ok(())
     }

@@ -79,7 +79,7 @@ fn manifest_with(kind: &str, scope: &str, root: &str) -> MergedManifest {
     manifest::parse(yaml.as_bytes()).unwrap()
 }
 
-fn native(kind: &str, scope: Scope) -> WingetPlan {
+pub(crate) fn native(kind: &str, scope: Scope) -> WingetPlan {
     let name = match scope {
         Scope::Machine => "machine",
         Scope::User => "user",
@@ -224,7 +224,7 @@ fn confirm_shows_pede_uac_for_machine_plan() {
     assert!(cmds.is_empty(), "{cmds:?}");
     let text = confirm_text(&a);
     assert!(text.contains(ADMIN_PROMPT_MSI), "{text}");
-    assert!(text.contains("Contoso App 1.0 (msi, machine)"), "{text}");
+    assert!(text.contains("Contoso App 1.0 (msi, máquina)"), "{text}");
     assert_eq!(confirm_actions(&a), vec![Action::WingetInstall(machine)]);
 
     let mut b = search_app();
@@ -242,7 +242,7 @@ fn confirm_shows_pede_uac_for_machine_plan() {
         !text.contains(ADMIN_PROMPT) && !text.contains(ADMIN_PROMPT_MSI),
         "{text}"
     );
-    assert!(text.contains("Contoso App 1.0 (inno, user)"), "{text}");
+    assert!(text.contains("Contoso App 1.0 (inno, usuário)"), "{text}");
 }
 
 fn orphan_row() -> ListRow {
@@ -665,7 +665,7 @@ fn upgrade_native_follows_engine() {
         }]
     );
     let text = confirm_text(&a);
-    assert!(text.contains("Contoso App 1.0 (inno, user)"), "{text}");
+    assert!(text.contains("Contoso App 1.0 (inno, usuário)"), "{text}");
 
     // Engine `winget`: the bridge, plan or not.
     let mut w = on_installed(vec![row.clone()]);
@@ -1076,4 +1076,48 @@ fn tui_batch_refused_uac_still_runs_the_next() {
         "{cmds:?}"
     );
     assert!(a.queue.is_empty());
+}
+
+/// The TUI confirmation and the CLI plan of the same native plan list the same steps, in the
+/// same order (both read `WingetPlan::steps`); the CLI numbers them, neither shows the URL.
+#[test]
+fn tui_confirmation_and_cli_plan_list_the_same_steps() {
+    use wingetrs::cli::install_cmd::Flags;
+    use wingetrs::cli::{style::with_enabled, winget_cmd::native_text};
+    let machine = native("msi", Scope::Machine);
+    assert!(machine.steps().len() >= 3, "{:?}", machine.steps());
+    let mut a = search_app();
+    update(&mut a, key(KeyCode::Char('i')));
+    update(
+        &mut a,
+        Msg::WingetInstallPlanned {
+            bridge: Ok((bridge_job(), Vec::new())),
+            native: Ok(PlanOrBridge::Native(machine.clone())),
+        },
+    );
+    let tui: Vec<String> = match &a.modal {
+        Some(Modal::Confirm { notes, .. }) => notes.clone(),
+        _ => panic!("confirmation not open"),
+    };
+    let cli = with_enabled(false, || native_text(&machine, Flags::default()));
+    // The CLI's numbered lines, without the number and the warning glyph.
+    let cli_steps: Vec<String> = cli
+        .lines()
+        .filter_map(|l| l.trim_start().split_once(". "))
+        .filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
+        .map(|(_, s)| s.trim_start_matches("⚠ ").to_string())
+        .collect();
+    assert_eq!(cli_steps, machine.steps(), "{cli}");
+    let tui_steps: Vec<String> = tui
+        .iter()
+        .filter(|n| cli_steps.contains(n))
+        .cloned()
+        .collect();
+    assert_eq!(tui_steps, cli_steps, "{tui:?}");
+    assert!(tui.contains(&machine.title()), "{tui:?}");
+    assert!(cli.contains(&machine.title()), "{cli}");
+    for text in [cli.as_str(), &tui.join("\n")] {
+        assert!(!text.contains(&machine.installer.url), "{text}");
+        assert!(!text.contains("SHA-256"), "{text}");
+    }
 }

@@ -741,8 +741,15 @@ fn plan_text_is_the_confirmation() {
     let machine_text = native(&inno_machine, Scope::Machine).to_string();
     assert!(machine_text.contains(ADMIN_PROMPT), "{machine_text}");
     assert!(text.contains("Licença: EULA — https://x/eula"), "{text}");
-    assert!(text.contains("Contoso App 1.0 (msi, machine)"), "{text}");
-    assert!(text.contains("Instalador: https://h/setup.msi"), "{text}");
+    assert!(text.contains("Contoso App 1.0 (msi, máquina)"), "{text}");
+    // URL, command line and hash only in `--dry-run`.
+    assert!(!text.contains("https://h/setup.msi"), "{text}");
+    let details = native(&msi, Scope::Machine).dry_run_details();
+    assert!(
+        details.contains(&"Instalador: https://h/setup.msi".to_string()),
+        "{details:?}"
+    );
+    assert!(details.contains(&format!("SHA-256: {sha}")), "{details:?}");
     assert!(!text.contains("<LOGPATH>"), "elevated: no log: {text}");
 
     let inno = manifest_of("inno", Some("user"), "https://h/setup.exe", &sha, "", "");
@@ -750,11 +757,11 @@ fn plan_text_is_the_confirmation() {
     assert!(!text.contains(ADMIN_PROMPT), "{text}");
     assert!(!text.contains(ADMIN_PROMPT_MSI), "{text}");
     assert!(!text.contains(RUN_FOLDER_NOTE), "{text}");
-    assert!(!text.contains("abre a janela"), "{text}");
+    assert!(!text.contains("Abre a janela"), "{text}");
 
     let exe = manifest_of("exe", None, "https://h/setup.exe", &sha, "", "");
     let text = native(&exe, Scope::User).to_string();
-    assert!(text.contains("abre a janela do instalador"), "{text}");
+    assert!(text.contains("Abre a janela do instalador"), "{text}");
     assert!(text.contains("escopo do instalador"), "{text}");
 }
 

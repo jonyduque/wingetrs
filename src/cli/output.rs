@@ -799,6 +799,47 @@ pub fn plan_text(text: &str) -> String {
     out.join("\n")
 }
 
+/// One detail line of a winget plan (not its title): a known label in header style.
+fn plan_line(body: &str) -> String {
+    match PLAN_LABELS
+        .iter()
+        .find(|l| body.strip_prefix(**l).is_some_and(|r| r.starts_with(": ")))
+    {
+        Some(l) => format!("{}{}", paint(HEADER, l), &body[l.len()..]),
+        None => body.to_string(),
+    }
+}
+
+/// The native winget plan in the shape of the Scoop one: the title (`7-Zip 26.04` in bold, its
+/// `(tipo, escopo)` dimmed), every step numbered (number in bold, UAC steps with the warning
+/// glyph, `Licença` as a label) and, only for `--dry-run`, the URL, command line and SHA-256.
+pub fn winget_plan_text(plan: &crate::winget_install::plan::WingetPlan, dry_run: bool) -> String {
+    use crate::winget_install::plan::{ADMIN_PROMPT, ADMIN_PROMPT_MSI};
+    let title = plan.title();
+    let mut s = match title.rfind(" (") {
+        Some(at) => format!("{}{}", paint(NAME, &title[..at]), paint(DIM, &title[at..])),
+        None => paint(NAME, &title),
+    };
+    s.push('\n');
+    let steps = plan.steps();
+    let width = steps.len().to_string().len();
+    for (i, step) in steps.iter().enumerate() {
+        let n = paint(NAME, &format!("{:>width$}", i + 1));
+        let text = if step == ADMIN_PROMPT || step == ADMIN_PROMPT_MSI {
+            format!("{} {step}", paint(WARN, style::glyphs().toast_warn))
+        } else {
+            plan_line(step)
+        };
+        s.push_str(&format!("  {n}. {text}\n"));
+    }
+    if dry_run {
+        for line in plan.dry_run_details() {
+            s.push_str(&format!("  {}\n", plan_line(&line)));
+        }
+    }
+    s
+}
+
 /// The engine chose `winget` for this package: `Instalando pelo winget: <why>`.
 pub fn through_winget(upgrade: bool, why: &str) -> String {
     let verb = if upgrade {

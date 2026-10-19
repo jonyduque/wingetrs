@@ -325,14 +325,6 @@ fn wide_chars_align_table() {
     }
 }
 
-/// `WingetPlan`'s text for an exe that needs the helper (as `install 7zip.7zip --dry-run`).
-const WINGET_PLAN: &str = "7-Zip 26.04 (exe, machine)
-Instalador: https://www.7-zip.org/a/7z2604-x64.exe
-Linha de comando: <instalador> /S
-pede permissão de administrador para este instalador
-mostra o progresso do instalador
-SHA-256: D54BF805F9F3704D1E8DB2FA3498AE7EF2DF0312B40B558E7C71C734430A665D";
-
 /// The ARP `UninstallPlan`'s text with shared folders.
 const WINGET_UNINSTALL: &str = "Desinstalar Kindle 2.0
   comando: C:\\K\\uninst.exe /S
@@ -431,6 +423,8 @@ fn snapshots_tty_color_and_plain() {
     dry_plan
         .notes
         .push("o manifesto pede uma reinicialização".into());
+    let winget_plan =
+        crate::wi_tui::native("msi", wingetrs::winget_install::select::Scope::Machine);
     let glyphs = wingetrs::tui::theme::Glyphs::for_set(wingetrs::tui::theme::GlyphSet::Unicode);
     let render = || {
         let mut s = String::new();
@@ -463,9 +457,10 @@ fn snapshots_tty_color_and_plain() {
         }
         s.push_str("-- install --dry-run (scoop)\n");
         s.push_str(&output::install_plan_text(&dry_plan, glyphs));
-        s.push_str("-- install --dry-run (winget, texto do plano)\n");
-        s.push_str(&output::plan_text(WINGET_PLAN));
-        s.push('\n');
+        s.push_str("-- install (winget, confirmação)\n");
+        s.push_str(&output::winget_plan_text(&winget_plan, false));
+        s.push_str("-- install --dry-run (winget)\n");
+        s.push_str(&output::winget_plan_text(&winget_plan, true));
         s.push_str(&output::through_winget(false, "tipo zip"));
         s.push('\n');
         s.push_str(&output::plan_text(
@@ -506,7 +501,6 @@ fn snapshots_tty_color_and_plain() {
     let color = with_enabled(true, render);
     let plain = with_enabled(false, render);
     // The winget plans keep their text: only styled.
-    assert!(plain.contains(&format!("{WINGET_PLAN}\n")), "{plain}");
     assert!(plain.contains(&format!("{WINGET_UNINSTALL}\n")), "{plain}");
     assert!(color.contains('\x1b'));
     assert!(!plain.contains('\x1b'));

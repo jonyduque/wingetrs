@@ -576,7 +576,11 @@ async fn native_install_prints_plan_and_logs_agreements() {
     .await
     .unwrap();
     let text = out.join("\n");
-    assert!(text.contains(p.to_string().trim_end()), "{text}");
+    // The same title and steps as the TUI confirmation (`Display`), numbered.
+    assert!(text.contains(&p.title()), "{text}");
+    for (i, step) in p.steps().iter().enumerate() {
+        assert!(text.contains(&format!("{}. {step}", i + 1)), "{text}");
+    }
     assert!(
         text.contains("Licença aceita: EULA — https://x/eula"),
         "{text}"

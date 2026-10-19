@@ -45,13 +45,19 @@ Instalar app 2.0  main · 64bit
    9. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
   10. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
 ⚠ aviso: o manifesto pede uma reinicialização
--- install --dry-run (winget, texto do plano)
-7-Zip 26.04 (exe, machine)
-Instalador: https://www.7-zip.org/a/7z2604-x64.exe
-Linha de comando: <instalador> /S
-pede permissão de administrador para este instalador
-mostra o progresso do instalador
-SHA-256: D54BF805F9F3704D1E8DB2FA3498AE7EF2DF0312B40B558E7C71C734430A665D
+-- install (winget, confirmação)
+Contoso App 1.0 (msi, máquina)
+  1. ⚠ Pede permissão de administrador para o Windows Installer
+  2. Roda numa pasta temporária do wingetrs
+  3. Mostra o progresso do instalador
+-- install --dry-run (winget)
+Contoso App 1.0 (msi, máquina)
+  1. ⚠ Pede permissão de administrador para o Windows Installer
+  2. Roda numa pasta temporária do wingetrs
+  3. Mostra o progresso do instalador
+  Instalador: https://h/setup
+  Linha de comando: msiexec.exe /i "<instalador>" /passive /norestart
+  SHA-256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Instalando pelo winget: tipo zip
 Licença aceita: EULA — https://x.invalid/eula
 Reinicie o computador para concluir.

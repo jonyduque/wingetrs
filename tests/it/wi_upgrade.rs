@@ -939,7 +939,7 @@ async fn upgrade_previous_cancel_before_removal_keeps_old() {
 
 #[test]
 fn upgrade_previous_confirmation_mentions_removal() {
-    const LINE: &str = "remove a versão instalada antes (o desinstalador pode abrir janela ou pedir permissão de administrador)";
+    const LINE: &str = "Remove a versão instalada antes (o desinstalador pode abrir janela ou pedir permissão de administrador)";
     let m = manifest_with(
         "inno",
         &[(Some("user"), Some("uninstallPrevious"))],
@@ -1103,12 +1103,12 @@ fn msix_plan_never_says_installer_window() {
         let m = manifest_with(kind, &[(Some("user"), None)], URL, SHA, "");
         let p = native(&m, ScopeWanted::Only(Scope::User), None);
         assert!(!p.interactive, "{kind}");
-        assert!(!p.to_string().contains("abre a janela"), "{p}");
+        assert!(!p.to_string().contains("Abre a janela"), "{p}");
     }
     // An exe with no silent mode still says it.
     let m = manifest_with("exe", &[(Some("user"), None)], URL, SHA, "");
     let p = native(&m, ScopeWanted::Only(Scope::User), None);
-    assert!(p.to_string().contains("abre a janela do instalador"), "{p}");
+    assert!(p.to_string().contains("Abre a janela do instalador"), "{p}");
 }
 
 /// The ARP record of a .NET runtime bundle (Burn): always in the 32-bit view.

@@ -346,7 +346,7 @@ fn refused(r: Refusal) -> anyhow::Error {
 
 /// Prints the plan, stops on `--dry-run`, confirms; `false` when nothing more runs.
 fn show_and_confirm(ui: &dyn Ui, text: &str, f: Flags, say: Say<'_>) -> anyhow::Result<bool> {
-    say(&output::plan_text(text.trim_end()));
+    say(text.trim_end());
     if f.dry_run {
         say(output::DRY_RUN_DONE);
         return Ok(false);
@@ -438,14 +438,10 @@ async fn run_native<E: std::fmt::Display + Send + 'static>(
     out.map_err(|e| anyhow!("{e}"))
 }
 
-/// The native plan as shown; `--dry-run` adds the installer's SHA-256 (URL, hash and staging
-/// appear only there, as in the Scoop dry run).
+/// The native plan as shown: the same steps as the TUI confirmation (`WingetPlan::steps`);
+/// URL, command line and SHA-256 only with `--dry-run`, as in the Scoop dry run.
 pub fn native_text(plan: &WingetPlan, f: Flags) -> String {
-    let mut text = plan.to_string().trim_end().to_string();
-    if f.dry_run {
-        text.push_str(&format!("\nSHA-256: {}", plan.installer.sha256));
-    }
-    text
+    output::winget_plan_text(plan, f.dry_run)
 }
 
 /// `Instalado:`/`Atualizado:`, or the "did not show up" warning in yellow; then the reboot.
