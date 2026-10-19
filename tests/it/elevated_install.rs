@@ -1356,3 +1356,21 @@ mod win {
         staging_win::open_source(&file).unwrap();
     }
 }
+
+#[test]
+fn worker_allows_progress_switches_exactly() {
+    assert!(msi_params_allowed("/passive /norestart"));
+    assert!(!msi_params_allowed("/passivex /norestart"));
+    assert!(exe_params_allowed(
+        ElevatedKind::Inno,
+        "/SP- /SILENT /NORESTART",
+        &[]
+    ));
+    assert!(!exe_params_allowed(ElevatedKind::Inno, "/SILENTX", &[]));
+    assert!(exe_params_allowed(
+        ElevatedKind::Burn,
+        "/passive /norestart",
+        &[]
+    ));
+    assert!(!exe_params_allowed(ElevatedKind::Burn, "/passivex", &[]));
+}

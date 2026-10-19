@@ -73,6 +73,7 @@ fn behavior_round_trips_through_save() {
             mouse: false,
             winget_engine: wingetrs::config::WingetEngine::Winget,
             default_scope: wingetrs::config::DefaultScope::Machine,
+            installer_mode: wingetrs::config::InstallerMode::Silent,
         },
         ..Config::default()
     };

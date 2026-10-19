@@ -1,6 +1,6 @@
 //! Winget engine and default scope settings (Task 171).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use wingetrs::config::{Behavior, Config, ConfigError, DefaultScope, WingetEngine};
+use wingetrs::config::{Behavior, Config, ConfigError, DefaultScope, InstallerMode, WingetEngine};
 use wingetrs::tui::settings::{ORDER, SettingId, SettingsState};
 use wingetrs::tui::theme::GlyphSet;
 
@@ -109,7 +109,8 @@ fn order_places_new_settings_after_redirect() {
         .unwrap();
     assert_eq!(ORDER[i + 1], SettingId::WingetEngine);
     assert_eq!(ORDER[i + 2], SettingId::DefaultScope);
-    assert_eq!(ORDER.len(), 12);
+    assert_eq!(ORDER[i + 3], SettingId::InstallerMode);
+    assert_eq!(ORDER.len(), 13);
 }
 
 #[test]
@@ -125,4 +126,32 @@ fn save_settings_writes_fields() {
     let text = std::fs::read_to_string(&p).unwrap();
     assert!(text.contains("winget_engine = \"winget\""), "{text}");
     assert!(text.contains("default_scope = \"machine\""), "{text}");
+}
+
+#[test]
+fn unknown_installer_mode_falls_back_to_progress() {
+    let cfg = load_text(
+        "[behavior]
+installer_mode = \"x\"
+",
+    )
+    .unwrap();
+    assert_eq!(cfg.behavior.installer_mode, InstallerMode::Progress);
+    let cfg = load_text(
+        "[behavior]
+installer_mode = \"silent\"
+",
+    )
+    .unwrap();
+    assert_eq!(cfg.behavior.installer_mode, InstallerMode::Silent);
+    assert_eq!(Behavior::default().installer_mode, InstallerMode::Progress);
+}
+
+#[test]
+fn cycle_installer_mode() {
+    let mut s = state_at(SettingId::InstallerMode);
+    assert!(s.cycle(true));
+    assert_eq!(s.behavior.installer_mode, InstallerMode::Silent);
+    s.cycle(true);
+    assert_eq!(s.behavior.installer_mode, InstallerMode::Progress);
 }

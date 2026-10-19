@@ -1,5 +1,7 @@
 //! State of the Settings tab: which setting is selected and the values being edited.
-use crate::config::{Behavior, ConfirmMode, DefaultScope, ResidueMode, WingetEngine};
+use crate::config::{
+    Behavior, ConfirmMode, DefaultScope, InstallerMode, ResidueMode, WingetEngine,
+};
 use crate::tui::theme::GlyphSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,6 +13,7 @@ pub enum SettingId {
     HttpRedirect,
     WingetEngine,
     DefaultScope,
+    InstallerMode,
     Glyphs,
     Icons,
     ListIcons,
@@ -19,7 +22,7 @@ pub enum SettingId {
 }
 
 /// Order of the settings on screen.
-pub const ORDER: [SettingId; 12] = [
+pub const ORDER: [SettingId; 13] = [
     SettingId::Confirm,
     SettingId::Purge,
     SettingId::KeepOld,
@@ -27,6 +30,7 @@ pub const ORDER: [SettingId; 12] = [
     SettingId::HttpRedirect,
     SettingId::WingetEngine,
     SettingId::DefaultScope,
+    SettingId::InstallerMode,
     SettingId::Glyphs,
     SettingId::Icons,
     SettingId::ListIcons,
@@ -44,6 +48,7 @@ impl SettingId {
             SettingId::HttpRedirect => "Redirecionar https para http",
             SettingId::WingetEngine => "Motor do winget",
             SettingId::DefaultScope => "Escopo padrão (winget)",
+            SettingId::InstallerMode => "Janela do instalador (winget)",
             SettingId::Glyphs => "Glifos",
             SettingId::Icons => "Ícones",
             SettingId::ListIcons => "Ícones da lista",
@@ -60,6 +65,7 @@ impl SettingId {
             SettingId::HttpRedirect => &["recusar", "aceitar"],
             SettingId::WingetEngine => &["wingetrs", "winget"],
             SettingId::DefaultScope => &["usuário", "máquina"],
+            SettingId::InstallerMode => &["mostrar progresso", "sem janela"],
             SettingId::Glyphs => &["nerd", "unicode", "ascii"],
             SettingId::Icons => &["Automático", "iTerm2", "Sixel", "Desligado"],
             SettingId::ListIcons => &["visíveis", "só ao abrir"],
@@ -86,6 +92,9 @@ impl SettingId {
             }
             SettingId::DefaultScope => {
                 "Para quem instalar quando o pacote oferece os dois: só você, ou todos os usuários (pede UAC)."
+            }
+            SettingId::InstallerMode => {
+                "Instaladores do winget: mostram a janela de progresso (padrão) ou rodam sem janela."
             }
             SettingId::Glyphs => "Conjunto de ícones da interface.",
             SettingId::Icons => {
@@ -183,6 +192,10 @@ impl SettingsState {
                 DefaultScope::User => 0,
                 DefaultScope::Machine => 1,
             },
+            SettingId::InstallerMode => match self.behavior.installer_mode {
+                InstallerMode::Progress => 0,
+                InstallerMode::Silent => 1,
+            },
             SettingId::Glyphs => match self.glyphs {
                 GlyphSet::Nerd => 0,
                 GlyphSet::Unicode => 1,
@@ -228,6 +241,10 @@ impl SettingsState {
             }
             SettingId::DefaultScope => {
                 self.behavior.default_scope = [DefaultScope::User, DefaultScope::Machine][next];
+            }
+            SettingId::InstallerMode => {
+                self.behavior.installer_mode =
+                    [InstallerMode::Progress, InstallerMode::Silent][next];
             }
             SettingId::Glyphs => {
                 self.glyphs = [GlyphSet::Nerd, GlyphSet::Unicode, GlyphSet::Ascii][next];

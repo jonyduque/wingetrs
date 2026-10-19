@@ -1,5 +1,6 @@
 //! Default switches and command line (Task 174).
 
+use crate::config::InstallerMode;
 use crate::sources::winget::manifest::{InstallerKind, InstallerSwitches};
 use std::path::Path;
 
@@ -70,10 +71,15 @@ fn present(s: &Option<String>) -> Option<&str> {
     s.as_deref().filter(|v| !v.trim().is_empty())
 }
 
-/// Silent unless the installer is an exe with no Silent switch.
+/// Progress window (the default) or quiet, unless the installer is an exe with no silent switch.
 // Port of the experience-switch choice, AppInstallerCLICore_Workflows_ShellExecuteInstallerHandler.cpp:86-105
-pub fn mode_for(kind: &InstallerKind, sw: &InstallerSwitches) -> Mode {
-    if defaults(kind).is_some() || present(&sw.silent).is_some() {
+pub fn mode_for(kind: &InstallerKind, sw: &InstallerSwitches, setting: InstallerMode) -> Mode {
+    let has_defaults = defaults(kind).is_some();
+    if setting == InstallerMode::Progress
+        && (has_defaults || present(&sw.silent_with_progress).is_some())
+    {
+        Mode::SilentWithProgress
+    } else if has_defaults || present(&sw.silent).is_some() {
         Mode::Silent
     } else if present(&sw.silent_with_progress).is_some() {
         Mode::SilentWithProgress

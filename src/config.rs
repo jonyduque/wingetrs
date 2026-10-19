@@ -48,6 +48,15 @@ pub enum DefaultScope {
     Machine,
 }
 
+/// How native winget installers run: with their progress window or fully quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallerMode {
+    #[default]
+    Progress,
+    Silent,
+}
+
 /// `[behavior]` section of `config.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
@@ -66,6 +75,9 @@ pub struct Behavior {
     /// Preferred scope when a winget package offers both.
     #[serde(deserialize_with = "lenient_scope")]
     pub default_scope: DefaultScope,
+    /// Installer window: `progress` (winget's SilentWithProgress) or `silent`.
+    #[serde(deserialize_with = "lenient_installer_mode")]
+    pub installer_mode: InstallerMode,
 }
 
 /// Unknown values fall back to the default (a typo must not stop the TUI from opening).
@@ -93,6 +105,20 @@ fn lenient_scope<'de, D: serde::Deserializer<'de>>(d: D) -> Result<DefaultScope,
     })
 }
 
+fn lenient_installer_mode<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<InstallerMode, D::Error> {
+    let text = String::deserialize(d)?;
+    Ok(match text.as_str() {
+        "progress" => InstallerMode::Progress,
+        "silent" => InstallerMode::Silent,
+        other => {
+            tracing::warn!(installer_mode = %other, "unknown installer_mode setting, using progress");
+            InstallerMode::default()
+        }
+    })
+}
+
 impl Default for Behavior {
     fn default() -> Self {
         Behavior {
@@ -104,6 +130,7 @@ impl Default for Behavior {
             mouse: true,
             winget_engine: WingetEngine::default(),
             default_scope: DefaultScope::default(),
+            installer_mode: InstallerMode::default(),
         }
     }
 }

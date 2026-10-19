@@ -3,6 +3,7 @@
 
 use super::launch::{Elevation, install_elevation};
 use super::select::{Host, Refusal, ScopeWanted, Verdict, choose};
+use crate::config::InstallerMode;
 use super::switches::{CommandLine, Mode, Program, install_args, mode_for};
 use crate::bridge::worker::{
     ElevatedKind, InstallerRequest, exe_params_allowed, msi_params_allowed_in,
@@ -51,6 +52,23 @@ pub fn plan(
     wanted: ScopeWanted,
     upgrade_from: Option<String>,
 ) -> Result<PlanOrBridge, Refusal> {
+    plan_with_mode(
+        manifest,
+        host,
+        wanted,
+        upgrade_from,
+        InstallerMode::default(),
+    )
+}
+
+/// `plan` with the `installer_mode` setting (progress window or quiet).
+pub fn plan_with_mode(
+    manifest: &MergedManifest,
+    host: &Host,
+    wanted: ScopeWanted,
+    upgrade_from: Option<String>,
+    installer_mode: InstallerMode,
+) -> Result<PlanOrBridge, Refusal> {
     let installers = manifest.effective();
     let sel = choose(&installers, host, wanted)?;
     let interactive = match sel.verdict {
@@ -58,7 +76,7 @@ pub fn plan(
         Verdict::Native { interactive } => interactive,
     };
     let inst = sel.installer;
-    let mode = mode_for(&inst.kind, &inst.switches);
+    let mode = mode_for(&inst.kind, &inst.switches, installer_mode);
     let command = if matches!(inst.kind, InstallerKind::Msix | InstallerKind::Appx) {
         None
     } else {
@@ -255,7 +273,14 @@ impl std::fmt::Display for WingetPlan {
             write!(f, "\npede UAC")?;
         }
         if self.interactive {
-            write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;
+            write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;        } else if self.command.is_some() {
+            match self.mode {
+                Mode::SilentWithProgress => write!(f, "
+mostra o progresso do instalador")?,
+                Mode::Silent => write!(f, "
+sem janela")?,
+                Mode::Interactive => {}
+            }
         }
         if self.upgrade_from.is_some()
             && super::engine::upgrade_route(&self.installer)

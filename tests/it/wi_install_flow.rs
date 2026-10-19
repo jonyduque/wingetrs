@@ -389,7 +389,7 @@ async fn machine_msi_goes_through_helper() {
     let req = &calls[0];
     assert_eq!(req.kind, ElevatedKind::Msi);
     assert!(req.file_name.ends_with(".msi"), "{}", req.file_name);
-    assert!(req.params.contains("/quiet /norestart"), "{}", req.params);
+    assert!(req.params.contains("/passive /norestart"), "{}", req.params);
     assert!(req.params.contains("<LOGPATH>"), "{}", req.params);
     assert_eq!(req.sha256, sha);
     // Task 180 contract: the source is the download cache's blob.

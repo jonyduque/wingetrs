@@ -2,6 +2,7 @@
 //! Default switches and command line (Task 174).
 
 use std::path::Path;
+use wingetrs::config::InstallerMode;
 use wingetrs::sources::winget::manifest::{InstallerKind, InstallerSwitches};
 use wingetrs::winget_install::switches::*;
 
@@ -88,14 +89,20 @@ fn exe_only_manifest() {
         silent: Some("/q".into()),
         ..sw()
     };
-    assert_eq!(mode_for(&InstallerKind::Exe, &s), Mode::Silent);
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &s, InstallerMode::Progress),
+        Mode::Silent
+    );
     assert_eq!(
         args(&InstallerKind::Exe, &s, Mode::Silent, false).args,
         "/q"
     );
 
     let none = sw();
-    assert_eq!(mode_for(&InstallerKind::Exe, &none), Mode::Interactive);
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &none, InstallerMode::Progress),
+        Mode::Interactive
+    );
     assert_eq!(
         args(&InstallerKind::Exe, &none, Mode::Interactive, false).args,
         ""
@@ -105,7 +112,10 @@ fn exe_only_manifest() {
         silent_with_progress: Some("/passive".into()),
         ..sw()
     };
-    assert_eq!(mode_for(&InstallerKind::Exe, &p), Mode::SilentWithProgress);
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &p, InstallerMode::Progress),
+        Mode::SilentWithProgress
+    );
     assert_eq!(
         args(&InstallerKind::Exe, &p, Mode::SilentWithProgress, false).args,
         "/passive"
@@ -242,5 +252,59 @@ fn inno_repeated_switch_passed_once() {
     assert_eq!(
         args(&InstallerKind::Exe, &exe, Mode::Silent, false).args,
         "/S /x /X"
+    );
+}
+
+#[test]
+fn default_mode_is_silent_with_progress() {
+    let m = mode_for(&InstallerKind::Msi, &sw(), InstallerMode::default());
+    assert_eq!(m, Mode::SilentWithProgress);
+    assert_eq!(
+        args(&InstallerKind::Msi, &sw(), m, false).args,
+        r#"/passive /norestart /log "<LOGPATH>""#
+    );
+    let m = mode_for(&InstallerKind::Inno, &sw(), InstallerMode::default());
+    assert_eq!(m, Mode::SilentWithProgress);
+    assert!(
+        args(&InstallerKind::Inno, &sw(), m, false)
+            .args
+            .contains("/SILENT")
+    );
+}
+
+#[test]
+fn silent_setting_keeps_quiet() {
+    let m = mode_for(&InstallerKind::Msi, &sw(), InstallerMode::Silent);
+    assert_eq!(m, Mode::Silent);
+    assert!(
+        args(&InstallerKind::Msi, &sw(), m, false)
+            .args
+            .starts_with("/quiet")
+    );
+    // An exe with only a progress switch still uses it, and one with none stays interactive.
+    let p = InstallerSwitches {
+        silent_with_progress: Some("/p".into()),
+        ..sw()
+    };
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &p, InstallerMode::Silent),
+        Mode::SilentWithProgress
+    );
+    assert_eq!(
+        mode_for(&InstallerKind::Exe, &sw(), InstallerMode::Progress),
+        Mode::Interactive
+    );
+}
+
+#[test]
+fn progress_setting_uses_manifest_progress_switch() {
+    let p = InstallerSwitches {
+        silent_with_progress: Some("/passive /x".into()),
+        ..sw()
+    };
+    let m = mode_for(&InstallerKind::Msi, &p, InstallerMode::Progress);
+    assert_eq!(
+        args(&InstallerKind::Msi, &p, m, false).args,
+        r#"/passive /x /log "<LOGPATH>""#
     );
 }
