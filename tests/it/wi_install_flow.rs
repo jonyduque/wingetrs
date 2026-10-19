@@ -22,7 +22,8 @@ use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::ops::{WingetCtx, WingetOpsError, install};
 use wingetrs::winget_install::plan::{
-    ADMIN_PROMPT, ADMIN_PROMPT_MSI, PlanOrBridge, RUN_FOLDER_NOTE, WingetPlan, plan,
+    ADMIN_PROMPT, ADMIN_PROMPT_MSI, MSIX_SCOPE_STEP, MSIX_STEP, PlanOrBridge, RUN_FOLDER_NOTE,
+    SELF_ADMIN_PROMPT, WingetPlan, plan, plan_with_mode,
 };
 use wingetrs::winget_install::post_check::find_installed;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
@@ -749,7 +750,10 @@ fn plan_text_is_the_confirmation() {
         details.contains(&"Instalador: https://h/setup.msi".to_string()),
         "{details:?}"
     );
-    assert!(details.contains(&format!("SHA-256: {sha}")), "{details:?}");
+    assert!(
+        details.contains(&format!("SHA-256: {}", sha.to_uppercase())),
+        "{details:?}"
+    );
     assert!(!text.contains("<LOGPATH>"), "elevated: no log: {text}");
 
     let inno = manifest_of("inno", Some("user"), "https://h/setup.exe", &sha, "", "");
@@ -1276,4 +1280,163 @@ fn run_folder_that_exists_is_refused() {
     let r = RunCopy::create_named(&root, &other, &source, &"0".repeat(64));
     assert!(r.is_err());
     assert!(!installers.join(&other).exists());
+}
+
+fn native_in(
+    m: &MergedManifest,
+    wanted: Scope,
+    mode: wingetrs::config::InstallerMode,
+) -> WingetPlan {
+    match plan_with_mode(m, &host(), ScopeWanted::Prefer(wanted), None, mode).unwrap() {
+        PlanOrBridge::Native(p) => p,
+        PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+    }
+}
+
+/// Task 203 item 2: the mode step comes from the switch that runs. NSIS takes `/S` in both
+/// modes: "Sem janela" whatever the setting; a manifest whose two switches are the same too.
+#[test]
+fn mode_step_comes_from_the_switch_that_runs() {
+    use wingetrs::config::InstallerMode::{Progress, Silent};
+    let sha = "a".repeat(64);
+    let url = "https://h/setup.exe";
+    let nsis = manifest_of("nullsoft", Some("user"), url, &sha, "", "");
+    for mode in [Progress, Silent] {
+        let p = native_in(&nsis, Scope::User, mode);
+        assert!(p.steps().contains(&"Sem janela".to_string()), "{p}");
+        assert!(!p.to_string().contains("Mostra o progresso"), "{p}");
+        assert_eq!(p.command.as_ref().unwrap().args, "/S");
+    }
+    let same = "  InstallerSwitches:\n    Silent: /quiet /x\n    SilentWithProgress: /QUIET  /x\n";
+    let exe = manifest_of("exe", Some("user"), url, &sha, same, "");
+    let p = native_in(&exe, Scope::User, Progress);
+    assert!(p.steps().contains(&"Sem janela".to_string()), "{p}");
+    // Inno and an exe with two different switches keep the progress window.
+    let inno = manifest_of("inno", Some("user"), url, &sha, "", "");
+    let p = native_in(&inno, Scope::User, Progress);
+    assert!(
+        p.steps()
+            .contains(&"Mostra o progresso do instalador".to_string()),
+        "{p}"
+    );
+    assert!(
+        p.command.as_ref().unwrap().args.contains("/SILENT"),
+        "{p:?}"
+    );
+    let two = "  InstallerSwitches:\n    Silent: /q\n    SilentWithProgress: /p\n";
+    let exe = manifest_of("exe", Some("user"), url, &sha, two, "");
+    let p = native_in(&exe, Scope::User, Progress);
+    assert!(
+        p.steps()
+            .contains(&"Mostra o progresso do instalador".to_string()),
+        "{p}"
+    );
+    assert_eq!(p.command.as_ref().unwrap().args, "/p");
+    let p = native_in(&exe, Scope::User, Silent);
+    assert!(p.steps().contains(&"Sem janela".to_string()), "{p}");
+    // Only a progress switch: progress (nothing quieter to run).
+    let only = "  InstallerSwitches:\n    SilentWithProgress: /p\n";
+    let exe = manifest_of("exe", Some("user"), url, &sha, only, "");
+    let p = native_in(&exe, Scope::User, Progress);
+    assert!(
+        p.steps()
+            .contains(&"Mostra o progresso do instalador".to_string()),
+        "{p}"
+    );
+}
+
+/// Task 203 item 3: an MSIX plan has its own steps (the package manager, no window, the
+/// user's scope), numbered in the CLI.
+#[test]
+fn msix_plan_has_steps() {
+    use wingetrs::cli::{output::winget_plan_text, style::with_enabled};
+    let sha = "a".repeat(64);
+    let m = manifest_of("msix", None, "https://h/a.msixbundle", &sha, "", "");
+    let p = native(&m, Scope::User);
+    assert_eq!(
+        p.steps(),
+        vec![
+            "Instala pelo Windows (pacote MSIX), sem janela".to_string(),
+            "Só para este usuário".to_string()
+        ]
+    );
+    assert_eq!(
+        p.steps(),
+        vec![MSIX_STEP.to_string(), MSIX_SCOPE_STEP.to_string()]
+    );
+    let cli = with_enabled(false, || winget_plan_text(&p, true));
+    assert!(
+        cli.contains(
+            "  1. Instala pelo Windows (pacote MSIX), sem janela\n  2. Só para este usuário\n"
+        ),
+        "{cli}"
+    );
+    // An installer with a command line never gets the MSIX steps.
+    let exe = manifest_of("inno", Some("user"), "https://h/setup.exe", &sha, "", "");
+    let steps = native(&exe, Scope::User).steps();
+    assert!(!steps.contains(&MSIX_STEP.to_string()), "{steps:?}");
+    assert!(!steps.contains(&MSIX_SCOPE_STEP.to_string()), "{steps:?}");
+}
+
+/// Task 203 item 7: an installer that asks for UAC by itself (`elevatesSelf`, or
+/// `elevationRequired` with a user scope, which wingetrs does not elevate) warns in the plan.
+#[test]
+fn self_elevating_installer_warns() {
+    use wingetrs::cli::{output::winget_plan_text, style::with_enabled};
+    let sha = "a".repeat(64);
+    let url = "https://h/setup.exe";
+    for req in ["elevatesSelf", "elevationRequired", "ELEVATESSELF"] {
+        let extra = format!("  ElevationRequirement: {req}\n");
+        let m = manifest_of("inno", Some("user"), url, &sha, &extra, "");
+        let p = native(&m, Scope::User);
+        assert_eq!(p.steps()[0], SELF_ADMIN_PROMPT, "{req}");
+        assert_eq!(
+            SELF_ADMIN_PROMPT,
+            "O instalador pode pedir permissão de administrador"
+        );
+        let cli = with_enabled(false, || winget_plan_text(&p, false));
+        assert!(
+            cli.contains("  1. ⚠ O instalador pode pedir permissão de administrador\n"),
+            "{cli}"
+        );
+    }
+    for extra in ["", "  ElevationRequirement: elevationProhibited\n"] {
+        let m = manifest_of("inno", Some("user"), url, &sha, extra, "");
+        let steps = native(&m, Scope::User).steps();
+        assert!(!steps.contains(&SELF_ADMIN_PROMPT.to_string()), "{steps:?}");
+    }
+    // Elevated by wingetrs: its own UAC line, not this one.
+    let extra = "  ElevationRequirement: elevationRequired\n";
+    let m = manifest_of("inno", Some("machine"), url, &sha, extra, "");
+    let steps = native(&m, Scope::Machine).steps();
+    assert_eq!(steps[0], ADMIN_PROMPT, "{steps:?}");
+    assert!(!steps.contains(&SELF_ADMIN_PROMPT.to_string()), "{steps:?}");
+    // MSIX never: the package manager has no UAC of its own.
+    let extra = "  ElevationRequirement: elevatesSelf\n";
+    let m = manifest_of("msix", None, "https://h/a.msix", &sha, extra, "");
+    let steps = native(&m, Scope::User).steps();
+    assert!(!steps.contains(&SELF_ADMIN_PROMPT.to_string()), "{steps:?}");
+}
+
+/// Task 203 item 10: the SHA-256 of the dry run is always in capitals (GPXSee's manifest has
+/// it in lowercase).
+#[test]
+fn dry_run_hash_is_upper_case() {
+    let lower = "da5b3122a4375117fca2607b2a1fc32d165960d36ddd467842f96ced3676ea8c";
+    let m = manifest_of(
+        "nullsoft",
+        Some("user"),
+        "https://h/setup.exe",
+        lower,
+        "",
+        "",
+    );
+    let details = native(&m, Scope::User).dry_run_details();
+    assert!(
+        details.contains(
+            &"SHA-256: DA5B3122A4375117FCA2607B2A1FC32D165960D36DDD467842F96CED3676EA8C"
+                .to_string()
+        ),
+        "{details:?}"
+    );
 }

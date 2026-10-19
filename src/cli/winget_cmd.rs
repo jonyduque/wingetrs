@@ -24,7 +24,9 @@ use crate::winget_install::codes;
 use crate::winget_install::engine::{Engine, UpgradeError, choose_engine, upgrade_scope};
 use crate::winget_install::ops::{InstallReport, WingetOpsError};
 use crate::winget_install::orphans::Orphan;
-use crate::winget_install::plan::{PlanOrBridge, WingetPlan, bridge_reason, name_version};
+use crate::winget_install::plan::{
+    PlanOrBridge, WingetPlan, bridge_reason, bridge_step, name_version,
+};
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::select::{Refusal, Scope, ScopeWanted};
 use crate::winget_install::uninstall::{
@@ -157,13 +159,16 @@ pub(super) fn run_tool(
 /// Prints the package and its license agreements (`--dry-run`: and the command line, then
 /// stops), confirms, and runs it elevated (through `helper`) when the manifest or
 /// `--scope machine` asks for it. Without `--scope`, a `machine` default in Settings becomes
-/// `--scope machine`, dropped once if winget finds no installer for it.
+/// `--scope machine`, dropped once if winget finds no installer for it. `why` is the
+/// planner's reason for the bridge (the plan's first step).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn install_bridge(
     ctx: &OpsCtx<'_>,
     helper: &ElevatedBridge,
     ui: &dyn Ui,
     cand: &Candidate,
     scope: Option<ScopeArg>,
+    why: Option<&str>,
     f: Flags,
     stop: Stop<'_, impl Interrupts>,
 ) -> anyhow::Result<()> {
@@ -192,18 +197,23 @@ pub(super) async fn install_bridge(
         agreements,
         scope_fallback,
     } = plan;
-    emit::out(&output::via_winget(&name_version(
-        &job.name,
-        Some(&version),
-    )));
-    if !f.yes || f.dry_run {
-        for line in agreement_lines(&agreements, false) {
-            emit::out(&output::license(&line));
-        }
-    }
-    if f.dry_run {
+    let command = f.dry_run.then(|| {
         let (program, args) = bridge::command(&job, Path::new(""), "");
-        emit::out(&output::dim(&bridge::command_text(&program, &args)));
+        bridge::command_text(&program, &args)
+    });
+    let licenses = if !f.yes || f.dry_run {
+        agreement_lines(&agreements, false)
+    } else {
+        Vec::new()
+    };
+    let text = bridge_text(
+        &name_version(&job.name, Some(&version)),
+        why,
+        &licenses,
+        command.as_deref(),
+    );
+    emit::out(text.trim_end());
+    if f.dry_run {
         emit::out(output::DRY_RUN_DONE);
         return Ok(());
     }
@@ -222,6 +232,25 @@ pub(super) async fn install_bridge(
     run_install_bridge(ctx.progress, ui, stop, job.tool.name(), |on_line| {
         crate::tui::jobs::run_bridge_install(helper, &job, scope_fallback, &msi_lock, exec, on_line)
     })
+}
+
+/// The plan of an install through winget, as shown (Task 203): `<name version> via winget`,
+/// the numbered steps ([`bridge_step`] of the planner's reason `why`, then the `licenses`) and,
+/// only for `--dry-run`, the `command` line.
+pub fn bridge_text(
+    name_version: &str,
+    why: Option<&str>,
+    licenses: &[String],
+    command: Option<&str>,
+) -> String {
+    let steps: Vec<String> = std::iter::once(bridge_step(why))
+        .chain(licenses.iter().cloned())
+        .collect();
+    let details: Vec<String> = command
+        .map(|c| format!("Comando: {c}"))
+        .into_iter()
+        .collect();
+    output::bridge_plan_text(name_version, &steps, &details)
 }
 
 /// The run of a confirmed install through the bridge (`run` is the tool's job, given its line
@@ -272,6 +301,7 @@ pub trait WingetFlows {
         ui: &dyn Ui,
         cand: &Candidate,
         scope: Option<ScopeArg>,
+        why: Option<&str>,
         f: Flags,
         stop: Stop<'_, I>,
     ) -> impl Future<Output = anyhow::Result<()>>;
@@ -479,11 +509,11 @@ pub async fn install<F: WingetFlows>(
         }
     };
     let plan = match engine {
+        // The reason becomes the plan's first step (`Instala pelo winget (zip)`, Task 203).
         Engine::Bridge(why) => {
-            if let Some(why) = why {
-                say(&output::through_winget(false, bridge_reason(&why)));
-            }
-            return flows.install_bridge(ui, cand, scope, f, stop).await;
+            return flows
+                .install_bridge(ui, cand, scope, why.as_deref(), f, stop)
+                .await;
         }
         Engine::Native(plan) => plan,
     };

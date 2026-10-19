@@ -119,6 +119,7 @@ impl WingetFlows for NoWinget {
         _: &dyn Ui,
         _: &Candidate,
         _: Option<ScopeArg>,
+        _: Option<&str>,
         _: Flags,
         _: Stop<'_, I>,
     ) -> anyhow::Result<()> {

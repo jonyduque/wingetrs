@@ -57,24 +57,28 @@ Simulação: nada foi alterado.
   ␛[1m3␛[0m. Mostra o progresso do instalador
   ␛[1m␛[35mInstalador␛[0m: https://h/setup
   ␛[1m␛[35mLinha de comando␛[0m: msiexec.exe /i "<instalador>" /passive /norestart
-  ␛[1m␛[35mSHA-256␛[0m: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  ␛[1m␛[35mSHA-256␛[0m: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 ␛[90mInstalando pelo winget:␛[0m tipo zip
+-- install --dry-run (winget pela ponte)
+␛[1mhyperfine 1.20.0␛[0m ␛[90mvia winget␛[0m
+  ␛[1m1␛[0m. Instala pelo winget (zip)
+  ␛[1m␛[35mComando␛[0m: winget install --id sharkdp.hyperfine
 ␛[1m␛[35mLicença aceita␛[0m: EULA — https://x.invalid/eula
 ␛[33mReinicie o computador para concluir.␛[0m
 -- uninstall (winget, confirmação)
 ␛[1m␛[35mDesinstalar␛[0m ␛[1mKindle 2.0␛[0m
-  ␛[1m1␛[0m. Roda o desinstalador registrado do app
-  ␛[1m2␛[0m. ␛[33m⚠␛[0m Pede permissão de administrador (UAC)
-  ␛[1m3␛[0m. Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
-  ␛[1m4␛[0m. Pasta compartilhada: C:\Users\u\Documents\My Kindle Content
-  ␛[1m5␛[0m. Também é possível remover só o registro desta instalação
+  ␛[1m1␛[0m. ␛[33m⚠␛[0m Pede permissão de administrador (UAC)
+  ␛[1m2␛[0m. Roda o desinstalador registrado do app
+  ␛[33m⚠␛[0m ␛[33mOutra instalação de Kindle usa as mesmas pastas: copie antes de remover.␛[0m
+  ␛[33m⚠␛[0m ␛[33mPasta compartilhada: C:\Users\u\Documents\My Kindle Content␛[0m
+  ␛[33m⚠␛[0m ␛[33mTambém é possível remover só o registro desta instalação␛[0m
 -- uninstall --dry-run (winget)
 ␛[1m␛[35mDesinstalar␛[0m ␛[1mKindle 2.0␛[0m
-  ␛[1m1␛[0m. Roda o desinstalador registrado do app
-  ␛[1m2␛[0m. ␛[33m⚠␛[0m Pede permissão de administrador (UAC)
-  ␛[1m3␛[0m. Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
-  ␛[1m4␛[0m. Pasta compartilhada: C:\Users\u\Documents\My Kindle Content
-  ␛[1m5␛[0m. Também é possível remover só o registro desta instalação
+  ␛[1m1␛[0m. ␛[33m⚠␛[0m Pede permissão de administrador (UAC)
+  ␛[1m2␛[0m. Roda o desinstalador registrado do app
+  ␛[33m⚠␛[0m ␛[33mOutra instalação de Kindle usa as mesmas pastas: copie antes de remover.␛[0m
+  ␛[33m⚠␛[0m ␛[33mPasta compartilhada: C:\Users\u\Documents\My Kindle Content␛[0m
+  ␛[33m⚠␛[0m ␛[33mTambém é possível remover só o registro desta instalação␛[0m
   ␛[1m␛[35mComando␛[0m: C:\K\uninst.exe /S
 ␛[32m✓␛[0m Pastas copiadas para ␛[3m␛[36mC:\B\kindle␛[0m
 ␛[32m✓ Removido:␛[0m registro de ␛[1mApp A␛[0m (cópia em ␛[3m␛[36mC:\B\a.reg␛[0m)

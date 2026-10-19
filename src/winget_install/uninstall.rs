@@ -125,9 +125,13 @@ impl UninstallPlan {
     }
 
     /// What the user must consider before saying yes, one capitalized line each. The CLI
-    /// numbers them and the TUI lists them: both read this list.
+    /// numbers them and the TUI lists them: both read this list. The UAC comes first, as in
+    /// the install plan.
     pub fn steps(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if self.elevation == Elevation::Helper {
+            out.push(UNINSTALL_ADMIN_PROMPT.to_string());
+        }
         match (&self.target, &self.command) {
             (UninstallTarget::Msix { family }, _) => {
                 out.push(format!("Remove o pacote MSIX {family} (só deste usuário)"));
@@ -146,9 +150,13 @@ impl UninstallPlan {
                 out.push("Sem comando de desinstalação registrado".into());
             }
         }
-        if self.elevation == Elevation::Helper {
-            out.push(UNINSTALL_ADMIN_PROMPT.to_string());
-        }
+        out
+    }
+
+    /// The shared-data warning (spec D6), apart from the steps (Task 203): the CLI prints it
+    /// as its own warning block and the TUI lists it after the steps.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
         if let Some(s) = &self.shared {
             out.push(format!(
                 "Outra instalação de {} usa as mesmas pastas: copie antes de remover.",
@@ -185,22 +193,30 @@ impl UninstallPlan {
     }
 }
 
-/// The title, then one step per line (what the TUI confirmation lists; no command line).
+/// The title, then one step per line and the warnings (what the TUI confirmation lists; no
+/// command line).
 impl fmt::Display for UninstallPlan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.title())?;
-        for step in self.steps() {
+        for step in self.steps().into_iter().chain(self.warnings()) {
             write!(f, "\n{step}")?;
         }
         Ok(())
     }
 }
 
-/// Whether a registered uninstaller program is `winget` (by name, any case, quoted or not).
+/// Whether a registered uninstaller program is `winget` (by name, any case, quoted or not),
+/// also when the registry wrote the whole line unquoted (`winget uninstall --product-code
+/// <id>`, which `split_command` keeps as the program: no `.exe` in it).
 fn is_winget(program: &str) -> bool {
-    Path::new(program.trim().trim_matches('"'))
-        .file_stem()
-        .is_some_and(|s| s.eq_ignore_ascii_case("winget"))
+    let p = program.trim();
+    let stem_is_winget = |s: &str| {
+        Path::new(s.trim_matches('"'))
+            .file_stem()
+            .is_some_and(|s| s.eq_ignore_ascii_case("winget"))
+    };
+    stem_is_winget(p)
+        || (!p.starts_with('"') && p.split_whitespace().next().is_some_and(stem_is_winget))
 }
 
 fn non_blank(s: &Option<String>) -> Option<&str> {

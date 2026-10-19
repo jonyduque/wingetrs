@@ -21,6 +21,13 @@ pub const RUN_FOLDER_NOTE: &str = "Roda numa pasta temporária do wingetrs";
 /// The same line for msi/wix: the UAC prompt names the Windows Installer (`msiexec`), not the
 /// package's publisher; the verified file stays held until it ends, so it is the one that runs.
 pub const ADMIN_PROMPT_MSI: &str = "Pede permissão de administrador para o Windows Installer";
+/// Plan line of an installer that is not elevated by wingetrs but may ask for its own UAC
+/// (`ElevationRequirement: elevatesSelf`, or `elevationRequired` with a user scope).
+pub const SELF_ADMIN_PROMPT: &str = "O instalador pode pedir permissão de administrador";
+/// Plan line of an MSIX package: deployed by the Windows package manager, no installer window.
+pub const MSIX_STEP: &str = "Instala pelo Windows (pacote MSIX), sem janela";
+/// Plan line of an MSIX package: deployed for the current user only (no provisioning).
+pub const MSIX_SCOPE_STEP: &str = "Só para este usuário";
 /// Plan line of an upgrade that removes the installed version first.
 pub const UNINSTALL_FIRST_NOTE: &str = "Remove a versão instalada antes (o desinstalador pode abrir janela ou pedir permissão de administrador)";
 
@@ -310,6 +317,8 @@ impl WingetPlan {
                 _ => ADMIN_PROMPT.to_string(),
             });
             out.push(RUN_FOLDER_NOTE.to_string());
+        } else if self.command.is_some() && self.elevates_itself() {
+            out.push(SELF_ADMIN_PROMPT.to_string());
         }
         if self.interactive {
             out.push("Abre a janela do instalador (sem modo silencioso)".to_string());
@@ -319,6 +328,9 @@ impl WingetPlan {
                 Mode::Silent => out.push("Sem janela".into()),
                 Mode::Interactive => {}
             }
+        } else {
+            out.push(MSIX_STEP.to_string());
+            out.push(MSIX_SCOPE_STEP.to_string());
         }
         if self.upgrade_from.is_some()
             && super::engine::upgrade_route(&self.installer)
@@ -362,8 +374,32 @@ impl WingetPlan {
             }
             out.push(line);
         }
-        out.push(format!("SHA-256: {}", self.installer.sha256));
+        out.push(format!(
+            "SHA-256: {}",
+            self.installer.sha256.trim().to_ascii_uppercase()
+        ));
         out
+    }
+
+    /// The manifest says the installer asks for UAC by itself (`elevatesSelf`, or
+    /// `elevationRequired` that wingetrs does not elevate: a user scope).
+    fn elevates_itself(&self) -> bool {
+        self.installer.elevation.as_deref().is_some_and(|r| {
+            r.eq_ignore_ascii_case("elevatesSelf") || r.eq_ignore_ascii_case("elevationRequired")
+        })
+    }
+}
+
+/// The step of an install through winget (Task 203): `Instala pelo winget (zip)`, with the
+/// planner's reason (`why`, as in `PlanOrBridge::Bridge`) without its `tipo ` and its ending.
+pub fn bridge_step(why: Option<&str>) -> String {
+    let why = why
+        .map(|w| bridge_reason(w.trim()))
+        .map(|w| w.strip_prefix("tipo ").unwrap_or(w).trim())
+        .filter(|w| !w.is_empty());
+    match why {
+        Some(w) => format!("Instala pelo winget ({w})"),
+        None => "Instala pelo winget".to_string(),
     }
 }
 

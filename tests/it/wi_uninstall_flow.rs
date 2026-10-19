@@ -1305,3 +1305,76 @@ fn registry_only_hklm_shows_uac_notice_phase() {
     );
     assert_eq!(el.0.count(), 1);
 }
+
+/// Task 203 items 5 and 6: the UAC step comes before the uninstaller (as in the install
+/// plan), and the shared-data warning is a block of its own (⚠), apart from the numbered
+/// steps, in the CLI and after the steps in the TUI text.
+#[test]
+fn removal_plan_uac_first_and_warnings_apart() {
+    use wingetrs::cli::{output::winget_uninstall_text, style::with_enabled};
+    let old = kindle(Hive::MachineX86, "Kindle", "2.8.3");
+    let new = kindle(Hive::User, "Kindle", "2.9.1");
+    let roaming_amazon = format!(r"{ROAMING}\Amazon");
+    let exists = |p: &str| p == roaming_amazon;
+    let mut p = plan_uninstall(&old, true, &[new], false, &known(), &user(), &exists).unwrap();
+    p.shared.as_mut().unwrap().size = Some(FolderSize {
+        bytes: 3 << 20,
+        entries: 7,
+    });
+    assert_eq!(
+        p.steps(),
+        vec![
+            "Pede permissão de administrador (UAC)".to_string(),
+            "Roda o desinstalador registrado do app".to_string()
+        ]
+    );
+    let warnings = p.warnings();
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    assert_eq!(
+        warnings[0],
+        "Outra instalação de Amazon Kindle usa as mesmas pastas: copie antes de remover."
+    );
+    assert_eq!(
+        warnings[1],
+        format!("Pasta compartilhada: {roaming_amazon}")
+    );
+    assert_eq!(warnings[2], "Tamanho da cópia: 3,0 MiB em 7 itens");
+    assert!(
+        warnings[3].starts_with("Remover só o registro não está disponível"),
+        "{warnings:?}"
+    );
+    let cli = with_enabled(false, || winget_uninstall_text(&p, true));
+    let lines: Vec<&str> = cli.lines().collect();
+    assert_eq!(lines[0], "Desinstalar Amazon Kindle 2.8.3", "{cli}");
+    assert_eq!(
+        lines[1], "  1. ⚠ Pede permissão de administrador (UAC)",
+        "{cli}"
+    );
+    assert_eq!(
+        lines[2], "  2. Roda o desinstalador registrado do app",
+        "{cli}"
+    );
+    for (i, w) in warnings.iter().enumerate() {
+        assert_eq!(lines[3 + i], format!("  ⚠ {w}"), "{cli}");
+    }
+    assert!(lines[7].starts_with("  Comando: "), "{cli}");
+    assert_eq!(lines.len(), 8, "{cli}");
+    // The TUI text: the steps, then the warnings.
+    let tui: Vec<String> = p.to_string().lines().map(str::to_string).collect();
+    let mut want = vec![p.title()];
+    want.extend(p.steps());
+    want.extend(warnings);
+    assert_eq!(tui, want);
+
+    // A removal without UAC and without another installation: no warning block.
+    let mut d = details(Hive::User, "App");
+    d.uninstall_string = Some(r#""C:\Users\t\AppData\Local\App\u.exe""#.to_string());
+    let p = plan(&d);
+    assert!(p.warnings().is_empty());
+    assert_eq!(
+        p.steps(),
+        vec!["Abre a janela do desinstalador".to_string()]
+    );
+    let cli = with_enabled(false, || winget_uninstall_text(&p, false));
+    assert!(!cli.contains('⚠'), "{cli}");
+}

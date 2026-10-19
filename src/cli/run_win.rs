@@ -206,10 +206,11 @@ impl WingetFlows for ProdFlows<'_, '_> {
         ui: &dyn Ui,
         cand: &Candidate,
         scope: Option<ScopeArg>,
+        why: Option<&str>,
         f: Flags,
         stop: Stop<'_, I>,
     ) -> anyhow::Result<()> {
-        winget_cmd::install_bridge(self.ctx, &self.helper.0, ui, cand, scope, f, stop).await
+        winget_cmd::install_bridge(self.ctx, &self.helper.0, ui, cand, scope, why, f, stop).await
     }
 
     fn installed(&self) -> anyhow::Result<Vec<ListRow>> {

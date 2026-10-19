@@ -1143,7 +1143,9 @@ fn tui_confirmation_and_cli_uninstall_list_the_same_steps() {
         interactive: false,
     });
     plan.elevation = Elevation::Helper;
-    assert!(plan.steps().len() >= 3, "{:?}", plan.steps());
+    // Task 203: the shared-data lines left the steps for their own warning block.
+    assert!(plan.steps().len() >= 2, "{:?}", plan.steps());
+    assert!(plan.warnings().len() >= 2, "{:?}", plan.warnings());
     let mut a = on_installed(vec![kindle_row()]);
     update(&mut a, key(KeyCode::Enter));
     pick(&mut a, "Remover o registro HKLM (32 bits)");
@@ -1160,6 +1162,24 @@ fn tui_confirmation_and_cli_uninstall_list_the_same_steps() {
         .cloned()
         .collect();
     assert_eq!(tui_steps, plan.steps(), "{tui:?}");
+    // The warnings: the same lines in both, after the steps (the CLI with the glyph).
+    let cli_warnings: Vec<String> = cli
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("⚠ "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(cli_warnings, plan.warnings(), "{cli}");
+    let tui_warnings: Vec<String> = tui
+        .iter()
+        .filter(|n| plan.warnings().contains(n))
+        .cloned()
+        .collect();
+    assert_eq!(tui_warnings, plan.warnings(), "{tui:?}");
+    let at = |text: &str| tui.iter().position(|n| n == text);
+    assert!(
+        at(plan.steps().last().unwrap()) < at(&plan.warnings()[0]),
+        "{tui:?}"
+    );
     let command = plan.command.as_ref().unwrap();
     for text in [cli.as_str(), &tui.join("\n")] {
         assert!(!text.contains(&command.args), "{text}");

@@ -128,6 +128,8 @@ struct Fake {
     installs: Arc<AtomicUsize>,
     install_hook: Option<InstallHook>,
     bridged: Cell<usize>,
+    /// The planner's reason each install through winget received.
+    bridge_whys: RefCell<Vec<Option<String>>>,
     planned_targets: RefCell<Vec<UninstallTarget>>,
     uninstalled: Arc<Mutex<Vec<UninstallTarget>>>,
     removed: RefCell<Vec<String>>,
@@ -206,10 +208,12 @@ impl WingetFlows for Fake {
         ui: &dyn Ui,
         cand: &Candidate,
         _: Option<ScopeArg>,
+        why: Option<&str>,
         _: Flags,
         stop: Stop<'_, I>,
     ) -> anyhow::Result<()> {
         self.bridged.set(self.bridged.get() + 1);
+        self.bridge_whys.borrow_mut().push(why.map(str::to_string));
         let progress = self.progress();
         winget_cmd::run_install_bridge(&*progress, ui, stop, "winget", |on_line| {
             on_line(wingetrs::install::progress::ELEVATION_NOTICE);
@@ -616,7 +620,12 @@ async fn bridge_reason_is_printed() {
     .await
     .unwrap();
     let text = out.join("\n");
-    assert!(text.contains("Instalando pelo winget: tipo zip"), "{text}");
+    // Task 203: the reason becomes the bridge plan's first step, never `Instalando…` before.
+    assert!(!text.contains("Instalando"), "{text}");
+    assert_eq!(
+        *fake.bridge_whys.borrow(),
+        vec![Some("tipo zip: instalado pelo winget".to_string())]
+    );
     assert_eq!(fake.bridged.get(), 1);
     assert_eq!(fake.installs.load(Ordering::SeqCst), 0);
 }
@@ -1447,7 +1456,7 @@ async fn winget_dry_run_shows_url_and_sha256() {
     let text = out.join("\n");
     assert!(text.contains("https://h/setup.exe"), "{text}");
     assert!(
-        text.contains(&format!("SHA-256: {}", "a".repeat(64))),
+        text.contains(&format!("SHA-256: {}", "A".repeat(64))),
         "{text}"
     );
     assert_eq!(fake.installs.load(Ordering::SeqCst), 0);
@@ -2109,4 +2118,105 @@ async fn bridge_install_progress_and_stdout() {
     assert!(!outputs.iter().any(|l| l.contains(ELEVATION_NOTICE)));
     assert!(ui.notices.borrow().is_empty(), "{:?}", ui.notices.borrow());
     assert!(ui.ended.get() >= 1);
+}
+
+/// Task 203 item 1: jq's real ARP line is `winget uninstall --product-code <id>`, unquoted and
+/// without `.exe`, so the whole line is the program: still winget, never "Abre a janela".
+#[test]
+fn product_code_line_is_removed_by_winget() {
+    let arp = |line: &str| ArpDetails {
+        hive: Hive::User,
+        key: "jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe".into(),
+        display_name: Some("jq".into()),
+        publisher: None,
+        display_version: Some("1.8.2".into()),
+        windows_installer: false,
+        system_component: false,
+        quiet_uninstall_string: None,
+        uninstall_string: Some(line.into()),
+        inno_app_path: None,
+        bundle_cache_path: None,
+        bundle_upgrade_code: None,
+        install_location: None,
+    };
+    let plan_of = |line: &str| {
+        let d = arp(line);
+        UninstallPlan {
+            target: UninstallTarget::Arp {
+                hive: Hive::User,
+                key: d.key.clone(),
+            },
+            name: "jq".into(),
+            version: Some("1.8.2".into()),
+            command: wingetrs::winget_install::uninstall_cmd::uninstall_command(&d, false),
+            elevation: Elevation::Never,
+            shared: None,
+        }
+    };
+    for line in [
+        "winget uninstall --product-code jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe",
+        "WINGET.EXE uninstall --product-code jqlang.jq_Microsoft.Winget.Source_8wekyb3d8bbwe",
+    ] {
+        let steps = plan_of(line).steps();
+        assert_eq!(
+            steps,
+            vec!["Remove pelo winget (pode mostrar o progresso dele)".to_string()],
+            "{line}"
+        );
+    }
+    // A program that only starts like winget is the app's own uninstaller.
+    for line in [
+        "wingetx uninstall --all",
+        r"C:\Program Files\winget tools\x.exe /u",
+    ] {
+        assert_eq!(
+            plan_of(line).steps(),
+            vec!["Abre a janela do desinstalador".to_string()],
+            "{line}"
+        );
+    }
+}
+
+/// Task 203 item 4: the install through winget is a plan, with its numbered steps, and the
+/// command only in the dry run; never `Instalando…`.
+#[test]
+fn bridge_plan_has_numbered_steps() {
+    use wingetrs::cli::style::with_enabled;
+    let licenses = vec!["Licença: EULA — https://x/eula".to_string()];
+    let cmd = "winget install --id sharkdp.hyperfine --exact";
+    let dry = with_enabled(false, || {
+        winget_cmd::bridge_text(
+            "hyperfine 1.20.0",
+            Some("tipo zip: instalado pelo winget"),
+            &licenses,
+            Some(cmd),
+        )
+    });
+    assert_eq!(
+        dry,
+        "hyperfine 1.20.0 via winget\n  1. Instala pelo winget (zip)\n  2. Licença: EULA — https://x/eula\n  Comando: winget install --id sharkdp.hyperfine --exact\n"
+    );
+    let confirm = with_enabled(false, || {
+        winget_cmd::bridge_text(
+            "hyperfine 1.20.0",
+            Some("tem dependências: instalado pelo winget"),
+            &[],
+            None,
+        )
+    });
+    assert_eq!(
+        confirm,
+        "hyperfine 1.20.0 via winget\n  1. Instala pelo winget (tem dependências)\n"
+    );
+    // The `winget` engine gives no reason.
+    let plain = with_enabled(false, || {
+        winget_cmd::bridge_text("hyperfine 1.20.0", None, &[], None)
+    });
+    assert_eq!(
+        plain,
+        "hyperfine 1.20.0 via winget\n  1. Instala pelo winget\n"
+    );
+    for text in [&dry, &confirm, &plain] {
+        assert!(!text.contains("Instalando"), "{text}");
+    }
 }

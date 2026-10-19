@@ -804,15 +804,27 @@ pub fn license(line: &str) -> String {
 
 /// The steps that ask for the administrator's permission (they get the warning glyph).
 fn asks_admin(step: &str) -> bool {
-    use crate::winget_install::plan::{ADMIN_PROMPT, ADMIN_PROMPT_MSI};
+    use crate::winget_install::plan::{ADMIN_PROMPT, ADMIN_PROMPT_MSI, SELF_ADMIN_PROMPT};
     use crate::winget_install::uninstall::UNINSTALL_ADMIN_PROMPT;
-    [ADMIN_PROMPT, ADMIN_PROMPT_MSI, UNINSTALL_ADMIN_PROMPT].contains(&step)
+    [
+        ADMIN_PROMPT,
+        ADMIN_PROMPT_MSI,
+        SELF_ADMIN_PROMPT,
+        UNINSTALL_ADMIN_PROMPT,
+    ]
+    .contains(&step)
 }
 
 /// A plan in the shape of the Scoop one: the title, every step numbered (number in bold, the
 /// UAC steps with the warning glyph, licenses labeled) and, only for `--dry-run`, the details
-/// (URL, command line, hash).
-fn numbered_plan(title: String, steps: &[String], details: &[String]) -> String {
+/// (URL, command line, hash). `warnings` follow the steps as their own block, each with the
+/// warning glyph and unnumbered (Task 203).
+fn numbered_plan(
+    title: String,
+    steps: &[String],
+    warnings: &[String],
+    details: &[String],
+) -> String {
     let mut s = title;
     s.push('\n');
     let width = steps.len().to_string().len();
@@ -826,6 +838,13 @@ fn numbered_plan(title: String, steps: &[String], details: &[String]) -> String 
             step.clone()
         };
         s.push_str(&format!("  {n}. {text}\n"));
+    }
+    for line in warnings {
+        s.push_str(&format!(
+            "  {} {}\n",
+            paint(WARN, style::glyphs().toast_warn),
+            paint(WARN, line)
+        ));
     }
     for line in details {
         s.push_str(&format!("  {}\n", labeled(line)));
@@ -846,7 +865,14 @@ pub fn winget_plan_text(plan: &crate::winget_install::plan::WingetPlan, dry_run:
     } else {
         Vec::new()
     };
-    numbered_plan(title, &plan.steps(), &details)
+    numbered_plan(title, &plan.steps(), &[], &details)
+}
+
+/// The install of a winget package through winget, in the shape of the native plan (Task
+/// 203): `<name version> via winget`, then the numbered `steps` (`Instala pelo winget (zip)`,
+/// licenses) and, only for `--dry-run`, `details` (the command line).
+pub fn bridge_plan_text(name_version: &str, steps: &[String], details: &[String]) -> String {
+    numbered_plan(via_winget(name_version), steps, &[], details)
 }
 
 /// The removal of an app of the Windows list (ARP/MSIX): `Desinstalar` as a header and the
@@ -865,8 +891,9 @@ pub fn winget_uninstall_text(
     } else {
         Vec::new()
     };
-    numbered_plan(title, &plan.steps(), &details)
+    numbered_plan(title, &plan.steps(), &plan.warnings(), &details)
 }
+
 /// The engine chose `winget` for this package: `Instalando pelo winget: <why>`.
 pub fn through_winget(upgrade: bool, why: &str) -> String {
     let verb = if upgrade {

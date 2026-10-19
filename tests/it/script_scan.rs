@@ -1525,3 +1525,49 @@ fn junction_out_of_base_stays_unresolved() {
         assert_eq!((r.verdict, called.len()), (Verdict::Confirm, 1), "{s}");
     }
 }
+
+/// Task 203 item 8: the same reason on two lines (`-Global` twice, as in python's
+/// `uninstaller.script`) is one flag, on its first line; other reasons stay. The same holds
+/// for a called file run from two lines (its reasons join the caller's once).
+#[test]
+fn same_reason_on_two_lines_is_one_flag() {
+    let script = [
+        r#"Get-Thing -Path "$dir\a""#,
+        r#"Add-Path -Path "$dir\bin" -Global"#,
+        r#"Remove-Path -Path "$dir\bin" -Global"#,
+        r#"Start-Process "$dir\x.exe" -Verb RunAs"#,
+    ]
+    .join("\n");
+    let script = script.as_str();
+    let r = scan(script, SUP);
+    let global: Vec<usize> = r
+        .flags
+        .iter()
+        .filter(|f| f.kind == FlagKind::GlobalSwitch)
+        .map(|f| f.line)
+        .collect();
+    assert_eq!(global, vec![2], "{:?}", r.flags);
+    assert!(has(&r, FlagKind::Elevation), "{:?}", kinds(&r));
+    let details: Vec<&str> = r.flags.iter().map(|f| f.detail.as_str()).collect();
+    let unique: BTreeSet<&str> = details.iter().copied().collect();
+    assert_eq!(details.len(), unique.len(), "{details:?}");
+
+    let t = bucket_root(
+        "foo.ps1",
+        r"Set-ItemProperty 'HKLM:\Software\X' -Name a -Value 1",
+        true,
+    );
+    let roots = CallRoots::new(t.path(), None);
+    let call = r#". "$bucketsdir\extras\scripts\foo.ps1""#;
+    let hook = format!("ensure 'x'\n{call}\n{call}\n");
+    let hook = hook.as_str();
+    let (r, _) = scan_called(hook, SUP, &roots);
+    let hklm: Vec<usize> = r
+        .flags
+        .iter()
+        .filter(|f| f.kind == FlagKind::Hklm)
+        .map(|f| f.line)
+        .collect();
+    assert_eq!(hklm, vec![2], "{:?}", r.flags);
+    assert_eq!(r.verdict, Verdict::Refuse);
+}

@@ -264,8 +264,9 @@ fn inno_names(v: &str) -> bool {
 const BURN_FLAGS: [&str; 3] = ["quiet", "passive", "norestart"];
 
 /// Burn bundle variables the helper passes, each an exact literal (any case): the whole
-/// `Name=value` token, never a free value (Python's machine scope, `InstallAllUsers=1`).
-const BURN_PROPERTIES: [&str; 1] = ["installallusers=1"];
+/// `Name=value` token, never a free value (Python's machine scope, `InstallAllUsers=1`, and
+/// its `PrependPath=1`/`PrependPath=0`, Task 203).
+const BURN_PROPERTIES: [&str; 3] = ["installallusers=1", "prependpath=1", "prependpath=0"];
 
 /// `v` is the log placeholder, bare or quoted (it becomes a file in the execution folder).
 fn is_log(v: &str) -> bool {

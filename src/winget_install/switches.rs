@@ -78,7 +78,27 @@ pub fn mode_for(kind: &InstallerKind, sw: &InstallerSwitches, setting: Installer
     if setting == InstallerMode::Progress
         && (has_defaults || present(&sw.silent_with_progress).is_some())
     {
-        Mode::SilentWithProgress
+        // The mode is the switch that runs (Task 203): NSIS takes `/S` in both modes, so its
+        // "progress" mode is the silent one.
+        let same = |a: Option<&str>, b: Option<&str>| {
+            let norm = |s: Option<&str>| {
+                s.map(|s| {
+                    s.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .to_lowercase()
+                })
+            };
+            norm(a) == norm(b)
+        };
+        if same(
+            mode_switch(kind, sw, Mode::SilentWithProgress),
+            mode_switch(kind, sw, Mode::Silent),
+        ) {
+            Mode::Silent
+        } else {
+            Mode::SilentWithProgress
+        }
     } else if has_defaults || present(&sw.silent).is_some() {
         Mode::Silent
     } else if present(&sw.silent_with_progress).is_some() {
@@ -110,6 +130,16 @@ pub fn install_args_unlogged(
     args_with(kind, sw, mode, upgrade, false)
 }
 
+/// The switch of `mode`: the manifest's, or the kind's default.
+fn mode_switch<'a>(kind: &InstallerKind, sw: &'a InstallerSwitches, mode: Mode) -> Option<&'a str> {
+    let def = defaults(kind);
+    match mode {
+        Mode::Silent => present(&sw.silent).or(def.map(|d| d.0)),
+        Mode::SilentWithProgress => present(&sw.silent_with_progress).or(def.map(|d| d.1)),
+        Mode::Interactive => present(&sw.interactive),
+    }
+}
+
 fn args_with(
     kind: &InstallerKind,
     sw: &InstallerSwitches,
@@ -121,11 +151,7 @@ fn args_with(
         return Err(ArgsError::NoCommandLine);
     }
     let def = defaults(kind);
-    let mode_part = match mode {
-        Mode::Silent => present(&sw.silent).or(def.map(|d| d.0)),
-        Mode::SilentWithProgress => present(&sw.silent_with_progress).or(def.map(|d| d.1)),
-        Mode::Interactive => present(&sw.interactive),
-    };
+    let mode_part = mode_switch(kind, sw, mode);
     let log = present(&sw.log)
         .or(def.and_then(|d| d.2))
         .filter(|_| with_log);

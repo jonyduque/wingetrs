@@ -643,6 +643,7 @@ fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, St
     }
 
     flags.sort_by_key(|f| f.line);
+    dedupe_reasons(&mut flags);
     #[rustfmt::skip]
     let verdict = flags.iter().map(|f| f.verdict).max().unwrap_or(Verdict::Confirm);
     let report = ScriptReport {
@@ -652,6 +653,20 @@ fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, St
         verdict,
     };
     (report, calls)
+}
+
+/// Drops a flag whose kind, verdict and reason an earlier one already has (Task 203: `-Global`
+/// on two lines is one reason); `flags` is sorted by line, so the first line stays.
+fn dedupe_reasons(flags: &mut Vec<Flag>) {
+    let mut seen: Vec<(FlagKind, Verdict, String)> = Vec::new();
+    flags.retain(|f| {
+        let key = (f.kind, f.verdict, f.detail.clone());
+        let new = !seen.contains(&key);
+        if new {
+            seen.push(key);
+        }
+        new
+    });
 }
 
 /// The line rules matched by one (lowercase, backtick-free) line.
@@ -994,6 +1009,7 @@ fn scan_called_at(
         }
     }
     report.flags.sort_by_key(|f| f.line);
+    dedupe_reasons(&mut report.flags);
     report.verdict = report
         .flags
         .iter()

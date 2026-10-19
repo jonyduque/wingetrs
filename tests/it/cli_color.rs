@@ -484,6 +484,12 @@ fn snapshots_tty_color_and_plain() {
         s.push_str(&output::winget_plan_text(&winget_plan, true));
         s.push_str(&output::through_winget(false, "tipo zip"));
         s.push('\n');
+        s.push_str("-- install --dry-run (winget pela ponte)\n");
+        s.push_str(&output::bridge_plan_text(
+            "hyperfine 1.20.0",
+            &["Instala pelo winget (zip)".to_string()],
+            &["Comando: winget install --id sharkdp.hyperfine".to_string()],
+        ));
         s.push_str(&output::license(
             "Licença aceita: EULA — https://x.invalid/eula",
         ));

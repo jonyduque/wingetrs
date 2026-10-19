@@ -376,11 +376,41 @@ fn norestart_and_install_all_users_pass_as_exact_literals() {
         (Burn, "/quiet InstallAllUsers=0"),
         (Burn, "/quiet InstallAllUsers=1x"),
         (Burn, r"/quiet TargetDir=C:\x"),
-        (Burn, "/quiet PrependPath=1"),
+        (Burn, "/quiet PrependPath=2"),
         (Inno, "/VERYSILENT InstallAllUsers=1"),
         // `<LOGPATH>` only as a whole value, never inside other text.
         (Exe, "/out=x<LOGPATH>"),
         (Exe, r#"/out="<LOGPATH>x""#),
+    ] {
+        assert!(
+            !exe_params_allowed(kind, params, &roots()),
+            "{kind:?} {params}"
+        );
+    }
+}
+
+/// Task 203 item 9: Burn's `PrependPath=1` and `PrependPath=0` (Python, machine scope) pass
+/// as exact literals, like `InstallAllUsers=1`; no prefix nor other value does.
+#[test]
+fn prepend_path_passes_as_exact_literals() {
+    for params in [
+        "/quiet InstallAllUsers=1 PrependPath=1",
+        "/passive PrependPath=0",
+        "/quiet prependpath=1",
+        "/quiet PREPENDPATH=0 /norestart",
+    ] {
+        assert!(exe_params_allowed(Burn, params, &roots()), "{params}");
+    }
+    for (kind, params) in [
+        (Burn, "/quiet PrependPath=2"),
+        (Burn, "/quiet PrependPath=1x"),
+        (Burn, "/quiet PrependPath=10"),
+        (Burn, "/quiet PrependPath="),
+        (Burn, "/quiet PrependPath"),
+        (Burn, "/quiet XPrependPath=1"),
+        (Burn, r"/quiet PrependPath=1\x"),
+        (Inno, "/VERYSILENT PrependPath=1"),
+        (Nullsoft, "/S PrependPath=1"),
     ] {
         assert!(
             !exe_params_allowed(kind, params, &roots()),
