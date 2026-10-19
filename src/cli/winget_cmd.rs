@@ -4,7 +4,8 @@
 //! `run_win::ProdFlows`), every prompt through `Ui`, every printed line through a `Say`.
 use super::install_cmd::{Cancelled, Flags, Interrupts, Stop, Ui, proceed, uncancellable};
 use super::style;
-use crate::bridge::elevated::{ElevatedBridge, SystemTransport};
+use crate::bridge::elevated::{ElevatedBridge, SystemTransport, Transport};
+use crate::bridge::helper_folder::NoticeTransport;
 use crate::bridge::worker::ScopeArg;
 use crate::bridge::{self, BridgeExec, BridgeJob};
 use crate::cache::BlobStore;
@@ -86,10 +87,38 @@ impl HelperShutdown {
             tracing::warn!(error = %e, "bridge: own executable unknown; elevated helper unavailable");
             PathBuf::new()
         });
+        HelperShutdown::with_transport(Box::new(SystemTransport::new(exe)))
+    }
+
+    /// The helper started through `inner`; the folder refusal is printed once (`helper_notice`).
+    pub fn with_transport(inner: Box<dyn Transport>) -> HelperShutdown {
+        let notice = Box::new(|text: &str| anstream::println!("{}", helper_notice(text)));
         HelperShutdown(Arc::new(ElevatedBridge::new(Box::new(
-            SystemTransport::new(exe),
+            NoticeTransport::new(inner, notice),
         ))))
     }
+}
+
+/// The CLI's native install plan of `manifest` for `host`, with the `installer_mode` setting
+/// of `behavior` (the TUI's is `tui::run::native_install_on`; a test compares them).
+pub fn install_plan(
+    manifest: &crate::sources::winget::manifest::MergedManifest,
+    host: &crate::winget_install::select::Host,
+    wanted: ScopeWanted,
+    behavior: &Behavior,
+) -> Result<PlanOrBridge, Refusal> {
+    crate::winget_install::plan::plan_with_mode(
+        manifest,
+        host,
+        wanted,
+        None,
+        behavior.installer_mode,
+    )
+}
+
+/// The CLI line of a refused helper start (`helper_folder::refusal_text`, as the TUI shows it).
+pub fn helper_notice(text: &str) -> String {
+    style::paint(style::WARN, text)
 }
 
 impl Drop for HelperShutdown {

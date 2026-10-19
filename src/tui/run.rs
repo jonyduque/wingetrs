@@ -152,6 +152,38 @@ fn helper_exe() -> std::path::PathBuf {
     })
 }
 
+/// The folder refusal of the elevated helper (`bridge::helper_folder`), waiting for the event
+/// loop to show it; told once per session, the same text the CLI prints.
+#[derive(Clone, Default)]
+pub struct HelperNotice(Arc<std::sync::Mutex<Option<String>>>);
+
+impl HelperNotice {
+    /// `inner` with its folder refusal kept here (the first time only) and `wake` called so the
+    /// loop shows it.
+    pub fn transport(
+        &self,
+        inner: Box<dyn crate::bridge::elevated::Transport>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> crate::bridge::helper_folder::NoticeTransport {
+        let slot = self.clone();
+        crate::bridge::helper_folder::NoticeTransport::new(
+            inner,
+            Box::new(move |text: &str| {
+                *slot.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(text.to_string());
+                wake();
+            }),
+        )
+    }
+
+    /// Shows the waiting refusal, if any, as an error toast (it stays until `Esc`).
+    pub fn show(&self, app: &mut App) {
+        let text = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(text) = text {
+            app.push_toast(crate::tui::app::ToastKind::Error, text);
+        }
+    }
+}
+
 /// How long the TUI waits at exit for the elevated helper to quit.
 const HELPER_EXIT_LIMIT: Duration = Duration::from_secs(5);
 
@@ -268,6 +300,14 @@ async fn event_loop(
     app.pwsh.clone_from(&pwsh);
     app.backups_dir = data.install_layout().backups();
     let (tx, mut rx) = unbounded_channel::<Msg>();
+    let helper_notice = HelperNotice::default();
+    let wake = tx.clone();
+    let transport = helper_notice.transport(
+        Box::new(crate::bridge::elevated::SystemTransport::new(helper_exe())),
+        move || {
+            let _ = wake.send(Msg::Clock);
+        },
+    );
     let ctx = Arc::new(Ctx {
         data,
         cfg,
@@ -282,9 +322,7 @@ async fn event_loop(
         icon_picker: std::sync::Mutex::new(crate::tui::icons::picker(app.icon_protocol)),
         scoop_root,
         pwsh,
-        elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(
-            crate::bridge::elevated::SystemTransport::new(helper_exe()),
-        )),
+        elevated: crate::bridge::elevated::ElevatedBridge::new(Box::new(transport)),
         winget_gate: std::sync::Mutex::new(None),
     });
     let _helper = HelperShutdown(Arc::clone(&ctx));
@@ -351,6 +389,7 @@ async fn event_loop(
             })
             .collect();
         let cmds = clock_turn(&mut app, Instant::now(), batch);
+        helper_notice.show(&mut app);
         if app.icon_protocol != protocol_now {
             // The Ícones setting changed: encode with the new protocol from here on.
             protocol_now = app.icon_protocol;
@@ -1303,8 +1342,9 @@ async fn plan_native_install(
     id: &str,
 ) -> anyhow::Result<crate::winget_install::plan::PlanOrBridge> {
     let manifest = winget_manifest(ctx, id).await?;
-    let wanted = install_scope(current_behavior(ctx).default_scope);
-    native_install(&manifest, wanted).map_err(anyhow::Error::msg)
+    let behavior = current_behavior(ctx);
+    let wanted = install_scope(behavior.default_scope);
+    native_install(&manifest, wanted, behavior.installer_mode).map_err(anyhow::Error::msg)
 }
 
 /// The merged manifest of the catalog version of winget package `id`.
@@ -1334,15 +1374,29 @@ async fn winget_manifest(
 fn native_install(
     manifest: &crate::sources::winget::manifest::MergedManifest,
     wanted: crate::winget_install::select::ScopeWanted,
+    installer_mode: crate::config::InstallerMode,
 ) -> Result<crate::winget_install::plan::PlanOrBridge, String> {
     let host = crate::winget_install::host_win::current();
-    crate::winget_install::plan::plan(manifest, &host, wanted, None).map_err(|e| e.0)
+    native_install_on(manifest, &host, wanted, installer_mode)
+}
+
+/// The TUI's native install plan for `host` with the `installer_mode` setting (the CLI's is
+/// `cli::winget_cmd::install_plan`; a test compares them).
+pub fn native_install_on(
+    manifest: &crate::sources::winget::manifest::MergedManifest,
+    host: &crate::winget_install::select::Host,
+    wanted: crate::winget_install::select::ScopeWanted,
+    installer_mode: crate::config::InstallerMode,
+) -> Result<crate::winget_install::plan::PlanOrBridge, String> {
+    crate::winget_install::plan::plan_with_mode(manifest, host, wanted, None, installer_mode)
+        .map_err(|e| e.0)
 }
 
 #[cfg(not(windows))]
 fn native_install(
     _manifest: &crate::sources::winget::manifest::MergedManifest,
     _wanted: crate::winget_install::select::ScopeWanted,
+    _installer_mode: crate::config::InstallerMode,
 ) -> Result<crate::winget_install::plan::PlanOrBridge, String> {
     Err("instalar pelo wingetrs só funciona no Windows".to_string())
 }

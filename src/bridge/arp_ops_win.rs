@@ -177,7 +177,7 @@ impl Drop for Local {
 }
 
 /// Owner and DACL of the open `file` as SDDL.
-fn handle_sddl(file: &File) -> io::Result<String> {
+pub fn handle_sddl(file: &File) -> io::Result<String> {
     let info = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: a valid handle owned by `file`; `sd` receives a LocalAlloc descriptor.
@@ -224,8 +224,12 @@ fn not_admin(path: &Path, why: &str) -> io::Error {
     )
 }
 
+/// Reads the owner and DACL of an open object of the chain as SDDL; `handle_sddl` in
+/// production, a fixed descriptor in tests.
+pub type SddlOf<'a> = &'a dyn Fn(&Path, &File) -> io::Result<String>;
+
 /// Opens one object of the chain (never through a reparse point) and checks its security.
-fn open_checked(path: &Path, level: AclLevel) -> io::Result<File> {
+fn open_checked(path: &Path, level: AclLevel, sddl_of: SddlOf<'_>) -> io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     if level == AclLevel::File {
         // No write or delete sharing: nobody can change, rename or delete the file until the
@@ -247,7 +251,7 @@ fn open_checked(path: &Path, level: AclLevel) -> io::Result<File> {
     if (level == AclLevel::File) != meta.is_file() {
         return Err(not_admin(path, "tipo inesperado"));
     }
-    let sddl = handle_sddl(&file)?;
+    let sddl = sddl_of(path, &file)?;
     if !sddl_admin_only(&sddl, level) {
         tracing::warn!(path = %path.display(), sddl, "arp: uninstaller chain not admin-only");
         return Err(not_admin(path, "permissões"));
@@ -258,14 +262,20 @@ fn open_checked(path: &Path, level: AclLevel) -> io::Result<File> {
 /// Opens `program` and every folder above it up to the volume root, each checked with
 /// `sddl_admin_only`; the handles keep them from being swapped until they drop.
 fn hold_admin_chain(program: &Path) -> io::Result<Vec<File>> {
-    let mut held = vec![open_checked(program, AclLevel::File)?];
+    hold_admin_chain_with(program, &|_, f| handle_sddl(f))
+}
+
+/// `hold_admin_chain` with the descriptors read by `sddl_of`. The file is held without write
+/// or delete sharing, each folder without delete sharing.
+pub fn hold_admin_chain_with(program: &Path, sddl_of: SddlOf<'_>) -> io::Result<Vec<File>> {
+    let mut held = vec![open_checked(program, AclLevel::File, sddl_of)?];
     for (n, dir) in program.ancestors().skip(1).enumerate() {
         let level = if n == 0 {
             AclLevel::Parent
         } else {
             AclLevel::Ancestor
         };
-        held.push(open_checked(dir, level)?);
+        held.push(open_checked(dir, level, sddl_of)?);
     }
     Ok(held)
 }

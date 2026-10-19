@@ -11,6 +11,7 @@ pub mod arp_ops_win;
 #[cfg(windows)]
 pub mod elevate_win;
 pub mod elevated;
+pub mod helper_folder;
 #[cfg(windows)]
 pub mod spawn_win;
 #[cfg(windows)]

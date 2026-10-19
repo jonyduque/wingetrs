@@ -406,13 +406,39 @@ fn check_server(pipe: &OwnedHandle, parent: u32) -> std::io::Result<()> {
 }
 
 /// Creates the pipe, starts `exe bridge-worker` elevated and accepts its connection, which
-/// must come from that very process.
+/// must come from that very process. Only from a folder only administrators write (see
+/// `start_with`).
 pub fn start(exe: &Path) -> std::io::Result<PipeHelper> {
+    start_with(exe, &|_, f| super::arp_ops_win::handle_sddl(f), &mut launch)
+}
+
+/// `start` with the descriptors read by `sddl_of` and the UAC launch done by `launcher`.
+/// Before `launcher` runs, `exe` and every folder above it must be administrator-only by owner
+/// and DACL and none a reparse point (`arp_ops_win::hold_admin_chain_with`); the file stays
+/// open without write or delete sharing, and the folders without delete sharing, until
+/// `launcher` returns. A DLL the helper loads from its own folder is covered by the same
+/// check: nobody else may create a file there. Otherwise no UAC prompt and the error is
+/// `helper_folder::refusal_text`; no variable, setting or flag skips this.
+pub fn start_with(
+    exe: &Path,
+    sddl_of: super::arp_ops_win::SddlOf<'_>,
+    launcher: &mut dyn FnMut(&Path, &str) -> std::io::Result<OwnedHandle>,
+) -> std::io::Result<PipeHelper> {
+    let folder = exe.parent().unwrap_or(exe);
+    let held = super::arp_ops_win::hold_admin_chain_with(exe, sddl_of).map_err(|e| {
+        tracing::warn!(error = %e, exe = %exe.display(), "bridge: helper folder not admin-only; no UAC");
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            super::helper_folder::refusal_text(folder),
+        )
+    })?;
     let name = format!("{PIPE_PREFIX}{}", random_hex()?);
     let pipe = create_pipe(&name)?;
     // SAFETY: no arguments.
     let me = unsafe { GetCurrentProcessId() };
-    let process = launch(exe, &format!("bridge-worker --pipe {name} --parent {me}"))?;
+    let process = launcher(exe, &format!("bridge-worker --pipe {name} --parent {me}"));
+    drop(held);
+    let process = process?;
     accept(&pipe, &process, CONNECT_LIMIT)?;
     let helper = check_client(&pipe, &process)?;
     tracing::info!(pid = helper, "bridge: elevated helper connected");

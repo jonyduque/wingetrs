@@ -31,7 +31,7 @@ use crate::winget_install::msix_win::SystemMsix;
 use crate::winget_install::ops::{self as wops, InstallReport, WingetCtx, WingetOpsError};
 use crate::winget_install::orphans::{self, Orphan};
 use crate::winget_install::orphans_win::SystemArp;
-use crate::winget_install::plan::{PlanOrBridge, WingetPlan, plan_with_mode};
+use crate::winget_install::plan::{PlanOrBridge, WingetPlan};
 use crate::winget_install::previous::RemovalRequest;
 use crate::winget_install::select::{Refusal, ScopeWanted};
 use crate::winget_install::uninstall::{
@@ -173,12 +173,11 @@ impl WingetFlows for ProdFlows<'_, '_> {
         let m = self
             .manifest(&cand.entry.source_name, &cand.entry.id)
             .await?;
-        Ok(plan_with_mode(
+        Ok(winget_cmd::install_plan(
             &m,
             &host_win::current(),
             wanted,
-            None,
-            self.behavior.installer_mode,
+            &self.behavior,
         ))
     }
 

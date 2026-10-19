@@ -697,3 +697,209 @@ fn read_line_caps_before_buffering_an_endless_line() {
         reader.get_ref().served
     );
 }
+/// Task 197: the helper only starts from a folder only administrators write.
+mod helper_folder {
+    use super::*;
+    use wingetrs::bridge::helper_folder::{self, NoticeTransport};
+
+    /// A transport whose start always fails with `text`; counts the starts.
+    struct Failing(String, Arc<AtomicUsize>);
+
+    impl Transport for Failing {
+        fn start(&self) -> Result<Box<dyn Helper>, String> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Err(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn elevation_refusal_text_same_in_cli_and_tui() {
+        let folder = Path::new(r"C:\Users\u\bin");
+        let text = helper_folder::refusal_text(folder);
+        assert_eq!(
+            text,
+            "Para usar funções de administrador, o wingetrs precisa estar numa pasta que só o administrador grava (ex.: C:\\Program Files\\wingetrs). Ele está em C:\\Users\\u\\bin."
+        );
+        // TUI: told once per session, as an error toast with the text itself.
+        let notice = wingetrs::tui::run::HelperNotice::default();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let woken = Arc::new(AtomicUsize::new(0));
+        let w = Arc::clone(&woken);
+        let tui = notice.transport(
+            Box::new(Failing(text.clone(), Arc::clone(&starts))),
+            move || {
+                w.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(tui.start().err().unwrap(), text);
+        assert_eq!(tui.start().err().unwrap(), text);
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(woken.load(Ordering::SeqCst), 1, "once per session");
+        let mut app =
+            wingetrs::tui::app::App::new(Vec::new(), wingetrs::tui::theme::GlyphSet::Ascii);
+        notice.show(&mut app);
+        notice.show(&mut app);
+        let toasts: Vec<_> = app
+            .toasts
+            .iter()
+            .map(|t| (t.kind, t.text.clone()))
+            .collect();
+        assert_eq!(
+            toasts,
+            vec![(wingetrs::tui::app::ToastKind::Error, text.clone())]
+        );
+        // CLI: the same text (colored or not), once.
+        let line = wingetrs::cli::winget_cmd::helper_notice(&text);
+        assert!(line.contains(&text), "{line}");
+        let said = Arc::new(Mutex::new(Vec::<String>::new()));
+        let s = Arc::clone(&said);
+        let cli = NoticeTransport::new(
+            Box::new(Failing(text.clone(), Arc::new(AtomicUsize::new(0)))),
+            Box::new(move |t: &str| s.lock().unwrap().push(t.to_string())),
+        );
+        let _ = cli.start();
+        let _ = cli.start();
+        assert_eq!(*said.lock().unwrap(), vec![text.clone()]);
+        // Any other failure (UAC "no") is not this notice.
+        let other = notice.transport(
+            Box::new(Failing(
+                "elevação recusada".into(),
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            || {},
+        );
+        let _ = other.start();
+        notice.show(&mut app);
+        assert_eq!(app.toasts.len(), 1);
+    }
+
+    #[cfg(windows)]
+    mod win {
+        use super::*;
+        use std::os::windows::io::OwnedHandle;
+        use wingetrs::bridge::elevate_win;
+
+        /// Owner and DACL of an administrator-only object.
+        const ADMIN: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)";
+        /// The same, plus a write ACE for Users.
+        const USERS_WRITE: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;BU)";
+
+        fn exe_in(dir: &Path) -> PathBuf {
+            std::fs::create_dir_all(dir).unwrap();
+            let exe = dir.join("wingetrs.exe");
+            std::fs::write(&exe, b"MZ").unwrap();
+            exe
+        }
+
+        fn junction(link: &Path, target: &Path) {
+            let ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "mklink /J");
+        }
+
+        type SddlOf<'a> = &'a dyn Fn(&Path, &std::fs::File) -> std::io::Result<String>;
+
+        /// Runs `start_with` with `sddl_of` and a fake launcher (never UAC) that records each
+        /// call, runs `during` and fails; the error and the calls.
+        fn start(
+            exe: &Path,
+            sddl_of: SddlOf<'_>,
+            during: &dyn Fn(),
+        ) -> (std::io::Error, Vec<(PathBuf, String)>) {
+            let mut calls = Vec::new();
+            let mut launcher = |p: &Path, args: &str| -> std::io::Result<OwnedHandle> {
+                calls.push((p.to_path_buf(), args.to_string()));
+                during();
+                Err(std::io::Error::other("lançador falso"))
+            };
+            let e = match elevate_win::start_with(exe, sddl_of, &mut launcher) {
+                Ok(_) => panic!("the fake launcher never starts anything"),
+                Err(e) => e,
+            };
+            (e, calls)
+        }
+
+        #[test]
+        fn worker_refused_from_user_writable_folder() {
+            let dir = TempDir::new().unwrap();
+            let bin = dir.path().join("bin");
+            let exe = exe_in(&bin);
+            let sddl_of = |p: &Path, _: &std::fs::File| {
+                Ok(if p == bin { USERS_WRITE } else { ADMIN }.to_string())
+            };
+            let (e, calls) = start(&exe, &sddl_of, &|| {});
+            assert!(calls.is_empty(), "{calls:?}");
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            assert_eq!(e.to_string(), helper_folder::refusal_text(&bin));
+            // The executable itself writable by Users: refused as well.
+            let sddl_of = |p: &Path, _: &std::fs::File| {
+                Ok(if p == exe { USERS_WRITE } else { ADMIN }.to_string())
+            };
+            let (e, calls) = start(&exe, &sddl_of, &|| {});
+            assert!(calls.is_empty(), "{calls:?}");
+            assert_eq!(e.to_string(), helper_folder::refusal_text(&bin));
+        }
+
+        #[test]
+        fn worker_allowed_from_admin_folder() {
+            let dir = TempDir::new().unwrap();
+            let bin = dir.path().join("bin");
+            let exe = exe_in(&bin);
+            let sddl_of = |_: &Path, _: &std::fs::File| Ok(ADMIN.to_string());
+            // While UAC is up, the file cannot be rewritten or deleted, nor its folder renamed.
+            let during = || {
+                let w = std::fs::OpenOptions::new().write(true).open(&exe);
+                assert!(w.is_err(), "file open for writing while held");
+                assert!(
+                    std::fs::remove_file(&exe).is_err(),
+                    "file deleted while held"
+                );
+                assert!(
+                    std::fs::rename(&bin, dir.path().join("moved")).is_err(),
+                    "folder renamed while held"
+                );
+            };
+            let (e, calls) = start(&exe, &sddl_of, &during);
+            assert_eq!(e.to_string(), "lançador falso");
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert_eq!(calls[0].0, exe);
+            assert!(
+                calls[0].1.starts_with("bridge-worker --pipe "),
+                "{:?}",
+                calls[0].1
+            );
+            // Released once the launch returned.
+            std::fs::OpenOptions::new().write(true).open(&exe).unwrap();
+            // A running executable (this test's) can be held the same way.
+            let me = std::env::current_exe().unwrap();
+            let (e, calls) = start(&me, &sddl_of, &|| {});
+            assert_eq!(e.to_string(), "lançador falso");
+            assert_eq!(calls.len(), 1);
+        }
+
+        #[test]
+        fn worker_refused_through_junction() {
+            let dir = TempDir::new().unwrap();
+            let real = dir.path().join("real");
+            exe_in(&real);
+            let link = dir.path().join("link");
+            junction(&link, &real);
+            let exe = link.join("wingetrs.exe");
+            let sddl_of = |_: &Path, _: &std::fs::File| Ok(ADMIN.to_string());
+            let (e, calls) = start(&exe, &sddl_of, &|| {});
+            assert!(calls.is_empty(), "{calls:?}");
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+            assert_eq!(e.to_string(), helper_folder::refusal_text(&link));
+            // Through the real folder (no junction) the same tree is allowed.
+            let (e, calls) = start(&real.join("wingetrs.exe"), &sddl_of, &|| {});
+            assert_eq!(e.to_string(), "lançador falso");
+            assert_eq!(calls.len(), 1);
+        }
+    }
+}
