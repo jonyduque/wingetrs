@@ -1342,4 +1342,11 @@ Mutação obrigatória: tirar a regra do item 1 ⇒ `call_quoted_path_is_confirm
 - Modify: `src/install/script_scan.rs`, `src/install/prelude.ps1` (só o comentário), e onde a confirmação monta o texto mostrado (CLI `src/cli/output.rs`, TUI pela mesma função)
 - Test: `tests/it/script_scan.rs`, testes de confirmação existentes.
 
+#### Checks beyond the steps
+
+1. A Task 164 já desliga a máscara de `if ($global)` quando o script chama variável (`& $x`) ou tem apelido; não enfraqueça isso: as regras novas só acrescentam flags.
+2. Arquivo de `scripts/` do bucket lido só da cópia guardada pela Task 149 (nunca da rede no momento da análise), pelo caminho resolvido com `safepath`.
+3. A Task 196 edita `src/winget_install/*` e `src/bridge/*` em paralelo: não toque.
+4. Gate: `pwsh -File scripts/verify.ps1`.
+
 **Commit:** `fix(scripts): gate follows called script files and flags aliases`
