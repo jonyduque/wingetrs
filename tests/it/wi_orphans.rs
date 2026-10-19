@@ -408,3 +408,39 @@ fn live_export_hklm_without_admin() {
     assert_eq!(r, Ok(()), "key {key}");
     assert!(!file.exists());
 }
+
+/// Task 196 (from Task 197): the helper did not start because wingetrs is not in an
+/// administrator-only folder. The job ends with that refusal text alone, never as a refused
+/// UAC nor with a "falha ao apagar" prefix in front of it.
+#[test]
+fn folder_refusal_is_its_own_error() {
+    struct FolderRefused(String);
+    impl ElevatedRunner for FolderRefused {
+        fn delete_arp_key(
+            &self,
+            _hive: MachineHive,
+            _key: &str,
+            _reason: DeleteReason,
+        ) -> Result<(), ElevatedError> {
+            Err(ElevatedError::NotAdminFolder(self.0.clone()))
+        }
+    }
+    let text = wingetrs::bridge::helper_folder::refusal_text(Path::new(r"C:\Users\u\Downloads"));
+    let dir = tempfile::tempdir().unwrap();
+    let reg = FakeReg::new(Some(utf16le(&reg_text("HKEY_LOCAL_MACHINE", "k1"))));
+    let el = FolderRefused(text.clone());
+    let r = remove_orphan(
+        &reg,
+        &el,
+        dir.path(),
+        "ts9",
+        &orphan(Hive::MachineX64, "k1"),
+    );
+    assert_eq!(r, Err(text.clone()));
+    let shown = r.unwrap_err();
+    assert!(
+        !shown.contains(wingetrs::winget_install::codes::UAC_REFUSED),
+        "{shown}"
+    );
+    assert!(!shown.contains("sem permissão"), "{shown}");
+}

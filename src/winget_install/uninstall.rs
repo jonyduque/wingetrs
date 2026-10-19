@@ -834,7 +834,7 @@ pub fn remove_registry_only(
             .map_err(|e| format!("falha ao apagar {key}: {e}"))?,
         Some(h) => elevated
             .delete_arp_key(h, key, DeleteReason::Duplicate)
-            .map_err(|e| format!("falha ao apagar {key}: {e}"))?,
+            .map_err(|e| e.context(format!("falha ao apagar {key}")))?,
     }
     Ok(file)
 }

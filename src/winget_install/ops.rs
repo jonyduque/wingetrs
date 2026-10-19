@@ -369,9 +369,9 @@ pub fn install_fetched(
     })
 }
 
-/// Runs a command-line installer, with the log filled in: unelevated (`Never`), or elevated
+/// Runs a command-line installer: unelevated (`Never`) with the log filled in, or elevated
 /// through its own UAC prompt (`Helper`: `runas` on the verified file, or on the absolute
-/// `msiexec` for msi/wix, with parameters the elevation allowlist accepts). The caller holds the
+/// `msiexec` for msi/wix, with parameters the elevation allowlist accepts and no log). The caller holds the
 /// verified file's share-deny handle for the whole run. Windows Installer types wait for the
 /// mutex and retry 1618.
 fn run_command(
@@ -387,12 +387,20 @@ fn run_command(
         }
         Elevation::Never => Verb::Open,
     };
-    let log = installer_log(ctx.data, plan)?;
-    if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| WingetOpsError::Io(format!("{}: {e}", dir.display())))?;
-    }
-    let args = switches::fill_log(&cmd.args, &log)?;
+    // An elevated installer gets no log (Task 196): a log path in a folder the user controls
+    // would let a junction send an admin write anywhere. Its exit code says enough.
+    let (log, args) = match verb {
+        Verb::RunAs => (None, cmd.args.clone()),
+        Verb::Open => {
+            let log = installer_log(ctx.data, plan)?;
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| WingetOpsError::Io(format!("{}: {e}", dir.display())))?;
+            }
+            let args = switches::fill_log(&cmd.args, &log)?;
+            (Some(log), args)
+        }
+    };
     let (program, params) = match cmd.program {
         Program::Msiexec => (
             ctx.msiexec.clone(),
@@ -455,12 +463,8 @@ fn run_command(
         attempt()?
     };
 
-    let tail = read_tail(&log);
-    Ok(Ran {
-        code,
-        log: Some(log),
-        tail,
-    })
+    let tail = log.as_deref().map(read_tail).unwrap_or_default();
+    Ok(Ran { code, log, tail })
 }
 
 /// The elevation allowlist (the rules the helper applied before Task 196) on what an elevated
@@ -473,6 +477,11 @@ fn elevation_allowed(
     let kind = elevated_kind(&plan.installer.kind).ok_or_else(|| {
         WingetOpsError::Elevated("tipo de instalador que não roda elevado".into())
     })?;
+    if cmd.args.contains(switches::LOG_TOKEN) {
+        return Err(WingetOpsError::Elevated(
+            "o instalador elevado não grava log (elevação)".into(),
+        ));
+    }
     let sha = file.sha256();
     if !one_component(sha) {
         return Err(FetchError::BadSha.into());

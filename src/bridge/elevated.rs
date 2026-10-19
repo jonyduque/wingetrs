@@ -3,6 +3,7 @@
 //! later ones reuse it. A refusal is final for the session (the jobs run unelevated, as
 //! before). It never runs an installer: each native installer that needs elevation asks for
 //! its own UAC (Task 196). The Win32 side is `elevate_win`.
+use super::helper_folder::is_refusal;
 use super::worker::{self, DeleteReason, MachineHive, Reply, Request};
 use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
 use crate::installed::correlate::InstallScope;
@@ -33,7 +34,8 @@ pub trait Transport: Send + Sync {
 enum State {
     NotStarted,
     Running(Box<dyn Helper>),
-    Refused,
+    /// Why it could not start (a refused UAC, or `helper_folder::refusal_text`).
+    Refused(String),
 }
 
 /// The session's helper and whether it may still be started.
@@ -93,10 +95,11 @@ impl ElevatedBridge {
             let mut state = self.lock();
             match self.ensure_started(&mut state) {
                 Ok(()) => true,
-                Err(None) => false,
-                Err(Some(e)) => {
+                Err((_, false)) => false,
+                Err((e, true)) => {
                     tracing::warn!(error = %e, "bridge: elevation refused; running unelevated");
-                    on_line(REFUSED_NOTE);
+                    // The folder refusal says itself why (never "no permission").
+                    on_line(if is_refusal(&e) { &e } else { REFUSED_NOTE });
                     false
                 }
             }
@@ -118,9 +121,9 @@ impl ElevatedBridge {
     }
 
     /// Makes `state` `Running`: a helper that exited (idle) is dropped and a new one started
-    /// (a new UAC prompt). `Err(Some(reason))` when starting failed now (the state becomes
-    /// `Refused`), `Err(None)` when it was refused before.
-    fn ensure_started(&self, state: &mut State) -> Result<(), Option<String>> {
+    /// (a new UAC prompt). `Err((reason, true))` when starting failed now (the state becomes
+    /// `Refused`), `Err((reason, false))` when it was refused before.
+    fn ensure_started(&self, state: &mut State) -> Result<(), (String, bool)> {
         if let State::Running(helper) = state
             && !helper.alive()
         {
@@ -129,7 +132,7 @@ impl ElevatedBridge {
         }
         match state {
             State::Running(_) => Ok(()),
-            State::Refused => Err(None),
+            State::Refused(reason) => Err((reason.clone(), false)),
             State::NotStarted => match self.transport.start() {
                 Ok(helper) => {
                     tracing::info!("bridge: elevated helper started");
@@ -137,8 +140,8 @@ impl ElevatedBridge {
                     Ok(())
                 }
                 Err(e) => {
-                    *state = State::Refused;
-                    Err(Some(e))
+                    *state = State::Refused(e.clone());
+                    Err((e, true))
                 }
             },
         }
@@ -160,6 +163,10 @@ impl ElevatedBridge {
         match self.ask_running(&mut state, &request, on_line) {
             Ok(answer) => answer,
             Err(Fail::Lost(e)) => Err(e),
+            Err(Fail::Refused(reason)) if is_refusal(&reason) => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                reason,
+            )),
             Err(Fail::Refused(reason)) => Err(lost(reason)),
         }
     }
@@ -190,10 +197,8 @@ impl ElevatedBridge {
             retried = true;
             tracing::warn!(error = %e, "bridge: request not sent; starting a new helper");
             *state = State::NotStarted;
-            if let Err(reason) = self.ensure_started(state) {
-                return Err(Fail::Refused(
-                    reason.unwrap_or_else(|| "recusado".to_string()),
-                ));
+            if let Err((reason, _)) = self.ensure_started(state) {
+                return Err(Fail::Refused(reason));
             }
         }
     }
@@ -247,11 +252,34 @@ pub enum ElevatedError {
     Lost(String),
     /// The helper refused the request or could not run it.
     Remote(String),
+    /// No UAC prompt: wingetrs is not in an administrator-only folder (Task 197). Shown as
+    /// `helper_folder::refusal_text` alone, never as a refused UAC.
+    NotAdminFolder(String),
+}
+
+impl ElevatedError {
+    /// From why the helper could not start: the folder refusal keeps its own text.
+    fn refused(reason: String) -> ElevatedError {
+        if is_refusal(&reason) {
+            ElevatedError::NotAdminFolder(reason)
+        } else {
+            ElevatedError::Refused
+        }
+    }
+
+    /// `"<prefix>: <self>"`, or the folder refusal alone (it already says everything).
+    pub fn context(&self, prefix: impl std::fmt::Display) -> String {
+        match self {
+            ElevatedError::NotAdminFolder(text) => text.clone(),
+            other => format!("{prefix}: {other}"),
+        }
+    }
 }
 
 impl std::fmt::Display for ElevatedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ElevatedError::NotAdminFolder(text) => f.write_str(text),
             ElevatedError::Refused => f.write_str("sem permissão de administrador"),
             ElevatedError::Lost(e) => write!(f, "auxiliar elevado perdido: {e}"),
             ElevatedError::Remote(e) => write!(f, "auxiliar elevado: {e}"),
@@ -367,13 +395,11 @@ impl ElevatedBridge {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<i32, ElevatedError> {
         let mut state = self.lock();
-        match self.ensure_started(&mut state) {
-            Ok(()) => {}
-            Err(None) => return Err(ElevatedError::Refused),
-            Err(Some(e)) => {
+        if let Err((e, now)) = self.ensure_started(&mut state) {
+            if now {
                 tracing::warn!(error = %e, "bridge: elevation refused");
-                return Err(ElevatedError::Refused);
             }
+            return Err(ElevatedError::refused(e));
         }
         match self.ask_running(&mut state, request, on_line) {
             Ok(Ok((code, _))) => Ok(code),
@@ -381,7 +407,7 @@ impl ElevatedBridge {
             Err(Fail::Lost(e)) => Err(ElevatedError::Lost(e.to_string())),
             Err(Fail::Refused(e)) => {
                 tracing::warn!(error = %e, "bridge: elevation refused");
-                Err(ElevatedError::Refused)
+                Err(ElevatedError::refused(e))
             }
         }
     }

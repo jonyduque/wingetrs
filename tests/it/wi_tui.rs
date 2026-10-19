@@ -23,7 +23,9 @@ use wingetrs::tui::theme::{ColorDepth, GlyphSet, Theme};
 use wingetrs::tui::view::view;
 use wingetrs::winget_install::launch::Elevation;
 use wingetrs::winget_install::orphans::Orphan;
-use wingetrs::winget_install::plan::{ADMIN_PROMPT, PlanOrBridge, WingetPlan, plan};
+use wingetrs::winget_install::plan::{
+    ADMIN_PROMPT, ADMIN_PROMPT_MSI, PlanOrBridge, WingetPlan, plan,
+};
 use wingetrs::winget_install::previous::RemovalRequest;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
 use wingetrs::winget_install::uninstall::{SharedData, UninstallPlan, UninstallTarget};
@@ -221,7 +223,7 @@ fn confirm_shows_pede_uac_for_machine_plan() {
     );
     assert!(cmds.is_empty(), "{cmds:?}");
     let text = confirm_text(&a);
-    assert!(text.contains(ADMIN_PROMPT), "{text}");
+    assert!(text.contains(ADMIN_PROMPT_MSI), "{text}");
     assert!(text.contains("Contoso App 1.0 (msi, machine)"), "{text}");
     assert_eq!(confirm_actions(&a), vec![Action::WingetInstall(machine)]);
 
@@ -236,7 +238,10 @@ fn confirm_shows_pede_uac_for_machine_plan() {
         },
     );
     let text = confirm_text(&b);
-    assert!(!text.contains(ADMIN_PROMPT), "{text}");
+    assert!(
+        !text.contains(ADMIN_PROMPT) && !text.contains(ADMIN_PROMPT_MSI),
+        "{text}"
+    );
     assert!(text.contains("Contoso App 1.0 (inno, user)"), "{text}");
 }
 

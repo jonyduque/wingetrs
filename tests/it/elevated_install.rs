@@ -471,6 +471,75 @@ fn upgrade_and_install_still_work() {
     assert_eq!(replies, [one.clone(), one].concat());
 }
 
+/// Task 196 (from Task 197): a helper that cannot start because wingetrs is not in an
+/// administrator-only folder gives `NotAdminFolder` with the refusal text alone (never "no
+/// permission" or a refused UAC), now and on every later request of the session, and a
+/// machine-wide bridge job is told that text instead of the generic note.
+#[test]
+fn folder_refusal_is_not_a_refused_uac() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wingetrs::bridge::elevated::{
+        ElevatedBridge, ElevatedError, ElevatedRunner, Helper, REFUSED_NOTE, Transport,
+    };
+    use wingetrs::bridge::helper_folder::refusal_text;
+    use wingetrs::bridge::worker::{DeleteReason, MachineHive};
+
+    struct FolderRefused(String, Arc<AtomicUsize>);
+    impl Transport for FolderRefused {
+        fn start(&self) -> Result<Box<dyn Helper>, String> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Err(self.0.clone())
+        }
+    }
+    let text = refusal_text(Path::new(r"C:\Users\u\Downloads"));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let bridge = ElevatedBridge::new(Box::new(FolderRefused(text.clone(), Arc::clone(&starts))));
+    for _ in 0..2 {
+        let e = bridge
+            .delete_arp_key(MachineHive::Hklm64, "App", DeleteReason::Orphan)
+            .unwrap_err();
+        assert_eq!(e, ElevatedError::NotAdminFolder(text.clone()));
+        assert_eq!(e.to_string(), text);
+        assert_eq!(e.context("falha ao apagar App"), text);
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "asked once per session");
+
+    // A refused UAC keeps its own error.
+    let other = ElevatedBridge::new(Box::new(FolderRefused(
+        "recusado".into(),
+        Arc::new(AtomicUsize::new(0)),
+    )));
+    let e = other
+        .delete_arp_key(MachineHive::Hklm64, "App", DeleteReason::Orphan)
+        .unwrap_err();
+    assert_eq!(e, ElevatedError::Refused);
+
+    // A machine-wide winget job through the bridge: the folder text, not the generic note.
+    let fresh = ElevatedBridge::new(Box::new(FolderRefused(
+        text.clone(),
+        Arc::new(AtomicUsize::new(0)),
+    )));
+    let job = BridgeJob {
+        op: BridgeOp::Upgrade,
+        tool: Tool::Winget,
+        target: "Git.Git".into(),
+        name: "Git.Git".into(),
+        installed: None,
+        available: None,
+        scope: Some(InstallScope::Machine),
+    };
+    let mut current = |_: &str,
+                       _: &[String],
+                       _: &mut dyn FnMut(&str)|
+     -> std::io::Result<(i32, Vec<String>)> { Ok((0, Vec::new())) };
+    let mut lines = Vec::new();
+    let chosen = fresh.exec_for(&job, &mut current, &mut |l: &str| lines.push(l.to_string()));
+    assert!(!chosen.elevated());
+    assert_eq!(lines, std::slice::from_ref(&text));
+    assert!(!lines.iter().any(|l| l == REFUSED_NOTE));
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;

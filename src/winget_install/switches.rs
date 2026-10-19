@@ -96,6 +96,27 @@ pub fn install_args(
     mode: Mode,
     upgrade: bool,
 ) -> Result<CommandLine, ArgsError> {
+    args_with(kind, sw, mode, upgrade, true)
+}
+
+/// `install_args` without the Log switch (the manifest's or the default one): for an installer
+/// that runs elevated, which must not write to a path the user controls (Task 196).
+pub fn install_args_unlogged(
+    kind: &InstallerKind,
+    sw: &InstallerSwitches,
+    mode: Mode,
+    upgrade: bool,
+) -> Result<CommandLine, ArgsError> {
+    args_with(kind, sw, mode, upgrade, false)
+}
+
+fn args_with(
+    kind: &InstallerKind,
+    sw: &InstallerSwitches,
+    mode: Mode,
+    upgrade: bool,
+    with_log: bool,
+) -> Result<CommandLine, ArgsError> {
     if !has_command_line(kind) {
         return Err(ArgsError::NoCommandLine);
     }
@@ -105,7 +126,9 @@ pub fn install_args(
         Mode::SilentWithProgress => present(&sw.silent_with_progress).or(def.map(|d| d.1)),
         Mode::Interactive => present(&sw.interactive),
     };
-    let log = present(&sw.log).or(def.and_then(|d| d.2));
+    let log = present(&sw.log)
+        .or(def.and_then(|d| d.2))
+        .filter(|_| with_log);
     let mut parts: Vec<&str> = vec![];
     parts.extend(mode_part);
     parts.extend(log);

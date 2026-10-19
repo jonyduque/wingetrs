@@ -3,7 +3,9 @@
 
 use super::launch::{Elevation, install_elevation};
 use super::select::{Host, Refusal, ScopeWanted, Verdict, choose};
-use super::switches::{CommandLine, Mode, Program, install_args, mode_for};
+use super::switches::{
+    CommandLine, LOG_TOKEN, Mode, Program, install_args, install_args_unlogged, mode_for,
+};
 use crate::bridge::worker::{
     ElevatedKind, InstallerRequest, exe_params_allowed, msi_params_allowed_in,
 };
@@ -14,6 +16,9 @@ use crate::sources::winget::manifest::{
 
 /// Plan line of an installer that runs elevated: it asks for its own UAC (Task 196).
 pub const ADMIN_PROMPT: &str = "pede permissão de administrador para este instalador";
+/// The same line for msi/wix: the UAC prompt names the Windows Installer (`msiexec`), not the
+/// package's publisher; the verified file stays held until it ends, so it is the one that runs.
+pub const ADMIN_PROMPT_MSI: &str = "pede permissão de administrador para o Windows Installer";
 
 /// Longest agreement text shown when the agreement has no URL.
 const AGREEMENT_TEXT_MAX: usize = 200;
@@ -80,15 +85,15 @@ pub fn plan_with_mode(
     };
     let inst = sel.installer;
     let mode = mode_for(&inst.kind, &inst.switches, installer_mode);
+    let elevation = install_elevation(&inst.kind, inst.scope.as_deref(), inst.elevation.as_deref());
     let command = if matches!(inst.kind, InstallerKind::Msix | InstallerKind::Appx) {
         None
     } else {
         Some(
-            install_args(&inst.kind, &inst.switches, mode, upgrade_from.is_some())
+            command_for(&inst, mode, elevation, upgrade_from.is_some())
                 .map_err(|e| Refusal(e.to_string()))?,
         )
     };
-    let elevation = install_elevation(&inst.kind, inst.scope.as_deref(), inst.elevation.as_deref());
     if elevation == Elevation::Helper
         && let Some(cmd) = &command
         && let Err(why) = helper_accepts(&inst, cmd)
@@ -120,6 +125,20 @@ pub fn plan_with_mode(
     }))
 }
 
+/// The installer's command line: without any log switch when it runs elevated (Task 196: an
+/// elevated installer never writes to a path the user controls; its exit code says enough).
+pub fn command_for(
+    inst: &EffectiveInstaller,
+    mode: Mode,
+    elevation: Elevation,
+    upgrade: bool,
+) -> Result<CommandLine, super::switches::ArgsError> {
+    match elevation {
+        Elevation::Helper => install_args_unlogged(&inst.kind, &inst.switches, mode, upgrade),
+        Elevation::Never => install_args(&inst.kind, &inst.switches, mode, upgrade),
+    }
+}
+
 /// The helper's type for an installer that runs elevated (Task 180); `None` for the others.
 pub fn elevated_kind(kind: &InstallerKind) -> Option<ElevatedKind> {
     Some(match kind {
@@ -147,6 +166,13 @@ fn helper_accepts(inst: &EffectiveInstaller, cmd: &CommandLine) -> Result<(), St
             inst.kind.name()
         ));
     };
+    if cmd.args.contains(LOG_TOKEN) {
+        return Err(
+            "log nos parâmetros do instalador, e o instalador elevado não grava log: instalado \
+             pelo winget"
+                .to_string(),
+        );
+    }
     let sha = inst.sha256.trim().to_ascii_lowercase();
     let req = InstallerRequest {
         // Stand-in for the blob path the flow will send (same shape: `...\blobs\<sha>`).
@@ -274,7 +300,11 @@ impl std::fmt::Display for WingetPlan {
             }
         }
         if self.elevation == Elevation::Helper {
-            write!(f, "\n{ADMIN_PROMPT}")?;
+            let prompt = match self.command.as_ref().map(|c| c.program) {
+                Some(Program::Msiexec) => ADMIN_PROMPT_MSI,
+                _ => ADMIN_PROMPT,
+            };
+            write!(f, "\n{prompt}")?;
         }
         if self.interactive {
             write!(f, "\nabre a janela do instalador (sem modo silencioso)")?;

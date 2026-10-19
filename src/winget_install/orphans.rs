@@ -210,7 +210,7 @@ pub fn remove_orphan(
             .map_err(|e| format!("falha ao apagar {}: {e}", o.key))?,
         Some(h) => elevated
             .delete_arp_key(h, &o.key, DeleteReason::Orphan)
-            .map_err(|e| format!("falha ao apagar {}: {e}", o.key))?,
+            .map_err(|e| e.context(format!("falha ao apagar {}", o.key)))?,
     }
     Ok(file)
 }

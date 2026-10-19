@@ -9,10 +9,9 @@ use super::ops::{
     InstallReport, WingetCtx, WingetOpsError, fetch_verified, install, install_fetched,
     lock_install_for,
 };
-use super::plan::{PlanOrBridge, WingetPlan, plan_with_mode};
+use super::plan::{PlanOrBridge, WingetPlan, command_for, plan_with_mode};
 use super::post_check::version_warning;
 use super::select::{Host, Refusal, Scope, ScopeWanted, arch_applicable};
-use super::switches::install_args;
 use super::uninstall::{MsiQueue, UninstallCtx, UninstallPlan, UninstallStatus, uninstall_queued};
 use super::uninstall_cmd::ArpDetails;
 use crate::config::{DefaultScope, InstallerMode, WingetEngine};
@@ -289,13 +288,8 @@ pub async fn upgrade(
                 InstallerKind::Msix | InstallerKind::Appx
             ) {
                 fresh.command = Some(
-                    install_args(
-                        &fresh.installer.kind,
-                        &fresh.installer.switches,
-                        fresh.mode,
-                        false,
-                    )
-                    .map_err(WingetOpsError::from)?,
+                    command_for(&fresh.installer, fresh.mode, fresh.elevation, false)
+                        .map_err(WingetOpsError::from)?,
                 );
             }
             // Removal and install under one `install.lock`: nothing runs in between.

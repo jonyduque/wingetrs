@@ -21,7 +21,9 @@ use wingetrs::winget_install::codes::{Outcome, UAC_REFUSED};
 use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::ops::{WingetCtx, WingetOpsError, install};
-use wingetrs::winget_install::plan::{ADMIN_PROMPT, PlanOrBridge, WingetPlan, plan};
+use wingetrs::winget_install::plan::{
+    ADMIN_PROMPT, ADMIN_PROMPT_MSI, PlanOrBridge, WingetPlan, plan,
+};
 use wingetrs::winget_install::post_check::find_installed;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
 use wingetrs::winget_install::uninstall_cmd::Rule;
@@ -446,16 +448,9 @@ async fn machine_installer_uses_runas_launcher() {
         spec.params
     );
     assert!(spec.params.contains("/norestart"), "{}", spec.params);
-    let log_dir = env.root().join("log").join("installers");
-    assert!(
-        spec.params
-            .contains(&format!("/log \"{}\\", log_dir.display())),
-        "{}",
-        spec.params
-    );
-    assert!(!spec.params.contains("<LOGPATH>"), "{}", spec.params);
+    assert_no_log(&spec.params);
     assert_eq!(spec.show, Show::Normal);
-    assert!(r.log.is_some_and(|l| l.starts_with(&log_dir)));
+    assert_eq!(r.log, None);
     assert!(env.elevated.calls.lock().unwrap().is_empty());
     let events = env.events.lock().unwrap().clone();
     let at = |p: Phase| {
@@ -478,7 +473,7 @@ async fn machine_installer_uses_runas_launcher() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].verb, Verb::RunAs);
     assert_eq!(calls[0].program, env.materialized("exe"));
-    assert!(calls[0].params.contains("/LOG=\""), "{}", calls[0].params);
+    assert_no_log(&calls[0].params);
     assert!(env.elevated.calls.lock().unwrap().is_empty());
 
     // A user-scope installer is not elevated.
@@ -495,6 +490,62 @@ async fn machine_installer_uses_runas_launcher() {
             .unwrap()
             .contains(&ProgressEvent::Phase(Phase::WaitingElevation))
     );
+}
+
+/// No log switch of any form (msiexec `/log`, `/l*v`, Inno `/LOG=`, the placeholder).
+fn assert_no_log(params: &str) {
+    let low = params.to_ascii_lowercase();
+    for bad in ["/log", "/l*", "-log", "<logpath>", r"log\installers"] {
+        assert!(!low.contains(bad), "{bad} in {params}");
+    }
+}
+
+/// Task 196: an installer launched through `runas` gets no log argument at all (an elevated
+/// write to a path the user controls is a junction away from anywhere): msi, inno and burn,
+/// whose defaults all carry one; the log folder is not even created.
+#[tokio::test]
+async fn runas_command_line_has_no_log() {
+    for (kind, ext) in [("msi", "msi"), ("inno", "exe"), ("burn", "exe")] {
+        let env = Env::new();
+        let (_s, p, _) = served_plan(kind, Some("machine"), Scope::Machine, "", "").await;
+        assert!(
+            !p.command.as_ref().unwrap().args.contains("<LOGPATH>"),
+            "{kind}: {:?}",
+            p.command
+        );
+        let ctx = ctx!(env);
+        let r = install(&ctx, &p).await.unwrap();
+        let calls = env.launcher.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{kind}");
+        assert_eq!(calls[0].verb, Verb::RunAs, "{kind}");
+        assert!(
+            calls[0]
+                .params
+                .contains(&env.materialized(ext).display().to_string())
+                || calls[0].program == env.materialized(ext),
+            "{kind}"
+        );
+        assert_no_log(&calls[0].params);
+        assert_eq!(r.log, None, "{kind}");
+        assert!(
+            !env.root().join("log").join("installers").exists(),
+            "{kind}"
+        );
+    }
+    // Control: the same installers unelevated keep their log.
+    for kind in ["msi", "inno", "burn"] {
+        let env = Env::new();
+        let (_s, p, _) = served_plan(kind, Some("user"), Scope::User, "", "").await;
+        let ctx = ctx!(env);
+        install(&ctx, &p).await.unwrap();
+        let calls = env.launcher.calls.lock().unwrap().clone();
+        assert_eq!(calls[0].verb, Verb::Open, "{kind}");
+        assert!(
+            calls[0].params.to_ascii_lowercase().contains("/log"),
+            "{kind}: {}",
+            calls[0].params
+        );
+    }
 }
 
 /// Task 196: the verified file cannot be renamed nor deleted while the elevated installer
@@ -655,15 +706,20 @@ fn plan_text_is_the_confirmation() {
         eula,
     );
     let text = native(&msi, Scope::Machine).to_string();
-    assert!(text.contains(ADMIN_PROMPT), "{text}");
+    assert!(text.contains(ADMIN_PROMPT_MSI), "{text}");
+    assert!(!text.contains(ADMIN_PROMPT), "{text}");
+    let inno_machine = manifest_of("inno", Some("machine"), "https://h/setup.exe", &sha, "", "");
+    let machine_text = native(&inno_machine, Scope::Machine).to_string();
+    assert!(machine_text.contains(ADMIN_PROMPT), "{machine_text}");
     assert!(text.contains("Licença: EULA — https://x/eula"), "{text}");
     assert!(text.contains("Contoso App 1.0 (msi, machine)"), "{text}");
     assert!(text.contains("Instalador: https://h/setup.msi"), "{text}");
-    assert!(text.contains("<LOGPATH>"), "{text}");
+    assert!(!text.contains("<LOGPATH>"), "elevated: no log: {text}");
 
     let inno = manifest_of("inno", Some("user"), "https://h/setup.exe", &sha, "", "");
     let text = native(&inno, Scope::User).to_string();
     assert!(!text.contains(ADMIN_PROMPT), "{text}");
+    assert!(!text.contains(ADMIN_PROMPT_MSI), "{text}");
     assert!(!text.contains("abre a janela"), "{text}");
 
     let exe = manifest_of("exe", None, "https://h/setup.exe", &sha, "", "");
@@ -883,11 +939,12 @@ async fn hold_msi_lock_while_running() {
 }
 
 #[tokio::test]
-async fn elevated_msi_failure_carries_the_log_hint() {
+async fn msi_failure_carries_the_log_hint() {
+    // Unelevated: the log is there to read (an elevated run has none, Task 196).
     let env = Env::new();
     env.launcher.codes.lock().unwrap().push_back(1603);
     *env.launcher.log_line.lock().unwrap() = Some("Error 1304. Error writing to file".into());
-    let (_s, p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
+    let (_s, p, _) = served_plan("msi", Some("user"), Scope::User, "", "").await;
     let ctx = ctx!(env);
     let e = install(&ctx, &p).await.unwrap_err();
     assert!(
@@ -898,6 +955,18 @@ async fn elevated_msi_failure_carries_the_log_hint() {
         e.to_string()
             .contains(wingetrs::install::msiexec_log::MAX_PATH_HINT),
         "{e}"
+    );
+    assert_eq!(env.launcher.calls.lock().unwrap()[0].verb, Verb::Open);
+
+    // Elevated: the same exit code is classified from the code alone.
+    let env = Env::new();
+    env.launcher.codes.lock().unwrap().push_back(1603);
+    let (_s, p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(
+        matches!(e, WingetOpsError::Failed { code: 1603, .. }),
+        "{e:?}"
     );
     assert_eq!(env.launcher.calls.lock().unwrap()[0].verb, Verb::RunAs);
 }
@@ -998,5 +1067,19 @@ async fn runas_refuses_params_outside_the_allowlist() {
     let e = install(&ctx, &p).await.unwrap_err();
     assert!(matches!(e, WingetOpsError::Elevated(_)), "{e:?}");
     assert!(e.to_string().contains("elevação"), "{e}");
+    assert_eq!(env.launcher.calls.lock().unwrap().len(), 0);
+
+    // A log placeholder (the allowlist alone would take `/log "<LOGPATH>"`): no elevated run
+    // writes a log.
+    let env = Env::new();
+    let (_s, mut p, _) = served_plan("msi", Some("machine"), Scope::Machine, "", "").await;
+    p.command
+        .as_mut()
+        .unwrap()
+        .args
+        .push_str(r#" /log "<LOGPATH>""#);
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::Elevated(_)), "{e:?}");
     assert_eq!(env.launcher.calls.lock().unwrap().len(), 0);
 }
