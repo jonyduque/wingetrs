@@ -4,6 +4,7 @@
 use super::uninstall_cmd::valid_arp_key;
 use crate::bridge::elevated::ElevatedRunner;
 use crate::bridge::worker::{DeleteReason, MachineHive};
+use crate::install::progress::{Phase, ProgressEvent, helper_line_phase};
 use crate::installed::{Hive, InstallSource, InstalledApp};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -194,6 +195,23 @@ pub fn remove_orphan(
     ts: &str,
     o: &Orphan,
 ) -> Result<PathBuf, String> {
+    remove_orphan_with(reg, elevated, backups, ts, o, &|_| {})
+}
+
+/// [`remove_orphan`] reporting its phases to `progress` (Task 201): `Removendo <name>`, and for
+/// an HKLM key the helper's UAC notice (`WaitingElevation`) until the helper runs.
+pub fn remove_orphan_with(
+    reg: &dyn ArpRegistry,
+    elevated: &dyn ElevatedRunner,
+    backups: &Path,
+    ts: &str,
+    o: &Orphan,
+    progress: &dyn Fn(&ProgressEvent),
+) -> Result<PathBuf, String> {
+    let removing = Phase::Removing {
+        app: o.name.clone(),
+    };
+    progress(&ProgressEvent::Phase(removing.clone()));
     if !valid_arp_key(&o.key) {
         return Err(format!("nome de chave ARP inválido: {:?}", o.key));
     }
@@ -209,7 +227,11 @@ pub fn remove_orphan(
             .delete_user_key(&o.key)
             .map_err(|e| format!("falha ao apagar {}: {e}", o.key))?,
         Some(h) => elevated
-            .delete_arp_key(h, &o.key, DeleteReason::Orphan)
+            .delete_arp_key_lines(h, &o.key, DeleteReason::Orphan, &mut |line: &str| {
+                if let Some(p) = helper_line_phase(line, &removing) {
+                    progress(&ProgressEvent::Phase(p));
+                }
+            })
             .map_err(|e| e.context(format!("falha ao apagar {}", o.key)))?,
     }
     Ok(file)

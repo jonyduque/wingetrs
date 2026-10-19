@@ -990,7 +990,9 @@ impl Phases {
                 | Phase::Uninstalling { .. }
                 | Phase::CheckingRemoval { .. }
                 | Phase::SelfElevating { .. }
-                | Phase::Bridge { .. },
+                | Phase::Bridge { .. }
+                | Phase::RunningScript { .. }
+                | Phase::RunningPackageInstaller { .. },
                 _,
             ))
             | None => None,
@@ -1051,7 +1053,9 @@ impl Phases {
                 | Phase::Uninstalling { .. }
                 | Phase::CheckingRemoval { .. }
                 | Phase::SelfElevating { .. }
-                | Phase::Bridge { .. },
+                | Phase::Bridge { .. }
+                | Phase::RunningScript { .. }
+                | Phase::RunningPackageInstaller { .. },
                 _,
             ))
             | None => return None,
@@ -1129,7 +1133,9 @@ impl Phases {
                 | Phase::Uninstalling { .. }
                 | Phase::CheckingRemoval { .. }
                 | Phase::SelfElevating { .. }
-                | Phase::Bridge { .. } => {
+                | Phase::Bridge { .. }
+                | Phase::RunningScript { .. }
+                | Phase::RunningPackageInstaller { .. } => {
                     main = format!("{spin} {}", phase_status(phase, elapsed));
                     if elapsed >= NATIVE_QUIET && !matches!(phase, Phase::CheckingRemoval { .. }) {
                         warn = format!(
@@ -1201,12 +1207,12 @@ impl Phases {
 }
 
 /// Runs a bridge job (`run` gets the tool's line sink) with the CLI's progress: `Bridge { tool }`
-/// from the first instant, then each output line through `progress::bridge_line` (the
-/// elevation notice becomes the phase, with its clock; other lines go to `notice`, above the
-/// progress line). The caller ends the progress line afterwards.
+/// from the first instant (stderr), then each output line through `progress::bridge_line`:
+/// the elevation notice becomes the phase, with its clock; the tool's own lines are the
+/// command's result and go to `output` (stdout). The caller ends the progress line afterwards.
 pub fn bridge_progress<R>(
     progress: &dyn Fn(&ProgressEvent),
-    notice: &dyn Fn(&str),
+    output: &dyn Fn(&str),
     tool: &str,
     run: impl FnOnce(&mut dyn FnMut(&str)) -> R,
 ) -> R {
@@ -1221,7 +1227,7 @@ pub fn bridge_progress<R>(
             progress(&ProgressEvent::Phase(current.clone()));
         }
         if show {
-            notice(&format!("  {line}"));
+            output(&format!("  {line}"));
         }
     })
 }

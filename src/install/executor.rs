@@ -1445,6 +1445,10 @@ async fn run_hook(
     )?;
     let hook = kind.key();
     tracing::info!("rodando o script {hook} de {app}");
+    // From PowerShell's start the hook runs to its end: its own phase says so (Task 201).
+    (ctx.progress)(&ProgressEvent::Phase(Phase::RunningScript {
+        hook: hook.to_string(),
+    }));
     let gate = ctx.launch.clone();
     let job = prepared.job.clone();
     let launch = move || {
@@ -2449,6 +2453,10 @@ async fn run_installer_file(
         }
     };
     tracing::info!("rodando o instalador {file}");
+    // From its start the installer runs to its end: its own phase says so (Task 201).
+    (ctx.progress)(&ProgressEvent::Phase(Phase::RunningPackageInstaller {
+        file: file.to_string(),
+    }));
     let staging = layout.staging_dir(&run.plan.app, &run.plan.version);
     let result = match AwaitWorker::spawn(work, staging, ctx.launch.clone())
         .join()
@@ -3669,7 +3677,12 @@ fn run_before_removal(
             let program = installer_program(vdir, file).map_err(|m| (label.clone(), m))?;
             tracing::info!("rodando o desinstalador {file}");
             ran.ran = true;
-            check_installer_exit(runner(&program, args, vdir)).map_err(|m| (label, m))?;
+            (ctx.progress)(&ProgressEvent::Phase(Phase::Uninstalling {
+                name: plan.app.clone(),
+            }));
+            let exit = runner(&program, args, vdir);
+            removing_again(ctx, plan);
+            check_installer_exit(exit).map_err(|m| (label, m))?;
         }
     }
     if let Some(script) = inst
@@ -3683,6 +3696,13 @@ fn run_before_removal(
             .map_err(|m| (step(kind), m))?;
     }
     Ok(())
+}
+
+/// Back to the removal's own phase once a script or the uninstaller ended.
+fn removing_again(ctx: &ExecCtx<'_>, plan: &UninstallPlan) {
+    (ctx.progress)(&ProgressEvent::Phase(Phase::Removing {
+        app: plan.app.clone(),
+    }));
 }
 
 /// Runs one uninstall hook synchronously through the host (the removal is not async) and applies
@@ -3721,7 +3741,11 @@ fn run_removal_hook(
         return Err("remoção cancelada antes de o script começar".into());
     }
     ran.ran = true;
+    (ctx.progress)(&ProgressEvent::Phase(Phase::RunningScript {
+        hook: hook.to_string(),
+    }));
     let result = host.run(&prepared.job);
+    removing_again(ctx, plan);
     if let Some(message) = hook_failure(result, hook, ctx.effects.env, &prepared.before) {
         return Err(message);
     }

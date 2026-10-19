@@ -1188,3 +1188,49 @@ async fn shim_effect_args_trusted_prefix_ends_at_separator() {
     assert!(e.contains("argumentos inseguros"), "{e}");
     assert!(!w.layout.shims().join("tc.cmd").exists());
 }
+
+/// Task 201: each removal script and the uninstaller announce their own (uncancellable) phase
+/// right before they start; the removal's own phase comes back once each ended.
+#[tokio::test]
+async fn removal_scripts_show_uncancellable_phases() {
+    use wingetrs::install::progress::{Phase, ProgressEvent, phase_status};
+    let w = setup().await;
+    w.install(&w.manifest("1.0", uninstall_hooks())).await;
+    let host = host_with_events(&w);
+    let base = w.base();
+    let record = |ev: &ProgressEvent| {
+        if let ProgressEvent::Phase(p) = ev {
+            if !matches!(p, Phase::Removing { .. }) {
+                assert!(
+                    phase_status(p, std::time::Duration::ZERO).ends_with("não pode ser cancelado"),
+                    "{p:?}"
+                );
+            }
+            log_event(&base, &format!("phase {p:?}"));
+        }
+    };
+    let scripts: Arc<dyn ScriptHost> = host.clone();
+    let mut ctx = w.ctx(Some(scripts), Some(fake_uninstaller));
+    ctx.progress = &record;
+    execute_uninstall(&w.uninstall_plan(), &mut ctx).unwrap();
+    let script = |hook: &str| format!("phase {:?}", Phase::RunningScript { hook: hook.into() });
+    let removing = format!("phase {:?}", Phase::Removing { app: "app".into() });
+    let uninstalling = format!("phase {:?}", Phase::Uninstalling { name: "app".into() });
+    assert_eq!(
+        w.events(),
+        [
+            script("pre_uninstall"),
+            "PreUninstall".to_string(),
+            removing.clone(),
+            uninstalling,
+            "run:setup.exe".to_string(),
+            removing.clone(),
+            script("uninstaller.script"),
+            "UninstallerScript".to_string(),
+            removing.clone(),
+            script("post_uninstall"),
+            "PostUninstall".to_string(),
+            removing,
+        ]
+    );
+}

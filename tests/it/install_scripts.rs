@@ -771,3 +771,51 @@ async fn unknown_effect_op_fails_unreadable() {
     assert!(!w.layout.app_dir("app").exists());
     assert_eq!(w.snapshot(), before);
 }
+
+/// Task 201: each hook and the package's installer announce their own phase right before
+/// they start, and that phase says it cannot be cancelled (CLI and TUI share `phase_status`).
+#[tokio::test]
+async fn scripts_and_installer_show_uncancellable_phases() {
+    use wingetrs::install::progress::{Phase, ProgressEvent, phase_status};
+    let w = setup().await;
+    let host = host_with_events(&w);
+    let plan = w.plan(all_hooks());
+    let base = w.base();
+    let record = |ev: &ProgressEvent| {
+        if let ProgressEvent::Phase(
+            p @ (Phase::RunningScript { .. } | Phase::RunningPackageInstaller { .. }),
+        ) = ev
+        {
+            assert!(
+                phase_status(p, std::time::Duration::ZERO).ends_with("não pode ser cancelado"),
+                "{p:?}"
+            );
+            log_event(&base, &format!("phase {p:?}"));
+        }
+    };
+    let scripts: Arc<dyn ScriptHost> = host.clone();
+    let mut ctx = w.ctx(&NoHook, Some(scripts));
+    ctx.progress = &record;
+    wingetrs::install::executor::execute_install(&plan, &mut ctx)
+        .await
+        .unwrap();
+    let script = |hook: &str| format!("phase {:?}", Phase::RunningScript { hook: hook.into() });
+    assert_eq!(
+        w.events(),
+        [
+            script("pre_install"),
+            "PreInstall".to_string(),
+            format!(
+                "phase {:?}",
+                Phase::RunningPackageInstaller {
+                    file: "setup.exe".into()
+                }
+            ),
+            "installer".to_string(),
+            script(HookKind::InstallerScript.key()),
+            "InstallerScript".to_string(),
+            script("post_install"),
+            "PostInstall".to_string(),
+        ]
+    );
+}

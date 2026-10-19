@@ -12,6 +12,12 @@ pub const ELEVATION_REFUSED: &str = "Permissão de administrador recusada.";
 /// Progress line of the elevated helper once its UAC prompt was accepted (or the session's
 /// helper already runs): the phase leaves [`ELEVATION_NOTICE`].
 pub const ELEVATION_GRANTED: &str = "permissão de administrador concedida";
+/// How long a self-elevating installer's phase keeps [`ELEVATION_NOTICE`]: its own UAC prompt
+/// cannot be observed, so after this the line says it may still ask (Task 201).
+pub const SELF_ELEVATION_WAIT: Duration = Duration::from_secs(120);
+/// [`Phase::SelfElevating`] past [`SELF_ELEVATION_WAIT`].
+pub const SELF_ELEVATION_LATER: &str =
+    "rodando o instalador (pode pedir autorização de administrador)";
 
 /// One report through `download::Progress`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +72,12 @@ pub enum Phase {
     SelfElevating { name: String },
     /// Bridge: `tool` (winget or scoop) is running the job; cannot be cancelled.
     Bridge { tool: String },
+    /// Scoop: the manifest's `hook` script (`pre_install`, `uninstaller.script`…) is running
+    /// in PowerShell; cannot be cancelled.
+    RunningScript { hook: String },
+    /// Scoop: the package's own installer (`installer.file`) or old uninstaller `file` is
+    /// running; cannot be cancelled.
+    RunningPackageInstaller { file: String },
 }
 
 /// Format name shown next to the file being extracted.
@@ -116,6 +128,10 @@ pub fn phase_title(phase: &Phase) -> String {
             format!("{ELEVATION_NOTICE} · instalador de {name} rodando (pode abrir janelas)")
         }
         Phase::Bridge { tool } => format!("{tool} rodando (pode abrir janelas)"),
+        Phase::RunningScript { hook } => format!("Rodando o script {hook} do pacote"),
+        Phase::RunningPackageInstaller { file } => {
+            format!("Rodando o instalador do pacote ({file}; pode abrir janelas)")
+        }
     }
 }
 
@@ -128,7 +144,13 @@ pub fn clock(elapsed: Duration) -> String {
 /// Plain text of `phase` with its clock, shared by the CLI line and the TUI status bar:
 /// `Extraindo x.msi (MSI) · 00:04`.
 pub fn phase_text(phase: &Phase, elapsed: Duration) -> String {
-    format!("{} · {}", phase_title(phase), clock(elapsed))
+    let title = match phase {
+        Phase::SelfElevating { name } if elapsed >= SELF_ELEVATION_WAIT => {
+            format!("{name}: {SELF_ELEVATION_LATER}")
+        }
+        _ => phase_title(phase),
+    };
+    format!("{title} · {}", clock(elapsed))
 }
 
 /// [`phase_text`] plus what the phase means for the user: the Windows Installer cannot be
@@ -142,7 +164,9 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::Uninstalling { .. }
         | Phase::CheckingRemoval { .. }
         | Phase::SelfElevating { .. }
-        | Phase::Bridge { .. } => format!("{text} · não pode ser cancelado"),
+        | Phase::Bridge { .. }
+        | Phase::RunningScript { .. }
+        | Phase::RunningPackageInstaller { .. } => format!("{text} · não pode ser cancelado"),
         Phase::Preparing
         | Phase::WaitingInstaller
         | Phase::Extracting { .. }
@@ -168,4 +192,14 @@ pub fn bridge_line(line: &str, current: Option<&Phase>, tool: &str) -> (Option<P
         tool: tool.to_string(),
     });
     (back, true)
+}
+
+/// The phase a line of the elevated helper moves to (Task 201): [`ELEVATION_NOTICE`] right
+/// before its UAC prompt, `granted` once it runs; `None` for any other line.
+pub fn helper_line_phase(line: &str, granted: &Phase) -> Option<Phase> {
+    match line {
+        ELEVATION_NOTICE => Some(Phase::WaitingElevation),
+        ELEVATION_GRANTED => Some(granted.clone()),
+        _ => None,
+    }
 }

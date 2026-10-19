@@ -180,7 +180,12 @@ impl WingetFlows for NoWinget {
     fn backups(&self) -> PathBuf {
         unreachable!("winget")
     }
-    fn remove_orphan(&self, _: &Orphan, _: &str) -> Result<PathBuf, String> {
+    fn remove_orphan(
+        &self,
+        _: &Orphan,
+        _: &str,
+        _: &dyn Fn(&wingetrs::install::progress::ProgressEvent),
+    ) -> Result<PathBuf, String> {
         unreachable!("winget")
     }
 }

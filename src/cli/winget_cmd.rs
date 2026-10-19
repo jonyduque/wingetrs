@@ -215,7 +215,7 @@ pub(super) async fn install_bridge(
     // Spinner and clock from the first instant; the UAC notice becomes the phase.
     let result = super::output::bridge_progress(
         ctx.progress,
-        &|line: &str| ui.notice(line),
+        &|line: &str| ui.output(line),
         job.tool.name(),
         |on_line| {
             crate::tui::jobs::run_bridge_install(
@@ -309,8 +309,14 @@ pub trait WingetFlows {
     fn orphans(&self) -> anyhow::Result<Vec<Orphan>>;
     /// The backup folder (`.reg` exports go to `<backups>\<ts>`).
     fn backups(&self) -> PathBuf;
-    /// `orphans::remove_orphan`; the `.reg` written.
-    fn remove_orphan(&self, o: &Orphan, ts: &str) -> Result<PathBuf, String>;
+    /// `orphans::remove_orphan_with` (its phases, the helper's UAC notice among them, go to
+    /// `progress`); the `.reg` written.
+    fn remove_orphan(
+        &self,
+        o: &Orphan,
+        ts: &str,
+        progress: &dyn Fn(&ProgressEvent),
+    ) -> Result<PathBuf, String>;
 }
 
 /// The planner's scope: `--scope` is a demand, the Settings default only a preference.
@@ -884,7 +890,7 @@ fn upgrade_bridge<F: WingetFlows>(
     let progress = flows.progress();
     let result = super::output::bridge_progress(
         &*progress,
-        &|line: &str| ui.notice(line),
+        &|line: &str| ui.output(line),
         job.tool.name(),
         |on_line| flows.upgrade_bridge(&job, on_line),
     );
@@ -981,9 +987,17 @@ pub fn cleanup<F: WingetFlows>(
         say("Nenhum registro removido.");
         return Ok(());
     }
+    // Each removal shows its phase (an HKLM key: the helper's UAC notice first); the results
+    // are printed once the progress line is gone.
+    let progress = flows.progress();
+    let results: Vec<_> = chosen
+        .into_iter()
+        .map(|o| (o, flows.remove_orphan(o, &ts, &*progress)))
+        .collect();
+    ui.end_progress();
     let mut failed = 0usize;
-    for o in chosen {
-        match flows.remove_orphan(o, &ts) {
+    for (o, result) in results {
+        match result {
             Ok(file) => say(&format!(
                 "{} {} (backup {})",
                 style::paint(style::OK, "Removido:"),

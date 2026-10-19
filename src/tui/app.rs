@@ -1937,6 +1937,8 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                         | crate::install::progress::Phase::Uninstalling { .. }
                         | crate::install::progress::Phase::CheckingRemoval { .. }
                         | crate::install::progress::Phase::SelfElevating { .. }
+                        | crate::install::progress::Phase::RunningScript { .. }
+                        | crate::install::progress::Phase::RunningPackageInstaller { .. }
                 ) || (native_removal
                     && matches!(phase, crate::install::progress::Phase::Removing { .. }))
                 {

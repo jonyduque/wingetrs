@@ -387,8 +387,20 @@ impl WingetFlows for ProdFlows<'_, '_> {
         self.ctx.data.install_layout().backups()
     }
 
-    fn remove_orphan(&self, o: &Orphan, ts: &str) -> Result<PathBuf, String> {
-        orphans::remove_orphan(&SystemArp, &*self.helper.0, &self.backups(), ts, o)
+    fn remove_orphan(
+        &self,
+        o: &Orphan,
+        ts: &str,
+        progress: &dyn Fn(&ProgressEvent),
+    ) -> Result<PathBuf, String> {
+        orphans::remove_orphan_with(
+            &SystemArp,
+            &*self.helper.0,
+            &self.backups(),
+            ts,
+            o,
+            progress,
+        )
     }
 }
 

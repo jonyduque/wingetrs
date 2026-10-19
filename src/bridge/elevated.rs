@@ -359,6 +359,18 @@ pub trait ElevatedRunner: Send + Sync {
             "exclusão elevada de chave não suportada".to_string(),
         ))
     }
+
+    /// `delete_arp_key`, with the helper's lines (`progress::ELEVATION_NOTICE` before its UAC
+    /// prompt, `ELEVATION_GRANTED` once it runs) sent to `on_line`. By default, no line.
+    fn delete_arp_key_lines(
+        &self,
+        hive: MachineHive,
+        key: &str,
+        reason: DeleteReason,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ElevatedError> {
+        self.delete_arp_key(hive, key, reason)
+    }
 }
 
 impl ElevatedRunner for ElevatedBridge {
@@ -400,12 +412,22 @@ impl ElevatedRunner for ElevatedBridge {
         key: &str,
         reason: DeleteReason,
     ) -> Result<(), ElevatedError> {
+        self.delete_arp_key_lines(hive, key, reason, &mut |_| {})
+    }
+
+    fn delete_arp_key_lines(
+        &self,
+        hive: MachineHive,
+        key: &str,
+        reason: DeleteReason,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), ElevatedError> {
         let request = Request::DeleteArpKey {
             hive,
             key: key.to_string(),
             reason,
         };
-        match self.ask_elevated(&request, &mut |_| {})? {
+        match self.ask_elevated(&request, on_line)? {
             0 => Ok(()),
             code => Err(ElevatedError::Remote(format!(
                 "resposta inesperada {code} ao apagar a chave"

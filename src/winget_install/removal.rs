@@ -2,7 +2,7 @@
 //! of the shared data folders, the launch gate, the phase, then the uninstaller (queued on
 //! `msi.lock`) or the registry-only removal.
 use crate::install::executor::LaunchGate;
-use crate::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, Phase, ProgressEvent};
+use crate::install::progress::{Phase, ProgressEvent, helper_line_phase};
 use crate::installed::Hive;
 use crate::winget_install::launch::Elevation;
 use crate::winget_install::ops::WingetOpsError;
@@ -194,15 +194,14 @@ pub fn run_uninstaller(
     // once the helper runs. The helper waits for what the uninstaller left running (Task 190):
     // say so instead of keeping the UAC text on screen.
     let helper_line = |line: &str| {
+        let granted = Phase::Uninstalling {
+            name: plan.name.clone(),
+        };
         let phase = match line {
-            ELEVATION_NOTICE => Some(Phase::WaitingElevation),
-            ELEVATION_GRANTED => Some(Phase::Uninstalling {
-                name: plan.name.clone(),
-            }),
             crate::bridge::worker::WAITING_UNINSTALLER => {
                 Some(waiting_uninstaller_phase(&plan.name))
             }
-            _ => None,
+            other => helper_line_phase(other, &granted),
         };
         if let Some(p) = phase {
             progress(&ProgressEvent::Phase(p));

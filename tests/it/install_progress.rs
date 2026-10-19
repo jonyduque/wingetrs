@@ -1072,6 +1072,102 @@ async fn every_path_emits_first_phase_immediately() {
         "bridge (TUI): {text}"
     );
     assert!(text.contains("· 00:02 · não pode ser cancelado"), "{text}");
+
+    // Orphan record, TUI: `Preparando` before the `install.lock` wait.
+    let n = Native::new("inno", Some("user"), Scope::User, "").await;
+    let held = wingetrs::cache::UpdateLock::try_acquire(&n.data.install_layout().install_lock())
+        .unwrap()
+        .unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(30), n.remove_orphan(LockWait::NoWait))
+        .await
+        .expect("NoWait never waits");
+    assert!(
+        matches!(r, Err(wingetrs::tui::app::InstallFail::Busy)),
+        "{r:?}"
+    );
+    assert_eq!(
+        n.trace(),
+        [format!("{:?}", Phase::Preparing)],
+        "orphan (TUI)"
+    );
+    drop(held);
+}
+
+struct NoClock;
+impl wingetrs::winget_install::uninstall::Clock for NoClock {
+    fn now(&self) -> Duration {
+        Duration::ZERO
+    }
+    fn sleep(&self, _: Duration) {}
+}
+
+struct NoArp;
+impl wingetrs::winget_install::orphans::ArpRegistry for NoArp {
+    fn export(&self, _: &[String]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn delete_user_key(&self, _: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn still_orphan(&self, _: wingetrs::installed::Hive, _: &str) -> bool {
+        true
+    }
+}
+
+impl Native {
+    /// The TUI's job removing an HKLM orphan record, with `wait`; phases land in the trace.
+    async fn remove_orphan(
+        &self,
+        wait: LockWait,
+    ) -> Result<wingetrs::tui::app::Done, wingetrs::tui::app::InstallFail> {
+        let launcher = TraceLauncher(std::sync::Arc::clone(&self.trace));
+        let trace = std::sync::Arc::clone(&self.trace);
+        let progress = move |ev: &ProgressEvent| {
+            if let ProgressEvent::Phase(p) = ev {
+                trace.lock().unwrap().push(format!("{p:?}"));
+            }
+        };
+        let msiexec = self.t.path().join("System32").join("msiexec.exe");
+        let env = wingetrs::tui::jobs::WingetEnv {
+            install: WingetCtx {
+                data: &self.data,
+                http: &self.http,
+                wait,
+                progress: &progress,
+                gate: LaunchGate::default(),
+                launcher: &launcher,
+                elevated: &NoHelper,
+                msix: &NoMsix,
+                scan: &Vec::new,
+                msiexec: msiexec.clone(),
+                busy: &|| false,
+                sleep: &|_| {},
+            },
+            uninstall: wingetrs::winget_install::uninstall::UninstallCtx {
+                launcher: &launcher,
+                elevated: &NoHelper,
+                msix: &NoMsix,
+                key_exists: &|_, _| false,
+                clock: &NoClock,
+                user_expand: &|_| None,
+                msiexec: &msiexec,
+                helper_line: &|_| {},
+            },
+            registry: &NoArp,
+            backups: self.t.path(),
+            free_space: &|_| None,
+            previous: &|_, _| Err("sem plano".into()),
+            stamp: "1".into(),
+        };
+        let o = wingetrs::winget_install::orphans::Orphan {
+            hive: wingetrs::installed::Hive::MachineX64,
+            key: "App".into(),
+            name: "Contoso App".into(),
+            missing: String::new(),
+        };
+        wingetrs::tui::jobs::run_winget_action(&env, wingetrs::tui::app::Action::RemoveOrphan(o))
+            .await
+    }
 }
 
 #[tokio::test]
@@ -1112,6 +1208,25 @@ async fn elevation_notice_before_every_uac() {
         seen[..3],
         [ELEVATION_NOTICE, "uac", ELEVATION_GRANTED],
         "helper of a removal: {seen:?}"
+    );
+
+    // The helper deleting an HKLM key (orphan, duplicate record): the notice before its UAC.
+    let trace = Trace::default();
+    let bridge = ElevatedBridge::new(Box::new(UacTransport {
+        trace: std::sync::Arc::clone(&trace),
+        refuse: false,
+    }));
+    let _lost = bridge.delete_arp_key_lines(
+        MachineHive::Hklm64,
+        "App",
+        wingetrs::bridge::worker::DeleteReason::Orphan,
+        &mut |l: &str| trace.lock().unwrap().push(l.to_string()),
+    );
+    let seen = trace.lock().unwrap().clone();
+    assert_eq!(
+        seen[..3],
+        [ELEVATION_NOTICE, "uac", ELEVATION_GRANTED],
+        "helper of a key deletion: {seen:?}"
     );
 
     // Refused: the notice, the prompt, then the refusal (the job runs unelevated).
@@ -1302,4 +1417,92 @@ fn elevation_notice_same_text_cli_tui() {
         ELEVATION_REFUSED
     );
     assert_eq!(WingetOpsError::UacRefused.to_string(), ELEVATION_REFUSED);
+}
+
+/// Task 201: a Scoop hook or package installer cannot be cancelled once started: the CLI line
+/// and the TUI status bar say so, and past `NATIVE_QUIET` the CLI warns a window may wait.
+#[test]
+fn package_scripts_and_installers_are_uncancellable_in_cli_and_tui() {
+    use wingetrs::cli::output::NATIVE_QUIET;
+    use wingetrs::tui::app::{App, Msg, Running, job_uncancellable, update};
+    for phase in [
+        Phase::RunningScript {
+            hook: "post_install".into(),
+        },
+        Phase::RunningPackageInstaller {
+            file: "setup.exe".into(),
+        },
+    ] {
+        let base = Instant::now();
+        let mut ph = Phases::new();
+        ph.update_at(&ProgressEvent::Phase(phase.clone()), base);
+        let line = ph
+            .line_at(0, ascii(), base + Duration::from_secs(5))
+            .unwrap();
+        assert!(line.ends_with("· 00:05 · não pode ser cancelado"), "{line}");
+        let late = base + NATIVE_QUIET + Duration::from_secs(60);
+        let line = ph.line_at(0, ascii(), late).unwrap();
+        assert!(
+            line.contains("pode haver uma janela esperando resposta"),
+            "{line}"
+        );
+
+        let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+        a.now = base;
+        a.running = Some(Running {
+            id: 1,
+            label: "Instalar app".into(),
+            progress: None,
+            action: None,
+        });
+        update(&mut a, Msg::InstallPhase(phase.clone()));
+        assert!(job_uncancellable(&a), "{phase:?}");
+        a.now = base + Duration::from_secs(5);
+        let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+        assert!(
+            tui.ends_with(&phase_status(&phase, Duration::from_secs(5))),
+            "{tui}"
+        );
+    }
+}
+
+/// Task 201: a self-elevating installer keeps the UAC notice for at most
+/// `SELF_ELEVATION_WAIT` (its own prompt cannot be seen), then says it may still ask; the
+/// same in the CLI and the TUI (injected clock).
+#[test]
+fn self_elevating_notice_gives_way_after_two_minutes() {
+    use wingetrs::install::progress::{SELF_ELEVATION_LATER, SELF_ELEVATION_WAIT};
+    use wingetrs::tui::app::{App, Msg, Running, update};
+    assert_eq!(SELF_ELEVATION_WAIT, Duration::from_secs(120));
+    let phase = Phase::SelfElevating {
+        name: "Contoso App".into(),
+    };
+    let base = Instant::now();
+    let mut ph = Phases::new();
+    ph.update_at(&ProgressEvent::Phase(phase.clone()), base);
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.now = base;
+    a.running = Some(Running {
+        id: 1,
+        label: "Instalar Contoso App".into(),
+        progress: None,
+        action: None,
+    });
+    update(&mut a, Msg::InstallPhase(phase));
+    let before = base + SELF_ELEVATION_WAIT - Duration::from_secs(1);
+    let after = base + SELF_ELEVATION_WAIT;
+    let cli = ph.line_at(0, ascii(), before).unwrap();
+    assert!(cli.contains(ELEVATION_NOTICE), "{cli}");
+    assert!(cli.contains("· 01:59"), "{cli}");
+    a.now = before;
+    let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(tui.contains(ELEVATION_NOTICE), "{tui}");
+    let cli = ph.line_at(0, ascii(), after).unwrap();
+    assert!(!cli.contains(ELEVATION_NOTICE), "{cli}");
+    assert!(cli.contains(SELF_ELEVATION_LATER), "{cli}");
+    assert!(cli.contains("· 02:00 · não pode ser cancelado"), "{cli}");
+    a.now = after;
+    let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(!tui.contains(ELEVATION_NOTICE), "{tui}");
+    assert!(tui.contains(SELF_ELEVATION_LATER), "{tui}");
 }

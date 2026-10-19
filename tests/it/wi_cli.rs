@@ -69,6 +69,10 @@ struct FakeUi {
     picked_items: RefCell<Vec<Vec<String>>>,
     initials: RefCell<Vec<Vec<bool>>>,
     notices: RefCell<Vec<String>>,
+    /// The command's result lines (stdout).
+    outputs: RefCell<Vec<String>>,
+    /// How many times the progress line was ended.
+    ended: Cell<usize>,
 }
 
 impl Ui for FakeUi {
@@ -95,6 +99,12 @@ impl Ui for FakeUi {
     }
     fn notice(&self, text: &str) {
         self.notices.borrow_mut().push(text.to_string());
+    }
+    fn output(&self, text: &str) {
+        self.outputs.borrow_mut().push(text.to_string());
+    }
+    fn end_progress(&self) {
+        self.ended.set(self.ended.get() + 1);
     }
 }
 
@@ -285,8 +295,20 @@ impl WingetFlows for Fake {
     ) -> Op<Result<InstallReport, UpgradeError>> {
         unreachable!("no upgrade in these tests")
     }
-    fn upgrade_bridge(&self, _: &BridgeJob, _: &mut dyn FnMut(&str)) -> Result<Done, InstallFail> {
-        unreachable!("no upgrade in these tests")
+    /// winget through the session's helper: its UAC notice, then winget's own line.
+    fn upgrade_bridge(
+        &self,
+        job: &BridgeJob,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<Done, InstallFail> {
+        self.bridged.set(self.bridged.get() + 1);
+        on_line(wingetrs::install::progress::ELEVATION_NOTICE);
+        on_line(wingetrs::install::progress::ELEVATION_GRANTED);
+        on_line("Instalando o pacote...");
+        Ok(Done {
+            summary: format!("{}: atualizado", job.name),
+            residues: None,
+        })
     }
     fn orphans(&self) -> anyhow::Result<Vec<Orphan>> {
         Ok(self.orphans.clone())
@@ -294,7 +316,19 @@ impl WingetFlows for Fake {
     fn backups(&self) -> PathBuf {
         self.backups.clone()
     }
-    fn remove_orphan(&self, o: &Orphan, ts: &str) -> Result<PathBuf, String> {
+    fn remove_orphan(
+        &self,
+        o: &Orphan,
+        ts: &str,
+        progress: &dyn Fn(&ProgressEvent),
+    ) -> Result<PathBuf, String> {
+        // As `orphans::remove_orphan_with`: an HKLM key opens the helper's UAC prompt.
+        progress(&ProgressEvent::Phase(Phase::Removing {
+            app: o.name.clone(),
+        }));
+        if o.hive != Hive::User {
+            progress(&ProgressEvent::Phase(Phase::WaitingElevation));
+        }
         self.removed.borrow_mut().push(o.key.clone());
         Ok(self.backups.join(ts).join(format!("{}.reg", o.key)))
     }
@@ -1875,4 +1909,114 @@ async fn kindle_without_terminal_refused() {
     assert!(!fake.backups.exists(), "nothing copied");
     let s = screen.lock().unwrap();
     assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
+}
+
+/// Task 201: `upgrade` through winget shows the bridge's phase from the start (stderr), the
+/// helper's UAC notice as a phase (never a printed line), and winget's own lines on stdout.
+#[test]
+fn bridge_upgrade_progress_and_stdout() {
+    use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE};
+    use wingetrs::installed::correlate::UpdateState;
+    let mut r = row("Contoso App", "arp/hklm64/Contoso", Some("Pub.App"));
+    r.state = UpdateState::Available {
+        latest: "2.0".into(),
+    };
+    let fake = Fake {
+        rows: vec![r],
+        planned: Some(PlanOrBridge::Bridge("motivo".into())),
+        ..Default::default()
+    };
+    let ui = FakeUi::default();
+    let (_tx, mut rx) = quiet();
+    let gate = LaunchGate::default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut out = Vec::new();
+    rt.block_on(winget_cmd::upgrade(
+        &fake,
+        &ui,
+        "Pub.App",
+        yes(),
+        Stop::new(&mut rx, &gate),
+        &mut |l: &str| out.push(l.to_string()),
+    ))
+    .unwrap();
+    assert_eq!(fake.bridged.get(), 1);
+    let bridge = Phase::Bridge {
+        tool: "winget".into(),
+    };
+    let phases: Vec<Phase> = fake
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::Phase(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        [bridge.clone(), Phase::WaitingElevation, bridge],
+        "the tool's phase, the UAC notice, the tool's phase again"
+    );
+    assert!(phase_title(&Phase::WaitingElevation).starts_with(ELEVATION_NOTICE));
+    // winget's lines are the command's result: stdout, never the stderr notices.
+    assert_eq!(
+        *ui.outputs.borrow(),
+        [
+            format!("  {ELEVATION_GRANTED}"),
+            "  Instalando o pacote...".to_string()
+        ]
+    );
+    assert!(ui.notices.borrow().is_empty(), "{:?}", ui.notices.borrow());
+    assert!(
+        !ui.outputs
+            .borrow()
+            .iter()
+            .any(|l| l.contains(ELEVATION_NOTICE))
+    );
+    assert!(
+        ui.ended.get() >= 1,
+        "the progress line ends before the result"
+    );
+    assert!(out.iter().any(|l| l.contains("Atualizado:")), "{out:?}");
+}
+
+/// Task 201: `cleanup --orphans` on an HKLM key: the removal's phases (the helper's UAC notice
+/// among them) go to the progress line, which ends before the results are printed.
+#[test]
+fn cleanup_hklm_orphan_shows_uac_notice() {
+    let t = TempDir::new().unwrap();
+    let mut o = orphan("M");
+    o.hive = Hive::MachineX64;
+    let fake = Fake {
+        orphans: vec![o],
+        backups: t.path().join("backups"),
+        ..Default::default()
+    };
+    let ui = FakeUi::default();
+    let (r, out) = cleanup(
+        &fake,
+        &ui,
+        CleanupArgs {
+            orphans: true,
+            yes: true,
+            dry_run: false,
+        },
+    );
+    r.unwrap();
+    let events = fake.events.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        [
+            ProgressEvent::Phase(Phase::Removing {
+                app: "App M".into()
+            }),
+            ProgressEvent::Phase(Phase::WaitingElevation),
+        ]
+    );
+    assert_eq!(ui.ended.get(), 1);
+    assert!(out.iter().any(|l| l.contains("Removido: App M")), "{out:?}");
 }

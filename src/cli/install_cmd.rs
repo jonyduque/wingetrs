@@ -44,6 +44,11 @@ pub trait Ui {
     fn end_progress(&self) {}
     /// A line printed once above the progress line (e.g. why Ctrl+C did nothing).
     fn notice(&self, _text: &str) {}
+    /// A line of the command's result on stdout (e.g. the output of winget or scoop through
+    /// the bridge), printed above the progress line, which stays on stderr.
+    fn output(&self, text: &str) {
+        anstream::println!("{text}");
+    }
 }
 
 /// Said once when Ctrl+C arrives while an uncancellable step runs (`LaunchGate::running`:
@@ -210,6 +215,10 @@ impl Ui for TtyUi {
 
     fn notice(&self, text: &str) {
         self.progress.notice(text);
+    }
+
+    fn output(&self, text: &str) {
+        self.progress.stdout_line(text);
     }
 
     fn interactive(&self) -> bool {
@@ -408,6 +417,25 @@ impl LineProgress {
             return;
         }
         *self.state.notice.lock().unwrap_or_else(|p| p.into_inner()) = Some(text.to_string());
+        self.state.draw();
+    }
+
+    /// Prints `text` on stdout: the progress line (stderr, same terminal) is erased first and
+    /// drawn again on the next tick, so the two never share a row.
+    pub fn stdout_line(&self, text: &str) {
+        if !self.tty || self.state.closed.load(Ordering::Relaxed) {
+            anstream::println!("{text}");
+            return;
+        }
+        let mut err = std::io::stderr().lock();
+        let width = self.state.drawn.swap(0, Ordering::Relaxed);
+        if width > 0 {
+            let _ = write!(err, "\r{:<width$}\r", "");
+            let _ = err.flush();
+        }
+        anstream::println!("{text}");
+        let _ = std::io::stdout().flush();
+        drop(err);
         self.state.draw();
     }
 

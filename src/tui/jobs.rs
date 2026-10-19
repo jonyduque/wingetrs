@@ -14,13 +14,12 @@ use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue};
 use crate::install::script_scan::CallRoots;
 use crate::install::state::StateDb;
-use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use crate::winget_install::engine::{self, UpgradeError, UpgradeRoute, upgrade_route};
 use crate::winget_install::ops::{self as winget_ops, WingetCtx, WingetOpsError};
-use crate::winget_install::orphans::{ArpRegistry, remove_orphan};
+use crate::winget_install::orphans::{ArpRegistry, remove_orphan_with};
 use crate::winget_install::plan::WingetPlan as NativePlan;
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::uninstall::{
@@ -118,7 +117,9 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::Uninstalling { .. }
             | Phase::CheckingRemoval { .. }
             | Phase::SelfElevating { .. }
-            | Phase::Bridge { .. }),
+            | Phase::Bridge { .. }
+            | Phase::RunningScript { .. }
+            | Phase::RunningPackageInstaller { .. }),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }
@@ -685,22 +686,24 @@ async fn run_winget_inner(
             winget_removal(env, &plan, RemovalChoice::RegistryOnly).await
         }
         Action::RemoveOrphan(o) => {
+            // A live line from the first instant: the `install.lock` wait is silent.
+            phase_of(env, Phase::Preparing);
             let layout = env.install.data.install_layout();
             let _lock = match winget_ops::lock_install(&layout, env.install.wait).await {
                 Ok(l) => l,
                 Err(e) => return failed(winget_fail(e)),
             };
-            if let Err(f) =
-                start_removal(env, removal::removal_phase(o.hive != Hive::User, &o.name))
-            {
+            // `Removendo`; an HKLM key: the helper's UAC notice while its prompt is open.
+            if let Err(f) = start_removal(env, removal::removal_phase(false, &o.name)) {
                 return failed(f);
             }
-            match remove_orphan(
+            match remove_orphan_with(
                 env.registry,
                 env.install.elevated,
                 env.backups,
                 &env.stamp,
                 &o,
+                env.install.progress,
             ) {
                 Ok(file) => (
                     Ok(Done {

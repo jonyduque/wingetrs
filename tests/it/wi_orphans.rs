@@ -444,3 +444,47 @@ fn folder_refusal_is_its_own_error() {
     );
     assert!(!shown.contains("sem permissão"), "{shown}");
 }
+
+/// Task 201: an HKLM orphan goes through the session's helper, whose UAC prompt shows the
+/// notice phase until the helper runs; then back to `Removendo`.
+#[test]
+fn hklm_orphan_shows_uac_notice_phase() {
+    use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, Phase, ProgressEvent};
+    use wingetrs::winget_install::orphans::remove_orphan_with;
+
+    /// A helper that opens its UAC prompt before deleting.
+    struct Prompting(FakeElevated);
+    impl ElevatedRunner for Prompting {
+        fn delete_arp_key_lines(
+            &self,
+            hive: MachineHive,
+            key: &str,
+            reason: DeleteReason,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<(), ElevatedError> {
+            on_line(ELEVATION_NOTICE);
+            on_line(ELEVATION_GRANTED);
+            self.0.delete_arp_key(hive, key, reason)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let el = Prompting(FakeElevated::default());
+    let reg = FakeReg::new(Some(utf16le(&reg_text("HKEY_LOCAL_MACHINE", "k1"))));
+    let events = Mutex::new(Vec::new());
+    let progress = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
+    let o = orphan(Hive::MachineX64, "k1");
+    remove_orphan_with(&reg, &el, dir.path(), "ts11", &o, &progress).unwrap();
+    let removing = ProgressEvent::Phase(Phase::Removing {
+        app: o.name.clone(),
+    });
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            removing.clone(),
+            ProgressEvent::Phase(Phase::WaitingElevation),
+            removing,
+        ]
+    );
+    assert_eq!(el.0.deletes.lock().unwrap().len(), 1);
+}
