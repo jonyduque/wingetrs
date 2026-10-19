@@ -190,3 +190,85 @@ Testes (`tests/it/install_progress.rs`):
 5. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat(install): typed progress phases with live signs in the CLI and the TUI`
+
+
+---
+
+## Depois das fases 2c/2d (pedido do usuário em 2026-10-18)
+
+Pedido literal: "Quero que todas as saídas do CLI sejam devidamente formatadas. Além disso, opções devem ser sempre em forma de TUI. Sempre deve ser mostrado progresso, em todas as formas de instalações, atualizações e desinstalações. Quando for abrir solicitação de elevação, deve mostrar um aviso no CLI e TUI como 'aguardando autorização para executar como administrador'." Começa quando as Tasks 164, 192, 196 e 197 fecharem (antes da prova ao vivo final).
+
+### Task 199: Inventário e formatação de toda saída do CLI
+
+**Modelo:** opus (revisor opus).
+
+#### Where this fits
+
+- Saída do CLI: `src/cli/output.rs` (formatadores puros), `src/cli/style.rs` (`choose` de cor, TTY, `NO_COLOR`/`CLICOLOR_FORCE`), `src/cli/install_cmd.rs` (29 `println!`/`eprintln!` em 2026-10-18), `src/cli/winget_cmd.rs` (9), `src/cli/mod.rs` (5); glifos em `tui::theme::Glyphs`.
+- Regra do `CLAUDE.md` (UX): número em negrito, glifos, só as etapas que o usuário precisa considerar; URL/hash/staging só no `--dry-run`.
+
+#### What binds this task
+
+1. Inventário (no relatório) de **toda** linha que o CLI escreve, por comando (`update`, `search`, `show`, `list`, `install`, `uninstall`, `upgrade`, `cleanup`, erros do `anyhow` na borda, `--help`): onde nasce e como sai hoje.
+2. Toda saída passa por formatadores de `output.rs` (nenhum `println!` com texto montado fora dele): títulos e nomes em negrito, números de lista em negrito, sucesso/aviso/erro com glifo e cor de `style.rs`, caminhos e ids em estilo próprio, tabelas alinhadas pela largura real (caracteres largos/acentos). Sem cor e sem ANSI quando não é TTY, `NO_COLOR` ou `--color never`.
+3. Mensagens de erro: uma linha "✗ <o que falhou>" + uma linha "→ <o que fazer>" quando houver ação possível; cadeia de causas do `anyhow` só com `-v`.
+4. Teste de regra mecânica em `scripts/check_rules.ps1`: `println!`/`eprintln!`/`print!` em `src/cli/` só dentro de `output.rs` e de um módulo de escrita único (prove plantando a violação).
+
+#### Tests (literais)
+
+- Snapshots (`insta` já em uso nos testes de help? se não, texto literal) de cada comando em TTY com cor, TTY sem cor e não TTY.
+- `error_has_action_line`, `no_ansi_when_not_tty`, `wide_chars_align_table`.
+
+**Files:** `src/cli/*`, `scripts/check_rules.ps1`, testes `tests/it/cli_*`.
+
+**Commit:** `feat(cli): every output line goes through the formatter`
+
+### Task 200: Escolhas do CLI sempre como seletor no estilo TUI
+
+**Modelo:** opus (revisor opus).
+
+#### Where this fits
+
+- Perguntas de hoje: `install_cmd.rs` ~:24 trait com `fn confirm(&self, question)` (implementação real ~:178 lê `stdin`), `choose` ~:607, `src/cli/picker.rs` (seletor existente: veja se já é interativo), escolhas do caso Kindle (Task 193), confirmação por item do `msiexec` (2b), consentimento de scripts (Task 161), órfãos (`cleanup --orphans`).
+- `ratatui`/`crossterm` já são dependências (TUI).
+
+#### What binds this task
+
+1. Um componente único de escolha para o CLI (lista com setas, Enter confirma, Esc/q cancela, atalho por letra, item padrão destacado, glifos e cores do tema), desenhado inline (sem tela alternativa), que limpa o que desenhou ao terminar e deixa uma linha com a escolha feita.
+2. **Toda** pergunta do CLI usa esse componente: sim/não, escolha entre opções (Kindle: copiar e remover / só o registro / cancelar), seleção múltipla (órfãos, itens de lote) com espaço para marcar.
+3. Sem terminal (stdin/stdout não TTY): nunca pergunta; sem `--yes` recusa com a mensagem de qual flag usar; `--yes` nunca escolhe por cima do que exige escolha do usuário (regra existente).
+4. Ctrl+C dentro do seletor = cancelar, terminal restaurado (raw mode desligado em todos os caminhos, inclusive pânico: guard com `Drop`).
+
+#### Tests (literais)
+
+- Seletor dirigido por eventos injetados (setas, Enter, Esc, espaço, letra) ⇒ resultado; buffer desenhado comparado a texto.
+- `selector_restores_terminal_on_panic` (guard), `no_tty_never_prompts`.
+- Um teste por pergunta existente provando que ela usa o componente.
+
+**Files:** `src/cli/picker.rs` (ou novo `src/cli/select.rs`), `src/cli/install_cmd.rs`, `src/cli/winget_cmd.rs`, testes `tests/it/cli_*`.
+
+**Commit:** `feat(cli): every choice is an inline TUI selector`
+
+### Task 201: Progresso em toda instalação, atualização e remoção; aviso de elevação
+
+**Modelo:** opus (revisor opus).
+
+#### Where this fits
+
+- Fases tipadas (`install::progress`, Tasks 139/141) e as fases da 2d (`WaitingElevation`, `Uninstalling`, `CheckingRemoval`, Task 193); `winget_install::removal`; executor do Scoop; ponte do winget; MSIX (`PackageManager`); reserva `msiexec /a`; scripts (`PwshHost`); innounp; lote na TUI.
+- Pontos que abrem UAC: subida do `bridge-worker` (`elevate_win.rs`), `runas` por instalador (Task 196), exe que se eleva sozinho (`ElevationRequirement: elevatesSelf`), `msiexec /a` da reserva quando pede elevação.
+
+#### What binds this task
+
+1. Matriz (no relatório) de cada caminho × (instalar, atualizar, remover) × (CLI, TUI): que fases aparecem, do primeiro instante ao fim. Todo caminho tem fase com spinner e relógio desde o início, aviso de lentidão e "não pode ser cancelado" quando for o caso. Falta ⇒ corrigir.
+2. Antes de **todo** pedido de elevação, CLI e TUI mostram "Aguardando autorização para executar como administrador" (mesmo texto, uma constante), com o relógio correndo, até o UAC voltar; recusado ⇒ "Permissão de administrador recusada." Exe que se eleva sozinho: o aviso aparece quando o manifesto diz `elevatesSelf`/`elevationRequired`.
+3. Teste por caminho da matriz com progresso falso/eventos capturados; teste de que o texto do aviso é o mesmo constante nos dois lados.
+
+#### Tests (literais)
+
+- `every_path_emits_first_phase_immediately` (tabela de caminhos, eventos capturados).
+- `elevation_notice_before_every_uac` (worker, runas por instalador, elevatesSelf) e `elevation_notice_same_text_cli_tui`.
+
+**Files:** `src/install/progress.rs`, `src/cli/output.rs`, `src/tui/*` (barra de status e jobs), `src/winget_install/*`, `src/bridge/elevate_win.rs`; testes existentes.
+
+**Commit:** `feat: progress on every install path and an elevation notice before every UAC`
