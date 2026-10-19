@@ -5,6 +5,7 @@ Status: DONE
 Commits:
 ```
 1ce073c fix: plan texts from the final dry-run preflight
+e302976 fix(winget_install): winget product-code records uninstall through the bridge
 ```
 
 Gate:
@@ -154,5 +155,8 @@ Decisions:
 
 Concerns:
 - Testes existentes alterados porque o comportamento mudou de propósito: `bridge_reason_is_printed` (agora exige que o motivo chegue ao `install_bridge` e que não haja "Instalando"), `tui_confirmation_and_cli_uninstall_list_the_same_steps` (`steps() >= 3` virou `>= 2`, e agora compara também os avisos da CLI e da TUI e a ordem passos → avisos), `norestart_and_install_all_users_pass_as_exact_literals` (`PrependPath=1` saiu da lista de recusa e `PrependPath=2` entrou), `plan_text_is_the_confirmation` e `winget_dry_run_shows_url_and_sha256` (hash em maiúsculas), snapshots `tty_color`/`tty_plain` (passos de remoção e o plano novo da ponte).
-- Item 1 só corrige o texto. A remoção nativa do jq de verdade continua tentando rodar `winget uninstall --product-code …` como programa, e `uninstall()` recusa com "desinstalador sem caminho absoluto" (`uninstall.rs` ~l.430). Não medi se o fluxo real manda pacotes instalados pelo winget para a ponte antes de chegar ali.
+- Item 1 (resolvido na rodada 2, commit `e302976`): o plano dizia "Remove pelo winget", mas a execução recusava com "desinstalador sem caminho absoluto". Agora uma função só, `uninstall::winget_product_code`, decide o passo do plano e a rota da execução. Ela aceita só `winget uninstall --product-code <id simples>`, com a linha inteira em `program` ou separada em `program`/`args`. `uninstall_queued` (chamado pela CLI e pela TUI via `removal::run_uninstaller`) desvia para o executor da ponte antes de qualquer checagem de comando nativo: novo campo `UninstallCtx::bridge`, que em produção é o `run_tool` da CLI/TUI (`spawn_win::run`, sem elevação), com `winget uninstall --product-code <id> --exact --silent --disable-interactivity --accept-source-agreements`. Depois espera a chave ARP sumir. Esse registro planeja com `Elevation::Never`, porque o próprio winget pede o UAC. Arquivos a mais: `src/cli/run_win.rs` e `src/tui/run.rs` (o campo novo); os testes `install_progress.rs` e `wi_upgrade.rs` (o fake `no_bridge`).
+  - Testes: `wi_uninstall_flow::winget_record_plan_and_run_take_the_bridge` (a mesma linha ARP, em HKCU e HKLM, dá o passo "Remove pelo winget"; o executor falso da ponte é chamado 1 vez com o id; o launcher e o auxiliar, 0 vezes) e `winget_record_failure_and_other_lines` (o código de erro do winget vira o erro da remoção; outras linhas nunca chegam ao winget).
+  - Mutação: `[OK] mutação PEGA: '    if let Some(id) = winget_product_code(c) {' -> '    if let Some(id) = winget_product_code(c).filter(|_| false) {' fez o teste falhar (exit 101).`
+  - Gate da rodada 2: `[OK]   test (1903 passed, 87 ignored) 84s` / `[OK]   gate verde`.
 - O passo "O instalador pode pedir permissão de administrador" aparece em todo instalador não elevado com `elevatesSelf`/`elevationRequired`, inclusive `exe` sem escopo (`Elevation::Never`).
