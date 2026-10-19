@@ -1121,3 +1121,52 @@ fn tui_confirmation_and_cli_plan_list_the_same_steps() {
         assert!(!text.contains("SHA-256"), "{text}");
     }
 }
+/// The numbered steps of a CLI plan, without number and warning glyph.
+fn cli_steps(cli: &str) -> Vec<String> {
+    cli.lines()
+        .filter_map(|l| l.trim_start().split_once(". "))
+        .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map(|(_, s)| s.trim_start_matches("⚠ ").to_string())
+        .collect()
+}
+
+/// The TUI confirmation and the CLI plan of the same ARP removal list the same steps, in the
+/// same order (both read `UninstallPlan::steps`); the command line only in the CLI dry run.
+#[test]
+fn tui_confirmation_and_cli_uninstall_list_the_same_steps() {
+    use wingetrs::cli::{output::winget_uninstall_text, style::with_enabled};
+    let mut plan = kindle_plan(true);
+    plan.command = Some(wingetrs::winget_install::uninstall_cmd::UninstallCommand {
+        rule: wingetrs::winget_install::uninstall_cmd::Rule::Nsis,
+        program: r"C:\K\uninst.exe".into(),
+        args: "/S /kindle".into(),
+        interactive: false,
+    });
+    plan.elevation = Elevation::Helper;
+    assert!(plan.steps().len() >= 3, "{:?}", plan.steps());
+    let mut a = on_installed(vec![kindle_row()]);
+    update(&mut a, key(KeyCode::Enter));
+    pick(&mut a, "Remover o registro HKLM (32 bits)");
+    update(&mut a, Msg::WingetUninstallPlanned(Ok(plan.clone())));
+    let tui: Vec<String> = match &a.modal {
+        Some(Modal::Confirm { notes, .. }) => notes.clone(),
+        _ => panic!("confirmation not open"),
+    };
+    let cli = with_enabled(false, || winget_uninstall_text(&plan, false));
+    assert_eq!(cli_steps(&cli), plan.steps(), "{cli}");
+    let tui_steps: Vec<String> = tui
+        .iter()
+        .filter(|n| plan.steps().contains(n))
+        .cloned()
+        .collect();
+    assert_eq!(tui_steps, plan.steps(), "{tui:?}");
+    let command = plan.command.as_ref().unwrap();
+    for text in [cli.as_str(), &tui.join("\n")] {
+        assert!(!text.contains(&command.args), "{text}");
+    }
+    let dry = with_enabled(false, || winget_uninstall_text(&plan, true));
+    assert!(
+        dry.contains(&format!("Comando: {}", command.program)),
+        "{dry}"
+    );
+}

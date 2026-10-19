@@ -198,7 +198,7 @@ pub(super) async fn install_bridge(
     )));
     if !f.yes || f.dry_run {
         for line in agreement_lines(&agreements, false) {
-            emit::out(&output::plan_text(&line));
+            emit::out(&output::license(&line));
         }
     }
     if f.dry_run {
@@ -213,7 +213,7 @@ pub(super) async fn install_bridge(
     }
     if f.yes {
         for line in agreement_lines(&agreements, true) {
-            emit::out(&output::plan_text(&line));
+            emit::out(&output::license(&line));
         }
     }
     let msi_lock = ctx.data.install_layout().msi_lock();
@@ -492,7 +492,7 @@ pub async fn install<F: WingetFlows>(
     }
     if f.yes {
         for line in agreement_lines(&plan.agreements, true) {
-            say(&output::plan_text(&line));
+            say(&output::license(&line));
         }
     }
     let info = JobInfo {
@@ -592,10 +592,14 @@ pub async fn uninstall<F: WingetFlows>(
         return Ok(());
     };
     if purge {
-        bail!(
-            "--purge só vale para apps do wingetrs ({} foi instalado por outro programa)",
-            row.name
-        );
+        return Err(output::Advice::new(
+            format!(
+                "--purge só vale para apps do wingetrs ({} foi instalado por outro programa)",
+                row.name
+            ),
+            "rode de novo sem --purge",
+        )
+        .into());
     }
     let t = target_of(&row.app_key).ok_or_else(|| {
         anyhow!(
@@ -608,7 +612,7 @@ pub async fn uninstall<F: WingetFlows>(
         .plan_uninstall(row, &t)
         .await
         .map_err(anyhow::Error::msg)?;
-    say(&output::plan_text(plan.to_string().trim_end()));
+    say(output::winget_uninstall_text(&plan, f.dry_run).trim_end());
     if f.dry_run {
         say(output::DRY_RUN_DONE);
         return Ok(());
@@ -793,10 +797,11 @@ pub async fn upgrade<F: WingetFlows>(
         );
     };
     if crate::pins::is_pinned(&flows.pins(), &row.origin, &row.name) {
-        bail!(
-            "{} está com a versão fixada; desafixe na TUI (menu de ações)",
-            row.name
-        );
+        return Err(output::Advice::new(
+            format!("{} está com a versão fixada", row.name),
+            "desafixe na TUI (menu de ações)",
+        )
+        .into());
     }
     let b = flows.behavior();
     let (engine, previous) = match b.winget_engine {
@@ -821,7 +826,7 @@ pub async fn upgrade<F: WingetFlows>(
     }
     if f.yes {
         for line in agreement_lines(&plan.agreements, true) {
-            say(&output::plan_text(&line));
+            say(&output::license(&line));
         }
     }
     let info = JobInfo {

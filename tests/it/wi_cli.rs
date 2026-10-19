@@ -1496,11 +1496,11 @@ fn winget_wording_says_things_once() {
     };
     let text = plan.to_string();
     assert!(text.starts_with("Desinstalar jq 1.7.1\n"), "{text}");
-    assert!(!text.contains("abre a janela"), "{text}");
-    assert!(text.contains("remove pelo winget"), "{text}");
+    assert!(!text.contains("Abre a janela"), "{text}");
+    assert!(text.contains("Remove pelo winget"), "{text}");
     let mut other = plan.clone();
     other.command.as_mut().unwrap().program = r"C:\jq\uninst.exe".into();
-    assert!(other.to_string().contains("abre a janela do desinstalador"));
+    assert!(other.to_string().contains("Abre a janela do desinstalador"));
 
     let mut root = Cli::command();
     root.build();

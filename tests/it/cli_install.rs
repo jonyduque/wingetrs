@@ -562,3 +562,18 @@ async fn yes_does_not_allow_msiexec() {
     assert!(!se.contains("rode de novo com --allow-msiexec"), "{se}");
     assert!(!lab.root.join("apps").join("m").exists());
 }
+
+/// `--scope` on a Scoop app: what failed, then what to do (Task 199).
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_on_a_scoop_app_says_what_to_do() {
+    let server = MockServer::start().await;
+    let lab = Lab::new(&server, "t199-scope").await;
+    let out = tokio::task::block_in_place(|| {
+        lab.run(&["install", "solo", "--scope", "user", "--dry-run"])
+    });
+    assert!(!out.status.success());
+    assert_eq!(
+        text(&out.stderr),
+        "✗ --scope só vale para pacotes do winget\n→ rode de novo sem --scope\n"
+    );
+}

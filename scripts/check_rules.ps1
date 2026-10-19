@@ -20,8 +20,10 @@ $rules = @(
     # The TUI owns the terminal: stdout only from main.rs and cli/.
     @{ Name = 'println fora de main/cli'; Pattern = '\b(e?println!|e?print!)\('; Skip = '(^|[\\/])src[\\/](main\.rs|cli[\\/])' },
     # Task 199: inside cli/ every line goes out through emit.rs, with its text from output.rs
-    # (glyph, color, alignment in one place). A locked stdout/stderr is a print by another name.
-    @{ Name = 'saida do CLI fora de cli/emit.rs'; Pattern = '\b(e?println!|e?print!)\(|\bstd(out|err)\(\)\s*\.lock\(\)'; Skip = '^(?!(.*[\\/])?src[\\/]cli[\\/])|(^|[\\/])src[\\/]cli[\\/]emit\.rs$' },
+    # (glyph, color, alignment in one place). Any stdout()/stderr() handle (std::io or anstream,
+    # locked or not, `write!` or `write_all`) and dbg! are a print by another name; only the
+    # selector (picker.rs) owns its terminal.
+    @{ Name = 'saida do CLI fora de cli/emit.rs'; Pattern = '\b(e?println!|e?print!|dbg!)\(|\bstd(out|err)\(\)'; Skip = '^(?!(.*[\\/])?src[\\/]cli[\\/])|(^|[\\/])src[\\/]cli[\\/](emit|picker)\.rs$' },
     # Platform code lives in *_win.rs behind cfg on the module, never inline.
     @{ Name = 'cfg!(windows) na logica'; Pattern = 'cfg!\(\s*windows\s*\)'; Skip = '' },
     # Colors only through theme tokens.

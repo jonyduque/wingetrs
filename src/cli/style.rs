@@ -3,7 +3,6 @@
 use anstream::ColorChoice;
 pub use anstyle::Style;
 use anstyle::{AnsiColor, Effects};
-use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const fn fg(c: AnsiColor) -> Style {
@@ -44,31 +43,58 @@ pub enum ColorArg {
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Glyph set of the status lines: 0 = unicode (default, and always off a terminal), 1 = nerd,
-/// 2 = ascii.
+/// Glyph set of the status lines on stdout and on stderr: 0 = unicode (default, and always
+/// off a terminal), 1 = nerd, 2 = ascii.
 static GLYPHS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static GLYPHS_ERR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// The glyphs of the status lines (`✓`, `⚠`, `✗`, `→` in the unicode set).
+std::thread_local! {
+    /// Set while a stderr line is built ([`on_stderr`]).
+    static ON_STDERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The glyphs of the status lines (`✓`, `⚠`, `✗`, `→` in the unicode set), of stderr's set
+/// inside [`on_stderr`], else of stdout's.
 pub fn glyphs() -> &'static crate::tui::theme::Glyphs {
     use crate::tui::theme::{GlyphSet, Glyphs};
-    Glyphs::for_set(match GLYPHS.load(Ordering::Relaxed) {
+    let slot = if ON_STDERR.with(std::cell::Cell::get) {
+        &GLYPHS_ERR
+    } else {
+        &GLYPHS
+    };
+    Glyphs::for_set(match slot.load(Ordering::Relaxed) {
         1 => GlyphSet::Nerd,
         2 => GlyphSet::Ascii,
         _ => GlyphSet::Unicode,
     })
 }
 
-/// Uses `set` for the status lines when stdout is a terminal; off a terminal they stay unicode
-/// (a log or a pipe is read without the Nerd font).
-pub fn init_glyphs(set: crate::tui::theme::GlyphSet) {
+/// Builds a stderr line: the glyphs inside `f` follow stderr's terminal, not stdout's.
+pub fn on_stderr<T>(f: impl FnOnce() -> T) -> T {
+    let prev = ON_STDERR.with(|o| o.replace(true));
+    let out = f();
+    ON_STDERR.with(|o| o.set(prev));
+    out
+}
+
+/// The glyph code of one stream: `set` on a terminal, unicode off it.
+fn glyph_code(set: crate::tui::theme::GlyphSet, tty: bool) -> u8 {
     use crate::tui::theme::GlyphSet;
-    let n = match set {
-        _ if !std::io::stdout().is_terminal() => 0,
+    match set {
+        _ if !tty => 0,
         GlyphSet::Nerd => 1,
         GlyphSet::Ascii => 2,
         GlyphSet::Unicode => 0,
-    };
-    GLYPHS.store(n, Ordering::Relaxed);
+    }
+}
+
+/// Uses `set` for the status lines of each stream that is a terminal; a stream off a terminal
+/// stays unicode (a log or a pipe is read without the Nerd font).
+pub fn init_glyphs(set: crate::tui::theme::GlyphSet) {
+    let out = glyph_code(set, super::emit::stdout_is_terminal());
+    let err = glyph_code(set, super::emit::stderr_is_terminal());
+    GLYPHS.store(out, Ordering::Relaxed);
+    GLYPHS_ERR.store(err, Ordering::Relaxed);
 }
 
 std::thread_local! {
@@ -79,6 +105,29 @@ fn enabled() -> bool {
     OVERRIDE
         .with(std::cell::Cell::get)
         .unwrap_or_else(|| ENABLED.load(Ordering::Relaxed))
+}
+
+/// Columns of the terminal stdout writes to; 0 = not a terminal (tables keep full cells).
+static TABLE_COLUMNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+    static COLUMNS_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The width tables must fit in (stdout's terminal), or `None` off a terminal.
+pub fn table_columns() -> Option<usize> {
+    let n = COLUMNS_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| TABLE_COLUMNS.load(Ordering::Relaxed));
+    (n > 0).then_some(n)
+}
+
+/// Runs `f` as if stdout were a terminal of `cols` columns (0 = not a terminal) (tests).
+pub fn with_columns<T>(cols: usize, f: impl FnOnce() -> T) -> T {
+    let prev = COLUMNS_OVERRIDE.with(|o| o.replace(Some(cols)));
+    let out = f();
+    COLUMNS_OVERRIDE.with(|o| o.set(prev));
+    out
 }
 
 /// Runs `f` with painting forced on or off on this thread (tests).
@@ -123,11 +172,14 @@ fn force_from(v: Option<&std::ffi::OsStr>) -> bool {
 /// Decides from the environment and installs the choice for painting and for `anstream`.
 pub fn init(flag: ColorArg) {
     let var = |k: &str| std::env::var_os(k);
-    let is_tty = std::io::stdout().is_terminal();
+    let is_tty = super::emit::stdout_is_terminal();
     let no_color = var("NO_COLOR").is_some_and(|v| !v.is_empty());
     let force = force_from(var("CLICOLOR_FORCE").as_deref());
     let chosen = choose(flag, is_tty, no_color, force);
     ENABLED.store(chosen == ColorChoice::Always, Ordering::Relaxed);
+    if is_tty && let Ok((cols, _)) = crossterm::terminal::size() {
+        TABLE_COLUMNS.store(usize::from(cols), Ordering::Relaxed);
+    }
     // On a terminal let anstream enable VT (or convert) itself.
     let global = if flag == ColorArg::Auto && chosen == ColorChoice::Always && is_tty && !force {
         ColorChoice::Auto
@@ -203,6 +255,18 @@ mod tests {
         assert!(!force_from(Some(OsStr::new(""))));
         assert!(!force_from(Some(OsStr::new("0"))));
         assert!(force_from(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn glyphs_follow_each_stream() {
+        use crate::tui::theme::GlyphSet::{Ascii, Nerd, Unicode};
+        assert_eq!(glyph_code(Nerd, true), 1);
+        assert_eq!(glyph_code(Nerd, false), 0);
+        assert_eq!(glyph_code(Ascii, true), 2);
+        assert_eq!(glyph_code(Unicode, true), 0);
+        // Stderr's slot inside `on_stderr`, stdout's outside (both unicode by default).
+        assert!(on_stderr(|| ON_STDERR.with(std::cell::Cell::get)));
+        assert!(!ON_STDERR.with(std::cell::Cell::get));
     }
 
     #[test]

@@ -112,59 +112,85 @@ pub fn human_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-impl fmt::Display for UninstallPlan {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            f,
+/// Plan line of a removal that runs elevated (its own UAC).
+pub const UNINSTALL_ADMIN_PROMPT: &str = "Pede permissão de administrador (UAC)";
+
+impl UninstallPlan {
+    /// `Desinstalar jq 1.7.1`: the first line of every confirmation (CLI and TUI).
+    pub fn title(&self) -> String {
+        format!(
             "Desinstalar {}",
             super::plan::name_version(&self.name, self.version.as_deref())
-        )?;
+        )
+    }
+
+    /// What the user must consider before saying yes, one capitalized line each. The CLI
+    /// numbers them and the TUI lists them: both read this list.
+    pub fn steps(&self) -> Vec<String> {
+        let mut out = Vec::new();
         match (&self.target, &self.command) {
             (UninstallTarget::Msix { family }, _) => {
-                writeln!(f, "  remove o pacote MSIX {family} (só deste usuário)")?;
+                out.push(format!("Remove o pacote MSIX {family} (só deste usuário)"));
             }
-            (UninstallTarget::Arp { .. }, Some(c)) => {
-                let line = format!("{} {}", c.program, c.args);
-                writeln!(f, "  comando: {}", line.trim())?;
+            // A portable app winget installed: its uninstaller is winget itself.
+            (UninstallTarget::Arp { .. }, Some(c)) if is_winget(&c.program) => {
+                out.push("Remove pelo winget (pode mostrar o progresso dele)".into());
             }
-            (UninstallTarget::Arp { .. }, None) => writeln!(f, "  sem comando")?,
+            (UninstallTarget::Arp { .. }, Some(c)) if c.interactive => {
+                out.push("Abre a janela do desinstalador".into());
+            }
+            (UninstallTarget::Arp { .. }, Some(_)) => {
+                out.push("Roda o desinstalador registrado do app".into());
+            }
+            (UninstallTarget::Arp { .. }, None) => {
+                out.push("Sem comando de desinstalação registrado".into());
+            }
         }
         if self.elevation == Elevation::Helper {
-            writeln!(f, "  pede UAC")?;
-        }
-        match &self.command {
-            // A portable app winget installed: its uninstaller is winget itself.
-            Some(c) if is_winget(&c.program) => {
-                writeln!(f, "  remove pelo winget (pode mostrar o progresso dele)")?;
-            }
-            Some(c) if c.interactive => writeln!(f, "  abre a janela do desinstalador")?,
-            _ => {}
+            out.push(UNINSTALL_ADMIN_PROMPT.to_string());
         }
         if let Some(s) = &self.shared {
-            writeln!(
-                f,
-                "  Outra instalação de {} usa as mesmas pastas: copie antes de remover.",
+            out.push(format!(
+                "Outra instalação de {} usa as mesmas pastas: copie antes de remover.",
                 self.name
-            )?;
+            ));
             for p in &s.folders {
-                writeln!(f, "    pasta: {}", p.display())?;
+                out.push(format!("Pasta compartilhada: {}", p.display()));
             }
             if let Some(size) = s.size {
-                writeln!(
-                    f,
-                    "    tamanho da cópia: {} em {} itens",
+                out.push(format!(
+                    "Tamanho da cópia: {} em {} itens",
                     human_size(size.bytes),
                     size.entries
-                )?;
+                ));
             }
             if s.registry_only_allowed {
-                writeln!(
-                    f,
-                    "  também é possível remover só o registro desta instalação"
-                )?;
+                out.push("Também é possível remover só o registro desta instalação".into());
             } else if let Some(why) = &s.registry_only_refused {
-                writeln!(f, "  remover só o registro não está disponível: {why}")?;
+                out.push(format!("Remover só o registro não está disponível: {why}"));
             }
+        }
+        out
+    }
+
+    /// Only for `--dry-run`: the registered uninstall command line.
+    pub fn dry_run_details(&self) -> Vec<String> {
+        match (&self.target, &self.command) {
+            (UninstallTarget::Arp { .. }, Some(c)) => {
+                let line = format!("{} {}", c.program, c.args);
+                vec![format!("Comando: {}", line.trim())]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The title, then one step per line (what the TUI confirmation lists; no command line).
+impl fmt::Display for UninstallPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.title())?;
+        for step in self.steps() {
+            write!(f, "\n{step}")?;
         }
         Ok(())
     }

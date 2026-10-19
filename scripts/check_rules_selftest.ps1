@@ -53,7 +53,14 @@ $cliCases = @(
     @{ Name = 'eprint em cli/x.rs'; File = 'src/cli/x.rs'; Text = 'fn f() { eprint!("x"); }'; Want = 1 },
     @{ Name = 'stderr travado em cli/x.rs'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = std::io::stderr().lock(); }'; Want = 1 },
     @{ Name = 'println em cli/emit.rs'; File = 'src/cli/emit.rs'; Text = 'fn f() { anstream::println!("x"); }'; Want = 0 },
-    @{ Name = 'stdout sem trava no seletor'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = std::io::stdout(); }'; Want = 0 }
+    @{ Name = 'stdout sem trava fora do seletor'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = std::io::stdout(); }'; Want = 1 },
+    @{ Name = 'stdout guardado e writeln'; File = 'src/cli/x.rs'; Text = "fn f() {`n    let mut o = std::io::stdout();`n    writeln!(o, `"x`").ok();`n}"; Want = 1 },
+    @{ Name = 'stdout write_all'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = std::io::stdout().write_all(b"x"); }'; Want = 1 },
+    @{ Name = 'writeln em anstream::stdout'; File = 'src/cli/x.rs'; Text = 'fn f() { let _ = writeln!(anstream::stdout(), "x"); }'; Want = 1 },
+    @{ Name = 'dbg em cli/x.rs'; File = 'src/cli/x.rs'; Text = 'fn f() { dbg!(1); }'; Want = 1 },
+    @{ Name = 'lock na linha seguinte'; File = 'src/cli/x.rs'; Text = "fn f() {`n    let _ = std::io::stderr()`n        .lock();`n}"; Want = 1 },
+    @{ Name = 'stdout no seletor'; File = 'src/cli/picker.rs'; Text = 'fn f() { let _ = std::io::stdout(); }'; Want = 0 },
+    @{ Name = 'stderr em cli/emit.rs'; File = 'src/cli/emit.rs'; Text = 'fn f() { let _ = std::io::stderr().lock(); }'; Want = 0 }
 )
 $base = Join-Path ([IO.Path]::GetTempPath()) ("check_rules_selftest-" + [guid]::NewGuid())
 $bad = @()

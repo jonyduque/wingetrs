@@ -602,7 +602,7 @@ fn kindle_hklm_old_hkcu_new_offers_uninstaller_only() {
     let text = p.to_string();
     assert!(text.contains("Outra instalação de Amazon Kindle"), "{text}");
     assert!(
-        text.contains("remover só o registro não está disponível"),
+        text.contains("Remover só o registro não está disponível"),
         "{text}"
     );
     assert!(text.contains("HKCU"), "{text}");
@@ -825,7 +825,7 @@ fn plan_shows_the_backup_size() {
     });
     assert!(
         p.to_string()
-            .contains("tamanho da cópia: 1,5 GiB em 7 itens"),
+            .contains("Tamanho da cópia: 1,5 GiB em 7 itens"),
         "{p}"
     );
     assert_eq!(human_size(12), "12 B");
@@ -938,17 +938,25 @@ fn target_of_parses_app_keys() {
 fn plan_text_matches_confirmation() {
     let p = plan(&msi(Hive::MachineX86));
     let text = p.to_string();
-    assert!(text.contains("pede UAC"), "{text}");
-    assert!(text.contains("msiexec"), "{text}");
-    assert!(!text.contains("abre a janela do desinstalador"), "{text}");
+    assert!(
+        text.contains("Pede permissão de administrador (UAC)"),
+        "{text}"
+    );
+    // The command line only in `--dry-run`.
+    assert!(!text.contains("msiexec"), "{text}");
+    assert!(
+        p.dry_run_details().iter().any(|l| l.contains("msiexec")),
+        "{p:?}"
+    );
+    assert!(!text.contains("Abre a janela do desinstalador"), "{text}");
 
     let mut d = details(Hive::User, "App");
     d.uninstall_string = Some(r#""C:\Users\t\AppData\Local\App\u.exe""#.to_string());
     let p = plan(&d);
     assert!(p.command.as_ref().unwrap().interactive);
     let text = p.to_string();
-    assert!(text.contains("abre a janela do desinstalador"), "{text}");
-    assert!(!text.contains("pede UAC"), "{text}");
+    assert!(text.contains("Abre a janela do desinstalador"), "{text}");
+    assert!(!text.contains("Pede permissão de administrador"), "{text}");
     assert!(!text.contains("Outra instalação"), "{text}");
 
     let d = kindle(Hive::User, "K", "1");

@@ -137,12 +137,7 @@ pub struct TtyUi {
 
 impl TtyUi {
     pub fn new(cfg: &crate::config::Config) -> TtyUi {
-        use std::io::IsTerminal;
-        TtyUi::build(
-            cfg,
-            Box::new(StdTerm::new()),
-            std::io::stderr().is_terminal(),
-        )
+        TtyUi::build(cfg, Box::new(StdTerm::new()), emit::stderr_is_terminal())
     }
 
     /// Questions go to `term` (tests inject keys there); the progress line stays plain.
@@ -311,23 +306,23 @@ impl ProgressState {
             .unwrap_or(output::LINE_COLUMNS + 1)
             .saturating_sub(1)
             .max(20);
-        let mut err = emit::stderr();
+        let mut err = emit::progress();
         // `finish` sets `closed` before erasing under this same lock, so no late redraw.
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
         if let Some(notice) = notice {
             let width = self.drawn.swap(0, Ordering::Relaxed);
-            emit::line_above(&mut err, width, &notice);
+            err.line_above(width, &notice);
         }
         let Some((main, warn)) = parts else {
-            emit::flush(&mut err);
+            err.flush();
             return;
         };
         let (main, warn) = fit_cols(main, warn, cols);
         let len = main.chars().count() + warn.chars().count();
         let pad = self.drawn.load(Ordering::Relaxed).saturating_sub(len);
-        emit::redraw(&mut err, &output::progress_line(&main, &warn), pad);
+        err.redraw(&output::progress_line(&main, &warn), pad);
         self.drawn.store(len, Ordering::Relaxed);
     }
 
@@ -424,8 +419,8 @@ impl LineProgress {
             emit::out(text);
             return;
         }
-        let mut err = emit::stderr();
-        emit::erase(&mut err, self.state.drawn.swap(0, Ordering::Relaxed));
+        let mut err = emit::progress();
+        err.erase(self.state.drawn.swap(0, Ordering::Relaxed));
         emit::out_flushed(text);
         drop(err);
         self.state.draw();
@@ -473,7 +468,7 @@ impl LineProgress {
         }
         let width = self.state.drawn.swap(0, Ordering::Relaxed);
         if width > 0 {
-            emit::erase(&mut emit::stderr(), width);
+            emit::progress().erase(width);
         }
     }
 }
@@ -771,7 +766,11 @@ async fn install(
         return winget_cmd::install(winget, ui, &cand, scope, f, stop, &mut stdout_line).await;
     }
     if scope.is_some() {
-        bail!("--scope só vale para pacotes do winget");
+        return Err(output::Advice::new(
+            "--scope só vale para pacotes do winget",
+            "rode de novo sem --scope",
+        )
+        .into());
     }
     let plans = ops::plan_for(ctx, &cand, false)?;
     print_plans(ctx, ui, &plans, f);
@@ -874,7 +873,7 @@ async fn uninstall(
         &output::app_version(&plan.app, &plan.version),
     ));
     for note in &removed.notes {
-        emit::err(&output::warning(note));
+        emit::err_with(|| output::warning(note));
     }
     clean_residues(ctx, ui, &plan.app, &removed.residues, f.yes)
 }
@@ -925,7 +924,7 @@ fn clean_residues(
     for (r, res) in selected.iter().zip(results) {
         match res {
             Ok(()) => emit::out(&output::success("Removido:", &output::residue_label(r))),
-            Err(e) => emit::err(&output::warning(&e.to_string())),
+            Err(e) => emit::err_with(|| output::warning(&e.to_string())),
         }
     }
     Ok(())
@@ -979,7 +978,7 @@ async fn upgrade(
         }
         None => {
             for (app, reason) in &list.skipped {
-                emit::err(&output::warning(&format!("{app}: {reason}")));
+                emit::err_with(|| output::warning(&format!("{app}: {reason}")));
             }
             if !all {
                 emit::out_block(&output::upgrades_listing(&list.upgradable, &pinned));

@@ -325,12 +325,33 @@ fn wide_chars_align_table() {
     }
 }
 
-/// The ARP `UninstallPlan`'s text with shared folders.
-const WINGET_UNINSTALL: &str = "Desinstalar Kindle 2.0
-  comando: C:\\K\\uninst.exe /S
-  pede UAC
-  Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
-    pasta: C:\\Users\\u\\Documents\\My Kindle Content";
+/// An ARP removal that runs elevated and shares its data folders (Kindle).
+pub(crate) fn kindle_uninstall() -> wingetrs::winget_install::uninstall::UninstallPlan {
+    use wingetrs::winget_install::launch::Elevation;
+    use wingetrs::winget_install::uninstall::{SharedData, UninstallPlan, UninstallTarget};
+    use wingetrs::winget_install::uninstall_cmd::{Rule, UninstallCommand};
+    UninstallPlan {
+        target: UninstallTarget::Arp {
+            hive: wingetrs::installed::Hive::MachineX64,
+            key: "Kindle".into(),
+        },
+        name: "Kindle".into(),
+        version: Some("2.0".into()),
+        command: Some(UninstallCommand {
+            rule: Rule::Nsis,
+            program: r"C:\K\uninst.exe".into(),
+            args: "/S".into(),
+            interactive: false,
+        }),
+        elevation: Elevation::Helper,
+        shared: Some(SharedData {
+            folders: vec![r"C:\Users\u\Documents\My Kindle Content".into()],
+            size: None,
+            registry_only_allowed: true,
+            registry_only_refused: None,
+        }),
+    }
+}
 
 /// `\x1b` made visible, so a colored snapshot reads as text.
 fn visible(s: &str) -> String {
@@ -463,15 +484,16 @@ fn snapshots_tty_color_and_plain() {
         s.push_str(&output::winget_plan_text(&winget_plan, true));
         s.push_str(&output::through_winget(false, "tipo zip"));
         s.push('\n');
-        s.push_str(&output::plan_text(
+        s.push_str(&output::license(
             "Licença aceita: EULA — https://x.invalid/eula",
         ));
         s.push('\n');
         s.push_str(&output::reboot(false));
         s.push('\n');
-        s.push_str("-- uninstall (winget)\n");
-        s.push_str(&output::plan_text(WINGET_UNINSTALL));
-        s.push('\n');
+        s.push_str("-- uninstall (winget, confirmação)\n");
+        s.push_str(&output::winget_uninstall_text(&kindle_uninstall(), false));
+        s.push_str("-- uninstall --dry-run (winget)\n");
+        s.push_str(&output::winget_uninstall_text(&kindle_uninstall(), true));
         for line in [
             output::folders_copied(std::path::Path::new(r"C:\B\kindle")),
             output::record_removed("App A", std::path::Path::new(r"C:\B\a.reg")),
@@ -501,7 +523,6 @@ fn snapshots_tty_color_and_plain() {
     let color = with_enabled(true, render);
     let plain = with_enabled(false, render);
     // The winget plans keep their text: only styled.
-    assert!(plain.contains(&format!("{WINGET_UNINSTALL}\n")), "{plain}");
     assert!(color.contains('\x1b'));
     assert!(!plain.contains('\x1b'));
     // Color never changes the text.
@@ -539,4 +560,54 @@ async fn snapshots_not_tty_dry_run() {
         .replace(&server.uri(), "<SERVIDOR>");
     assert!(!text.contains('\x1b'), "{text:?}");
     insta::assert_snapshot!("not_tty_dry_run", text);
+}
+
+/// On a terminal, long names are cut (display width, ending in `…`) so no table line wraps;
+/// off a terminal the cells stay whole.
+#[test]
+fn long_names_fit_the_terminal() {
+    use wingetrs::cli::output::{columns, search_table};
+    use wingetrs::cli::style::{with_columns, with_enabled};
+    use wingetrs::core::PackageEntry;
+    let names = [
+        "Advanced Archive Password Recovery Professional Edition",
+        "漢字アプリケーション漢字アプリケーション漢字",
+        "ab",
+    ];
+    let rows: Vec<PackageEntry> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| PackageEntry {
+            name: (*n).into(),
+            id: format!("Pub.Id{i}"),
+            version: "1.0".into(),
+            source: wingetrs::core::SourceKind::Winget,
+            source_name: "winget".into(),
+            moniker: None,
+            publisher: None,
+            description: None,
+            tags: vec![],
+            commands: vec![],
+        })
+        .collect();
+    for on in [false, true] {
+        let narrow = with_enabled(on, || with_columns(40, || search_table(&rows)));
+        let plain = anstream::adapter::strip_str(&narrow).to_string();
+        for line in plain.lines() {
+            assert!(columns(line) <= 39, "{} {line:?}", columns(line));
+        }
+        assert!(plain.contains("Advanced"), "{plain}");
+        assert_eq!(plain.matches('…').count(), 2, "{plain}");
+        // The Id column still starts at the same place on every line.
+        let starts: Vec<usize> = plain
+            .lines()
+            .map(|l| columns(&l[..l.find(" Id").or_else(|| l.find(" Pub.")).unwrap()]))
+            .collect();
+        assert!(starts.windows(2).all(|w| w[0] == w[1]), "{plain}");
+    }
+    let full = with_enabled(false, || with_columns(0, || search_table(&rows)));
+    for n in names {
+        assert!(full.contains(n), "{full}");
+    }
+    assert!(!full.contains('…'));
 }

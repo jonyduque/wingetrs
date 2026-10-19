@@ -61,12 +61,21 @@ Contoso App 1.0 (msi, máquina)
 Instalando pelo winget: tipo zip
 Licença aceita: EULA — https://x.invalid/eula
 Reinicie o computador para concluir.
--- uninstall (winget)
+-- uninstall (winget, confirmação)
 Desinstalar Kindle 2.0
-  comando: C:\K\uninst.exe /S
-  pede UAC
-  Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
-    pasta: C:\Users\u\Documents\My Kindle Content
+  1. Roda o desinstalador registrado do app
+  2. ⚠ Pede permissão de administrador (UAC)
+  3. Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
+  4. Pasta compartilhada: C:\Users\u\Documents\My Kindle Content
+  5. Também é possível remover só o registro desta instalação
+-- uninstall --dry-run (winget)
+Desinstalar Kindle 2.0
+  1. Roda o desinstalador registrado do app
+  2. ⚠ Pede permissão de administrador (UAC)
+  3. Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
+  4. Pasta compartilhada: C:\Users\u\Documents\My Kindle Content
+  5. Também é possível remover só o registro desta instalação
+  Comando: C:\K\uninst.exe /S
 ✓ Pastas copiadas para C:\B\kindle
 ✓ Removido: registro de App A (cópia em C:\B\a.reg)
 -- cleanup --orphans

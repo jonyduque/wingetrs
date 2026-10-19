@@ -22,6 +22,26 @@ pub fn columns(text: &str) -> usize {
     ratatui::text::Span::raw(text).width()
 }
 
+/// `text` cut to `width` terminal columns, ending in `…` when cut.
+pub fn truncate(text: &str, width: usize) -> String {
+    if columns(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let mut buf = [0u8; 4];
+        let w = columns(c.encode_utf8(&mut buf));
+        if used + w + 1 > width {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 /// `text` painted, then padded to `width` terminal columns counted on the plain text.
 fn pad(style: Style, text: &str, width: usize) -> String {
     let pad = " ".repeat(width.saturating_sub(columns(text)));
@@ -241,12 +261,30 @@ fn table<const N: usize>(
             *w = (*w).max(columns(c));
         }
     }
+    // On a terminal the first column (the names) gives up what the line lacks, so no line
+    // wraps (one column less than the terminal); never below the header nor 8 columns.
+    if let Some(cols) = style::table_columns() {
+        let total = widths.iter().sum::<usize>() + 2 * N.saturating_sub(1);
+        let room = cols.saturating_sub(1);
+        if total > room {
+            let floor = header.map_or(0, |h| columns(h[0])).max(8);
+            widths[0] = widths[0].saturating_sub(total - room).max(floor);
+        }
+    }
+    let first = widths[0];
     let line = |r: &[&str], styles: [Style; N]| {
         let parts: Vec<String> = r
             .iter()
             .zip(widths)
             .zip(styles)
-            .map(|((c, w), st)| pad(st, c, w))
+            .enumerate()
+            .map(|(i, ((c, w), st))| {
+                if i == 0 {
+                    pad(st, &truncate(c, first), w)
+                } else {
+                    pad(st, c, w)
+                }
+            })
             .collect();
         parts.join("  ").trim_end().to_string()
     };
@@ -750,96 +788,85 @@ pub fn progress_line(main: &str, warn: &str) -> String {
     format!("{main}{}", paint(WARN, warn))
 }
 
-/// Labels the winget plans start their detail lines with (`Instalador: …`).
-const PLAN_LABELS: &[&str] = &[
-    "Instalador",
-    "Linha de comando",
-    "Licença aceita",
-    "Licença",
-    "SHA-256",
-    "comando",
-    "pasta",
-    "tamanho da cópia",
-];
-
-/// A winget plan as its `Display` writes it (`WingetPlan`, the ARP/MSIX `UninstallPlan`, an
-/// agreement line), styled line by line; without color the text is the same. The title:
-/// `Desinstalar`/`Instalar`/`Atualizar` as a header and the name in bold, or the name in bold
-/// and its `(tipo, escopo)` dimmed; a known label in header style.
-pub fn plan_text(text: &str) -> String {
-    let mut out = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        let body = line.trim_start();
-        let indent = &line[..line.len() - body.len()];
-        let label = PLAN_LABELS
-            .iter()
-            .find(|l| body.strip_prefix(**l).is_some_and(|r| r.starts_with(": ")));
-        let styled = if let Some(l) = label {
-            format!("{}{}", paint(HEADER, l), &body[l.len()..])
-        } else if i == 0 {
-            let verb = ["Desinstalar ", "Instalar ", "Atualizar "]
-                .iter()
-                .find(|v| body.starts_with(**v));
-            match (verb, body.rfind(" (")) {
-                (Some(v), _) => format!(
-                    "{} {}",
-                    paint(HEADER, v.trim_end()),
-                    paint(NAME, &body[v.len()..])
-                ),
-                (None, Some(at)) => {
-                    format!("{}{}", paint(NAME, &body[..at]), paint(DIM, &body[at..]))
-                }
-                (None, None) => paint(NAME, body),
-            }
-        } else {
-            body.to_string()
-        };
-        out.push(format!("{indent}{styled}"));
-    }
-    out.join("\n")
-}
-
-/// One detail line of a winget plan (not its title): a known label in header style.
-fn plan_line(body: &str) -> String {
-    match PLAN_LABELS
-        .iter()
-        .find(|l| body.strip_prefix(**l).is_some_and(|r| r.starts_with(": ")))
-    {
-        Some(l) => format!("{}{}", paint(HEADER, l), &body[l.len()..]),
-        None => body.to_string(),
+/// `Label: value` with the label in header style (the `--dry-run` details and the license
+/// lines are built this way by their plans).
+fn labeled(line: &str) -> String {
+    match line.split_once(": ") {
+        Some((label, value)) => format!("{}: {value}", paint(HEADER, label)),
+        None => line.to_string(),
     }
 }
 
-/// The native winget plan in the shape of the Scoop one: the title (`7-Zip 26.04` in bold, its
-/// `(tipo, escopo)` dimmed), every step numbered (number in bold, UAC steps with the warning
-/// glyph, `Licença` as a label) and, only for `--dry-run`, the URL, command line and SHA-256.
-pub fn winget_plan_text(plan: &crate::winget_install::plan::WingetPlan, dry_run: bool) -> String {
+/// A license line of a winget package (`Licença: EULA — url`, `Licença aceita: …`).
+pub fn license(line: &str) -> String {
+    labeled(line)
+}
+
+/// The steps that ask for the administrator's permission (they get the warning glyph).
+fn asks_admin(step: &str) -> bool {
     use crate::winget_install::plan::{ADMIN_PROMPT, ADMIN_PROMPT_MSI};
-    let title = plan.title();
-    let mut s = match title.rfind(" (") {
-        Some(at) => format!("{}{}", paint(NAME, &title[..at]), paint(DIM, &title[at..])),
-        None => paint(NAME, &title),
-    };
+    use crate::winget_install::uninstall::UNINSTALL_ADMIN_PROMPT;
+    [ADMIN_PROMPT, ADMIN_PROMPT_MSI, UNINSTALL_ADMIN_PROMPT].contains(&step)
+}
+
+/// A plan in the shape of the Scoop one: the title, every step numbered (number in bold, the
+/// UAC steps with the warning glyph, licenses labeled) and, only for `--dry-run`, the details
+/// (URL, command line, hash).
+fn numbered_plan(title: String, steps: &[String], details: &[String]) -> String {
+    let mut s = title;
     s.push('\n');
-    let steps = plan.steps();
     let width = steps.len().to_string().len();
     for (i, step) in steps.iter().enumerate() {
         let n = paint(NAME, &format!("{:>width$}", i + 1));
-        let text = if step == ADMIN_PROMPT || step == ADMIN_PROMPT_MSI {
+        let text = if asks_admin(step) {
             format!("{} {step}", paint(WARN, style::glyphs().toast_warn))
+        } else if step.starts_with("Licença") {
+            license(step)
         } else {
-            plan_line(step)
+            step.clone()
         };
         s.push_str(&format!("  {n}. {text}\n"));
     }
-    if dry_run {
-        for line in plan.dry_run_details() {
-            s.push_str(&format!("  {}\n", plan_line(&line)));
-        }
+    for line in details {
+        s.push_str(&format!("  {}\n", labeled(line)));
     }
     s
 }
 
+/// The native winget install/upgrade plan: `7-Zip 26.04` in bold and its `(tipo, escopo)`
+/// dimmed, then [`numbered_plan`] of `WingetPlan::steps` (the TUI lists the same steps).
+pub fn winget_plan_text(plan: &crate::winget_install::plan::WingetPlan, dry_run: bool) -> String {
+    let title = plan.title();
+    let title = match title.rfind(" (") {
+        Some(at) => format!("{}{}", paint(NAME, &title[..at]), paint(DIM, &title[at..])),
+        None => paint(NAME, &title),
+    };
+    let details = if dry_run {
+        plan.dry_run_details()
+    } else {
+        Vec::new()
+    };
+    numbered_plan(title, &plan.steps(), &details)
+}
+
+/// The removal of an app of the Windows list (ARP/MSIX): `Desinstalar` as a header and the
+/// name in bold, then [`numbered_plan`] of `UninstallPlan::steps` (the TUI lists the same).
+pub fn winget_uninstall_text(
+    plan: &crate::winget_install::uninstall::UninstallPlan,
+    dry_run: bool,
+) -> String {
+    let title = plan.title();
+    let title = match title.split_once(' ') {
+        Some((verb, rest)) => format!("{} {}", paint(HEADER, verb), paint(NAME, rest)),
+        None => paint(NAME, &title),
+    };
+    let details = if dry_run {
+        plan.dry_run_details()
+    } else {
+        Vec::new()
+    };
+    numbered_plan(title, &plan.steps(), &details)
+}
 /// The engine chose `winget` for this package: `Instalando pelo winget: <why>`.
 pub fn through_winget(upgrade: bool, why: &str) -> String {
     let verb = if upgrade {
