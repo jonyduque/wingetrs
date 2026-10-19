@@ -558,7 +558,7 @@ fn pick_row<'a>(
                     note: Some(r.location.clone()),
                 })
                 .collect();
-            Ok(ui.pick(items)?.and_then(|i| many.get(i).copied()))
+            Ok(ui.pick_target(items)?.and_then(|i| many.get(i).copied()))
         }
     }
 }
@@ -645,17 +645,17 @@ fn removal_choice(
         let size = shared.size.map(|s| human_size(s.bytes)).unwrap_or_default();
         options.push((
             RemovalChoice::BackupThenRemove,
-            item("Copiar as pastas para backups e remover", size),
+            item("Backup das pastas e remover", size),
         ));
     }
     options.push((
         RemovalChoice::Remove,
-        item("Remover sem copiar as pastas", String::new()),
+        item("Remover sem copiar", String::new()),
     ));
     if shared.registry_only_allowed {
         options.push((
             RemovalChoice::RegistryOnly,
-            item(crate::tui::app::REGISTRY_ONLY_ITEM, String::new()),
+            item("Só o registro", String::new()),
         ));
     }
     let items = options

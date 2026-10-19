@@ -1187,8 +1187,8 @@ async fn cli_kindle_backup_then_remove() {
     assert_eq!(
         ui.picked_items.borrow()[0],
         vec![
-            "Copiar as pastas para backups e remover".to_string(),
-            "Remover sem copiar as pastas".to_string(),
+            "Backup das pastas e remover".to_string(),
+            "Remover sem copiar".to_string(),
             "Cancelar".to_string(),
         ]
     );
@@ -1243,8 +1243,8 @@ async fn cli_kindle_registry_only_and_cancel() {
     assert_eq!(
         ui.picked_items.borrow()[0],
         vec![
-            "Remover sem copiar as pastas".to_string(),
-            "Remover só o registro".to_string(),
+            "Remover sem copiar".to_string(),
+            "Só o registro".to_string(),
             "Cancelar".to_string(),
         ]
     );
@@ -1746,7 +1746,7 @@ fn scripted_ui(keys: Vec<Event>) -> (install_cmd::TtyUi, Arc<Mutex<Screen>>) {
 async fn kindle_question_uses_selector() {
     let t = TempDir::new().unwrap();
     let fake = kindle(&t, true);
-    let (ui, screen) = scripted_ui(vec![key(Down), key(Enter)]);
+    let (ui, screen) = scripted_ui(vec![key(Char('s'))]);
     let (r, _) = uninstall_with(&fake, &ui, Flags::default()).await;
     r.unwrap();
     assert_eq!(
@@ -1760,12 +1760,10 @@ async fn kindle_question_uses_selector() {
     );
     let text = plain(&screen.lock().unwrap().out);
     assert!(
-        text.starts_with(
-            "> Remover sem copiar as pastas\r\n  Remover só o registro\r\n  Cancelar\r\n"
-        ),
+        text.starts_with("> r) Remover sem copiar\r\n  s) Só o registro\r\n  c) Cancelar\r\n"),
         "{text:?}"
     );
-    assert!(text.contains("> Remover só o registro\r\n"), "{text:?}");
+    assert!(text.ends_with("> Só o registro\r\n"), "{text:?}");
     // Esc (or Ctrl+C) in the selector cancels: nothing locked or run.
     let fake = kindle(&t, true);
     let (ui, screen) = scripted_ui(vec![ctrl_c()]);
@@ -1836,4 +1834,32 @@ async fn ambiguous_installed_uses_selector() {
     assert_eq!(s.raw_enabled, 2, "two questions, both the selector");
     let text = plain(&s.out);
     assert!(text.contains("Continuar? Não\r\n"), "{text:?}");
+}
+
+#[tokio::test]
+async fn kindle_without_terminal_refused() {
+    let t = TempDir::new().unwrap();
+    let fake = kindle(&t, false);
+    let term = {
+        let mut t = ScriptedTerm::new(vec![key(Enter)]);
+        t.interactive = false;
+        t
+    };
+    let screen = term.screen();
+    let cfg = wingetrs::config::Config {
+        glyphs: "ascii".into(),
+        ..Default::default()
+    };
+    let ui = install_cmd::TtyUi::with_term(&cfg, Box::new(term));
+    let (r, _) = uninstall_with(&fake, &ui, Flags::default()).await;
+    let e = r.unwrap_err().to_string();
+    assert!(e.contains("rode num terminal para escolher"), "{e}");
+    assert!(fake.uninstalled.lock().unwrap().is_empty());
+    assert!(
+        fake.steps.lock().unwrap().is_empty(),
+        "nothing locked or run"
+    );
+    assert!(!fake.backups.exists(), "nothing copied");
+    let s = screen.lock().unwrap();
+    assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
 }

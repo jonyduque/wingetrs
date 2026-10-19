@@ -907,9 +907,42 @@ async fn run_async(
     }
 }
 
+/// `bucket add`'s config change: a bucket wingetrs does not know is added only after the
+/// user's yes in the selector, or with `--yes`; without a terminal the error names `--yes`.
+/// `Ok(false)` = the user declined (`Cancelado.` was said).
+pub fn bucket_add(
+    ui: &dyn install_cmd::Ui,
+    cfg: &mut Config,
+    name: &str,
+    url: Option<String>,
+    yes: bool,
+    say: &mut dyn FnMut(&str),
+) -> anyhow::Result<bool> {
+    use crate::buckets::{self, BucketError};
+    let spec = match (url, buckets::known_repo(name)) {
+        (Some(u), _) => u,
+        (None, Some(known)) => known.to_string(),
+        (None, None) => anyhow::bail!(
+            "o bucket {name} não é conhecido; informe o repositório: wingetrs bucket add {name} <owner/repo>"
+        ),
+    };
+    match buckets::add(cfg, name, &spec, yes) {
+        Err(BucketError::NeedsConfirmation { name, repo }) if ui.interactive() => {
+            let q = format!("O bucket {name} ({repo}) não é conhecido. Adicionar?");
+            if !ui.confirm(&q)? {
+                say("Cancelado.");
+                return Ok(false);
+            }
+            buckets::add(cfg, &name, &spec, true)?;
+        }
+        other => other?,
+    }
+    Ok(true)
+}
+
 /// `bucket add|list|rm`: edits `config.toml` (and the catalog on `rm`).
 fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::Result<()> {
-    use crate::buckets::{self, BucketError};
+    use crate::buckets;
     match action {
         BucketAction::List => {
             for (name, repo) in buckets::resolved(&cfg)? {
@@ -918,24 +951,10 @@ fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::
             Ok(())
         }
         BucketAction::Add { name, url, yes } => {
-            let spec = match (url, buckets::known_repo(&name)) {
-                (Some(u), _) => u,
-                (None, Some(known)) => known.to_string(),
-                (None, None) => anyhow::bail!(
-                    "o bucket {name} não é conhecido; informe o repositório: wingetrs bucket add {name} <owner/repo>"
-                ),
-            };
-            match buckets::add(&mut cfg, &name, &spec, yes) {
-                Err(BucketError::NeedsConfirmation { name, repo }) if picker::is_interactive() => {
-                    let ui = install_cmd::TtyUi::new(&cfg);
-                    let q = format!("O bucket {name} ({repo}) não é conhecido. Adicionar?");
-                    if !install_cmd::Ui::confirm(&ui, &q)? {
-                        anstream::println!("Cancelado.");
-                        return Ok(());
-                    }
-                    buckets::add(&mut cfg, &name, &spec, true)?;
-                }
-                other => other?,
+            let ui = install_cmd::TtyUi::new(&cfg);
+            let say = &mut |l: &str| anstream::println!("{l}");
+            if !bucket_add(&ui, &mut cfg, &name, url, yes, say)? {
+                return Ok(());
             }
             cfg.save(&data.config_path())?;
             anstream::println!(

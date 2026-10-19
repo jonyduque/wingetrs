@@ -1044,7 +1044,7 @@ async fn continue_question_uses_selector() {
     assert_eq!(w.installed(), None);
     let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
     assert!(
-        text.starts_with("Continuar?\r\n  Sim\r\n> Não\r\n"),
+        text.starts_with("Continuar?\r\n  s) Sim\r\n> n) Não\r\n"),
         "{text:?}"
     );
     assert!(text.ends_with("Continuar? Não\r\n"), "{text:?}");
@@ -1061,8 +1061,8 @@ async fn ambiguous_target_uses_selector() {
         .await;
     w.publish_in("scoop:extras", "2.0", serde_json::json!({}))
         .await;
-    // `m` picks `main/x` by its letter, then `s` answers "Continuar?".
-    let (ui, screen) = scripted_ui(vec![key(Char('m')), key(Char('s'))], true);
+    // `m` moves to `main/x`, Enter confirms it, then `s` answers "Continuar?".
+    let (ui, screen) = scripted_ui(vec![key(Char('m')), key(Enter), key(Char('s'))], true);
     w.run(&ui, &["install", "x"]).await.unwrap();
     assert_eq!(w.installed().as_deref(), Some("1.0"));
     let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
@@ -1078,4 +1078,75 @@ async fn ambiguous_target_uses_selector() {
     w.run(&ui, &["install", "x"]).await.unwrap();
     assert_eq!(w.installed(), None);
     assert_eq!(screen.lock().unwrap().reads, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn target_letter_only_moves_the_cursor() {
+    let mut w = World::new().await;
+    w.publish_in("scoop:main", "1.0", serde_json::json!({}))
+        .await;
+    w.publish_in("scoop:extras", "2.0", serde_json::json!({}))
+        .await;
+    // `m` moves to `main/x` but does not confirm; Esc then cancels.
+    let (ui, screen) = scripted_ui(vec![key(Char('m')), key(Esc)], true);
+    w.run(&ui, &["install", "x"]).await.unwrap();
+    assert_eq!(w.installed(), None);
+    let s = screen.lock().unwrap();
+    assert_eq!(s.reads, 2);
+    let text = wingetrs::cli::picker::fake::plain(&s.out);
+    assert!(text.contains("> m) main/x  1.0\r\n"), "{text:?}");
+    assert!(text.contains("setas ou letra movem"), "{text:?}");
+}
+
+#[test]
+fn bucket_add_question_uses_selector() {
+    let has = |cfg: &wingetrs::config::Config| {
+        wingetrs::buckets::resolved(cfg)
+            .unwrap()
+            .iter()
+            .any(|(n, _)| n == "meu")
+    };
+    let add = |ui: &install_cmd::TtyUi, cfg: &mut wingetrs::config::Config, yes: bool| {
+        let mut said = Vec::new();
+        let r = wingetrs::cli::bucket_add(
+            ui,
+            cfg,
+            "meu",
+            Some("dono/repo".into()),
+            yes,
+            &mut |l: &str| said.push(l.to_string()),
+        );
+        (r, said)
+    };
+    // No terminal and no --yes: refused, naming the flag, nothing drawn.
+    let mut cfg = wingetrs::config::Config::default();
+    let (ui, screen) = scripted_ui(vec![key(Char('s'))], false);
+    let e = add(&ui, &mut cfg, false).0.unwrap_err().to_string();
+    assert!(e.contains("--yes"), "{e}");
+    assert!(!has(&cfg));
+    {
+        let s = screen.lock().unwrap();
+        assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
+    }
+    // Enter keeps the default "Não".
+    let (ui, screen) = scripted_ui(vec![key(Enter)], true);
+    let (r, said) = add(&ui, &mut cfg, false);
+    assert!(!r.unwrap());
+    assert_eq!(said, vec!["Cancelado.".to_string()]);
+    assert!(!has(&cfg));
+    let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
+    assert!(
+        text.starts_with("O bucket meu (dono/repo) não é conhecido. Adicionar?\r\n"),
+        "{text:?}"
+    );
+    // `s` adds it.
+    let (ui, _) = scripted_ui(vec![key(Char('s'))], true);
+    assert!(add(&ui, &mut cfg, false).0.unwrap());
+    assert!(has(&cfg));
+    // `--yes` adds without asking.
+    let mut cfg = wingetrs::config::Config::default();
+    let (ui, screen) = scripted_ui(vec![], false);
+    assert!(add(&ui, &mut cfg, true).0.unwrap());
+    assert!(has(&cfg));
+    assert_eq!(screen.lock().unwrap().reads, 0);
 }

@@ -11,6 +11,7 @@ use crossterm::terminal::{self, Clear, ClearType};
 use crossterm::{execute, queue};
 use ratatui::backend::IntoCrossterm;
 use ratatui::style::Style;
+use ratatui::text::Span;
 use std::io::{self, IsTerminal, Write};
 
 /// Error text when a question is asked without a terminal (callers check first and name
@@ -110,8 +111,24 @@ pub fn shortcuts(items: &[PickerItem]) -> Vec<Option<char>> {
         .collect()
 }
 
-/// The lines of one frame: the prompt (when any), the visible rows, the key hint.
-pub fn frame(p: &Picker, height: usize, prompt: Option<&str>, glyphs: &Glyphs) -> Vec<FrameLine> {
+/// What a shortcut letter does in a single choice. In several choices it always moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Letters {
+    /// The letter picks its row at once (yes/no, the Kindle options).
+    Pick,
+    /// The letter only moves the cursor; Enter confirms (targets that share a name).
+    Move,
+}
+
+/// The lines of one frame: the prompt (when any), the visible rows, the key hint. In a single
+/// choice each row shows its shortcut letter (`s) Sim`) when any row has one.
+pub fn frame(
+    p: &Picker,
+    height: usize,
+    prompt: Option<&str>,
+    letters: Letters,
+    glyphs: &Glyphs,
+) -> Vec<FrameLine> {
     let mut lines = Vec::new();
     if let Some(q) = prompt {
         lines.push(FrameLine {
@@ -119,6 +136,8 @@ pub fn frame(p: &Picker, height: usize, prompt: Option<&str>, glyphs: &Glyphs) -
             kind: LineKind::Prompt,
         });
     }
+    let keys = shortcuts(p.items());
+    let show_keys = !p.is_multi() && keys.iter().any(Option::is_some);
     for i in window(p.selected(), p.items().len(), height) {
         let it = &p.items()[i];
         let here = i == p.selected();
@@ -128,7 +147,12 @@ pub fn frame(p: &Picker, height: usize, prompt: Option<&str>, glyphs: &Glyphs) -
             (true, true) => "[x] ",
             (true, false) => "[ ] ",
         };
-        let mut text = format!("{marker} {boxed}{}", it.label);
+        let key = match (show_keys, keys[i]) {
+            (false, _) => String::new(),
+            (true, Some(c)) => format!("{c}) "),
+            (true, None) => "   ".to_string(),
+        };
+        let mut text = format!("{marker} {boxed}{key}{}", it.label);
         if !it.detail.is_empty() {
             text.push_str(&format!("  {}", it.detail));
         }
@@ -144,10 +168,10 @@ pub fn frame(p: &Picker, height: usize, prompt: Option<&str>, glyphs: &Glyphs) -
         };
         lines.push(FrameLine { text, kind });
     }
-    let hint = if p.is_multi() {
-        "setas movem · Espaço marca · Enter confirma · Esc cancela"
-    } else {
-        "setas movem · letra inicial ou Enter escolhe · Esc cancela"
+    let hint = match (p.is_multi(), letters) {
+        (true, _) => "setas movem · Espaço marca · Enter confirma · Esc cancela",
+        (false, Letters::Pick) => "setas movem · letra ou Enter escolhe · Esc cancela",
+        (false, Letters::Move) => "setas ou letra movem · Enter escolhe · Esc cancela",
     };
     lines.push(FrameLine {
         text: hint.to_string(),
@@ -220,7 +244,25 @@ fn style_of(kind: LineKind, theme: &Theme) -> Style {
     }
 }
 
-/// Draws `lines`, first moving up over the `drawn` lines of the previous frame.
+/// The longest prefix of `text` that fits in `width` terminal columns (wide CJK and emoji
+/// characters count two).
+pub fn fit(text: &str, width: usize) -> String {
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let mut buf = [0u8; 4];
+        let w = Span::raw(&*c.encode_utf8(&mut buf)).width();
+        if used + w > width {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out
+}
+
+/// Draws `lines`, first erasing the `drawn` lines of the previous frame (its height may
+/// differ after a resize).
 fn draw(
     out: &mut dyn Write,
     lines: &[FrameLine],
@@ -230,7 +272,12 @@ fn draw(
 ) -> io::Result<()> {
     let out = &mut &mut *out;
     if drawn > 0 {
-        queue!(out, MoveUp(drawn))?;
+        queue!(
+            out,
+            MoveUp(drawn),
+            MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
     }
     // One column short so a full line never wraps (the move-up count would be wrong).
     let width = usize::from(cols.saturating_sub(1)).max(1);
@@ -241,8 +288,7 @@ fn draw(
             Clear(ClearType::CurrentLine),
             SetStyle(style_of(l.kind, theme).into_crossterm())
         )?;
-        let text: String = l.text.chars().take(width).collect();
-        write!(out, "{text}")?;
+        write!(out, "{}", fit(&l.text, width))?;
         queue!(out, SetAttribute(Attribute::Reset))?;
         write!(out, "\r\n")?;
     }
@@ -250,8 +296,13 @@ fn draw(
 }
 
 /// What a key does before the picker sees it: `q` cancels, a shortcut letter picks its row
-/// (one choice) or moves the cursor to it (several). `None` = the picker decides.
-fn pre_key(p: &mut Picker, keys: &[Option<char>], k: KeyEvent) -> Option<PickOutcome> {
+/// (one choice with [`Letters::Pick`]) or moves the cursor to it. `None` = the picker decides.
+fn pre_key(
+    p: &mut Picker,
+    keys: &[Option<char>],
+    letters: Letters,
+    k: KeyEvent,
+) -> Option<PickOutcome> {
     if k.kind == KeyEventKind::Release
         || k.modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -266,7 +317,7 @@ fn pre_key(p: &mut Picker, keys: &[Option<char>], k: KeyEvent) -> Option<PickOut
         return Some(PickOutcome::Cancelled);
     }
     let i = keys.iter().position(|s| *s == Some(c))?;
-    if !p.is_multi() {
+    if !p.is_multi() && letters == Letters::Pick {
         return Some(PickOutcome::Picked(vec![i]));
     }
     // Move the cursor through the picker's own keys: Home, then Down over pickable rows.
@@ -282,6 +333,12 @@ fn pre_key(p: &mut Picker, keys: &[Option<char>], k: KeyEvent) -> Option<PickOut
     Some(PickOutcome::Pending)
 }
 
+/// Rows of the window for a terminal of `rows` lines (prompt and hint take the rest).
+fn window_height(rows: u16, prompt: Option<&str>) -> usize {
+    let fixed = 1 + usize::from(prompt.is_some());
+    usize::from(rows).saturating_sub(fixed + 1).clamp(1, 15)
+}
+
 /// Runs `p` on `term` until a pick or a cancel (Esc, `q`, Ctrl+C). The drawing is erased at
 /// the end and, after a pick, one line with the choice is left. Without a terminal nothing is
 /// drawn nor read: an `Unsupported` error.
@@ -289,6 +346,7 @@ pub fn run(
     term: &mut dyn Term,
     mut p: Picker,
     prompt: Option<&str>,
+    letters: Letters,
     theme: &Theme,
     glyphs: &Glyphs,
 ) -> io::Result<Option<Vec<usize>>> {
@@ -296,30 +354,36 @@ pub fn run(
         return Err(io::Error::new(io::ErrorKind::Unsupported, NO_TTY));
     }
     let keys = shortcuts(p.items());
-    let (cols, rows) = term.size()?;
-    let fixed = 1 + usize::from(prompt.is_some());
-    let height = usize::from(rows).saturating_sub(fixed + 1).clamp(1, 15);
+    let (mut cols, rows) = term.size()?;
+    let mut height = window_height(rows, prompt);
     let mut s = Session::enter(term)?;
-    let lines = frame(&p, height, prompt, glyphs);
+    let lines = frame(&p, height, prompt, letters, glyphs);
     draw(s.term.out(), &lines, theme, cols, 0)?;
     s.drawn = lines.len() as u16;
     let result = loop {
-        let Event::Key(k) = s.term.read()? else {
-            continue;
-        };
-        let outcome = match pre_key(&mut p, &keys, k) {
-            Some(o) => o,
-            None => p.key(k),
-        };
-        match outcome {
-            PickOutcome::Pending => {}
-            PickOutcome::Cancelled => break None,
-            PickOutcome::Picked(v) => break Some(v),
+        match s.term.read()? {
+            Event::Key(k) => {
+                let outcome = match pre_key(&mut p, &keys, letters, k) {
+                    Some(o) => o,
+                    None => p.key(k),
+                };
+                match outcome {
+                    PickOutcome::Pending => {}
+                    PickOutcome::Cancelled => break None,
+                    PickOutcome::Picked(v) => break Some(v),
+                }
+            }
+            Event::Resize(c, r) => {
+                cols = c;
+                height = window_height(r, prompt);
+            }
+            _ => continue,
         }
-        // The frame height is constant, but the window follows the selection.
-        let lines = frame(&p, height, prompt, glyphs);
+        // The window follows the selection (and the terminal size after a resize).
+        let lines = frame(&p, height, prompt, letters, glyphs);
         let drawn = s.drawn;
         draw(s.term.out(), &lines, theme, cols, drawn)?;
+        s.drawn = lines.len() as u16;
     };
     drop(s);
     if let Some(v) = &result {
@@ -338,6 +402,7 @@ pub fn select_one(
     prompt: Option<&str>,
     items: Vec<PickerItem>,
     default: Option<usize>,
+    letters: Letters,
     theme: &Theme,
     glyphs: &Glyphs,
 ) -> io::Result<Option<usize>> {
@@ -345,7 +410,7 @@ pub fn select_one(
         Some(at) => Picker::single_at(items, at),
         None => Picker::single(items),
     };
-    let picked = run(term, p, prompt, theme, glyphs)?;
+    let picked = run(term, p, prompt, letters, theme, glyphs)?;
     Ok(picked.and_then(|v| v.first().copied()))
 }
 
@@ -358,7 +423,14 @@ pub fn select_many(
     theme: &Theme,
     glyphs: &Glyphs,
 ) -> io::Result<Option<Vec<usize>>> {
-    run(term, Picker::multi(items, initial), prompt, theme, glyphs)
+    run(
+        term,
+        Picker::multi(items, initial),
+        prompt,
+        Letters::Move,
+        theme,
+        glyphs,
+    )
 }
 
 /// The rows of a yes/no question.
@@ -381,7 +453,15 @@ pub fn yes_no(
     theme: &Theme,
     glyphs: &Glyphs,
 ) -> io::Result<bool> {
-    let picked = select_one(term, Some(question), yes_no_items(), Some(1), theme, glyphs)?;
+    let picked = select_one(
+        term,
+        Some(question),
+        yes_no_items(),
+        Some(1),
+        Letters::Pick,
+        theme,
+        glyphs,
+    )?;
     Ok(picked == Some(0))
 }
 

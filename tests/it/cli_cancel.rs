@@ -620,7 +620,7 @@ mod selector {
     use crossterm::event::KeyCode::{self, Char, Down, Enter, Esc, Up};
     use crossterm::event::{Event, KeyEvent, KeyModifiers};
     use wingetrs::cli::picker::fake::{self, ScriptedTerm, ctrl_c, key};
-    use wingetrs::cli::picker::{self, LineKind};
+    use wingetrs::cli::picker::{self, Letters, LineKind};
     use wingetrs::tui::picker::{Picker, PickerItem};
     use wingetrs::tui::theme::{ColorDepth, GlyphSet, Glyphs, Theme};
 
@@ -648,7 +648,16 @@ mod selector {
     fn one(keys: Vec<Event>, labels: &[&str]) -> (Option<usize>, String, String) {
         let mut t = ScriptedTerm::new(keys);
         let screen = t.screen();
-        let got = picker::select_one(&mut t, None, items(labels), None, &theme(), ascii()).unwrap();
+        let got = picker::select_one(
+            &mut t,
+            None,
+            items(labels),
+            None,
+            Letters::Pick,
+            &theme(),
+            ascii(),
+        )
+        .unwrap();
         let s = screen.lock().unwrap();
         assert!(!s.raw, "raw mode left on");
         assert_eq!(s.raw_enabled, 1);
@@ -656,7 +665,7 @@ mod selector {
         (got, fake::plain(&s.out), raw)
     }
 
-    const HINT_ONE: &str = "setas movem · letra inicial ou Enter escolhe · Esc cancela";
+    const HINT_ONE: &str = "setas movem · letra ou Enter escolhe · Esc cancela";
     const HINT_MANY: &str = "setas movem · Espaço marca · Enter confirma · Esc cancela";
 
     #[test]
@@ -666,7 +675,7 @@ mod selector {
             &["Alfa", "Beta", "Gama"],
         );
         assert_eq!(got, Some(1));
-        let first = format!("> Alfa\r\n  Beta\r\n  Gama\r\n{HINT_ONE}\r\n");
+        let first = format!("> a) Alfa\r\n  b) Beta\r\n  g) Gama\r\n{HINT_ONE}\r\n");
         assert!(text.starts_with(&first), "{text:?}");
         // Inline: never the alternate screen; the 4 lines are erased before the summary.
         assert!(!raw.contains("\u{1b}[?1049h"), "{raw:?}");
@@ -724,7 +733,7 @@ mod selector {
         let (yes, text) = ask(vec![key(Enter)]);
         assert!(!yes);
         assert!(
-            text.starts_with("Continuar?\r\n  Sim\r\n> Não\r\n"),
+            text.starts_with("Continuar?\r\n  s) Sim\r\n> n) Não\r\n"),
             "{text:?}"
         );
         assert!(text.ends_with("Continuar? Não\r\n"), "{text:?}");
@@ -777,7 +786,7 @@ mod selector {
             p.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         // Cursor on `e` (the disabled `c` is skipped); a 3-row window follows it.
-        let lines = picker::frame(&p, 3, Some("Quais?"), ascii());
+        let lines = picker::frame(&p, 3, Some("Quais?"), Letters::Move, ascii());
         let text: Vec<(&str, LineKind)> = lines.iter().map(|l| (l.text.as_str(), l.kind)).collect();
         assert_eq!(
             text,
@@ -790,13 +799,36 @@ mod selector {
             ]
         );
         let p = Picker::multi(items(&["a", "b"]), &[false, true]);
-        let lines = picker::frame(&p, 5, None, ascii());
+        let lines = picker::frame(&p, 5, None, Letters::Move, ascii());
         assert_eq!(lines[1].text, "  [x] b");
         let mut list = items(&["a", "b"]);
         list[1].detail = "1.0".into();
         list[1].note = Some("nota".into());
-        let lines = picker::frame(&Picker::single(list), 5, None, ascii());
-        assert_eq!(lines[1].text, "  b  1.0  (nota)");
+        let lines = picker::frame(&Picker::single(list), 5, None, Letters::Pick, ascii());
+        assert_eq!(lines[1].text, "  b) b  1.0  (nota)");
+        // Rows that share an initial get no letter; the column stays aligned.
+        let lines = picker::frame(
+            &Picker::single(items(&["Remover", "Registro", "Cancelar"])),
+            5,
+            None,
+            Letters::Pick,
+            ascii(),
+        );
+        assert_eq!(lines[0].text, ">    Remover");
+        assert_eq!(lines[2].text, "  c) Cancelar");
+        // No row has a letter: no letter column at all.
+        let lines = picker::frame(
+            &Picker::single(items(&["a1", "a2"])),
+            5,
+            None,
+            Letters::Move,
+            ascii(),
+        );
+        assert_eq!(lines[0].text, "> a1");
+        assert_eq!(
+            lines[2].text,
+            "setas ou letra movem · Enter escolhe · Esc cancela"
+        );
     }
 
     #[test]
@@ -810,6 +842,7 @@ mod selector {
                 None,
                 items(&["Alfa", "Beta"]),
                 None,
+                Letters::Pick,
                 &theme(),
                 ascii(),
             )
@@ -831,10 +864,109 @@ mod selector {
         let mut t = ScriptedTerm::new(vec![key(Enter)]);
         t.interactive = false;
         let screen = t.screen();
-        let e = picker::select_one(&mut t, None, items(&["Alfa"]), None, &theme(), ascii())
-            .unwrap_err();
+        let e = picker::select_one(
+            &mut t,
+            None,
+            items(&["Alfa"]),
+            None,
+            Letters::Pick,
+            &theme(),
+            ascii(),
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
         let s = screen.lock().unwrap();
         assert_eq!((s.raw_enabled, s.reads, s.out.len()), (0, 0, 0));
+    }
+
+    /// Every `ESC [ n A` (move up n lines) in `raw`: the height of each erased frame.
+    fn move_ups(raw: &str) -> Vec<usize> {
+        raw.split("\u{1b}[")
+            .skip(1)
+            .filter_map(|p| {
+                let n: String = p.chars().take_while(char::is_ascii_digit).collect();
+                (p[n.len()..].starts_with('A') && !n.is_empty()).then(|| n.parse().unwrap())
+            })
+            .collect()
+    }
+
+    fn numbered(n: usize) -> Vec<&'static str> {
+        (1..=n)
+            .map(|i| &*Box::leak(format!("item {i}").into_boxed_str()))
+            .collect()
+    }
+
+    /// Runs one choice of `labels` on a `cols` x `rows` terminal: (result, plain, raw).
+    fn sized(
+        keys: Vec<Event>,
+        labels: &[&str],
+        size: (u16, u16),
+    ) -> (Option<usize>, String, String) {
+        let mut t = ScriptedTerm::new(keys);
+        t.size = size;
+        let screen = t.screen();
+        let got = picker::select_one(
+            &mut t,
+            None,
+            items(labels),
+            None,
+            Letters::Pick,
+            &theme(),
+            ascii(),
+        )
+        .unwrap();
+        let s = screen.lock().unwrap();
+        let raw = String::from_utf8_lossy(&s.out).into_owned();
+        (got, fake::plain(&s.out), raw)
+    }
+
+    #[test]
+    fn selector_cuts_lines_to_the_terminal_width() {
+        let long = "Um rótulo comprido demais 漢字漢字 com 🙂 no fim";
+        let (got, text, _) = sized(vec![key(Down), key(Esc)], &[long, "Beta"], (20, 24));
+        assert_eq!(got, None);
+        let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
+        assert!(lines.len() >= 6, "{lines:?}");
+        for l in &lines {
+            let w = ratatui::text::Span::raw(*l).width();
+            assert!(w <= 19, "{w} columns: {l:?}");
+        }
+        // Wide characters never split a column: a CJK pair either fits or is dropped.
+        assert_eq!(picker::fit("ab漢字", 3), "ab");
+        assert_eq!(picker::fit("ab漢字", 4), "ab漢");
+    }
+
+    #[test]
+    fn selector_window_follows_the_cursor_in_a_short_terminal() {
+        let labels = numbered(30);
+        let mut keys = vec![key(Down); 29];
+        keys.push(key(Enter));
+        let (got, text, raw) = sized(keys, &labels, (80, 8));
+        assert_eq!(got, Some(29));
+        let ups = move_ups(&raw);
+        assert_eq!(ups.len(), 30, "29 redraws and the final erase");
+        assert!(ups.iter().all(|&n| n <= 7), "{ups:?}");
+        // The last frame shows the last item under the cursor.
+        assert!(text.contains("> item 30\r\nsetas"), "{text:?}");
+        // A tall terminal: still at most 15 rows plus the hint.
+        let (_, _, raw) = sized(vec![key(Down), key(Enter)], &labels, (80, 40));
+        assert_eq!(move_ups(&raw), vec![16, 16]);
+    }
+
+    #[test]
+    fn selector_redraws_after_a_resize() {
+        let labels = numbered(30);
+        let keys = vec![
+            Event::Resize(80, 8),
+            key(Down),
+            Event::Resize(30, 40),
+            key(Enter),
+        ];
+        let (got, text, raw) = sized(keys, &labels, (80, 40));
+        assert_eq!(got, Some(1));
+        // 16 lines, then 7 after shrinking, 7 again, 16 after growing; the final erase
+        // covers exactly the last frame.
+        assert_eq!(move_ups(&raw), vec![16, 7, 7, 16]);
+        assert!(text.ends_with("> item 2\r\n"), "{text:?}");
     }
 }

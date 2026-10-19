@@ -24,7 +24,13 @@ pub trait Ui {
     /// Both stdin and stdout are terminals.
     fn interactive(&self) -> bool;
     fn confirm(&self, question: &str) -> anyhow::Result<bool>;
+    /// One of a few options; a shortcut letter picks its row at once.
     fn pick(&self, items: Vec<PickerItem>) -> anyhow::Result<Option<usize>>;
+    /// One of the apps that answer to the same name: a letter only moves the cursor and
+    /// Enter confirms (the names often share an initial and a slip would act on the wrong one).
+    fn pick_target(&self, items: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
+        self.pick(items)
+    }
     fn pick_many(
         &self,
         items: Vec<PickerItem>,
@@ -169,6 +175,23 @@ impl TtyUi {
 }
 
 impl TtyUi {
+    fn select_one(
+        &self,
+        items: Vec<PickerItem>,
+        letters: picker::Letters,
+    ) -> anyhow::Result<Option<usize>> {
+        let mut term = self.term()?;
+        Ok(picker::select_one(
+            &mut **term,
+            None,
+            items,
+            None,
+            letters,
+            &self.theme,
+            self.glyphs,
+        )?)
+    }
+
     fn term(&self) -> anyhow::Result<std::sync::MutexGuard<'_, Box<dyn Term + Send>>> {
         self.term
             .lock()
@@ -207,15 +230,11 @@ impl Ui for TtyUi {
     }
 
     fn pick(&self, items: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
-        let mut term = self.term()?;
-        Ok(picker::select_one(
-            &mut **term,
-            None,
-            items,
-            None,
-            &self.theme,
-            self.glyphs,
-        )?)
+        self.select_one(items, picker::Letters::Pick)
+    }
+
+    fn pick_target(&self, items: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
+        self.select_one(items, picker::Letters::Move)
     }
 
     fn pick_many(
@@ -669,7 +688,7 @@ fn choose(
                 })
                 .collect();
             Ok(ui
-                .pick(items)?
+                .pick_target(items)?
                 .and_then(|i| (i < found.len()).then(|| found.swap_remove(i))))
         }
     }
