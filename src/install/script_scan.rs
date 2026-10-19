@@ -4,7 +4,7 @@
 //! wingetrs sandbox cannot allow (`Refuse`) or that needs a stronger confirmation
 //! (`ConfirmStrong`). Every script needs at least a plain confirmation (`Confirm`).
 //! The same report feeds the dry-run, the confirmation dialog, `show` and the oracle.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use super::classify_2c::{commands_in, normalize_quotes};
 use super::manifest::{HookKind, InstallerSpec, Resolved};
@@ -1171,14 +1171,19 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
     let uncommented: Vec<char> = strip_comments(script).chars().collect();
     let n = chars.len();
     let mut mask = vec![false; n];
-    if global_named_outside_conditions(&uncommented) {
+    if global_named_outside_conditions(&uncommented) || mask_killer(&chars) {
         return mask;
     }
     let mut last_close: Option<usize> = None;
-    // Brace depth in code: only top-level blocks are masked. A block nested in any `{}`
-    // may be a scriptblock run elsewhere (`Start-Job`, `pwsh -c`), where `$global` is
-    // not the runner's constant.
-    let mut depth = 0usize;
+    // Enclosing `{` frames in code. A block nested in a scriptblock may run elsewhere
+    // (`Start-Job`, `pwsh -c`), where `$global` is not the runner's constant: only blocks
+    // whose every enclosing frame is allowed by `open_frame` are masked.
+    let mut frames: Vec<FrameKind> = Vec::new();
+    let mut last_closed: Option<(usize, FrameKind)> = None;
+    let mut unbalanced = false;
+    // `)` index -> its `(` (code only), for `open_frame`.
+    let mut parens: Vec<usize> = Vec::new();
+    let mut paren_open: HashMap<usize, usize> = HashMap::new();
     let mut i = 0;
     // Same tokenizing as `blank`: the keyword counts only in code.
     while i < n {
@@ -1214,12 +1219,33 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
                     i += 1;
                 }
             }
+            '(' => {
+                parens.push(i);
+                i += 1;
+            }
+            ')' => {
+                if let Some(o) = parens.pop() {
+                    paren_open.insert(i, o);
+                }
+                i += 1;
+            }
             '{' => {
-                depth += 1;
+                frames.push(open_frame(
+                    &chars,
+                    &uncommented,
+                    &paren_open,
+                    i,
+                    last_closed,
+                ));
                 i += 1;
             }
             '}' => {
-                depth = depth.saturating_sub(1);
+                // An unbalanced `}` leaves the frame unknown: nothing after it is masked.
+                let kind = frames.pop().unwrap_or_else(|| {
+                    unbalanced = true;
+                    FrameKind::Other
+                });
+                last_closed = Some((i, kind));
                 i += 1;
             }
             _ => {
@@ -1250,11 +1276,13 @@ fn global_dead_mask(script: &str) -> Vec<bool> {
                     Some(_) => before.is_some() && before == last_close,
                     None => false,
                 };
-                match keyword.filter(|_| starts_word && statement && depth == 0) {
+                let enclosed_ok = !unbalanced && frames.iter().all(|f| *f != FrameKind::Other);
+                match keyword.filter(|_| starts_word && statement && enclosed_ok) {
                     Some(k) => match global_block(&chars, i + k.len()) {
                         Some((open, close)) => {
                             mask[open + 1..close].iter_mut().for_each(|m| *m = true);
                             last_close = Some(close);
+                            last_closed = Some((close, FrameKind::If));
                             i = close + 1;
                         }
                         None => i += k.len(),
@@ -1324,7 +1352,15 @@ fn global_block(chars: &[char], j: usize) -> Option<(usize, usize)> {
     if chars.get(k) != Some(&'{') {
         return None;
     }
-    let open = k;
+    Some((k, block_close(chars, k)?))
+}
+
+/// Index of the `}` closing the `{` at `open`, or `None` on any doubt: unbalanced braces, a
+/// brace inside a string or comment or escaped with a backtick, a here-string or block
+/// comment, `a#b`.
+fn block_close(chars: &[char], open: usize) -> Option<usize> {
+    let n = chars.len();
+    let mut k = open;
     let mut depth = 0usize;
     while k < n {
         let c = chars[k];
@@ -1362,7 +1398,7 @@ fn global_block(chars: &[char], j: usize) -> Option<(usize, usize)> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((open, k));
+                    return Some(k);
                 }
             }
             _ => {}
@@ -1576,4 +1612,224 @@ fn global_named_outside_conditions(view: &[char]) -> bool {
                     && lower.get(k + 6).is_none_or(|c| !word(*c)));
         !(in_condition || passthrough)
     })
+}
+/// Kind of a `{` the mask scanner is inside (see [`open_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameKind {
+    /// Body of `if`/`elseif`/`else`.
+    If,
+    Try,
+    Catch,
+    /// `foreach`/`for`/`while`/`finally` body or the `| ForEach-Object { }` scriptblock.
+    Plain,
+    /// Anything else: scriptblock literal, hashtable, function body, `${...}`.
+    Other,
+}
+
+/// Words that switch masking off for a whole script (raw text, comments included): ways
+/// to run a scriptblock elsewhere or to redefine `ForEach-Object`/`%`.
+const MASK_KILLERS: &[&str] = &[
+    // Aliases (also `Set-Item`/`New-Item`/`ni`/`si` on the `alias:` drive).
+    "set-alias",
+    "new-alias",
+    "alias:",
+    // Another runspace or process.
+    "-parallel",
+    "start-job",
+    "start-threadjob",
+    "invoke-command",
+    "[powershell]",
+    "runspace",
+    // Dynamic code.
+    "invoke-expression",
+    "[scriptblock]::create",
+    ".invoke(",
+    "invoke-item",
+    "add-type",
+    "executioncontext",
+    "get-command",
+    "new-module",
+    "import-module",
+];
+
+/// Words of [`MASK_KILLERS`] that would false-match as substrings (`sal` in `salt`):
+/// matched as whole tokens only.
+const MASK_KILLER_TOKENS: &[&str] = &[
+    "function",
+    "filter",
+    "sal",
+    "nal",
+    "iex",
+    "gcm",
+    "ipmo",
+    "pwsh",
+    "powershell",
+];
+
+/// Whether the raw script (comments included) names anything of [`MASK_KILLERS`], a token of
+/// [`MASK_KILLER_TOKENS`] (not after `-`: `-Filter` is a parameter), or calls a variable
+/// (`& $x`, `. $x`). A false match only turns masking off (fail closed).
+fn mask_killer(chars: &[char]) -> bool {
+    let lower: String = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    if MASK_KILLERS.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    if lower.lines().any(invokes_variable) {
+        return true;
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    MASK_KILLER_TOKENS.iter().any(|kw| {
+        lower.match_indices(kw).any(|(at, _)| {
+            let before = lower[..at].chars().next_back();
+            let after = lower[at + kw.len()..].chars().next();
+            before.is_none_or(|c| !word(c) && c != '-')
+                && after.is_none_or(|c| !word(c) && c != '-')
+        })
+    })
+}
+
+/// Classifies the `{` at `open`. Allowed (not [`FrameKind::Other`]) only for:
+/// - the scriptblock right after `| ForEach-Object` or `| %` with no other argument;
+/// - the body of `if (...)`, `foreach (...)`, `for (...)`, `while (...)`, `try` in statement
+///   position, of `elseif (...)`/`else` right after an `if` body, and of `catch`/`finally`
+///   right after a `try`/`catch` body.
+///
+/// `last_closed` is the `}` the scanner closed last and the kind of its frame.
+fn open_frame(
+    chars: &[char],
+    uncommented: &[char],
+    paren_open: &HashMap<usize, usize>,
+    open: usize,
+    last_closed: Option<(usize, FrameKind)>,
+) -> FrameKind {
+    let blank = |c: char| matches!(c, ' ' | '\t');
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    // Previous index that is not a blank (same line).
+    let back = |k: usize| (0..k).rev().find(|&j| !blank(chars[j]));
+    // `| ForEach-Object {` / `| % {` with nothing after the closing brace.
+    if let Some(end) = back(open) {
+        let start = if chars[end] == '%' {
+            Some(end)
+        } else {
+            let s = (0..=end)
+                .rev()
+                .take_while(|&j| word(chars[j]) || chars[j] == '-')
+                .last();
+            s.filter(|&s| {
+                chars[s..=end]
+                    .iter()
+                    .collect::<String>()
+                    .eq_ignore_ascii_case("foreach-object")
+            })
+        };
+        let pipe = start.and_then(back).filter(|&p| chars[p] == '|');
+        if let Some(p) = pipe {
+            let double = p.checked_sub(1).is_some_and(|q| chars[q] == '|');
+            let close = code_close(chars, open);
+            let alone = close.is_some_and(|c| {
+                (c + 1..chars.len())
+                    .find(|&j| !matches!(chars[j], ' ' | '\t' | '\r'))
+                    .is_none_or(|j| matches!(chars[j], '\n' | ';' | '|' | '}' | ')'))
+            });
+            return if !double && alone {
+                FrameKind::Plain
+            } else {
+                FrameKind::Other
+            };
+        }
+    }
+    // Keyword blocks: the brace on the keyword's line or the next one.
+    let mut p = back(open);
+    if let Some(k) = p.filter(|&k| chars[k] == '\n') {
+        let k = if k > 0 && chars[k - 1] == '\r' {
+            k - 1
+        } else {
+            k
+        };
+        p = back(k);
+    }
+    let Some(p) = p else {
+        return FrameKind::Other;
+    };
+    // `kw` ends at `end` (inclusive): the word and its start.
+    let word_before = |end: usize| -> Option<(String, usize)> {
+        let s = (0..=end).rev().take_while(|&j| word(chars[j])).last()?;
+        if s > 0 && (word(chars[s - 1]) || matches!(chars[s - 1], '-' | '$' | '.' | ':')) {
+            return None;
+        }
+        Some((
+            chars[s..=end]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase(),
+            s,
+        ))
+    };
+    let statement = |s: usize| statement_position(chars, s) && statement_position(uncommented, s);
+    let after = |kinds: &[FrameKind], s: usize| {
+        let prev = (0..s)
+            .rev()
+            .find(|&j| !matches!(chars[j], ' ' | '\t' | '\r' | '\n'));
+        last_closed.is_some_and(|(c, k)| prev == Some(c) && kinds.contains(&k))
+    };
+    if chars[p] == ')' {
+        // Matching `(`, as paired by the mask scanner (strings skipped).
+        let lp = paren_open.get(&p).copied();
+        let Some((kw, s)) = lp.and_then(back).and_then(word_before) else {
+            return FrameKind::Other;
+        };
+        return match kw.as_str() {
+            "if" if statement(s) => FrameKind::If,
+            "elseif" if after(&[FrameKind::If], s) => FrameKind::If,
+            "foreach" | "for" | "while" if statement(s) => FrameKind::Plain,
+            _ => FrameKind::Other,
+        };
+    }
+    let Some((kw, s)) = word_before(p) else {
+        return FrameKind::Other;
+    };
+    match kw.as_str() {
+        "else" if after(&[FrameKind::If], s) => FrameKind::If,
+        "try" if statement(s) => FrameKind::Try,
+        "catch" if after(&[FrameKind::Try, FrameKind::Catch], s) => FrameKind::Catch,
+        "finally" if after(&[FrameKind::Try, FrameKind::Catch], s) => FrameKind::Plain,
+        _ => FrameKind::Other,
+    }
+}
+
+/// Index of the `}` closing the `{` at `open`, tokenized like the mask scanner (braces in
+/// strings and `#` comments are text). `None` on a here-string, block comment or `a#b`
+/// inside, or when it never closes.
+fn code_close(chars: &[char], open: usize) -> Option<usize> {
+    let n = chars.len();
+    let mut depth = 0usize;
+    let mut k = open;
+    while k < n {
+        let prev = k.checked_sub(1).map(|p| chars[p]);
+        match chars[k] {
+            '`' => k += 2,
+            '@' if here_string_start(chars, k) => return None,
+            '\'' | '"' => k = string_end(chars, k)?,
+            '<' if chars.get(k + 1) == Some(&'#') => return None,
+            '#' if prev.is_some_and(continues_word) => return None,
+            '#' => {
+                while k < n && chars[k] != '\n' {
+                    k += 1;
+                }
+            }
+            '{' => {
+                depth += 1;
+                k += 1;
+            }
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(k);
+                }
+                k += 1;
+            }
+            _ => k += 1,
+        }
+    }
+    None
 }

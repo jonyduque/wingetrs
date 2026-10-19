@@ -955,9 +955,11 @@ fn global_block_in_another_runspace_fails_closed() {
         // `$global` is the runner's constant only in its own runspace.
         format!("Start-Job {{ $global = $true; if ($global) {{ {HKLM} }} }}"),
         format!("pwsh -c {{ $global = $true; if ($global) {{ {HKLM} }} }}"),
-        // Nested in any `{}`: never masked.
-        format!("foreach ($a in $b) {{ if ($global) {{ {HKLM} }} }}"),
-        format!("foreach ($a in $b) {{\n    if ($global) {{\n        {HKLM}\n    }}\n}}"),
+        format!("Start-Job {{ if ($global) {{ {HKLM} }} }}"),
+        // Nested in a scriptblock literal or a function body: never masked.
+        format!("Invoke-Thing {{ if ($global) {{ {HKLM} }} }}"),
+        format!("Invoke-Thing {{\n    if ($global) {{\n        {HKLM}\n    }}\n}}"),
+        format!("$sb = {{ if ($global) {{ {HKLM} }} }}; & $sb"),
         format!("function f {{ if ($global) {{ {HKLM} }} }}"),
     ] {
         let r = scan(&s, SUP);
@@ -988,6 +990,140 @@ fn global_named_elsewhere_disables_masking() {
         format!("# $global = $true\nif ($global) {{ {HKLM} }}"),
         format!("$globaldir = 1\nif ($global) {{ {HKLM} }}"),
     ] {
+        let r = scan(&s, SUP);
+        assert!(informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+/// `post_install` of `main/7zip` (catalog text, 2026-10-18): the shape shared by git, vscode
+/// and the other `.reg` templating scripts.
+const SEVENZIP_SHAPE: &str = r#"$7zip_dir = $dir -replace '\\', '\\'
+Get-ChildItem -Path "$bucketsdir\$bucket\scripts\7-zip" -Filter '*.reg' -File | ForEach-Object {
+    $content = Get-Content -Path $_.FullName -Encoding utf8
+    if ($global) { $content = $content -replace 'HKEY_CURRENT_USER(?=.+Classes)', 'HKEY_LOCAL_MACHINE' }
+    $content -replace '{{7zip_dir}}', $7zip_dir | Set-Content -Path "$dir\$($_.Name)" -Encoding unicode
+}"#;
+
+#[test]
+fn global_block_in_foreach_object_is_informational() {
+    let r = scan(SEVENZIP_SHAPE, SUP);
+    assert!(informational(&r), "{:?}", r.flags);
+    for s in [
+        format!("$a | ForEach-Object {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | foreach-object {{\n    if ($global) {{\n        {HKLM}\n    }}\n}}"),
+        format!("$a |% {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | % {{ if ($global) {{ {HKLM} }} }} | Out-Null"),
+        format!("($a | % {{ if ($global) {{ {HKLM} }} }})"),
+        // Statement blocks in statement position.
+        format!("foreach ($a in $b) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("for ($i = 0; $i -lt 2; $i++) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("while ($x) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("if ($x) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("if ($x) {{ }} elseif ($y) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("if ($x) {{ }}\nelse\n{{ if ($global) {{ {HKLM} }} }}"),
+        format!("try {{ if ($global) {{ {HKLM} }} }} catch {{ }}"),
+        format!("try {{ }} catch {{ if ($global) {{ {HKLM} }} }}"),
+        format!("try {{ }} catch {{ }} finally {{ if ($global) {{ {HKLM} }} }}"),
+        format!("foreach ($a in $b) {{ $a | % {{ if ($global) {{ {HKLM} }} }} }}"),
+        // `-Filter` is a parameter, not the `filter` keyword.
+        format!("gci -Filter x | % {{ if ($global) {{ {HKLM} }} }}"),
+        format!("foreach ($a in (gci 'x')) {{ if ($global) {{ {HKLM} }} }}"),
+        format!(
+            "$a | % {{\n    if (Test-Path \"$d\\$_.reg\") {{\n        if ($global) {{ {HKLM} }}\n    }}\n}}"
+        ),
+    ] {
+        let r = scan(&s, SUP);
+        assert!(informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn global_block_in_other_frames_fails_closed() {
+    for s in [
+        format!("$a | ForEach-Object -Parallel {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | % -Begin {{}} -Process {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | % {{ if ($global) {{ {HKLM} }} }} -End {{ }}"),
+        format!("$a | ForEach-Object -Process {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | Where-Object {{ if ($global) {{ {HKLM} }} }}"),
+        format!("ForEach-Object {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a || % {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | x% {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$a | My-ForEach-Object {{ if ($global) {{ {HKLM} }} }}"),
+        format!("x ForEach-Object {{ if ($global) {{ {HKLM} }} }}"),
+        format!("Write-Output if ($x) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("& {{ }} elseif ($y) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("Write-Output try {{ if ($global) {{ {HKLM} }} }}"),
+        format!("$sb = {{ if ($global) {{ {HKLM} }} }}; & $sb"),
+        format!("$h = @{{ a = {{ if ($global) {{ {HKLM} }} }} }}"),
+        // Keyword blocks out of statement position or out of order.
+        format!("& {{ }} else {{ if ($global) {{ {HKLM} }} }}"),
+        format!("Write-Output foreach ($a in $b) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("catch {{ if ($global) {{ {HKLM} }} }}"),
+        format!("& {{ }} finally {{ if ($global) {{ {HKLM} }} }}"),
+        format!("if ($x) {{ }} elsif ($y) {{ if ($global) {{ {HKLM} }} }}"),
+        format!("switch ($x) {{ a {{ if ($global) {{ {HKLM} }} }} }}"),
+        // An unbalanced `}` before the block.
+        format!("}}\nif ($global) {{ {HKLM} }}"),
+    ] {
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn mask_killer_words_disable_masking() {
+    let body = format!("$a | ForEach-Object {{ if ($global) {{ {HKLM} }} }}");
+    for extra in [
+        "Set-Alias ForEach-Object Start-Job",
+        "Set-Alias x y",
+        "iex ('Set-'+'Alias ForEach-Object Start-Job')",
+        "iex $x",
+        "sal x y",
+        "nal x y",
+        "Set-Item alias:x y",
+        "Invoke-Expression x",
+        "[ScriptBlock]::Create('x')",
+        "$sb.Invoke()",
+        "& $sb",
+        ". $sb",
+        "Invoke-Item x",
+        "Add-Type x",
+        "$ExecutionContext.x",
+        "Get-Command x",
+        "gcm x",
+        "New-Module x",
+        "Import-Module x",
+        "ipmo x",
+        "New-Alias x y",
+        "Remove-Item alias:%",
+        "# -Parallel",
+        "Start-Job { }",
+        "Start-ThreadJob { }",
+        "Invoke-Command { }",
+        "[powershell]::Create()",
+        "[runspacefactory]::CreateRunspace()",
+        "pwsh -c x",
+        "& powershell.exe x",
+        "function g { }",
+        "filter g { }",
+        "# FUNCTION",
+    ] {
+        let s = format!("{extra}\n{body}");
+        let r = scan(&s, SUP);
+        assert_eq!(r.verdict, Verdict::Refuse, "{s}: {:?}", r.flags);
+        assert!(!informational(&r), "{s}: {:?}", r.flags);
+    }
+    for extra in [
+        "gci -Filter x",
+        "$functions = 1",
+        "$myfilter = 2",
+        "$salt = 1",
+        "$pwsharch = 1",
+        "$mypowershellx = 1",
+        "$x = 'banal'",
+        "Get-Thing -iexx",
+    ] {
+        let s = format!("{extra}\n{body}");
         let r = scan(&s, SUP);
         assert!(informational(&r), "{s}: {:?}", r.flags);
     }
