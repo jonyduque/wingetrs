@@ -23,6 +23,7 @@ use wingetrs::core::SourceKind;
 use wingetrs::http::Http;
 use wingetrs::install::executor::{ExecError, Runners, ScriptHost, ScriptJob, ScriptOutcome};
 use wingetrs::install::ops::{self, Allow, OpsCtx, OpsError, ResidueScan};
+use wingetrs::install::script_scan::CallRoots;
 use wingetrs::install::target::Candidate;
 use wingetrs::install::traits::Effects;
 use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
@@ -789,7 +790,7 @@ fn resolved(extra: serde_json::Value) -> wingetrs::install::manifest::Resolved {
 fn removal_consent_lists_args_only_uninstaller() {
     let m = resolved(serde_json::json!({"uninstaller": {"args": "/S"}}));
     let vdir = Path::new(r"C:\w\apps\x\1.0");
-    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "");
+    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "", &CallRoots::default());
     assert_eq!(
         items,
         [ThirdParty::Program {
@@ -801,7 +802,7 @@ fn removal_consent_lists_args_only_uninstaller() {
     assert_eq!(items[0].label(), "desinstalador x-1.0.zip");
     // `$dir` in the arguments is the version folder, as the executor passes it.
     let m = resolved(serde_json::json!({"uninstaller": {"file": "un.exe", "args": ["/D=$dir"]}}));
-    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "");
+    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "", &CallRoots::default());
     assert_eq!(
         items,
         [ThirdParty::Program {
@@ -812,7 +813,7 @@ fn removal_consent_lists_args_only_uninstaller() {
     );
     // No uninstaller file and no args: nothing runs, nothing listed.
     let m = resolved(serde_json::json!({"uninstaller": {"script": "info 'x'"}}));
-    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "");
+    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "", &CallRoots::default());
     assert_eq!(
         items.iter().map(ThirdParty::label).collect::<Vec<_>>(),
         ["script uninstaller.script"]
@@ -828,7 +829,12 @@ fn removal_consent_order_matches_executor() {
         "uninstaller": {"file": "un.exe", "script": "info 'unins'"},
         "post_uninstall": "info 'post'",
     }));
-    let items = wingetrs::cli::output::removal_third_party(&m, Path::new(r"C:\v"), ", na remoção");
+    let items = wingetrs::cli::output::removal_third_party(
+        &m,
+        Path::new(r"C:\v"),
+        ", na remoção",
+        &CallRoots::default(),
+    );
     assert_eq!(
         items.iter().map(ThirdParty::label).collect::<Vec<_>>(),
         [
@@ -899,4 +905,83 @@ async fn dry_run_msi_shows_allow_msiexec_hint_and_capitalized_steps() {
         "{out}"
     );
     assert!(!out.contains("pede --allow-msiexec"), "{out}");
+}
+// ---- Task 192 ----
+
+/// A root whose `extras` bucket stores `scripts\ok.ps1` with the Task 149 marker.
+fn root_with_ok_script() -> TempDir {
+    let t = tempfile::tempdir().unwrap();
+    let bucket = t.path().join("buckets").join("extras");
+    std::fs::create_dir_all(bucket.join("scripts")).unwrap();
+    std::fs::write(
+        bucket.join("scripts").join("ok.ps1"),
+        "Write-Host 'chamado'\r\n",
+    )
+    .unwrap();
+    std::fs::write(bucket.join(".scripts-ok"), b"").unwrap();
+    t
+}
+
+/// The consent (CLI and TUI build it with `plan_third_party`) shows the file a hook runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn consent_shows_called_bucket_script() {
+    use wingetrs::install::manifest::HookKind;
+    use wingetrs::install::plan::Step;
+    let mut w = World::new().await;
+    w.publish("1.0", serde_json::json!({})).await;
+    let ctx = w.ctx();
+    let cand = match ops::resolve_target(&ctx, "x", None).unwrap() {
+        ops::Resolution::One(c) => c,
+        other => panic!("{other:?}"),
+    };
+    let mut plan = ops::plan_for(&ctx, &cand, false).unwrap().remove(0);
+    let t = root_with_ok_script();
+    plan.root = t.path().to_path_buf();
+    plan.steps.push(Step::Hook {
+        kind: HookKind::PostInstall,
+        script: ". \"$bucketsdir\\extras\\scripts\\ok.ps1\"".into(),
+    });
+    let items = wingetrs::cli::output::plan_third_party(&plan);
+    let called = items.iter().find_map(|i| match i {
+        ThirdParty::Script { hook, script, .. }
+            if hook == "arquivo chamado por post_install: $bucketsdir\\extras\\scripts\\ok.ps1" =>
+        {
+            Some(script.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        called.as_deref(),
+        Some("Write-Host 'chamado'\r\n"),
+        "{items:?}"
+    );
+    let block = wingetrs::cli::output::third_party_block(&items);
+    assert!(block.contains("Write-Host 'chamado'"), "{block}");
+    assert!(block.contains("analisado e mostrado abaixo"), "{block}");
+}
+
+/// The removal consent reads the installed `$dir`.
+#[test]
+fn removal_consent_shows_called_dir_script() {
+    let t = tempfile::tempdir().unwrap();
+    let vdir = t.path().join("apps").join("x").join("1.0");
+    std::fs::create_dir_all(&vdir).unwrap();
+    std::fs::write(vdir.join("un.ps1"), "Write-Host 'tchau'\r\n").unwrap();
+    let m = resolved(serde_json::json!({"pre_uninstall": "& \"$dir\\un.ps1\""}));
+    let roots = CallRoots::new(t.path(), Some(&vdir));
+    let items = wingetrs::cli::output::removal_third_party(&m, &vdir, "", &roots);
+    let hooks: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            ThirdParty::Script { hook, .. } => Some(hook.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        hooks,
+        [
+            "pre_uninstall",
+            "arquivo chamado por pre_uninstall: $dir\\un.ps1"
+        ]
+    );
 }

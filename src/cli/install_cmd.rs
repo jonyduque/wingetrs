@@ -6,6 +6,7 @@ use crate::install::executor::LaunchGate;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
 use crate::install::progress::ProgressEvent;
 use crate::install::residue::{self, Confidence, Residue};
+use crate::install::script_scan::CallRoots;
 use crate::install::target::Candidate;
 use crate::job_log::{JobInfo, JobLog, Outcome};
 use crate::tui::picker::PickerItem;
@@ -765,12 +766,11 @@ async fn uninstall(
         output::uninstall_plan_text(&plan, &ctx.data.install_layout(), ui.glyphs())
     );
     let (manifest, shown_sha) = ops::uninstall_manifest(ctx, &plan)?;
-    let vdir = ctx
-        .data
-        .install_layout()
-        .version_dir(&plan.app, &plan.version);
+    let layout = ctx.data.install_layout();
+    let vdir = layout.version_dir(&plan.app, &plan.version);
+    let roots = CallRoots::new(layout.root(), Some(&vdir));
     let code: Vec<_> = manifest
-        .map(|m| output::removal_third_party(&m, &vdir, ""))
+        .map(|m| output::removal_third_party(&m, &vdir, "", &roots))
         .filter(|items| !items.is_empty())
         .map(|items| (plan.app.clone(), items))
         .into_iter()

@@ -1098,7 +1098,7 @@ const MAX_PS1_BYTES: u64 = 1024 * 1024;
 /// UTF-16; none: strict UTF-8, because PowerShell 5.1 reads a BOM-less file as ANSI) and runs
 /// `script_scan` over the text. A refused verdict, an oversized or undecodable file stops the
 /// step. Returns the exact text that was analysed.
-fn scan_ps1_file(program: &Path) -> Result<String, String> {
+fn scan_ps1_file(program: &Path, roots: &script_scan::CallRoots) -> Result<String, String> {
     use std::io::Read;
     let name = program
         .file_name()
@@ -1114,35 +1114,13 @@ fn scan_ps1_file(program: &Path) -> Result<String, String> {
         return Err(format!("instalador {name} passa de 1 MiB: não analisado"));
     }
     let bad = |what: &str| format!("instalador {name} {what}: não analisado");
-    let utf16 = |rest: &[u8], be: bool| -> Result<String, String> {
-        if !rest.len().is_multiple_of(2) {
-            return Err(bad("tem UTF-16 truncado"));
-        }
-        let units = rest.as_chunks::<2>().0.iter().map(|c| {
-            if be {
-                u16::from_be_bytes(*c)
-            } else {
-                u16::from_le_bytes(*c)
-            }
-        });
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|_| bad("tem UTF-16 inválido"))
+    let text = script_scan::decode_script(&bytes).map_err(bad)?;
+    // Files it dot-sources from its own folder (`$PSScriptRoot`) are scanned too.
+    let roots = script_scan::CallRoots {
+        script_root: program.parent().map(Path::to_path_buf),
+        ..roots.clone()
     };
-    let text = match bytes.as_slice() {
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, false)?,
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, true)?,
-        [0xEF, 0xBB, 0xBF, rest @ ..] => {
-            String::from_utf8(rest.to_vec()).map_err(|_| bad("não é UTF-8 válido"))?
-        }
-        other => {
-            if other.contains(&0) {
-                return Err(bad("não é texto simples (UTF-16 sem BOM?)"));
-            }
-            String::from_utf8(other.to_vec()).map_err(|_| bad("não é UTF-8 válido"))?
-        }
-    };
-    let report = script_scan::scan(&text, PRELUDE_FUNCTIONS);
+    let (report, _) = script_scan::scan_called(&text, PRELUDE_FUNCTIONS, &roots);
     if report.verdict == script_scan::Verdict::Refuse {
         let reasons: Vec<String> = report
             .flags
@@ -1156,6 +1134,29 @@ fn scan_ps1_file(program: &Path) -> Result<String, String> {
         ));
     }
     Ok(text)
+}
+
+/// Refuses a manifest script whose called files (readable now) the scanner refuses.
+fn refuse_called(
+    kind: HookKind,
+    script: &str,
+    roots: &script_scan::CallRoots,
+) -> Result<(), String> {
+    let (report, _) = script_scan::scan_called(script, PRELUDE_FUNCTIONS, roots);
+    if report.verdict != script_scan::Verdict::Refuse {
+        return Ok(());
+    }
+    let reasons: Vec<String> = report
+        .flags
+        .into_iter()
+        .filter(|f| f.verdict == script_scan::Verdict::Refuse)
+        .map(|f| f.detail)
+        .collect();
+    Err(format!(
+        "script {} recusado pela análise: {}",
+        kind.key(),
+        reasons.join("; ")
+    ))
 }
 
 /// Removes the analysed copy of a `.ps1` installer on every path out.
@@ -1285,11 +1286,17 @@ fn prepare_hook(
     body: &HookBody<'_>,
     scope: &HookScope,
 ) -> Result<PreparedHook, String> {
+    // `$dir` is extracted now: the files a script runs from it (or from a bucket's guarded
+    // `scripts/`) are scanned again before it runs (Task 192).
+    let roots = script_scan::CallRoots::new(layout.root(), Some(&scope.version_dir));
     let (script, ps1_program, copy_guard) = match body {
-        HookBody::Script(s) => ((*s).to_string(), None, None),
+        HookBody::Script(s) => {
+            refuse_called(kind, s, &roots)?;
+            ((*s).to_string(), None, None)
+        }
         HookBody::Ps1 { file, .. } => {
             let program = installer_program(&scope.version_dir, file)?;
-            let text = scan_ps1_file(&program)?;
+            let text = scan_ps1_file(&program, &roots)?;
             // Only the analysed copy runs; the original is never executed.
             let (copy, guard) = write_ps1_copy(&program, &text)?;
             (text, Some(copy), Some(guard))
@@ -3461,7 +3468,8 @@ pub fn execute_uninstall(
     let (installed, notes) = load_installed(ctx, &plan.app)?;
     if let Some(inst) = &installed {
         // The scanner and the consent come before the first step: nothing runs, nothing goes.
-        planner::check_uninstall_scripts(&inst.manifest)
+        let roots = script_scan::CallRoots::new(layout.root(), Some(&inst.scope.version_dir));
+        planner::check_uninstall_scripts(&inst.manifest, &roots)
             .map_err(|e| fail(0, "analisar scripts".into(), e.to_string()))?;
         if planner::has_uninstall_scripts(&inst.manifest) && ctx.runners.scripts.is_none() {
             return Err(ExecError::NeedsScriptConsent {

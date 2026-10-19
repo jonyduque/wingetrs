@@ -9,6 +9,11 @@
 #   $__wr_shortcut_root shortcut root
 # Optional: $bucketsdir (Find-BucketDirectory throws if it is empty).
 # This file only defines functions: loading it has no side effects.
+#
+# Security note (Task 192): any refusal on this side (and the script_scan rules about the
+# prelude internals) is a convenience, not a boundary. A script can get around it (aliases,
+# names built at run time, writing the effects file directly). The boundary is the Rust
+# side, which revalidates every effect read back from the effects file against its allowlist.
 
 # messages -- core.ps1:311-314
 function abort($msg, [int] $exit_code = 1) { throw "abort: $msg" }

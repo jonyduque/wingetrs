@@ -1,5 +1,6 @@
 //! Plan builder: turns a resolved manifest, the layout and the current state into
-//! an [`InstallPlan`]. Pure: no I/O.
+//! an [`InstallPlan`]. Pure except for reading the files a script runs, for the gate
+//! (`script_scan::scan_called`, Task 192).
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,7 @@ use crate::install::plan::{
 };
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::safepath;
-use crate::install::script_scan::{self, Verdict};
+use crate::install::script_scan::{self, CallRoots, Verdict};
 use crate::install::shim;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,9 +242,10 @@ fn needs_powershell(spec: &InstallerSpec) -> bool {
     spec.script.is_some() || runs_ps1_file(spec)
 }
 
-/// `Step::Hook` for a manifest script, refused at planning when the scanner refuses it.
-fn hook_step(kind: HookKind, script: &str) -> Result<Step, PlanError> {
-    let report = script_scan::scan(script, PRELUDE_FUNCTIONS);
+/// `Step::Hook` for a manifest script, refused at planning when the scanner refuses it (or
+/// a file it runs that `roots` can read).
+fn hook_step(kind: HookKind, script: &str, roots: &CallRoots) -> Result<Step, PlanError> {
+    let (report, _) = script_scan::scan_called(script, PRELUDE_FUNCTIONS, roots);
     if report.verdict == Verdict::Refuse {
         let reasons = report
             .flags
@@ -296,10 +298,16 @@ fn installer_step(m: &Resolved, spec: &InstallerSpec, vdir: &Path) -> Result<Ste
 /// Scoop's `uninstall` order for the OLD version during an update (scoop-update.ps1:351-377):
 /// `pre_uninstall`, the uninstaller file, `uninstaller.script`, `post_uninstall`. Every script
 /// goes through the scanner; the uninstaller file is the one the old manifest declares.
-fn upgrade_uninstall_steps(old: &Resolved, old_vdir: &Path) -> Result<Vec<Step>, PlanError> {
+fn upgrade_uninstall_steps(
+    old: &Resolved,
+    old_vdir: &Path,
+    root: &Path,
+) -> Result<Vec<Step>, PlanError> {
     let mut steps = Vec::new();
+    // The old version is extracted: files its hooks run from `$dir` are read.
+    let roots = CallRoots::new(root, Some(old_vdir));
     let hook = |kind: HookKind, script: &str| {
-        hook_step(kind, script).map(|s| match s {
+        hook_step(kind, script, &roots).map(|s| match s {
             Step::Hook { kind, script } => Step::UpgradeUninstallHook { kind, script },
             other => other,
         })
@@ -341,8 +349,9 @@ pub fn uninstaller_command(
 }
 
 /// Refuses (at planning, `ScriptRefused`) an installed manifest whose uninstall scripts the
-/// scanner refuses; a `.ps1` uninstaller file is scanned when it is about to run.
-pub fn check_uninstall_scripts(m: &Resolved) -> Result<(), PlanError> {
+/// scanner refuses; a `.ps1` uninstaller file is scanned when it is about to run. `roots`:
+/// where the files the scripts run can be read (`CallRoots::new(root, Some(vdir))`).
+pub fn check_uninstall_scripts(m: &Resolved, roots: &CallRoots) -> Result<(), PlanError> {
     let scripts = [
         (HookKind::PreUninstall, m.hooks.pre_uninstall.as_deref()),
         (
@@ -353,7 +362,7 @@ pub fn check_uninstall_scripts(m: &Resolved) -> Result<(), PlanError> {
     ];
     for (kind, script) in scripts {
         if let Some(script) = script {
-            hook_step(kind, script)?;
+            hook_step(kind, script, roots)?;
         }
     }
     Ok(())
@@ -369,9 +378,11 @@ pub fn has_uninstall_scripts(m: &Resolved) -> bool {
 
 pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     let m = input.manifest;
-    // Its own uninstall hooks run at removal time: the scanner already looks at them here.
-    check_uninstall_scripts(m)?;
     let (app, version, layout) = (input.app, m.version.as_str(), input.layout);
+    // Nothing of this version is extracted yet: only the buckets' guarded `scripts/` is read.
+    let roots = CallRoots::new(layout.root(), None);
+    // Its own uninstall hooks run at removal time: the scanner already looks at them here.
+    check_uninstall_scripts(m, &roots)?;
     let upgrade_from = match &input.installed {
         Some(i) if i.version == m.version => {
             return Err(PlanError::AlreadyInstalled {
@@ -421,11 +432,12 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
         steps.extend(upgrade_uninstall_steps(
             old,
             &layout.version_dir(app, &old.version),
+            layout.root(),
         )?);
     }
     steps.push(Step::Promote);
     if let Some(script) = &m.hooks.pre_install {
-        steps.push(hook_step(HookKind::PreInstall, script)?);
+        steps.push(hook_step(HookKind::PreInstall, script, &roots)?);
     }
     if let Some(spec) = &m.installer {
         // install.ps1 Invoke-Installer: the file runs only with `file` or `args`, then the script.
@@ -433,7 +445,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
             steps.push(installer_step(m, spec, &layout.version_dir(app, version))?);
         }
         if let Some(script) = &spec.script {
-            steps.push(hook_step(HookKind::InstallerScript, script)?);
+            steps.push(hook_step(HookKind::InstallerScript, script, &roots)?);
         }
     }
     for p in &m.persist {
@@ -508,7 +520,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     }
     steps.push(Step::EnsureShimsOnPath);
     if let Some(script) = &m.hooks.post_install {
-        steps.push(hook_step(HookKind::PostInstall, script)?);
+        steps.push(hook_step(HookKind::PostInstall, script, &roots)?);
     }
     steps.push(Step::WriteManifest {
         json: m.raw_json.clone(),

@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use wingetrs::install::layout::Layout;
 use wingetrs::install::manifest::{Arch, resolve};
 use wingetrs::install::plan::{PersistKind, ShimKind, Step};
-use wingetrs::install::planner::{InstalledInfo, PlanError, PlanInput, plan_install, substitute};
+use wingetrs::install::planner::{
+    InstalledInfo, PlanError, PlanInput, check_uninstall_scripts, plan_install, substitute,
+};
+use wingetrs::install::script_scan::CallRoots;
 
 fn fx(n: &str) -> String {
     std::fs::read_to_string(format!("tests/fixtures/scoop/manifests/{n}")).unwrap()
@@ -611,4 +614,121 @@ fn rar_still_unsupported() {
         }
         other => panic!("{other:?}"),
     }
+}
+// Task 192: the planner follows the files a hook runs.
+
+const BAD_PS1: &str = "Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1\r\n";
+
+/// A root whose `extras` bucket stores `scripts\bad.ps1` (HKLM) and `scripts\ok.ps1`.
+fn root_with_bucket_scripts() -> tempfile::TempDir {
+    let t = tempfile::tempdir().unwrap();
+    let bucket = t.path().join("buckets").join("extras");
+    std::fs::create_dir_all(bucket.join("scripts")).unwrap();
+    std::fs::write(bucket.join("scripts").join("bad.ps1"), BAD_PS1).unwrap();
+    std::fs::write(bucket.join("scripts").join("ok.ps1"), "Write-Host ok\r\n").unwrap();
+    std::fs::write(bucket.join(".scripts-ok"), b"").unwrap();
+    t
+}
+
+fn manifest_with(extra: serde_json::Value) -> wingetrs::install::manifest::Resolved {
+    let mut v = serde_json::json!({"version": "2", "url": "https://x/a.zip", "hash": "aa"});
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    resolve(&v.to_string(), Arch::X64).unwrap()
+}
+
+fn plan_in(
+    l: &Layout,
+    m: &wingetrs::install::manifest::Resolved,
+    installed: Option<InstalledInfo>,
+) -> Result<wingetrs::install::plan::InstallPlan, PlanError> {
+    plan_install(&PlanInput {
+        app: "app",
+        bucket: "extras",
+        manifest: m,
+        layout: l,
+        shortcut_root: Path::new(SC),
+        installed,
+        launcher_present: true,
+        keep_old: false,
+        manifest_sha256: "",
+    })
+}
+
+#[test]
+fn bucket_script_called_by_any_hook_is_refused() {
+    let t = root_with_bucket_scripts();
+    let l = Layout::new(t.path());
+    let call = |name: &str| format!(". \"$bucketsdir\\extras\\scripts\\{name}\"");
+    let hooks = |name: &str| {
+        let c = call(name);
+        [
+            ("pre_install", serde_json::json!({"pre_install": c})),
+            ("installer", serde_json::json!({"installer": {"script": c}})),
+            ("post_install", serde_json::json!({"post_install": c})),
+            ("pre_uninstall", serde_json::json!({"pre_uninstall": c})),
+            (
+                "uninstaller",
+                serde_json::json!({"uninstaller": {"script": c}}),
+            ),
+            ("post_uninstall", serde_json::json!({"post_uninstall": c})),
+        ]
+    };
+    for (hook, extra) in hooks("bad.ps1") {
+        let e = plan_in(&l, &manifest_with(extra), None).unwrap_err();
+        assert!(
+            matches!(&e, PlanError::ScriptRefused { .. }),
+            "{hook}: {e:?}"
+        );
+        assert!(e.to_string().contains("HKLM"), "{hook}: {e}");
+    }
+    for (hook, extra) in hooks("ok.ps1") {
+        plan_in(&l, &manifest_with(extra), None).unwrap_or_else(|e| panic!("{hook}: {e}"));
+    }
+}
+
+#[test]
+fn upgrade_hook_reads_old_version_dir() {
+    let t = root_with_bucket_scripts();
+    let l = Layout::new(t.path());
+    let old = manifest_with(serde_json::json!({
+        "version": "1",
+        "pre_uninstall": "& \"$dir\\un.ps1\""
+    }));
+    let installed = || {
+        Some(InstalledInfo {
+            version: "1".into(),
+            old_manifest: Some(old.clone()),
+        })
+    };
+    let new = manifest_with(serde_json::json!({}));
+    // Not extracted (or gone): the call keeps its strong confirmation and plans.
+    plan_in(&l, &new, installed()).unwrap();
+    let vdir = l.version_dir("app", "1");
+    std::fs::create_dir_all(&vdir).unwrap();
+    std::fs::write(vdir.join("un.ps1"), BAD_PS1).unwrap();
+    let e = plan_in(&l, &new, installed()).unwrap_err();
+    assert!(
+        matches!(&e, PlanError::ScriptRefused { hook, .. } if hook == "pre_uninstall"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn removal_check_reads_installed_dir() {
+    let t = root_with_bucket_scripts();
+    let l = Layout::new(t.path());
+    let m = manifest_with(serde_json::json!({"post_uninstall": ". \"$dir\\un.ps1\""}));
+    let vdir = l.version_dir("app", "2");
+    let roots = CallRoots::new(l.root(), Some(&vdir));
+    check_uninstall_scripts(&m, &roots).unwrap();
+    std::fs::create_dir_all(&vdir).unwrap();
+    std::fs::write(vdir.join("un.ps1"), BAD_PS1).unwrap();
+    let roots = CallRoots::new(l.root(), Some(&vdir));
+    let e = check_uninstall_scripts(&m, &roots).unwrap_err();
+    assert!(
+        matches!(&e, PlanError::ScriptRefused { hook, .. } if hook == "post_uninstall"),
+        "{e:?}"
+    );
 }

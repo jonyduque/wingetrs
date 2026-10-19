@@ -282,6 +282,10 @@ async fn setup() -> World {
 }
 
 async fn setup_with(ps1: &[u8]) -> World {
+    setup_zip(fixture_zip(ps1)).await
+}
+
+async fn setup_zip(zip: Vec<u8>) -> World {
     let server = MockServer::start().await;
     let t = tempfile::tempdir().unwrap();
     let root = t.path().join("root");
@@ -301,7 +305,6 @@ async fn setup_with(ps1: &[u8]) -> World {
     let shortcuts = FakeShortcuts::new(t.path().join("startmenu"));
     let state_path = t.path().join("state").join("state.db");
     let state = StateDb::open(&state_path).unwrap();
-    let zip = fixture_zip(ps1);
     let sha = sha256_hex(&zip);
     Mock::given(method("GET"))
         .and(path("/pkg.zip"))
@@ -655,4 +658,53 @@ async fn ps1_through_junction_out_of_version_dir_refused() {
         1,
         "no copy outside"
     );
+}
+
+// ---- Task 192 ----
+
+const HKLM_PS1: &[u8] = b"Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1\r\n";
+
+/// A `.ps1` installer that dot-sources a file of its folder: the file is scanned too.
+#[tokio::test]
+async fn ps1_dot_sourced_file_is_scanned() {
+    let zip = zip_of(&[
+        ("pkg/setup.ps1", b". \"$PSScriptRoot\\helper.ps1\"\r\n"),
+        ("pkg/helper.ps1", HKLM_PS1),
+        ("pkg/tool.exe", &fake_pe(3)),
+    ]);
+    let w = setup_zip(zip).await;
+    let host = Arc::new(FakeHost::default());
+    let plan = w.plan(ps1_manifest(serde_json::json!([])));
+    match w.run(&plan, &host).await {
+        Err(ExecError::Failed { message, .. }) => {
+            assert!(message.contains("recusado pela análise"), "{message}");
+            assert!(message.contains("helper.ps1"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(host.seen().is_empty());
+}
+
+/// A hook that runs a file of `$dir` is scanned again once `$dir` is extracted.
+#[tokio::test]
+async fn hook_called_dir_file_is_scanned_before_running() {
+    let w = setup_with(HKLM_PS1).await;
+    let host = Arc::new(FakeHost::default());
+    let plan = w.plan(serde_json::json!({"post_install": "& \"$dir\\setup.ps1\""}));
+    match w.run(&plan, &host).await {
+        Err(ExecError::Failed { message, .. }) => {
+            assert!(
+                message.contains("script post_install recusado pela análise"),
+                "{message}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(host.seen().is_empty());
+    // A clean file runs.
+    let w = setup_with(b"Write-Host ok\r\n").await;
+    let host = Arc::new(FakeHost::default());
+    let plan = w.plan(serde_json::json!({"post_install": "& \"$dir\\setup.ps1\""}));
+    w.run(&plan, &host).await.unwrap();
+    assert_eq!(host.seen().len(), 1);
 }

@@ -10,7 +10,7 @@ use crate::install::plan::{InstallPlan, Step};
 use crate::install::planner;
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
-use crate::install::script_scan::{self, ScriptReport, Verdict, printable};
+use crate::install::script_scan::{self, CallRoots, ScriptReport, Verdict, printable};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
 use std::collections::VecDeque;
@@ -580,12 +580,21 @@ impl ThirdParty {
     }
 }
 
-fn script_item(hook: String, script: &str) -> ThirdParty {
-    ThirdParty::Script {
-        hook,
+/// A manifest script, then each file it runs that `roots` can read (Task 192): the user
+/// sees what runs, and the script's report already carries their flags.
+fn script_items(hook: String, script: &str, roots: &CallRoots) -> Vec<ThirdParty> {
+    let (report, called) = script_scan::scan_called(script, PRELUDE_FUNCTIONS, roots);
+    let files = called.into_iter().map(|c| ThirdParty::Script {
+        hook: format!("arquivo chamado por {hook}: {}", c.target),
+        script: c.script,
+        report: c.report,
+    });
+    let first = ThirdParty::Script {
+        hook: hook.clone(),
         script: script.to_string(),
-        report: script_scan::scan(script, PRELUDE_FUNCTIONS),
-    }
+        report,
+    };
+    std::iter::once(first).chain(files).collect()
 }
 
 fn ps1_item(uninstaller: bool, file: &str, args: &[String]) -> ThirdParty {
@@ -619,12 +628,18 @@ fn uninstaller_item(file: &str, args: &[String]) -> ThirdParty {
 /// executor's order (`pre_uninstall`, the uninstaller file, `uninstaller.script`,
 /// `post_uninstall`); the uninstaller comes from `planner::uninstaller_command`, the same call
 /// the executor makes (an `args`-only uninstaller runs the first download). `suffix` is
-/// appended to each script name (`, na remoção`).
-pub fn removal_third_party(m: &Resolved, vdir: &Path, suffix: &str) -> Vec<ThirdParty> {
+/// appended to each script name (`, na remoção`). `roots`: where the files the scripts run
+/// can be read (`CallRoots::new(root, Some(vdir))`).
+pub fn removal_third_party(
+    m: &Resolved,
+    vdir: &Path,
+    suffix: &str,
+    roots: &CallRoots,
+) -> Vec<ThirdParty> {
     let name = |k: HookKind| format!("{}{suffix}", k.key());
     let mut out = Vec::new();
     if let Some(s) = &m.hooks.pre_uninstall {
-        out.push(script_item(name(HookKind::PreUninstall), s));
+        out.extend(script_items(name(HookKind::PreUninstall), s, roots));
     }
     if let Some(u) = &m.uninstaller {
         match planner::uninstaller_command(m, u, vdir) {
@@ -636,11 +651,11 @@ pub fn removal_third_party(m: &Resolved, vdir: &Path, suffix: &str) -> Vec<Third
             }),
         }
         if let Some(s) = &u.script {
-            out.push(script_item(name(HookKind::UninstallerScript), s));
+            out.extend(script_items(name(HookKind::UninstallerScript), s, roots));
         }
     }
     if let Some(s) = &m.hooks.post_uninstall {
-        out.push(script_item(name(HookKind::PostUninstall), s));
+        out.extend(script_items(name(HookKind::PostUninstall), s, roots));
     }
     out
 }
@@ -649,12 +664,23 @@ pub fn removal_third_party(m: &Resolved, vdir: &Path, suffix: &str) -> Vec<Third
 /// (installing it already needs the consent: Tasks 151 and 159).
 pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
     let mut out = Vec::new();
+    let layout = Layout::new(&plan.root);
+    // The same roots the planner scanned with: nothing of the new version is extracted yet,
+    // the old one (an update) is.
+    let roots = CallRoots::new(&plan.root, None);
+    let old_dir = plan
+        .upgrade_from
+        .as_deref()
+        .map(|v| layout.version_dir(&plan.app, v));
+    let old_roots = CallRoots::new(&plan.root, old_dir.as_deref());
     for step in &plan.steps {
         match step {
-            Step::Hook { kind, script } => out.push(script_item(kind.key().to_string(), script)),
+            Step::Hook { kind, script } => {
+                out.extend(script_items(kind.key().to_string(), script, &roots));
+            }
             Step::UpgradeUninstallHook { kind, script } => {
                 let hook = format!("{} da versão instalada", kind.key());
-                out.push(script_item(hook, script));
+                out.extend(script_items(hook, script, &old_roots));
             }
             Step::RunInstaller { file, args, .. } => out.push(program_item(false, file, args)),
             Step::RunPs1Installer { file, args } => out.push(ps1_item(false, file, args)),
@@ -672,8 +698,9 @@ pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
                 _ => None,
             })
             .map(|m| {
-                let vdir = Layout::new(&plan.root).version_dir(&plan.app, &plan.version);
-                removal_third_party(&m, &vdir, ", na remoção")
+                let vdir = layout.version_dir(&plan.app, &plan.version);
+                let roots = CallRoots::new(&plan.root, Some(&vdir));
+                removal_third_party(&m, &vdir, ", na remoção", &roots)
             })
             .unwrap_or_default();
         if later.is_empty() {

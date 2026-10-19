@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use wingetrs::install::manifest::{Arch, HookKind, resolve};
 use wingetrs::install::script_scan::{
-    FlagKind, SCOOP_FUNCTIONS, ScriptReport, Verdict, env_var_names, scan, scan_manifest,
+    CallRoots, FlagKind, SCOOP_FUNCTIONS, ScriptReport, Verdict, env_var_names, scan, scan_called,
+    scan_manifest,
 };
 
 const SUP: &[&str] = &["ensure"];
@@ -362,8 +363,8 @@ fn alternate_spellings_flagged() {
 
 #[test]
 fn near_misses_not_flagged() {
+    // `& "$dir\x.exe" /S` was here until Task 192: running a file is now `CalledFile`.
     for s in [
-        r#"& "$dir\x.exe" /S"#,
         r#"Copy-Item "$dir\curl.exe" "$dir\bin""#,
         "$iex = 1",
         r"Get-ItemProperty 'HKCU:\Software\X'",
@@ -1147,4 +1148,159 @@ fn parameter_defaults_disable_masking() {
             r.flags
         );
     }
+}
+
+// Task 192: files a script runs, and aliases.
+
+/// A wingetrs root with `buckets\extras\scripts\<name>` = `body` and the Task 149 marker.
+fn bucket_root(name: &str, body: &str, marker: bool) -> tempfile::TempDir {
+    let t = tempfile::tempdir().unwrap();
+    let bucket = t.path().join("buckets").join("extras");
+    std::fs::create_dir_all(bucket.join("scripts")).unwrap();
+    std::fs::write(bucket.join("scripts").join(name), body).unwrap();
+    if marker {
+        std::fs::write(bucket.join(".scripts-ok"), b"").unwrap();
+    }
+    t
+}
+
+fn called_flag(r: &ScriptReport) -> Option<&wingetrs::install::script_scan::Flag> {
+    r.flags.iter().find(|f| f.kind == FlagKind::CalledFile)
+}
+
+#[test]
+fn call_quoted_path_is_confirm_strong() {
+    let r = scan(r#"& "$dir\setup.ps1" /S"#, SUP);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", r.flags);
+    let f = called_flag(&r).expect("CalledFile flag");
+    assert_eq!(f.verdict, Verdict::ConfirmStrong);
+    assert_eq!(
+        f.detail,
+        r"roda um arquivo que não é mostrado: $dir\setup.ps1"
+    );
+    for s in [
+        r"& '$dir\setup.ps1'",
+        r#". "$bucketsdir\extras\scripts\foo.ps1""#,
+        r". .\helper.ps1",
+        r"&.\tools\install.cmd",
+        r#"if ($x) { & "C:\Tools\x.exe" }"#,
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        assert!(called_flag(&r).is_some(), "{s}: {:?}", r.flags);
+    }
+    // Commands, operators and redirections are not files.
+    for s in [
+        "& git status",
+        "a && b",
+        "x 2>&1",
+        "$a.Trim()",
+        "& { ensure 'x' }",
+    ] {
+        let r = scan(s, SUP);
+        assert!(called_flag(&r).is_none(), "{s}: {:?}", r.flags);
+    }
+}
+
+#[test]
+fn dot_source_bucket_script_scanned() {
+    let t = bucket_root(
+        "foo.ps1",
+        "Set-ItemProperty 'HKLM:\\Software\\X' -Name a -Value 1\r\n",
+        true,
+    );
+    let roots = CallRoots::new(t.path(), None);
+    let hook = "ensure 'x'\n. \"$bucketsdir\\extras\\scripts\\foo.ps1\"\n";
+    let (r, called) = scan_called(hook, SUP, &roots);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
+    let hklm = r.flags.iter().find(|f| f.kind == FlagKind::Hklm).unwrap();
+    assert_eq!(hklm.line, 2);
+    assert!(
+        hklm.detail.contains(r"$bucketsdir\extras\scripts\foo.ps1"),
+        "{}",
+        hklm.detail
+    );
+    assert_eq!(called.len(), 1);
+    assert!(called[0].script.contains("HKLM:"));
+    assert_eq!(called[0].report.verdict, Verdict::Refuse);
+    // A clean called file is shown: its call only informs.
+    let t = bucket_root("ok.ps1", "ensure 'ok'\n", true);
+    let roots = CallRoots::new(t.path(), None);
+    let (r, called) = scan_called(r#". "$bucketsdir\extras\scripts\ok.ps1""#, SUP, &roots);
+    assert_eq!(r.verdict, Verdict::Confirm, "{:?}", r.flags);
+    assert_eq!(called_flag(&r).unwrap().verdict, Verdict::Confirm);
+    assert_eq!(called[0].script, "ensure 'ok'\n");
+    // The plain scan never reads files.
+    assert_eq!(
+        scan(r#". "$bucketsdir\extras\scripts\ok.ps1""#, SUP).verdict,
+        Verdict::ConfirmStrong
+    );
+}
+
+#[test]
+fn unresolvable_target_confirm_strong() {
+    let t = bucket_root("foo.ps1", "ensure 'x'\n", true);
+    let roots = CallRoots {
+        dir: Some(t.path().join("buckets")),
+        ..CallRoots::new(t.path(), None)
+    };
+    for s in [
+        r#". "$bucketsdir\extras\scripts\missing.ps1""#,
+        r#". "$bucketsdir\extras\..\extras\scripts\foo.ps1""#,
+        r#". "$bucketsdir\extras\scripts\..\scripts\foo.ps1""#,
+        r#". "$bucketsdir\other\scripts\foo.ps1""#,
+        r#". "$bucketsdir\$bucket\scripts\foo.ps1""#,
+        r#"& "$dir\extras\scripts\$name.ps1""#,
+        r#"& "$dir\..\buckets\extras\scripts\foo.ps1""#,
+        r#"& "$dir\extras\scripts\foo.txt""#,
+        r#"& "$persist_dir\foo.ps1""#,
+    ] {
+        let (r, called) = scan_called(s, SUP, &roots);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        assert!(called.is_empty(), "{s}");
+    }
+    // `$dir` resolves when it is there; without the Task 149 marker the bucket does not.
+    let (r, called) = scan_called(r#"& "$dir\extras\scripts\foo.ps1""#, SUP, &roots);
+    assert_eq!(
+        (r.verdict, called.len()),
+        (Verdict::Confirm, 1),
+        "{:?}",
+        r.flags
+    );
+    let t = bucket_root("foo.ps1", "ensure 'x'\n", false);
+    let roots = CallRoots::new(t.path(), None);
+    let (r, called) = scan_called(r#". "$bucketsdir\extras\scripts\foo.ps1""#, SUP, &roots);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", r.flags);
+    assert!(called.is_empty());
+    // A file that calls itself keeps the strong confirmation and ends.
+    let t = bucket_root("loop.ps1", ". \"$PSScriptRoot\\loop.ps1\"\n", true);
+    let roots = CallRoots::new(t.path(), None);
+    let (r, called) = scan_called(r#". "$bucketsdir\extras\scripts\loop.ps1""#, SUP, &roots);
+    assert_eq!(r.verdict, Verdict::ConfirmStrong, "{:?}", r.flags);
+    assert_eq!(called.len(), 1);
+}
+
+#[test]
+fn alias_redefinition_confirm_strong() {
+    for s in [
+        "Set-Alias shim Out-Null",
+        "New-Alias -Name Add-Path -Value Out-Null",
+        "sal x y",
+        "New-Item alias:Add-Path -Value Out-Null",
+        "Set-Item -Path Alias:shim -Value Out-Null",
+    ] {
+        let r = scan(s, SUP);
+        assert_eq!(r.verdict, Verdict::ConfirmStrong, "{s}: {:?}", r.flags);
+        let f = r.flags.iter().find(|f| f.kind == FlagKind::Alias).unwrap();
+        assert_eq!(f.detail, "redefine comando por apelido");
+    }
+    assert!(!has(&scan("Get-Alias", SUP), FlagKind::Alias));
+}
+
+#[test]
+fn called_file_disables_global_masking() {
+    // Task 164's masking of `if ($global)` bodies stays off when another file runs.
+    let s = "if ($global) { Set-ItemProperty 'HKLM:\\X' -Name a -Value 1 }\n. \"$dir\\x.ps1\"\n";
+    let r = scan(s, SUP);
+    assert_eq!(r.verdict, Verdict::Refuse, "{:?}", r.flags);
 }

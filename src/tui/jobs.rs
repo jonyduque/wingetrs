@@ -12,6 +12,7 @@ use crate::install::ops::{self, Allow, AllowMsiexec, OpsCtx, OpsError, Resolutio
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue};
+use crate::install::script_scan::CallRoots;
 use crate::install::state::StateDb;
 use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
@@ -285,12 +286,11 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
     // The removal runs the code of the manifest written at install time: it goes to the user.
     let (manifest, manifest_sha256) =
         ops::uninstall_manifest(c, &plan).map_err(|e| e.to_string())?;
-    let vdir = c
-        .data
-        .install_layout()
-        .version_dir(&plan.app, &plan.version);
+    let layout = c.data.install_layout();
+    let vdir = layout.version_dir(&plan.app, &plan.version);
+    let roots = CallRoots::new(layout.root(), Some(&vdir));
     let code = manifest
-        .map(|m| removal_third_party(&m, &vdir, ""))
+        .map(|m| removal_third_party(&m, &vdir, "", &roots))
         .unwrap_or_default();
     let action = Action::Remove(plan);
     if code.is_empty() {

@@ -4,7 +4,16 @@
 //! wingetrs sandbox cannot allow (`Refuse`) or that needs a stronger confirmation
 //! (`ConfirmStrong`). Every script needs at least a plain confirmation (`Confirm`).
 //! The same report feeds the dry-run, the confirmation dialog, `show` and the oracle.
+//!
+//! The rules about the prelude (`PreludeInternal`, `PreludeRedefinition`) are a convenience,
+//! not a boundary: aliases, names built at run time or a direct write to the effects file get
+//! around them. The boundary is the Rust side revalidating every effect against its allowlist.
+//!
+//! A script that runs another file (`& "..."`, `. "..."`) gets a strong confirmation, unless
+//! [`scan_called`] can read that file (`$dir`, `$PSScriptRoot`, a bucket's guarded `scripts/`):
+//! then the file is scanned too (the worst verdict wins) and shown with the script.
 use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 
 use super::classify_2c::{commands_in, normalize_quotes};
 use super::manifest::{HookKind, InstallerSpec, Resolved};
@@ -310,6 +319,11 @@ pub enum FlagKind {
     /// Declares its own `$global` (parameter, `param(...)`, `foreach`), which clashes with
     /// the runner's constant `$global`.
     GlobalName,
+    /// `& "<file>"`, `. "<file>"` or the same with a bare path: runs a file the user does
+    /// not see (unless [`scan_called`] reads it).
+    CalledFile,
+    /// `Set-Alias`, `New-Alias`, the `alias:` drive.
+    Alias,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,6 +448,9 @@ const D_GLOBAL_NAME: &str =
     "usa `$global` como nome próprio (incompatível com o `$global` fixo do wingetrs)";
 
 /// Detail of a flag found only inside an `if ($global) { ... }` body.
+const D_CALLED: &str = "roda um arquivo que não é mostrado";
+const D_ALIAS: &str = "redefine comando por apelido";
+
 fn global_only(detail: &str) -> String {
     format!("só roda em instalação global; não roda no wingetrs ({detail})")
 }
@@ -441,6 +458,11 @@ fn global_only(detail: &str) -> String {
 /// Scans one script. `supported` lists the Scoop functions the wingetrs prelude implements
 /// (compared case-insensitively); any other name of [`SCOOP_FUNCTIONS`] is refused.
 pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
+    scan_inner(script, supported).0
+}
+
+/// [`scan`], plus the files the live text runs (`(1-based line, target as written)`).
+fn scan_inner(script: &str, supported: &[&str]) -> (ScriptReport, Vec<(usize, String)>) {
     // Typographic quotes are string delimiters to pwsh (see `normalize_quotes`).
     let script = &normalize_quotes(script);
     let text = strip_here_strings(&strip_comments(script));
@@ -575,16 +597,35 @@ pub fn scan(script: &str, supported: &[&str]) -> ScriptReport {
             (line, false),
         );
     }
+    // Files run by `&`/`.`, with their case kept (the target is shown and resolved).
+    let mut calls = Vec::new();
+    for (part, in_dead) in [(&live_text, false), (&dead_text, true)] {
+        for (i, l) in part.lines().enumerate() {
+            for target in called_files(&l.replace('`', "")) {
+                let detail = format!("{D_CALLED}: {}", target);
+                push_at(
+                    FlagKind::CalledFile,
+                    Verdict::ConfirmStrong,
+                    &detail,
+                    (i + 1, in_dead),
+                );
+                if !in_dead {
+                    calls.push((i + 1, target));
+                }
+            }
+        }
+    }
 
     flags.sort_by_key(|f| f.line);
     #[rustfmt::skip]
     let verdict = flags.iter().map(|f| f.verdict).max().unwrap_or(Verdict::Confirm);
-    ScriptReport {
+    let report = ScriptReport {
         commands,
         variables: variables_in(&text),
         flags,
         verdict,
-    }
+    };
+    (report, calls)
 }
 
 /// The line rules matched by one (lowercase, backtick-free) line.
@@ -633,6 +674,9 @@ fn line_rules(l: &str, calls_reg: bool) -> Vec<(FlagKind, Verdict, String)> {
     }
     if contains(USER_DIRS) || has_absolute_literal(l) {
         out.push((FlagKind::AbsolutePath, Verdict::ConfirmStrong, D_ABSOLUTE));
+    }
+    if any(&["set-alias", "new-alias", "sal", "nal"]) || l.contains("alias:") {
+        out.push((FlagKind::Alias, Verdict::ConfirmStrong, D_ALIAS));
     }
     let mut out: Vec<(FlagKind, Verdict, String)> = out
         .into_iter()
@@ -805,6 +849,219 @@ pub fn ps1_installer_report(file: &str) -> ScriptReport {
     }
 }
 
+/// Folders the gate may read a called file from (Task 192). Each is `None` when unknown or
+/// not there yet: a `$dir` that is not extracted at analysis time cannot be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallRoots {
+    /// `$dir`.
+    pub dir: Option<PathBuf>,
+    /// `$PSScriptRoot` (the folder of the file being scanned, when it is a file).
+    pub script_root: Option<PathBuf>,
+    /// `$bucketsdir`: a bucket's `scripts/` is read only with the `.scripts-ok` marker the
+    /// `update` writes after storing it (Task 149); never from the network.
+    pub bucketsdir: Option<PathBuf>,
+}
+
+impl CallRoots {
+    /// `$dir` = `dir` only when it already is a folder; `$bucketsdir` = `<root>\buckets`.
+    pub fn new(root: &Path, dir: Option<&Path>) -> CallRoots {
+        CallRoots {
+            dir: dir.filter(|d| d.is_dir()).map(Path::to_path_buf),
+            script_root: None,
+            bucketsdir: Some(root.join("buckets")),
+        }
+    }
+}
+
+/// A file a script runs, read and scanned by [`scan_called`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalledScript {
+    /// As written in the calling script (`$bucketsdir\extras\scripts\x.ps1`).
+    pub target: String,
+    pub path: PathBuf,
+    pub script: String,
+    pub report: ScriptReport,
+}
+
+/// Cap of a called file read for scanning (same as a `.ps1` installer).
+const MAX_CALLED_BYTES: u64 = 1024 * 1024;
+/// Nesting of called files followed; deeper calls keep their strong confirmation.
+const MAX_CALL_DEPTH: usize = 4;
+
+/// [`scan`], following the files the script runs that `roots` can resolve: each is scanned
+/// the same way, its flags join the caller's (on the calling line, the worst verdict wins)
+/// and its `CalledFile` flag only informs, because the file is returned to be shown. A target
+/// that cannot be resolved or read keeps its `ConfirmStrong`.
+pub fn scan_called(
+    script: &str,
+    supported: &[&str],
+    roots: &CallRoots,
+) -> (ScriptReport, Vec<CalledScript>) {
+    let mut stack = Vec::new();
+    scan_called_at(script, supported, roots, &mut stack)
+}
+
+fn scan_called_at(
+    script: &str,
+    supported: &[&str],
+    roots: &CallRoots,
+    stack: &mut Vec<PathBuf>,
+) -> (ScriptReport, Vec<CalledScript>) {
+    let (mut report, calls) = scan_inner(script, supported);
+    let mut called: Vec<CalledScript> = Vec::new();
+    if stack.len() >= MAX_CALL_DEPTH {
+        return (report, called);
+    }
+    for (line, target) in calls {
+        let Some(path) = resolve_call(&target, roots) else {
+            continue;
+        };
+        // A cycle keeps the strong confirmation.
+        if stack.contains(&path) {
+            continue;
+        }
+        let Some(text) = read_called(&path) else {
+            continue;
+        };
+        let sub_roots = CallRoots {
+            script_root: path.parent().map(Path::to_path_buf),
+            ..roots.clone()
+        };
+        stack.push(path.clone());
+        let (sub, nested) = scan_called_at(&text, supported, &sub_roots, stack);
+        stack.pop();
+        let unshown = format!("{D_CALLED}: {target}");
+        for f in report.flags.iter_mut() {
+            if f.kind == FlagKind::CalledFile && f.line == line && f.detail == unshown {
+                f.verdict = Verdict::Confirm;
+                f.detail = format!("roda o arquivo {target}, analisado e mostrado abaixo");
+            }
+        }
+        for f in &sub.flags {
+            let flag = Flag {
+                kind: f.kind,
+                verdict: f.verdict,
+                detail: format!("{target}, linha {}: {}", f.line, f.detail),
+                line,
+            };
+            if !report.flags.contains(&flag) {
+                report.flags.push(flag);
+            }
+        }
+        let first = CalledScript {
+            target,
+            path,
+            script: text,
+            report: sub,
+        };
+        for c in std::iter::once(first).chain(nested) {
+            if !called.iter().any(|k| k.path == c.path) {
+                called.push(c);
+            }
+        }
+    }
+    report.flags.sort_by_key(|f| f.line);
+    report.verdict = report
+        .flags
+        .iter()
+        .map(|f| f.verdict)
+        .max()
+        .unwrap_or(Verdict::Confirm);
+    (report, called)
+}
+
+/// The file `target` names under `roots`: `$dir\<rel>.ps1`, `$PSScriptRoot\<rel>.ps1` or
+/// `$bucketsdir\<bucket>\scripts\<rel>.ps1`, every component through `safepath` (no other
+/// variable, no `..`), and the real file inside its base folder.
+fn resolve_call(target: &str, roots: &CallRoots) -> Option<PathBuf> {
+    let t = target.replace('/', "\\");
+    let lower = t.to_ascii_lowercase();
+    let after = |prefixes: [&str; 2]| {
+        prefixes
+            .iter()
+            .find(|p| lower.starts_with(*p))
+            .map(|p| &t[p.len()..])
+    };
+    let (base, rel) = if let Some(rel) = after(["$dir\\", "${dir}\\"]) {
+        (roots.dir.clone()?, rel)
+    } else if let Some(rel) = after(["$psscriptroot\\", "${psscriptroot}\\"]) {
+        (roots.script_root.clone()?, rel)
+    } else {
+        let rest = after(["$bucketsdir\\", "${bucketsdir}\\"])?;
+        let (bucket, rest) = rest.split_once('\\')?;
+        let (scripts, rel) = rest.split_once('\\')?;
+        if !scripts.eq_ignore_ascii_case("scripts") || !one_component(bucket) {
+            return None;
+        }
+        let bucket_dir = roots.bucketsdir.as_ref()?.join(bucket);
+        if !bucket_dir.join(".scripts-ok").is_file() {
+            return None;
+        }
+        (bucket_dir.join("scripts"), rel)
+    };
+    if rel.contains(['$', '`', '"', '\'']) || !rel.to_ascii_lowercase().ends_with(".ps1") {
+        return None;
+    }
+    let parts = super::safepath::safe_components(rel)?;
+    if parts.is_empty() {
+        return None;
+    }
+    let path = parts.iter().fold(base.clone(), |p, c| p.join(c));
+    let real_base = std::fs::canonicalize(&base).ok()?;
+    let real = std::fs::canonicalize(&path).ok()?;
+    (real.starts_with(&real_base) && real.is_file()).then_some(path)
+}
+
+/// `c` is one safe path component, unchanged by `safepath`.
+fn one_component(c: &str) -> bool {
+    super::safepath::safe_components(c).is_some_and(|v| v.len() == 1 && v[0] == c)
+}
+
+/// Bounded read and [`decode_script`]; `None` when too big, unreadable or not text.
+fn read_called(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    f.take(MAX_CALLED_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_CALLED_BYTES) {
+        return None;
+    }
+    decode_script(&bytes).ok()
+}
+
+/// Decodes a script file as PowerShell reads it: a BOM picks UTF-8 or UTF-16 (LE/BE);
+/// without one, strict UTF-8 (PowerShell 5.1 reads a BOM-less file as ANSI, so anything
+/// else is refused). `Err` says why, in Portuguese.
+pub fn decode_script(bytes: &[u8]) -> Result<String, &'static str> {
+    let utf16 = |rest: &[u8], be: bool| -> Result<String, &'static str> {
+        if !rest.len().is_multiple_of(2) {
+            return Err("tem UTF-16 truncado");
+        }
+        let units = rest.as_chunks::<2>().0.iter().map(|c| {
+            if be {
+                u16::from_be_bytes(*c)
+            } else {
+                u16::from_le_bytes(*c)
+            }
+        });
+        char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map_err(|_| "tem UTF-16 inválido")
+    };
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => {
+            String::from_utf8(rest.to_vec()).map_err(|_| "não é UTF-8 válido")
+        }
+        other => {
+            if other.contains(&0) {
+                return Err("não é texto simples (UTF-16 sem BOM?)");
+            }
+            String::from_utf8(other.to_vec()).map_err(|_| "não é UTF-8 válido")
+        }
+    }
+}
 /// One report per script present in the manifest, in [`HookKind`] order.
 pub fn scan_manifest(m: &Resolved, supported: &[&str]) -> Vec<(HookKind, ScriptReport)> {
     fn script(s: Option<&InstallerSpec>) -> Option<&str> {
@@ -978,6 +1235,71 @@ fn invokes_variable(line: &str) -> bool {
     })
 }
 
+/// Targets of `& <string or path>` and of `. <string or path>` (dot-sourcing at command
+/// position) on one backtick-free line: the string's content, or the bare path as written.
+/// A bare word without `\`/`/` that does not end in `.ps1` is a command (`& git`), and a
+/// `$` target is [`invokes_variable`]'s. A match inside a string only asks for more care.
+fn called_files(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let blank = |c: char| matches!(c, ' ' | '\t');
+    let mut out = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let operator = match c {
+            '&' => prev != Some('&') && next != Some('&'),
+            '.' => {
+                let before = chars[..i].iter().rev().find(|c| !blank(**c));
+                before.is_none_or(|b| matches!(b, ';' | '|' | '{' | '(' | '&'))
+                    && next.is_some_and(blank)
+            }
+            _ => false,
+        };
+        if !operator {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() && blank(chars[j]) {
+            j += 1;
+        }
+        if let Some(t) = call_target(&chars, j) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The file named at `chars[j]` (see [`called_files`]).
+fn call_target(chars: &[char], j: usize) -> Option<String> {
+    let first = *chars.get(j)?;
+    if first == '\'' || first == '"' {
+        let mut s = String::new();
+        let mut k = j + 1;
+        while k < chars.len() {
+            if chars[k] == first {
+                // A doubled quote is an escaped quote in both kinds of string.
+                if chars.get(k + 1) == Some(&first) {
+                    s.push(first);
+                    k += 2;
+                    continue;
+                }
+                break;
+            }
+            s.push(chars[k]);
+            k += 1;
+        }
+        return Some(s);
+    }
+    if matches!(first, '$' | '{' | '(' | '@') {
+        return None;
+    }
+    let end = (j..chars.len())
+        .find(|&k| chars[k].is_whitespace() || matches!(chars[k], ';' | '|' | ')' | '}'))
+        .unwrap_or(chars.len());
+    let word: String = chars[j..end].iter().collect();
+    let path = word.contains(['\\', '/']) || word.to_ascii_lowercase().ends_with(".ps1");
+    path.then_some(word)
+}
 /// A drive path `X:\` not glued to a longer name (`HKCU:\` is not one), or a UNC `\\host`.
 fn has_absolute_literal(line: &str) -> bool {
     let chars: Vec<char> = line.chars().collect();
@@ -1678,7 +2000,10 @@ fn mask_killer(chars: &[char]) -> bool {
     if MASK_KILLERS.iter().any(|w| lower.contains(w)) {
         return true;
     }
-    if lower.lines().any(invokes_variable) {
+    if lower
+        .lines()
+        .any(|l| invokes_variable(l) || !called_files(l).is_empty())
+    {
         return true;
     }
     let word = |c: char| c.is_alphanumeric() || c == '_';

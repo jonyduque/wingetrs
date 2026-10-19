@@ -21,6 +21,7 @@ use crate::install::plan::{InstallPlan, Step, UninstallPlan};
 use crate::install::planner::{self, InstalledInfo, PlanError, PlanInput};
 use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::residue::{self, Residue, ResidueInput};
+use crate::install::script_scan::CallRoots;
 use crate::install::state::{self, AppRecord, Artifact, ArtifactKind, StateDb, StateError};
 use crate::install::target::{self, Candidate, TargetError};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
@@ -917,7 +918,10 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
         .ok_or_else(|| OpsError::NotInstalled(app.to_string()))?;
     refuse_if_needed(ctx, &state, &plan.app)?;
     if let Some(m) = recorded_manifest(ctx, &state, &plan.app)? {
-        planner::check_uninstall_scripts(&m)?;
+        let layout = layout(ctx);
+        let vdir = layout.version_dir(&plan.app, &plan.version);
+        let roots = CallRoots::new(layout.root(), Some(&vdir));
+        planner::check_uninstall_scripts(&m, &roots)?;
     }
     Ok(plan)
 }
