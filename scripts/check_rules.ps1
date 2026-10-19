@@ -148,6 +148,15 @@ if ($ItDir -and (Test-Path (Join-Path $ItDir 'main.rs'))) {
         }
     }
 }
+# Task 204: a raw NUL byte in a .rs file (a test literal) makes git treat it as binary, so
+# diffs and reviews show nothing. Write `\0` instead.
+if ($Path -eq 'src') {
+    foreach ($f in @(Get-ChildItem -Recurse -File -Path 'src', 'tests', 'examples' -Filter *.rs -ErrorAction SilentlyContinue)) {
+        if ([Array]::IndexOf([IO.File]::ReadAllBytes($f.FullName), [byte]0) -ge 0) {
+            $violations += "{0}: [{1}]" -f $f.FullName, 'byte NUL cru em .rs (use \0)'
+        }
+    }
+}
 if ($violations.Count -gt 0) {
     $violations | ForEach-Object { "  $_" }
     exit 1
