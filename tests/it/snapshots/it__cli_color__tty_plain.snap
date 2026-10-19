@@ -32,6 +32,47 @@ fixo (fixado)
 ⚠ Cancelado.
 Simulação: nada foi alterado.
 ✗ Erro: App A: negado
+-- install --dry-run (scoop)
+Instalar app 2.0  main · 64bit
+   1. Baixar [1] https://example.invalid/app.7z (app.7z, sha256 abababababababababababababababababababababababababababababababab)
+   2. Extrair [1] app.7z (7z) para C:\R\apps\app\.staging-2.0
+   3. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+   4. Apontar C:\R\apps\app\current -> C:\R\apps\app\2.0 (junção)
+   5. Criar comando app em C:\R\shims (app.exe + app.shim) -> C:\R\apps\app\current\app.exe
+   6. Garantir C:\R\shims no PATH do usuário
+   7. Registrar app 2.0 (main) em C:\R\state.db
+   8. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+   9. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+  10. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+⚠ aviso: o manifesto pede uma reinicialização
+-- install --dry-run (winget, texto do plano)
+7-Zip 26.04 (exe, machine)
+Instalador: https://www.7-zip.org/a/7z2604-x64.exe
+Linha de comando: <instalador> /S
+pede permissão de administrador para este instalador
+mostra o progresso do instalador
+SHA-256: D54BF805F9F3704D1E8DB2FA3498AE7EF2DF0312B40B558E7C71C734430A665D
+Instalando pelo winget: tipo zip
+Licença aceita: EULA — https://x.invalid/eula
+Reinicie o computador para concluir.
+-- uninstall (winget)
+Desinstalar Kindle 2.0
+  comando: C:\K\uninst.exe /S
+  pede UAC
+  Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
+    pasta: C:\Users\u\Documents\My Kindle Content
+✓ Pastas copiadas para C:\B\kindle
+✓ Removido: registro de App A (cópia em C:\B\a.reg)
+-- cleanup --orphans
+Órfão: App A — HKCU — falta C:\Gone\A\uninst.exe
+O app pode ter mudado de lugar (ex.: Steam em outra pasta).
+Antes de apagar, cada registro é exportado para um .reg em C:\B\orphans-1
+Nada foi removido: sem terminal.
+→ use --yes para remover todos os listados
+Nenhum registro órfão.
+Nenhum registro removido.
+✓ Removido: App A (backup C:\B\a.reg)
+✗ Erro: App B: acesso negado
 -- erro
 ✗ nenhum pacote encontrado para 'x'
 → você quis dizer: xz?

@@ -1137,7 +1137,7 @@ fn bucket_add_question_uses_selector() {
     let (ui, screen) = scripted_ui(vec![key(Enter)], true);
     let (r, said) = add(&ui, &mut cfg, false);
     assert!(!r.unwrap());
-    assert_eq!(said, vec!["Cancelado.".to_string()]);
+    assert_eq!(said, vec!["⚠ Cancelado.".to_string()]);
     assert!(!has(&cfg));
     let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
     assert!(

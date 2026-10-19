@@ -726,7 +726,7 @@ fn print_plans(
     };
     for p in plans {
         if f.dry_run {
-            emit::out(&p.to_string());
+            emit::out_block(&output::install_plan_text(p, ui.glyphs()));
             if let Some(hint) = output::msi_hint(p, f.allow_msiexec) {
                 emit::out(&output::dim(hint));
             }

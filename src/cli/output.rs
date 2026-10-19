@@ -473,16 +473,12 @@ pub fn uninstall_plan_text(
     s
 }
 
-/// The short plan `install`/`upgrade` show before asking: only what touches the world
-/// outside the app folder, numbered in plan order.
-pub fn plan_summary(
+/// `Instalar app 1.0  bucket · arch` (or `Atualizar app 0.9 → 1.0 …`): the first line of the
+/// short and the full plan.
+fn plan_header(
     plan: &crate::install::plan::InstallPlan,
-    layout: &crate::install::layout::Layout,
     glyphs: &crate::tui::theme::Glyphs,
-    user_path: Option<&str>,
-    allow_msiexec: bool,
 ) -> String {
-    use crate::install::plan::Step;
     let arch = plan.arch.map_or("sem arquitetura", |a| a.key());
     let mut s = match &plan.upgrade_from {
         Some(old) => format!(
@@ -502,6 +498,41 @@ pub fn plan_summary(
     };
     s.push_str(&paint(DIM, &format!("  {} · {arch}", plan.bucket)));
     s.push('\n');
+    s
+}
+
+/// The full plan of `--dry-run` (the only place with URLs, hashes and the staging folder):
+/// the header, every step numbered (number in bold, right-aligned), the planner's notes as
+/// warnings.
+pub fn install_plan_text(
+    plan: &crate::install::plan::InstallPlan,
+    glyphs: &crate::tui::theme::Glyphs,
+) -> String {
+    let mut s = plan_header(plan, glyphs);
+    let lines = plan.step_lines();
+    let width = lines.len().to_string().len();
+    for (i, line) in lines.iter().enumerate() {
+        let n = format!("{:>width$}", i + 1);
+        s.push_str(&format!("  {}. {line}\n", paint(NAME, &n)));
+    }
+    for note in &plan.notes {
+        s.push_str(&warning(note));
+        s.push('\n');
+    }
+    s
+}
+
+/// The short plan `install`/`upgrade` show before asking: only what touches the world
+/// outside the app folder, numbered in plan order.
+pub fn plan_summary(
+    plan: &crate::install::plan::InstallPlan,
+    layout: &crate::install::layout::Layout,
+    glyphs: &crate::tui::theme::Glyphs,
+    user_path: Option<&str>,
+    allow_msiexec: bool,
+) -> String {
+    use crate::install::plan::Step;
+    let mut s = plan_header(plan, glyphs);
     let shims: Vec<&str> = plan
         .steps
         .iter()
@@ -718,6 +749,149 @@ pub fn residues_left(residues: &[crate::install::residue::Residue]) -> String {
 pub fn progress_line(main: &str, warn: &str) -> String {
     format!("{main}{}", paint(WARN, warn))
 }
+
+/// Labels the winget plans start their detail lines with (`Instalador: …`).
+const PLAN_LABELS: &[&str] = &[
+    "Instalador",
+    "Linha de comando",
+    "Licença aceita",
+    "Licença",
+    "SHA-256",
+    "comando",
+    "pasta",
+    "tamanho da cópia",
+];
+
+/// A winget plan as its `Display` writes it (`WingetPlan`, the ARP/MSIX `UninstallPlan`, an
+/// agreement line), styled line by line; without color the text is the same. The title:
+/// `Desinstalar`/`Instalar`/`Atualizar` as a header and the name in bold, or the name in bold
+/// and its `(tipo, escopo)` dimmed; a known label in header style.
+pub fn plan_text(text: &str) -> String {
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let body = line.trim_start();
+        let indent = &line[..line.len() - body.len()];
+        let label = PLAN_LABELS
+            .iter()
+            .find(|l| body.strip_prefix(**l).is_some_and(|r| r.starts_with(": ")));
+        let styled = if let Some(l) = label {
+            format!("{}{}", paint(HEADER, l), &body[l.len()..])
+        } else if i == 0 {
+            let verb = ["Desinstalar ", "Instalar ", "Atualizar "]
+                .iter()
+                .find(|v| body.starts_with(**v));
+            match (verb, body.rfind(" (")) {
+                (Some(v), _) => format!(
+                    "{} {}",
+                    paint(HEADER, v.trim_end()),
+                    paint(NAME, &body[v.len()..])
+                ),
+                (None, Some(at)) => {
+                    format!("{}{}", paint(NAME, &body[..at]), paint(DIM, &body[at..]))
+                }
+                (None, None) => paint(NAME, body),
+            }
+        } else {
+            body.to_string()
+        };
+        out.push(format!("{indent}{styled}"));
+    }
+    out.join("\n")
+}
+
+/// The engine chose `winget` for this package: `Instalando pelo winget: <why>`.
+pub fn through_winget(upgrade: bool, why: &str) -> String {
+    let verb = if upgrade {
+        "Atualizando pelo winget:"
+    } else {
+        "Instalando pelo winget:"
+    };
+    format!("{} {why}", paint(DIM, verb))
+}
+
+/// After a removal that copied the shared folders first.
+pub fn folders_copied(dest: &Path) -> String {
+    format!(
+        "{} Pastas copiadas para {}",
+        paint(OK, style::glyphs().toast_ok),
+        path(dest)
+    )
+}
+
+/// The installer asked for a restart (`initiated`: it is restarting now).
+pub fn reboot(initiated: bool) -> String {
+    warn_text(if initiated {
+        "O instalador está reiniciando o computador."
+    } else {
+        "Reinicie o computador para concluir."
+    })
+}
+
+/// `cleanup --orphans`: one record whose uninstaller is gone.
+pub fn orphan_line(name: &str, hive: &str, missing: &str) -> String {
+    format!(
+        "{} {} — {} — falta {}",
+        paint(WARN, "Órfão:"),
+        paint(NAME, name),
+        paint(DIM, hive),
+        paint(style::PATH, missing)
+    )
+}
+
+/// The registry-only removal of an app: `✓ Removido: registro de <name> (cópia em <file>)`.
+pub fn record_removed(name: &str, file: &Path) -> String {
+    success(
+        "Removido:",
+        &format!(
+            "registro de {} (cópia em {})",
+            paint(NAME, name),
+            path(file)
+        ),
+    )
+}
+
+/// `cleanup --orphans` removed one record: `✓ Removido: <name> (backup <file>)`.
+pub fn orphan_removed(name: &str, file: &Path) -> String {
+    success(
+        "Removido:",
+        &format!("{} (backup {})", paint(NAME, name), path(file)),
+    )
+}
+
+/// `cleanup --orphans` could not remove one record: `✗ Erro: <name>: <error>`.
+pub fn orphan_failed(name: &str, error: &str) -> String {
+    failed_item(&format!("{}: {error}", paint(NAME, name)))
+}
+
+/// `cleanup --orphans` found nothing.
+pub const NO_ORPHANS: &str = "Nenhum registro órfão.";
+
+/// Why a listed orphan may not be one.
+pub fn orphans_may_have_moved() -> String {
+    paint(
+        DIM,
+        "O app pode ter mudado de lugar (ex.: Steam em outra pasta).",
+    )
+}
+
+/// Where `cleanup --orphans` exports each record before deleting it.
+pub fn orphans_backup(dir: &Path) -> String {
+    format!(
+        "Antes de apagar, cada registro é exportado para um .reg em {}",
+        path(dir)
+    )
+}
+
+/// `cleanup --orphans` without a terminal and without `--yes`.
+pub fn orphans_not_removed() -> String {
+    format!(
+        "Nada foi removido: sem terminal.\n{}",
+        action("use --yes para remover todos os listados")
+    )
+}
+
+/// The user picked no record.
+pub const NONE_REMOVED: &str = "Nenhum registro removido.";
 
 /// One piece of third-party code an operation runs, as the confirmation shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]

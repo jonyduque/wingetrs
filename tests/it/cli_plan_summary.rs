@@ -17,7 +17,7 @@ fn ascii() -> &'static Glyphs {
     Glyphs::for_set(GlyphSet::Ascii)
 }
 
-fn source(file: &str) -> Source {
+pub(crate) fn source(file: &str) -> Source {
     Source {
         url: format!("https://example.invalid/{file}"),
         file_name: file.to_string(),
@@ -30,7 +30,7 @@ fn source(file: &str) -> Source {
     }
 }
 
-fn shim(name: &str) -> Step {
+pub(crate) fn shim(name: &str) -> Step {
     Step::Shim(ShimSpec {
         name: name.into(),
         target: PathBuf::from(r"C:\R\apps\app\current").join(format!("{name}.exe")),
@@ -39,7 +39,7 @@ fn shim(name: &str) -> Step {
     })
 }
 
-fn plan(steps: Vec<Step>) -> InstallPlan {
+pub(crate) fn plan(steps: Vec<Step>) -> InstallPlan {
     InstallPlan {
         app: "app".into(),
         bucket: "main".into(),

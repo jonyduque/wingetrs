@@ -32,6 +32,47 @@ expression: visible(&color)
 ␛[33m⚠ Cancelado.␛[0m
 Simulação: nada foi alterado.
 ␛[1m␛[31m✗ Erro:␛[0m App A: negado
+-- install --dry-run (scoop)
+␛[1m␛[35mInstalar␛[0m ␛[1mapp␛[0m 2.0␛[90m  main · 64bit␛[0m
+  ␛[1m 1␛[0m. Baixar [1] https://example.invalid/app.7z (app.7z, sha256 abababababababababababababababababababababababababababababababab)
+  ␛[1m 2␛[0m. Extrair [1] app.7z (7z) para C:\R\apps\app\.staging-2.0
+  ␛[1m 3␛[0m. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+  ␛[1m 4␛[0m. Apontar C:\R\apps\app\current -> C:\R\apps\app\2.0 (junção)
+  ␛[1m 5␛[0m. Criar comando app em C:\R\shims (app.exe + app.shim) -> C:\R\apps\app\current\app.exe
+  ␛[1m 6␛[0m. Garantir C:\R\shims no PATH do usuário
+  ␛[1m 7␛[0m. Registrar app 2.0 (main) em C:\R\state.db
+  ␛[1m 8␛[0m. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+  ␛[1m 9␛[0m. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+  ␛[1m10␛[0m. Mover C:\R\apps\app\.staging-2.0 para C:\R\apps\app\2.0
+␛[33m⚠ aviso:␛[0m o manifesto pede uma reinicialização
+-- install --dry-run (winget, texto do plano)
+␛[1m7-Zip 26.04␛[0m␛[90m (exe, machine)␛[0m
+␛[1m␛[35mInstalador␛[0m: https://www.7-zip.org/a/7z2604-x64.exe
+␛[1m␛[35mLinha de comando␛[0m: <instalador> /S
+pede permissão de administrador para este instalador
+mostra o progresso do instalador
+␛[1m␛[35mSHA-256␛[0m: D54BF805F9F3704D1E8DB2FA3498AE7EF2DF0312B40B558E7C71C734430A665D
+␛[90mInstalando pelo winget:␛[0m tipo zip
+␛[1m␛[35mLicença aceita␛[0m: EULA — https://x.invalid/eula
+␛[33mReinicie o computador para concluir.␛[0m
+-- uninstall (winget)
+␛[1m␛[35mDesinstalar␛[0m ␛[1mKindle 2.0␛[0m
+  ␛[1m␛[35mcomando␛[0m: C:\K\uninst.exe /S
+  pede UAC
+  Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
+    ␛[1m␛[35mpasta␛[0m: C:\Users\u\Documents\My Kindle Content
+␛[32m✓␛[0m Pastas copiadas para ␛[3m␛[36mC:\B\kindle␛[0m
+␛[32m✓ Removido:␛[0m registro de ␛[1mApp A␛[0m (cópia em ␛[3m␛[36mC:\B\a.reg␛[0m)
+-- cleanup --orphans
+␛[33mÓrfão:␛[0m ␛[1mApp A␛[0m — ␛[90mHKCU␛[0m — falta ␛[3m␛[36mC:\Gone\A\uninst.exe␛[0m
+␛[90mO app pode ter mudado de lugar (ex.: Steam em outra pasta).␛[0m
+Antes de apagar, cada registro é exportado para um .reg em ␛[3m␛[36mC:\B\orphans-1␛[0m
+Nada foi removido: sem terminal.
+␛[90m→␛[0m use --yes para remover todos os listados
+Nenhum registro órfão.
+Nenhum registro removido.
+␛[32m✓ Removido:␛[0m ␛[1mApp A␛[0m (backup ␛[3m␛[36mC:\B\a.reg␛[0m)
+␛[1m␛[31m✗ Erro:␛[0m ␛[1mApp B␛[0m: acesso negado
 -- erro
 ␛[1m␛[31m✗␛[0m nenhum pacote encontrado para 'x'
 ␛[90m→␛[0m você quis dizer: ␛[36mxz␛[0m?

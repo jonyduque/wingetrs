@@ -198,7 +198,7 @@ pub(super) async fn install_bridge(
     )));
     if !f.yes || f.dry_run {
         for line in agreement_lines(&agreements, false) {
-            emit::out(&line);
+            emit::out(&output::plan_text(&line));
         }
     }
     if f.dry_run {
@@ -213,7 +213,7 @@ pub(super) async fn install_bridge(
     }
     if f.yes {
         for line in agreement_lines(&agreements, true) {
-            emit::out(&line);
+            emit::out(&output::plan_text(&line));
         }
     }
     let msi_lock = ctx.data.install_layout().msi_lock();
@@ -346,7 +346,7 @@ fn refused(r: Refusal) -> anyhow::Error {
 
 /// Prints the plan, stops on `--dry-run`, confirms; `false` when nothing more runs.
 fn show_and_confirm(ui: &dyn Ui, text: &str, f: Flags, say: Say<'_>) -> anyhow::Result<bool> {
-    say(text.trim_end());
+    say(&output::plan_text(text.trim_end()));
     if f.dry_run {
         say(output::DRY_RUN_DONE);
         return Ok(false);
@@ -458,15 +458,7 @@ fn print_report(r: &InstallReport, done: &str, plan: &WingetPlan, say: Say<'_>) 
         )),
     }
     if let codes::Outcome::OkReboot { initiated } = r.outcome {
-        say(reboot_text(initiated));
-    }
-}
-
-fn reboot_text(initiated: bool) -> &'static str {
-    if initiated {
-        "O instalador está reiniciando o computador."
-    } else {
-        "Reinicie o computador para concluir."
+        say(&output::reboot(initiated));
     }
 }
 
@@ -493,7 +485,7 @@ pub async fn install<F: WingetFlows>(
     let plan = match engine {
         Engine::Bridge(why) => {
             if let Some(why) = why {
-                say(&format!("Instalando pelo winget: {}", bridge_reason(&why)));
+                say(&output::through_winget(false, bridge_reason(&why)));
             }
             return flows.install_bridge(ui, cand, scope, f, stop).await;
         }
@@ -504,7 +496,7 @@ pub async fn install<F: WingetFlows>(
     }
     if f.yes {
         for line in agreement_lines(&plan.agreements, true) {
-            say(&line);
+            say(&output::plan_text(&line));
         }
     }
     let info = JobInfo {
@@ -620,7 +612,7 @@ pub async fn uninstall<F: WingetFlows>(
         .plan_uninstall(row, &t)
         .await
         .map_err(anyhow::Error::msg)?;
-    say(plan.to_string().trim_end());
+    say(&output::plan_text(plan.to_string().trim_end()));
     if f.dry_run {
         say(output::DRY_RUN_DONE);
         return Ok(());
@@ -757,17 +749,10 @@ async fn run_removal<F: WingetFlows>(
         Removed::App { report, copied } => {
             print_uninstalled(&report, &plan, &mut *say);
             if let Some(dest) = copied {
-                say(&format!("Pastas copiadas para {}", output::path(&dest)));
+                say(&output::folders_copied(&dest));
             }
         }
-        Removed::Record(file) => say(&output::success(
-            "Removido:",
-            &format!(
-                "registro de {} (cópia em {})",
-                output::name(&plan.name),
-                output::path(&file)
-            ),
-        )),
+        Removed::Record(file) => say(&output::record_removed(&plan.name, &file)),
     }
     Ok(())
 }
@@ -786,7 +771,7 @@ fn print_uninstalled(r: &UninstallReport, plan: &UninstallPlan, say: Say<'_>) {
         )),
     }
     if let Some(initiated) = r.reboot {
-        say(reboot_text(initiated));
+        say(&output::reboot(initiated));
     }
 }
 
@@ -829,7 +814,7 @@ pub async fn upgrade<F: WingetFlows>(
     let plan = match engine {
         Engine::Bridge(why) => {
             if let Some(why) = why {
-                say(&format!("Atualizando pelo winget: {}", bridge_reason(&why)));
+                say(&output::through_winget(true, bridge_reason(&why)));
             }
             return upgrade_bridge(flows, ui, row, f, stop, say);
         }
@@ -840,7 +825,7 @@ pub async fn upgrade<F: WingetFlows>(
     }
     if f.yes {
         for line in agreement_lines(&plan.agreements, true) {
-            say(&line);
+            say(&output::plan_text(&line));
         }
     }
     let info = JobInfo {
@@ -943,23 +928,15 @@ pub fn cleanup<F: WingetFlows>(
     }
     let found = flows.orphans()?;
     if found.is_empty() {
-        say("Nenhum registro órfão.");
+        say(output::NO_ORPHANS);
         return Ok(());
     }
     for o in &found {
-        say(&format!(
-            "Órfão: {} — {} — falta {}",
-            o.name,
-            hive_text(o.hive),
-            o.missing
-        ));
+        say(&output::orphan_line(&o.name, hive_text(o.hive), &o.missing));
     }
-    say("O app pode ter mudado de lugar (ex.: Steam em outra pasta).");
+    say(&output::orphans_may_have_moved());
     let ts = format!("orphans-{}", crate::cache::now_unix());
-    say(&format!(
-        "Antes de apagar, cada registro é exportado para um .reg em {}",
-        output::path(&flows.backups().join(&ts))
-    ));
+    say(&output::orphans_backup(&flows.backups().join(&ts)));
     if a.dry_run {
         say(output::DRY_RUN_DONE);
         return Ok(());
@@ -983,11 +960,11 @@ pub fn cleanup<F: WingetFlows>(
             None => Vec::new(),
         }
     } else {
-        say("Nada foi removido: sem terminal, use --yes para remover todos os listados.");
+        say(&output::orphans_not_removed());
         return Ok(());
     };
     if chosen.is_empty() {
-        say("Nenhum registro removido.");
+        say(output::NONE_REMOVED);
         return Ok(());
     }
     // Each removal shows its phase (an HKLM key: the helper's UAC notice first); the results
@@ -1001,13 +978,10 @@ pub fn cleanup<F: WingetFlows>(
     let mut failed = 0usize;
     for (o, result) in results {
         match result {
-            Ok(file) => say(&output::success(
-                "Removido:",
-                &format!("{} (backup {})", o.name, output::path(&file)),
-            )),
+            Ok(file) => say(&output::orphan_removed(&o.name, &file)),
             Err(e) => {
                 failed += 1;
-                say(&output::failed_item(&format!("{}: {e}", o.name)));
+                say(&output::orphan_failed(&o.name, &e.to_string()));
             }
         }
     }

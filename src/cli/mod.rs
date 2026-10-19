@@ -946,7 +946,7 @@ pub fn bucket_add(
         Err(BucketError::NeedsConfirmation { name, repo }) if ui.interactive() => {
             let q = format!("O bucket {name} ({repo}) não é conhecido. Adicionar?");
             if !ui.confirm(&q)? {
-                say("Cancelado.");
+                say(&output::cancelled());
                 return Ok(false);
             }
             buckets::add(cfg, &name, &spec, true)?;

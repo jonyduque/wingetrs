@@ -259,6 +259,16 @@ impl InstallPlan {
         })
     }
 
+    /// One line per step, in order, for the full plan (`--dry-run`, the TUI details): the
+    /// text only; the CLI numbers and styles it (`cli::output::install_plan_text`).
+    pub fn step_lines(&self) -> Vec<String> {
+        let layout = Layout::new(self.root.clone());
+        self.steps
+            .iter()
+            .map(|step| self.step_line(step, &layout))
+            .collect()
+    }
+
     fn step_line(&self, step: &Step, l: &Layout) -> String {
         let (app, v) = (self.app.as_str(), self.version.as_str());
         let staging = l.staging_dir(app, v);
@@ -456,9 +466,8 @@ impl fmt::Display for InstallPlan {
                 self.app, self.version, self.bucket
             )?,
         }
-        let layout = Layout::new(self.root.clone());
-        for (i, step) in self.steps.iter().enumerate() {
-            writeln!(f, "{:>3}. {}", i + 1, self.step_line(step, &layout))?;
+        for (i, line) in self.step_lines().iter().enumerate() {
+            writeln!(f, "{:>3}. {line}", i + 1)?;
         }
         for note in &self.notes {
             writeln!(f, "Aviso: {note}")?;

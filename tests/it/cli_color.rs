@@ -325,6 +325,21 @@ fn wide_chars_align_table() {
     }
 }
 
+/// `WingetPlan`'s text for an exe that needs the helper (as `install 7zip.7zip --dry-run`).
+const WINGET_PLAN: &str = "7-Zip 26.04 (exe, machine)
+Instalador: https://www.7-zip.org/a/7z2604-x64.exe
+Linha de comando: <instalador> /S
+pede permissão de administrador para este instalador
+mostra o progresso do instalador
+SHA-256: D54BF805F9F3704D1E8DB2FA3498AE7EF2DF0312B40B558E7C71C734430A665D";
+
+/// The ARP `UninstallPlan`'s text with shared folders.
+const WINGET_UNINSTALL: &str = "Desinstalar Kindle 2.0
+  comando: C:\\K\\uninst.exe /S
+  pede UAC
+  Outra instalação de Kindle usa as mesmas pastas: copie antes de remover.
+    pasta: C:\\Users\\u\\Documents\\My Kindle Content";
+
 /// `\x1b` made visible, so a colored snapshot reads as text.
 fn visible(s: &str) -> String {
     s.replace('\x1b', "␛")
@@ -392,6 +407,31 @@ fn snapshots_tty_color_and_plain() {
         ..Default::default()
     };
     let upgrades = [("solo".to_string(), "1.0".to_string(), "2.0".to_string())];
+    use crate::cli_plan_summary::{plan, shim, source};
+    use wingetrs::install::plan::Step;
+    let mut dry_plan = plan(
+        [
+            vec![
+                Step::Download {
+                    index: 0,
+                    source: source("app.7z"),
+                },
+                Step::Extract { index: 0 },
+                Step::Promote,
+                Step::LinkCurrent,
+                shim("app"),
+                Step::EnsureShimsOnPath,
+                Step::RecordState,
+            ],
+            // Ten steps or more: the numbers stay right-aligned.
+            vec![Step::Promote; 3],
+        ]
+        .concat(),
+    );
+    dry_plan
+        .notes
+        .push("o manifesto pede uma reinicialização".into());
+    let glyphs = wingetrs::tui::theme::Glyphs::for_set(wingetrs::tui::theme::GlyphSet::Unicode);
     let render = || {
         let mut s = String::new();
         for o in &reports {
@@ -421,6 +461,43 @@ fn snapshots_tty_color_and_plain() {
             s.push_str(&line);
             s.push('\n');
         }
+        s.push_str("-- install --dry-run (scoop)\n");
+        s.push_str(&output::install_plan_text(&dry_plan, glyphs));
+        s.push_str("-- install --dry-run (winget, texto do plano)\n");
+        s.push_str(&output::plan_text(WINGET_PLAN));
+        s.push('\n');
+        s.push_str(&output::through_winget(false, "tipo zip"));
+        s.push('\n');
+        s.push_str(&output::plan_text(
+            "Licença aceita: EULA — https://x.invalid/eula",
+        ));
+        s.push('\n');
+        s.push_str(&output::reboot(false));
+        s.push('\n');
+        s.push_str("-- uninstall (winget)\n");
+        s.push_str(&output::plan_text(WINGET_UNINSTALL));
+        s.push('\n');
+        for line in [
+            output::folders_copied(std::path::Path::new(r"C:\B\kindle")),
+            output::record_removed("App A", std::path::Path::new(r"C:\B\a.reg")),
+        ] {
+            s.push_str(&line);
+            s.push('\n');
+        }
+        s.push_str("-- cleanup --orphans\n");
+        for line in [
+            output::orphan_line("App A", "HKCU", r"C:\Gone\A\uninst.exe"),
+            output::orphans_may_have_moved(),
+            output::orphans_backup(std::path::Path::new(r"C:\B\orphans-1")),
+            output::orphans_not_removed(),
+            output::NO_ORPHANS.to_string(),
+            output::NONE_REMOVED.to_string(),
+            output::orphan_removed("App A", std::path::Path::new(r"C:\B\a.reg")),
+            output::orphan_failed("App B", "acesso negado"),
+        ] {
+            s.push_str(&line);
+            s.push('\n');
+        }
         s.push_str("-- erro\n");
         let failure: anyhow::Error = output::not_found("x", &["xz".into()]).into();
         s.push_str(&output::error_report(&failure, false));
@@ -428,6 +505,9 @@ fn snapshots_tty_color_and_plain() {
     };
     let color = with_enabled(true, render);
     let plain = with_enabled(false, render);
+    // The winget plans keep their text: only styled.
+    assert!(plain.contains(&format!("{WINGET_PLAN}\n")), "{plain}");
+    assert!(plain.contains(&format!("{WINGET_UNINSTALL}\n")), "{plain}");
     assert!(color.contains('\x1b'));
     assert!(!plain.contains('\x1b'));
     // Color never changes the text.
@@ -451,4 +531,18 @@ async fn snapshots_not_tty() {
         s.push_str(&both(&out));
     }
     insta::assert_snapshot!("not_tty", s);
+}
+
+/// `install --dry-run` of a Scoop app from the binary, piped (root and port redacted).
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshots_not_tty_dry_run() {
+    let server = MockServer::start().await;
+    let lab = crate::cli_install::Lab::new(&server, "t199-dry").await;
+    let out = tokio::task::block_in_place(|| lab.run(&["install", "solo", "--dry-run"]));
+    assert!(out.status.success(), "{}", both(&out));
+    let text = both(&out)
+        .replace(&lab.root.display().to_string(), "<RAIZ>")
+        .replace(&server.uri(), "<SERVIDOR>");
+    assert!(!text.contains('\x1b'), "{text:?}");
+    insta::assert_snapshot!("not_tty_dry_run", text);
 }

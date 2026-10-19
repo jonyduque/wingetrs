@@ -1,0 +1,14 @@
+---
+source: tests/it/cli_color.rs
+expression: text
+---
+Instalar solo 1.0  main · sem arquitetura
+  1. Baixar [1] <SERVIDOR>/solo-1.0.zip (solo-1.0.zip, sha256 db1829a51af38e9b256f8b7cd5f8bfcb19dc042ea8f4cad9e75e4b4970f742a2)
+  2. Extrair [1] solo-1.0.zip para <RAIZ>\apps\solo\.staging-1.0 (só a subpasta pkg)
+  3. Mover <RAIZ>\apps\solo\.staging-1.0 para <RAIZ>\apps\solo\1.0
+  4. Apontar <RAIZ>\apps\solo\current -> <RAIZ>\apps\solo\1.0 (junção)
+  5. Criar comando solo em <RAIZ>\shims (solo.exe + solo.shim) -> <RAIZ>\apps\solo\current\solo.exe
+  6. Garantir <RAIZ>\shims no PATH do usuário
+  7. Gravar <RAIZ>\apps\solo\1.0\manifest.json
+  8. Registrar solo 1.0 (main) em <RAIZ>\state.db
+Simulação: nada foi alterado.
