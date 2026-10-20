@@ -117,10 +117,16 @@ function Invoke-Main {
     try {
         Write-Step 'baixando wingetrs.exe'
         Invoke-WebRequest -UseBasicParsing -Uri "$base/wingetrs.exe" -OutFile $tmp
-        $sumText = [string](Invoke-WebRequest -UseBasicParsing -Uri "$base/wingetrs.exe.sha256").Content
+        # Release assets come as application/octet-stream: Content is a byte[] there, not text.
+        $sumRaw = (Invoke-WebRequest -UseBasicParsing -Uri "$base/wingetrs.exe.sha256").Content
+        $sumText = if ($sumRaw -is [byte[]]) { [Text.Encoding]::UTF8.GetString($sumRaw) } else { [string]$sumRaw }
         $expected = ($sumText.Trim() -split '\s+')[0].ToUpperInvariant()
         if ($expected -notmatch '^[0-9A-F]{64}$') { Fail "wingetrs.exe.sha256 inválido: $sumText" }
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash.ToUpperInvariant()
+        # .NET instead of Get-FileHash: a 5.1 started from PowerShell 7 inherits a PSModulePath
+        # where Get-FileHash does not load.
+        $stream = [IO.File]::OpenRead($tmp)
+        try { $digest = [Security.Cryptography.SHA256]::Create().ComputeHash($stream) } finally { $stream.Dispose() }
+        $actual = ([BitConverter]::ToString($digest) -replace '-', '').ToUpperInvariant()
         if ($actual -ne $expected) { Fail "SHA-256 não confere (esperado $expected, baixado $actual)" }
         Write-Step "SHA-256 conferido: $actual"
 
