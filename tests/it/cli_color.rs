@@ -561,10 +561,13 @@ fn redact_dates(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         let date = b.len() - i >= 10
-            && b[i..i + 10]
-                .iter()
-                .enumerate()
-                .all(|(k, c)| if k == 4 || k == 7 { *c == b'-' } else { c.is_ascii_digit() });
+            && b[i..i + 10].iter().enumerate().all(|(k, c)| {
+                if k == 4 || k == 7 {
+                    *c == b'-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            });
         if date {
             out.push_str("<DATA>");
             i += 10;
