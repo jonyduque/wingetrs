@@ -994,11 +994,11 @@ Testes (`tests/it/wi_tui.rs`, `App` montado como em `tests/it/tui_state.rs`):
 
 ---
 
-### Task 189 (opcional — depende de decisão do usuário): `portable` e `zip`→`portable` nativos
+### Task 189: `portable` e `zip`→`portable` nativos
 
 **Modelo:** opus (revisor opus).
 
-> **Depende de decisão do usuário.** S2: ~32% da amostra cai na ponte só por `portable` (29 pacotes) ou zip com `portable` aninhado (66). O desenho abaixo reaproveita a máquina da fase 2a (pasta do app, shims, PATH do usuário) e toca arquivos de `src/install/` que a 2c também edita: só rode depois da 2c fechar, ou com o usuário aceitando a coordenação. Alternativa sem tocar `src/install/`: ficar na ponte (o winget já faz isso bem).
+> **Decisão do usuário (2026-10-19): implementar agora, sempre ligado (sem ajuste), antes da prova 188.** S2: ~32% da amostra cai na ponte só por `portable` (29 pacotes) ou zip com `portable` aninhado (66). O desenho abaixo reaproveita a máquina da fase 2a (pasta do app, shims, PATH do usuário) e toca arquivos de `src/install/` que a 2c também edita: só rode depois da 2c fechar, ou com o usuário aceitando a coordenação. Alternativa sem tocar `src/install/`: ficar na ponte (o winget já faz isso bem).
 
 #### Where this fits
 
@@ -1010,12 +1010,12 @@ Testes (`tests/it/wi_tui.rs`, `App` montado como em `tests/it/tui_state.rs`):
 #### What binds this task
 
 1. `portable` (exe solto) e `zip` com `NestedInstallerType: portable` viram um `InstallPlan` da 2a com `bucket = "winget"` e `app = <id>`: arquivos em `apps\<id>\<ver>\`, um shim por `PortableCommandAlias` (ou pelo nome do exe sem alias), todo `RelativeFilePath` por `safepath`; zip extraído pelo `archive.rs`; hash do `InstallerSha256` conferido como hoje.
-2. `select.rs`: esses dois casos passam a `Native { interactive: false }` **só** quando a decisão do usuário ligar a opção (constante ou ajuste — a decisão diz qual); zip com outro aninhado continua na ponte.
+2. `select.rs`: esses dois casos passam a `Native { interactive: false }` sempre (decisão do usuário em 2026-10-19, sem ajuste); zip com outro aninhado continua na ponte.
 3. Desinstalar e atualizar seguem o caminho dos apps do wingetrs (2a); a linha aparece com origem `wingetrs`.
 
 **Files:**
-- Create: (definido na decisão; provável `src/winget_install/portable.rs`)
-- Modify: `src/winget_install/select.rs` e os pontos da 2a que a decisão aprovar
+- Create: `src/winget_install/portable.rs`
+- Modify: `src/winget_install/select.rs` e os pontos da 2a que o plano precisar (`src/install/plan.rs`, `planner.rs`, `executor.rs`, `state.rs`, mínimo necessário)
 - Test: `tests/it/wi_portable.rs` (**já criado pelo orquestrador** com uma linha `//!`; não edite `tests/it/main.rs`)
 
 Testes (`tests/it/wi_portable.rs`, wiremock + zip montado no teste):
@@ -1042,7 +1042,7 @@ Testes (`tests/it/wi_portable.rs`, wiremock + zip montado no teste):
 5. `upgrade --all`: continua só com apps do wingetrs (BACKLOG).
 6. `--location`: fora desta fase.
 7. Ambiente elevado: **lista branca na Task 180** (revisão de segurança): nada herdado do usuário; variáveis só de KnownFolder e constantes, PATH só de pastas do sistema, `TEMP`/`TMP` na pasta de execução protegida. Propriedades MSI por lista fechada; parâmetros de outros tipos sem caminho fora da pasta de execução.
-8. Task 189: **aguarda o usuário** (proposta: fazer depois da 188, sempre ligada, com o motor nativo).
+8. Task 189: **decidida em 2026-10-19**: fazer agora, sempre ligada, com o motor nativo.
 
 
 ### Task 190: Correções da revisão de fase do lado elevado (2d)
@@ -1330,7 +1330,7 @@ Mutação obrigatória: `mode_for` ignorar o ajuste ⇒ teste PEGA.
 
 ### Task 202: Lado elevado confere o hash pelo catálogo assinado e roda da pasta de staging (opção B, depois da 2d)
 
-**Modelo:** opus (revisor opus), com sonda antes. Decisão do usuário em 2026-10-19 ("Mitigar agora, B depois"): a revisão da Task 196 achou que o instalador elevado por `runas` roda de uma pasta que o usuário grava (`%LOCALAPPDATA%\wingetrs\installers`), então uma DLL plantada ao lado (ou no TEMP onde Inno/Burn extraem) carrega como administrador. A Task 196 mitigou (pasta de trabalho System32, caminho final pelo handle, cadeia sem junção, pasta nova e vazia por execução): risco igual ao do winget. Esta tarefa fecha o risco e devolve um UAC por sessão.
+**Modelo:** opus (revisor opus), com sonda antes. Pedido de implementação em 2026-10-19 (depois da 204). **Se a sonda pedir crate nova ou feature nova do crate `windows`, pare e devolva o relatório da sonda antes do código (decisão do usuário).** Decisão do usuário em 2026-10-19 ("Mitigar agora, B depois"): a revisão da Task 196 achou que o instalador elevado por `runas` roda de uma pasta que o usuário grava (`%LOCALAPPDATA%\wingetrs\installers`), então uma DLL plantada ao lado (ou no TEMP onde Inno/Burn extraem) carrega como administrador. A Task 196 mitigou (pasta de trabalho System32, caminho final pelo handle, cadeia sem junção, pasta nova e vazia por execução): risco igual ao do winget. Esta tarefa fecha o risco e devolve um UAC por sessão.
 
 #### What binds this task
 
@@ -1341,6 +1341,13 @@ Mutação obrigatória: `mode_for` ignorar o ajuste ⇒ teste PEGA.
 5. Testes nunca baixam nem rodam nada real: msix e manifesto sintéticos com assinatura de teste (ou o verificador injetado), servidor `wiremock`.
 
 **Files:** definidos pela sonda (provável `src/bridge/worker.rs`, `src/bridge/staging_win.rs`, `src/bridge/catalog_verify_win.rs` novo, `src/winget_install/ops.rs`).
+
+#### Checks beyond the steps
+
+1. Mutação: pular a conferência da assinatura do msix ⇒ teste da assinatura inválida **PEGA**.
+2. Mutação: aceitar SHA-256 vindo do pedido do pipe (campo antigo) ⇒ teste que manda SHA diferente do manifesto **PEGA**.
+3. Mutação: rodar o instalador fora do staging ⇒ teste da pasta de execução **PEGA**.
+4. Gate: `pwsh -File scripts/verify.ps1`. O relatório da sonda vai em `docs/superpowers/reports/2026-10-19-sonda-202.md`.
 
 **Commit:** `feat(bridge): elevated side derives the installer hash from the signed catalog and runs it from admin-only staging`
 
