@@ -50,6 +50,35 @@ Data: 2026-10-19. Pedido do usuário: avaliar instalar um repositório do GitHub
 - **Registro:** o estado guarda a origem `github:<dono>/<repo>`, a tag, o nome do arquivo e o digest. A atualização compara a tag nova (pelo redirecionamento `302`) com a registrada e reaplica a mesma regra de escolha. Se o nome do arquivo mudar de padrão entre versões, o seletor volta a aparecer.
 - **Nome do app:** `gh/<dono>/<repo>`, para não colidir com apps do Scoop de mesmo nome.
 
+## `.exe` instalador ou programa
+
+A API só dá nome, tamanho e digest; a decisão vem do conteúdo, depois do download e do hash conferido. Medido em 2026-10-19:
+
+| Arquivo | Overlay (bytes depois da última seção) | Marca | `requestedExecutionLevel` |
+|---|---|---|---|
+| `jq-windows-amd64.exe` (programa) | 0 | nenhuma | `asInvoker` |
+| `lazygit.exe` (programa, de dentro do zip) | 0 | nenhuma | sem manifesto |
+| `npp.8.9.8.1.Installer.x64.exe` (instalador) | 6,7 MB de 7 MB | `NullsoftInst` | `requireAdministrator` |
+
+Sinais, do mais forte ao mais fraco:
+
+1. **Overlay grande.** `sniff::pe_overlay_start` já calcula onde ele começa. Antes de medir, desconte a assinatura Authenticode, que fica no overlay; o tamanho dela está no diretório de dados de segurança, entrada 4.
+2. **Marca do gerador:**
+   - NSIS: `NullsoftInst`;
+   - Inno Setup: `Inno Setup`/`rDlPtS`;
+   - WiX Burn: seção `.wixburn`;
+   - 7z SFX: assinatura 7z no overlay;
+   - também `InstallShield` e `SquirrelSetup`.
+3. **`requireAdministrator`** no manifesto do PE. É só um indício.
+4. **Nome do arquivo** (`setup`, `installer`): serve só para desempatar.
+5. **Mesma URL num manifesto do winget-pkgs:** o `InstallerType` revisado decide.
+
+Falhas possíveis:
+- instalador sem marca conhecida: o overlay grande decide;
+- programa com dados no overlay (Electron num `.exe` só): parece instalador e vai para o seletor com o motivo.
+
+Nos dois casos o resultado é programa, que vira atalho de comando, ou instalador, que é recusado com o nome do gerador.
+
 ## Riscos
 
 - **Confiança.** Ninguém revisou o arquivo. O `digest` só garante que o arquivo baixado é o que está no GitHub. Conta invadida, repositório transferido (a API segue redirecionamentos) ou tag reescrita entregam binário novo com hash "certo".
