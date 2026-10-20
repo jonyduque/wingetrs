@@ -6,6 +6,8 @@
 mod spans;
 
 mod bridge;
+mod bridge_scope;
+mod bucket_admin;
 mod bucket_scripts;
 mod buckets;
 mod cache;
@@ -23,6 +25,9 @@ mod correlate;
 mod elevated_install;
 mod elevated_uninstall;
 mod elevated_worker;
+mod gh_asset;
+mod gh_install;
+mod gh_release;
 mod http;
 mod icons;
 mod index_file;
@@ -70,6 +75,7 @@ mod script_runner;
 mod script_scan;
 mod search;
 mod spawn_env;
+mod tui_buckets;
 mod tui_jobs;
 mod tui_loop;
 mod tui_scripts;
