@@ -551,7 +551,30 @@ async fn snapshots_not_tty() {
         s.push_str(&format!("$ wingetrs {}\n", args.join(" ")));
         s.push_str(&both(&out));
     }
-    insta::assert_snapshot!("not_tty", s);
+    insta::assert_snapshot!("not_tty", redact_dates(&s));
+}
+
+/// `bucket list` shows the day the bucket was fetched: today, so never in a snapshot.
+fn redact_dates(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        let date = b.len() - i >= 10
+            && b[i..i + 10]
+                .iter()
+                .enumerate()
+                .all(|(k, c)| if k == 4 || k == 7 { *c == b'-' } else { c.is_ascii_digit() });
+        if date {
+            out.push_str("<DATA>");
+            i += 10;
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// `install --dry-run` of a Scoop app from the binary, piped (root and port redacted).

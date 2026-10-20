@@ -22,5 +22,5 @@ $ wingetrs show nao.existe
 ✗ pacote não encontrado: nao.existe
 → procure o id com `wingetrs search <termo>`
 $ wingetrs bucket list
-main    ScoopInstaller/Main
-extras  ScoopInstaller/Extras
+main    ScoopInstaller/Main    8            <DATA>
+extras  ScoopInstaller/Extras  não baixado
