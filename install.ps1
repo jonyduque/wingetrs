@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Installs (or updates, or removes) wingetrs for the current user, without elevation.
 

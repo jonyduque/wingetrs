@@ -157,6 +157,14 @@ if ($Path -eq 'src') {
         }
     }
 }
+# 2026-10-20: install.ps1 runs as `irm … | iex`; a UTF-8 BOM reaches iex as U+FEFF before `<#`,
+# the help block is parsed as code and the install fails with "Missing argument in parameter list".
+if ($Path -eq 'src' -and (Test-Path 'install.ps1')) {
+    $head = [IO.File]::ReadAllBytes((Resolve-Path 'install.ps1').Path)
+    if ($head.Length -ge 3 -and $head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF) {
+        $violations += "install.ps1: [BOM UTF-8 quebra irm | iex]"
+    }
+}
 if ($violations.Count -gt 0) {
     $violations | ForEach-Object { "  $_" }
     exit 1
