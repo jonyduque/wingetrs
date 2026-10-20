@@ -16,6 +16,7 @@ use crate::catalog::search::{Found, search_on_disk};
 use crate::config::Config;
 use crate::core::SourceKind;
 use crate::http::Http;
+use crate::install::progress::{Phase, ProgressEvent};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState, correlate};
 use crate::tui::theme::GlyphSet;
 use crate::update::{
@@ -377,7 +378,7 @@ pub enum BucketAction {
     List,
     /// Remove um bucket (recusa se houver apps instalados dele)
     #[command(
-        override_usage = "wingetrs bucket rm <NOME>",
+        override_usage = "wingetrs bucket rm [OPÇÕES] <NOME>",
         help_template = HELP_TEMPLATE,
         next_help_heading = "Opções"
     )]
@@ -385,6 +386,9 @@ pub enum BucketAction {
         /// Nome do bucket
         #[arg(help_heading = "Argumentos", value_name = "NOME")]
         name: String,
+        /// Confirma a remoção de um bucket padrão (main, extras) sem perguntar
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -913,7 +917,7 @@ async fn run_async(
                 anyhow::bail!("instalar e remover apps só funciona no Windows")
             }
         }
-        Command::Bucket { action } => run_bucket(action, &data, cfg),
+        Command::Bucket { action } => run_bucket(action, &data, &http, cfg).await,
         // Handled in `run`, before the runtime exists.
         Command::BridgeWorker { .. } => anyhow::bail!("bridge-worker fora do lugar"),
     }
@@ -956,12 +960,18 @@ pub fn bucket_add(
     Ok(true)
 }
 
-/// `bucket add|list|rm`: edits `config.toml` (and the catalog on `rm`).
-fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::Result<()> {
+/// `bucket add|list|rm`: `add` downloads the bucket now, `rm` also cleans the catalog.
+async fn run_bucket(
+    action: BucketAction,
+    data: &DataDir,
+    http: &Http,
+    mut cfg: Config,
+) -> anyhow::Result<()> {
     use crate::buckets;
+    use install_cmd::Ui;
     match action {
         BucketAction::List => {
-            emit::out_block(&output::buckets_text(&buckets::resolved(&cfg)?));
+            emit::out_block(&output::buckets_text(&buckets::rows(data, &cfg)?));
             Ok(())
         }
         BucketAction::Add { name, url, yes } => {
@@ -970,16 +980,42 @@ fn run_bucket(action: BucketAction, data: &DataDir, mut cfg: Config) -> anyhow::
             if !bucket_add(&ui, &mut cfg, &name, url, yes, say)? {
                 return Ok(());
             }
-            cfg.save(&data.config_path())?;
+            let progress = ui.progress();
+            progress.update(&ProgressEvent::Phase(Phase::Extracting {
+                file: format!("bucket {name}"),
+                engine: "GitHub".to_string(),
+            }));
+            // Same override as `update`, so offline tests can serve the tarball.
+            let url = std::env::var("WINGETRS_SCOOP_BASE_URL")
+                .ok()
+                .map(|base| format!("{}/{name}.tgz", base.trim_end_matches('/')));
+            let added = buckets::add_downloaded(data, http, &cfg, &name, url.as_deref()).await;
+            ui.end_progress();
+            let apps = added?;
             emit::out(&output::success("Bucket adicionado:", &output::name(&name)));
-            emit::out(&output::action(
-                "rode `wingetrs update` para baixar o catálogo",
-            ));
+            emit::out(&output::action(&format!("{apps} apps no catálogo")));
             Ok(())
         }
-        BucketAction::Rm { name } => {
+        BucketAction::Rm { name, yes } => {
+            let ui = install_cmd::TtyUi::new(&cfg);
             let state_db = data.install_layout().state_db();
-            buckets::remove_and_cleanup(data, &mut cfg, &name, &state_db)?;
+            let mut confirmed = yes;
+            if !confirmed && matches!(name.as_str(), "main" | "extras") && ui.interactive() {
+                let q = format!("{name} é um bucket padrão. Remover mesmo assim?");
+                if !ui.confirm(&q)? {
+                    emit::out(&output::cancelled());
+                    return Ok(());
+                }
+                confirmed = true;
+            }
+            let progress = ui.progress();
+            progress.update(&ProgressEvent::Phase(Phase::Removing {
+                app: format!("bucket {name}"),
+            }));
+            let removed =
+                buckets::remove_and_cleanup_confirmed(data, &mut cfg, &name, &state_db, confirmed);
+            ui.end_progress();
+            removed?;
             cfg.save(&data.config_path())?;
             emit::out(&output::success("Bucket removido:", &output::name(&name)));
             Ok(())

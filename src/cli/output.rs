@@ -103,10 +103,33 @@ pub fn name(text: &str) -> String {
     paint(NAME, text)
 }
 
-/// `bucket list`: `name  owner/repo`, one per line.
-pub fn buckets_text(rows: &[(String, String)]) -> String {
-    let cells: Vec<[String; 2]> = rows.iter().map(|(n, r)| [n.clone(), r.clone()]).collect();
-    table(None, [NAME, ID], &cells)
+/// `bucket list`: name, `owner/repo`, apps in the catalog and day of the last download.
+pub fn buckets_text(rows: &[crate::buckets::BucketRow]) -> String {
+    let cells: Vec<[String; 4]> = rows
+        .iter()
+        .map(|r| {
+            let (apps, day) = match r.apps {
+                Some(n) => (n.to_string(), r.updated.map(unix_day).unwrap_or_default()),
+                None => ("não baixado".to_string(), String::new()),
+            };
+            [r.name.clone(), r.repo.clone(), apps, day]
+        })
+        .collect();
+    table(None, [NAME, ID, NAME, ID], &cells)
+}
+
+/// `YYYY-MM-DD` (UTC) of a unix timestamp (Hinnant's civil-from-days).
+fn unix_day(secs: i64) -> String {
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// A path of the disk, in its own style.

@@ -41,6 +41,16 @@ pub enum BucketError {
     StateDb(String),
     #[error("falha ao gravar o estado: {0}")]
     State(String),
+    #[error("uma atualização está em andamento; tente de novo")]
+    Busy,
+    #[error("repositório não encontrado: {0}")]
+    RepoNotFound(String),
+    #[error("não parece um bucket do Scoop (nenhum manifesto em bucket/)")]
+    NotABucket,
+    #[error("falha ao baixar o bucket: {0}")]
+    Download(String),
+    #[error("{0} é um bucket padrão; confirme num terminal ou rode de novo com --yes")]
+    DefaultNeedsConfirmation(String),
 }
 
 /// Repo (`owner/repo`) of a well-known bucket name.
@@ -177,16 +187,178 @@ pub fn remove(cfg: &mut Config, name: &str, state_db: &Path) -> Result<(), Bucke
     Ok(())
 }
 
+/// Buckets that ship with Scoop; `rm` asks before dropping them.
+fn is_default_bucket(name: &str) -> bool {
+    matches!(name, "main" | "extras")
+}
+
+/// Holds the `update` lock; busy means another update (or bucket command) is running.
+fn lock(data: &crate::cache::DataDir) -> Result<crate::cache::UpdateLock, BucketError> {
+    match crate::cache::UpdateLock::try_acquire(&data.lock_path()) {
+        Ok(Some(l)) => Ok(l),
+        Ok(None) => Err(BucketError::Busy),
+        Err(e) => Err(BucketError::State(e.to_string())),
+    }
+}
+
+/// `<root>\buckets\<name>` when `name` is one safe path component.
+fn bucket_dir(data: &crate::cache::DataDir, name: &str) -> Option<std::path::PathBuf> {
+    match crate::install::safepath::safe_components(name) {
+        Some(p) if p.len() == 1 => Some(data.buckets_dir().join(&p[0])),
+        _ => None,
+    }
+}
+
+/// Downloads bucket `name` (already added to `cfg`, in memory) right now and, only when the
+/// tarball is a Scoop bucket, stores its source in the catalog, rewrites `search.idx` and
+/// saves `cfg`. Any failure leaves config, catalog and index untouched. Holds the update
+/// lock. `url` overrides the tarball URL (tests). Returns the number of apps.
+pub async fn add_downloaded(
+    data: &crate::cache::DataDir,
+    http: &crate::http::Http,
+    cfg: &Config,
+    name: &str,
+    url: Option<&str>,
+) -> Result<usize, BucketError> {
+    use crate::sources::scoop::bucket::{ScoopFetch, fetch_bucket, repo_tarball_url};
+    let _lock = lock(data)?;
+    let repo = resolved(cfg)
+        .map_err(|e| BucketError::Catalog(e.to_string()))?
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, r)| r)
+        .ok_or_else(|| BucketError::NotConfigured(name.to_string()))?;
+    let url = url.map_or_else(|| repo_tarball_url(&repo), str::to_string);
+    let (import, mut entry) = match fetch_bucket(http, &url, None).await {
+        Ok(ScoopFetch::Modified { import, entry }) => (import, entry),
+        Ok(ScoopFetch::NotModified) => {
+            return Err(BucketError::Download("resposta sem conteúdo".to_string()));
+        }
+        Err(ScoopError::Http(crate::http::HttpError::Status(404))) => {
+            return Err(BucketError::RepoNotFound(repo));
+        }
+        Err(e) => return Err(BucketError::Download(e.to_string())),
+    };
+    if import.packages.is_empty() {
+        return Err(BucketError::NotABucket);
+    }
+    let cat_err = |e: crate::catalog::CatalogError| BucketError::Catalog(e.to_string());
+    let now = crate::cache::now_unix();
+    let version = entry
+        .source_version
+        .clone()
+        .or_else(|| entry.etag.clone())
+        .unwrap_or_default();
+    let mut catalog = crate::catalog::Catalog::open(&data.catalog_path()).map_err(cat_err)?;
+    let stats = catalog
+        .replace_source(
+            &crate::sources::scoop::source_name(name),
+            crate::core::SourceKind::Scoop,
+            &version,
+            now,
+            &import.packages,
+            &crate::catalog::WingetMaps::default(),
+        )
+        .map_err(cat_err)?;
+    let idx = data.search_index_path();
+    if let Err(e) = crate::catalog::index_file::write(&catalog, &idx) {
+        tracing::warn!("falha ao gravar o índice de busca: {e}");
+        let _ = std::fs::remove_file(&idx);
+    }
+    if let Some(dir) = bucket_dir(data, name) {
+        let tag = std::process::id().to_string();
+        if let Err(e) = crate::sources::scoop::bucket::write_scripts(&dir, &import.scripts, &tag) {
+            tracing::warn!(bucket = name, error = %e, "could not store the bucket scripts");
+            let _ = std::fs::remove_file(dir.join(".scripts-ok"));
+        }
+    }
+    entry.checked_at = now;
+    let path = data.http_state_path();
+    let mut state = crate::cache::HttpState::load(&path);
+    state.set(&url, entry);
+    state
+        .save(&path)
+        .map_err(|e| BucketError::State(e.to_string()))?;
+    cfg.save(&data.config_path())
+        .map_err(|e| BucketError::State(e.to_string()))?;
+    Ok(stats.packages)
+}
+
+/// One line of `bucket list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketRow {
+    pub name: String,
+    pub repo: String,
+    /// Apps in the catalog; `None` when the bucket was never downloaded.
+    pub apps: Option<usize>,
+    /// Unix seconds of the last download.
+    pub updated: Option<i64>,
+}
+
+/// The configured buckets with their app count and last download from the catalog.
+pub fn rows(data: &crate::cache::DataDir, cfg: &Config) -> Result<Vec<BucketRow>, BucketError> {
+    let resolved = resolved(cfg).map_err(|e| BucketError::Catalog(e.to_string()))?;
+    let conn = Some(data.catalog_path())
+        .filter(|p| p.exists())
+        .and_then(|p| {
+            rusqlite::Connection::open_with_flags(p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .ok()
+        });
+    Ok(resolved
+        .into_iter()
+        .map(|(name, repo)| {
+            let source = crate::sources::scoop::source_name(&name);
+            let updated = conn.as_ref().and_then(|c| {
+                c.query_row(
+                    "SELECT fetched_at FROM meta WHERE source = ?1",
+                    [&source],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            });
+            let apps = updated.and(conn.as_ref()).and_then(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM packages WHERE source = ?1",
+                    [&source],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+                .map(|n| n as usize)
+            });
+            BucketRow {
+                name,
+                repo,
+                apps,
+                updated,
+            }
+        })
+        .collect())
+}
+
 /// Full `bucket rm`: checks `state.db`, drops the `scoop:<name>` source from the catalog,
 /// forgets its URL in `http.json` (so a later `add` refetches) and rewrites `search.idx`
 /// (deleting it when that fails; search then falls back to SQLite). The caller saves `cfg`.
-/// Stale `refs/heads/master` URLs from phase 1 stay orphaned in `http.json` (no effect).
 pub fn remove_and_cleanup(
     data: &crate::cache::DataDir,
     cfg: &mut Config,
     name: &str,
     state_db: &Path,
 ) -> Result<(), BucketError> {
+    remove_and_cleanup_confirmed(data, cfg, name, state_db, false)
+}
+
+/// [`remove_and_cleanup`] under the update lock; `main` and `extras` need `confirmed`.
+pub fn remove_and_cleanup_confirmed(
+    data: &crate::cache::DataDir,
+    cfg: &mut Config,
+    name: &str,
+    state_db: &Path,
+    confirmed: bool,
+) -> Result<(), BucketError> {
+    let _lock = lock(data)?;
+    if is_default_bucket(name) && !confirmed {
+        return Err(BucketError::DefaultNeedsConfirmation(name.to_string()));
+    }
     let repo = resolved(cfg)
         .ok()
         .and_then(|v| v.into_iter().find(|(n, _)| n == name).map(|(_, r)| r));
@@ -219,8 +391,12 @@ pub fn remove_and_cleanup(
     if let Some(repo) = repo {
         let path = data.http_state_path();
         let mut state = crate::cache::HttpState::load(&path);
+        // Phase 1 stored `refs/heads/master` URLs; they would linger orphaned.
+        let legacy = format!("https://codeload.github.com/{repo}/tar.gz/refs/heads/master");
         let url = crate::sources::scoop::bucket::repo_tarball_url(&repo);
-        if state.entries.remove(&url).is_some() {
+        let current = state.entries.remove(&url).is_some();
+        let old = state.entries.remove(&legacy).is_some();
+        if current || old {
             state
                 .save(&path)
                 .map_err(|e| BucketError::State(e.to_string()))?;

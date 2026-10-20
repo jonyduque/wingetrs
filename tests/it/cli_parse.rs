@@ -293,7 +293,8 @@ fn bucket_and_repair_parse() {
         parse(&["bucket", "rm", "mine"]),
         Some(Command::Bucket {
             action: BucketAction::Rm {
-                name: "mine".into()
+                name: "mine".into(),
+                yes: false
             }
         })
     );

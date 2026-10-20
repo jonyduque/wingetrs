@@ -367,13 +367,23 @@ async fn repair_on_an_empty_root_reports_nothing_to_do() {
 async fn bucket_add_list_rm_round_trip() {
     let server = MockServer::start().await;
     let lab = Lab::new(&server, "bucket").await;
+    // `bucket add` downloads the bucket on the spot.
+    Mock::given(method("GET"))
+        .and(path("/mine.tgz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(include_bytes!("../fixtures/scoop/Main-mini.tar.gz").as_slice()),
+        )
+        .mount(&server)
+        .await;
     let ok = |args: &[&str]| {
         let o = tokio::task::block_in_place(|| lab.run(args));
         assert!(o.status.success(), "{args:?}: {}", text(&o.stderr));
         text(&o.stdout)
     };
-    // One aligned row per bucket: name, then repository.
-    let has = |listed: &str, row: [&str; 2]| listed.lines().any(|l| l.split_whitespace().eq(row));
+    // One aligned row per bucket: name, repository, then the app count and day.
+    let has =
+        |listed: &str, row: [&str; 2]| listed.lines().any(|l| l.split_whitespace().take(2).eq(row));
     let listed = ok(&["bucket", "list"]);
     assert!(has(&listed, ["main", "ScoopInstaller/Main"]), "{listed}");
     // A repository that is not well known needs --yes without a terminal.
