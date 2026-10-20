@@ -3,7 +3,7 @@ Status: BLOCKED
 BLOCKED: a sonda mostra que a verificação pedida (`WinVerifyTrust`) precisa da feature nova `Win32_Security_WinTrust` do crate `windows` (confirmado em `windows-0.62.2/src/Windows/Win32/Security/mod.rs:29`, `#[cfg(feature = "Win32_Security_WinTrust")]`). Pela regra do brief, parado depois do relatório da sonda: `docs/superpowers/reports/2026-10-19-sonda-202.md`. Nenhum código escrito.
 
 Commits:
-a17d0c1 docs(report): probe for task 202 (signed catalog hash on the elevated side)
+59c4ca1 docs(report): probe for task 202 (signed catalog hash on the elevated side)
 
 Gate: não rodado (nenhum `.rs` alterado).
 
