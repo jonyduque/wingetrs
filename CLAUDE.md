@@ -16,7 +16,8 @@ Gerenciador de pacotes para Windows em Rust (TUI ratatui + CLI) sobre o catálog
 
 | O quê | Comando |
 |---|---|
-| Gate completo (regras + fmt + clippy + testes) | `pwsh -File scripts/verify.ps1` |
+| Gate completo (regras + fmt + licenças + clippy + testes) | `pwsh -File scripts/verify.ps1` |
+| Regenerar `THIRD_PARTY_LICENSES.txt` (depois de mudar dependência; o gate acusa se esquecer) | `pwsh -File scripts/third_party.ps1` |
 | Só as regras mecânicas do projeto | `pwsh -File scripts/check_rules.ps1` |
 | Um teste | `cargo test --quiet <nome>` |
 | Prova de mutação | `pwsh -File scripts/mutate.ps1 -Path <arquivo> -Anchor '<texto exato>' -Replacement '<texto>' -TestCommand 'cargo test --quiet <nome>'`  (âncora de várias linhas: `-AnchorFile`/`-ReplacementFile`) |

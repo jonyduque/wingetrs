@@ -128,4 +128,4 @@ pwsh -File scripts/verify.ps1   # regras, fmt, clippy e testes
 
 ## Licença
 
-MIT. O diretório `docs/reference/winget-cli/` traz trechos do [winget-cli](https://github.com/microsoft/winget-cli) (MIT), no commit indicado em `SOURCE_COMMIT.txt`.
+MIT. As licenças das dependências embutidas no executável estão em `THIRD_PARTY_LICENSES.txt` (gerado por `scripts/third_party.ps1` e anexado a cada release) e os avisos principais em `NOTICE`. O diretório `docs/reference/winget-cli/` traz trechos do [winget-cli](https://github.com/microsoft/winget-cli) (MIT), no commit indicado em `SOURCE_COMMIT.txt`.

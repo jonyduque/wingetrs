@@ -21,6 +21,7 @@ $steps = @(
     @{ Name = 'rules';  Cmd = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'check_rules.ps1') 2>&1 } },
     @{ Name = 'rules-selftest'; Cmd = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'check_rules_selftest.ps1') 2>&1 } },
     @{ Name = 'fmt';    Cmd = { cargo fmt --all -- --check 2>&1 } },
+    @{ Name = 'licenses'; Cmd = { pwsh -NoProfile -File (Join-Path $PSScriptRoot 'third_party.ps1') -Check 2>&1 } },
     @{ Name = 'clippy'; Cmd = { cargo clippy --quiet --all-targets --message-format short -- -D warnings 2>&1 } }
 )
 if (-not $NoTests) {
