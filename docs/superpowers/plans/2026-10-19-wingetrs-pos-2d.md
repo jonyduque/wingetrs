@@ -497,3 +497,50 @@ Testes (`tests/it/winget_out.rs`, novo):
 3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat(bridge): format winget output lines in the CLI and TUI`
+
+### Task 218: Terminal de administrador recusado já no plano
+
+**Modelo:** opus (revisor opus).
+
+> **Achado da prova ao vivo (2026-10-21), decisão do usuário (opção A):** num terminal de administrador, (1) `wingetrs install yori --allow-scripts` mostrou o plano, perguntou "Continuar?", extraiu e só no passo 16 recusou o `post_install` ("o wingetrs não roda scripts de manifesto com o processo elevado"), desfazendo tudo; (2) remover kondo-ui e hyperfine (registros HKCU do winget, desinstalador `winget uninstall --product-code`) falhou com `0x8A15007D: The package installed for user scope cannot be uninstalled when running with administrator privileges`. As duas recusas passam a sair no plano, antes de qualquer pergunta ou efeito. Rodar o winget sem elevação a partir do terminal admin é o item H do BACKLOG (não fazer aqui).
+
+#### Where this fits
+
+- Recusa de hoje, na execução (fica como defesa): `src/install/script_policy.rs:63` `refuse_if_elevated(elevated: bool) -> Result<(), String>`; chamada em `src/install/script_host_win.rs:89-91` (`PwshHost.elevated: fn() -> io::Result<bool>`), `src/install/installer_win.rs:23-30` e `src/install/inno_win.rs:22-29` (`run_with(..., elevated: fn() -> io::Result<bool>, launch)`). Token real: `src/winget_install/launch_win.rs:157` `is_elevated()`.
+- Código de terceiro no plano do Scoop: `src/cli/output.rs:1146` `plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty>` (CLI); `src/install/plan.rs:141` `InstallPlan.has_uninstall_scripts` (remoção); TUI monta o mesmo bloco em `src/tui/app.rs:2881`. Portão do CLI: `src/cli/install_cmd.rs:509` `third_party_gate(code, f)` (recusa sem `--allow-scripts` em `:522-525`, antes de `proceed`/"Continuar?" em `:541-550`); remoção Scoop: `install_cmd.rs:832` e `src/tui/jobs.rs:327` (`ops::plan_uninstall`).
+- Rota winget do ARP: `src/winget_install/uninstall.rs:237` `winget_product_code(c) -> Option<String>`; plano `plan_uninstall` (`:350-373`, `UninstallPlan`, `:94-99`); hive em `ArpDetails.hive` (`Hive::User` / `MachineX64` / `MachineX86`); execução `uninstall_by_winget` (`:553-580`), desvio em `uninstall_queued` (`:669-670`). Plano no CLI: `src/cli/run_win.rs:258-275` (`previous_win::plain_removal_plan`); TUI: `Cmd::PlanWingetUninstall` (`src/tui/app.rs:623`, `:2415`; `src/tui/run.rs:465`).
+- Testes de hoje das recusas: `tests/it/script_host_win.rs` (`elevated_refused` `:244`, `elevated_refusal_starts_nothing` `:516`), `tests/it/install_inno.rs:575`, `tests/it/install_file_installer.rs:673`; rota winget: `tests/it/wi_cli.rs:2129` `product_code_line_is_removed_by_winget`.
+
+#### What binds this task
+
+1. Função pura nova em `src/install/script_policy.rs`: `pub fn admin_terminal_refusal(elevated: bool, reason: AdminBlock) -> Option<String>` com `pub enum AdminBlock { ThirdPartyCode { what: String }, WingetUserScope }`. Textos (únicos, usados por CLI e TUI):
+   - `ThirdPartyCode`: `"{what} é código de terceiro e o wingetrs não o roda como administrador; abra um terminal sem administrador e repita"` (`what` = o rótulo que o bloco "Script de terceiro (…)" já usa, ex. `script post_install`, `instalador (installer.file)`, `innounp`).
+   - `WingetUserScope`: `"pacote instalado só para você: o winget não o remove de um terminal de administrador; abra um terminal sem administrador e repita"`.
+2. **Scoop (install, upgrade, uninstall), CLI e TUI:** com o processo elevado e o plano trazendo código de terceiro (o que `plan_third_party` lista; na remoção, `has_uninstall_scripts`), o comando recusa **antes** do bloco de consentimento, antes de "Continuar?" e antes de baixar/extrair — vale com ou sem `--allow-scripts`, e com `--yes`. No `--dry-run` o plano aparece inteiro e a recusa sai como linha de aviso no fim (saída 0). Lote: o item recusado vira "pulado" com o motivo; os outros seguem.
+3. **winget ARP:** registro com `winget_product_code(..).is_some()` e `hive == Hive::User` + processo elevado ⇒ mesma recusa no plano (`WingetUserScope`), CLI e TUI, antes de qualquer pergunta. Registro HKLM pela rota winget não muda.
+4. O "está elevado?" entra por injeção (`fn() -> io::Result<bool>` como nos `run_with`; produção = `launch_win::is_elevated`), nunca chamado direto da lógica testável. Erro ao consultar o token ⇒ tratar como elevado (recusa; fail-safe).
+5. As recusas da execução (`refuse_if_elevated`) continuam onde estão.
+6. Upgrade de pacote winget pela ponte com escopo usuário num terminal admin: **fora** desta tarefa (não medido); só registrar no relatório se o código mostrar o mesmo risco.
+
+Testes (`tests/it/admin_terminal.rs`, novo; `mod` no `main.rs`):
+1. `refusal_texts_fixed` (os dois textos literais acima, e `None` com `elevated = false`).
+2. `scoop_script_refused_before_confirm` (CLI, terminal falso: plano com `post_install`, elevado ⇒ erro com o texto, nenhuma pergunta lida do terminal, nada extraído na raiz temporária).
+3. `scoop_script_allowed_when_not_elevated` (mesmo plano, não elevado ⇒ segue para o bloco de consentimento como hoje).
+4. `dry_run_shows_plan_and_warning` (saída 0, plano + linha de aviso).
+5. `batch_skips_only_the_blocked_item`.
+6. `winget_user_scope_refused_in_plan` (registro HKCU com `winget uninstall --product-code`, elevado ⇒ recusa sem chamar a ponte; `FakeBridge` sem chamadas).
+7. `winget_machine_scope_unchanged` (mesmo registro em HKLM ⇒ plano como hoje).
+8. `cli_and_tui_same_refusal_text` (equivalência: o texto que a TUI mostra no toast/modal = o do CLI, para os dois casos).
+9. `token_error_counts_as_elevated`.
+
+**Files:** `src/install/script_policy.rs`, `src/cli/install_cmd.rs`, `src/cli/output.rs` (só a linha de aviso do `--dry-run`, se preciso), `src/cli/run_win.rs`, `src/cli/winget_cmd.rs`, `src/winget_install/uninstall.rs` (só o que o plano precisar), `src/tui/app.rs`, `src/tui/jobs.rs`, `tests/it/admin_terminal.rs` (novo), `tests/it/main.rs` (só o `mod`).
+
+#### Checks beyond the steps
+
+1. Mutação: tirar a recusa do plano do Scoop (deixar só a da execução) ⇒ teste 2 **PEGA**.
+2. Mutação: recusar também `Hive::MachineX64` ⇒ teste 7 **PEGA**.
+3. Mutação: erro do token ⇒ não elevado ⇒ teste 9 **PEGA**.
+4. Colar no relatório a saída do teste 2 (texto sem CSI).
+5. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat: refuse third-party code and user-scope winget removals in an admin terminal at plan time`
