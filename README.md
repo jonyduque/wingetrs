@@ -11,7 +11,7 @@ Todo o texto da interface é em português.
 
 ## Instalação
 
-Num PowerShell **sem** "Executar como administrador":
+Num PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/jonyduque/wingetrs/main/install.ps1 | iex
@@ -21,10 +21,17 @@ O script faz quatro coisas:
 
 1. baixa o `wingetrs.exe` do último release;
 2. confere o SHA-256 contra o `wingetrs.exe.sha256` publicado junto;
-3. copia o executável para `%LOCALAPPDATA%\Programs\wingetrs`;
-4. põe essa pasta no PATH do usuário.
+3. copia o executável para a pasta de instalação;
+4. põe essa pasta no PATH.
 
-Ele não pede administrador. Abra um terminal novo depois de instalar.
+O escopo segue o terminal:
+
+| Terminal | Pasta | PATH |
+|---|---|---|
+| normal | `%LOCALAPPDATA%\Programs\wingetrs` (só para você) | do usuário |
+| "Executar como administrador" | `C:\Program Files\wingetrs` (todos os usuários) | da máquina |
+
+Abra um terminal novo depois de instalar.
 
 - **Atualizar:** rode o mesmo comando de novo.
 - **Versão específica:** `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/jonyduque/wingetrs/main/install.ps1))) -Version v0.2.1`
@@ -32,13 +39,11 @@ Ele não pede administrador. Abra um terminal novo depois de instalar.
 
 Também dá para baixar o `wingetrs.exe` direto da página de [releases](https://github.com/jonyduque/wingetrs/releases).
 
-### Instalação na pasta do usuário e operações de administrador
+### Qual escopo escolher
 
-Instaladores de pacotes do winget para a máquina inteira pedem o UAC um por um e funcionam normalmente.
+Instaladores de pacotes do winget para a máquina inteira pedem o UAC um por um e funcionam nos dois escopos.
 
-O auxiliar elevado (`bridge-worker`) é outra história. Ele cuida da ponte `winget` elevada, das remoções de programas registrados em HKLM e da limpeza dessas chaves. Por segurança, ele só roda se o `wingetrs.exe` estiver numa pasta que só administradores gravam, como `C:\Program Files\wingetrs`. Instalado pelo script, na pasta do usuário, o wingetrs avisa e recusa essas operações.
-
-Para tê-las, copie o executável para `C:\Program Files\wingetrs` num terminal de administrador e ponha essa pasta no PATH.
+O auxiliar elevado (`bridge-worker`) é outra história. Ele cuida da ponte `winget` elevada, das remoções de programas registrados em HKLM e da limpeza dessas chaves. Por segurança, ele só roda se o `wingetrs.exe` estiver numa pasta que só administradores gravam, como `C:\Program Files\wingetrs`. Instalado só para você, o wingetrs avisa e recusa essas operações. Para tê-las, instale num terminal de administrador.
 
 ## Uso
 
