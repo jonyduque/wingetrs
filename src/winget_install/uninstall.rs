@@ -259,6 +259,22 @@ pub fn winget_product_code(c: &UninstallCommand) -> Option<String> {
     (plain && t.next().is_none()).then(|| id.to_string())
 }
 
+/// The removal goes through `winget uninstall --product-code` on a user-scope (`HKCU`) record:
+/// winget refuses it from an administrator terminal (Task 218). Machine records are unaffected.
+pub fn winget_user_scope(plan: &UninstallPlan) -> bool {
+    matches!(
+        plan.target,
+        UninstallTarget::Arp {
+            hive: Hive::User,
+            ..
+        }
+    ) && plan
+        .command
+        .as_ref()
+        .and_then(winget_product_code)
+        .is_some()
+}
+
 fn non_blank(s: &Option<String>) -> Option<&str> {
     s.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }

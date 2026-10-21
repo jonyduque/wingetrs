@@ -5,6 +5,7 @@
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod spans;
 
+mod admin_terminal;
 mod bridge;
 mod bridge_scope;
 mod bucket_admin;

@@ -16,6 +16,7 @@ use crate::install::executor::LaunchGate;
 use crate::install::ops::OpsCtx;
 use crate::install::prod_win::{ProdEffects, build_ctx};
 use crate::install::progress::ProgressEvent;
+use crate::install::script_policy::elevated_or_unknown;
 use crate::install::target::Candidate;
 use crate::installed::correlate::{ListRow, correlate};
 use crate::installed::{Hive, InstalledApp};
@@ -222,7 +223,8 @@ impl WingetFlows for ProdFlows<'_, '_> {
         stop: Stop<'_, I>,
     ) -> anyhow::Result<()> {
         let plan = winget_cmd::portable_plan(self.ctx, spec, self.behavior)?;
-        install_cmd::apply_install(self.ctx, ui, vec![plan], f, stop).await
+        let elevated = elevated_or_unknown(self.elevated());
+        install_cmd::apply_install(self.ctx, ui, vec![plan], f, elevated, stop).await
     }
 
     async fn plan_portable_upgrade(
@@ -328,6 +330,10 @@ impl WingetFlows for ProdFlows<'_, '_> {
 
     fn pins(&self) -> BTreeSet<String> {
         crate::pins::load(self.ctx.data)
+    }
+
+    fn elevated(&self) -> fn() -> std::io::Result<bool> {
+        crate::winget_install::launch_win::is_elevated
     }
 
     async fn plan_upgrade(

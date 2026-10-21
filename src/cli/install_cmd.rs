@@ -7,6 +7,7 @@ use crate::install::executor::LaunchGate;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
 use crate::install::progress::ProgressEvent;
 use crate::install::residue::{self, Confidence, Residue};
+use crate::install::script_policy::{AdminBlock, admin_terminal_refusal, elevated_or_unknown};
 use crate::install::script_scan::CallRoots;
 use crate::install::target::Candidate;
 use crate::job_log::{JobInfo, JobLog, Outcome};
@@ -527,6 +528,110 @@ fn third_party_gate(code: &[(String, Vec<ThirdParty>)], f: Flags) -> anyhow::Res
     Ok(())
 }
 
+/// The administrator-terminal refusal of third-party `code` (and innounp when `inno`): `None`
+/// when not elevated or there is none (Task 218). The one text of the CLI and the TUI.
+pub fn admin_code_refusal(elevated: bool, code: &[ThirdParty], inno: bool) -> Option<String> {
+    if !elevated {
+        return None;
+    }
+    let mut what: Vec<String> = Vec::new();
+    let labels = code.iter().map(ThirdParty::label);
+    for label in labels.chain(inno.then(|| "innounp".to_string())) {
+        if !what.contains(&label) {
+            what.push(label);
+        }
+    }
+    if what.is_empty() {
+        return None;
+    }
+    let what = what.join(", ");
+    admin_terminal_refusal(elevated, AdminBlock::ThirdPartyCode { what })
+}
+
+/// [`admin_code_refusal`] of the first plan of `plans` that cannot run as administrator.
+pub fn plans_admin_refusal(
+    elevated: bool,
+    plans: &[crate::install::plan::InstallPlan],
+) -> Option<String> {
+    if !elevated {
+        return None;
+    }
+    plans.iter().find_map(|p| {
+        let inno = p
+            .steps
+            .iter()
+            .any(|s| matches!(s, crate::install::plan::Step::ExtractInno { .. }));
+        admin_code_refusal(elevated, &output::plan_third_party(p), inno)
+    })
+}
+
+/// An administrator-terminal refusal ends the command before the consent block and
+/// "Continuar?"; a dry run keeps it to print as its last warning.
+fn admin_gate(refusal: Option<String>, f: Flags) -> anyhow::Result<Option<String>> {
+    match refusal {
+        Some(r) if !f.dry_run => Err(anyhow::Error::msg(r)),
+        other => Ok(other),
+    }
+}
+
+type Group = Vec<crate::install::plan::InstallPlan>;
+
+/// The upgrade groups an administrator terminal refuses (Task 218). A dry run keeps every
+/// group and returns the warnings for its end. Otherwise each refused group is skipped with a
+/// warning and the others go on; refusing every group is the command's error.
+fn admin_split(
+    groups: Vec<Group>,
+    elevated: bool,
+    f: Flags,
+) -> anyhow::Result<(Vec<Group>, Vec<String>)> {
+    let total = groups.len();
+    let refusals: Vec<Option<String>> = groups
+        .iter()
+        .map(|g| plans_admin_refusal(elevated, g))
+        .collect();
+    let lines: Vec<String> = groups
+        .iter()
+        .zip(&refusals)
+        .filter_map(|(g, r)| {
+            let r = r.as_deref()?;
+            if total == 1 {
+                return Some(r.to_string());
+            }
+            let apps: Vec<&str> = g.iter().map(|p| p.app.as_str()).collect();
+            Some(format!("{} pulado: {r}", apps.join(", ")))
+        })
+        .collect();
+    if f.dry_run || lines.is_empty() {
+        return Ok((groups, lines));
+    }
+    if lines.len() == total {
+        let first = refusals.into_iter().flatten().next().unwrap_or_default();
+        if total > 1 {
+            for l in &lines {
+                emit::err_with(|| output::warning(l));
+            }
+        }
+        return Err(anyhow::Error::msg(first));
+    }
+    for l in &lines {
+        emit::err_with(|| output::warning(l));
+    }
+    let kept = groups
+        .into_iter()
+        .zip(refusals)
+        .filter_map(|(g, r)| r.is_none().then_some(g))
+        .collect();
+    Ok((kept, Vec::new()))
+}
+
+/// The dry run's end: the administrator-terminal warning, if any, then "nothing changed".
+fn dry_run_done(ui: &dyn Ui, refusal: Option<&str>) {
+    if let Some(r) = refusal {
+        ui.output(&output::warning(r));
+    }
+    emit::out(output::DRY_RUN_DONE);
+}
+
 /// The plans that run third-party code, with that code.
 fn plans_code<'a>(
     plans: impl Iterator<Item = &'a crate::install::plan::InstallPlan>,
@@ -773,22 +878,25 @@ async fn install(
         .into());
     }
     let plans = ops::plan_for(ctx, &cand, false)?;
-    apply_install(ctx, ui, plans, f, stop).await
+    let elevated = elevated_or_unknown(winget.elevated());
+    apply_install(ctx, ui, plans, f, elevated, stop).await
 }
 
 /// Shows `plans`, asks, and applies them (the scoop install; also a winget portable package,
-/// Task 189).
+/// Task 189). `elevated`: this process runs as administrator (third-party code is refused).
 pub(crate) async fn apply_install(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
     plans: Vec<crate::install::plan::InstallPlan>,
     f: Flags,
+    elevated: bool,
     mut stop: Stop<'_, impl Interrupts>,
 ) -> anyhow::Result<()> {
     print_plans(ctx, ui, &plans, f);
+    let refusal = admin_gate(plans_admin_refusal(elevated, &plans), f)?;
     third_party_gate(&plans_code(plans.iter()), f)?;
     if f.dry_run {
-        emit::out(output::DRY_RUN_DONE);
+        dry_run_done(ui, refusal.as_deref());
         return Ok(());
     }
     if !proceed(ui, f)? {
@@ -852,9 +960,12 @@ async fn uninstall(
         .map(|items| (plan.app.clone(), items))
         .into_iter()
         .collect();
+    let items: Vec<ThirdParty> = code.iter().flat_map(|(_, i)| i.iter().cloned()).collect();
+    let elevated = elevated_or_unknown(winget.elevated());
+    let refusal = admin_gate(admin_code_refusal(elevated, &items, false), f)?;
     third_party_gate(&code, f)?;
     if f.dry_run {
-        emit::out(output::DRY_RUN_DONE);
+        dry_run_done(ui, refusal.as_deref());
         return Ok(());
     }
     if !proceed(ui, f)? {
@@ -1022,11 +1133,16 @@ async fn upgrade(
         };
         groups.push(ops::plan_for(ctx, &cand, keep)?);
     }
+    let elevated = elevated_or_unknown(winget.elevated());
+    let (groups, refusals) = admin_split(groups, elevated, f)?;
     for g in &groups {
         print_plans(ctx, ui, g, f);
     }
     third_party_gate(&plans_code(groups.iter().flatten()), f)?;
     if f.dry_run {
+        for r in &refusals {
+            ui.output(&output::warning(r));
+        }
         emit::out(output::DRY_RUN_DONE);
         return Ok(());
     }

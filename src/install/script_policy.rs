@@ -67,3 +67,37 @@ pub fn refuse_if_elevated(elevated: bool) -> Result<(), String> {
         Ok(())
     }
 }
+
+/// Why an operation cannot go on from an administrator terminal (Task 218).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminBlock {
+    /// The plan runs third-party code; `what` is its label (`script post_install`, `innounp`).
+    ThirdPartyCode { what: String },
+    /// A user-scope record removed by `winget uninstall --product-code`: winget refuses it
+    /// elevated (`0x8A15007D`).
+    WingetUserScope,
+}
+
+/// The refusal shown in the plan (CLI and TUI) when the process is elevated; `None` otherwise.
+pub fn admin_terminal_refusal(elevated: bool, reason: AdminBlock) -> Option<String> {
+    if !elevated {
+        return None;
+    }
+    Some(match reason {
+        AdminBlock::ThirdPartyCode { what } => format!(
+            "{what} é código de terceiro e o wingetrs não o roda como administrador; abra um terminal sem administrador e repita"
+        ),
+        AdminBlock::WingetUserScope => "pacote instalado só para você: o winget não o remove de um terminal de administrador; abra um terminal sem administrador e repita".to_string(),
+    })
+}
+
+/// Asks `probe` whether this process is elevated; an error reading the token counts as
+/// elevated (the refusal is the safe side).
+pub fn elevated_or_unknown(probe: fn() -> std::io::Result<bool>) -> bool {
+    probe().unwrap_or(true)
+}
+
+/// A probe for contexts that never run elevated (test fakes; production injects the token's).
+pub fn not_elevated() -> std::io::Result<bool> {
+    Ok(false)
+}

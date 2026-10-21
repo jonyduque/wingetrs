@@ -1,11 +1,14 @@
 //! Elm-style TUI state: `update` is pure and performs no I/O; side effects are returned as `Cmd`.
 use crate::bridge::{self, BridgeJob, BridgeOp, NOT_OURS_NOTE, PINNED_NOTE, Tool, WingetFit};
 use crate::catalog::search::{SearchHit, SearchIndex};
+use crate::cli::install_cmd::{admin_code_refusal, plans_admin_refusal};
 use crate::cli::output::{ThirdParty, plan_third_party};
+use crate::cli::winget_cmd::winget_admin_refusal;
 use crate::config::{Behavior, Config, ConfirmMode, ResidueMode, WingetEngine};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
+use crate::install::script_policy::elevated_or_unknown;
 use crate::install::script_scan::{ScriptReport, Verdict, printable};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, InstallScope, ListRow, Rule, UpdateState};
@@ -804,6 +807,10 @@ pub struct App {
     /// Third-party code of the removals planned and not yet confirmed, by lowercase app.
     /// `(manifest hash, code)`.
     pub removal_code: HashMap<String, (String, Vec<ThirdParty>)>,
+    /// Whether this process is elevated (Task 218): third-party code and user-scope winget
+    /// removals are refused in the plan. `App::new`: never; `tui::run`: the token's (an error
+    /// counts as elevated).
+    pub elevated: fn() -> std::io::Result<bool>,
     /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
     pub now: Instant,
     /// Toasts on screen, newest first.
@@ -951,6 +958,7 @@ impl App {
             planning_keep: false,
             planning_confirm: None,
             removal_code: HashMap::new(),
+            elevated: crate::install::script_policy::not_elevated,
             now: Instant::now(),
             toasts: Vec::new(),
             refresh_forced: false,
@@ -4218,6 +4226,72 @@ fn queue_key(app: &mut App, selected: u64, key: KeyEvent) -> Vec<Cmd> {
     Vec::new()
 }
 
+/// Task 218: the administrator-terminal refusal of `action` when this process is elevated
+/// (the same text as the CLI's).
+fn admin_refusal(app: &App, action: &Action, elevated: bool) -> Option<String> {
+    match action {
+        Action::Apply(groups) => groups.iter().find_map(|g| plans_admin_refusal(elevated, g)),
+        Action::Remove(p) => {
+            let code = app.removal_code.get(&p.app.to_lowercase());
+            let code = code.map(|(_, c)| c.as_slice()).unwrap_or_default();
+            admin_code_refusal(elevated, code, false)
+        }
+        Action::WingetUninstall(p) => winget_admin_refusal(p, elevated),
+        _ => None,
+    }
+}
+
+/// Task 218: what of `action` an administrator terminal lets go on, before any confirmation.
+/// A refused item is an error toast; in an upgrade of several apps each refused group is
+/// skipped with a warning and the others go on. `None`: nothing is left.
+fn admin_filter(app: &mut App, action: Action) -> Option<Action> {
+    let elevated = elevated_or_unknown(app.elevated);
+    if !elevated {
+        return Some(action);
+    }
+    match action {
+        Action::Apply(groups) if groups.len() > 1 => {
+            let mut kept = Vec::new();
+            for g in groups {
+                match plans_admin_refusal(elevated, &g) {
+                    Some(r) => {
+                        let apps: Vec<&str> = g.iter().map(|p| p.app.as_str()).collect();
+                        app.push_toast(
+                            ToastKind::Warning,
+                            format!("{} pulado: {r}", apps.join(", ")),
+                        );
+                    }
+                    None => kept.push(g),
+                }
+            }
+            (!kept.is_empty()).then_some(Action::Apply(kept))
+        }
+        other => match admin_refusal(app, &other, elevated) {
+            Some(r) => {
+                if let Action::Remove(p) = &other {
+                    app.removal_code.remove(&p.app.to_lowercase());
+                }
+                app.push_toast(ToastKind::Error, r);
+                None
+            }
+            None => Some(other),
+        },
+    }
+}
+
+/// [`admin_filter`] of one item of a batch: a refused item is skipped with the reason.
+fn admin_batch_item(app: &mut App, label: &str, action: Action) -> Option<Action> {
+    let elevated = elevated_or_unknown(app.elevated);
+    let Some(r) = admin_refusal(app, &action, elevated) else {
+        return Some(action);
+    };
+    if let Action::Remove(p) = &action {
+        app.removal_code.remove(&p.app.to_lowercase());
+    }
+    app.push_toast(ToastKind::Warning, format!("{label} pulado: {r}"));
+    None
+}
+
 fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
     app.planning = false;
     app.status = None;
@@ -4230,6 +4304,9 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
             if let Action::Remove(p) = &action {
                 app.removal_code.remove(&p.app.to_lowercase());
             }
+            let Some(action) = admin_filter(app, action) else {
+                return Vec::new();
+            };
             return ready_one(app, action, confirm);
         }
         Ok(Planned::ReadyScripts {
@@ -4242,6 +4319,9 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
                 app.removal_code
                     .insert(p.app.to_lowercase(), (manifest_sha256, code));
             }
+            let Some(action) = admin_filter(app, action) else {
+                return Vec::new();
+            };
             return ready_one(app, action, confirm);
         }
         Ok(Planned::Choose(candidates)) => {
@@ -4284,6 +4364,9 @@ fn on_portable_planned(
             app.planning = false;
             app.status = None;
             app.planning_confirm = None;
+            let Some(action) = admin_filter(app, action) else {
+                return Vec::new();
+            };
             let modal = confirm_modal(app, vec![action], agreements, None);
             open_modal(app, modal);
             Vec::new()
@@ -4399,7 +4482,10 @@ fn on_winget_uninstall_planned(
         .take()
         .unwrap_or(app.settings.behavior.confirm);
     match result {
-        Ok(plan) => start_ready(app, Action::WingetUninstall(plan), confirm, Vec::new()),
+        Ok(plan) => match admin_filter(app, Action::WingetUninstall(plan)) {
+            Some(action) => start_ready(app, action, confirm, Vec::new()),
+            None => Vec::new(),
+        },
         Err(message) => {
             app.push_toast(ToastKind::Error, message);
             Vec::new()
@@ -4425,15 +4511,16 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
     for (i, result) in results.into_iter().enumerate() {
         let label = batch.labels.get(i).cloned().unwrap_or_default();
         match result {
-            Ok(Planned::Ready { action, .. }) => match action {
-                Action::Apply(g) => groups.extend(g),
-                other => {
-                    if let Action::Remove(p) = &other {
-                        app.removal_code.remove(&p.app.to_lowercase());
-                    }
-                    removals.push(other);
+            Ok(Planned::Ready { action, .. }) => {
+                if let Action::Remove(p) = &action {
+                    app.removal_code.remove(&p.app.to_lowercase());
                 }
-            },
+                match admin_batch_item(app, &label, action) {
+                    Some(Action::Apply(g)) => groups.extend(g),
+                    Some(other) => removals.push(other),
+                    None => {}
+                }
+            }
             Ok(Planned::ReadyScripts {
                 action,
                 code,
@@ -4444,7 +4531,7 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
                     app.removal_code
                         .insert(p.app.to_lowercase(), (manifest_sha256, code));
                 }
-                removals.push(action);
+                removals.extend(admin_batch_item(app, &label, action));
             }
             Ok(Planned::Choose(_)) => ambiguous.push(label),
             Err(message) => app.push_toast(ToastKind::Error, format!("{label}: {message}")),

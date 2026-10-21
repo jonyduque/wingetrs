@@ -14,6 +14,7 @@ use crate::install::executor::LaunchGate;
 use crate::install::ops::OpsCtx;
 use crate::install::plan::InstallPlan;
 use crate::install::progress::ProgressEvent;
+use crate::install::script_policy::{AdminBlock, admin_terminal_refusal, elevated_or_unknown};
 use crate::install::target::Candidate;
 use crate::installed::Hive;
 use crate::installed::correlate::{InstallScope, ListRow};
@@ -345,6 +346,11 @@ pub trait WingetFlows {
     fn free_space(&self) -> fn(&Path) -> Option<u64>;
     /// Pinned apps (`pins::load`).
     fn pins(&self) -> BTreeSet<String>;
+    /// Whether this process is elevated (Task 218; production: `launch_win::is_elevated`). The
+    /// default is for fakes that never run elevated; an error counts as elevated.
+    fn elevated(&self) -> fn() -> std::io::Result<bool> {
+        crate::install::script_policy::not_elevated
+    }
     /// `engine::plan_upgrade` of `row` to the catalog version of `package_id`, and the plan
     /// removing the installed record (for `uninstallPrevious`).
     fn plan_upgrade(
@@ -682,15 +688,32 @@ pub async fn uninstall<F: WingetFlows>(
         .await
         .map_err(anyhow::Error::msg)?;
     say(output::winget_uninstall_text(&plan, f.dry_run).trim_end());
+    // Winget refuses a user-scope removal elevated: said in the plan, before any question.
+    let refusal = winget_admin_refusal(&plan, elevated_or_unknown(flows.elevated()));
     if f.dry_run {
+        if let Some(r) = &refusal {
+            say(&output::warning(r));
+        }
         say(output::DRY_RUN_DONE);
         return Ok(());
+    }
+    if let Some(r) = refusal {
+        bail!("{r}");
     }
     let Some(choice) = removal_choice(ui, &plan, f)? else {
         say(&output::cancelled());
         return Ok(());
     };
     run_removal(flows, ui, stop, &row.app_key, plan, choice, say).await
+}
+
+/// The administrator-terminal refusal of removing `plan` (Task 218): a user-scope record that
+/// only `winget uninstall --product-code` removes. The one text of the CLI and the TUI.
+pub fn winget_admin_refusal(plan: &UninstallPlan, elevated: bool) -> Option<String> {
+    if !crate::winget_install::uninstall::winget_user_scope(plan) {
+        return None;
+    }
+    admin_terminal_refusal(elevated, AdminBlock::WingetUserScope)
 }
 
 /// The data another installation shares with this one, when there is something to choose
