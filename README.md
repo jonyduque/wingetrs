@@ -1,13 +1,24 @@
+<p align="center"><img src="docs/assets/logo.svg" alt="wingetrs" width="360"></p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/licen%C3%A7a-MIT-blue" alt="Licença MIT"></a>
+  <a href="https://github.com/jonyduque/wingetrs/releases"><img src="https://img.shields.io/github/v/release/jonyduque/wingetrs" alt="Último release"></a>
+  <img src="https://img.shields.io/badge/plataforma-Windows-0078D6" alt="Plataforma Windows">
+</p>
+
 # wingetrs
 
-Gerenciador de pacotes para Windows, em Rust, com TUI e CLI. Usa o catálogo do winget e os buckets do Scoop.
-
-- Busca e mostra pacotes do winget e do Scoop a partir de um catálogo local, que o `update` atualiza.
-- Instala, atualiza e remove apps do Scoop sem precisar do Scoop: extrai zip, 7z, MSI, CAB, `.tar.gz`, `.tar.xz` e `.nupkg` por conta própria e cria shims, PATH e atalhos.
-- Instala pacotes do winget com motor próprio (MSI, WiX, Burn, Inno, NSIS, MSIX e exe silencioso) ou, quando não dá, pelo próprio winget.
-- Lista o que está instalado no Windows e mostra o que tem atualização.
+Gerenciador de pacotes rápido para Windows, em Rust, com TUI e CLI. Usa o catálogo do winget e os buckets do Scoop.
 
 Todo o texto da interface é em português.
+
+## O que faz
+
+- Busca e mostra pacotes do winget e do Scoop a partir de um catálogo local, que o `update` atualiza.
+- Instala, atualiza e remove apps do Scoop sem precisar do Scoop. Extrai zip, 7z, MSI, CAB, `.tar.gz`, `.tar.xz` e `.nupkg` por conta própria e cria shims, PATH e atalhos.
+- Instala pacotes do winget com motor próprio (MSI, WiX, Burn, Inno, NSIS, MSIX e exe silencioso) ou, quando não dá, pelo próprio winget.
+- Lista o que está instalado no Windows e mostra o que tem atualização.
+- Mostra progresso por fases, com relógio, em qualquer operação demorada.
 
 ## Instalação
 
@@ -59,9 +70,52 @@ wingetrs upgrade --all         atualiza tudo que o wingetrs instalou
 wingetrs bucket add extras     adiciona um bucket do Scoop
 ```
 
+Outros comandos: `uninstall`, `repair` (reconstrói o estado a partir do disco) e `cleanup` (limpa registros de apps cujo desinstalador sumiu).
+
 `wingetrs <comando> --help` mostra as opções e exemplos de cada comando.
 
-`--dry-run` mostra o plano sem mudar nada. Scripts de manifestos do Scoop só rodam com `--allow-scripts`.
+Opções que valem para vários comandos:
+
+- `--dry-run` mostra o plano sem mudar nada.
+- `--yes` não pergunta nada.
+- `--scope user|machine` escolhe o escopo de um pacote do winget.
+- `--color auto|always|never` e `--glyphs nerd|unicode|ascii` ajustam a saída.
+
+## TUI
+
+Rode `wingetrs` sem argumentos. As abas são Busca, Instalados e Atualizações.
+
+| Tecla | Ação |
+|---|---|
+| `↑↓` `j` `k` | mover seleção |
+| `PgUp` `PgDn` | mover de 10 em 10 |
+| `←→` / `Tab` | trocar aba |
+| `Enter` | foco nos detalhes |
+| `Espaço` | marcar (busca vazia) |
+| `Ins` `Ctrl+Espaço` | marcar (sempre) |
+| `i` | instalar (aba Busca, Scoop) |
+| `u` | remover (aba Instalados) |
+| `U` | atualizar (aba Atualizações) |
+| `f` | fila de operações |
+| `Ctrl+S` | filtrar fonte |
+| `Ctrl+E` | mostrar (aba Instalados) |
+| `Ctrl+R` | atualizar catálogo |
+| `Esc` | voltar / limpar / sair |
+| `q` `Ctrl+C` | sair |
+
+## Segurança
+
+- O instalador de um pacote do winget só roda com o SHA-256 conferido.
+- Scripts e instaladores de terceiros de manifestos do Scoop só rodam com `--allow-scripts`, e antes aparecem na tela com a análise. `--yes` não libera isso.
+- O `msiexec /a` (reserva para MSI que o extrator não suporta) só roda com `--allow-msiexec` ou confirmação naquele item.
+- Todo caminho vindo de manifesto ou de arquivo baixado é validado antes de virar caminho no disco (recusa `..`, caminho absoluto, drive, UNC e nomes reservados do Windows).
+- O auxiliar elevado não procura executáveis no PATH, monta o próprio ambiente do zero e não grava em pastas do usuário.
+- O wingetrs só lê os arquivos do winget e do Scoop. O `installed.db` do winget é aberto somente para leitura.
+- Dado externo malformado vira erro, não pânico: um manifesto ruim não derruba a TUI.
+
+## Dados
+
+Tudo fica em `%LOCALAPPDATA%\wingetrs`: catálogo, buckets, cache, apps instalados, shims, dados persistentes e logs. Fora dessa pasta, o wingetrs mexe só no que um app instalado pede: PATH do usuário (`HKCU\Environment`), atalhos em `Start Menu\Programs\wingetrs Apps` e a Lixeira. Pacotes do winget gravam onde o próprio instalador grava.
 
 ## Compilar
 
