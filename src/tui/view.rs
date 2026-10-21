@@ -1057,6 +1057,16 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
             theme.alert().add_modifier(Modifier::BOLD),
         ));
     }
+    if let Some(new) = app
+        .self_update
+        .as_deref()
+        .and_then(crate::selfupdate::parse_tag)
+    {
+        push(Span::styled(
+            format!(" wingetrs {new} · ctrl+u "),
+            theme.pill_a(),
+        ));
+    }
     if let Some(age) = app.index_age_secs {
         push(Span::styled(
             format!(" {} índice {} ", g.refresh, format_age(age)),
@@ -1126,6 +1136,7 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("Ctrl+S", "filtrar fonte"),
         key("Ctrl+E", "mostrar (aba Instalados)"),
         key("Ctrl+R", "atualizar catálogo"),
+        key("Ctrl+U", "atualizar o wingetrs (se houver versão nova)"),
         key("Esc", "voltar / limpar / sair"),
         key("q Ctrl+C", "sair"),
     ];

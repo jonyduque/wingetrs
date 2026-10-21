@@ -174,6 +174,11 @@ pub enum Msg {
     },
     /// Results of a `Cmd::PlanBatch`, in the order of its items.
     BatchPlanned(Vec<Result<Planned, String>>),
+    /// The background check found a release newer than this build (`tag` is `vX.Y.Z`; older or
+    /// equal ones are dropped).
+    SelfUpdateAvailable {
+        tag: String,
+    },
     /// Download/extract progress of the running operation.
     InstallProgress {
         label: String,
@@ -275,6 +280,10 @@ pub enum Action {
     },
     /// Exports and deletes an ARP record whose uninstaller is gone.
     RemoveOrphan(Orphan),
+    /// Replaces the running wingetrs by the release `tag` (the same update as `self update`).
+    SelfUpdate {
+        tag: String,
+    },
 }
 
 impl Action {
@@ -308,6 +317,7 @@ impl Action {
             Action::WingetRegistryOnly(p) => format!("Removendo o registro de {}", p.name),
             Action::WingetUpgrade { plan, .. } => format!("Atualizando {}", plan.name),
             Action::RemoveOrphan(o) => format!("Removendo registro órfão de {}", o.name),
+            Action::SelfUpdate { .. } => "Atualizando o wingetrs".to_string(),
         }
     }
 }
@@ -790,6 +800,10 @@ pub struct App {
     pub details_pending: Option<String>,
     pub refreshing: bool,
     pub offline: bool,
+    /// Version of this build (`X.Y.Z`), what a newer release is compared with.
+    pub version: String,
+    /// Tag of the newer wingetrs release the background check found (the status pill, Ctrl+U).
+    pub self_update: Option<String>,
     pub index_age_secs: Option<i64>,
     pub spinner_frame: usize,
     pub show_help: bool,
@@ -947,6 +961,8 @@ impl App {
             details_pending: None,
             refreshing: false,
             offline: false,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            self_update: None,
             index_age_secs: None,
             spinner_frame: 0,
             show_help: false,
@@ -1976,6 +1992,10 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::InstallFinished(result) => on_finished(app, result),
+        Msg::SelfUpdateAvailable { tag } => {
+            app.self_update = crate::selfupdate::newer(&app.version, &tag).map(|_| tag);
+            Vec::new()
+        }
         Msg::ToolsDetected { winget, scoop } => {
             app.tools = Tools {
                 winget: Some(winget),
@@ -2143,6 +2163,7 @@ fn on_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                 app.cycle_show();
                 Vec::new()
             }
+            KeyCode::Char('u') => ask_self_update(app),
             _ => Vec::new(),
         };
     }
@@ -2672,6 +2693,14 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     items.push(option_item(REGISTRY_ONLY_ITEM, false));
                 }
             }
+            Action::SelfUpdate { tag } => items.push(ConfirmItem {
+                name: "wingetrs".to_string(),
+                key: None,
+                from: Some(app.version.clone()),
+                to: crate::selfupdate::parse_tag(tag).map(|v| v.to_string()),
+                manager: "wingetrs",
+                checked: true,
+            }),
             Action::RemoveOrphan(o) => items.push(ConfirmItem {
                 name: format!("Remover registro órfão de {}", o.name),
                 key: None,
@@ -4574,6 +4603,14 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
 
 fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
     let finished = app.running.take();
+    if result.is_ok()
+        && matches!(
+            finished.as_ref().and_then(|r| r.action.as_ref()),
+            Some(Action::SelfUpdate { .. })
+        )
+    {
+        app.self_update = None;
+    }
     app.installer_running = false;
     app.bridge_last_line = None;
     // Success or not, the disk may have changed.
@@ -4666,6 +4703,27 @@ fn ask_msiexec(
     let modal = confirm_modal(app, vec![action], vec![note], None);
     open_modal(app, modal);
     cmds
+}
+
+/// Ctrl+U: with a newer release known, asks (the usual buttons) to update wingetrs; the update
+/// itself is queued only after Continuar. Refused with a toast while an operation runs or
+/// waits (the executable must not be swapped under an installer), and without a newer release
+/// it does nothing.
+fn ask_self_update(app: &mut App) -> Vec<Cmd> {
+    let Some(tag) = app.self_update.clone() else {
+        return Vec::new();
+    };
+    let Some(new) = crate::selfupdate::parse_tag(&tag) else {
+        return Vec::new();
+    };
+    if !can_start(app) || !app.queue.is_empty() {
+        app.push_toast(ToastKind::Warning, "espere a operação atual");
+        return Vec::new();
+    }
+    let note = format!("Atualizar o wingetrs de {} para {new}?", app.version);
+    let modal = confirm_modal(app, vec![Action::SelfUpdate { tag }], vec![note], None);
+    open_modal(app, modal);
+    Vec::new()
 }
 
 /// `Cancelar` (or `Esc`) on a confirmation; declining `msiexec /a` ends that item as an error.

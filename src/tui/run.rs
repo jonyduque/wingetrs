@@ -333,6 +333,7 @@ async fn event_loop(
     let mut ticker = spinner_ticker();
     spawn_boot(&ctx);
     spawn_job(&ctx, |c, _| detect_tools(c));
+    spawn_version_check(&ctx);
     if app.icon_protocol != crate::tui::icons::IconProtocol::Off {
         spawn_job(&ctx, |c, _| {
             Msg::IconMapLoaded(crate::icons::load_map(&c.data))
@@ -1753,6 +1754,9 @@ fn spawn_bridge(ctx: &Arc<Ctx>, job: crate::bridge::BridgeJob) {
 }
 
 fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
+    if let Action::SelfUpdate { tag } = action {
+        return spawn_self_update(ctx, tag);
+    }
     if let Action::Bridge(job) = action {
         return spawn_bridge(ctx, job);
     }
@@ -1777,6 +1781,58 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
         })
         .and_then(|r| r);
         Msg::InstallFinished(result)
+    });
+}
+
+/// Looks for a newer wingetrs release once per 24 h (cache in the data dir) after the first
+/// frame; offline, rate limit or any error is silent. A development build never asks.
+fn spawn_version_check(ctx: &Arc<Ctx>) {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        let dev = std::env::current_exe()
+            .map_err(crate::selfupdate::SelfUpdateError::from)
+            .and_then(|exe| crate::selfupdate::refuse_dev_build(&exe));
+        if dev.is_err() {
+            return;
+        }
+        let tag = crate::selfupdate::check_latest(
+            &ctx.http,
+            crate::selfupdate::WEB_BASE,
+            ctx.data.root(),
+            now_unix(),
+        )
+        .await;
+        if let Some(tag) = tag {
+            let _ = ctx.tx.send(Msg::SelfUpdateAvailable { tag });
+        }
+    });
+}
+
+/// Runs the same update as `wingetrs self update` (`selfupdate::update_to`: direct, or one UAC
+/// prompt announced first) on a blocking thread.
+fn spawn_self_update(ctx: &Arc<Ctx>, tag: String) {
+    spawn_job(ctx, move |c, handle| {
+        let tx = c.tx.clone();
+        let throttle = jobs::ProgressThrottle::new(Instant::now());
+        let progress = move |ev: &crate::install::progress::ProgressEvent| {
+            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), ev) {
+                let _ = tx.send(msg);
+            }
+        };
+        let new = crate::selfupdate::parse_tag(&tag).map(|v| v.to_string());
+        let result = std::env::current_exe()
+            .map_err(crate::selfupdate::SelfUpdateError::from)
+            .and_then(|exe| {
+                crate::selfupdate::refuse_dev_build(&exe)?;
+                Ok(exe)
+            });
+        let result = match result {
+            Ok(exe) => {
+                handle.block_on(crate::selfupdate::update_to(&c.http, &tag, &exe, &progress))
+            }
+            Err(e) => Err(e),
+        };
+        Msg::InstallFinished(jobs::self_update_done(new.as_deref(), result))
     });
 }
 

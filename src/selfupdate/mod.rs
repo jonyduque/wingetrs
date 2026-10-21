@@ -476,3 +476,107 @@ pub async fn latest_tag(http: &Http, web_base: &str) -> Result<String, SelfUpdat
     }
     Ok(tag)
 }
+
+/// `{"checked_at": <unix>, "latest": "v0.2.2"}` in the data dir: the TUI asks GitHub at most
+/// once per [`CHECK_EVERY`].
+const CACHE_FILE: &str = "self-update.json";
+
+/// Minimum seconds between two version checks of the TUI.
+pub const CHECK_EVERY: i64 = 24 * 60 * 60;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckCache {
+    checked_at: i64,
+    latest: String,
+}
+
+/// The newest release tag for the TUI notice: the cache in `data_root` when it is under 24 h
+/// old (no network), else [`latest_tag`] (then cached). Any failure is silent: `None`, with the
+/// reason only in the log. A cache dated in the future or holding a bad tag counts as stale.
+pub async fn check_latest(
+    http: &Http,
+    web_base: &str,
+    data_root: &Path,
+    now: i64,
+) -> Option<String> {
+    let file = data_root.join(CACHE_FILE);
+    let cached = std::fs::read(&file)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CheckCache>(&b).ok());
+    if let Some(c) = cached
+        && (0..CHECK_EVERY).contains(&(now - c.checked_at))
+        && parse_tag(&c.latest).is_some()
+    {
+        return Some(c.latest);
+    }
+    match latest_tag(http, web_base).await {
+        Ok(tag) => {
+            let fresh = CheckCache {
+                checked_at: now,
+                latest: tag.clone(),
+            };
+            let written = serde_json::to_vec(&fresh)
+                .map_err(std::io::Error::other)
+                .and_then(|b| std::fs::write(&file, b));
+            if let Err(e) = written {
+                tracing::debug!(error = %e, "self-update cache not written");
+            }
+            Some(tag)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "version check failed");
+            None
+        }
+    }
+}
+
+/// The update to `tag` of the executable `exe`, shared by `self update` and the TUI: directly
+/// when the user may write its folder, else through one UAC prompt for the executable itself
+/// (which fetches the tag on its own; the elevation notice goes out as a progress phase first).
+pub async fn update_to(
+    http: &Http,
+    tag: &str,
+    exe: &Path,
+    progress: &(dyn Fn(&ProgressEvent) + Sync),
+) -> Result<Outcome, SelfUpdateError> {
+    if elevated_scope(exe) {
+        return elevated_update(exe, progress);
+    }
+    apply_with(http, DL_BASE, tag, exe, progress)
+        .await
+        .map(|()| Outcome::Updated)
+}
+
+#[cfg(windows)]
+fn elevated_scope(exe: &Path) -> bool {
+    apply_win::admin_scope(exe)
+}
+
+#[cfg(not(windows))]
+fn elevated_scope(_exe: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn elevated_update(
+    exe: &Path,
+    progress: &(dyn Fn(&ProgressEvent) + Sync),
+) -> Result<Outcome, SelfUpdateError> {
+    apply_win::elevated_apply(
+        exe,
+        &mut || progress(&ProgressEvent::Phase(Phase::WaitingElevation)),
+        &mut || {
+            progress(&ProgressEvent::Phase(Phase::SelfUpdate(
+                SelfUpdateStep::Elevated,
+            )))
+        },
+    )
+}
+
+#[cfg(not(windows))]
+fn elevated_update(
+    _exe: &Path,
+    _progress: &(dyn Fn(&ProgressEvent) + Sync),
+) -> Result<Outcome, SelfUpdateError> {
+    Err(SelfUpdateError::Elevation(CODE_OTHER))
+}

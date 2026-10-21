@@ -490,6 +490,28 @@ fn installed(applied: Result<Vec<InstallPlan>, OpsError>) -> Result<Done, Instal
     })
 }
 
+/// The end of a wingetrs self-update as the queue shows it: the toast text, or the typed
+/// error's text.
+pub fn self_update_done(
+    new: Option<&str>,
+    result: Result<crate::selfupdate::Outcome, crate::selfupdate::SelfUpdateError>,
+) -> Result<Done, InstallFail> {
+    match result {
+        Ok(crate::selfupdate::Outcome::Updated) => Ok(Done {
+            summary: format!(
+                "wingetrs atualizado para {}; feche e abra de novo para usar a versão nova",
+                new.unwrap_or("a versão nova")
+            ),
+            residues: None,
+        }),
+        Ok(crate::selfupdate::Outcome::AlreadyLatest) => Ok(Done {
+            summary: "o wingetrs já está na versão mais recente".to_string(),
+            residues: None,
+        }),
+        Err(e) => Err(InstallFail::Other(e.to_string())),
+    }
+}
+
 /// The `job.start` data of an action run by the own installer; `None` for a bridge job
 /// (`run_bridge` logs it).
 fn action_info(action: &Action) -> Option<JobInfo> {
@@ -510,7 +532,7 @@ fn action_info(action: &Action) -> Option<JobInfo> {
             to: None,
             cmd: None,
         }),
-        Action::Bridge(_) => None,
+        Action::Bridge(_) | Action::SelfUpdate { .. } => None,
         Action::WingetInstall(p) => Some(winget_info("install", p, None)),
         Action::WingetUpgrade { plan, .. } => {
             Some(winget_info("upgrade", plan, plan.upgrade_from.clone()))

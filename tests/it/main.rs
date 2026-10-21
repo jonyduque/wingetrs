@@ -81,6 +81,7 @@ mod tui_buckets;
 mod tui_jobs;
 mod tui_loop;
 mod tui_scripts;
+mod tui_self_update;
 mod tui_state;
 mod tui_theme;
 mod tui_view;
