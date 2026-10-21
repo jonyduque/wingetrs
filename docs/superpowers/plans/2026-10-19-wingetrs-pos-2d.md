@@ -583,3 +583,132 @@ Testes:
 4. Gate local: `pwsh -File scripts/verify.ps1` (num terminal não elevado).
 
 **Commit:** `ci: GitHub Actions running the verify gate on Windows`
+
+### Task 216: Barra de progresso e spinner do CLI no estilo da TUI; fase e relógio em `update` e `list`
+
+**Modelo:** opus (revisor opus).
+
+**Depois de:** 212 (`src/cli/style.rs`) e 215 (`src/cli/output.rs`, `src/install/progress.rs`). Nenhum arquivo em comum com tarefa rodando em paralelo.
+
+#### Where this fits
+
+- Eventos: `ProgressEvent` (`src/install/progress.rs:22-33`: `Download { url, done, total }` e `Phase(Phase)`); `Phase` (`:36-81`) é casado de forma exaustiva em `phase_title` (`:101-137`), `phase_status` (`:159-182`), `Phases::log_to_read` (`src/cli/output.rs:1456`), `take_notice_at` (`:1521`), `parts_at` (`:1571`), `tui/jobs.rs::progress_msg` (`:98-123`) e `tui/app.rs:1953`. Variante nova quebra o build em todos esses lugares (é de propósito: ver ARMADILHAS "Rótulo especial no callback de progresso só tratado num consumidor").
+- CLI, estado puro: `output::Phases` (`src/cli/output.rs:1404-1414`), `update_at` (`:1427-1453`: soma por URL, `samples` numa janela de 3 s, `last_data`), `parts_at` (`:1571-1676`): spinner `glyphs.spinner[frame]`, barra `[{#×n}{-×(20-n)}] {pct}%  {done:.1} / {total} MiB` (`:1647-1660`), ` · {x} MiB/s · ~N s` (`:1662-1666`), aviso ` · sem dados há N s` depois de `STALL_AFTER` = 10 s (`:1668-1674`); `speed_at` (`:1679`); `mib` (`:1334`). Sem TTY: `PhaseLog` (`:1722-1745`) imprime uma linha por mudança de fase (`Baixando…`, `Preparando…`), sem `\r` nem cor.
+- CLI, desenho: `output::progress_line(main, warn)` (`:810-812`) só pinta o aviso (`style::WARN`). `LineProgress`/`ProgressState` (`src/cli/install_cmd.rs:265-475`): thread de animação a cada `TICK` = 120 ms (`:260`, `:429-450`), `draw` (`:292-327`) corta com `fit_cols` (`:278-284`, o aviso sai primeiro) e escreve por `emit::progress()` (`src/cli/emit.rs:61-92`, `StderrLock` com `\r` e espaços). O único construtor é `TtyUi::build` (`install_cmd.rs:148-168`), que já monta um `tui::theme::Theme` (dark/light do config + `detect_depth`) e os `Glyphs` do config.
+- Cores do CLI: `src/cli/style.rs` só tem constantes `anstyle` de 16 cores (`:12-26`); `paint` (`:147-153`) respeita `--color`/`NO_COLOR`/TTY do stdout (`ENABLED`, `:44`, decidido em `init` `:173-190`). Nenhum mapeamento de `tui::theme` existe hoje.
+- TUI: a barra é só `"{label} [####----] {pct}%"` ou `"{label} {done} bytes"` (`src/tui/view.rs:1470-1489`, `progress_text`), sem tamanho, velocidade nem "sem dados"; vai dentro da pílula `pill_msg` da barra de status (`view.rs:1066-1090`, via `running_text` `:1445-1466`). Spinner: `view.rs:320-325`. `RunProgress` (`src/tui/app.rs:346-352`) é **substituído inteiro** a cada `Msg::InstallProgress` (`app.rs:1911-1921`), então não guarda amostras para velocidade.
+- Glifos: `Glyphs` (`src/tui/theme.rs:18-51`), spinners `BRAILLE`/`ASCII_SPINNER` (`:53-54`); não há glifos de barra. Tokens: `Theme::accent()`/`muted()`/`warn()`/`spinner()` (`:307-377`).
+- `wingetrs update`: `src/cli/mod.rs:711-728` chama `update::run_update` (`src/update.rs:186-310`: lock `:193-201`, downloads em paralelo `join_all` `:221-242`, abre e grava o catálogo `:246-285`, `search.idx` `:305`) e só imprime os relatórios no fim: nada na tela durante (inventário `docs/cli-textos.md` §1). `--background` (`spawn_background_update`, `mod.rs:502-520`) não imprime nada e deve continuar assim. O mesmo `run_update` roda calado na 1ª busca com catálogo vazio (`ensure_catalog_ran`, `mod.rs:542-591`, chamada `:572`; inventário SRC-07). `run_update` tem 21 chamadas (testes incluídos) e uma na TUI (`src/tui/run.rs:808`).
+- `wingetrs list`: `src/cli/mod.rs:834-905`: três threads (varredura, rastreamento, normalizador) `:845-861`, `ensure_catalog` `:863`, `correlate` `:884-887`, saída `:895-902`; nada na tela até a tabela (inventário LST-11).
+- Testes que fixam o texto atual: `tests/it/install_progress.rs` `phase_line_has_spinner_and_clock` (`:386`), `download_line_speed_eta_and_stall` (`:445`, `Baixando [######--------------] 34%`), `not_a_tty_prints_one_line_per_phase` (`:663`), `tui_status_shows_phase_and_clock` (`:702`); `tests/it/cli_plan_summary.rs` `download_bar_has_twenty_columns` (`:264`, `[#####---------------] 25%`). Terminal falso: `cli::picker::fake::plain` (`src/cli/picker.rs:540`, tira CSI). Harness de CLI ponta a ponta com wiremock: `tests/it/cli_color.rs:12-60` (`Env::run(args, vars)`).
+- Regras (CLAUDE.md): "Operação que pode demorar nunca deixa a tela parada" (spinner, fase e relógio desde o primeiro instante; aviso quando passa do normal); "Cores só via tokens de `tui/theme.rs`"; toda saída do CLI pelos formatadores de `cli/output.rs` e escrita só em `cli/emit.rs`; "Mais de um caminho para o mesmo resultado ⇒ teste de equivalência".
+
+#### What binds this task
+
+1. **Uma formatação de download só, em `src/install/progress.rs`** (módulo comum ao CLI e à TUI, como `phase_text`):
+   - `pub struct DownloadMeter` com o que hoje está em `Phases` (`per_url`, `samples`, `last_data`, `SPEED_WINDOW`, `speed_at`): `record_at(url, done, total, now)`, `rate_at(now) -> Option<f64>`, `quiet_at(now) -> Option<Duration>`, `done()`, `total() -> Option<u64>`, `finished()`. `Phases` passa a usar o `DownloadMeter`; nada de cálculo de velocidade duplicado.
+   - `pub fn download_parts(meter: &DownloadMeter, now: Instant, glyphs: &Glyphs) -> DownloadParts` com `filled: String`, `empty: String` (20 células no total), `tail: String` e `warn: String`. `tail` = `"{pct}%  {done:.1} / {total:.1} MiB"` + `" · {x:.1} MiB/s"` + `" · ~N s"` (como hoje); total desconhecido: sem barra (`filled`/`empty` vazios) e `tail` = `"{done:.1} MiB · {x:.1} MiB/s"`. `warn` = `" · sem dados há N s"` a partir de `STALL_AFTER` (10 s; a constante muda para `progress.rs` e `output.rs` reexporta).
+   - `pub fn download_text(label: &str, parts: &DownloadParts) -> String` = `"{label} {open}{filled}{empty}{close} {tail}{warn}"` (sem barra: `"{label} {tail}{warn}"`).
+2. **Glifos de barra** em `Glyphs` (`tui/theme.rs`): `bar_full`, `bar_empty`, `bar_open`, `bar_close`. Nerd e Unicode: `"█"`, `"░"`, `""`, `""`. Ascii: `"#"`, `"-"`, `"["`, `"]"`. Com Ascii o texto fica igual ao de hoje (os testes de `:445` e `cli_plan_summary.rs:264` continuam valendo sem mudança).
+3. **CLI**: `Phases::parts_at` monta a linha de download com `download_parts` + rótulo `Baixando` (texto sem cor igual ao de `download_text("Baixando", …)` com o spinner na frente). O texto sem cor de toda linha (`line_at`) não muda para Ascii.
+4. **Cores do CLI pelos tokens do tema**: `style.rs` ganha `pub fn from_theme(s: ratatui::style::Style) -> anstyle::Style` (`Color::Rgb` ⇒ `RgbColor`, `Color::Indexed` ⇒ `Ansi256Color`, cores nomeadas ⇒ `AnsiColor`, `BOLD` ⇒ `Effects::BOLD`, sem cor ⇒ `Style::new()`) e `pub struct ProgressStyles { spinner, fill, empty }` com `ProgressStyles::of(&Theme)` = `accent`, `accent`, `muted`. Nenhum `anstyle` fora de `style.rs`. `LineProgress::new(tty, glyphs, styles)`: o `TtyUi::build` passa `ProgressStyles::of(&self.theme)`; `update`/`list` montam o mesmo `Theme` pelo config (função única `install_cmd::line_progress(cfg) -> Arc<LineProgress>`, usada também por `TtyUi::build`).
+5. **Desenho pintado sem quebrar o corte**: `parts_at` devolve as partes separadas (spinner, rótulo, `filled`, `empty`, resto, aviso), e uma função pura `output::progress_frame(parts, cols, styles) -> (String, usize)` corta pelo texto **sem cor** (mesma prioridade do `fit_cols`: o aviso sai primeiro, depois o fim da linha) e só então pinta cada pedaço com `style::paint` (spinner e `filled` com `fill`/`spinner`, `empty` com `empty`, aviso com `WARN`). Devolve também a largura visível (para o `drawn`). `ProgressState::draw` só chama `progress_frame` e `emit::progress().redraw`. Com cor desligada (`--color never`, `NO_COLOR`, stdout redirecionado) a linha não tem `\x1b`; stderr fora de terminal continua no `PhaseLog` (uma linha por fase, sem `\r` e sem CSI), igual a hoje.
+6. **TUI usa a mesma formatação**: `RunProgress` ganha `meter: DownloadMeter` (o `#[derive(Clone, PartialEq)]` continua); `Msg::InstallProgress` grava no medidor existente com `app.now` em vez de trocar o `RunProgress` (uma fase nova zera o medidor). `progress_text` (`view.rs:1470`) chama `download_parts` + `download_text(label, …)`: a TUI passa a mostrar tamanho, velocidade, estimativa e `sem dados há N s`. A pílula continua com o estilo `pill_msg` (sem cor por pedaço).
+7. **`update` com spinner, fase e relógio**: `update::run_update_with(data, ep, http, force, wait, progress: download::Progress<'_>)`; `run_update` vira um atalho que passa progresso vazio (as 21 chamadas atuais não mudam). Fases novas em `Phase` (todas canceláveis: entram no grupo sem "não pode ser cancelado" de `phase_status`):
+   - `WaitingUpdate` ⇒ "Aguardando outra atualização do catálogo", só quando a 1ª tentativa do lock sem espera falha e o `LockWait` permite esperar;
+   - `FetchingCatalog { sources: usize }` ⇒ "Baixando o catálogo" (1 fonte) / "Baixando os catálogos ({n} fontes)", antes do `join_all`, com `n` = fontes que vão de fato baixar (sem as puladas por estarem em dia);
+   - `WritingCatalog` ⇒ "Gravando o catálogo", antes de abrir o catálogo para gravar (só quando `needs_catalog`).
+   A ordem é `Preparing` (antes do lock) ⇒ [`WaitingUpdate`] ⇒ `FetchingCatalog` ⇒ [`WritingCatalog`]. O comando `update` (sem `--background`) usa `line_progress(cfg)` e chama `finish()` antes de `print_reports`; `--background` passa progresso vazio (nenhuma saída, nem em stderr). `ensure_catalog_ran` (atualização bloqueante da 1ª busca/list/show) também mostra as fases e fecha a linha antes de devolver.
+8. **`list` com spinner, fase e relógio**: `Phase::ReadingInstalled` ⇒ "Lendo os apps instalados" antes de abrir as threads; `Phase::Correlating` ⇒ "Comparando com o catálogo" antes do `correlate`; `finish()` antes de imprimir (também no caminho de erro: guard ou `finish` antes do `?`). `--json` mantém o stdout só com o JSON (o progresso vai em stderr).
+9. Todos os consumidores exaustivos de `Phase` tratam as variantes novas (`tui/jobs.rs` manda para `Msg::InstallPhase`, como as demais). Nenhum `if cfg!`, nenhum `println!`, nenhuma cor fora de `style.rs`/`theme.rs`.
+
+Testes (`tests/it/install_progress.rs`, acrescenta; nenhum teste usa relógio real: `Instant` base + `Duration`):
+1. `bar_parts_unicode_and_ascii` (`download_parts` com 5 MiB de 20 MiB: Unicode ⇒ `filled == "█████"`, `empty == "░"×15`, `tail == "25%  5.0 / 20.0 MiB"`; Ascii ⇒ `download_text("Baixando", …) == "Baixando [#####---------------] 25%  5.0 / 20.0 MiB"`).
+2. `cli_and_tui_share_download_text` (os mesmos 4 eventos de download nos mesmos instantes em `Phases::update_at` e em `update(&mut app, Msg::InstallProgress{..})` com `app.now`; o pedaço depois do rótulo, de `Baixando ` no CLI e de `rust.msi ` na TUI, é idêntico aos 3 s, com `" · 3.1 MiB/s · ~6 s"`, e aos 15 s, com `" · sem dados há 12 s"`).
+3. `tui_download_shows_size_speed_and_stall` (`running_text` contém `9.3 / 27.0 MiB · 3.1 MiB/s` e depois termina em ` · sem dados há 12 s`; total desconhecido ⇒ `rust.msi 4.0 MiB · 2.0 MiB/s`, sem a palavra `bytes`).
+4. `progress_frame_paints_with_theme_tokens` (`style::with_enabled(true)`, `ProgressStyles::of(&Theme::new(true, ColorDepth::Ansi256))`: a saída contém `"\x1b[38;5;99m"` (o accent) imediatamente antes do spinner; `fake::plain(saída) == line_at(...)`).
+5. `progress_frame_plain_without_color` (`with_enabled(false)`: nenhum `\x1b` na saída; texto igual a `line_at`).
+6. `progress_frame_cuts_before_painting` (linha de download com aviso, `cols = 30`, cor ligada: `fake::plain(saída)` tem exatamente 30 caracteres e é o prefixo da linha sem cor; toda sequência `\x1b[` da saída termina antes do fim da string).
+7. `from_theme_maps_rgb_indexed_and_none` (`Rgb(1,2,3)` ⇒ `RgbColor(1,2,3)`; `Indexed(99)` ⇒ `Ansi256Color(99)`; `Style::new()` ⇒ `anstyle::Style::new()`; `BOLD` vira `Effects::BOLD`).
+8. `update_reports_phases_in_order` (`run_update_with` contra o wiremock de `tests/it/update.rs` `setup()`, progresso gravando num `Mutex<Vec<Phase>>`: `[Preparing, FetchingCatalog { sources: 3 }, WritingCatalog]`; segunda rodada sem `force` com tudo em dia ⇒ `[Preparing, FetchingCatalog { sources: 0 }]`, sem `WritingCatalog`).
+9. `update_waits_for_lock_with_phase` (lock segurado por um `UpdateLock` do teste, `LockWait::Block(…)`: o primeiro evento depois de `Preparing` é `WaitingUpdate`; solta o lock por um canal depois de receber o evento, sem `sleep` nem limiar de relógio).
+10. `new_phase_titles` (`phase_text` de `WaitingUpdate`, `FetchingCatalog{1}`, `FetchingCatalog{3}`, `WritingCatalog`, `ReadingInstalled`, `Correlating` aos 2 s, texto exato com `· 00:02`; `phase_status` igual a `phase_text` para todas, sem "não pode ser cancelado").
+
+Testes (`tests/it/cli_color.rs`, acrescenta, binário real com stderr redirecionado):
+11. `update_progress_plain_off_a_terminal` (`update --force`: stderr tem as linhas `Preparando…`, `Baixando os catálogos (3 fontes)…`, `Gravando o catálogo…` nessa ordem, nenhum `\r` nem `\x1b`; stdout continua só com os relatórios).
+12. `background_update_prints_nothing` (`update --background --force`: stdout e stderr vazios).
+13. Ao vivo, `#[ignore = "live: varre o registro real"]` em `tests/it/cli_color.rs`: `list_progress_plain_off_a_terminal` (`list` com stderr redirecionado: `Lendo os apps instalados…` antes de `Comparando com o catálogo…`; stdout começa pelo cabeçalho da tabela).
+
+Antes de mexer, rode `grep -rn "stderr" tests/it/cli_offline.rs tests/it/cli_color.rs tests/it/cli_install.rs` e ajuste só as asserções que exigem stderr vazio em `update`/`search` com catálogo vazio (cite cada uma no relatório).
+
+**Files:** `src/install/progress.rs`, `src/cli/output.rs`, `src/cli/style.rs`, `src/cli/install_cmd.rs`, `src/cli/mod.rs`, `src/update.rs`, `src/tui/theme.rs`, `src/tui/app.rs` (`RunProgress`, `Msg::InstallProgress`, `phase_progress`, o `match` de `:1953`), `src/tui/view.rs` (`progress_text`), `src/tui/jobs.rs` (`progress_msg`), `tests/it/install_progress.rs`, `tests/it/cli_color.rs`, e os testes listados pelo grep acima se algum mudar.
+
+#### Checks beyond the steps
+
+1. Mutação: `progress_text` da TUI volta ao formato antigo (`"{} [{}{}] {pct}%"`) ⇒ teste 2 **PEGA**.
+2. Mutação: a TUI troca o `RunProgress` inteiro a cada `InstallProgress` (perde o medidor) ⇒ teste 3 **PEGA** (sem velocidade).
+3. Mutação: o spinner pintado com `style::WARN` em vez de `styles.spinner` ⇒ teste 4 **PEGA**.
+4. Mutação: `progress_frame` usa `paint_raw` (ignora `--color never`) ⇒ teste 5 **PEGA**.
+5. Mutação: cortar depois de pintar (`fit_cols` sobre o texto já com CSI) ⇒ teste 6 **PEGA**.
+6. Mutação: tirar o `progress(Phase(WritingCatalog))` ⇒ teste 8 **PEGA**; contar todas as fontes em `FetchingCatalog` (sem descontar as puladas) ⇒ teste 8 **PEGA** na 2ª rodada.
+7. Mutação: o `update --background` usa `line_progress` ⇒ teste 12 **PEGA**.
+8. Colar no relatório: a linha do teste 4 com os escapes trocados por `<ESC>` e a saída `fake::plain` dos testes 1 e 2. Escapes nos testes: escreva `"\x1b"` direto no `.rs` com a ferramenta Edit/Write, nunca por heredoc (ARMADILHAS "Escape `\xNN` no texto de um comando vira byte bruto"); confira com `grep -c` por bytes `< 0x20`.
+9. Prova manual (o orquestrador faz, não o implementador): `wingetrs update --force` e `wingetrs list` num terminal mostram spinner colorido, fase e relógio até a saída; `wingetrs install <app>` mostra a barra `█░` com tamanho e velocidade; com `--color never` sem cor.
+10. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(cli): themed progress bar and spinner shared with the TUI; phases in update and list`
+
+---
+
+### Task 217: Transcript do CLI e da TUI para a prova ao vivo
+
+**Modelo:** sonnet (revisor sonnet).
+
+**Depois de:** 212 (`src/cli/picker.rs`) e 216 (`src/cli/install_cmd.rs`, `src/cli/output.rs`, `src/tui/view.rs`, `src/tui/app.rs`). As mudanças em `scripts/live/` ficam com o orquestrador.
+
+#### Where this fits
+
+- Toda escrita do CLI passa por `src/cli/emit.rs`: `out` (`:18`), `out_block` (`:23`), `out_flushed` (`:28`), `err` (`:34`), `err_with` (`:39`), `json` (`:45`), `error` (`:52`, chamado por `main.rs:48`) e a linha de progresso `Progress` (`:61-92`: `erase`, `line_above` para avisos, `redraw` a cada 120 ms). `check_rules.ps1` recusa `print!`/`stdout()` fora de `emit.rs` em `src/cli/` (o terminal do seletor em `picker.rs` é a exceção).
+- O seletor escreve no próprio `Term` (`src/cli/picker.rs`); a linha de resumo depois da escolha (`"{prompt} {rótulo}"`) sai em `picker.rs:389-393` (`summary`, `:184`). A Task 212 mantém essa linha.
+- Linha de progresso com TTY (`LineProgress`, `src/cli/install_cmd.rs:358-475`): só redesenha; sem TTY, o `output::PhaseLog` (`src/cli/output.rs:1722-1745`) dá uma linha por fase.
+- Processo elevado: `cli::run` (`src/cli/mod.rs:1037`) devolve antes de tudo para `Command::BridgeWorker` (`:1040-1043`, `bridge::elevated::run_worker`, `src/bridge/elevated.rs:577`), sem pasta de dados nem log (regra do CLAUDE.md: código elevado não grava em pasta do usuário). A TUI entra por `crate::tui::run::run` (`mod.rs:1083-1086`), depois do config. `update --background` é um processo filho destacado (`mod.rs:502-520`) que herda o ambiente.
+- TUI: `update(app, msg)` é pura; efeitos ficam no laço `event_loop` (`src/tui/run.rs:287`), que desenha em `:539-543`. Toasts: `App::push_toast` (`src/tui/app.rs:986`), `Toast { kind, text, expires, count }` (`:719-724`), `ToastKind` (`:698-703`). Modais: `enum Modal` (`app.rs:~474`, variantes `Confirm`, `ConfirmQuit`, `Picking`, `Actions`, `Residues`, `Choosing`, `Queue`), abertos por `open_modal` (`:4007`, com fila `pending_modals`); os títulos estão espalhados no desenho (`src/tui/view.rs:1195-1275`: "Confirmar", "Escolha o pacote", nome do app, "Escolha a correspondência", "Resíduos de {app}", "Fila"; `draw_confirm` `:1312`). Itens do Confirm: `ConfirmItem { name, from, to, manager, .. }` (`app.rs:417`). Job em execução: `app.running` (`Running { label, progress }`, `app.rs:~366`), fase em `RunProgress.phase`; texto da barra de status em `view::running_text` (`view.rs:1445`).
+
+#### What binds this task
+
+1. Módulo novo `src/transcript.rs` (fora de `cli/` porque a TUI também usa): `pub const VAR: &str = "WINGETRS_TRANSCRIPT"`; `pub fn open(path: &Path) -> io::Result<()>` (cria ou abre em **append**; guarda o `File` num `Mutex<Option<File>>` global); `pub fn enabled() -> bool`; `pub fn line(text: &str)` (tira as sequências CSI/OSC com `strip_ansi`, divide em `\n`, sem `\r`, grava cada linha + `\n` com uma chamada `write_all` e `flush` por linha; sem transcript aberto não faz nada; erro de escrita depois de aberto fecha o transcript e vai para `tracing::warn!`, nunca para o terminal); `pub fn strip_ansi(text: &str) -> String`; `pub fn with_file<T>(path: &Path, f: impl FnOnce() -> T) -> T` (desvio por thread, para testes, no padrão de `style::with_enabled`). Nada aqui escreve em stdout/stderr.
+2. Decisão de ligar: `pub fn transcript_path(cli: &Cli, var: Option<OsString>) -> Option<PathBuf>` em `cli/mod.rs`: `None` para `BridgeWorker` e para `Update { background: true }`, e para valor vazio; caso contrário, o caminho. `cli::run` chama `transcript_path` **depois** do `return` do `BridgeWorker` e antes do desvio para a TUI só nos comandos do CLI; falha de `open` ⇒ **um** aviso por `emit::err_with(|| output::warning(&output::transcript_failed(path, e)))` com o texto `não foi possível abrir o transcript {caminho}: {erro}; seguindo sem transcript` e o comando segue normalmente.
+3. CLI (`emit.rs`): `out`, `out_block`, `out_flushed`, `err`, `err_with`, `json` e `error` mandam o mesmo texto para `transcript::line` (o texto já pronto, antes ou depois de escrever, tanto faz). `Progress::line_above` também (avisos acima da linha). `redraw`/`erase` **não** (seriam centenas de linhas): em vez disso, `LineProgress::update` com TTY passa o evento por um `PhaseLog` próprio e manda a linha da fase para o transcript, então o transcript tem as mesmas linhas de fase que um stderr redirecionado. O resumo do seletor (`picker.rs:389-393`) vai para o transcript.
+4. TUI: `tui::run::run` abre o transcript com a mesma variável (aviso de caminho inválido vira **um** toast `ToastKind::Warning` com o mesmo texto do CLI, nunca stderr). Módulo novo `src/tui/transcript.rs` com `#[derive(Default)] pub struct Observer` e `pub fn observe(&mut self, app: &App) -> Vec<String>` puro, chamado no laço antes do desenho só quando `transcript::enabled()`; cada linha vai para `transcript::line`. Linhas, todas com prefixo `[tui] `:
+   - toast novo, ou o mesmo com `count` maior: `[tui] toast {ok|info|aviso|erro}: {texto}`;
+   - modal que passa a ser mostrado (`app.modal` muda): `[tui] modal: {título}`; para `Confirm`, uma linha por item `[tui]   {nome} {de} → {para} ({manager})` (sem `de`/`para` quando ausentes) e uma por nota `[tui]   nota: {nota}`; para `ConfirmQuit`, uma linha por linha do texto; modal fechado: `[tui] modal fechado`;
+   - job: quando muda o rótulo do `running` ou o **título** da fase (`phase_title`, sem relógio; download conta como `baixando`): `[tui] job: {rótulo} · {fase}`; quando `running` volta a `None`: `[tui] job terminou: {rótulo}`.
+   O título do modal vem de uma função só, `pub fn modal_title(m: &Modal) -> String` em `view.rs`, usada também pelo desenho (sem cópia do texto).
+5. Nunca escreve no terminal pela TUI; nunca abre transcript no `bridge-worker` nem no `update --background`.
+
+Testes (`tests/it/transcript.rs`, novo; o `mod transcript;` em `tests/it/main.rs` é do orquestrador):
+1. `emit_lines_are_plain` (`transcript::with_file(tmp)` + `style::with_enabled(true)`: `emit::out(&output::success("x", "y"))`, `emit::out_block("a\nb\n")`, `emit::err("e")` ⇒ o arquivo é exatamente `format!("{} x y\na\nb\ne\n", Glyphs::for_set(GlyphSet::Unicode).toast_ok)` (glifo unicode, padrão fora de terminal), sem `\x1b` nem `\r`; o conteúdo é lido **antes** de sair do `with_file`, provando o flush por linha).
+2. `appends_to_existing_file` (arquivo já com `"antes\n"` ⇒ `"antes\nnovo\n"`).
+3. `invalid_path_is_an_error_not_a_panic` (`transcript::open(tmp/"nao/existe/t.txt")` ⇒ `Err`; `transcript::line("x")` depois não entra em pânico e `enabled()` continua `false`).
+4. `cli_warns_once_and_runs` (binário real, harness de `cli_color.rs`: `search ""` com `WINGETRS_TRANSCRIPT=<pasta inexistente>/t.txt` ⇒ sucesso, stdout igual ao da mesma busca sem a variável, stderr contém `não foi possível abrir o transcript ` exatamente uma vez).
+5. `cli_transcript_has_stdout_stderr_and_phases` (binário real: `update --force --color always` com a variável ⇒ o arquivo contém a linha de relatório do `winget` (`winget: ` com o token inteiro), `Preparando…` e nenhum byte `0x1b`).
+6. `tui_toast_goes_to_transcript` (`App::new`, `push_toast(Success, "instalado")`, `observe` ⇒ `["[tui] toast ok: instalado"]`; 2º `observe` ⇒ vazio; o mesmo toast de novo (`count` 2) ⇒ a linha outra vez).
+7. `tui_confirm_modal_lines` (`Modal::Confirm` com dois itens, um com `from`/`to` e outro sem, e uma nota ⇒ `[tui] modal: Confirmar`, as duas linhas de item na ordem e `[tui]   nota: …`; fechar ⇒ `[tui] modal fechado`).
+8. `tui_job_lines_ignore_the_clock` (`running` com `Phase::Preparing`; `observe`; `app.now += 5 s`; `observe` ⇒ vazio; `Msg::InstallPhase(Phase::Placing)` ⇒ `[tui] job: Instalar rust · Colocando os arquivos`; `running = None` ⇒ `[tui] job terminou: Instalar rust`).
+9. `elevated_worker_and_background_never_transcribe` (`transcript_path` com `Cli::try_parse_from(["wingetrs", "bridge-worker", "--pipe", "p", "--parent", "1"])` e `Some("t.txt")` ⇒ `None`; `["wingetrs", "update", "--background"]` ⇒ `None`; `["wingetrs", "list"]` ⇒ `Some("t.txt")`; valor vazio ⇒ `None`).
+10. `picker_summary_in_transcript` (`picker::yes_no` com `fake::ScriptedTerm` e `Enter`, dentro de `with_file` ⇒ o arquivo tem `Continuar? Não`).
+
+**Files:** `src/transcript.rs` (novo), `src/lib.rs` (só o `mod`), `src/cli/emit.rs`, `src/cli/mod.rs` (`transcript_path` e a abertura), `src/cli/output.rs` (só `transcript_failed`), `src/cli/install_cmd.rs` (fases para o transcript com TTY), `src/cli/picker.rs` (só a linha de resumo), `src/tui/transcript.rs` (novo), `src/tui/mod.rs` (só o `mod`), `src/tui/view.rs` (`modal_title`), `src/tui/run.rs` (abertura e `Observer` no laço), `tests/it/transcript.rs` (novo).
+
+#### Checks beyond the steps
+
+1. Mutação: `line` grava o texto sem `strip_ansi` ⇒ testes 1 e 5 **PEGAM**.
+2. Mutação: `BufWriter` sem `flush` por linha ⇒ teste 1 **PEGA** (lê antes do fim).
+3. Mutação: `open` com `truncate(true)` em vez de `append` ⇒ teste 2 **PEGA**.
+4. Mutação: `transcript_path` sem o caso `BridgeWorker` ⇒ teste 9 **PEGA**; o revisor confere também que a abertura em `cli::run` está depois do `return` do worker (`git show HEAD:src/cli/mod.rs | grep -n "run_worker\|transcript"`).
+5. Mutação: `observe` usa `phase_text` (com relógio) em vez de `phase_title` ⇒ teste 8 **PEGA**.
+6. Mutação: o aviso de caminho inválido impresso a cada linha ⇒ teste 4 **PEGA** (exatamente uma vez).
+7. Colar no relatório o arquivo do teste 5 (as primeiras 10 linhas).
+8. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat: WINGETRS_TRANSCRIPT records CLI and TUI text for the live proof`
