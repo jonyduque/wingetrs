@@ -544,3 +544,42 @@ Testes (`tests/it/admin_terminal.rs`, novo; `mod` no `main.rs`):
 5. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat: refuse third-party code and user-scope winget removals in an admin terminal at plan time`
+
+### Task 222: CI no GitHub Actions
+
+**Modelo:** opus (revisor opus).
+
+> **Pedido do usuário (2026-10-21).** O repositório é público e não tem `.github/`; hoje só o `scripts/verify.ps1` local protege o `main`. A CI roda o mesmo gate em Windows a cada push e pull request, sem segredo e sem publicar nada.
+
+#### Where this fits
+
+- Gate local: `scripts/verify.ps1` (passos `rules`, `rules-selftest`, `fmt`, `licenses`, `clippy`, `test`; `-NoTests`; resumo curto e log em `target/verify.log`; `INSTA_UPDATE=no`). Licenças: `scripts/third_party.ps1 -Check` (usa `cargo metadata --offline`: exige `cargo fetch` antes).
+- Toolchain: `rust-version`/edição em `Cargo.toml` (README: Rust 1.93 ou mais novo); `Cargo.lock` travado (CI usa `--locked`).
+- **Armadilha conhecida:** o runner `windows-latest` roda como administrador sem UAC (token elevado). Localmente, 10 testes falham elevados por desenho: os de `tests/it/script_host_win.rs`, `tests/it/install_file_installer.rs` e `staging_dacl_has_no_users` (recusa de script/instalador com processo elevado e DACL do staging). Eles testam justamente o comportamento não elevado.
+- Testes `#[ignore = "live: ..."]` nunca rodam na CI (rede/máquina real).
+
+#### What binds this task
+
+1. `.github/workflows/ci.yml`: gatilhos `push` (todas as branches) e `pull_request`; `permissions: contents: read` no topo; `concurrency` por ref com `cancel-in-progress: true`; um job `windows-latest` com timeout de 60 min.
+2. Toda action fixada por **SHA de commit** (com a versão em comentário), não por tag: `actions/checkout`, a de toolchain Rust e a de cache (`Swatinem/rust-cache` ou `actions/cache` com chave do `Cargo.lock`). Nada de `pull_request_target`; nenhum `secrets.*`; `persist-credentials: false` no checkout.
+3. Passos: toolchain (com `rustfmt` e `clippy`) → `cargo fetch --locked` → `pwsh -File scripts/verify.ps1`. Se o gate falhar, o job imprime as linhas `[FAIL]` e o fim de `target/verify.log` (≤ 200 linhas) e sobe o log como artifact (retenção 7 dias).
+4. **Testes que exigem processo não elevado:** cada um checa `launch_win::is_elevated()` e, **só quando `CI=true` e o processo está elevado**, termina cedo com `eprintln!("pulado: processo elevado na CI ({motivo})")`. Fora da CI, elevado continua falhando como hoje (o aviso de reabrir o Claude sem elevação continua valendo). Um helper único (`tests/it/support` ou equivalente já existente) em vez de cópia em cada teste. O `check_rules.ps1` ganha uma regra: o helper só pode ser chamado nos testes da lista fechada (os 10 de hoje), para a CI não virar desculpa para pular teste novo.
+5. O job registra no resumo (`$GITHUB_STEP_SUMMARY`) quantos testes foram pulados por elevação (contando as linhas `pulado: processo elevado na CI`).
+6. Badge de CI no README, ao lado dos atuais.
+7. Fora do escopo: workflow de release (build, `.sha256`, anexar `NOTICE`/`THIRD_PARTY_LICENSES.txt`), assinatura do executável, matriz de plataformas.
+
+Testes:
+1. `skip_helper_only_in_ci_and_elevated` (unitário do helper com as duas entradas injetadas: `ci=false, elevated=true` ⇒ não pula; `ci=true, elevated=false` ⇒ não pula; `ci=true, elevated=true` ⇒ pula).
+2. Regra nova do `check_rules.ps1` com caso no `check_rules_selftest.ps1` (chamada fora da lista ⇒ violação).
+3. Prova real: um push numa branch de teste mostra o job verde, e o log mostra os 10 "pulado" e nenhum outro. **Push só pelo orquestrador**, com pedido do usuário; o implementador termina com commits locais e o YAML validado por `actionlint` se estiver disponível (se não, diga "não validado").
+
+**Files:** `.github/workflows/ci.yml` (novo), helper de teste (novo ou existente em `tests/it/`), os testes da lista (só a chamada do helper), `scripts/check_rules.ps1`, `scripts/check_rules_selftest.ps1`, `README.md` (badge).
+
+#### Checks beyond the steps
+
+1. Mutação: helper pula sem checar `CI` ⇒ teste 1 **PEGA**.
+2. Mutação: chamada do helper num teste fora da lista ⇒ regra do `check_rules` **PEGA**.
+3. `grep -n "uses:" .github/workflows/ci.yml` colado no relatório: toda linha com `@<40 hex>`.
+4. Gate local: `pwsh -File scripts/verify.ps1` (num terminal não elevado).
+
+**Commit:** `ci: GitHub Actions running the verify gate on Windows`
