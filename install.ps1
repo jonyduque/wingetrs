@@ -1,14 +1,15 @@
 <#
 .SYNOPSIS
-    Installs (or updates, or removes) wingetrs. The scope follows the terminal: a normal one
-    installs for the current user, an elevated one ("Run as administrator") for all users.
+    Installs (or updates, or removes) wingetrs, for the current user or for all users.
 
 .DESCRIPTION
     Downloads wingetrs.exe from the latest GitHub release, checks it against the published
     wingetrs.exe.sha256 and copies it to the install folder, which is then added to the PATH:
-      - normal terminal:   %LOCALAPPDATA%\Programs\wingetrs, user PATH (HKCU\Environment);
-      - elevated terminal: %ProgramFiles%\wingetrs, machine PATH (HKLM). Only this one lets
+      - user scope:    %LOCALAPPDATA%\Programs\wingetrs, user PATH (HKCU\Environment);
+      - machine scope: %ProgramFiles%\wingetrs, machine PATH (HKLM). Only this one lets
         wingetrs start its elevated helper (it refuses to run from a folder the user can write).
+    An elevated terminal installs for all users. A normal one asks which scope; all users
+    relaunches the script elevated (one UAC prompt). -Scope skips the question.
     Running it again updates to the latest release. Works in Windows PowerShell 5.1 and 7.
 
     irm https://raw.githubusercontent.com/jonyduque/wingetrs/main/install.ps1 | iex
@@ -22,15 +23,25 @@
 .PARAMETER Dir
     Install folder. Default: depends on the scope (see above).
 
+.PARAMETER Scope
+    User or Machine. Default: Machine in an elevated terminal, otherwise ask (User when there
+    is no console to ask on).
+
 .PARAMETER Uninstall
-    Removes wingetrs.exe and its PATH entry for the scope of this terminal. Data in
+    Removes wingetrs.exe and its PATH entry for the chosen scope. Data in
     %LOCALAPPDATA%\wingetrs (catalog, apps installed by wingetrs) is kept.
+
+.PARAMETER Relaunched
+    Internal: set on the elevated copy this script starts, which waits for Enter at the end.
 #>
 [CmdletBinding()]
 param(
     [string]$Version = '',
     [string]$Dir = '',
-    [switch]$Uninstall
+    [ValidateSet('', 'User', 'Machine')]
+    [string]$Scope = '',
+    [switch]$Uninstall,
+    [switch]$Relaunched
 )
 
 Set-StrictMode -Version 2.0
@@ -38,13 +49,61 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $repo = 'jonyduque/wingetrs'
+$scriptUrl = "https://raw.githubusercontent.com/$repo/main/install.ps1"
 
 function Test-Elevated {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-$machine = Test-Elevated
+# Arrow-key choice in the TUI style: up/down (or left/right, Tab) move, Enter picks, Esc
+# cancels ($null). Returns $Default when there is no console to read keys from.
+function Read-Choice([string]$Question, [string[]]$Options, [int]$Default = 0) {
+    try { if ([Console]::IsInputRedirected) { return $Default } } catch { return $Default }
+    Write-Host $Question -ForegroundColor Cyan
+    $sel = $Default
+    $top = [Console]::CursorTop
+    $draw = {
+        [Console]::SetCursorPosition(0, $top)
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $line = $Options[$i].PadRight([Math]::Max(0, [Console]::WindowWidth - 5))
+            if ($i -eq $sel) { Write-Host '  > ' -ForegroundColor Cyan -NoNewline; Write-Host $line -ForegroundColor Cyan }
+            else { Write-Host "    $line" -ForegroundColor DarkGray }
+        }
+        Write-Host '  setas movem · Enter escolhe · Esc cancela' -ForegroundColor DarkGray
+    }
+    & $draw
+    $top = [Console]::CursorTop - $Options.Count - 1
+    while ($true) {
+        $k = [Console]::ReadKey($true)
+        switch ($k.Key) {
+            { $_ -in 'UpArrow', 'LeftArrow' } { $sel = ($sel + $Options.Count - 1) % $Options.Count }
+            { $_ -in 'DownArrow', 'RightArrow', 'Tab' } { $sel = ($sel + 1) % $Options.Count }
+            'Enter' { return $sel }
+            'Escape' { return $null }
+        }
+        & $draw
+    }
+}
+
+$elevated = Test-Elevated
+# An elevated terminal defaults to all users; a normal one asks, and all users then relaunches
+# the script elevated (Invoke-Relaunch). The user scope in an elevated terminal is allowed: it
+# is the same user's folder and HKCU.
+$cancelled = $false
+if ($Scope) {
+    $machine = $Scope -eq 'Machine'
+} elseif ($elevated) {
+    $machine = $true
+} else {
+    $verb = if ($Uninstall) { 'Remover' } else { 'Instalar' }
+    $pick = Read-Choice "$verb o wingetrs para quem?" @(
+        'Só para você          sem administrador',
+        'Para todos os usuários   pede autorização de administrador (necessário para o auxiliar elevado)')
+    $cancelled = $null -eq $pick
+    $machine = $pick -eq 1
+}
+$dirGiven = [bool]$Dir
 if (-not $Dir) {
     if ($machine) {
         # ProgramW6432 is the 64-bit Program Files even from a 32-bit PowerShell.
@@ -111,7 +170,57 @@ function Same-Dir([string]$A, [string]$B) {
     [string]::Equals($x, $y, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Quote-Arg([string]$Value) {
+    if ($Value -match '[\s;]') { '"' + $Value + '"' } else { $Value }
+}
+
+# Runs this script again elevated for the machine scope and waits for it. From a file the copy
+# runs that same file; under `irm | iex` there is no file, so it downloads the script again.
+function Invoke-Relaunch {
+    if ($Version -and $Version -notmatch '^[\w.\-]+$') { Fail "versão inválida: $Version" }
+    if ($Dir.Contains('"') -or $Dir.Contains("'")) { Fail "pasta inválida: $Dir" }
+    $hostExe = (Get-Process -Id $PID).Path
+    $extra = @('-Scope', 'Machine', '-Relaunched')
+    if ($Version) { $extra += @('-Version', $Version) }
+    if ($dirGiven) { $extra += @('-Dir', $Dir) }
+    if ($Uninstall) { $extra += '-Uninstall' }
+    if ($PSCommandPath) {
+        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) + $extra
+    } else {
+        $tail = ($extra | ForEach-Object { if ($_ -like '-*') { $_ } else { "'$_'" } }) -join ' '
+        $cmd = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; " +
+            "& ([scriptblock]::Create((Invoke-RestMethod -UseBasicParsing '$scriptUrl'))) $tail"
+        $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc)
+    }
+    Write-Note 'Aguardando autorização para executar como administrador'
+    try {
+        $p = Start-Process -FilePath $hostExe -ArgumentList (($argv | ForEach-Object { Quote-Arg $_ }) -join ' ') -Verb RunAs -Wait -PassThru
+    } catch {
+        Fail 'autorização de administrador recusada; nada foi alterado'
+    }
+    if ($p.ExitCode -ne 0) { Fail "a janela de administrador terminou com erro (código $($p.ExitCode))" }
+    $exe = Join-Path $Dir 'wingetrs.exe'
+    if ($Uninstall) {
+        Write-Ok "removido para todos os usuários: $exe"
+        return
+    }
+    if (@(Split-PathList $env:Path | Where-Object { Same-Dir $_ $Dir }).Count -eq 0) { $env:Path = "$env:Path;$Dir" }
+    $installed = & $exe --version
+    Write-Host ''
+    Write-Host "Pronto: $installed (todos os usuários)" -ForegroundColor Green
+    Write-Note 'terminais abertos antes da instalação precisam ser reabertos para achar o wingetrs'
+}
+
 function Invoke-Main {
+    if ($cancelled) {
+        Write-Note 'cancelado; nada foi alterado'
+        return
+    }
+    if ($machine -and -not $elevated) {
+        Invoke-Relaunch
+        return
+    }
     $exe = Join-Path $Dir 'wingetrs.exe'
 
     if ($Uninstall) {
@@ -190,8 +299,14 @@ function Invoke-Main {
     Write-Host "Pronto: $installed" -ForegroundColor Green
     Write-Note 'terminais abertos antes da instalação precisam ser reabertos para achar o wingetrs'
     if (-not $machine) {
-        Write-Note 'operações de administrador (ponte elevada, remoções em HKLM) pedem a instalação para todos os usuários: rode este comando num terminal de administrador'
+        Write-Note 'operações de administrador (ponte elevada, remoções em HKLM) pedem a instalação para todos os usuários: rode de novo e escolha "Para todos os usuários"'
     }
 }
 
-try { Invoke-Main } catch { Write-Host "x $($_.Exception.Message)" -ForegroundColor Red }
+$failed = $false
+try { Invoke-Main } catch { $failed = $true; Write-Host "x $($_.Exception.Message)" -ForegroundColor Red }
+if ($Relaunched) {
+    # The elevated copy runs in its own window: keep it open until the user has read it.
+    Read-Host 'Enter fecha esta janela' | Out-Null
+    if ($failed) { exit 1 }
+}

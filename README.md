@@ -35,12 +35,12 @@ O script faz quatro coisas:
 3. copia o executável para a pasta de instalação;
 4. põe essa pasta no PATH.
 
-O escopo segue o terminal:
+Num terminal normal, o script pergunta para quem instalar. "Para todos os usuários" pede autorização de administrador (UAC) e continua numa janela elevada. Num terminal de administrador, instala para todos os usuários sem perguntar. `-Scope User` ou `-Scope Machine` dispensa a pergunta.
 
-| Terminal | Pasta | PATH |
+| Escopo | Pasta | PATH |
 |---|---|---|
-| normal | `%LOCALAPPDATA%\Programs\wingetrs` (só para você) | do usuário |
-| "Executar como administrador" | `C:\Program Files\wingetrs` (todos os usuários) | da máquina |
+| só para você | `%LOCALAPPDATA%\Programs\wingetrs` | do usuário |
+| todos os usuários | `C:\Program Files\wingetrs` | da máquina |
 
 Abra um terminal novo depois de instalar.
 
@@ -54,7 +54,7 @@ Também dá para baixar o `wingetrs.exe` direto da página de [releases](https:/
 
 Instaladores de pacotes do winget para a máquina inteira pedem o UAC um por um e funcionam nos dois escopos.
 
-O auxiliar elevado (`bridge-worker`) é outra história. Ele cuida da ponte `winget` elevada, das remoções de programas registrados em HKLM e da limpeza dessas chaves. Por segurança, ele só roda se o `wingetrs.exe` estiver numa pasta que só administradores gravam, como `C:\Program Files\wingetrs`. Instalado só para você, o wingetrs avisa e recusa essas operações. Para tê-las, instale num terminal de administrador.
+O auxiliar elevado (`bridge-worker`) é outra história. Ele cuida da ponte `winget` elevada, das remoções de programas registrados em HKLM e da limpeza dessas chaves. Por segurança, ele só roda se o `wingetrs.exe` estiver numa pasta que só administradores gravam, como `C:\Program Files\wingetrs`. Instalado só para você, o wingetrs avisa e recusa essas operações. Para tê-las, instale para todos os usuários.
 
 ## Uso
 
