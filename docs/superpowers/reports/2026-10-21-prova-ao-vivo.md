@@ -79,3 +79,11 @@ Autorização: dada pelo usuário para a rodada. Itens pedidos: um S-psm, o `xmi
 | 131 (2b) | DONE_WITH_CONCERNS | Segundo app 7z (o yori falhou no extrator; ver a prova da 204) e `.tar.xz` sem prova. MSI com `extract_dir` pelo extrator próprio não provado (o `rust` foi pela reserva). Conferir `compare.ps1` (E6) para "nada sobra na raiz" e explicar a pasta `apps\rust` após Ctrl+C no download (A2). |
 | 163 (2c) | DONE_WITH_CONCERNS | S-psm (pester), `xming` e S-hook (7zip) provados. O yori precisa de nova rodada num terminal normal registrada neste formato (ou citar a prova da 204). Diff antes/depois de scoop, `HKCU\Environment` e `leftovers` sem saída gravada (E5–E7). |
 | 188 (2d) | DONE_WITH_CONCERNS | Falta: upgrade `install` (Sumatra não instalou), remoção pela ponte (Task 218), segunda tentativa de recusa de UAC, `elevated=true` no log, recusa do `wingetrs.exe` fora de pasta de administrador (C3 com respostas n) e foobar2000 (rede). Windows Terminal x conhost não distinguido. |
+
+## Triagem do orquestrador das falhas não triadas
+
+- **A4b (janela 1 com código 1):** não é defeito. O log mostra dois `install main/rust` na janela 1: o de 18:09:06Z terminou `ok` (635 s) e um segundo, iniciado 18:10:23Z, esperou 30 s pela trava de instalação e saiu com "outra instalação do wingetrs está em andamento" (código 1). O roteiro rodou o comando duas vezes.
+- **D4 (`elevated=false` em todo `job.end`):** defeito do log. `JobLog.elevated` só é preenchido na ponte (`src/tui/jobs.rs:1004`); remoções pelo auxiliar e instaladores nativos com UAC próprio ficam `false`. Vira tarefa.
+- **A2 (`apps\rust` depois do Ctrl+C no download):** não reproduzido nem descartado; a pasta já não existe (A4d removeu o rust). Vira teste na mesma tarefa: cancelar durante o download não deixa `apps\<app>`.
+- **C3 (respostas "n" ao aviso da pasta e a "Nenhum UAC abriu?"):** as respostas se contradizem ("aviso apareceu uma vez só?" = s). A chave HKLM continuou e nenhum `job` elevado consta do log. Precisa de nova checagem ao vivo, com o que observar dito antes.
+- **A3b (`rustc` do rustup antes do shim):** ambiente da máquina (rustup vem antes no PATH), não defeito.
