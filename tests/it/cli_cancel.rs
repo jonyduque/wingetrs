@@ -617,7 +617,7 @@ fn exit_code_is_130_only_for_ctrl_c() {
 // ---- the inline selector (Task 200): keys and terminal injected, never the real one ----
 
 mod selector {
-    use crossterm::event::KeyCode::{self, Char, Down, Enter, Esc, Up};
+    use crossterm::event::KeyCode::{self, BackTab, Char, Down, Enter, Esc, Left, Right, Tab, Up};
     use crossterm::event::{Event, KeyEvent, KeyModifiers};
     use wingetrs::cli::picker::fake::{self, ScriptedTerm, ctrl_c, key};
     use wingetrs::cli::picker::{self, Letters, LineKind};
@@ -721,28 +721,60 @@ mod selector {
         );
     }
 
+    fn ask_yes_no(keys: Vec<Event>) -> (bool, String, usize) {
+        let mut t = ScriptedTerm::new(keys);
+        let screen = t.screen();
+        let yes = picker::yes_no(&mut t, "Continuar?", &theme(), ascii()).unwrap();
+        let s = screen.lock().unwrap();
+        (yes, fake::plain(&s.out), s.reads)
+    }
+
     #[test]
-    fn selector_yes_no_defaults_to_no() {
-        let ask = |keys: Vec<Event>| {
-            let mut t = ScriptedTerm::new(keys);
-            let screen = t.screen();
-            let yes = picker::yes_no(&mut t, "Continuar?", &theme(), ascii()).unwrap();
-            let text = fake::plain(&screen.lock().unwrap().out);
-            (yes, text)
-        };
-        let (yes, text) = ask(vec![key(Enter)]);
+    fn yes_no_buttons_one_line() {
+        let (_, text, _) = ask_yes_no(vec![key(Enter)]);
+        let first = text.lines().next().unwrap();
+        assert!(first.contains("Continuar?  [ Sim ]  [ Não ]"), "{text:?}");
+        let hint = "←/→ escolher · Enter confirmar · s/n · Esc = Não";
+        assert!(text.contains(&format!("\r\n{hint}\r\n")), "{text:?}");
+    }
+
+    #[test]
+    fn yes_no_enter_keeps_no() {
+        let (yes, text, _) = ask_yes_no(vec![key(Enter)]);
         assert!(!yes);
-        assert!(
-            text.starts_with("Continuar?\r\n  s) Sim\r\n> n) Não\r\n"),
-            "{text:?}"
-        );
         assert!(text.ends_with("Continuar? Não\r\n"), "{text:?}");
-        let (yes, text) = ask(vec![key(Char('s'))]);
+    }
+
+    #[test]
+    fn yes_no_arrow_then_enter_is_yes() {
+        assert!(ask_yes_no(vec![key(Left), key(Enter)]).0);
+        assert!(ask_yes_no(vec![key(Right), key(Enter)]).0);
+        assert!(ask_yes_no(vec![key(Tab), key(Enter)]).0);
+        assert!(ask_yes_no(vec![key(BackTab), key(Enter)]).0);
+        assert!(!ask_yes_no(vec![key(Left), key(Right), key(Enter)]).0);
+    }
+
+    #[test]
+    fn yes_no_letters_pick_at_once() {
+        let (yes, _, reads) = ask_yes_no(vec![key(Char('s'))]);
         assert!(yes);
+        assert_eq!(reads, 1);
+        let (yes, _, reads) = ask_yes_no(vec![key(Char('n'))]);
+        assert!(!yes);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn yes_no_esc_and_ctrl_c_are_no() {
+        assert!(!ask_yes_no(vec![key(Left), key(Esc)]).0);
+        assert!(!ask_yes_no(vec![key(Left), key(Char('q'))]).0);
+        assert!(!ask_yes_no(vec![key(Left), ctrl_c()]).0);
+    }
+
+    #[test]
+    fn yes_no_summary_line_unchanged() {
+        let (_, text, _) = ask_yes_no(vec![key(Char('s'))]);
         assert!(text.ends_with("Continuar? Sim\r\n"), "{text:?}");
-        assert!(ask(vec![key(Up), key(Enter)]).0);
-        assert!(!ask(vec![key(Char('n'))]).0);
-        assert!(!ask(vec![key(Esc)]).0);
     }
 
     #[test]

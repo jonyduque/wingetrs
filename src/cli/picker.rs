@@ -433,36 +433,112 @@ pub fn select_many(
     )
 }
 
-/// The rows of a yes/no question.
-pub fn yes_no_items() -> Vec<PickerItem> {
-    ["Sim", "Não"]
-        .into_iter()
-        .map(|label| PickerItem {
-            label: label.into(),
-            detail: String::new(),
-            selectable: true,
-            note: None,
-        })
-        .collect()
+const YES_NO_HINT: &str = "←/→ escolher · Enter confirmar · s/n · Esc = Não";
+
+/// Draws the question with its two buttons (the focused one highlighted) and the hint line,
+/// first erasing the `drawn` lines of the previous frame.
+fn draw_buttons(
+    out: &mut dyn Write,
+    question: &str,
+    yes_focus: bool,
+    theme: &Theme,
+    cols: u16,
+    drawn: u16,
+) -> io::Result<()> {
+    let out = &mut &mut *out;
+    if drawn > 0 {
+        queue!(
+            out,
+            MoveUp(drawn),
+            MoveToColumn(0),
+            Clear(ClearType::FromCursorDown)
+        )?;
+    }
+    let width = usize::from(cols.saturating_sub(1)).max(1);
+    // The buttons keep their room; a long question is the one that gets cut.
+    let buttons = "  [ Sim ]  [ Não ]".chars().count();
+    let q = fit(question, width.saturating_sub(buttons).max(1));
+    queue!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+    write!(out, "{q}")?;
+    let focus = theme
+        .accent()
+        .add_modifier(ratatui::style::Modifier::REVERSED);
+    for (label, focused) in [("Sim", yes_focus), ("Não", !yes_focus)] {
+        let style = if focused { focus } else { theme.muted() };
+        write!(out, "  ")?;
+        queue!(out, SetStyle(style.into_crossterm()))?;
+        write!(out, "[ {label} ]")?;
+        queue!(out, SetAttribute(Attribute::Reset))?;
+    }
+    write!(out, "\r\n")?;
+    queue!(
+        out,
+        MoveToColumn(0),
+        Clear(ClearType::CurrentLine),
+        SetStyle(theme.muted().into_crossterm())
+    )?;
+    write!(out, "{}", fit(YES_NO_HINT, width))?;
+    queue!(out, SetAttribute(Attribute::Reset))?;
+    write!(out, "\r\n")?;
+    out.flush()
 }
 
-/// Yes/no: "Não" is the default; cancelling is "Não".
+/// Yes/no as two buttons on one line; focus starts on "Não" and cancelling is "Não".
+/// `←`/`→`/Tab move the focus, Enter takes it, `s`/`n` answer at once.
 pub fn yes_no(
     term: &mut dyn Term,
     question: &str,
     theme: &Theme,
     glyphs: &Glyphs,
 ) -> io::Result<bool> {
-    let picked = select_one(
-        term,
-        Some(question),
-        yes_no_items(),
-        Some(1),
-        Letters::Pick,
-        theme,
-        glyphs,
-    )?;
-    Ok(picked == Some(0))
+    let _ = glyphs;
+    if !term.interactive() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, NO_TTY));
+    }
+    let (mut cols, _) = term.size()?;
+    let mut s = Session::enter(term)?;
+    let mut yes = false;
+    draw_buttons(s.term.out(), question, yes, theme, cols, 0)?;
+    s.drawn = 2;
+    let answer = loop {
+        match s.term.read()? {
+            Event::Key(k) => {
+                if k.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
+                    break false;
+                }
+                if k.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    continue;
+                }
+                match k.code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                        yes = !yes;
+                    }
+                    KeyCode::Enter => break yes,
+                    KeyCode::Esc => break false,
+                    KeyCode::Char(c) => match c.to_lowercase().next() {
+                        Some('s') => break true,
+                        Some('n' | 'q') => break false,
+                        _ => continue,
+                    },
+                    _ => continue,
+                }
+            }
+            Event::Resize(c, _) => cols = c,
+            _ => continue,
+        }
+        let drawn = s.drawn;
+        draw_buttons(s.term.out(), question, yes, theme, cols, drawn)?;
+    };
+    drop(s);
+    let out = term.out();
+    write!(out, "{question} {}\r\n", if answer { "Sim" } else { "Não" })?;
+    out.flush()?;
+    Ok(answer)
 }
 
 /// A scripted [`Term`] for tests: keys come from a list, the drawing goes to a buffer, and

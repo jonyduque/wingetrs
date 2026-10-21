@@ -1912,6 +1912,7 @@ async fn ambiguous_installed_uses_selector() {
     let s = screen.lock().unwrap();
     assert_eq!(s.raw_enabled, 2, "two questions, both the selector");
     let text = plain(&s.out);
+    assert!(text.contains("Continuar?  [ Sim ]  [ Não ]"), "{text:?}");
     assert!(text.contains("Continuar? Não\r\n"), "{text:?}");
 }
 
@@ -1999,7 +2000,7 @@ fn bridge_upgrade_progress_and_stdout() {
         *ui.outputs.borrow(),
         [
             format!("  {ELEVATION_GRANTED}"),
-            "  Instalando o pacote...".to_string()
+            "  winget: Instalando o pacote...".to_string()
         ]
     );
     assert!(ui.notices.borrow().is_empty(), "{:?}", ui.notices.borrow());
@@ -2114,7 +2115,7 @@ async fn bridge_install_progress_and_stdout() {
         outputs[..2],
         [
             format!("  {ELEVATION_GRANTED}"),
-            "  Baixando o instalador...".to_string()
+            "  → Baixando o instalador".to_string()
         ]
     );
     assert!(outputs[2].contains("Instalado:"), "{outputs:?}");

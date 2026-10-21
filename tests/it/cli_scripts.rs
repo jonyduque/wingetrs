@@ -1050,7 +1050,7 @@ async fn continue_question_uses_selector() {
     assert_eq!(w.installed(), None);
     let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
     assert!(
-        text.starts_with("Continuar?\r\n  s) Sim\r\n> n) Não\r\n"),
+        text.starts_with("Continuar?  [ Sim ]  [ Não ]\r\n"),
         "{text:?}"
     );
     assert!(text.ends_with("Continuar? Não\r\n"), "{text:?}");
@@ -1142,7 +1142,9 @@ fn bucket_add_question_uses_selector() {
     assert!(!has(&cfg));
     let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
     assert!(
-        text.starts_with("O bucket meu (dono/repo) não é conhecido. Adicionar?\r\n"),
+        text.starts_with(
+            "O bucket meu (dono/repo) não é conhecido. Adicionar?  [ Sim ]  [ Não ]\r\n"
+        ),
         "{text:?}"
     );
     // `s` adds it.
