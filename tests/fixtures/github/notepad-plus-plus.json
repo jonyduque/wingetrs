@@ -1,0 +1,204 @@
+{
+ "tag_name": "v8.9.8.1",
+ "prerelease": false,
+ "draft": false,
+ "immutable": false,
+ "assets": [
+  {
+   "name": "npp.8.9.8.1.checksums.sha256",
+   "size": 1271,
+   "digest": "sha256:78bc138eff0675589b7887ed3114d30acdcd807f19f36b3ba4095b44173d1e36",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.checksums.sha256",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.checksums.sha256.sig",
+   "size": 594,
+   "digest": "sha256:c274d40e1ff3bef4f4e911f9a764c3e19c62ca4768bd75bbe99fa7eeefc2275b",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.checksums.sha256.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.arm64.exe",
+   "size": 6632744,
+   "digest": "sha256:a53c5116b55ac93fedd7808e71096badecbf10a55f2be9b28b741591b8917a73",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.arm64.exe",
+   "content_type": "application/x-msdownload"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.arm64.exe.sig",
+   "size": 594,
+   "digest": "sha256:7ab161e45491273af80602538e33e26713fc085d3538a4ed7d6cb72f31535d2f",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.arm64.exe.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.exe",
+   "size": 6814128,
+   "digest": "sha256:ee848aa54df153921678b343857a83861da81ce0c9dbb217b6f55a8780e60f5e",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.exe",
+   "content_type": "application/x-msdownload"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.exe.sig",
+   "size": 594,
+   "digest": "sha256:db406430903b3d163face9a46ebca6dfe4d9d1b7a6779203420778388af0b3ef",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.exe.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.x64.exe",
+   "size": 6963432,
+   "digest": "sha256:26f3bcced788fadbac4e7e577b430ea2ce6060cf3bcad993ef4612ecd7d743da",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.x64.exe",
+   "content_type": "application/x-msdownload"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.x64.exe.sig",
+   "size": 594,
+   "digest": "sha256:f0ee7d275fe4a7e96b83108e6ae4ba769e1bd0665e346263350b43de61c5ae74",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.x64.exe.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.x64.msi",
+   "size": 7835648,
+   "digest": "sha256:0c4f4fe82babd7688f5c1431b1357392491563af6ffedf4e37f5de0bd71babb4",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.x64.msi",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.Installer.x64.msi.sig",
+   "size": 594,
+   "digest": "sha256:1dc40a98b05ced5252275f007fff064e3026dcac23c95137da59a85e4c0639fc",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.Installer.x64.msi.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.7z",
+   "size": 5812293,
+   "digest": "sha256:24199c5bb37d86bcc004f353f4ce1ec644b50c4757cd591bc41aad9150935f83",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.7z",
+   "content_type": "application/x-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.7z.sig",
+   "size": 594,
+   "digest": "sha256:12eff85bcf86363c423618bdff425e65f83a35c12ee449605a22c6233a000dfb",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.7z.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.arm64.7z",
+   "size": 5774292,
+   "digest": "sha256:7d42389b5f057d5985211cbca029d388fd8f619c67ec5a254170e3bbd69f9c36",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.arm64.7z",
+   "content_type": "application/x-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.arm64.7z.sig",
+   "size": 594,
+   "digest": "sha256:15bea7884d9732505ed7147b98b4832720463c493cc97de3ba2707ee8245b7b5",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.arm64.7z.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.arm64.zip",
+   "size": 8090883,
+   "digest": "sha256:43bf78c7569fd43b03d4f86a1073ac4306b31099e4487bdbf536c42d16d03f48",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.arm64.zip",
+   "content_type": "application/x-zip-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.arm64.zip.sig",
+   "size": 594,
+   "digest": "sha256:f995ae6dc0fb86a251f79f2f4d903d2f4c9214d49b6918179b2b358838b9c738",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.arm64.zip.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.minimalist.7z",
+   "size": 3843753,
+   "digest": "sha256:0d586b722098b4ab2f71cca9e699bb8c2a0a6ba828d8d9ce1efe48019ab236af",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.minimalist.7z",
+   "content_type": "application/x-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.minimalist.7z.sig",
+   "size": 594,
+   "digest": "sha256:86b52ede37a4341011b305986ec84867f874d0568a3dc57b2bb2a5bfd254621c",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.minimalist.7z.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.minimalist.arm64.7z",
+   "size": 3854873,
+   "digest": "sha256:2af9eb21e1b98165b717a396b4590e5afd3008025421eb864c24c3b749b31cc2",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.minimalist.arm64.7z",
+   "content_type": "application/x-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.minimalist.arm64.7z.sig",
+   "size": 594,
+   "digest": "sha256:cd9eb07aaa8439d3efecf271dfa7e3111d2794f558ba21582e4f13354c3a3930",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.minimalist.arm64.7z.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.minimalist.x64.7z",
+   "size": 4062038,
+   "digest": "sha256:b55623308bf6a88836db9aaa7343b3eec0579f992af669575305381ce362207a",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.minimalist.x64.7z",
+   "content_type": "application/x-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.minimalist.x64.7z.sig",
+   "size": 594,
+   "digest": "sha256:9b55366381c883630ae6d0a2dcd50dad5bbf06b981ec0ab487fdb28c690cb8d7",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.minimalist.x64.7z.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.x64.7z",
+   "size": 6082405,
+   "digest": "sha256:82d53c35ec66644332bad2dd4d5e61b684759fd40a854601e18d73239c92e8f6",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.x64.7z",
+   "content_type": "application/x-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.x64.7z.sig",
+   "size": 594,
+   "digest": "sha256:395decfff26842460192423ac7d3bc435ac5c221eeb32627358a396278a4cc6b",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.x64.7z.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.x64.zip",
+   "size": 8250001,
+   "digest": "sha256:beddf5548e75c97930d1575ba1c7d113e6e2b33d0a200310e734ca08e225f414",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.x64.zip",
+   "content_type": "application/x-zip-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.x64.zip.sig",
+   "size": 594,
+   "digest": "sha256:134f3ba69f05928c06578889dc51a8828f8711b6b33a5b971de0492381cd2ad2",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.x64.zip.sig",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.zip",
+   "size": 7821291,
+   "digest": "sha256:65d3435b5dcbefde47c401a2666132138e76a2b62e189ad4ffe568581b6adfd2",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.zip",
+   "content_type": "application/x-zip-compressed"
+  },
+  {
+   "name": "npp.8.9.8.1.portable.zip.sig",
+   "size": 594,
+   "digest": "sha256:0358dfb73ed2220275aacfc568a51f83a85e4479884a0c98d37de6371e4622fa",
+   "browser_download_url": "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.9.8.1/npp.8.9.8.1.portable.zip.sig",
+   "content_type": "application/octet-stream"
+  }
+ ]
+}

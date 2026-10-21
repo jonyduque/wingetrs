@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod core;
 pub mod fs_retry;
+pub mod github;
 pub mod http;
 pub mod icons;
 pub mod install;

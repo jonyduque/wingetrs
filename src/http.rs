@@ -101,6 +101,23 @@ fn map_err(e: reqwest::Error) -> HttpError {
 /// How often a download waiting for its next chunk looks at its stop signal.
 const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// A reply as [`Http::get_limited_raw`] returns it; header names are lower case.
+#[derive(Debug, Clone)]
+pub struct RawReply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawReply {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 #[derive(Clone)]
 pub struct Http {
     client: reqwest::Client,
@@ -217,11 +234,30 @@ impl Http {
     /// Like [`Http::get`], but refuses bodies over `max` bytes: at once when `Content-Length`
     /// says so, otherwise as soon as the streamed total passes `max`.
     pub async fn get_limited(&self, url: &str, max: usize) -> Result<Vec<u8>, HttpError> {
+        let reply = self.get_limited_raw(url, max).await?;
+        if !(200..300).contains(&reply.status) {
+            return Err(HttpError::Status(reply.status));
+        }
+        Ok(reply.body)
+    }
+
+    /// [`Http::get_limited`] that hands back a non-success reply (status and headers, empty
+    /// body) instead of an error, for callers that read rate-limit headers.
+    pub async fn get_limited_raw(&self, url: &str, max: usize) -> Result<RawReply, HttpError> {
         use futures_util::StreamExt;
         let resp = self.client.get(url).send().await.map_err(map_err)?;
         let status = resp.status();
+        let headers = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+            .collect();
         if !status.is_success() {
-            return Err(HttpError::Status(status.as_u16()));
+            return Ok(RawReply {
+                status: status.as_u16(),
+                headers,
+                body: Vec::new(),
+            });
         }
         if resp.content_length().is_some_and(|n| n > max as u64) {
             return Err(HttpError::TooLarge(max));
@@ -234,7 +270,21 @@ impl Http {
                 return Err(HttpError::TooLarge(max));
             }
         }
-        Ok(body)
+        Ok(RawReply {
+            status: status.as_u16(),
+            headers,
+            body,
+        })
+    }
+
+    /// GET that follows redirects and returns the final URL without reading the body.
+    pub async fn final_url(&self, url: &str) -> Result<String, HttpError> {
+        let resp = self.client.get(url).send().await.map_err(map_err)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(HttpError::Status(status.as_u16()));
+        }
+        Ok(resp.url().to_string())
     }
 
     /// Streams the body of `url` into `path` (created/truncated), reporting `(done, total)`.

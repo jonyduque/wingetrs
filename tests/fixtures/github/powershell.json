@@ -1,0 +1,267 @@
+{
+ "tag_name": "v7.6.7",
+ "prerelease": false,
+ "draft": false,
+ "immutable": false,
+ "assets": [
+  {
+   "name": "hashes.sha256",
+   "size": 7358,
+   "digest": "sha256:6c2d5f481cc20c83df45d5c29e15f0d7e9e1db82eb5b8f7f2fe33b107f308325",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/hashes.sha256",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-1.azl4.aarch64.rpm",
+   "size": 34900618,
+   "digest": "sha256:2512824937a805ec83218be2ae46da45baf780c279189b69259b7f8edb1933a2",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-1.azl4.aarch64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-1.azl4.x86_64.rpm",
+   "size": 37155538,
+   "digest": "sha256:47196b02bcd967edd62f72bdadaeb922fdbf150a36e5ab722d4fba488fb12e54",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-1.azl4.x86_64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-1.cm.aarch64.rpm",
+   "size": 34900602,
+   "digest": "sha256:3204c62767010131797e95bc0220178cec9b7e4b38a1abd7ce3ab5b47d4ec154",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-1.cm.aarch64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-1.cm.x86_64.rpm",
+   "size": 37155553,
+   "digest": "sha256:ef69fde88f71dc37081553bf87cb96ed971a41c7defe266609f77bb64ddbe8f4",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-1.cm.x86_64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-1.rh.x86_64.rpm",
+   "size": 70229469,
+   "digest": "sha256:3c506d68ef70c47ac874bea0985f4e3e9401b7591d0e2778501f4c5aa50a3518",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-1.rh.x86_64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-linux-arm32.tar.gz",
+   "size": 73064304,
+   "digest": "sha256:6c056a2104273c834da2e383960ffa850520f3e760bada5af43f7ce8a64146d2",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-arm32.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-linux-arm64.tar.gz",
+   "size": 71930903,
+   "digest": "sha256:ba465efdfb0984c1c5dc5ed9eb0b79a7e91a1b52c45f99377058c0659b84d3f1",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-arm64.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-linux-musl-x64.tar.gz",
+   "size": 75888297,
+   "digest": "sha256:d74a1b7e1d1fbf150ae6f29e083953ce07fc833fe9d66218d54940a8638249c6",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-musl-x64.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-linux-x64-fxdependent.tar.gz",
+   "size": 23614949,
+   "digest": "sha256:0c87e8e10898fb42694e4dcea1ee2b9420607836b6b8502c895d942e91cc34bd",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64-fxdependent.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-linux-x64-musl-noopt-fxdependent.tar.gz",
+   "size": 23600145,
+   "digest": "sha256:034931e34232df4854c7769299ba60618abbbef1c6b5d1f6378f38160ffc22f7",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64-musl-noopt-fxdependent.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-linux-x64.tar.gz",
+   "size": 75913191,
+   "digest": "sha256:6896f9e3a6b0a354bf470835a96da76d2f801cd50dcf047ad7c4563bf93bf431",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-linux-x64.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-osx-arm64.pkg",
+   "size": 70966655,
+   "digest": "sha256:a627ef1649521449cab796ec798de3048ce89021c51f6f65b8b63d032165f1f5",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-osx-arm64.pkg",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-osx-arm64.tar.gz",
+   "size": 70628335,
+   "digest": "sha256:50dde99bb066adacbb9a748182d09eb9beff25119dc3b12e85c84b6b6b1c5da9",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-osx-arm64.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-osx-x64.pkg",
+   "size": 75045118,
+   "digest": "sha256:b5173081d521040add595d5c99fbdda4135ba96be82f49d340aa82b1227c319e",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-osx-x64.pkg",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-7.6.7-osx-x64.tar.gz",
+   "size": 74691245,
+   "digest": "sha256:c354ca845cb81f9239bc0c6fbfd14256056400e4b269bd7a6373d113ad94c1e3",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-7.6.7-osx-x64.tar.gz",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-arm64.msi",
+   "size": 110931968,
+   "digest": "sha256:ddb2f3613a0ad27817b90601a0827f7347e81dfa5bce18d4be8009b8cb0e0a31",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-arm64.msi",
+   "content_type": "application/x-msdownload"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-arm64.zip",
+   "size": 99570891,
+   "digest": "sha256:119bd9221254ef3637523cb1990797618f5fd68848b57de40f12b561d743149e",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-arm64.zip",
+   "content_type": "application/zip"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-fxdependent.zip",
+   "size": 23007954,
+   "digest": "sha256:6b50af1679d9a46d0c629b04bec5508bc95b51aed253fd6da576025ce0afcf8c",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-fxdependent.zip",
+   "content_type": "application/zip"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-fxdependentWinDesktop.zip",
+   "size": 21332595,
+   "digest": "sha256:87edad652adb342f3811c96815697f4fa0aa599da436b5b731dce3e8f8780821",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-fxdependentWinDesktop.zip",
+   "content_type": "application/zip"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-x64.msi",
+   "size": 117514240,
+   "digest": "sha256:ec575cef9ec56fcd905de0d5eeac9cb7f81a0a65abb87bb5cd0e87fdfe2b8cc0",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.msi",
+   "content_type": "application/x-msdownload"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-x64.zip",
+   "size": 106364316,
+   "digest": "sha256:d2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip",
+   "content_type": "application/zip"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-x86.msi",
+   "size": 110428160,
+   "digest": "sha256:e0a5296fe368b2dc1b4fef1217979a32cfed8a26f3586fb09fcee9a72873691b",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x86.msi",
+   "content_type": "application/x-msdownload"
+  },
+  {
+   "name": "PowerShell-7.6.7-win-x86.zip",
+   "size": 98959647,
+   "digest": "sha256:5d7594be11dd0ce7177e5121d5db643b7183170209a489ff4840b3284313cd73",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x86.zip",
+   "content_type": "application/zip"
+  },
+  {
+   "name": "PowerShell-7.6.7.msixbundle",
+   "size": 352302222,
+   "digest": "sha256:4dda8f77324028d2fc043a120cddb9ea32465a96a31d48f6062df2445fe12829",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7.msixbundle",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-1.azl4.aarch64.rpm",
+   "size": 34900102,
+   "digest": "sha256:4790adbfea91aae4d5eebb26afabb8c0cb7e45dda40a7b62ffcdc9264d1a65ec",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-1.azl4.aarch64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-1.azl4.x86_64.rpm",
+   "size": 37155488,
+   "digest": "sha256:6e571ed4e05359fd3a1abc029f2edabf9f59e18d1d0496e13019a7f8fe3c7f4b",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-1.azl4.x86_64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-1.cm.aarch64.rpm",
+   "size": 34900095,
+   "digest": "sha256:11b0d3592bd824a888ba77265294597c75bb097835f6d96935942fedcf5329d7",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-1.cm.aarch64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-1.cm.x86_64.rpm",
+   "size": 37155473,
+   "digest": "sha256:af66fdd4ee0ca9fe2cf2ce3d4e5dbb97109cfa8457ad8efd68266b2febee12bd",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-1.cm.x86_64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-1.rh.x86_64.rpm",
+   "size": 70234352,
+   "digest": "sha256:8636f860da0c7d003e2bb8408fb0570e6afec032e989e0a1ba2bf8d8ce0e9ee1",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-1.rh.x86_64.rpm",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-osx-arm64.pkg",
+   "size": 70967480,
+   "digest": "sha256:64735ff201b9b1243bdf04c246c14fb4b5dc21d95fba0d388e149a3633d186ee",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-osx-arm64.pkg",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts-7.6.7-osx-x64.pkg",
+   "size": 75046081,
+   "digest": "sha256:ad40d1da0b9b17688f4d37a23557d1838ca3c6bdc2e8c82202f9d712efbc3310",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts-7.6.7-osx-x64.pkg",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "PowerShell-LTS-7.6.7.msixbundle",
+   "size": 352301254,
+   "digest": "sha256:7f2d6518b8ea93a6971a01d5912f388271ffb528836407748a17aa7988b5e538",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-LTS-7.6.7.msixbundle",
+   "content_type": "application/octet-stream"
+  },
+  {
+   "name": "powershell-lts_7.6.7-1.deb_amd64.deb",
+   "size": 55418546,
+   "digest": "sha256:a8e673ef7cc9a10b7aa5070c4c74b2dc5b868f6b3826690145b393cbf98834bb",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts_7.6.7-1.deb_amd64.deb",
+   "content_type": "application/x-debian-package"
+  },
+  {
+   "name": "powershell-lts_7.6.7-1.deb_arm64.deb",
+   "size": 49464186,
+   "digest": "sha256:8e19050c8d8c4bbb4e1f43f26cee9e5e5a72e829e1c77b95c5ed1a44ecae8dae",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell-lts_7.6.7-1.deb_arm64.deb",
+   "content_type": "application/x-debian-package"
+  },
+  {
+   "name": "powershell_7.6.7-1.deb_amd64.deb",
+   "size": 55407546,
+   "digest": "sha256:868c575f0822b2deed054c1c3c464a9d4b841f67e153369147fb6ace3545c8b2",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell_7.6.7-1.deb_amd64.deb",
+   "content_type": "application/x-debian-package"
+  },
+  {
+   "name": "powershell_7.6.7-1.deb_arm64.deb",
+   "size": 49441674,
+   "digest": "sha256:120d3245f1985525a60a8225d80f65771d361a795d33e155a446aa8a6e30d3c4",
+   "browser_download_url": "https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/powershell_7.6.7-1.deb_arm64.deb",
+   "content_type": "application/x-debian-package"
+  }
+ ]
+}
