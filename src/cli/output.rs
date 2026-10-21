@@ -1704,15 +1704,52 @@ pub fn bridge_progress<R>(
         tool: tool.to_string(),
     };
     progress(&ProgressEvent::Phase(current.clone()));
+    let mut license_seen = false;
     run(&mut |line: &str| {
         let (next, show) = crate::install::progress::bridge_line(line, Some(&current), tool);
         if let Some(p) = next {
             current = p;
             progress(&ProgressEvent::Phase(current.clone()));
         }
-        if show {
-            output(&format!("  {line}"));
+        if show && let Some(text) = format_winget_line(&mut license_seen, line) {
+            output(&text);
         }
+    })
+}
+
+/// One winget output line as the CLI shows it (Task 215), classified by
+/// `bridge::winget_out::classify` like the TUI. `license_seen` merges the two license notices
+/// into one line. `None` hides the line. URLs are never shown (they belong to `--dry-run`).
+pub fn format_winget_line(license_seen: &mut bool, line: &str) -> Option<String> {
+    use crate::bridge::winget_out::{WingetLine, classify};
+    use crate::install::progress::{ELEVATION_GRANTED, ELEVATION_REFUSED};
+    let g = style::glyphs();
+    if line == ELEVATION_GRANTED || line == ELEVATION_REFUSED {
+        // the wingetrs own lines, not winget output
+        return Some(format!("  {line}"));
+    }
+    Some(match classify(line) {
+        WingetLine::Found { name, version, .. } => {
+            format!("  {} {} {}", g.winget, paint(NAME, &name), version)
+        }
+        WingetLine::License => {
+            if std::mem::replace(license_seen, true) {
+                return None;
+            }
+            paint(
+                DIM,
+                "  licença de terceiros: aceita pelo --accept-package-agreements",
+            )
+        }
+        WingetLine::Downloading { .. } => format!("  {} Baixando o instalador", g.arrow),
+        WingetLine::HashOk => format!("  {} hash do instalador conferido", paint(OK, g.ok)),
+        WingetLine::Starting { removing } => {
+            let text = if removing { "Removendo" } else { "Instalando" };
+            format!("  {} {text}", g.arrow)
+        }
+        WingetLine::Done => format!("  {} {}", paint(OK, g.ok), line.trim()),
+        WingetLine::NoUpgrade => "  nenhuma atualização encontrada pelo winget".to_string(),
+        WingetLine::Other(text) => paint(DIM, &format!("  winget: {text}")),
     })
 }
 

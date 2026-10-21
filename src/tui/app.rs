@@ -3139,7 +3139,10 @@ fn set_bridge_line(app: &mut App, line: &str) {
     if let Some(r) = &mut app.running
         && let Some(action @ Action::Bridge(_)) = &r.action
     {
-        r.label = format!("{} · {line}", action.label());
+        let shown =
+            crate::bridge::winget_out::tui_label(&crate::bridge::winget_out::classify(line))
+                .unwrap_or_else(|| line.to_string());
+        r.label = format!("{} · {shown}", action.label());
     }
 }
 

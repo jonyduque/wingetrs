@@ -106,4 +106,5 @@ mod winget_applicability;
 mod winget_details;
 mod winget_index;
 mod winget_manifest;
+mod winget_out;
 mod winget_version_data;

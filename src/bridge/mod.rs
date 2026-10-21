@@ -16,6 +16,7 @@ pub mod helper_folder;
 pub mod spawn_win;
 #[cfg(windows)]
 pub mod staging_win;
+pub mod winget_out;
 pub mod worker;
 
 pub const PINNED_NOTE: &str = "versão fixada";
