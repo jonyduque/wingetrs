@@ -338,6 +338,24 @@ Cada registro é exportado para um .reg (backups) antes de ser apagado."
         #[arg(long)]
         yes: bool,
     },
+    /// Atualiza o próprio wingetrs
+    #[command(
+        name = "self",
+        override_usage = "wingetrs self <COMANDO>",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções",
+        subcommand_help_heading = "Comandos",
+        subcommand_required = true,
+        arg_required_else_help = true,
+        after_help = "Exemplos:
+  wingetrs self update --check   só informa se há versão nova
+  wingetrs self update           mostra a versão nova e pergunta
+  wingetrs self update --yes     atualiza sem perguntar"
+    )]
+    SelfCmd {
+        #[command(subcommand)]
+        action: SelfAction,
+    },
     /// Auxiliar elevado da ponte do winget (iniciado pela TUI via UAC)
     #[command(hide = true)]
     BridgeWorker {
@@ -390,6 +408,27 @@ pub enum BucketAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Debug, PartialEq, clap::Subcommand)]
+pub enum SelfAction {
+    /// Atualiza o wingetrs para a última versão publicada no GitHub
+    #[command(
+        override_usage = "wingetrs self update [OPÇÕES]",
+        help_template = HELP_TEMPLATE,
+        next_help_heading = "Opções"
+    )]
+    Update {
+        /// Só informa se há versão nova, sem atualizar
+        #[arg(long)]
+        check: bool,
+        /// Atualiza sem perguntar
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Cópia elevada que troca o executável (iniciada pelo próprio wingetrs via UAC)
+    #[command(hide = true)]
+    ApplyElevated,
 }
 
 /// Whether the stderr log layer is wanted: never for the TUI (it owns the terminal).
@@ -918,6 +957,7 @@ async fn run_async(
             }
         }
         Command::Bucket { action } => run_bucket(action, &data, &http, cfg).await,
+        Command::SelfCmd { action } => run_self(action, &http, &cfg).await,
         // Handled in `run`, before the runtime exists.
         Command::BridgeWorker { .. } => anyhow::bail!("bridge-worker fora do lugar"),
     }
@@ -1023,6 +1063,118 @@ async fn run_bucket(
     }
 }
 
+/// `self update`: the latest release tag, `current → new`, the user's yes (or `--yes`), then
+/// the swap, directly when the user may write the executable's folder, else through one UAC
+/// prompt for the executable itself (`self apply-elevated`, which fetches the tag on its own).
+async fn run_self(action: SelfAction, http: &Http, cfg: &Config) -> anyhow::Result<()> {
+    use crate::install::progress::SelfUpdateStep;
+    use crate::selfupdate as su;
+    use install_cmd::Ui;
+    let SelfAction::Update { check, yes } = action else {
+        anyhow::bail!("self apply-elevated fora do lugar");
+    };
+    let exe = std::env::current_exe()?;
+    su::refuse_dev_build(&exe)?;
+    let current = env!("CARGO_PKG_VERSION");
+    let checking = install_cmd::TtyUi::new(cfg);
+    checking
+        .progress()
+        .update(&ProgressEvent::Phase(Phase::SelfUpdate(
+            SelfUpdateStep::CheckingVersion,
+        )));
+    let tag = su::latest_tag(http, su::WEB_BASE).await;
+    checking.end_progress();
+    let tag = tag?;
+    let Some(new) = su::newer(current, &tag) else {
+        emit::out(&output::self_latest(current));
+        return Ok(());
+    };
+    let new = new.to_string();
+    emit::out(&output::self_available(current, &new));
+    if check {
+        emit::out(&output::action("para atualizar: wingetrs self update"));
+        return Ok(());
+    }
+    let ui = install_cmd::TtyUi::new(cfg);
+    if !yes {
+        if !ui.interactive() {
+            return Err(output::Advice::new(
+                "a confirmação exige um terminal interativo",
+                "use --yes",
+            )
+            .into());
+        }
+        if !ui.confirm("Atualizar o wingetrs?")? {
+            emit::out(&output::cancelled());
+            return Ok(());
+        }
+    }
+    let progress = ui.progress();
+    let result = if elevated_scope(&exe) {
+        elevated_self_apply(&exe, &progress)
+    } else {
+        su::apply_with(http, su::DL_BASE, &tag, &exe, &|ev| progress.update(ev))
+            .await
+            .map(|()| su::Outcome::Updated)
+    };
+    ui.end_progress();
+    match result? {
+        su::Outcome::Updated => emit::out(&output::self_updated(&new)),
+        // The elevated copy found nothing newer (a release withdrawn meanwhile).
+        su::Outcome::AlreadyLatest => emit::out(&output::self_latest(current)),
+    }
+    Ok(())
+}
+
+/// Whether only an elevated copy may replace `exe` (an administrator-only chain).
+fn elevated_scope(exe: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        crate::selfupdate::apply_win::admin_scope(exe)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        false
+    }
+}
+
+/// The elevated update, with the elevation notice before the UAC prompt.
+fn elevated_self_apply(
+    exe: &std::path::Path,
+    progress: &install_cmd::LineProgress,
+) -> Result<crate::selfupdate::Outcome, crate::selfupdate::SelfUpdateError> {
+    #[cfg(windows)]
+    {
+        use crate::install::progress::SelfUpdateStep;
+        crate::selfupdate::apply_win::elevated_apply(
+            exe,
+            &mut || progress.update(&ProgressEvent::Phase(Phase::WaitingElevation)),
+            &mut || {
+                progress.update(&ProgressEvent::Phase(Phase::SelfUpdate(
+                    SelfUpdateStep::Elevated,
+                )))
+            },
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, progress);
+        Err(crate::selfupdate::SelfUpdateError::Elevation(
+            crate::selfupdate::CODE_OTHER,
+        ))
+    }
+}
+
+/// `self apply-elevated`: the exit code of the elevated copy (no data dir, no log, no output).
+pub fn self_apply_elevated() -> u8 {
+    #[cfg(windows)]
+    let code = crate::selfupdate::apply_win::run_elevated();
+    #[cfg(not(windows))]
+    let code = crate::selfupdate::CODE_OTHER;
+    u8::try_from(code).unwrap_or(22)
+}
+
 /// Source kind a row was correlated against; `None` when unmatched.
 fn row_kind(r: &ListRow) -> Option<SourceKind> {
     match &r.correlation {
@@ -1040,6 +1192,12 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     if let Some(Command::BridgeWorker { pipe, parent }) = &cli.command {
         return crate::bridge::elevated::run_worker(pipe, *parent)
             .map_err(|e| anyhow::anyhow!("auxiliar elevado: {e}"));
+    }
+    if let Some(Command::SelfCmd {
+        action: SelfAction::ApplyElevated,
+    }) = &cli.command
+    {
+        anyhow::bail!("self apply-elevated fora do lugar");
     }
     style::init(cli.color);
     let data = DataDir::from_env()?;

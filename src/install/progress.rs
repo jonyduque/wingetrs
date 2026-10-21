@@ -78,6 +78,21 @@ pub enum Phase {
     /// Scoop: the package's own installer (`installer.file`) or old uninstaller `file` is
     /// running; cannot be cancelled.
     RunningPackageInstaller { file: String },
+    /// `wingetrs self update` (Task 213): one of its steps.
+    SelfUpdate(SelfUpdateStep),
+}
+
+/// The steps of `wingetrs self update` (the download itself is `ProgressEvent::Download`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfUpdateStep {
+    /// Asking GitHub for the latest tag.
+    CheckingVersion,
+    /// Hashing the downloaded executable.
+    CheckingHash,
+    /// Renaming the running executable to `.old` and moving the new one in.
+    Swapping,
+    /// The elevated copy downloads, checks and swaps (cannot be cancelled).
+    Elevated,
 }
 
 /// Format name shown next to the file being extracted.
@@ -133,6 +148,12 @@ pub fn phase_title(phase: &Phase) -> String {
         Phase::RunningPackageInstaller { file } => {
             format!("Rodando o instalador do pacote ({file}; pode abrir janelas)")
         }
+        Phase::SelfUpdate(step) => match step {
+            SelfUpdateStep::CheckingVersion => "Conferindo versão".into(),
+            SelfUpdateStep::CheckingHash => "Conferindo SHA-256".into(),
+            SelfUpdateStep::Swapping => "Trocando o executável".into(),
+            SelfUpdateStep::Elevated => "Atualizando como administrador".into(),
+        },
     }
 }
 
@@ -167,7 +188,8 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::SelfElevating { .. }
         | Phase::Bridge { .. }
         | Phase::RunningScript { .. }
-        | Phase::RunningPackageInstaller { .. } => format!("{text} · não pode ser cancelado"),
+        | Phase::RunningPackageInstaller { .. }
+        | Phase::SelfUpdate(SelfUpdateStep::Elevated) => format!("{text} · não pode ser cancelado"),
         Phase::Preparing
         | Phase::WaitingInstaller
         | Phase::Extracting { .. }
@@ -177,7 +199,12 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::Removing { .. }
         | Phase::Scanning
         | Phase::Verifying
-        | Phase::CopyingFolders => text,
+        | Phase::CopyingFolders
+        | Phase::SelfUpdate(
+            SelfUpdateStep::CheckingVersion
+            | SelfUpdateStep::CheckingHash
+            | SelfUpdateStep::Swapping,
+        ) => text,
     }
 }
 

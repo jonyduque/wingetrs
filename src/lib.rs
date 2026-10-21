@@ -14,6 +14,7 @@ pub mod install;
 pub mod installed;
 pub mod job_log;
 pub mod pins;
+pub mod selfupdate;
 pub mod sources;
 pub mod tui;
 pub mod update;

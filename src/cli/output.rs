@@ -9,6 +9,7 @@ use crate::install::msiexec_log::LogTail;
 use crate::install::plan::{InstallPlan, Step};
 use crate::install::planner;
 use crate::install::prelude::PRELUDE_FUNCTIONS;
+use crate::install::progress::SelfUpdateStep;
 use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
 use crate::install::script_scan::{self, CallRoots, ScriptReport, Verdict, printable};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
@@ -1476,7 +1477,8 @@ impl Phases {
                 | Phase::SelfElevating { .. }
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
-                | Phase::RunningPackageInstaller { .. },
+                | Phase::RunningPackageInstaller { .. }
+                | Phase::SelfUpdate(_),
                 _,
             ))
             | None => None,
@@ -1539,7 +1541,8 @@ impl Phases {
                 | Phase::SelfElevating { .. }
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
-                | Phase::RunningPackageInstaller { .. },
+                | Phase::RunningPackageInstaller { .. }
+                | Phase::SelfUpdate(_),
                 _,
             ))
             | None => return None,
@@ -1609,7 +1612,12 @@ impl Phases {
                 | Phase::Removing { .. }
                 | Phase::Scanning
                 | Phase::Verifying
-                | Phase::CopyingFolders => {}
+                | Phase::CopyingFolders
+                | Phase::SelfUpdate(
+                    SelfUpdateStep::CheckingVersion
+                    | SelfUpdateStep::CheckingHash
+                    | SelfUpdateStep::Swapping,
+                ) => {}
                 // The native installer and uninstaller cannot be cancelled either; they have
                 // no log to follow: past `NATIVE_QUIET` the line says a window may be waiting.
                 Phase::RunningInstaller { .. }
@@ -1619,7 +1627,8 @@ impl Phases {
                 | Phase::SelfElevating { .. }
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
-                | Phase::RunningPackageInstaller { .. } => {
+                | Phase::RunningPackageInstaller { .. }
+                | Phase::SelfUpdate(SelfUpdateStep::Elevated) => {
                     main = format!("{spin} {}", phase_status(phase, elapsed));
                     if elapsed >= NATIVE_QUIET && !matches!(phase, Phase::CheckingRemoval { .. }) {
                         warn = format!(
@@ -1793,6 +1802,32 @@ impl PhaseLog {
         Some(format!("{text}…"))
     }
 }
+
+/// `self update` when no newer release exists.
+pub fn self_latest(current: &str) -> String {
+    format!(
+        "{} o wingetrs já está na última versão ({})",
+        paint(OK, style::glyphs().toast_ok),
+        paint(VERSION, current)
+    )
+}
+
+/// `self update` with a newer release: `wingetrs 0.2.1 → 0.2.2`.
+pub fn self_available(current: &str, new: &str) -> String {
+    format!(
+        "{} {} {} {}",
+        paint(NAME, "wingetrs"),
+        paint(VERSION, current),
+        paint(DIM, style::glyphs().arrow),
+        paint(NEW_VERSION, new)
+    )
+}
+
+/// The last line of a successful `self update`.
+pub fn self_updated(new: &str) -> String {
+    success("wingetrs atualizado para", &paint(NEW_VERSION, new))
+}
+
 #[cfg(test)]
 mod install_output_tests {
     use super::*;

@@ -17,6 +17,7 @@ Comandos:
   bucket     Gerencia os buckets do Scoop
   repair     Reconstrói o estado a partir do disco
   cleanup    Limpa sobras: registros de apps cujo desinstalador sumiu
+  self       Atualiza o próprio wingetrs
 
 Opções:
       --glyphs <GLIFOS>

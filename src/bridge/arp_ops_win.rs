@@ -261,7 +261,7 @@ fn open_checked(path: &Path, level: AclLevel, sddl_of: SddlOf<'_>) -> io::Result
 
 /// Opens `program` and every folder above it up to the volume root, each checked with
 /// `sddl_admin_only`; the handles keep them from being swapped until they drop.
-fn hold_admin_chain(program: &Path) -> io::Result<Vec<File>> {
+pub(crate) fn hold_admin_chain(program: &Path) -> io::Result<Vec<File>> {
     hold_admin_chain_with(program, &|_, f| handle_sddl(f))
 }
 

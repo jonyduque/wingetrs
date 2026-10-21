@@ -38,6 +38,24 @@ fn parse() -> wingetrs::cli::Cli {
 
 fn main() -> std::process::ExitCode {
     let cli = parse();
+    // The elevated copy of `self update` writes nothing but the swap, and answers by its code.
+    if matches!(
+        cli.command,
+        Some(wingetrs::cli::Command::SelfCmd {
+            action: wingetrs::cli::SelfAction::ApplyElevated
+        })
+    ) {
+        return std::process::ExitCode::from(wingetrs::cli::self_apply_elevated());
+    }
+    // The executable a previous `self update` replaced; silently kept when it cannot go. Not
+    // in the elevated bridge helper, which deletes nothing.
+    if !matches!(
+        cli.command,
+        Some(wingetrs::cli::Command::BridgeWorker { .. })
+    ) && let Ok(exe) = std::env::current_exe()
+    {
+        wingetrs::selfupdate::remove_old(&exe);
+    }
     let verbose = cli.verbose > 0;
     match wingetrs::cli::run(cli) {
         Ok(()) => std::process::ExitCode::SUCCESS,

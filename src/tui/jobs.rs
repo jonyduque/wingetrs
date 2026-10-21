@@ -119,7 +119,8 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::SelfElevating { .. }
             | Phase::Bridge { .. }
             | Phase::RunningScript { .. }
-            | Phase::RunningPackageInstaller { .. }),
+            | Phase::RunningPackageInstaller { .. }
+            | Phase::SelfUpdate(_)),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }

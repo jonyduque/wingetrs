@@ -74,6 +74,7 @@ mod script_host_win;
 mod script_runner;
 mod script_scan;
 mod search;
+mod self_update;
 mod spawn_env;
 mod tui_buckets;
 mod tui_jobs;
