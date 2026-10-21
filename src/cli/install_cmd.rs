@@ -49,6 +49,10 @@ pub trait Ui {
     fn output(&self, text: &str) {
         emit::out(text);
     }
+    /// A plan block on stdout (`text` carries its own line ends), before any question.
+    fn plan(&self, text: &str) {
+        emit::out_block(text);
+    }
 }
 
 /// Said once when Ctrl+C arrives while an uncancellable step runs (`LaunchGate::running`:
@@ -561,7 +565,13 @@ pub fn plans_admin_refusal(
             .steps
             .iter()
             .any(|s| matches!(s, crate::install::plan::Step::ExtractInno { .. }));
-        admin_code_refusal(elevated, &output::plan_third_party(p), inno)
+        // Only what runs now: the code the manifest runs at removal time is refused then.
+        let now = crate::install::plan::InstallPlan {
+            third_party_uninstaller: false,
+            has_uninstall_scripts: false,
+            ..p.clone()
+        };
+        admin_code_refusal(elevated, &output::plan_third_party(&now), inno)
     })
 }
 
@@ -576,14 +586,21 @@ fn admin_gate(refusal: Option<String>, f: Flags) -> anyhow::Result<Option<String
 
 type Group = Vec<crate::install::plan::InstallPlan>;
 
-/// The upgrade groups an administrator terminal refuses (Task 218). A dry run keeps every
-/// group and returns the warnings for its end. Otherwise each refused group is skipped with a
-/// warning and the others go on; refusing every group is the command's error.
-fn admin_split(
+/// The upgrade groups after the administrator-terminal check (Task 218).
+struct AdminSplit {
+    /// The groups to show (and, unless `fail`, to apply).
     groups: Vec<Group>,
-    elevated: bool,
-    f: Flags,
-) -> anyhow::Result<(Vec<Group>, Vec<String>)> {
+    /// One warning per refused group: printed at the end of a dry run, else before the
+    /// consent block.
+    warnings: Vec<String>,
+    /// Every group refused (not a dry run): the command's error, after the plans are shown.
+    fail: Option<String>,
+}
+
+/// Splits the upgrade groups an administrator terminal refuses. A dry run keeps every group;
+/// otherwise each refused group is skipped and the others go on, and refusing every group
+/// fails the command (its plans still shown, as `install` does).
+fn admin_split(groups: Vec<Group>, elevated: bool, f: Flags) -> AdminSplit {
     let total = groups.len();
     let refusals: Vec<Option<String>> = groups
         .iter()
@@ -602,26 +619,31 @@ fn admin_split(
         })
         .collect();
     if f.dry_run || lines.is_empty() {
-        return Ok((groups, lines));
+        return AdminSplit {
+            groups,
+            warnings: lines,
+            fail: None,
+        };
     }
     if lines.len() == total {
-        let first = refusals.into_iter().flatten().next().unwrap_or_default();
-        if total > 1 {
-            for l in &lines {
-                emit::err_with(|| output::warning(l));
-            }
-        }
-        return Err(anyhow::Error::msg(first));
-    }
-    for l in &lines {
-        emit::err_with(|| output::warning(l));
+        let first = refusals.into_iter().flatten().next();
+        let warnings = if total > 1 { lines } else { Vec::new() };
+        return AdminSplit {
+            groups,
+            warnings,
+            fail: first,
+        };
     }
     let kept = groups
         .into_iter()
         .zip(refusals)
         .filter_map(|(g, r)| r.is_none().then_some(g))
         .collect();
-    Ok((kept, Vec::new()))
+    AdminSplit {
+        groups: kept,
+        warnings: lines,
+        fail: None,
+    }
 }
 
 /// The dry run's end: the administrator-terminal warning, if any, then "nothing changed".
@@ -826,13 +848,13 @@ fn print_plans(
     };
     for p in plans {
         if f.dry_run {
-            emit::out_block(&output::install_plan_text(p, ui.glyphs()));
+            ui.plan(&output::install_plan_text(p, ui.glyphs()));
             if let Some(hint) = output::msi_hint(p, f.allow_msiexec) {
                 emit::out(&output::dim(hint));
             }
         } else {
             let layout = crate::install::layout::Layout::new(p.root.clone());
-            emit::out_block(&output::plan_summary(
+            ui.plan(&output::plan_summary(
                 p,
                 &layout,
                 ui.glyphs(),
@@ -1134,14 +1156,23 @@ async fn upgrade(
         groups.push(ops::plan_for(ctx, &cand, keep)?);
     }
     let elevated = elevated_or_unknown(winget.elevated());
-    let (groups, refusals) = admin_split(groups, elevated, f)?;
+    let split = admin_split(groups, elevated, f);
+    let groups = split.groups;
     for g in &groups {
         print_plans(ctx, ui, g, f);
     }
+    if !f.dry_run {
+        for w in &split.warnings {
+            emit::err_with(|| output::warning(w));
+        }
+    }
+    if let Some(r) = split.fail {
+        return Err(anyhow::Error::msg(r));
+    }
     third_party_gate(&plans_code(groups.iter().flatten()), f)?;
     if f.dry_run {
-        for r in &refusals {
-            ui.output(&output::warning(r));
+        for w in &split.warnings {
+            ui.output(&output::warning(w));
         }
         emit::out(output::DRY_RUN_DONE);
         return Ok(());

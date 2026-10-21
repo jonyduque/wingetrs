@@ -77,12 +77,18 @@ impl ScriptHost for CountHost {
     }
 }
 
+/// A picker item as shown: its label and note.
+type Shown = (String, Option<String>);
+
 /// A terminal that records every question and every stdout line it is handed.
 struct TestUi {
     interactive: bool,
     answer: bool,
     asked: AtomicUsize,
     lines: Mutex<Vec<String>>,
+    plans: Mutex<Vec<String>>,
+    /// Each picker shown: its items (label, note).
+    picks: Mutex<Vec<Vec<Shown>>>,
 }
 
 impl TestUi {
@@ -92,6 +98,8 @@ impl TestUi {
             answer,
             asked: AtomicUsize::new(0),
             lines: Mutex::new(Vec::new()),
+            plans: Mutex::new(Vec::new()),
+            picks: Mutex::new(Vec::new()),
         }
     }
     fn asked(&self) -> usize {
@@ -110,8 +118,10 @@ impl Ui for TestUi {
         self.asked.fetch_add(1, Ordering::SeqCst);
         Ok(self.answer)
     }
-    fn pick(&self, _: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
+    fn pick(&self, items: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        let shown = items.into_iter().map(|i| (i.label, i.note)).collect();
+        self.picks.lock().unwrap().push(shown);
         Ok(None)
     }
     fn pick_many(&self, _: Vec<PickerItem>, _: &[bool]) -> anyhow::Result<Option<Vec<usize>>> {
@@ -120,6 +130,9 @@ impl Ui for TestUi {
     }
     fn output(&self, text: &str) {
         self.lines.lock().unwrap().push(text.to_string());
+    }
+    fn plan(&self, text: &str) {
+        self.plans.lock().unwrap().push(text.to_string());
     }
 }
 
@@ -867,4 +880,164 @@ async fn token_error_counts_as_elevated() {
     let mut a = tui(token_error);
     update(&mut a, Msg::WingetUninstallPlanned(Ok(jq_plan(Hive::User))));
     assert_eq!(errors(&a), vec![WINGET_REFUSAL.to_string()]);
+}
+
+// ---- review of Task 218 ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn innounp_refused_in_plan() {
+    let mut w = World::new().await;
+    let inno = serde_json::json!({
+        "innosetup": true,
+        "url": format!("{}/x-1.0.exe", w.server.uri()),
+    });
+    // The planner adds innounp (from the catalog) as a dependency.
+    w.publish("v1", &[("innounp", "1.0", none()), ("x", "1.0", inno)])
+        .await;
+    let refusal = "innounp é código de terceiro e o wingetrs não o roda como administrador; abra um terminal sem administrador e repita";
+    let ui = TestUi::new(true, true);
+    let e = w
+        .run(&ui, elevated, &["install", "x", "--yes", "--allow-scripts"])
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), refusal);
+    assert_eq!(ui.asked(), 0);
+    assert_eq!(w.requests().await, 0);
+    assert!(!w.extracted("x") && !w.extracted("innounp"));
+    assert_eq!(w.installed("x"), None);
+    // TUI: the same plan, the same text.
+    let planned = jobs::plan_install(&w.ctx(), &wsrc(), "scoop:main", "x", false).unwrap();
+    let mut a = tui(elevated);
+    update(&mut a, Msg::Planned(Ok(planned)));
+    assert_eq!(errors(&a), vec![refusal.to_string()]);
+    assert!(a.modal.is_none() && a.running.is_none() && a.queue.is_empty());
+}
+
+fn shared_record_only() -> wingetrs::winget_install::uninstall::SharedData {
+    wingetrs::winget_install::uninstall::SharedData {
+        folders: Vec::new(),
+        size: None,
+        registry_only_allowed: true,
+        registry_only_refused: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn winget_user_scope_offers_only_the_record() {
+    use wingetrs::winget_install::removal::{CANCEL_LABEL, REGISTRY_ONLY_LABEL};
+    let mut flows = jq_flows(Hive::User, elevated);
+    flows.plan.as_mut().unwrap().shared = Some(shared_record_only());
+    // CLI: only "remove the record" and "cancel", the refusal as the note; cancelled here.
+    let ui = TestUi::new(true, true);
+    let (said, r) = uninstall_jq(&flows, &ui, Flags::default()).await;
+    r.unwrap();
+    let picks = ui.picks.lock().unwrap().clone();
+    assert_eq!(
+        picks,
+        vec![vec![
+            (
+                REGISTRY_ONLY_LABEL.to_string(),
+                Some(WINGET_REFUSAL.to_string())
+            ),
+            (CANCEL_LABEL.to_string(), None),
+        ]]
+    );
+    assert!(
+        said.last().is_some_and(|l| l.ends_with("Cancelado.")),
+        "{said:?}"
+    );
+    // `--yes` never chooses: the refusal.
+    let ui = TestUi::new(true, true);
+    let (_, r) = uninstall_jq(&flows, &ui, yes()).await;
+    assert_eq!(r.unwrap_err().to_string(), WINGET_REFUSAL);
+    assert_eq!(ui.asked(), 0);
+    // TUI: the confirmation holds only the record-only removal, with the refusal as a note.
+    let mut a = tui(elevated);
+    let plan = flows.plan.clone().unwrap();
+    update(&mut a, Msg::WingetUninstallPlanned(Ok(plan.clone())));
+    assert!(errors(&a).is_empty(), "{:?}", errors(&a));
+    let Some(Modal::Confirm { actions, notes, .. }) = &a.modal else {
+        panic!("no confirmation");
+    };
+    assert_eq!(actions, &vec![Action::WingetRegistryOnly(plan)]);
+    assert!(notes.contains(&WINGET_REFUSAL.to_string()), "{notes:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_ignores_code_that_runs_only_at_removal() {
+    let mut w = World::new().await;
+    let pre = serde_json::json!({ "pre_uninstall": ["Write-Host 'tchau'"] });
+    w.publish("v1", &[("x", "1.0", pre)]).await;
+    let ui = TestUi::new(true, true);
+    w.run(&ui, elevated, &["install", "x", "--yes", "--allow-scripts"])
+        .await
+        .unwrap();
+    assert_eq!(w.installed("x").as_deref(), Some("1.0"));
+    assert_eq!(w.runs(), 0);
+    // Its removal runs that code now: refused.
+    let e = w
+        .run(
+            &ui,
+            elevated,
+            &["uninstall", "x", "--yes", "--allow-scripts"],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string()
+            .starts_with("script pre_uninstall é código de terceiro"),
+        "{e}"
+    );
+    assert_eq!(w.installed("x").as_deref(), Some("1.0"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_shows_plan_before_refusal() {
+    let mut w = World::new().await;
+    w.publish("v1", &[("x", "1.0", none())]).await;
+    let ui = TestUi::new(false, false);
+    w.run(&ui, not_elevated, &["install", "x", "--yes"])
+        .await
+        .unwrap();
+    w.publish("v2", &[("x", "2.0", post_install())]).await;
+    let ui = TestUi::new(true, true);
+    let e = w
+        .run(&ui, elevated, &["upgrade", "x", "--yes", "--allow-scripts"])
+        .await
+        .unwrap_err();
+    assert_eq!(e.to_string(), SCRIPT_REFUSAL);
+    let plans = ui.plans.lock().unwrap().clone();
+    assert_eq!(plans.len(), 1, "{plans:?}");
+    assert!(plans[0].contains("Atualizar x 1.0 -> 2.0"), "{plans:?}");
+    assert_eq!(ui.asked(), 0);
+    assert_eq!(w.installed("x").as_deref(), Some("1.0"));
+    assert_eq!(w.runs(), 0);
+}
+
+/// An upgrade runs the installed version's removal code now (`UpgradeUninstallHook`): refused,
+/// while a fresh install of a manifest with that code is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_counts_the_old_versions_removal_code() {
+    let mut w = World::new().await;
+    let pre = serde_json::json!({ "pre_uninstall": ["Write-Host 'tchau'"] });
+    w.publish("v1", &[("x", "1.0", pre)]).await;
+    let ui = TestUi::new(true, true);
+    w.run(
+        &ui,
+        not_elevated,
+        &["install", "x", "--yes", "--allow-scripts"],
+    )
+    .await
+    .unwrap();
+    w.publish("v2", &[("x", "2.0", none())]).await;
+    let e = w
+        .run(&ui, elevated, &["upgrade", "x", "--yes", "--allow-scripts"])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "script pre_uninstall da versão instalada é código de terceiro e o wingetrs não o roda como administrador; abra um terminal sem administrador e repita"
+    );
+    assert_eq!(w.installed("x").as_deref(), Some("1.0"));
+    assert_eq!(w.runs(), 0);
 }

@@ -698,7 +698,30 @@ pub async fn uninstall<F: WingetFlows>(
         return Ok(());
     }
     if let Some(r) = refusal {
-        bail!("{r}");
+        // Only the registry record can still go (no winget runs): offered, never on `--yes`.
+        let record_only = plan
+            .shared
+            .as_ref()
+            .is_some_and(|s| s.registry_only_allowed);
+        if !record_only || f.yes || !ui.interactive() {
+            bail!("{r}");
+        }
+        let item = |label: &str, note: Option<String>| PickerItem {
+            label: label.to_string(),
+            detail: String::new(),
+            selectable: true,
+            note,
+        };
+        let items = vec![
+            item(removal::REGISTRY_ONLY_LABEL, Some(r)),
+            item(removal::CANCEL_LABEL, None),
+        ];
+        if ui.pick(items)? != Some(0) {
+            say(&output::cancelled());
+            return Ok(());
+        }
+        let choice = RemovalChoice::RegistryOnly;
+        return run_removal(flows, ui, stop, &row.app_key, plan, choice, say).await;
     }
     let Some(choice) = removal_choice(ui, &plan, f)? else {
         say(&output::cancelled());

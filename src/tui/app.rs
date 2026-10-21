@@ -4481,6 +4481,20 @@ fn on_winget_uninstall_planned(
         .planning_confirm
         .take()
         .unwrap_or(app.settings.behavior.confirm);
+    // Refused by winget from here, yet the record alone may go: the confirmation offers only
+    // that (no item that calls winget), with the refusal as its note; always shown.
+    if let Ok(plan) = &result
+        && plan
+            .shared
+            .as_ref()
+            .is_some_and(|s| s.registry_only_allowed)
+        && let Some(r) = winget_admin_refusal(plan, elevated_or_unknown(app.elevated))
+    {
+        let action = Action::WingetRegistryOnly(plan.clone());
+        let modal = confirm_modal(app, vec![action], vec![r], None);
+        open_modal(app, modal);
+        return Vec::new();
+    }
     match result {
         Ok(plan) => match admin_filter(app, Action::WingetUninstall(plan)) {
             Some(action) => start_ready(app, action, confirm, Vec::new()),
