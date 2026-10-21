@@ -39,7 +39,10 @@ try {
     Invoke-Step @{
         Id = 'E1'; Title = 'Remover o hyperfine'; Mode = 'Stdout'; Destructive = $true
         Cmd = @($W, 'uninstall', 'sharkdp.hyperfine', '--yes')
-        Checks = @(@{ Name = 'list sem hyperfine'; Test = { -not (Get-WList $W | Where-Object { $_ -match 'hyperfine' }) } })
+        # A user-scope winget package cannot be removed elevated (0x8A15007D, 2026-10-21).
+        When = { -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+        WhenWhy = 'o terminal não for de administrador (o winget não remove pacote de escopo usuário elevado)'
+        Checks = @(@{ Name = 'list sem hyperfine'; Test = { -not (Get-WList $W | Where-Object { $_ -cmatch 'hyperfine' }) } })
         Notes = @('removido pela ponte (winget uninstall) ou pelo ARP?')
     }
     Invoke-Step @{

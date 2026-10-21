@@ -414,6 +414,12 @@ function Invoke-StepCore([hashtable]$Spec) {
     if ($S.Destructive) { Write-Host '  !!! Passo que remove ou altera algo na máquina: pede confirmação explícita.' -ForegroundColor White -BackgroundColor DarkMagenta }
     foreach ($i in @($S.Instructions)) { if ($i) { Write-Host "  * $i" -ForegroundColor Yellow } }
     foreach ($l in $display) { Write-Host "  > $l" -ForegroundColor White }
+    # The questions asked after the step, shown before it runs: the user watches for them
+    # instead of answering from memory (user's request, 2026-10-21).
+    if (-not $c.DryRun -and (@($S.Ask) + @($S.Notes) | Where-Object { $_ })) {
+        Write-Host '  O que observar (vou perguntar depois):' -ForegroundColor Cyan
+        foreach ($q in @($S.Ask) + @($S.Notes)) { if ($q) { Write-Host "    - $q" -ForegroundColor Cyan } }
+    }
 
     if ($c.DryRun) {
         Write-Host "  modo: $mode" -ForegroundColor DarkGray

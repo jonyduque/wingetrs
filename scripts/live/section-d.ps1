@@ -43,6 +43,9 @@ function Get-JobLines {
     }
 }
 
+# Log timestamps are UTC, 'yyyy-MM-ddTHH:mm:ss' compares as text; kept across -From resumes.
+if (-not $script:Ctx.DryRun -and -not (Get-State 'dStart')) { Set-State 'dStart' ((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss')) }
+
 try {
     Invoke-Step @{
         Id = 'D0'; Title = 'O wingetrs de Program Files existe e é o mesmo do target\release'; Mode = 'Script'
@@ -61,7 +64,7 @@ try {
         ExpectExit = 'nonzero'
         Expect = @('Aguardando autorização para executar como administrador', 'Pede permissão de administrador para o Windows Installer', 'Permissão de administrador recusada.')
         Checks = @(
-            @{ Name = 'list sem PuTTY'; Test = { -not (Get-WList $W | Where-Object { $_ -match 'PuTTY' }) } }
+            @{ Name = 'list sem PuTTY'; Test = { -not (Get-WList $W | Where-Object { $_ -cmatch 'PuTTY' }) } }
             @{ Name = 'nenhuma pasta installers\run-* sobrando'; Test = { @(Get-RunDirs).Count -eq 0 } }
         )
         Notes = @('o UAC veio em primeiro plano ou piscou na barra de tarefas?')
@@ -102,7 +105,7 @@ try {
             'Saia com q.'
             'Alternativa CLI: & $W uninstall PuTTY.PuTTY etc. (um UAC por comando); órfãos: & $W cleanup --orphans, marque só os dois "wingetrs test orphan", Enter, s.')
         Checks = @(
-            @{ Name = 'list sem PuTTY, Reddit, ASP.NET Core 8 e foobar'; Test = { -not (Get-WList $W | Where-Object { $_ -match 'PuTTY|Reddit|ASP\.NET Core.*8\.0\.32|foobar' }) } }
+            @{ Name = 'list sem PuTTY, Reddit, ASP.NET Core 8 e foobar'; Test = { -not (Get-WList $W | Where-Object { $_ -cmatch 'PuTTY|Reddit Wallpaper|ASP\.NET Core.*8\.0\.32|foobar2000' }) } }
             @{ Name = 'órfão HKCU removido'; Test = { -not (Test-Path -LiteralPath $orfHkcuPs) } }
             @{ Name = 'órfão HKLM removido'; Test = { -not (Test-Path -LiteralPath $orfHklmPs) } }
             @{ Name = 'Amazon Kindle continua no list'; Test = { [bool](Get-WList $W | Where-Object { $_ -match 'Kindle' }) } }
@@ -126,8 +129,10 @@ try {
             "staging: $(@(Get-ChildItem -Force -LiteralPath $staging -ErrorAction SilentlyContinue | ForEach-Object Name) -join ', ')"
         }
         Checks = @(
-            @{ Name = 'número de job.start = número de job.end'; Test = {
-                    $lines = @(Get-JobLines)
+            @{ Name = 'número de job.start = número de job.end (jobs desta seção)'; Test = {
+                    # Earlier days of the same run may hold a job the user killed (no job.end).
+                    $since = Get-State 'dStart'
+                    $lines = @(Get-JobLines | Where-Object { -not $since -or $_.Substring(0, [Math]::Min(19, $_.Length)) -ge $since })
                     @($lines | Where-Object { $_ -match 'job\.start' }).Count -eq @($lines | Where-Object { $_ -match 'job\.end' }).Count } }
             @{ Name = 'nenhuma pasta run-* sobrando'; Test = { @(Get-RunDirs).Count -eq 0 } }
             @{ Name = 'staging vazio ou inexistente'; Test = { -not (Get-ChildItem -Force -LiteralPath $staging -ErrorAction SilentlyContinue) } }
