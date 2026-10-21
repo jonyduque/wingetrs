@@ -472,8 +472,11 @@ fn machine_roots_read_only_local_machine_stores() {
     let read = |location: u32, name: &str| -> std::io::Result<Vec<Vec<u8>>> {
         calls.lock().unwrap().push((location, name.to_string()));
         Ok(match name {
-            "Root" => vec![b"a".to_vec(), b"b".to_vec()],
-            _ => vec![b"b".to_vec(), b"c".to_vec()],
+            "Root" => vec![b"a".to_vec(), b"b".to_vec(), b"x".to_vec()],
+            "AuthRoot" => vec![b"b".to_vec(), b"c".to_vec()],
+            // Distrusted by Windows: out even though `Root` has it.
+            "Disallowed" => vec![b"x".to_vec(), b"z".to_vec()],
+            _ => vec![b"user".to_vec()],
         })
     };
     let roots = machine_roots_with(&read).unwrap();
@@ -482,17 +485,29 @@ fn machine_roots_read_only_local_machine_stores() {
         *calls.lock().unwrap(),
         [
             (LOCAL_MACHINE, "Root".to_string()),
-            (LOCAL_MACHINE, "AuthRoot".to_string())
+            (LOCAL_MACHINE, "AuthRoot".to_string()),
+            (LOCAL_MACHINE, "Disallowed".to_string())
         ]
     );
-    // One store missing is skipped; none read is an error.
+    // One root store missing is skipped; none read, or no disallowed store, is an error.
     let one = |_: u32, name: &str| -> std::io::Result<Vec<Vec<u8>>> {
         match name {
             "Root" => Ok(vec![b"a".to_vec()]),
+            "Disallowed" => Ok(Vec::new()),
             _ => Err(std::io::Error::other("no store")),
         }
     };
     assert_eq!(machine_roots_with(&one).unwrap(), [b"a".to_vec()]);
+    let no_disallowed = |_: u32, name: &str| -> std::io::Result<Vec<Vec<u8>>> {
+        match name {
+            "Disallowed" => Err(std::io::Error::other("no store")),
+            _ => Ok(vec![b"a".to_vec()]),
+        }
+    };
+    assert!(machine_roots_with(&no_disallowed).is_err());
+    // Every root disallowed: nothing left is an error.
+    let all_out = |_: u32, _: &str| -> std::io::Result<Vec<Vec<u8>>> { Ok(vec![b"a".to_vec()]) };
+    assert!(machine_roots_with(&all_out).is_err());
     let none = |_: u32, _: &str| -> std::io::Result<Vec<Vec<u8>>> {
         Err(std::io::Error::other("no store"))
     };
@@ -580,4 +595,38 @@ fn startup_cleanup_removes_only_stale_downloads_of_this_exe() {
             "wingetrs.exe.download-dir"
         ]
     );
+}
+
+#[derive(Debug)]
+struct Wrapper(std::io::Error);
+
+impl std::fmt::Display for Wrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error sending request")
+    }
+}
+
+impl std::error::Error for Wrapper {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[test]
+fn untrusted_certificate_is_classified_from_rustls_text() {
+    use wingetrs::http::{HttpError, classify_causes};
+    // rustls 0.23.45 `Error::InvalidCertificate(UnknownIssuer)` Display, as a cause.
+    let e = Wrapper(std::io::Error::other(
+        "invalid peer certificate: UnknownIssuer",
+    ));
+    let got = classify_causes(&e);
+    assert!(
+        matches!(&got, Some(HttpError::UntrustedCertificate(m)) if m.contains("UnknownIssuer")),
+        "{got:?}"
+    );
+    let e = Wrapper(std::io::Error::other("connection refused"));
+    assert!(classify_causes(&e).is_none());
+    // The top-level message itself is not a cause.
+    let plain = std::io::Error::other("invalid peer certificate: UnknownIssuer");
+    assert!(classify_causes(&plain).is_none());
 }

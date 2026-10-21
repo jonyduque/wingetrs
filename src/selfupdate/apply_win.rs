@@ -14,13 +14,16 @@ pub const LOCAL_MACHINE: u32 = CERT_SYSTEM_STORE_LOCAL_MACHINE;
 /// The machine stores the elevated client trusts: the roots and the third-party roots Windows
 /// adds on demand. Never a `CurrentUser` store (the user writes those without elevation).
 pub const MACHINE_ROOT_STORES: [&str; 2] = ["Root", "AuthRoot"];
+/// The machine store of certificates Windows distrusts: removed from the roots.
+pub const MACHINE_DISALLOWED_STORE: &str = "Disallowed";
 
 /// Reads the DER certificates of one system store: `(location flag, store name)`.
 pub type StoreReader<'a> = &'a dyn Fn(u32, &str) -> std::io::Result<Vec<Vec<u8>>>;
 
 /// The trusted roots of the elevated client: every certificate of
-/// [`MACHINE_ROOT_STORES`] in [`LOCAL_MACHINE`] read through `read`, without duplicates. A
-/// store that cannot be opened is skipped; none read is an error.
+/// [`MACHINE_ROOT_STORES`] in [`LOCAL_MACHINE`] read through `read`, without duplicates and
+/// without any certificate of [`MACHINE_DISALLOWED_STORE`]. A root store that cannot be opened
+/// is skipped; none read, or the disallowed store unreadable, is an error.
 pub fn machine_roots_with(read: StoreReader<'_>) -> std::io::Result<Vec<Vec<u8>>> {
     let mut roots: Vec<Vec<u8>> = Vec::new();
     let mut last_err = None;
@@ -36,6 +39,8 @@ pub fn machine_roots_with(read: StoreReader<'_>) -> std::io::Result<Vec<Vec<u8>>
             Err(e) => last_err = Some(e),
         }
     }
+    let disallowed = read(LOCAL_MACHINE, MACHINE_DISALLOWED_STORE)?;
+    roots.retain(|c| !disallowed.contains(c));
     match (roots.is_empty(), last_err) {
         (true, Some(e)) => Err(e),
         (true, None) => Err(std::io::Error::other(

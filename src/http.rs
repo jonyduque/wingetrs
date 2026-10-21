@@ -86,18 +86,27 @@ fn checked_policy(
     })
 }
 
-fn map_err(e: reqwest::Error) -> HttpError {
-    let mut src = std::error::Error::source(&e);
+/// The error the causes of a request error (`e` itself excluded) stand for, when one is
+/// recognized: a refused insecure redirect or an untrusted certificate chain.
+pub fn classify_causes(e: &(dyn std::error::Error + 'static)) -> Option<HttpError> {
+    let mut src = e.source();
     while let Some(s) = src {
         if let Some(i) = s.downcast_ref::<InsecureRedirectError>() {
-            return HttpError::InsecureRedirect(i.0.clone());
+            return Some(HttpError::InsecureRedirect(i.0.clone()));
         }
-        // rustls's `Error::InvalidCertificate` (not a direct dependency: matched by its text).
+        // Text of rustls's `Error::InvalidCertificate` Display (0.23.45, locked in Cargo.lock).
         let text = s.to_string();
         if text.contains("invalid peer certificate") {
-            return HttpError::UntrustedCertificate(text);
+            return Some(HttpError::UntrustedCertificate(text));
         }
         src = s.source();
+    }
+    None
+}
+
+fn map_err(e: reqwest::Error) -> HttpError {
+    if let Some(known) = classify_causes(&e) {
+        return known;
     }
     if e.is_timeout() {
         HttpError::Timeout
