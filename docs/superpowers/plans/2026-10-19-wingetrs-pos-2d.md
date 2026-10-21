@@ -306,3 +306,194 @@ Testes (`tests/it/gh_install.rs`, continuação):
 3. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat(install): upgrade and list GitHub release apps`
+
+---
+
+## Extras de 2026-10-21 (pedido do usuário)
+
+Pedido: "que o wingetrs tenha um comando update e que quando acesse a TUI seja feita a checagem de atualização disponível. Os prompts de sim ou não no CLI devem ser com botões. Os prompts que aparecem durante a instalação, desinstalação, atualização do CLI devem ser formatados, inclusive aqueles que são do winget, msiexec, etc." Decisões do usuário (2026-10-21): `wingetrs self update` (o `update` continua sendo o catálogo); na TUI, aviso na barra mais uma tecla que confirma e atualiza; saída do winget traduzida nas linhas conhecidas, as demais recuadas e esmaecidas. O `install.ps1` já instala para todos os usuários quando rodado elevado (`C:\Program Files\wingetrs`, PATH da máquina; commit e5a1e1b).
+
+Sonda do orquestrador (2026-10-21, `winget download --id jqlang.jq` com stdout redirecionado, `--disable-interactivity`): **nenhuma barra de progresso nem spinner** com saída redirecionada; o texto sai no idioma do Windows (aqui pt-BR), em UTF-8 com `\r\n`. As 6 linhas, literais:
+
+```
+Encontrado jq [jqlang.jq] Versão 1.8.2
+Este aplicativo é licenciado para você pelo proprietário.
+A Microsoft não é responsável por, nem concede licenças a pacotes de terceiros.
+Baixando https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe
+Hash do instalador verificado com êxito
+Instalador baixado: C:\...\dl\jq_1.8.2_X64_portable_en-US.exe
+```
+
+| Onda | Tarefas | Depende de |
+|---|---|---|
+| 4 | 212 (botões Sim/Não) ‖ 215 (saída do winget) | trabalho em andamento de 189/208 commitado (tocam `wi_cli.rs`, `winget_cmd.rs`) |
+| 5 | 213 (`self update`) | 208 (`github::latest_tag`, `Http::final_url`) |
+| 6 | 214 (aviso na TUI) | 213 |
+
+### Task 212: Sim/Não do CLI com botões
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- `src/cli/picker.rs`: `yes_no(term, question, theme, glyphs) -> io::Result<bool>` (`:450`) chama `select_one(..., Some(1), Letters::Pick)` e desenha a lista vertical (`s) Sim` / `n) Não`). Desenho: `draw()` (`:266`, `MoveUp(drawn)` + `Clear(FromCursorDown)`, linhas cortadas em `cols-1` com `\r\n`); `Session::enter`/`drop` (raw mode, cursor oculto, apaga o desenhado); depois da escolha, uma linha de resumo `"{prompt} {label}"` (`:389`). Sem TTY ⇒ erro `Unsupported` com `NO_TTY` (mantém).
+- Único chamador de `picker::yes_no`: `TtyUi::confirm` (`src/cli/install_cmd.rs:225`); `ui.confirm(` em `install_cmd.rs:550`, `cli/mod.rs:952` e `:1005`.
+- A TUI já tem botões: `CONFIRM_BUTTONS` (`src/tui/app.rs:428-439`), desenhados em `draw_confirm` (`src/tui/view.rs:1386`) como `" {label} "` com `theme.accent()` + `REVERSED` no focado.
+- Testes que fixam o desenho vertical e mudam: `tests/it/cli_cancel.rs` `selector_yes_no_defaults_to_no` (`:725`), `tests/it/cli_scripts.rs` (`:1053`, `:1056`, `:1137`), `tests/it/wi_cli.rs` (`:1891-1915`). Terminal falso: `picker::fake::ScriptedTerm`, `fake::key`, `fake::ctrl_c`, `fake::plain`.
+
+#### What binds this task
+
+1. `yes_no` desenha **uma** linha: `"{question}  [ Sim ]  [ Não ]"`; o botão focado com o estilo de foco do CLI (via `src/cli/style.rs`, nunca `anstyle` fora dele), o outro esmaecido; uma linha de dica abaixo (`←/→ escolher · Enter confirmar · s/n · Esc = Não`). Foco inicial em **Não**.
+2. Teclas: `←`/`→`/`Tab`/`BackTab` trocam o foco; `Enter` escolhe o focado; `s` ⇒ Sim e `n` ⇒ Não na hora; `Esc`, `q` e `Ctrl+C` ⇒ Não (cancelar continua sendo "não"). Eventos de soltar tecla e combinações Ctrl/Alt (exceto Ctrl+C) ignorados, como hoje.
+3. Ao sair: apaga o desenho e escreve a mesma linha de resumo de hoje (`"{question} Sim"` / `"{question} Não"`), para o histórico do terminal não mudar.
+4. `select_one`/`select_many` não mudam.
+
+Testes (`tests/it/cli_cancel.rs`, troca o `selector_yes_no_defaults_to_no` e acrescenta):
+1. `yes_no_buttons_one_line` (a tela depois do 1º desenho contém `Continuar?  [ Sim ]  [ Não ]` numa linha só).
+2. `yes_no_enter_keeps_no`.
+3. `yes_no_arrow_then_enter_is_yes` (`←` + `Enter` ⇒ `true`).
+4. `yes_no_letters_pick_at_once` (`s` ⇒ `true`; `n` ⇒ `false`; uma leitura de tecla cada).
+5. `yes_no_esc_and_ctrl_c_are_no`.
+6. `yes_no_summary_line_unchanged` (termina com `"Continuar? Sim\r\n"`).
+E ajustar as asserções de `cli_scripts.rs` e `wi_cli.rs` para o desenho novo (o resumo final não muda).
+
+**Files:** `src/cli/picker.rs`, `src/cli/style.rs` (só se faltar estilo de botão), `tests/it/cli_cancel.rs`, `tests/it/cli_scripts.rs`, `tests/it/wi_cli.rs`.
+
+#### Checks beyond the steps
+
+1. Mutação: foco inicial em Sim ⇒ teste 2 **PEGA**.
+2. Mutação: `Esc` ⇒ Sim ⇒ teste 5 **PEGA**.
+3. Colar no relatório a tela do teste 1 (texto sem CSI, via `fake::plain`).
+4. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(cli): yes/no prompt as buttons`
+
+### Task 213: `wingetrs self update`
+
+**Modelo:** opus (revisor opus: código que roda elevado).
+
+#### Where this fits
+
+- Release: `github.com/jonyduque/wingetrs`, arquivos `wingetrs.exe` e `wingetrs.exe.sha256` (texto `<hex64>  wingetrs.exe`, servido como `application/octet-stream`). Tags `vX.Y.Z`. Versão atual: `env!("CARGO_PKG_VERSION")`.
+- Task 208: `github::latest_tag(http, base_web, &GhRepo) -> Result<String, GhError>` (redirecionamento `302`, sem cota), `GhError::{Offline, NotFound, RateLimited, …}`, `Http::final_url`. `Http::get_to_file(url, &Path, progress)` (`src/http.rs:292`), `get_limited` (`:219`).
+- Clap: `enum Command` (`src/cli/mod.rs:98`); grupo aninhado como `Bucket { #[command(subcommand)] action: BucketAction }` (`:292-308`, `subcommand_required`, `HELP_TEMPLATE`, `after_help` em português); despacho em `run_async` (`:698`). O snapshot da ajuda raiz (`tests/it/snapshots/it__cli_parse__help_*.snap`) muda.
+- Escopo: o auxiliar elevado só sobe se o exe e cada pasta acima tiverem DACL só de administrador: `bridge::arp_ops_win::hold_admin_chain_with(program, sddl_of) -> io::Result<Vec<File>>` (`:270`; a versão de produção `hold_admin_chain` é privada, `:264`). Elevação: `winget_install::launch` `Launcher` + `LaunchSpec { program, params, dir, show, verb: Verb::RunAs }` (`launch.rs:15-51`, real em `launch_win.rs:22`). Aviso antes do UAC: o texto e o caminho que os outros pedidos de elevação do CLI já usam ("Aguardando autorização para executar como administrador").
+- `install.ps1` faz a mesma troca: baixa para dentro da pasta de instalação, confere o SHA, renomeia o exe em uso para `.old`, move o novo.
+
+#### What binds this task
+
+1. Módulo `src/selfupdate/mod.rs` (lógica pura e testável) + `src/selfupdate/apply_win.rs` (só o que é Windows). Funções:
+   - `newer(current: &str, tag: &str) -> Option<Version>`: compara `X.Y.Z` numericamente (`v` inicial opcional na tag); tag fora de `^v?\d+\.\d+\.\d+$` ⇒ `None` (nunca compara como texto).
+   - `apply(http, base_dl, tag, exe: &Path) -> Result<(), SelfUpdateError>`: baixa `{base_dl}/{tag}/wingetrs.exe` (tag **fixa**, nunca `latest/download`, para o exe e o `.sha256` serem do mesmo release) para `<pasta do exe>\wingetrs.exe.download-<aleatório>`; confere o SHA-256 contra o `.sha256` do mesmo release; troca (`.old` antigo apagado se der, exe em uso renomeado para `.old`, novo movido); temporário apagado em todo caminho de erro.
+2. Escopo pela pasta do exe (`std::env::current_exe`):
+   - pasta que o usuário grava ⇒ `apply` direto, sem UAC;
+   - cadeia só de administrador (`hold_admin_chain`) ⇒ aviso de elevação e `Launcher` com `Verb::RunAs` sobre o **próprio exe**, parâmetros literais `self apply-elevated` (subcomando oculto, sem nenhum argumento vindo do lado não elevado); o processo elevado busca a tag sozinho (`latest_tag`), valida o formato, roda `apply` e responde só pelo código de saída (`0` atualizado, `10` já na última, `20` sem internet, `21` SHA não confere, `22` outro erro), mapeado para português no lado não elevado. O lado elevado não grava nada fora da pasta do exe (nada em `%LOCALAPPDATA%`, nada de log).
+   - exe de build de desenvolvimento (existe `Cargo.toml` duas pastas acima da pasta do exe) ⇒ recusa: "build de desenvolvimento: atualize com cargo".
+3. CLI: `wingetrs self update [--check] [--yes]`. Sem versão nova ⇒ "o wingetrs já está na última versão (0.2.1)". Com versão nova ⇒ mostra `0.2.1 → 0.2.2` e confirma por `ui.confirm` (botões da Task 212), `--yes` pula; `--check` só informa (código de saída 0 com ou sem versão nova). Progresso com fases ("Conferindo versão", "Baixando", "Conferindo SHA-256", "Trocando o executável") pelo formatador de progresso existente. No fim: "wingetrs atualizado para 0.2.2".
+4. Ao iniciar (`main.rs`), apagar `<exe>.old` se existir, em silêncio (escopo máquina sem permissão: ignora).
+5. Erros tipados (`thiserror`): `Offline`, `RateLimited`, `HashMismatch`, `BadSumFile`, `DevBuild`, `Elevation(code)`, `Io`.
+
+Testes (`tests/it/self_update.rs`, novo; wiremock para o release; exe falso num tempdir):
+1. `newer_compares_numbers` (`0.10.0` > `0.9.9`; mesma versão ⇒ `None`; tag `latest`/`v1.2` ⇒ `None`).
+2. `apply_replaces_exe` (exe falso trocado, conteúdo novo, nenhum `.download-*` sobrando).
+3. `apply_hash_mismatch_keeps_exe` (exe antigo intacto, temporário apagado).
+4. `apply_uses_pinned_tag_paths` (pedidos só em `/{tag}/wingetrs.exe` e `/{tag}/wingetrs.exe.sha256`).
+5. `bad_sum_file_refused` (`.sha256` que não é 64 hex).
+6. `dev_build_refused` (`Cargo.toml` duas pastas acima).
+7. `elevated_scope_uses_runas_self_apply` (`Launcher` falso: um `LaunchSpec` com `Verb::RunAs`, programa = o exe, `params == "self apply-elevated"`; código `21` vira `HashMismatch`).
+8. `cli_parse_self_update` (`self update --check`, `self update --yes`; `self apply-elevated` oculto na ajuda).
+
+**Files:** `src/selfupdate/mod.rs` (novo), `src/selfupdate/apply_win.rs` (novo), `src/lib.rs`, `src/main.rs` (limpeza do `.old`), `src/cli/mod.rs`, `src/cli/output.rs`, `src/bridge/arp_ops_win.rs` (só tornar `hold_admin_chain` `pub(crate)`), `tests/it/self_update.rs` (novo; `mod` no `main.rs`), snapshot da ajuda raiz.
+
+#### Checks beyond the steps
+
+1. Mutação: baixar de `latest/download` em vez da tag ⇒ teste 4 **PEGA**.
+2. Mutação: pular a conferência do SHA ⇒ teste 3 **PEGA**.
+3. Mutação: passar a tag como argumento ao processo elevado ⇒ teste 7 **PEGA**.
+4. Nada real: testes nunca usam `runas` nem tocam `Program Files`; a prova ao vivo fica para o usuário.
+5. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(cli): self update from the GitHub release`
+
+### Task 214: Aviso de versão nova na TUI
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- Partida da TUI: `tui::run::run` (`src/tui/run.rs:201`) chama `spawn_boot(&ctx)` e `spawn_job(&ctx, |c, _| detect_tools(c))`; `spawn_job(ctx, work)` (`:1660`) manda o `Msg` resultante por `ctx.tx`. `Ctx` (`:104`) tem `http`, `data`, `cfg`. `enum Msg` (`src/tui/app.rs:73`), `enum Cmd` (`:580`), `update(app, msg) -> Vec<Cmd>` (`:1599`).
+- Barra de status: `draw_status` (`src/tui/view.rs:1040`); à direita, pílulas (`theme.pill_a()`, `theme.alert()`, `muted`). Toasts: `app.push_toast(ToastKind, text)` (`app.rs:986`).
+- Teclas: `on_key` (`app.rs:2101`); Ctrl usados: C, R, Espaço, S, E. **Ctrl+U livre.** Ajuda: `draw_help` (`view.rs:1104`) e `help::hints` (`src/tui/help.rs:34`).
+- Botões de confirmação já existentes: `CONFIRM_BUTTONS` (`app.rs:428`), `draw_confirm` (`view.rs:1386`), `confirm_mouse` (`app.rs:2046`).
+- Task 213: `selfupdate::newer`, a função que faz a atualização completa (mesma do CLI) e o mapeamento de erros para texto.
+
+#### What binds this task
+
+1. Ao abrir, um job de fundo confere a versão no máximo **uma vez a cada 24 h**: cache `self-update.json` em `DataDir` (`{ "checked_at": <unix>, "latest": "v0.2.2" }`); dentro das 24 h usa o cache sem rede. Sem internet, limite do GitHub ou erro ⇒ silêncio (nada na tela, só `tracing`).
+2. Versão nova ⇒ `Msg::SelfUpdateAvailable { tag }` e uma pílula à direita na barra: `wingetrs 0.2.2 · ctrl+u` (token de tema existente; nada de `Color::` fora de `theme.rs`). Linha nova na ajuda.
+3. `Ctrl+U` (só com a pílula visível) abre um modal com os botões existentes: "Atualizar o wingetrs de 0.2.1 para 0.2.2?". Continuar ⇒ job que roda a **mesma** função de atualização do CLI (escopo máquina ⇒ aviso "Aguardando autorização para executar como administrador" antes do UAC); sucesso ⇒ toast "wingetrs atualizado para 0.2.2; feche e abra de novo para usar a versão nova" e a pílula some; erro ⇒ toast de erro com o texto do erro tipado.
+4. Uma operação de instalação rodando ⇒ `Ctrl+U` entra na fila como as outras (ou recusa com toast "espere a operação atual"; escolha uma e teste).
+
+Testes (`tests/it/tui_self_update.rs`, novo; relógio e cache injetados, sem rede real):
+1. `check_skipped_within_24h` (cache recente ⇒ nenhum pedido ao servidor falso).
+2. `check_refreshes_after_24h`.
+3. `offline_check_is_silent` (sem toast, sem pílula).
+4. `pill_shows_new_version` (snapshot da barra).
+5. `ctrl_u_without_update_does_nothing`.
+6. `ctrl_u_opens_confirm_and_runs_update` (`Cmd` da atualização emitido só depois de Continuar).
+
+**Files:** `src/tui/app.rs`, `src/tui/run.rs`, `src/tui/view.rs`, `src/tui/help.rs`, `src/selfupdate/mod.rs` (só o cache), `tests/it/tui_self_update.rs` (novo; `mod` no `main.rs`).
+
+#### Checks beyond the steps
+
+1. Mutação: ignorar o cache ⇒ teste 1 **PEGA**.
+2. Mutação: toast no erro de rede ⇒ teste 3 **PEGA**.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(tui): notice and Ctrl+U for a new wingetrs version`
+
+### Task 215: Saída do winget formatada no CLI e na TUI
+
+**Modelo:** sonnet (revisor sonnet).
+
+#### Where this fits
+
+- Sonda acima: com stdout redirecionado o winget não desenha barra nem spinner; as linhas saem no idioma do Windows. Linhas conhecidas hoje no código: "Found/Encontrado X [Id] Version/Versão v" (`bridge::winget_chosen_version`, `src/bridge/mod.rs:541`), "Successfully installed" / "Instalado com êxito" (`tests/it/job_log.rs:47-89`, `tests/it/bridge.rs:483`), textos de reinício (`REBOOT_MARKERS`, `:476`). Normalização: `bridge::plain()` (`:490`, tira ANSI e acentos).
+- CLI: as linhas chegam por `output::bridge_progress` (`src/cli/output.rs:1697`), que imprime toda linha mostrada como `"  {line}"`; `install::progress::bridge_line` (`src/install/progress.rs:188`) só trata o aviso de elevação. TUI: `Msg::BridgeLine` ⇒ `on_bridge_line` (`app.rs:3119`) ⇒ `set_bridge_line` põe `"{ação} · {linha}"` no rótulo em execução. O log de jobs guarda as linhas cruas (fica assim).
+- Regra do CLI (CLAUDE.md): URL, hash e caminhos de staging só no `--dry-run`; glifos de `tui::theme::Glyphs`; toda saída pelos formatadores de `cli/output.rs`.
+- Instaladores nativos e `msiexec`: o resultado já vira texto em português por `winget_install::codes` (`classify_install`, `message(Category)`); o `msiexec` roda `/quiet` e não tem saída de texto. Janela própria de instalador que ignora o modo silencioso não é formatável (fora do escopo).
+
+#### What binds this task
+
+1. Módulo puro `src/bridge/winget_out.rs`: `classify(line: &str) -> WingetLine`, comparando por `plain()` (sem acento, minúsculas), com textos em **inglês e português**:
+   - `Found { name, id, version }` ("Found … [id] Version v" / "Encontrado … [id] Versão v");
+   - `License` ("This application is licensed to you by its owner." / "Este aplicativo é licenciado para você pelo proprietário."; "Microsoft is not responsible for, nor does it grant any licenses to, third-party packages." / "A Microsoft não é responsável por, nem concede licenças a pacotes de terceiros.");
+   - `Downloading { url }` ("Downloading " / "Baixando ");
+   - `HashOk` ("Successfully verified installer hash" / "Hash do instalador verificado com êxito");
+   - `Starting` ("Starting package install..." / "Starting package uninstall..." / "Iniciando a instalação do pacote..." / "Iniciando a desinstalação do pacote...");
+   - `Done` ("Successfully installed" / "Instalado com êxito" / "Successfully uninstalled" / "Desinstalado com êxito");
+   - `NoUpgrade` ("No available upgrade found." / "No newer package versions are available from the configured sources."; textos em português que não estão nesta lista ficam como `Other` e a lista é completada na prova ao vivo);
+   - `Other(text)`.
+   Uma tabela só (`const`), um teste por entrada.
+2. CLI (`bridge_progress`): `Found` ⇒ `{glifo} {name} {version}`; `License` ⇒ esmaecido, **uma** linha "licença de terceiros: aceita pelo --accept-package-agreements" no lugar das duas; `Downloading` ⇒ fase "Baixando o instalador" (URL só no `--dry-run`); `HashOk` ⇒ `{glifo ok} hash do instalador conferido`; `Starting` ⇒ fase "Instalando"/"Removendo"; `Done` ⇒ linha de sucesso com o glifo de ok; `NoUpgrade` ⇒ "nenhuma atualização encontrada pelo winget"; `Other` ⇒ recuada e esmaecida com prefixo `winget:`. Estilos só por `cli/style.rs` / formatadores de `output.rs`.
+3. TUI: `set_bridge_line` usa o mesmo `classify` para o rótulo curto em português (ex.: `Instalar · baixando o instalador`); `Other` mostra o texto cru como hoje.
+4. Equivalência: CLI e TUI nunca classificam por caminhos diferentes — os dois chamam `winget_out::classify`.
+
+Testes (`tests/it/winget_out.rs`, novo):
+1. `probe_lines_classified` (as 6 linhas literais da sonda ⇒ `Found`, `License`, `License`, `Downloading`, `HashOk`, `Other`).
+2. `english_lines_classified` (as entradas em inglês da tabela).
+3. `ansi_and_case_ignored`.
+4. `cli_hides_download_url` (saída formatada de `Downloading` sem a URL).
+5. `cli_license_lines_merged` (duas linhas ⇒ uma).
+6. `other_lines_dimmed_with_prefix`.
+7. `tui_label_uses_classify` (rótulo `· baixando o instalador`).
+
+**Files:** `src/bridge/winget_out.rs` (novo), `src/bridge/mod.rs` (só o `mod`), `src/cli/output.rs`, `src/install/progress.rs`, `src/tui/app.rs` (só `set_bridge_line`), `tests/it/winget_out.rs` (novo; `mod` no `main.rs`).
+
+#### Checks beyond the steps
+
+1. Mutação: comparar sem `plain()` ⇒ teste 3 **PEGA**.
+2. Mutação: mostrar a URL de `Downloading` ⇒ teste 4 **PEGA**.
+3. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `feat(bridge): format winget output lines in the CLI and TUI`
