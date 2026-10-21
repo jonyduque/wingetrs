@@ -1717,15 +1717,25 @@ pub fn bridge_progress<R>(
     })
 }
 
+/// Progress lines the wingetrs itself pushes through the bridge sink (closed list): shown
+/// without the `winget:` prefix, which is only for lines from the process output.
+pub const WINGETRS_LINES: [&str; 6] = [
+    crate::install::progress::ELEVATION_GRANTED,
+    crate::install::progress::ELEVATION_REFUSED,
+    crate::bridge::SCOPE_FALLBACK_NOTE,
+    crate::tui::jobs::WAITING_INSTALLER,
+    crate::tui::jobs::STARTING_WINGET,
+    crate::bridge::winget_out::UPDATING_SOURCE,
+];
+
 /// One winget output line as the CLI shows it (Task 215), classified by
 /// `bridge::winget_out::classify` like the TUI. `license_seen` merges the two license notices
 /// into one line. `None` hides the line. URLs are never shown (they belong to `--dry-run`).
 pub fn format_winget_line(license_seen: &mut bool, line: &str) -> Option<String> {
     use crate::bridge::winget_out::{WingetLine, classify};
-    use crate::install::progress::{ELEVATION_GRANTED, ELEVATION_REFUSED};
     let g = style::glyphs();
-    if line == ELEVATION_GRANTED || line == ELEVATION_REFUSED {
-        // the wingetrs own lines, not winget output
+    if WINGETRS_LINES.contains(&line) {
+        // the wingetrs own progress lines, not winget output
         return Some(format!("  {line}"));
     }
     Some(match classify(line) {
@@ -1747,7 +1757,11 @@ pub fn format_winget_line(license_seen: &mut bool, line: &str) -> Option<String>
             let text = if removing { "Removendo" } else { "Instalando" };
             format!("  {} {text}", g.arrow)
         }
-        WingetLine::Done => format!("  {} {}", paint(OK, g.ok), line.trim()),
+        WingetLine::Done => format!(
+            "  {} {}",
+            paint(OK, g.ok),
+            crate::bridge::winget_out::clean(line).trim()
+        ),
         WingetLine::NoUpgrade => "  nenhuma atualização encontrada pelo winget".to_string(),
         WingetLine::Other(text) => paint(DIM, &format!("  winget: {text}")),
     })

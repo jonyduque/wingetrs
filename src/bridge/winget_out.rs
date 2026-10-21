@@ -111,8 +111,9 @@ pub fn classify(line: &str) -> WingetLine {
     WingetLine::Other(line.trim().to_string())
 }
 
-/// "Found <name> [<id>] Version <v>": every folded char is one byte, so offsets of `key`
-/// (ASCII-lowercased `text`) are valid in `text`.
+/// "Found <name> [<id>] Version <v>": `key` is `text` ASCII-lowercased, so both have the same
+/// byte offsets. `text` is already folded by `plain()`, hence the name loses its accents
+/// (known limitation).
 fn found(text: &str, key: &str) -> Option<WingetLine> {
     let p = FOUND.iter().find(|p| key.starts_with(**p))?;
     let open = key.find(" [")?;
@@ -148,4 +149,12 @@ pub fn tui_label(line: &WingetLine) -> Option<String> {
         WingetLine::NoUpgrade => "nenhuma atualização encontrada pelo winget".to_string(),
         WingetLine::Other(_) => return None,
     })
+}
+
+/// Line the wingetrs itself pushes before refreshing winget's source (tui/jobs.rs).
+pub const UPDATING_SOURCE: &str = "atualizando a fonte do winget";
+
+/// `line` without ANSI sequences and accents (`plain()`), for display.
+pub fn clean(line: &str) -> String {
+    plain(line)
 }

@@ -26,3 +26,10 @@ Concerns:
 - Edited `tests/it/wi_cli.rs` (not in Files) for 2 expectations changed by this feature ("winget: Instalando o pacote...", "→ Baixando o instalador"); those edits were swept into the other agent's commit 88f0b4c.
 - `plain()` folds accents, so a Found name loses them ("Visão" -> "Visao"); Portuguese texts beyond the table stay `Other` until the live proof.
 - No `.join` with external data written.
+
+## Correções da revisão (commit fix(bridge))
+- Linhas do próprio wingetrs (`output::WINGETRS_LINES`: ELEVATION_GRANTED/REFUSED, SCOPE_FALLBACK_NOTE, WAITING_INSTALLER, STARTING_WINGET, `winget_out::UPDATING_SOURCE`) saem sem `winget:`; lista fechada. `tui/jobs.rs` não foi tocado: o literal "atualizando a fonte do winget" continua lá e deveria usar `winget_out::UPDATING_SOURCE` (pendente, após a 189). Teste verifica que as constantes existentes estão na lista.
+- `Done` usa `winget_out::clean` (plain). Comentário do `found` corrigido; limitação: o nome do `Found` perde acentos.
+- Mutação: `[OK] mutação PEGA: 'if WINGETRS_LINES.contains(&line) {' -> 'if WINGETRS_LINES.is_empty() {' fez o teste falhar (exit 101).`
+- Mutação: `[OK] mutação PEGA: 'crate::bridge::winget_out::clean(line).trim()' -> 'line.trim()' fez o teste falhar (exit 101).`
+- `cargo test --quiet --test it winget_out::` => 10 passed; clippy e rustfmt sem avisos nos meus arquivos.

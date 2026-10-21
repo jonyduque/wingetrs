@@ -223,3 +223,34 @@ fn tui_label_uses_classify() {
     let label = a.running.as_ref().unwrap().label.clone();
     assert!(label.ends_with("· linha desconhecida"), "{label}");
 }
+
+#[test]
+fn wingetrs_own_lines_have_no_winget_prefix() {
+    for l in output::WINGETRS_LINES {
+        let out = cli_out(&[l]);
+        assert_eq!(out, vec![format!("  {l}")], "{l}");
+    }
+    for l in [
+        wingetrs::bridge::SCOPE_FALLBACK_NOTE,
+        wingetrs::tui::jobs::WAITING_INSTALLER,
+        wingetrs::tui::jobs::STARTING_WINGET,
+        wingetrs::bridge::winget_out::UPDATING_SOURCE,
+    ] {
+        assert!(output::WINGETRS_LINES.contains(&l), "{l}");
+    }
+    let out = cli_out(&["linha desconhecida do processo"]);
+    assert_eq!(
+        out,
+        vec!["  winget: linha desconhecida do processo".to_string()]
+    );
+}
+
+#[test]
+fn done_line_has_no_csi() {
+    let out = cli_out(&["\u{1b}[32mSuccessfully installed\u{1b}[0m"]);
+    assert_eq!(out.len(), 1);
+    assert!(
+        out[0].contains("Successfully installed") && !out[0].contains('\u{1b}'),
+        "{out:?}"
+    );
+}
