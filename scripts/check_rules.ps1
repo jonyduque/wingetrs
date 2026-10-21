@@ -30,6 +30,9 @@ $rules = @(
     @{ Name = 'Color:: fora de theme.rs'; Pattern = '\bColor::'; Skip = '^src[\\/]tui[\\/]theme\.rs$' },
     # CLI colors only through src/cli/style.rs.
     @{ Name = 'anstyle fora de cli/style.rs'; Pattern = '\b(anstyle|AnsiColor)::'; Skip = '^src[\\/]cli[\\/]style\.rs$' },
+    # Task 213 review: in code that runs elevated, `Http::new()` follows the user's proxy and trusts
+    # CurrentUser\Root (both writable without admin); the elevated side uses `Http::for_elevated`.
+    @{ Name = 'Http::new no lado elevado'; Pattern = '\bHttp::new\s*\('; Skip = '^(?!(.*[\\/])?src[\\/](selfupdate[\\/]apply_win|bridge[\\/](worker|elevate_win|staging_win|arp_ops_win))\.rs$)' },
     # Windows APIs only in *_win.rs.
     @{ Name = 'API Windows fora de *_win.rs'; Pattern = '(?<![\w:])(winreg|windows)::'; Skip = '_win\.rs$' }
 )
