@@ -154,6 +154,41 @@ async fn foreign_download_host_dropped() {
             "https://github.com.evil.example/o/r/releases/download/v1/ghlook.zip",
         ),
         asset(
+            "dots.zip",
+            Some(&digest),
+            "https://github.com/o/r/releases/download/../../x/y/releases/download/f",
+        ),
+        asset(
+            "pct.zip",
+            Some(&digest),
+            "https://github.com/o/r/releases/download/v%31/pct.zip",
+        ),
+        asset(
+            "bslash.zip",
+            Some(&digest),
+            "https://github.com/o/r/releases/download/v1\\\\bslash.zip",
+        ),
+        asset(
+            "port.zip",
+            Some(&digest),
+            "https://github.com:444/o/r/releases/download/v1/port.zip",
+        ),
+        asset(
+            "short.zip",
+            Some(&digest),
+            "https://github.com/o/r/releases/download/short.zip",
+        ),
+        asset(
+            "deep.zip",
+            Some(&digest),
+            "https://github.com/o/r/releases/download/v1/sub/deep.zip",
+        ),
+        asset(
+            "cased.zip",
+            Some(&digest),
+            "https://github.com/O/R/releases/download/v1/cased.zip",
+        ),
+        asset(
             "ghuser.zip",
             Some(&digest),
             "https://github.com@evil.example/o/r/releases/download/v1/ghuser.zip",
@@ -162,7 +197,7 @@ async fn foreign_download_host_dropped() {
     .join(",");
     let rel = latest_of(release_with(&assets)).await;
     let names: Vec<_> = rel.assets.iter().map(|a| a.name.as_str()).collect();
-    assert_eq!(names, ["gh.zip", "cdn.zip"]);
+    assert_eq!(names, ["gh.zip", "cdn.zip", "cased.zip"]);
 }
 
 #[tokio::test]
@@ -297,5 +332,58 @@ fn repo_names_follow_bucket_rules() {
         "", "a", "a/", "/b", "../b", "a/..", "a/b/c", "a b/c", "a/b?x", "a..b/c",
     ] {
         assert!(GhRepo::parse(bad).is_err(), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn repo_case_is_ignored_in_download_url() {
+    let digest = format!("sha256:{GOOD_HEX}");
+    let a = asset(
+        "rg.zip",
+        Some(&digest),
+        "https://github.com/BurntSushi/ripgrep/releases/download/1/rg.zip",
+    );
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/BurntSushi/RipGrep/releases/latest"))
+        .respond_with(json(&release_with(&a)))
+        .mount(&s)
+        .await;
+    let rel = github::latest(&Http::new().unwrap(), &s.uri(), &repo("BurntSushi/RipGrep"))
+        .await
+        .unwrap();
+    assert_eq!(rel.assets.len(), 1);
+}
+
+#[tokio::test]
+async fn latest_tag_with_separators_is_refused() {
+    let s = MockServer::start().await;
+    let h = Http::new().unwrap();
+    for (name, enc) in [
+        ("slash", "a%2Fb"),
+        ("bslash", "a%5Cb"),
+        ("dots", "..%2e"),
+        ("pct", "a%25b"),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/o/{name}/releases/latest")))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("/o/{name}/releases/tag/{enc}")),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/o/{name}/releases/tag/{enc}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
+            .mount(&s)
+            .await;
+        assert!(
+            matches!(
+                github::latest_tag(&h, &s.uri(), &repo(&format!("o/{name}"))).await,
+                Err(GhError::NoRelease)
+            ),
+            "{enc}"
+        );
     }
 }

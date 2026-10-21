@@ -18,3 +18,14 @@ Decisions:
 - Extra tests beyond the 7: draft_or_garbage_is_typed, repo_names_follow_bucket_rules.
 
 Concerns: gate test step blocked by Task 189 test (above). No .join with external data written.
+
+## Fix round (3 Minors)
+Commit: see git log (fix(github): ...). download_url_allowed now parses with reqwest::Url (https, exact host, no port/userinfo, github.com path = exactly [owner, repo, releases, download, tag, name], no empty/./.. segment, no `%` in path, no `\`), owner/repo case-insensitive, latest_tag refuses decoded tags with / \ .. % (NoRelease). New tests: more fixtures in foreign_download_host_dropped, repo_case_is_ignored_in_download_url, latest_tag_with_separators_is_refused. Gate: only gh_release (11 pass) + clippy + rustfmt, as instructed.
+Mutation proofs (all [OK] mutação PEGA, exit 101):
+- 'if url.contains('\') {' -> 'if false {'
+- '|| tag.contains(['/', '\', '%'])' -> ''
+- 'segments[0].eq_ignore_ascii_case(&repo.owner)' -> 'segments[0] == repo.owner'
+- '|| parsed.port().is_some()' -> ''
+- 'if parsed.path().contains('%') {' -> 'if false {'
+- 'segments.len() == 6' -> 'segments.len() >= 5'
+Note: the url crate normalizes `..`/`\`/`%2e` itself, so the fixtures for `%` and `\` use `v%31` and `v1\bslash.zip` to fail only on those checks. Some runs were INCONCLUSIVO from Task 189 compile breaks; reran until conclusive.

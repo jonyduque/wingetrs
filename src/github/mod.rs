@@ -105,16 +105,45 @@ struct RawAsset {
     browser_download_url: Option<String>,
 }
 
-/// Closed list of download origins.
+/// Closed list of download origins, checked on the parsed URL (no string prefixes).
 fn download_url_allowed(repo: &GhRepo, url: &str) -> bool {
-    let prefix = format!(
-        "https://github.com/{}/{}/releases/download/",
-        repo.owner, repo.repo
-    );
-    (url.starts_with(&prefix) && url.len() > prefix.len())
-        || url
-            .strip_prefix("https://objects.githubusercontent.com/")
-            .is_some_and(|rest| !rest.is_empty())
+    if url.contains('\\') {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https"
+        || parsed.port().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    if parsed.path().contains('%') {
+        return false;
+    }
+    let Some(segments) = parsed.path_segments() else {
+        return false;
+    };
+    let segments: Vec<&str> = segments.collect();
+    if segments
+        .iter()
+        .any(|s| s.is_empty() || *s == "." || *s == "..")
+    {
+        return false;
+    }
+    match parsed.host_str() {
+        Some("github.com") => {
+            segments.len() == 6
+                && segments[0].eq_ignore_ascii_case(&repo.owner)
+                && segments[1].eq_ignore_ascii_case(&repo.repo)
+                && segments[2] == "releases"
+                && segments[3] == "download"
+        }
+        Some("objects.githubusercontent.com") => true,
+        _ => false,
+    }
 }
 
 fn parse_digest(digest: &str) -> Option<[u8; 32]> {
@@ -223,7 +252,11 @@ pub async fn latest_tag(http: &Http, base_web: &str, repo: &GhRepo) -> Result<St
         .rsplit_once("/releases/tag/")
         .ok_or(GhError::NoRelease)?;
     let tag = percent_decode(encoded).ok_or(GhError::NoRelease)?;
-    if tag.is_empty() || tag.chars().any(char::is_control) {
+    if tag.is_empty()
+        || tag.contains(['/', '\\', '%'])
+        || tag.contains("..")
+        || tag.chars().any(char::is_control)
+    {
         return Err(GhError::NoRelease);
     }
     Ok(tag)
