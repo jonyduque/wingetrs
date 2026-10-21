@@ -450,6 +450,18 @@ async fn event_loop(
                     });
                 }
                 Cmd::PlanWingetInstall { id } => spawn_winget_plan(&ctx, id),
+                Cmd::PlanPortable { spec, keep } => spawn_job(&ctx, move |c, _| {
+                    let agreements = spec
+                        .agreements
+                        .iter()
+                        .map(|a| crate::bridge::agreement_line(a, false))
+                        .collect();
+                    Msg::PortablePlanned {
+                        result: with_ops(c, &no_progress, |o| jobs::plan_portable(o, &spec, keep))
+                            .and_then(|r| r),
+                        agreements,
+                    }
+                }),
                 Cmd::PlanWingetUninstall(req) => spawn_job(&ctx, move |c, h| {
                     Msg::WingetUninstallPlanned(plan_winget_uninstall(c, h, &req))
                 }),
@@ -1270,6 +1282,8 @@ fn native_upgrade(
         installer_mode,
     ) {
         Ok(PlanOrBridge::Native(p)) => Some(p),
+        // `plan_upgrade` answers bridge for a portable record of the Windows list.
+        Ok(PlanOrBridge::Portable(_)) => None,
         Ok(PlanOrBridge::Bridge(why)) => {
             tracing::debug!(app_key = %q.app_key, %why, "native upgrade goes to winget");
             None

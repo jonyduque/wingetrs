@@ -133,7 +133,6 @@ fn bridge_reasons_one_fixture_each() {
     };
     for (t, want) in [
         ("zip", "tipo zip"),
-        ("portable", "tipo portable"),
         ("font", "tipo font"),
         ("pwa", "tipo pwa"),
         ("msstore", "tipo msstore"),
@@ -141,6 +140,11 @@ fn bridge_reasons_one_fixture_each() {
         let m = bridge(&format!("InstallerType: {t}\n"));
         assert!(m.contains(want), "{m}");
     }
+    // Task 189: portable is a wingetrs app now, without a window
+    assert_eq!(
+        pick_root("InstallerType: portable\n", &[inst("x64", "")]).verdict,
+        Verdict::Native { interactive: false }
+    );
     // no InstallerType anywhere
     match pick_root("", &[inst("x64", "")]).verdict {
         Verdict::Bridge(m) => assert!(m.contains("tipo desconhecido"), "{m}"),

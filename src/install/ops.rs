@@ -628,6 +628,46 @@ pub fn plan_for(
     Ok(plans)
 }
 
+/// Plans app `app` of `bucket` from a manifest that is not in a scoop bucket (a winget portable
+/// package, Task 189): no dependencies; an app of another bucket with the same name is refused.
+pub fn plan_manifest(
+    ctx: &OpsCtx<'_>,
+    app: &str,
+    bucket: &str,
+    raw: &str,
+    keep_old: bool,
+) -> Result<InstallPlan, OpsError> {
+    let _span = tracing::debug_span!("plan.build").entered();
+    let target = manifest::resolve(raw, Arch::host())?;
+    let layout = layout(ctx);
+    let state = read_state(&layout)?;
+    let installed = match state.get(app)? {
+        Some((r, _)) if r.bucket != bucket => {
+            return Err(OpsError::Unsupported(format!(
+                "{app} já está instalado pelo wingetrs a partir do bucket {}",
+                r.bucket
+            )));
+        }
+        Some((r, _)) => Some(InstalledInfo {
+            old_manifest: old_manifest(&layout, app, &r)?,
+            version: r.version,
+        }),
+        None => None,
+    };
+    let sha = crate::cache::sha256_hex(raw.as_bytes());
+    Ok(planner::plan_install(&PlanInput {
+        app,
+        bucket,
+        manifest: &target,
+        layout: &layout,
+        shortcut_root: &ctx.effects.shortcuts.root(),
+        installed,
+        launcher_present: layout.launcher().exists(),
+        keep_old,
+        manifest_sha256: &sha,
+    })?)
+}
+
 /// The manifest written when `rec` was installed (never the catalog's), resolved for the
 /// architecture it was installed with. `None` for an app installed before Phase 2c or whose
 /// written manifest no longer resolves; an altered one (SHA-256 differs) stops the update.
@@ -1155,7 +1195,12 @@ pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
                 .push((rec.app, "instalação quebrada (rode repair)".into()));
             continue;
         }
-        let source = crate::sources::scoop::source_name(&rec.bucket);
+        // A winget portable app's newer version is the winget catalog's (Task 189).
+        let source = if rec.bucket == crate::winget_install::portable::WINGET_BUCKET {
+            "winget".to_string()
+        } else {
+            crate::sources::scoop::source_name(&rec.bucket)
+        };
         let Some(pkg) = ctx.catalog.get(&source, &rec.app)? else {
             out.skipped
                 .push((rec.app, format!("não está mais no catálogo ({source})")));

@@ -755,7 +755,7 @@ async fn install(
     bucket: Option<&str>,
     scope: Option<crate::bridge::worker::ScopeArg>,
     f: Flags,
-    mut stop: Stop<'_, impl Interrupts>,
+    stop: Stop<'_, impl Interrupts>,
     winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
     let Some(cand) = choose(ctx, ui, target, bucket, f.yes)? else {
@@ -773,6 +773,18 @@ async fn install(
         .into());
     }
     let plans = ops::plan_for(ctx, &cand, false)?;
+    apply_install(ctx, ui, plans, f, stop).await
+}
+
+/// Shows `plans`, asks, and applies them (the scoop install; also a winget portable package,
+/// Task 189).
+pub(crate) async fn apply_install(
+    ctx: &OpsCtx<'_>,
+    ui: &dyn Ui,
+    plans: Vec<crate::install::plan::InstallPlan>,
+    f: Flags,
+    mut stop: Stop<'_, impl Interrupts>,
+) -> anyhow::Result<()> {
     print_plans(ctx, ui, &plans, f);
     third_party_gate(&plans_code(plans.iter()), f)?;
     if f.dry_run {
@@ -999,6 +1011,11 @@ async fn upgrade(
         let Some((rec, _)) = state.get(app)? else {
             bail!("{app} não está instalado pelo wingetrs");
         };
+        // A winget portable package: its newer manifest is the winget catalog's (Task 189).
+        if rec.bucket == crate::winget_install::portable::WINGET_BUCKET {
+            groups.push(vec![winget.plan_portable_upgrade(app, keep).await?]);
+            continue;
+        }
         let cand = match ops::resolve_installed(ctx, app, &rec.bucket)? {
             Resolution::One(c) => c,
             _ => bail!("{app} não foi encontrado no bucket {}", rec.bucket),

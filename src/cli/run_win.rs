@@ -32,6 +32,7 @@ use crate::winget_install::ops::{self as wops, InstallReport, WingetCtx, WingetO
 use crate::winget_install::orphans::{self, Orphan};
 use crate::winget_install::orphans_win::SystemArp;
 use crate::winget_install::plan::{PlanOrBridge, WingetPlan};
+use crate::winget_install::portable::{self, PortableSpec};
 use crate::winget_install::previous::RemovalRequest;
 use crate::winget_install::select::{Refusal, ScopeWanted};
 use crate::winget_install::uninstall::{
@@ -211,6 +212,32 @@ impl WingetFlows for ProdFlows<'_, '_> {
         stop: Stop<'_, I>,
     ) -> anyhow::Result<()> {
         winget_cmd::install_bridge(self.ctx, &self.helper.0, ui, cand, scope, why, f, stop).await
+    }
+
+    async fn install_portable<I: Interrupts>(
+        &self,
+        ui: &dyn Ui,
+        spec: &PortableSpec,
+        f: Flags,
+        stop: Stop<'_, I>,
+    ) -> anyhow::Result<()> {
+        let plan = portable::install_plan(self.ctx, spec, false)?;
+        install_cmd::apply_install(self.ctx, ui, vec![plan], f, stop).await
+    }
+
+    async fn plan_portable_upgrade(
+        &self,
+        id: &str,
+        keep_old: bool,
+    ) -> anyhow::Result<crate::install::plan::InstallPlan> {
+        Ok(portable::plan_from_catalog(
+            self.ctx,
+            crate::sources::winget::CDN_BASE,
+            &host_win::current(),
+            id,
+            keep_old,
+        )
+        .await?)
     }
 
     fn installed(&self) -> anyhow::Result<Vec<ListRow>> {

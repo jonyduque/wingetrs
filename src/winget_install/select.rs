@@ -360,10 +360,13 @@ pub fn choose(
 }
 
 fn verdict(i: &EffectiveInstaller) -> Verdict {
+    // `portable` and zip with portable files become wingetrs apps (Task 189, always on).
+    let portable = super::portable::is_portable(i);
     match &i.kind {
         InstallerKind::Unknown(s) if s.is_empty() => {
             return Verdict::Bridge("tipo desconhecido: instalado pelo winget".to_string());
         }
+        InstallerKind::Zip | InstallerKind::Portable if portable => {}
         InstallerKind::Zip
         | InstallerKind::Portable
         | InstallerKind::Font
@@ -381,6 +384,9 @@ fn verdict(i: &EffectiveInstaller) -> Verdict {
             || !d.external_dependencies.is_empty())
     {
         return Verdict::Bridge("tem dependências: instalado pelo winget".to_string());
+    }
+    if portable {
+        return Verdict::Native { interactive: false };
     }
     let no_silent = i.switches.silent.is_none() && i.switches.silent_with_progress.is_none();
     Verdict::Native {

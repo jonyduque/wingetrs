@@ -192,14 +192,21 @@ fn by_name_and_publisher(
     Ok((!ids.is_empty()).then(|| (WINGET_SOURCE.to_owned(), ids, Rule::NameAndPublisher)))
 }
 
-/// Scoop and wingetrs installs record their bucket; both correlate by `scoop:<bucket>` + app.
+/// Scoop and wingetrs installs record their bucket; both correlate by `scoop:<bucket>` + app
+/// (`winget` + id for a winget portable package).
 fn by_scoop(app: &InstalledApp, catalog: &Catalog) -> Result<Option<Hit>, CatalogError> {
     let (InstallSource::Scoop | InstallSource::Wingetrs, Some(bucket)) =
         (&app.source, app.scoop_bucket.as_deref())
     else {
         return Ok(None);
     };
-    let source = crate::sources::scoop::source_name(bucket);
+    // A winget portable package installed as a wingetrs app (Task 189): the winget catalog's.
+    let source = match app.source {
+        InstallSource::Wingetrs if bucket == crate::winget_install::portable::WINGET_BUCKET => {
+            WINGET_SOURCE.to_owned()
+        }
+        _ => crate::sources::scoop::source_name(bucket),
+    };
     Ok(catalog
         .get(&source, &app.key)?
         .map(|p| (source, vec![p.entry.id], Rule::ScoopManifest)))

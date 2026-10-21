@@ -286,6 +286,7 @@ fn native(m: &MergedManifest, wanted: Scope) -> WingetPlan {
     match plan(m, &host(), ScopeWanted::Prefer(wanted), None).unwrap() {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 
@@ -1049,6 +1050,7 @@ fn helper_params_outside_allowlist_go_to_bridge() {
             "parâmetros do instalador fora da lista permitida para elevação: /INVENTED"
         ),
         PlanOrBridge::Native(p) => panic!("native: {p}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
     let accepted = manifest_of(
         "inno",
@@ -1290,6 +1292,7 @@ fn native_in(
     match plan_with_mode(m, &host(), ScopeWanted::Prefer(wanted), None, mode).unwrap() {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 

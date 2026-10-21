@@ -249,14 +249,72 @@ pub async fn plan_winget_install(
     })
 }
 
+/// Plans the winget portable package `spec` as a wingetrs app (Task 189).
+pub fn plan_portable(
+    c: &OpsCtx<'_>,
+    spec: &crate::winget_install::portable::PortableSpec,
+    keep: bool,
+) -> Result<Planned, String> {
+    let plan =
+        crate::winget_install::portable::install_plan(c, spec, keep).map_err(|e| e.to_string())?;
+    Ok(one_plan(plan))
+}
+
+fn one_plan(plan: InstallPlan) -> Planned {
+    let plans = vec![plan];
+    Planned::Ready {
+        text: plans_text(std::slice::from_ref(&plans)),
+        action: Action::Apply(vec![plans]),
+    }
+}
+
+#[cfg(windows)]
+fn winget_host() -> Result<crate::winget_install::select::Host, String> {
+    Ok(crate::winget_install::host_win::current())
+}
+
+#[cfg(not(windows))]
+fn winget_host() -> Result<crate::winget_install::select::Host, String> {
+    Err("pacotes do winget só no Windows".to_string())
+}
+
+/// The upgrade plan of wingetrs app `id`, a portable package of the winget catalog. Runs on a
+/// job's blocking thread: the manifest read (cached blob, else the CDN) is awaited here.
+fn portable_upgrade(c: &OpsCtx<'_>, id: &str, keep: bool) -> Result<InstallPlan, String> {
+    let host = winget_host()?;
+    let rt = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
+    rt.block_on(crate::winget_install::portable::plan_from_catalog(
+        c,
+        crate::sources::winget::CDN_BASE,
+        &host,
+        id,
+        keep,
+    ))
+    .map_err(|e| e.to_string())
+}
+
 /// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`; `keep` keeps
-/// the old version on an upgrade.
+/// the old version on an upgrade. `winget` is the upgrade of a portable package installed as a
+/// wingetrs app.
 pub fn plan_install(
     c: &OpsCtx<'_>,
     source_name: &str,
     id: &str,
     keep: bool,
 ) -> Result<Planned, String> {
+    if source_name == "winget" {
+        let rec = StateDb::open(&c.data.install_layout().state_db())
+            .and_then(|s| s.get(id))
+            .map_err(|e| e.to_string())?;
+        return match rec {
+            Some((r, _)) if r.bucket == crate::winget_install::portable::WINGET_BUCKET => {
+                portable_upgrade(c, id, keep).map(one_plan)
+            }
+            _ => Err(format!(
+                "{id} não é um pacote do winget instalado pelo wingetrs"
+            )),
+        };
+    }
     let bucket = source_name
         .strip_prefix("scoop:")
         .ok_or_else(|| format!("{id} não vem de um bucket do scoop"))?;
@@ -329,6 +387,10 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>, keep: bool) -> Result<Planned, String> {
             .find(|(a, _)| a == app)
             .map(|(_, b)| b.as_str())
             .ok_or_else(|| format!("{app}: não está no registro do wingetrs"))?;
+        if bucket == crate::winget_install::portable::WINGET_BUCKET {
+            groups.push(vec![portable_upgrade(c, app, keep)?]);
+            continue;
+        }
         match ops::resolve_installed(c, app, bucket).map_err(|e| e.to_string())? {
             Resolution::One(cand) => {
                 groups.push(ops::plan_for(c, &cand, keep).map_err(|e| e.to_string())?);

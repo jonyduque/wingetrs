@@ -826,6 +826,7 @@ impl Native {
         {
             PlanOrBridge::Native(p) => p,
             PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+            PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
         };
         let t = tempfile::tempdir().unwrap();
         let data = DataDir::new(t.path().join("root"));

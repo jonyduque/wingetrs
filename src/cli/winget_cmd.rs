@@ -12,6 +12,7 @@ use crate::cache::BlobStore;
 use crate::config::{Behavior, DefaultScope, WingetEngine};
 use crate::install::executor::LaunchGate;
 use crate::install::ops::OpsCtx;
+use crate::install::plan::InstallPlan;
 use crate::install::progress::ProgressEvent;
 use crate::install::target::Candidate;
 use crate::installed::Hive;
@@ -27,6 +28,7 @@ use crate::winget_install::orphans::Orphan;
 use crate::winget_install::plan::{
     PlanOrBridge, WingetPlan, bridge_reason, bridge_step, name_version,
 };
+use crate::winget_install::portable::PortableSpec;
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::select::{Refusal, Scope, ScopeWanted};
 use crate::winget_install::uninstall::{
@@ -305,6 +307,25 @@ pub trait WingetFlows {
         f: Flags,
         stop: Stop<'_, I>,
     ) -> impl Future<Output = anyhow::Result<()>>;
+    /// Installs portable package `spec` as a wingetrs app: the phase 2a plan, confirmation and
+    /// executor (Task 189).
+    fn install_portable<I: Interrupts>(
+        &self,
+        _ui: &dyn Ui,
+        _spec: &PortableSpec,
+        _f: Flags,
+        _stop: Stop<'_, I>,
+    ) -> impl Future<Output = anyhow::Result<()>> {
+        async { bail!("este fluxo não instala pacotes portable") }
+    }
+    /// The phase 2a upgrade plan of wingetrs app `id`, a portable package of the winget catalog.
+    fn plan_portable_upgrade(
+        &self,
+        _id: &str,
+        _keep_old: bool,
+    ) -> impl Future<Output = anyhow::Result<InstallPlan>> {
+        async { bail!("este fluxo não atualiza pacotes portable") }
+    }
     /// The installed apps, correlated with the catalog (`wingetrs list`).
     fn installed(&self) -> anyhow::Result<Vec<ListRow>>;
     /// `winget_install::uninstall::plan_uninstall` for the record `target` of `row`.
@@ -514,6 +535,12 @@ pub async fn install<F: WingetFlows>(
             return flows
                 .install_bridge(ui, cand, scope, why.as_deref(), f, stop)
                 .await;
+        }
+        Engine::Portable(spec) => {
+            for line in agreement_lines(&spec.agreements, f.yes) {
+                say(&output::license(&line));
+            }
+            return flows.install_portable(ui, &spec, f, stop).await;
         }
         Engine::Native(plan) => plan,
     };
@@ -849,6 +876,8 @@ pub async fn upgrade<F: WingetFlows>(
             }
             return upgrade_bridge(flows, ui, row, f, stop, say);
         }
+        // `plan_upgrade` never answers portable for a record of the Windows list.
+        Engine::Portable(_) => return upgrade_bridge(flows, ui, row, f, stop, say),
         Engine::Native(plan) => plan,
     };
     if !show_and_confirm(ui, &native_text(&plan, f), f, &mut *say)? {

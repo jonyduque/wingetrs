@@ -94,6 +94,7 @@ pub(crate) fn native(kind: &str, scope: Scope) -> WingetPlan {
     {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 
@@ -639,6 +640,7 @@ fn upgrade_native_follows_engine() {
     {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     };
     let loaded = |a: &mut App, latest: &str| {
         update(
@@ -705,6 +707,7 @@ fn plan_from(m: &MergedManifest, from: Option<&str>) -> WingetPlan {
     {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 
@@ -1015,6 +1018,7 @@ fn installer_mode_same_switches_in_cli_and_tui_plans() {
     let command = |p: Result<PlanOrBridge, String>| match p.unwrap() {
         PlanOrBridge::Native(p) => format!("{:?}", p.command),
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     };
     let wanted = ScopeWanted::Prefer(Scope::User);
     for kind in ["inno", "nullsoft", "msi"] {

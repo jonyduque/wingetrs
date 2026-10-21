@@ -146,6 +146,11 @@ pub enum Msg {
     SettingsSaved(Result<(), String>),
     /// Result of planning an install, upgrade or removal.
     Planned(Result<Planned, String>),
+    /// Result of `Cmd::PlanPortable`, with one note per license agreement of the package.
+    PortablePlanned {
+        result: Result<Planned, String>,
+        agreements: Vec<String>,
+    },
     /// Result of `Cmd::PlanWingetInstall`: the bridge job and one note per license agreement
     /// (`Licença: <label> — <url>`).
     WingetPlanned(Result<(BridgeJob, Vec<String>), String>),
@@ -604,6 +609,12 @@ pub enum Cmd {
     /// answers with `Msg::WingetPlanned`.
     PlanWingetInstall {
         id: String,
+    },
+    /// Plan the winget portable package `spec` as a wingetrs app (Task 189); answers with
+    /// `Msg::PortablePlanned`.
+    PlanPortable {
+        spec: crate::winget_install::portable::PortableSpec,
+        keep: bool,
     },
     /// Plan the native uninstall of the installed record `app_key` (`name` for a record that
     /// cannot be read); `others` are the other records of the same app, `is_main` whether this
@@ -1881,6 +1892,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Planned(result) => on_planned(app, result),
+        Msg::PortablePlanned { result, agreements } => on_portable_planned(app, result, agreements),
         Msg::WingetPlanned(result) => on_winget_planned(app, result),
         Msg::WingetInstallPlanned { bridge, native } => {
             on_winget_install_planned(app, bridge, native)
@@ -4257,6 +4269,26 @@ fn ready_one(app: &mut App, action: Action, confirm: ConfirmMode) -> Vec<Cmd> {
     Vec::new()
 }
 
+/// A portable package planned as a wingetrs app: like any 2a plan, except that license
+/// agreements always ask for the confirmation that shows them.
+fn on_portable_planned(
+    app: &mut App,
+    result: Result<Planned, String>,
+    agreements: Vec<String>,
+) -> Vec<Cmd> {
+    match result {
+        Ok(Planned::Ready { action, .. }) if !agreements.is_empty() => {
+            app.planning = false;
+            app.status = None;
+            app.planning_confirm = None;
+            let modal = confirm_modal(app, vec![action], agreements, None);
+            open_modal(app, modal);
+            Vec::new()
+        }
+        other => on_planned(app, other),
+    }
+}
+
 /// The winget install planned by `Cmd::PlanWingetInstall`: confirmed (always, when the package
 /// has license agreements to show), then queued as a bridge job.
 fn on_winget_planned(app: &mut App, result: Result<(BridgeJob, Vec<String>), String>) -> Vec<Cmd> {
@@ -4298,6 +4330,12 @@ fn on_winget_install_planned(
                 .take()
                 .unwrap_or(app.settings.behavior.confirm);
             start_ready(app, Action::WingetInstall(plan), confirm, Vec::new())
+        }
+        // Still planning: the 2a plan needs `state.db` and the root, read on a job.
+        Ok(Engine::Portable(spec)) => {
+            let keep = app.settings.behavior.keep_old;
+            app.planning_keep = keep;
+            vec![Cmd::PlanPortable { spec, keep }]
         }
         Ok(Engine::Bridge(why)) => {
             let Some(why) = why else {

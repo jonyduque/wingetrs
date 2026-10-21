@@ -29,6 +29,8 @@ use crate::sources::winget::manifest::{EffectiveInstaller, InstallerKind, Merged
 #[derive(Debug, Clone)]
 pub enum Engine {
     Native(WingetPlan),
+    /// Installed as a wingetrs app by the phase 2a executor (Task 189).
+    Portable(super::portable::PortableSpec),
     Bridge(Option<String>),
 }
 
@@ -42,6 +44,7 @@ pub fn choose_engine(
         WingetEngine::Winget => Ok(Engine::Bridge(None)),
         WingetEngine::Wingetrs => match planned? {
             PlanOrBridge::Native(p) => Ok(Engine::Native(p)),
+            PlanOrBridge::Portable(spec) => Ok(Engine::Portable(spec)),
             PlanOrBridge::Bridge(why) => Ok(Engine::Bridge(Some(why))),
         },
     }
@@ -171,6 +174,24 @@ fn bundle_arch(d: &ArpDetails) -> Option<&'static str> {
 // src/AppInstallerCommonCore/Manifest/ManifestComparator.cpp (InstalledScopeFilter,
 // InstalledTypeFilter, allowed architectures); `bridge::winget_applicability` is the other path.
 pub fn plan_upgrade(
+    manifest: &MergedManifest,
+    host: &Host,
+    wanted: ScopeWanted,
+    installed: &str,
+    facts: &InstalledFacts,
+    installer_mode: InstallerMode,
+) -> Result<PlanOrBridge, Refusal> {
+    // A record of the Windows list was not installed by wingetrs: a portable one lives in
+    // winget's folder with winget's ARP entry, and a native upgrade would add a second copy.
+    match plan_upgrade_any(manifest, host, wanted, installed, facts, installer_mode)? {
+        PlanOrBridge::Portable(_) => Ok(PlanOrBridge::Bridge(
+            "tipo portable instalado fora do wingetrs: atualizado pelo winget".to_string(),
+        )),
+        other => Ok(other),
+    }
+}
+
+fn plan_upgrade_any(
     manifest: &MergedManifest,
     host: &Host,
     wanted: ScopeWanted,

@@ -87,6 +87,7 @@ fn native(m: &MergedManifest, wanted: ScopeWanted, from: Option<&str>) -> Winget
     match planned(m, wanted, from).unwrap() {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 
@@ -265,6 +266,7 @@ fn native_agrees_with_winget_applicability() {
         ) {
             Ok(PlanOrBridge::Native(p)) => upgrade_route(&p.installer) != UpgradeRoute::Denied,
             Ok(PlanOrBridge::Bridge(_)) => panic!("{label}: bridge"),
+            Ok(PlanOrBridge::Portable(s)) => panic!("portable: {s:?}"),
             Err(_) => false,
         };
         match fit {
@@ -1044,6 +1046,7 @@ fn upgrade_url(m: &MergedManifest, facts: &InstalledFacts) -> Result<String, Ref
     )? {
         PlanOrBridge::Native(p) => Ok(p.installer.url),
         PlanOrBridge::Bridge(w) => panic!("{w}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 
@@ -1186,6 +1189,7 @@ fn upgrade_follows_installer_mode() {
     {
         PlanOrBridge::Native(p) => p.command.unwrap().args,
         PlanOrBridge::Bridge(w) => panic!("{w}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     };
     let quiet = args(InstallerMode::Silent);
     assert!(quiet.contains("/quiet"), "{quiet}");

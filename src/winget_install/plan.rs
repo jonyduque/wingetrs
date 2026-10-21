@@ -2,7 +2,7 @@
 //! the text shown by `--dry-run` and by every confirmation (CLI and TUI).
 
 use super::launch::{Elevation, install_elevation};
-use super::select::{Host, Refusal, ScopeWanted, Verdict, choose};
+use super::select::{Host, Refusal, Scope, ScopeWanted, Verdict, choose};
 use super::switches::{
     CommandLine, LOG_TOKEN, Mode, Program, install_args, install_args_unlogged, mode_for,
 };
@@ -61,6 +61,8 @@ pub struct WingetPlan {
 #[derive(Debug, Clone)]
 pub enum PlanOrBridge {
     Native(WingetPlan),
+    /// `portable` or zip with portable files: installed as a wingetrs app (Task 189).
+    Portable(super::portable::PortableSpec),
     Bridge(String),
 }
 
@@ -94,6 +96,20 @@ pub fn plan_with_mode(
         Verdict::Bridge(why) => return Ok(PlanOrBridge::Bridge(why)),
         Verdict::Native { interactive } => interactive,
     };
+    if super::portable::is_portable(&sel.installer) {
+        // A wingetrs app lives in the user's root: a machine-wide portable stays with winget.
+        let declared_machine = sel
+            .installer
+            .scope
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("machine"));
+        if declared_machine || wanted == ScopeWanted::Only(Scope::Machine) {
+            return Ok(PlanOrBridge::Bridge(
+                "tipo portable com escopo máquina: instalado pelo winget".to_string(),
+            ));
+        }
+        return super::portable::spec(manifest, &sel.installer).map(PlanOrBridge::Portable);
+    }
     let inst = sel.installer;
     let mode = mode_for(&inst.kind, &inst.switches, installer_mode);
     let elevation = install_elevation(&inst.kind, inst.scope.as_deref(), inst.elevation.as_deref());

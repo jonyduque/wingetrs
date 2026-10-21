@@ -26,6 +26,9 @@ pub struct MergedManifest {
     pub nested_installer_type: Option<String>,
     #[serde(default)]
     pub nested_installer_files: Option<Vec<NestedInstallerFile>>,
+    /// Command names of the package; a `portable` installer's first one is its alias.
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
     #[serde(default)]
     pub installer_locale: Option<String>,
     #[serde(default)]
@@ -108,6 +111,9 @@ pub struct Installer {
     pub nested_installer_type: Option<String>,
     #[serde(default)]
     pub nested_installer_files: Option<Vec<NestedInstallerFile>>,
+    /// Command names of the package; a `portable` installer's first one is its alias.
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
     #[serde(default)]
     pub installer_locale: Option<String>,
     #[serde(default)]
@@ -310,6 +316,8 @@ pub struct EffectiveInstaller {
     pub package_family_name: Option<String>,
     pub arp_entries: Vec<ArpEntry>,
     pub dependencies: Option<Dependencies>,
+    /// `Commands`; for a `portable` installer the first one names its command alias.
+    pub commands: Vec<String>,
     pub url: String,
     pub sha256: String,
 }
@@ -412,6 +420,11 @@ impl MergedManifest {
                         .or(root.apps_and_features_entries.clone())
                         .unwrap_or_default(),
                     dependencies: i.dependencies.clone().or(root.dependencies.clone()),
+                    commands: i
+                        .commands
+                        .clone()
+                        .or(root.commands.clone())
+                        .unwrap_or_default(),
                     url: i.installer_url.clone(),
                     sha256: i.installer_sha256.clone(),
                 }

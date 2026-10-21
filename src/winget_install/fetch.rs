@@ -141,7 +141,7 @@ fn one_component(name: &str) -> bool {
 
 /// `https`, or plain `http` only to a loopback host (`127.0.0.1`, `::1`, `localhost`) and
 /// without credentials in the URL. Parsed with `reqwest::Url`, never by text prefix.
-fn scheme_allowed(raw: &str) -> bool {
+pub(crate) fn scheme_allowed(raw: &str) -> bool {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     let Ok(u) = reqwest::Url::parse(raw) else {
         return false;

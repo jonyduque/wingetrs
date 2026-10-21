@@ -416,6 +416,7 @@ fn native_plan() -> WingetPlan {
     match plan(&m, &host, ScopeWanted::Prefer(Scope::User), None).unwrap() {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 
@@ -1084,6 +1085,7 @@ fn plan_of(kind: &str) -> WingetPlan {
     {
         PlanOrBridge::Native(p) => p,
         PlanOrBridge::Bridge(why) => panic!("bridge: {why}"),
+        PlanOrBridge::Portable(s) => panic!("portable: {s:?}"),
     }
 }
 

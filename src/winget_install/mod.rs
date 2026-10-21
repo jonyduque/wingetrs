@@ -21,6 +21,7 @@ pub mod orphans;
 #[cfg(windows)]
 pub mod orphans_win;
 pub mod plan;
+pub mod portable;
 pub mod post_check;
 pub mod previous;
 #[cfg(windows)]
