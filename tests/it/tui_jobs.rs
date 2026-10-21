@@ -177,7 +177,8 @@ async fn plan_install_gives_a_confirmation_for_a_scoop_package() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { text, action }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    let Ok(Planned::Ready { text, action }) =
+        jobs::plan_install(&ctx, &wsrc(), "scoop:main", "leaf", false)
     else {
         panic!("expected Ready");
     };
@@ -190,8 +191,8 @@ async fn plan_install_reports_unknown_packages_and_non_scoop_sources() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    assert!(jobs::plan_install(&ctx, "scoop:main", "ghost", false).is_err());
-    assert!(jobs::plan_install(&ctx, "winget", "leaf", false).is_err());
+    assert!(jobs::plan_install(&ctx, &wsrc(), "scoop:main", "ghost", false).is_err());
+    assert!(jobs::plan_install(&ctx, &wsrc(), "winget", "leaf", false).is_err());
 }
 
 #[tokio::test]
@@ -205,7 +206,8 @@ async fn run_action_installs_reports_progress_and_then_removes() {
         }
     };
     let ctx = w.ctx(LockWait::NoWait, &record);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    let Ok(Planned::Ready { action, .. }) =
+        jobs::plan_install(&ctx, &wsrc(), "scoop:main", "leaf", false)
     else {
         panic!("expected Ready");
     };
@@ -234,7 +236,7 @@ async fn run_action_applies_all_groups_with_one_broadcast() {
         let Ok(Planned::Ready {
             action: Action::Apply(g),
             ..
-        }) = jobs::plan_install(&ctx, "scoop:main", id, false)
+        }) = jobs::plan_install(&ctx, &wsrc(), "scoop:main", id, false)
         else {
             panic!("expected Ready");
         };
@@ -250,7 +252,8 @@ async fn held_install_lock_is_busy_not_a_failure_text() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    let Ok(Planned::Ready { action, .. }) =
+        jobs::plan_install(&ctx, &wsrc(), "scoop:main", "leaf", false)
     else {
         panic!("expected Ready");
     };
@@ -465,7 +468,8 @@ async fn plan_remove_text_uses_the_plan_lines() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    let Ok(Planned::Ready { action, .. }) =
+        jobs::plan_install(&ctx, &wsrc(), "scoop:main", "leaf", false)
     else {
         panic!("expected Ready");
     };
@@ -523,7 +527,8 @@ async fn purge_plan_says_data_will_be_deleted() {
     let mut w = World::new().await;
     w.add("leaf").await;
     let ctx = w.ctx(LockWait::NoWait, &quiet);
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    let Ok(Planned::Ready { action, .. }) =
+        jobs::plan_install(&ctx, &wsrc(), "scoop:main", "leaf", false)
     else {
         panic!("expected Ready");
     };
@@ -1362,7 +1367,7 @@ fn planned_groups(
     ctx: &wingetrs::install::ops::OpsCtx<'_>,
     id: &str,
 ) -> Vec<Vec<wingetrs::install::plan::InstallPlan>> {
-    match jobs::plan_install(ctx, "scoop:main", id, false) {
+    match jobs::plan_install(ctx, &wsrc(), "scoop:main", id, false) {
         Ok(Planned::Ready {
             action: Action::Apply(groups),
             ..
@@ -1571,7 +1576,8 @@ async fn run_action_logs_start_and_end_of_own_jobs() {
     let ctx = w.ctx(LockWait::NoWait, &quiet);
     let log = crate::spans::Log::default();
     let _installed = log.install();
-    let Ok(Planned::Ready { action, .. }) = jobs::plan_install(&ctx, "scoop:main", "leaf", false)
+    let Ok(Planned::Ready { action, .. }) =
+        jobs::plan_install(&ctx, &wsrc(), "scoop:main", "leaf", false)
     else {
         panic!("expected Ready");
     };
@@ -1650,4 +1656,9 @@ fn a_context_that_failed_to_build_still_logs_the_job() {
         end.contains("outcome=falhou") && end.contains("catálogo ausente"),
         "{end}"
     );
+}
+
+/// Winget manifests are never read by these scoop plans.
+fn wsrc() -> jobs::WingetSrc {
+    jobs::WingetSrc::production(&tokio::runtime::Handle::current())
 }

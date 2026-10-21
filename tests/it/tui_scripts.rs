@@ -485,7 +485,7 @@ async fn plans_of(w: &World, host: &Arc<FakeHost>) -> Vec<Vec<InstallPlan>> {
     let Ok(Planned::Ready {
         action: Action::Apply(groups),
         ..
-    }) = jobs::plan_install(&ctx, "scoop:main", "hooked", false)
+    }) = jobs::plan_install(&ctx, &wsrc(), "scoop:main", "hooked", false)
     else {
         panic!("expected a ready plan");
     };
@@ -788,4 +788,9 @@ fn code_lines(n: usize) -> Vec<wingetrs::tui::app::ScriptLine> {
             text: format!("  {i} | x"),
         })
         .collect()
+}
+
+/// Winget manifests are never read by these scoop plans.
+fn wsrc() -> jobs::WingetSrc {
+    jobs::WingetSrc::production(&tokio::runtime::Handle::current())
 }

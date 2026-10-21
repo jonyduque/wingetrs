@@ -445,8 +445,8 @@ async fn event_loop(
                     id,
                     keep,
                 } => {
-                    spawn_plan(&ctx, move |o| {
-                        jobs::plan_install(o, &source_name, &id, keep)
+                    spawn_plan(&ctx, move |o, w| {
+                        jobs::plan_install(o, w, &source_name, &id, keep)
                     });
                 }
                 Cmd::PlanWingetInstall { id } => spawn_winget_plan(&ctx, id),
@@ -466,19 +466,20 @@ async fn event_loop(
                     Msg::WingetUninstallPlanned(plan_winget_uninstall(c, h, &req))
                 }),
                 Cmd::PlanRemove { app, purge } => {
-                    spawn_plan(&ctx, move |o| jobs::plan_remove(o, &app, purge));
+                    spawn_plan(&ctx, move |o, _| jobs::plan_remove(o, &app, purge));
                 }
                 Cmd::PlanBatch { items } => {
-                    spawn_job(&ctx, move |c, _| {
+                    spawn_job(&ctx, move |c, h| {
+                        let w = jobs::WingetSrc::production(h);
                         Msg::BatchPlanned(
-                            with_ops(c, &no_progress, |o| jobs::plan_batch(o, &items))
+                            with_ops(c, &no_progress, |o| jobs::plan_batch(o, &w, &items))
                                 .unwrap_or_else(|e| vec![Err(e)]),
                         )
                     });
                 }
                 Cmd::FetchApplicability { rows } => spawn_applicability(&ctx, rows),
                 Cmd::PlanUpgradeAll { keep } => {
-                    spawn_plan(&ctx, move |o| jobs::plan_upgrade_all(o, keep));
+                    spawn_plan(&ctx, move |o, w| jobs::plan_upgrade_all(o, w, keep));
                 }
                 Cmd::SaveSettings {
                     behavior,
@@ -1672,10 +1673,11 @@ fn spawn_job(
 
 fn spawn_plan(
     ctx: &Arc<Ctx>,
-    plan: impl FnOnce(&OpsCtx<'_>) -> Result<Planned, String> + Send + 'static,
+    plan: impl FnOnce(&OpsCtx<'_>, &jobs::WingetSrc) -> Result<Planned, String> + Send + 'static,
 ) {
-    spawn_job(ctx, move |c, _| {
-        Msg::Planned(with_ops(c, &no_progress, plan).and_then(|r| r))
+    spawn_job(ctx, move |c, h| {
+        let w = jobs::WingetSrc::production(h);
+        Msg::Planned(with_ops(c, &no_progress, |o| plan(o, &w)).and_then(|r| r))
     });
 }
 

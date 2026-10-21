@@ -6,26 +6,43 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use wingetrs::bridge::BridgeJob;
+use wingetrs::bridge::worker::ScopeArg;
 use wingetrs::cache::DataDir;
 use wingetrs::catalog::{Catalog, NewPackage, WingetMaps};
-use wingetrs::config::InstallerMode;
+use wingetrs::cli::install_cmd::{Flags, Interrupts, Stop, Ui};
+use wingetrs::cli::winget_cmd::{self, WingetFlows};
+use wingetrs::config::{Behavior, ConfirmMode, InstallerMode};
 use wingetrs::core::SourceKind;
 use wingetrs::http::Http;
+use wingetrs::install::executor::LaunchGate;
 use wingetrs::install::layout::Layout;
 use wingetrs::install::ops::{OpsCtx, ResidueScan, apply, plan_manifest, upgradable};
 use wingetrs::install::plan::{InstallPlan, ShimKind, Step};
 use wingetrs::install::state::StateDb;
+use wingetrs::install::target::Candidate;
 use wingetrs::install::traits::Effects;
 use wingetrs::install::traits::fake::{FakeEnv, FakeRegistry, FakeShortcuts, FakeTrash};
+use wingetrs::installed::correlate::ListRow;
 use wingetrs::installed::correlate::{Correlation, UpdateState, correlate};
 use wingetrs::sources::winget::manifest;
+use wingetrs::tui::app::{Action, App, Cmd, Done, InstallFail, Modal, Msg, Planned, update};
+use wingetrs::tui::jobs;
+use wingetrs::tui::picker::PickerItem;
+use wingetrs::tui::theme::GlyphSet;
 use wingetrs::update::LockWait;
+use wingetrs::winget_install::engine::UpgradeError;
 use wingetrs::winget_install::engine::{InstalledFacts, plan_upgrade};
+use wingetrs::winget_install::ops::{InstallReport, WingetOpsError};
+use wingetrs::winget_install::orphans::Orphan;
+use wingetrs::winget_install::plan::WingetPlan;
 use wingetrs::winget_install::plan::{PlanOrBridge, plan_with_mode};
 use wingetrs::winget_install::portable::{
     PortableSpec, WINGET_BUCKET, install_plan, plan_from_catalog,
 };
+use wingetrs::winget_install::select::Refusal;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
+use wingetrs::winget_install::uninstall::{UninstallPlan, UninstallTarget};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -653,4 +670,438 @@ fn upgrade_of_a_portable_record_of_the_windows_list_goes_to_winget() {
         Ok(PlanOrBridge::Bridge(why)) => assert!(why.contains("portable"), "{why}"),
         other => panic!("expected bridge, got {other:?}"),
     }
+}
+// ---- CLI and TUI wiring (review of Task 189) ----
+
+const EULA: &str = "Agreements:\n- AgreementLabel: EULA\n  AgreementUrl: https://x/eula\n";
+
+/// A portable `Pub.App` `ver` whose root carries `root` (e.g. its agreements).
+fn portable_with_root(w: &World, ver: &str, root: &str) -> PortableSpec {
+    let text = format!(
+        "PackageIdentifier: {ID}\nPackageVersion: '{ver}'\nPackageName: Pub App\n{root}Installers:\n- Architecture: x64\n  InstallerUrl: {}/dl/tool.exe\n  InstallerSha256: {}\n  InstallerType: portable\n  Commands:\n  - x\n",
+        w.server.uri(),
+        sha256_hex(b"x")
+    );
+    portable_spec(&manifest::parse(text.as_bytes()).unwrap())
+}
+
+struct NoUi;
+
+impl Ui for NoUi {
+    fn interactive(&self) -> bool {
+        false
+    }
+    fn confirm(&self, _: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    fn pick(&self, _: Vec<PickerItem>) -> anyhow::Result<Option<usize>> {
+        Ok(None)
+    }
+    fn pick_many(&self, _: Vec<PickerItem>, _: &[bool]) -> anyhow::Result<Option<Vec<usize>>> {
+        Ok(None)
+    }
+}
+
+/// Answers `planned` and records the spec `install_portable` receives; nothing else is asked.
+struct PortableFlows {
+    planned: PlanOrBridge,
+    received: std::cell::RefCell<Vec<PortableSpec>>,
+}
+
+impl WingetFlows for PortableFlows {
+    fn behavior(&self) -> Behavior {
+        Behavior::default()
+    }
+    async fn plan_install(
+        &self,
+        _: &Candidate,
+        _: ScopeWanted,
+    ) -> anyhow::Result<Result<PlanOrBridge, Refusal>> {
+        Ok(Ok(self.planned.clone()))
+    }
+    async fn install_portable<I: Interrupts>(
+        &self,
+        _: &dyn Ui,
+        spec: &PortableSpec,
+        _: Flags,
+        _: Stop<'_, I>,
+    ) -> anyhow::Result<()> {
+        self.received.borrow_mut().push(spec.clone());
+        Ok(())
+    }
+    fn gate(&self) -> LaunchGate {
+        unreachable!("portable")
+    }
+    fn progress(&self) -> winget_cmd::Sink {
+        unreachable!("portable")
+    }
+    fn install(&self, _: &WingetPlan) -> winget_cmd::Op<Result<InstallReport, WingetOpsError>> {
+        unreachable!("portable")
+    }
+    async fn install_bridge<I: Interrupts>(
+        &self,
+        _: &dyn Ui,
+        _: &Candidate,
+        _: Option<ScopeArg>,
+        _: Option<&str>,
+        _: Flags,
+        _: Stop<'_, I>,
+    ) -> anyhow::Result<()> {
+        unreachable!("portable")
+    }
+    fn installed(&self) -> anyhow::Result<Vec<ListRow>> {
+        unreachable!("portable")
+    }
+    async fn plan_uninstall(
+        &self,
+        _: &ListRow,
+        _: &UninstallTarget,
+    ) -> Result<UninstallPlan, String> {
+        unreachable!("portable")
+    }
+    fn lock_install(&self) -> winget_cmd::Op<Result<winget_cmd::Held, WingetOpsError>> {
+        unreachable!("portable")
+    }
+    fn uninstall(&self, _: &UninstallPlan) -> winget_cmd::Uninstaller {
+        unreachable!("portable")
+    }
+    fn remove_registry_only(&self, _: &UninstallPlan, _: &str) -> winget_cmd::RecordRemover {
+        unreachable!("portable")
+    }
+    fn free_space(&self) -> fn(&Path) -> Option<u64> {
+        unreachable!("portable")
+    }
+    fn pins(&self) -> std::collections::BTreeSet<String> {
+        std::collections::BTreeSet::new()
+    }
+    async fn plan_upgrade(
+        &self,
+        _: &ListRow,
+        _: &str,
+        _: ScopeWanted,
+    ) -> anyhow::Result<(Result<PlanOrBridge, Refusal>, Option<UninstallPlan>)> {
+        unreachable!("portable")
+    }
+    fn upgrade(
+        &self,
+        _: &WingetPlan,
+        _: Option<&UninstallPlan>,
+    ) -> winget_cmd::Op<Result<InstallReport, UpgradeError>> {
+        unreachable!("portable")
+    }
+    fn upgrade_bridge(&self, _: &BridgeJob, _: &mut dyn FnMut(&str)) -> Result<Done, InstallFail> {
+        unreachable!("portable")
+    }
+    fn orphans(&self) -> anyhow::Result<Vec<Orphan>> {
+        unreachable!("portable")
+    }
+    fn backups(&self) -> PathBuf {
+        unreachable!("portable")
+    }
+    fn remove_orphan(
+        &self,
+        _: &Orphan,
+        _: &str,
+        _: &dyn Fn(&wingetrs::install::progress::ProgressEvent),
+    ) -> Result<PathBuf, String> {
+        unreachable!("portable")
+    }
+}
+
+fn candidate() -> Candidate {
+    Candidate {
+        entry: wingetrs::core::PackageEntry {
+            source: SourceKind::Winget,
+            source_name: "winget".into(),
+            id: ID.into(),
+            name: "Pub App".into(),
+            moniker: None,
+            version: "1.0".into(),
+            publisher: None,
+            description: None,
+            tags: Vec::new(),
+            commands: Vec::new(),
+        },
+        selectable: true,
+        note: None,
+    }
+}
+
+/// The CLI's `install` lines and the specs its flows were handed.
+async fn cli_install(spec: &PortableSpec, f: Flags) -> (Vec<String>, Vec<PortableSpec>) {
+    let flows = PortableFlows {
+        planned: PlanOrBridge::Portable(spec.clone()),
+        received: Default::default(),
+    };
+    let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let gate = LaunchGate::default();
+    let mut out = Vec::new();
+    winget_cmd::install(
+        &flows,
+        &NoUi,
+        &candidate(),
+        None,
+        f,
+        Stop::new(&mut rx, &gate),
+        &mut |l: &str| out.push(l.to_string()),
+    )
+    .await
+    .unwrap();
+    (out, flows.received.into_inner())
+}
+
+#[tokio::test]
+async fn cli_portable_prints_agreements_and_hands_the_spec_over() {
+    let w = World::new().await;
+    let spec = portable_with_root(&w, "1.0", EULA);
+    let yes = Flags {
+        yes: true,
+        ..Default::default()
+    };
+    let (out, received) = cli_install(&spec, yes).await;
+    let text = out.join("\n");
+    assert!(
+        text.contains("Licença aceita: EULA — https://x/eula"),
+        "{text}"
+    );
+    assert_eq!(received, vec![spec.clone()]);
+    // without --yes the agreement is shown, not accepted
+    let (out, received) = cli_install(&spec, Flags::default()).await;
+    let text = out.join("\n");
+    assert!(text.contains("EULA — https://x/eula"), "{text}");
+    assert!(!text.contains("Licença aceita"), "{text}");
+    assert_eq!(received, vec![spec]);
+    // no agreements: no license line
+    let bare = portable_with_root(&w, "1.0", "");
+    let (out, received) = cli_install(&bare, yes).await;
+    assert!(!out.join("\n").contains("EULA"), "{out:?}");
+    assert_eq!(received, vec![bare]);
+}
+
+fn tui_app(confirm: ConfirmMode) -> App {
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.settings.behavior.confirm = confirm;
+    a
+}
+
+#[tokio::test]
+async fn tui_engine_portable_asks_for_the_2a_plan() {
+    let w = World::new().await;
+    let spec = portable_with_root(&w, "1.0", "");
+    for keep in [false, true] {
+        let mut a = tui_app(ConfirmMode::Always);
+        a.settings.behavior.keep_old = keep;
+        let cmds = update(
+            &mut a,
+            Msg::WingetInstallPlanned {
+                bridge: Err("sem ponte".into()),
+                native: Ok(PlanOrBridge::Portable(spec.clone())),
+            },
+        );
+        assert_eq!(
+            cmds,
+            vec![Cmd::PlanPortable {
+                spec: spec.clone(),
+                keep
+            }]
+        );
+        assert!(a.modal.is_none());
+    }
+}
+
+#[tokio::test]
+async fn tui_portable_planned_each_arm() {
+    let w = World::new().await;
+    let spec = portable_with_root(&w, "1.0", "");
+    let planned = || jobs::plan_portable(&w.ctx(), &spec, false);
+    let license = "Licença: EULA — https://x/eula".to_string();
+
+    // agreements: the confirmation opens even with confirmations turned off, and shows them
+    let mut a = tui_app(ConfirmMode::Never);
+    let cmds = update(
+        &mut a,
+        Msg::PortablePlanned {
+            result: planned(),
+            agreements: vec![license.clone()],
+        },
+    );
+    assert!(cmds.is_empty(), "{cmds:?}");
+    match &a.modal {
+        Some(Modal::Confirm { notes, actions, .. }) => {
+            assert_eq!(notes, &vec![license.clone()]);
+            assert!(
+                matches!(actions.as_slice(), [Action::Apply(_)]),
+                "{actions:?}"
+            );
+        }
+        _ => panic!("expected the confirmation"),
+    }
+
+    // no agreements, confirmations off: it starts at once, like any 2a plan
+    let mut a = tui_app(ConfirmMode::Never);
+    let cmds = update(
+        &mut a,
+        Msg::PortablePlanned {
+            result: planned(),
+            agreements: Vec::new(),
+        },
+    );
+    assert!(a.modal.is_none());
+    assert!(
+        matches!(cmds.as_slice(), [Cmd::Execute(Action::Apply(_))]),
+        "{cmds:?}"
+    );
+
+    // no agreements, confirmations on: the usual confirmation, without notes
+    let mut a = tui_app(ConfirmMode::Always);
+    let cmds = update(
+        &mut a,
+        Msg::PortablePlanned {
+            result: planned(),
+            agreements: Vec::new(),
+        },
+    );
+    assert!(cmds.is_empty(), "{cmds:?}");
+    match &a.modal {
+        Some(Modal::Confirm { notes, .. }) => assert!(notes.is_empty(), "{notes:?}"),
+        _ => panic!("expected the confirmation"),
+    }
+
+    // a failed plan is a toast, with or without agreements
+    let mut a = tui_app(ConfirmMode::Never);
+    let cmds = update(
+        &mut a,
+        Msg::PortablePlanned {
+            result: Err("falhou".into()),
+            agreements: vec![license],
+        },
+    );
+    assert!(cmds.is_empty() && a.modal.is_none(), "{cmds:?}");
+}
+
+/// The text of a TUI plan.
+fn planned_text(p: Result<Planned, String>) -> String {
+    match p {
+        Ok(Planned::Ready { text, .. }) => text,
+        Ok(_) => panic!("expected Ready"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[tokio::test]
+async fn cli_and_tui_portable_plans_are_the_same() {
+    let w = World::new().await;
+    let exe = fake_pe();
+    let url = w.serve("tool.exe", exe.clone()).await;
+    let alias = "  InstallerType: portable\n  Commands:\n  - x\n";
+    let one = portable_spec(&yaml(&url, &sha256_hex(&exe), alias));
+    apply(&w.ctx(), &[w.plan(&one)]).await.unwrap();
+    let two = portable_spec(&with(ID, "2.0", &url, &sha256_hex(&exe), alias));
+
+    let mut texts = Vec::new();
+    for keep in [false, true] {
+        let behavior = Behavior {
+            keep_old: keep,
+            ..Behavior::default()
+        };
+        let cli = winget_cmd::portable_plan(&w.ctx(), &two, behavior)
+            .unwrap()
+            .to_string();
+        let mut a = tui_app(ConfirmMode::Always);
+        a.settings.behavior = behavior;
+        let cmds = update(
+            &mut a,
+            Msg::WingetInstallPlanned {
+                bridge: Err("sem ponte".into()),
+                native: Ok(PlanOrBridge::Portable(two.clone())),
+            },
+        );
+        let [Cmd::PlanPortable { spec, keep: k }] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        let tui = planned_text(jobs::plan_portable(&w.ctx(), spec, *k));
+        assert_eq!(cli, tui, "keep_old = {keep}");
+        texts.push(cli);
+    }
+    // the setting reaches both plans: keeping 1.0 is a different plan
+    assert_ne!(texts[0], texts[1]);
+}
+
+/// Runs a TUI planning job as `spawn_job` does: on a thread outside the runtime, blocking on it.
+fn tui_upgrade_world() -> (tokio::runtime::Runtime, World, jobs::WingetSrc) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut w = rt.block_on(World::new());
+    let alias = "  InstallerType: portable\n  Commands:\n  - x\n";
+    let one = fake_pe();
+    let url = rt.block_on(w.serve("tool.exe", one.clone()));
+    let plan = w.plan(&portable_spec(&yaml(&url, &sha256_hex(&one), alias)));
+    rt.block_on(apply(&w.ctx(), std::slice::from_ref(&plan)))
+        .unwrap();
+    let two = [fake_pe(), b"v2".to_vec()].concat();
+    let url2 = rt.block_on(w.serve("tool2.exe", two.clone()));
+    let text = manifest_text("2.0", &url2, &sha256_hex(&two), alias);
+    let base = rt.block_on(publish(&mut w, "2.0", &text));
+    let src = jobs::WingetSrc {
+        handle: rt.handle().clone(),
+        cdn_base: base,
+    };
+    (rt, w, src)
+}
+
+fn upgrade_groups(p: Result<Planned, String>) -> Vec<Vec<InstallPlan>> {
+    match p {
+        Ok(Planned::Ready {
+            action: Action::Apply(groups),
+            ..
+        }) => groups,
+        Ok(other) => panic!("expected Apply, got {other:?}"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[test]
+fn tui_jobs_plan_the_portable_upgrade_from_the_catalog() {
+    let (_rt, w, src) = tui_upgrade_world();
+    let ctx = w.ctx();
+    let check = |groups: Vec<Vec<InstallPlan>>| {
+        let [group] = groups.as_slice() else {
+            panic!("{groups:?}")
+        };
+        let [plan] = group.as_slice() else {
+            panic!("{group:?}")
+        };
+        assert_eq!(
+            (plan.version.as_str(), plan.upgrade_from.as_deref()),
+            ("2.0", Some("1.0"))
+        );
+        assert_eq!(download_names(plan), vec!["tool2.exe".to_string()]);
+    };
+    // the upgrade of one row (source `winget`)
+    check(upgrade_groups(jobs::plan_install(
+        &ctx, &src, "winget", ID, false,
+    )));
+    // "upgrade all"
+    check(upgrade_groups(jobs::plan_upgrade_all(&ctx, &src, false)));
+    // a batch item
+    let batch = jobs::plan_batch(
+        &ctx,
+        &src,
+        &[Cmd::PlanInstall {
+            source_name: "winget".into(),
+            id: ID.into(),
+            keep: false,
+        }],
+    );
+    let [one] = <[_; 1]>::try_from(batch).unwrap();
+    check(upgrade_groups(one));
+    // an id that wingetrs did not install from winget
+    let e = jobs::plan_install(&ctx, &src, "winget", "Other.App", false).unwrap_err();
+    assert!(
+        e.contains("não é um pacote do winget instalado pelo wingetrs"),
+        "{e}"
+    );
 }

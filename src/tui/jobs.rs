@@ -168,7 +168,7 @@ fn plans_text(groups: &[Vec<InstallPlan>]) -> String {
 
 /// Plans each item of a batch in turn (one failure does not stop the others); only
 /// `PlanInstall` and `PlanRemove` are plans.
-pub fn plan_batch(c: &OpsCtx<'_>, items: &[Cmd]) -> Vec<Result<Planned, String>> {
+pub fn plan_batch(c: &OpsCtx<'_>, w: &WingetSrc, items: &[Cmd]) -> Vec<Result<Planned, String>> {
     items
         .iter()
         .map(|item| match item {
@@ -176,7 +176,7 @@ pub fn plan_batch(c: &OpsCtx<'_>, items: &[Cmd]) -> Vec<Result<Planned, String>>
                 source_name,
                 id,
                 keep,
-            } => plan_install(c, source_name, id, *keep),
+            } => plan_install(c, w, source_name, id, *keep),
             Cmd::PlanRemove { app, purge } => plan_remove(c, app, *purge),
             _ => Err("item de lote inválido".to_string()),
         })
@@ -278,19 +278,42 @@ fn winget_host() -> Result<crate::winget_install::select::Host, String> {
     Err("pacotes do winget só no Windows".to_string())
 }
 
+/// Where a planning job reads winget manifests from: the runtime that awaits the read (the
+/// job's blocking thread blocks on it) and the CDN base.
+#[derive(Debug, Clone)]
+pub struct WingetSrc {
+    pub handle: tokio::runtime::Handle,
+    pub cdn_base: String,
+}
+
+impl WingetSrc {
+    /// The winget CDN, read through `handle` (the one `spawn_job` hands to the job).
+    pub fn production(handle: &tokio::runtime::Handle) -> WingetSrc {
+        WingetSrc {
+            handle: handle.clone(),
+            cdn_base: crate::sources::winget::CDN_BASE.to_string(),
+        }
+    }
+}
+
 /// The upgrade plan of wingetrs app `id`, a portable package of the winget catalog. Runs on a
 /// job's blocking thread: the manifest read (cached blob, else the CDN) is awaited here.
-fn portable_upgrade(c: &OpsCtx<'_>, id: &str, keep: bool) -> Result<InstallPlan, String> {
+fn portable_upgrade(
+    c: &OpsCtx<'_>,
+    w: &WingetSrc,
+    id: &str,
+    keep: bool,
+) -> Result<InstallPlan, String> {
     let host = winget_host()?;
-    let rt = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
-    rt.block_on(crate::winget_install::portable::plan_from_catalog(
-        c,
-        crate::sources::winget::CDN_BASE,
-        &host,
-        id,
-        keep,
-    ))
-    .map_err(|e| e.to_string())
+    w.handle
+        .block_on(crate::winget_install::portable::plan_from_catalog(
+            c,
+            &w.cdn_base,
+            &host,
+            id,
+            keep,
+        ))
+        .map_err(|e| e.to_string())
 }
 
 /// Plans installing (or upgrading) `id` from the scoop bucket in `source_name`; `keep` keeps
@@ -298,6 +321,7 @@ fn portable_upgrade(c: &OpsCtx<'_>, id: &str, keep: bool) -> Result<InstallPlan,
 /// wingetrs app.
 pub fn plan_install(
     c: &OpsCtx<'_>,
+    w: &WingetSrc,
     source_name: &str,
     id: &str,
     keep: bool,
@@ -308,7 +332,7 @@ pub fn plan_install(
             .map_err(|e| e.to_string())?;
         return match rec {
             Some((r, _)) if r.bucket == crate::winget_install::portable::WINGET_BUCKET => {
-                portable_upgrade(c, id, keep).map(one_plan)
+                portable_upgrade(c, w, id, keep).map(one_plan)
             }
             _ => Err(format!(
                 "{id} não é um pacote do winget instalado pelo wingetrs"
@@ -366,7 +390,7 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
 }
 
 /// Plans upgrading every upgradable app; `keep` keeps the old versions.
-pub fn plan_upgrade_all(c: &OpsCtx<'_>, keep: bool) -> Result<Planned, String> {
+pub fn plan_upgrade_all(c: &OpsCtx<'_>, w: &WingetSrc, keep: bool) -> Result<Planned, String> {
     let (list, _pinned) = ops::upgradable(c)
         .map_err(|e| e.to_string())?
         .without_pinned(&crate::pins::load(c.data));
@@ -388,7 +412,7 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>, keep: bool) -> Result<Planned, String> {
             .map(|(_, b)| b.as_str())
             .ok_or_else(|| format!("{app}: não está no registro do wingetrs"))?;
         if bucket == crate::winget_install::portable::WINGET_BUCKET {
-            groups.push(vec![portable_upgrade(c, app, keep)?]);
+            groups.push(vec![portable_upgrade(c, w, app, keep)?]);
             continue;
         }
         match ops::resolve_installed(c, app, bucket).map_err(|e| e.to_string())? {
@@ -1141,7 +1165,7 @@ fn bridge_run(
                 reason = "fonte do winget atrasada",
                 "job.retry"
             );
-            on_line("atualizando a fonte do winget");
+            on_line(crate::bridge::winget_out::UPDATING_SOURCE);
             let (src_program, src_args) = bridge::winget_source_update();
             match exec(&src_program, &src_args, &mut |_: &str| {}) {
                 Ok((0, _)) => continue,

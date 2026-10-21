@@ -71,7 +71,7 @@ fn alias_of(raw: Option<&str>) -> Result<Option<String>, Refusal> {
     let Some(a) = raw.map(str::trim).filter(|a| !a.is_empty()) else {
         return Ok(None);
     };
-    if !one_component(a) || !crate::install::shim::is_safe_shim_name(a) {
+    if !crate::install::shim::is_safe_shim_name(a) {
         return Err(Refusal(format!(
             "apelido de comando inválido no manifesto: {a}"
         )));

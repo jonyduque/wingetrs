@@ -509,6 +509,18 @@ fn print_report(r: &InstallReport, done: &str, plan: &WingetPlan, say: Say<'_>) 
     }
 }
 
+/// The phase 2a plan of portable package `spec` for the CLI: keeps the old version on an
+/// upgrade when `[behavior] keep_old` says so, as the TUI does (Task 189).
+pub fn portable_plan(
+    ctx: &OpsCtx<'_>,
+    spec: &PortableSpec,
+    b: Behavior,
+) -> anyhow::Result<InstallPlan> {
+    Ok(crate::winget_install::portable::install_plan(
+        ctx, spec, b.keep_old,
+    )?)
+}
+
 /// `wingetrs install <winget id>`: natively when the engine and the planner allow it,
 /// through winget otherwise (saying why).
 pub async fn install<F: WingetFlows>(

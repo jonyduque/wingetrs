@@ -221,7 +221,7 @@ impl WingetFlows for ProdFlows<'_, '_> {
         f: Flags,
         stop: Stop<'_, I>,
     ) -> anyhow::Result<()> {
-        let plan = portable::install_plan(self.ctx, spec, false)?;
+        let plan = winget_cmd::portable_plan(self.ctx, spec, self.behavior)?;
         install_cmd::apply_install(self.ctx, ui, vec![plan], f, stop).await
     }
 
