@@ -24,6 +24,9 @@ pub enum HttpError {
     TooLarge(usize),
     #[error("redirecionamento de https para http recusado: {0} (permita em Ajustes)")]
     InsecureRedirect(String),
+    /// The server's certificate chain does not end in a trusted root.
+    #[error("certificado do servidor não confiável: {0}")]
+    UntrustedCertificate(String),
 }
 
 impl HttpError {
@@ -89,6 +92,11 @@ fn map_err(e: reqwest::Error) -> HttpError {
         if let Some(i) = s.downcast_ref::<InsecureRedirectError>() {
             return HttpError::InsecureRedirect(i.0.clone());
         }
+        // rustls's `Error::InvalidCertificate` (not a direct dependency: matched by its text).
+        let text = s.to_string();
+        if text.contains("invalid peer certificate") {
+            return HttpError::UntrustedCertificate(text);
+        }
         src = s.source();
     }
     if e.is_timeout() {
@@ -126,6 +134,20 @@ pub struct Http {
     chunk_timeout: Duration,
     connect_timeout: Duration,
     allow_http_redirect: Arc<AtomicBool>,
+    /// [`Http::for_elevated`]: no proxy and only these roots, on every client it builds.
+    pinned_roots: Option<Arc<Vec<reqwest::Certificate>>>,
+}
+
+/// No proxy (neither the environment's nor the system's: both are the user's to set) and
+/// `roots` as the only trusted roots, when given.
+fn lock_down(
+    b: reqwest::ClientBuilder,
+    roots: Option<&Arc<Vec<reqwest::Certificate>>>,
+) -> reqwest::ClientBuilder {
+    match roots {
+        Some(r) => b.no_proxy().tls_certs_only(r.iter().cloned()),
+        None => b,
+    }
 }
 
 impl Http {
@@ -154,7 +176,70 @@ impl Http {
             chunk_timeout: Duration::from_secs(30),
             connect_timeout: connect,
             allow_http_redirect,
+            pinned_roots: None,
         })
+    }
+
+    /// The client of code that runs elevated (`self apply-elevated`): no proxy at all and only
+    /// `roots` (DER, read from the machine's certificate stores, which only an administrator
+    /// writes) as trusted roots, instead of `Http::new`'s user proxy and the platform verifier
+    /// (which trusts `CurrentUser\Root`). Roots that rustls cannot use are skipped; none left
+    /// is an error. Same timeouts and redirect policies as [`Http::new`].
+    pub fn for_elevated(roots: &[Vec<u8>]) -> Result<Http, HttpError> {
+        let usable: Vec<reqwest::Certificate> = roots
+            .iter()
+            .filter_map(|der| reqwest::Certificate::from_der(der).ok())
+            .filter(|c| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .tls_certs_only([c.clone()])
+                    .build()
+                    .is_ok()
+            })
+            .collect();
+        if usable.is_empty() {
+            return Err(HttpError::UntrustedCertificate(
+                "nenhuma raiz utilizável no repositório de certificados da máquina".into(),
+            ));
+        }
+        let roots = Some(Arc::new(usable));
+        let (connect, total) = (Duration::from_secs(10), Duration::from_secs(60));
+        let allow_http_redirect = Arc::new(AtomicBool::new(false));
+        let client = lock_down(reqwest::Client::builder(), roots.as_ref())
+            .redirect(redirect_policy(allow_http_redirect.clone()))
+            .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(connect)
+            .timeout(total)
+            .build()
+            .map_err(|e| HttpError::Network(e.to_string()))?;
+        let dl_client = lock_down(reqwest::Client::builder(), roots.as_ref())
+            .redirect(redirect_policy(allow_http_redirect.clone()))
+            .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(connect)
+            .build()
+            .map_err(|e| HttpError::Network(e.to_string()))?;
+        Ok(Http {
+            client,
+            dl_client,
+            chunk_timeout: Duration::from_secs(30),
+            connect_timeout: connect,
+            allow_http_redirect,
+            pinned_roots: roots,
+        })
+    }
+
+    /// Whether any client of this `Http` may go through a proxy (explicit or the system's).
+    pub fn may_use_proxy(&self) -> bool {
+        // reqwest lists `proxies` in a client's `Debug` exactly when it has any, the system
+        // one included.
+        [&self.client, &self.dl_client]
+            .iter()
+            .any(|c| format!("{c:?}").contains("proxies"))
+    }
+
+    /// Whether the trusted roots are only the ones given to [`Http::for_elevated`].
+    pub fn pinned_roots(&self) -> Option<usize> {
+        self.pinned_roots.as_ref().map(|r| r.len())
     }
 
     /// Whether redirects from https to http are followed (shared by all clones).
@@ -165,7 +250,7 @@ impl Http {
     /// A copy whose downloads (`get_to_file`) follow only https -> https redirects, ignoring
     /// `allow_http_redirect` (see [`strict_redirect_allowed`]). Other requests are unchanged.
     pub fn with_strict_download_redirects(&self) -> Result<Http, HttpError> {
-        let dl_client = reqwest::Client::builder()
+        let dl_client = lock_down(reqwest::Client::builder(), self.pinned_roots.as_ref())
             .redirect(checked_policy(strict_redirect_allowed))
             .user_agent(concat!("wingetrs/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(self.connect_timeout)

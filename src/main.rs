@@ -47,14 +47,15 @@ fn main() -> std::process::ExitCode {
     ) {
         return std::process::ExitCode::from(wingetrs::cli::self_apply_elevated());
     }
-    // The executable a previous `self update` replaced; silently kept when it cannot go. Not
+    // The executable a previous `self update` replaced and stale downloads; silently kept when
+    // they cannot go. Not
     // in the elevated bridge helper, which deletes nothing.
     if !matches!(
         cli.command,
         Some(wingetrs::cli::Command::BridgeWorker { .. })
     ) && let Ok(exe) = std::env::current_exe()
     {
-        wingetrs::selfupdate::remove_old(&exe);
+        wingetrs::selfupdate::startup_cleanup(&exe);
     }
     let verbose = cli.verbose > 0;
     match wingetrs::cli::run(cli) {

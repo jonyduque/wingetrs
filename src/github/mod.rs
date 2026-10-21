@@ -26,6 +26,8 @@ pub enum GhError {
     Other(String),
     #[error("nome de repositório inválido: {0}")]
     InvalidRepo(String),
+    #[error("{0}")]
+    UntrustedCertificate(String),
 }
 
 impl GhError {
@@ -35,6 +37,7 @@ impl GhError {
             HttpError::Status(404) => GhError::NotFound,
             HttpError::Status(n) => GhError::Status(n),
             HttpError::TooLarge(_) => GhError::BadJson,
+            HttpError::UntrustedCertificate(m) => GhError::UntrustedCertificate(m),
             other => GhError::Other(other.to_string()),
         }
     }

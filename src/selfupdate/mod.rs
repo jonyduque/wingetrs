@@ -48,6 +48,8 @@ pub enum SelfUpdateError {
     BadSumFile,
     #[error("build de desenvolvimento: atualize com cargo")]
     DevBuild,
+    #[error("o Windows não tem a raiz do GitHub no repositório da máquina ({0})")]
+    UntrustedRoot(String),
     #[error("a atualização como administrador falhou (código {0})")]
     Elevation(i32),
     #[error("{}", crate::install::progress::ELEVATION_REFUSED)]
@@ -65,6 +67,7 @@ impl SelfUpdateError {
         match e {
             GhError::Offline => SelfUpdateError::Offline,
             GhError::RateLimited { .. } => SelfUpdateError::RateLimited,
+            GhError::UntrustedCertificate(m) => SelfUpdateError::UntrustedRoot(m),
             other => SelfUpdateError::Other(other.to_string()),
         }
     }
@@ -72,6 +75,7 @@ impl SelfUpdateError {
     fn from_http(e: HttpError) -> SelfUpdateError {
         match e {
             e if e.is_offline() => SelfUpdateError::Offline,
+            HttpError::UntrustedCertificate(m) => SelfUpdateError::UntrustedRoot(m),
             other => SelfUpdateError::Other(other.to_string()),
         }
     }
@@ -152,6 +156,46 @@ pub fn remove_old(exe: &Path) {
         && e.kind() != std::io::ErrorKind::NotFound
     {
         tracing::debug!(error = %e, path = %old.display(), "self update: .old kept");
+    }
+}
+
+/// A `wingetrs.exe.download-*` left in the executable's folder by an update that was killed is
+/// deleted once untouched for this long (a running download keeps writing to it).
+const STALE_DOWNLOAD: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// At startup: [`remove_old`], and the stale downloads ([`STALE_DOWNLOAD`]) next to `exe`,
+/// only plain files of that folder (a link or reparse point is never followed), silently.
+pub fn startup_cleanup(exe: &Path) {
+    remove_old(exe);
+    remove_stale_downloads(exe, std::time::SystemTime::now());
+}
+
+/// The stale-download half of [`startup_cleanup`], as of `now`.
+pub fn remove_stale_downloads(exe: &Path, now: std::time::SystemTime) {
+    let (Some(dir), Some(name)) = (exe.parent(), exe.file_name()) else {
+        return;
+    };
+    let mut prefix = name.to_owned();
+    prefix.push(".download-");
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        if !file_name.to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow links: a link is not a file here.
+        let Ok(meta) = entry.metadata() else { continue };
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= STALE_DOWNLOAD);
+        if meta.is_file() && stale {
+            let _ = std::fs::remove_file(dir.join(&file_name));
+        }
     }
 }
 
@@ -307,19 +351,32 @@ pub async fn apply_capped(
     swap(temp, exe)
 }
 
-/// `exe` → `<exe>.old`, `temp` → `exe`; on failure the old executable is put back.
+/// [`swap_with`] through `std::fs::rename`.
 fn swap(mut temp: TempFile, exe: &Path) -> Result<(), SelfUpdateError> {
-    let old = old_path(exe);
-    remove_old(exe);
-    std::fs::rename(exe, &old)?;
-    if let Err(e) = std::fs::rename(&temp.path, exe) {
-        if let Err(back) = std::fs::rename(&old, exe) {
-            tracing::warn!(error = %back, "self update: could not restore the old executable");
-        }
-        return Err(e.into());
-    }
+    swap_with(&temp.path, exe, &|from, to| std::fs::rename(from, to))?;
     temp.armed = false;
     Ok(())
+}
+
+/// One rename of the swap (`from`, `to`).
+pub type Rename<'a> = &'a dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+/// `exe` → `<exe>.old`, `temp` → `exe`, through `rename`. When the second rename fails the old
+/// executable is put back in place; on any failure `temp` is deleted.
+pub fn swap_with(temp: &Path, exe: &Path, rename: Rename<'_>) -> Result<(), SelfUpdateError> {
+    let old = old_path(exe);
+    remove_old(exe);
+    let result = rename(exe, &old).and_then(|()| {
+        rename(temp, exe).inspect_err(|_| {
+            if let Err(back) = rename(&old, exe) {
+                tracing::warn!(error = %back, "self update: could not restore the old executable");
+            }
+        })
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    Ok(result?)
 }
 
 /// What an update ended with.

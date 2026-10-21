@@ -438,3 +438,146 @@ fn cli_parse_self_update() {
     assert!(help.contains("update"), "{help}");
     assert!(!help.contains("apply-elevated"), "{help}");
 }
+
+const TEST_ROOT: &[u8] = include_bytes!("../fixtures/selfupdate/test-root.der");
+
+#[test]
+fn elevated_http_has_no_proxy_and_only_given_roots() {
+    // Control: the ordinary client keeps the system/environment proxy.
+    assert!(Http::new().unwrap().may_use_proxy());
+    let h = Http::for_elevated(&[TEST_ROOT.to_vec()]).unwrap();
+    assert!(!h.may_use_proxy());
+    assert_eq!(h.pinned_roots(), Some(1));
+    // The download copy `apply` uses keeps both.
+    let dl = h.with_strict_download_redirects().unwrap();
+    assert!(!dl.may_use_proxy());
+    assert_eq!(dl.pinned_roots(), Some(1));
+    assert_eq!(Http::new().unwrap().pinned_roots(), None);
+    // Unusable roots are skipped; none usable is an error.
+    let h = Http::for_elevated(&[b"garbage".to_vec(), TEST_ROOT.to_vec()]).unwrap();
+    assert_eq!(h.pinned_roots(), Some(1));
+    let r = Http::for_elevated(&[b"garbage".to_vec()]);
+    assert!(
+        matches!(r, Err(wingetrs::http::HttpError::UntrustedCertificate(_))),
+        "{:?}",
+        r.err()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn machine_roots_read_only_local_machine_stores() {
+    use wingetrs::selfupdate::apply_win::{LOCAL_MACHINE, machine_roots_with};
+    let calls = Mutex::new(Vec::new());
+    let read = |location: u32, name: &str| -> std::io::Result<Vec<Vec<u8>>> {
+        calls.lock().unwrap().push((location, name.to_string()));
+        Ok(match name {
+            "Root" => vec![b"a".to_vec(), b"b".to_vec()],
+            _ => vec![b"b".to_vec(), b"c".to_vec()],
+        })
+    };
+    let roots = machine_roots_with(&read).unwrap();
+    assert_eq!(roots, [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            (LOCAL_MACHINE, "Root".to_string()),
+            (LOCAL_MACHINE, "AuthRoot".to_string())
+        ]
+    );
+    // One store missing is skipped; none read is an error.
+    let one = |_: u32, name: &str| -> std::io::Result<Vec<Vec<u8>>> {
+        match name {
+            "Root" => Ok(vec![b"a".to_vec()]),
+            _ => Err(std::io::Error::other("no store")),
+        }
+    };
+    assert_eq!(machine_roots_with(&one).unwrap(), [b"a".to_vec()]);
+    let none = |_: u32, _: &str| -> std::io::Result<Vec<Vec<u8>>> {
+        Err(std::io::Error::other("no store"))
+    };
+    assert!(machine_roots_with(&none).is_err());
+    let empty = |_: u32, _: &str| -> std::io::Result<Vec<Vec<u8>>> { Ok(Vec::new()) };
+    assert!(machine_roots_with(&empty).is_err());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+#[ignore = "live: reads the machine certificate stores and reaches github.com"]
+async fn live_elevated_client_reaches_github() {
+    let roots = wingetrs::selfupdate::apply_win::machine_roots().unwrap();
+    let h = Http::for_elevated(&roots).unwrap();
+    let tag = selfupdate::latest_tag(&h, selfupdate::WEB_BASE)
+        .await
+        .unwrap();
+    assert!(selfupdate::parse_tag(&tag).is_some(), "{tag}");
+    // Only a root that is not GitHub's: the chain fails with the clear error.
+    let h = Http::for_elevated(&[TEST_ROOT.to_vec()]).unwrap();
+    let r = selfupdate::latest_tag(&h, selfupdate::WEB_BASE).await;
+    assert!(matches!(r, Err(SelfUpdateError::UntrustedRoot(_))), "{r:?}");
+    assert!(
+        r.unwrap_err()
+            .to_string()
+            .starts_with("o Windows não tem a raiz do GitHub no repositório da máquina"),
+    );
+}
+
+#[test]
+fn swap_failure_puts_old_exe_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exe = fake_exe(tmp.path(), b"MZ old");
+    let dir = exe.parent().unwrap().to_path_buf();
+    let temp = dir.join("wingetrs.exe.download-0123");
+    std::fs::write(&temp, b"MZ new").unwrap();
+    let calls = Mutex::new(Vec::new());
+    let rename = |from: &Path, to: &Path| -> std::io::Result<()> {
+        calls.lock().unwrap().push(from.to_path_buf());
+        if from == temp.as_path() {
+            return Err(std::io::Error::other("in use"));
+        }
+        std::fs::rename(from, to)
+    };
+    let r = selfupdate::swap_with(&temp, &exe, &rename);
+    assert!(matches!(r, Err(SelfUpdateError::Io(_))), "{r:?}");
+    assert_eq!(std::fs::read(&exe).unwrap(), b"MZ old");
+    assert_eq!(names(&dir), ["wingetrs.exe"]);
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    // The first rename failing: nothing moved, the temporary deleted.
+    std::fs::write(&temp, b"MZ new").unwrap();
+    let fail_all = |_: &Path, _: &Path| -> std::io::Result<()> { Err(std::io::Error::other("x")) };
+    assert!(selfupdate::swap_with(&temp, &exe, &fail_all).is_err());
+    assert_eq!(std::fs::read(&exe).unwrap(), b"MZ old");
+    assert_eq!(names(&dir), ["wingetrs.exe"]);
+}
+
+#[test]
+fn startup_cleanup_removes_only_stale_downloads_of_this_exe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exe = fake_exe(tmp.path(), b"MZ");
+    let dir = exe.parent().unwrap().to_path_buf();
+    std::fs::write(dir.join("wingetrs.exe.download-aa"), b"x").unwrap();
+    std::fs::write(dir.join("wingetrs.exe.old"), b"x").unwrap();
+    std::fs::write(dir.join("other.exe.download-bb"), b"x").unwrap();
+    std::fs::create_dir(dir.join("wingetrs.exe.download-dir")).unwrap();
+    // Fresh (a download may still be writing it): kept.
+    selfupdate::startup_cleanup(&exe);
+    assert_eq!(
+        names(&dir),
+        [
+            "other.exe.download-bb",
+            "wingetrs.exe",
+            "wingetrs.exe.download-aa",
+            "wingetrs.exe.download-dir"
+        ]
+    );
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2 * 3600);
+    selfupdate::remove_stale_downloads(&exe, later);
+    assert_eq!(
+        names(&dir),
+        [
+            "other.exe.download-bb",
+            "wingetrs.exe",
+            "wingetrs.exe.download-dir"
+        ]
+    );
+}
