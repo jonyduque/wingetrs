@@ -1,6 +1,8 @@
 //! GitHub releases client: assets with their SHA-256 `digest`, and the latest tag through
 //! the web redirect (which does not spend the API rate limit).
 
+pub mod pick;
+
 use serde::Deserialize;
 
 use crate::http::{Http, HttpError};

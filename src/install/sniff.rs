@@ -67,6 +67,134 @@ pub fn pe_overlay_start(head: &[u8]) -> u64 {
     end
 }
 
+/// What a downloaded `.exe` is (Task 209).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeKind {
+    Program,
+    /// Generator name, or "instalador" when only the overlay size decides.
+    Installer(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cabeçalho PE inválido: {0}")]
+pub struct PeError(&'static str);
+
+/// Windows loader limit.
+const MAX_SECTIONS: usize = 96;
+/// PE32+ needs 0xF0; anything far above is not a real header.
+const MAX_OPTIONAL_HEADER: usize = 0x1000;
+/// Generator marks are looked for only at the start of the overlay, where the
+/// installers put their data (a 7-Zip or innounp program carries the same bytes
+/// in its own code).
+const MARK_SCAN: usize = 1 << 20;
+const OVERLAY_MIN: u64 = 1 << 20;
+
+const GENERATOR_MARKS: &[(&[u8], &str)] = &[
+    (b"NullsoftInst", "NSIS"),
+    (b"Inno Setup Setup Data", "Inno Setup"),
+    (b"rDlPtS", "Inno Setup"),
+    (b"InstallShield", "InstallShield"),
+    (b"SquirrelSetup", "Squirrel"),
+    (&SEVEN_Z_SIGNATURE, "7-Zip SFX"),
+];
+
+/// Installer or program: generator mark ⇒ installer; overlay (minus the Authenticode
+/// certificate table) over 25 % of the file and over 1 MiB ⇒ installer; else program.
+pub fn classify_pe(bytes: &[u8]) -> Result<PeKind, PeError> {
+    let u16_at = |o: usize| {
+        o.checked_add(2)
+            .and_then(|e| bytes.get(o..e))
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let u32_at = |o: usize| {
+        o.checked_add(4)
+            .and_then(|e| bytes.get(o..e))
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
+    };
+    let len = bytes.len() as u64;
+    if !bytes.starts_with(b"MZ") {
+        return Err(PeError("sem assinatura MZ"));
+    }
+    let pe = u32_at(0x3C).ok_or(PeError("arquivo truncado"))?;
+    if pe >= len {
+        return Err(PeError("cabeçalho PE fora do arquivo"));
+    }
+    let pe = pe as usize;
+    if bytes.get(pe..pe + 4) != Some(b"PE\0\0".as_slice()) {
+        return Err(PeError("sem assinatura PE"));
+    }
+    let sections = u16_at(pe + 6).ok_or(PeError("arquivo truncado"))?;
+    if sections == 0 || sections > MAX_SECTIONS {
+        return Err(PeError("número de seções absurdo"));
+    }
+    let opt_size = u16_at(pe + 20).ok_or(PeError("arquivo truncado"))?;
+    if opt_size > MAX_OPTIONAL_HEADER {
+        return Err(PeError("cabeçalho opcional grande demais"));
+    }
+    let opt = pe + 24;
+    let dirs = match u16_at(opt) {
+        Some(0x10B) => opt + 96,
+        Some(0x20B) => opt + 112,
+        _ => return Err(PeError("cabeçalho opcional desconhecido")),
+    };
+    let dir_count = u32_at(dirs - 4).ok_or(PeError("arquivo truncado"))?;
+    // IMAGE_DIRECTORY_ENTRY_SECURITY: file offset and size of the certificate table.
+    let cert_entry = dirs + 4 * 8;
+    let cert = if dir_count > 4 && cert_entry + 8 <= opt + opt_size {
+        let off = u32_at(cert_entry).ok_or(PeError("arquivo truncado"))?;
+        let size = u32_at(cert_entry + 4).ok_or(PeError("arquivo truncado"))?;
+        (size > 0).then_some((off, size))
+    } else {
+        None
+    };
+
+    let table = opt + opt_size;
+    let mut names = Vec::with_capacity(sections);
+    let mut image_end = 0u64;
+    for i in 0..sections {
+        let s = table + i * 40;
+        let name = bytes
+            .get(s..s + 8)
+            .ok_or(PeError("tabela de seções truncada"))?;
+        let size = u32_at(s + 16).ok_or(PeError("tabela de seções truncada"))?;
+        let ptr = u32_at(s + 20).ok_or(PeError("tabela de seções truncada"))?;
+        if size > 0 && ptr + size > len {
+            return Err(PeError("seção além do fim do arquivo"));
+        }
+        names.push(name);
+        if size > 0 {
+            image_end = image_end.max(ptr + size);
+        }
+    }
+    if names.iter().any(|n| n.starts_with(b".wixburn")) {
+        return Ok(PeKind::Installer("WiX Burn"));
+    }
+
+    let mut overlay_end = len;
+    let mut signature = 0u64;
+    if let Some((off, size)) = cert {
+        if off < image_end || off + size > len {
+            return Err(PeError("assinatura fora do overlay"));
+        }
+        overlay_end = off;
+        signature = size;
+    }
+    let scan_end = overlay_end.min(image_end + MARK_SCAN as u64) as usize;
+    let head = bytes
+        .get(image_end as usize..scan_end)
+        .ok_or(PeError("overlay fora do arquivo"))?;
+    for (mark, generator) in GENERATOR_MARKS {
+        if head.windows(mark.len()).any(|w| w == *mark) {
+            return Ok(PeKind::Installer(generator));
+        }
+    }
+    let overlay = len - image_end - signature;
+    if overlay * 4 > len && overlay > OVERLAY_MIN {
+        return Ok(PeKind::Installer("instalador"));
+    }
+    Ok(PeKind::Program)
+}
+
 /// Scans `r` from `start` for the 7z signature (SFX overlay); `None` if absent.
 ///
 /// Every candidate must open as a 7z archive (start-header CRC, then the whole
