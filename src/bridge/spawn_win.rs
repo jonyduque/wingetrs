@@ -176,7 +176,12 @@ pub fn run_with_grace(
     grace: Duration,
     on_line: impl FnMut(&str),
 ) -> std::io::Result<(i32, Vec<String>)> {
-    let mut cmd = Command::new(program);
+    let exe = super::resolve_program(
+        program,
+        crate::winget_install::launch_win::is_elevated()?,
+        super::elevate_win::winget_exe,
+    )?;
+    let mut cmd = Command::new(exe);
     cmd.args(args);
     run_command(cmd, program, grace, utf8_lossy, on_line)
 }

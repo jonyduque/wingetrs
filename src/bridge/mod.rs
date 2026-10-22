@@ -22,6 +22,27 @@ pub mod staging_win;
 pub mod winget_out;
 pub mod worker;
 
+/// The program to start for `program`. With an elevated process a bare name is never looked
+/// up on the user's `PATH` (a writable folder would turn a planted exe into admin): `winget`
+/// comes from the protected package folder, any other bare name is refused.
+pub fn resolve_program(
+    program: &str,
+    elevated: bool,
+    winget_exe: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<PathBuf> {
+    if !elevated || Path::new(program).is_absolute() {
+        return Ok(PathBuf::from(program));
+    }
+    let lower = program.to_ascii_lowercase();
+    if lower == "winget" || lower == "winget.exe" {
+        return winget_exe();
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "o wingetrs não procura programas pelo PATH com o processo elevado; abra um terminal sem administrador e repita",
+    ))
+}
+
 pub const PINNED_NOTE: &str = "versão fixada";
 pub const NOT_OURS_NOTE: &str = "instalado fora do wingetrs";
 

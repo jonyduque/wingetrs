@@ -535,3 +535,50 @@ fn every_reboot_marker_matches() {
         assert!(reboot_requested(0, &[wrapped], &REBOOT_MARKERS), "{m}");
     }
 }
+
+mod resolve_program {
+    use std::path::PathBuf;
+    use wingetrs::bridge::resolve_program;
+
+    #[test]
+    fn unelevated_keeps_the_bare_name() {
+        let p = resolve_program("winget", false, || panic!("não deve resolver")).unwrap();
+        assert_eq!(p, PathBuf::from("winget"));
+    }
+
+    #[test]
+    fn elevated_winget_comes_from_the_admin_folder() {
+        let fixed = PathBuf::from(
+            r"C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1_x64__8wekyb3d8bbwe\winget.exe",
+        );
+        let p = resolve_program("WinGet.exe", true, || Ok(fixed.clone())).unwrap();
+        assert_eq!(p, fixed);
+    }
+
+    #[test]
+    fn elevated_other_bare_names_are_refused() {
+        let e = resolve_program("scoop", true, || panic!("não deve resolver")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("não procura programas pelo PATH"));
+    }
+
+    #[test]
+    fn elevated_absolute_path_is_kept() {
+        let abs = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+        let p =
+            resolve_program(abs.to_str().unwrap(), true, || panic!("não deve resolver")).unwrap();
+        assert_eq!(p, abs);
+    }
+
+    #[test]
+    fn elevated_winget_missing_is_an_error_not_the_path() {
+        let e = resolve_program("winget", true, || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "sem winget",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    }
+}
