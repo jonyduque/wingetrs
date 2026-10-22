@@ -229,6 +229,8 @@ Testes (`tests/it/gh_asset.rs`): tabela com as listas reais de nomes dos 12 repo
 
 **Modelo:** opus (revisor opus).
 
+**Nota da revisão da 209 (2026-10-22):** o nome do arquivo do release vira caminho só depois de passar por `install::safepath` (teste com nome `..\x.exe` recusado). Num `Choose`, depois da escolha do usuário, o chamador roda `unsupported()` (`.msi`/`.msix` sozinhos já dão `None` no `pick`), com teste. A marca `SquirrelSetup` não foi provada (o nupkg pode estar no `.rsrc`).
+
 #### Where this fits
 
 - Planejador do Scoop: `manifest::resolve(raw_json, host)` (`src/install/manifest.rs:473`) aceita JSON cru (`version`, `url`, `hash` com prefixo `sha256:`, `extract_dir`, `bin`, `#/nome` para renomear); `plan_install(&PlanInput)` (`src/install/planner.rs:379`); a entrada real `ops::plan_for(ctx, &Candidate, keep_old)` (`src/install/ops.rs:564`) exige fonte `scoop:` e lê o manifesto do catálogo (`:396-401`), calcula `sha = sha256(raw)` (`:627`).
