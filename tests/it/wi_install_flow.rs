@@ -906,7 +906,7 @@ fn consumers_show_new_phases() {
 
     let glyphs = Glyphs::for_set(GlyphSet::Ascii);
     let throttle = ProgressThrottle::new(Instant::now());
-    let line = LineProgress::new(false, glyphs);
+    let line = LineProgress::new(false, glyphs, Default::default());
     let mut plain = PhaseLog::new();
     for p in &phases {
         let ev = ProgressEvent::Phase(p.clone());

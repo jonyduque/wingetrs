@@ -20,7 +20,8 @@ use crate::install::progress::{Phase, ProgressEvent};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState, correlate};
 use crate::tui::theme::GlyphSet;
 use crate::update::{
-    Endpoints, LockWait, Outcome, SourceReport, UpdateError, claim_background_refresh, run_update,
+    Endpoints, LockWait, Outcome, SourceReport, UpdateError, claim_background_refresh,
+    run_update_with,
 };
 use anyhow::Context;
 use std::str::FromStr;
@@ -574,15 +575,18 @@ fn refresh_if_stale(data: &DataDir, ep: &Endpoints) {
 /// Ensures a catalog exists (blocking update when empty) and triggers a
 /// detached refresh when it is stale.
 async fn ensure_catalog(data: &DataDir, cfg: &Config, http: &Http) -> anyhow::Result<Catalog> {
-    Ok(ensure_catalog_ran(data, cfg, http, None).await?.0)
+    Ok(ensure_catalog_ran(data, cfg, http, None, None).await?.0)
 }
 
-/// Like `ensure_catalog`; the flag is true when a blocking update had to run.
+/// Like `ensure_catalog`; the flag is true when a blocking update had to run. The blocking
+/// update shows its phases on `line` (the caller's progress line, still running afterwards)
+/// or on a line of its own, closed before this returns.
 async fn ensure_catalog_ran(
     data: &DataDir,
     cfg: &Config,
     http: &Http,
     early: Option<&mut EarlySearch>,
+    line: Option<&install_cmd::LineProgress>,
 ) -> anyhow::Result<(Catalog, bool)> {
     let ep = Endpoints::production(cfg)?;
     let path = data.catalog_path();
@@ -608,7 +612,18 @@ async fn ensure_catalog_ran(
         if let Some(e) = early {
             let _ = e.join();
         }
-        let reports = run_update(data, &ep, http, true, LockWait::from_env()).await?;
+        let own = line.is_none().then(|| install_cmd::line_progress(cfg));
+        let shown = line.or(own.as_deref());
+        let progress = |ev: &ProgressEvent| {
+            if let Some(l) = shown {
+                l.update(ev);
+            }
+        };
+        let reports = run_update_with(data, &ep, http, true, LockWait::from_env(), &progress).await;
+        if let Some(own) = &own {
+            own.finish();
+        }
+        let reports = reports?;
         let catalog = Catalog::open(&data.catalog_path())?;
         if catalog.is_empty()? {
             for r in &reports {
@@ -754,7 +769,18 @@ async fn run_async(
             } else {
                 LockWait::from_env()
             };
-            let reports = match run_update(&data, &ep, &http, force, wait).await {
+            // `--background` runs detached: nothing on the screen, not even on stderr.
+            let line = (!background).then(|| install_cmd::line_progress(&cfg));
+            let progress = |ev: &ProgressEvent| {
+                if let Some(l) = &line {
+                    l.update(ev);
+                }
+            };
+            let reports = run_update_with(&data, &ep, &http, force, wait, &progress).await;
+            if let Some(l) = &line {
+                l.finish();
+            }
+            let reports = match reports {
                 Err(UpdateError::Busy) if background => {
                     tracing::debug!("another update holds the lock; background refresh skipped");
                     return Ok(());
@@ -783,7 +809,8 @@ async fn run_async(
                     .in_scope(|| refresh_if_stale(&data, &ep));
                 (None, false)
             } else {
-                let (c, updated) = ensure_catalog_ran(&data, &cfg, &http, early.as_mut()).await?;
+                let (c, updated) =
+                    ensure_catalog_ran(&data, &cfg, &http, early.as_mut(), None).await?;
                 (Some(c), updated)
             };
             let early = tracing::debug_span!("search.join_wait")
@@ -879,6 +906,10 @@ async fn run_async(
                 ms = after_log.elapsed().as_secs_f64() * 1000.0,
                 "list.setup"
             );
+            // Phases on stderr until the table (`--json` keeps stdout for the JSON only); an
+            // error path closes the line when `line` drops.
+            let line = install_cmd::line_progress(&cfg);
+            line.update(&ProgressEvent::Phase(Phase::ReadingInstalled));
             // Scan, tracking and normalizer start now so they overlap with the catalog open.
             let scan_job = std::thread::spawn(|| {
                 crate::installed::timed("scan_all", crate::installed::scan_all)
@@ -896,7 +927,9 @@ async fn run_async(
                 )
             });
             let t0 = std::time::Instant::now();
-            let catalog = ensure_catalog(&data, &cfg, &http).await;
+            let catalog = ensure_catalog_ran(&data, &cfg, &http, None, Some(&line))
+                .await
+                .map(|(c, _)| c);
             // Join every early thread on every path before propagating a catalog error.
             let scan_res = scan_job.join();
             let tracking_res = tracking_job.join();
@@ -916,6 +949,7 @@ async fn run_async(
             }
             let t = std::time::Instant::now();
             let overrides = crate::installed::overrides::load(&data);
+            line.update(&ProgressEvent::Phase(Phase::Correlating));
             let mut rows = crate::installed::timed("correlate", || {
                 correlate(&scan.apps, &catalog, &normalizer, &tracking, &overrides)
             })?;
@@ -930,6 +964,7 @@ async fn run_async(
             if upgradable {
                 rows.retain(|r| matches!(r.state, UpdateState::Available { .. }));
             }
+            line.finish();
             crate::installed::timed("output", || {
                 if json {
                     emit::json(&rows)?;

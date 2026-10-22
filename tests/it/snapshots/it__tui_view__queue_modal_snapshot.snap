@@ -1,5 +1,5 @@
 ---
-source: tests/tui_view.rs
+source: tests/it/tui_view.rs
 expression: "render(&with_queue_modal(), 100, 16)"
 ---
 "╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                                              "
@@ -17,4 +17,4 @@ expression: "render(&with_queue_modal(), 100, 16)"
 "│                                                      │                                           │"
 "│                                                      │  Instalar (enter)                         │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"  | Instalando powertoys powertoys.zip [##########----------] 50% · fila: 1                         "
+"  | Instalando powertoys powertoys.zip [##########----------] 50%  0.0 / 0.0 MiB · fila: 1          "

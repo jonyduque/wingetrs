@@ -362,17 +362,23 @@ pub struct RunProgress {
     pub total: Option<u64>,
     /// The step under way and when it started (`App::now`); `None` while downloading.
     pub phase: Option<(crate::install::progress::Phase, Instant)>,
+    /// The downloads since the last phase, with the samples their speed comes from.
+    pub meter: crate::install::progress::DownloadMeter,
 }
 
-/// Progress of a step that started at `now`.
+/// Progress of a step that started at `now` (a new phase starts a new meter).
 fn phase_progress(phase: crate::install::progress::Phase, now: Instant) -> RunProgress {
     RunProgress {
         label: String::new(),
         done: 0,
         total: None,
         phase: Some((phase, now)),
+        meter: Default::default(),
     }
 }
+
+/// Key of the TUI's download meter: the throttle already sums the downloads of an action.
+const METER_KEY: &str = "";
 
 /// The operation in progress (an action, or the cleanup of residues).
 #[derive(Debug, Clone, PartialEq)]
@@ -1934,11 +1940,15 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
         Msg::Panicked(payload) => std::panic::resume_unwind(payload),
         Msg::InstallProgress { label, done, total } => {
             if let Some(r) = &mut app.running {
+                // Recorded into the running meter: the speed needs the earlier samples.
+                let mut meter = r.progress.take().map(|p| p.meter).unwrap_or_default();
+                meter.record_at(METER_KEY, done, total, app.now);
                 r.progress = Some(RunProgress {
                     label,
                     done,
                     total,
                     phase: None,
+                    meter,
                 });
             }
             Vec::new()

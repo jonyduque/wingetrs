@@ -643,3 +643,62 @@ fn long_names_fit_the_terminal() {
     }
     assert!(!full.contains('…'));
 }
+/// `lines` appear in `text` in this order, each as a whole line.
+fn lines_in_order(text: &str, lines: &[&str]) {
+    let all: Vec<&str> = text.lines().collect();
+    let at: Vec<usize> = lines
+        .iter()
+        .map(|l| {
+            all.iter()
+                .position(|x| x == l)
+                .unwrap_or_else(|| panic!("{l:?} in {text:?}"))
+        })
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "{text:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_progress_plain_off_a_terminal() {
+    let env = Env::new().await;
+    let out = tokio::task::block_in_place(|| env.run(&["update", "--force"], &[]));
+    assert!(out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    lines_in_order(
+        &err,
+        &[
+            "Preparando…",
+            "Baixando os catálogos (3 fontes)…",
+            "Gravando o catálogo…",
+        ],
+    );
+    assert!(!err.contains('\r') && !err.contains('\x1b'), "{err:?}");
+    let so = String::from_utf8(out.stdout).unwrap();
+    assert!(so.contains("winget"), "{so}");
+    assert!(
+        !so.contains("Preparando") && !so.contains("Baixando"),
+        "{so}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn background_update_prints_nothing() {
+    let env = Env::new().await;
+    let out = tokio::task::block_in_place(|| env.run(&["update", "--background", "--force"], &[]));
+    assert!(out.status.success());
+    assert_eq!(both(&out), "");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live: varre o registro real"]
+async fn list_progress_plain_off_a_terminal() {
+    let env = Env::new().await;
+    let out = tokio::task::block_in_place(|| env.run(&["list"], &[]));
+    assert!(out.status.success());
+    let err = String::from_utf8(out.stderr).unwrap();
+    lines_in_order(
+        &err,
+        &["Lendo os apps instalados…", "Comparando com o catálogo…"],
+    );
+    let so = String::from_utf8(out.stdout).unwrap();
+    assert!(so.starts_with("Nome"), "{so}");
+}

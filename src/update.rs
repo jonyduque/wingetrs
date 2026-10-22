@@ -3,10 +3,13 @@ use crate::cache::{BLOB_MAX_AGE, BlobStore, DataDir, HttpEntry, HttpState, Updat
 use crate::catalog::{Catalog, NewPackage, WingetMaps, index_file};
 use crate::core::SourceKind;
 use crate::http::Http;
+use crate::install::download::Progress;
+use crate::install::progress::{Phase, ProgressEvent};
 use crate::sources::scoop::bucket::{BucketImport, ScoopFetch, fetch_bucket, repo_tarball_url};
 use crate::sources::scoop::source_name;
 use crate::sources::winget::index::WingetImport;
 use crate::sources::winget::{SOURCE_NAME, SOURCE2_URL, WingetFetch, fetch_index};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tracing::Instrument;
 
@@ -183,6 +186,7 @@ impl LockWait {
     }
 }
 
+/// [`run_update_with`] without progress.
 pub async fn run_update(
     data: &DataDir,
     endpoints: &Endpoints,
@@ -190,13 +194,39 @@ pub async fn run_update(
     force: bool,
     wait: LockWait,
 ) -> Result<Vec<SourceReport>, UpdateError> {
-    let lock_path = data.lock_path();
-    let timeout = wait.timeout();
+    run_update_with(data, endpoints, http, force, wait, &|_| {}).await
+}
+
+/// Takes the update lock, waiting up to `timeout`.
+async fn lock_within(
+    lock_path: PathBuf,
+    timeout: Duration,
+) -> Result<Option<UpdateLock>, UpdateError> {
     let lock =
         tokio::task::spawn_blocking(move || UpdateLock::acquire_timeout(&lock_path, timeout))
             .instrument(tracing::debug_span!("update.lock"))
             .await
             .map_err(|e| UpdateError::Internal(e.to_string()))??;
+    Ok(lock)
+}
+
+/// Updates the catalogs, reporting each slow step to `progress`: `Preparing`, then
+/// `WaitingUpdate` when another process holds the lock and `wait` allows waiting,
+/// `FetchingCatalog` with the sources that really download, and `WritingCatalog`.
+pub async fn run_update_with(
+    data: &DataDir,
+    endpoints: &Endpoints,
+    http: &Http,
+    force: bool,
+    wait: LockWait,
+    progress: Progress<'_>,
+) -> Result<Vec<SourceReport>, UpdateError> {
+    progress(&ProgressEvent::Phase(Phase::Preparing));
+    let mut lock = lock_within(data.lock_path(), Duration::ZERO).await?;
+    if lock.is_none() && !wait.timeout().is_zero() {
+        progress(&ProgressEvent::Phase(Phase::WaitingUpdate));
+        lock = lock_within(data.lock_path(), wait.timeout()).await?;
+    }
     let Some(_lock) = lock else {
         return Err(UpdateError::Busy);
     };
@@ -218,31 +248,42 @@ pub async fn run_update(
         });
     }
 
-    let fetches = jobs.iter().map(|job| {
-        let mut prev = state.get(job.url).cloned();
-        let mut missing_marker = false;
-        // Without the marker the stored `scripts/` is missing or incomplete: refetch the tarball.
-        if let Some(dir) = job.bucket.and_then(|b| bucket_dir(data, b)) {
-            let marker = dir.join(".scripts-ok");
-            if !marker.exists() {
-                prev = None;
-                missing_marker = true;
+    let mut fetching = 0;
+    let fetches: Vec<_> = jobs
+        .iter()
+        .map(|job| {
+            let mut prev = state.get(job.url).cloned();
+            let mut missing_marker = false;
+            // Without the marker the stored `scripts/` is missing or incomplete: refetch the tarball.
+            if let Some(dir) = job.bucket.and_then(|b| bucket_dir(data, b)) {
+                let marker = dir.join(".scripts-ok");
+                if !marker.exists() {
+                    prev = None;
+                    missing_marker = true;
+                }
             }
-        }
-        let skip = !force && !missing_marker && !needs_refresh(&state, &[job.url], now);
-        let span = tracing::debug_span!("update.fetch", source = %job.source);
-        async move {
-            if skip {
-                return None;
+            let skip = !force && !missing_marker && !needs_refresh(&state, &[job.url], now);
+            if !skip {
+                fetching += 1;
             }
-            Some(fetch_one(job, http, data, prev.as_ref()).await)
-        }
-        .instrument(span)
-    });
+            let span = tracing::debug_span!("update.fetch", source = %job.source);
+            async move {
+                if skip {
+                    return None;
+                }
+                Some(fetch_one(job, http, data, prev.as_ref()).await)
+            }
+            .instrument(span)
+        })
+        .collect();
+    progress(&ProgressEvent::Phase(Phase::FetchingCatalog {
+        sources: fetching,
+    }));
     let results = futures_util::future::join_all(fetches).await;
 
     let index_path = data.search_index_path();
     let mut catalog = if needs_catalog(&results, index_path.exists()) {
+        progress(&ProgressEvent::Phase(Phase::WritingCatalog));
         Some(
             tracing::debug_span!("update.catalog_open")
                 .in_scope(|| Catalog::open(&data.catalog_path()))?,

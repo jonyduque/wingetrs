@@ -152,6 +152,74 @@ pub fn paint(style: Style, text: &str) -> String {
     }
 }
 
+/// A color of `tui/theme.rs` as the CLI writes it (`Reset` = the terminal's own).
+fn color_of(c: ratatui::style::Color) -> Option<anstyle::Color> {
+    use ratatui::style::Color as C;
+    let ansi = match c {
+        C::Reset => return None,
+        C::Rgb(r, g, b) => return Some(anstyle::RgbColor(r, g, b).into()),
+        C::Indexed(i) => return Some(anstyle::Ansi256Color(i).into()),
+        C::Black => AnsiColor::Black,
+        C::Red => AnsiColor::Red,
+        C::Green => AnsiColor::Green,
+        C::Yellow => AnsiColor::Yellow,
+        C::Blue => AnsiColor::Blue,
+        C::Magenta => AnsiColor::Magenta,
+        C::Cyan => AnsiColor::Cyan,
+        C::Gray => AnsiColor::White,
+        C::DarkGray => AnsiColor::BrightBlack,
+        C::LightRed => AnsiColor::BrightRed,
+        C::LightGreen => AnsiColor::BrightGreen,
+        C::LightYellow => AnsiColor::BrightYellow,
+        C::LightBlue => AnsiColor::BrightBlue,
+        C::LightMagenta => AnsiColor::BrightMagenta,
+        C::LightCyan => AnsiColor::BrightCyan,
+        C::White => AnsiColor::BrightWhite,
+    };
+    Some(ansi.into())
+}
+
+/// A token of `tui/theme.rs` as a CLI style: the same color at the theme's depth (RGB,
+/// 256 colors or none) and its bold, dim, italic and underline.
+pub fn from_theme(s: ratatui::style::Style) -> Style {
+    use ratatui::style::Modifier;
+    let mut out = Style::new()
+        .fg_color(s.fg.and_then(color_of))
+        .bg_color(s.bg.and_then(color_of));
+    for (m, e) in [
+        (Modifier::BOLD, Effects::BOLD),
+        (Modifier::DIM, Effects::DIMMED),
+        (Modifier::ITALIC, Effects::ITALIC),
+        (Modifier::UNDERLINED, Effects::UNDERLINE),
+    ] {
+        if s.add_modifier.contains(m) {
+            out = out.effects(out.get_effects() | e);
+        }
+    }
+    out
+}
+
+/// Colors of the CLI progress line, from the TUI theme (Task 216).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgressStyles {
+    pub spinner: Style,
+    /// The done cells of the download bar.
+    pub fill: Style,
+    /// The missing cells.
+    pub empty: Style,
+}
+
+impl ProgressStyles {
+    /// Spinner and bar in `accent`, the missing cells in `muted`.
+    pub fn of(theme: &crate::tui::theme::Theme) -> ProgressStyles {
+        ProgressStyles {
+            spinner: from_theme(theme.accent()),
+            fill: from_theme(theme.accent()),
+            empty: from_theme(theme.muted()),
+        }
+    }
+}
+
 /// The color decision: `--color` beats the variables, `NO_COLOR` beats `auto`, then
 /// `CLICOLOR_FORCE`, then whether stdout is a terminal. Never returns `Auto`.
 pub fn choose(flag: ColorArg, is_tty: bool, no_color: bool, clicolor_force: bool) -> ColorChoice {

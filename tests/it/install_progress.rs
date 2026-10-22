@@ -1517,3 +1517,327 @@ fn no_bridge(
 ) -> std::io::Result<(i32, Vec<String>)> {
     panic!("winget bridge not expected")
 }
+// ---- Task 216: one download formatting for the CLI and the TUI, themed CLI line, phases of
+// `update` and `list` ----
+
+use wingetrs::cli::output::progress_frame;
+use wingetrs::cli::picker::fake;
+use wingetrs::cli::style::{self, ProgressStyles, from_theme, with_enabled};
+use wingetrs::install::progress::{DownloadMeter, download_parts, download_text, phase_text};
+use wingetrs::tui::theme::{ColorDepth, Theme};
+
+fn unicode() -> &'static Glyphs {
+    Glyphs::for_set(GlyphSet::Unicode)
+}
+
+/// 3.1 MiB per second for 3 s of a 27 MiB download, at `base + 0..=3 s`.
+const STEP: u64 = 31 * MIB / 10;
+
+#[test]
+fn bar_parts_unicode_and_ascii() {
+    let now = Instant::now();
+    let mut m = DownloadMeter::default();
+    m.record_at(
+        "https://example.invalid/rust.msi",
+        5 * MIB,
+        Some(20 * MIB),
+        now,
+    );
+    let p = download_parts(&m, now, unicode());
+    assert_eq!(p.filled, "█████");
+    assert_eq!(p.empty, "░".repeat(15));
+    assert_eq!(p.tail, "25%  5.0 / 20.0 MiB");
+    let p = download_parts(&m, now, ascii());
+    assert_eq!(
+        download_text("Baixando", &p),
+        "Baixando [#####---------------] 25%  5.0 / 20.0 MiB"
+    );
+}
+
+/// The TUI app with an action running, at `now`.
+fn tui_running(now: Instant) -> wingetrs::tui::app::App {
+    use wingetrs::tui::app::{App, Running};
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.now = now;
+    a.running = Some(Running {
+        id: 1,
+        label: "Instalar rust".into(),
+        progress: None,
+        action: None,
+    });
+    a
+}
+
+/// What follows `label ` in `line`.
+fn after<'a>(line: &'a str, label: &str) -> &'a str {
+    let at = line
+        .find(label)
+        .unwrap_or_else(|| panic!("{label} in {line}"));
+    &line[at + label.len()..]
+}
+
+#[test]
+fn cli_and_tui_share_download_text() {
+    use wingetrs::tui::app::{Msg, update};
+    let base = Instant::now();
+    let s = |n: u64| base + Duration::from_secs(n);
+    let mut ph = Phases::new();
+    let mut a = tui_running(base);
+    for i in 0..=3 {
+        ph.update_at(&dl(i * STEP, Some(27 * MIB)), s(i));
+        a.now = s(i);
+        update(
+            &mut a,
+            Msg::InstallProgress {
+                label: "rust.msi".into(),
+                done: i * STEP,
+                total: Some(27 * MIB),
+            },
+        );
+    }
+    for (at, end) in [(3, " · 3.1 MiB/s · ~6 s"), (15, " · sem dados há 12 s")] {
+        let cli = ph.line_at(0, ascii(), s(at)).unwrap();
+        a.now = s(at);
+        let tui = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+        let (c, t) = (after(&cli, "Baixando "), after(&tui, "rust.msi "));
+        assert_eq!(c, t);
+        assert!(c.ends_with(end), "{c}");
+        println!("t216 {at}s: {}", fake::plain(cli.as_bytes()));
+    }
+}
+
+#[test]
+fn tui_download_shows_size_speed_and_stall() {
+    use wingetrs::tui::app::{Msg, update};
+    let base = Instant::now();
+    let s = |n: u64| base + Duration::from_secs(n);
+    let mut a = tui_running(base);
+    for i in 0..=3 {
+        a.now = s(i);
+        update(
+            &mut a,
+            Msg::InstallProgress {
+                label: "rust.msi".into(),
+                done: i * STEP,
+                total: Some(27 * MIB),
+            },
+        );
+    }
+    let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(text.contains("9.3 / 27.0 MiB · 3.1 MiB/s"), "{text}");
+    a.now = s(15);
+    let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(text.ends_with(" · sem dados há 12 s"), "{text}");
+    // Unknown total: size and speed, no bar.
+    let mut a = tui_running(base);
+    for (at, done) in [(0, 0), (2, 4 * MIB)] {
+        a.now = s(at);
+        update(
+            &mut a,
+            Msg::InstallProgress {
+                label: "rust.msi".into(),
+                done,
+                total: None,
+            },
+        );
+    }
+    let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(text.ends_with("rust.msi 4.0 MiB · 2.0 MiB/s"), "{text}");
+    assert!(!text.contains("bytes"), "{text}");
+}
+
+/// A download line at 25% of 20 MiB, and the same line after 12 s without data.
+fn download_phases(base: Instant) -> Phases {
+    let mut ph = Phases::new();
+    ph.update_at(&dl(5 * MIB, Some(20 * MIB)), base);
+    ph
+}
+
+fn accent_styles() -> ProgressStyles {
+    ProgressStyles::of(&Theme::new(true, ColorDepth::Ansi256))
+}
+
+#[test]
+fn progress_frame_paints_with_theme_tokens() {
+    let base = Instant::now();
+    let ph = download_phases(base);
+    let parts = ph.parts_at(0, unicode(), base).unwrap();
+    let (out, width) = with_enabled(true, || progress_frame(&parts, 200, &accent_styles()));
+    let spin = unicode().spinner[0];
+    assert!(out.contains(&format!("\x1b[38;5;99m{spin}")), "{out:?}");
+    let plain = ph.line_at(0, unicode(), base).unwrap();
+    assert_eq!(fake::plain(out.as_bytes()), plain);
+    assert_eq!(width, plain.chars().count());
+    println!("t216 frame: {}", out.replace('\x1b', "<ESC>"));
+}
+
+#[test]
+fn progress_frame_plain_without_color() {
+    let base = Instant::now();
+    let ph = download_phases(base);
+    let parts = ph.parts_at(0, unicode(), base).unwrap();
+    let (out, _) = with_enabled(false, || progress_frame(&parts, 200, &accent_styles()));
+    assert!(!out.contains('\x1b'), "{out:?}");
+    assert_eq!(out, ph.line_at(0, unicode(), base).unwrap());
+}
+
+#[test]
+fn progress_frame_cuts_before_painting() {
+    let base = Instant::now();
+    let ph = download_phases(base);
+    let at = base + Duration::from_secs(12);
+    let parts = ph.parts_at(0, unicode(), at).unwrap();
+    let full = ph.line_at(0, unicode(), at).unwrap();
+    assert!(full.ends_with(" · sem dados há 12 s"), "{full}");
+    let (out, width) = with_enabled(true, || progress_frame(&parts, 30, &accent_styles()));
+    let plain = fake::plain(out.as_bytes());
+    assert_eq!(plain.chars().count(), 30, "{plain}");
+    assert_eq!(width, 30);
+    assert!(full.starts_with(&plain), "{plain} / {full}");
+    // Every escape sequence ends (final byte `@`..`~`) before the end of the string.
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find("\x1b[") {
+        rest = &rest[i + 2..];
+        let end = rest
+            .find(|c: char| ('@'..='~').contains(&c))
+            .unwrap_or_else(|| panic!("unterminated sequence in {out:?}"));
+        rest = &rest[end + 1..];
+    }
+}
+
+#[test]
+fn from_theme_maps_rgb_indexed_and_none() {
+    use ratatui::style::{Color, Modifier, Style};
+    let rgb = from_theme(Style::new().fg(Color::Rgb(1, 2, 3)));
+    assert_eq!(rgb.get_fg_color(), Some(anstyle::RgbColor(1, 2, 3).into()));
+    let idx = from_theme(Style::new().fg(Color::Indexed(99)));
+    assert_eq!(idx.get_fg_color(), Some(anstyle::Ansi256Color(99).into()));
+    assert_eq!(from_theme(Style::new()), anstyle::Style::new());
+    let bold = from_theme(Style::new().add_modifier(Modifier::BOLD));
+    assert!(bold.get_effects().contains(anstyle::Effects::BOLD));
+    assert_eq!(style::paint_raw(idx, "x"), "\x1b[38;5;99mx\x1b[0m");
+}
+
+/// The phases `run_update_with` reports, in order.
+type PhaseTrace = std::sync::Arc<Mutex<Vec<Phase>>>;
+
+fn phase_sink(trace: &PhaseTrace) -> impl Fn(&ProgressEvent) + Send + Sync + use<> {
+    let trace = std::sync::Arc::clone(trace);
+    move |ev| {
+        if let ProgressEvent::Phase(p) = ev {
+            trace.lock().unwrap().push(p.clone());
+        }
+    }
+}
+
+#[tokio::test]
+async fn update_reports_phases_in_order() {
+    use wingetrs::update::run_update_with;
+    let (s, ep) = crate::update::setup().await;
+    // Every source answers, so a second run without `force` finds them all up to date.
+    Mock::given(method("GET"))
+        .and(path("/extras.tgz"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(include_bytes!("../fixtures/scoop/Main-mini.tar.gz").to_vec())
+                .insert_header("ETag", "\"e1\""),
+        )
+        .with_priority(1)
+        .mount(&s)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let http = Http::new().unwrap();
+    let trace = PhaseTrace::default();
+    let sink = phase_sink(&trace);
+    run_update_with(&data, &ep, &http, true, LockWait::NoWait, &sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            Phase::Preparing,
+            Phase::FetchingCatalog { sources: 3 },
+            Phase::WritingCatalog
+        ]
+    );
+    trace.lock().unwrap().clear();
+    run_update_with(&data, &ep, &http, false, LockWait::NoWait, &sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [Phase::Preparing, Phase::FetchingCatalog { sources: 0 }]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_waits_for_lock_with_phase() {
+    use wingetrs::update::run_update_with;
+    let (_s, ep) = crate::update::setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let held = wingetrs::cache::UpdateLock::try_acquire(&data.lock_path())
+        .unwrap()
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Phase>();
+    let job = tokio::spawn(async move {
+        let sink = move |ev: &ProgressEvent| {
+            if let ProgressEvent::Phase(p) = ev {
+                let _ = tx.send(p.clone());
+            }
+        };
+        let http = Http::new().unwrap();
+        run_update_with(
+            &data,
+            &ep,
+            &http,
+            true,
+            LockWait::Block(Duration::from_secs(600)),
+            &sink,
+        )
+        .await
+        .map(|_| ())
+    });
+    let mut next = async || {
+        tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("a phase in time")
+    };
+    assert_eq!(next().await, Some(Phase::Preparing));
+    assert_eq!(next().await, Some(Phase::WaitingUpdate));
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(60), job)
+        .await
+        .expect("the update goes on once the lock is free")
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn new_phase_titles() {
+    use wingetrs::install::progress::phase_status;
+    let two = Duration::from_secs(2);
+    for (phase, text) in [
+        (
+            Phase::WaitingUpdate,
+            "Aguardando outra atualização do catálogo · 00:02",
+        ),
+        (
+            Phase::FetchingCatalog { sources: 1 },
+            "Baixando o catálogo · 00:02",
+        ),
+        (
+            Phase::FetchingCatalog { sources: 3 },
+            "Baixando os catálogos (3 fontes) · 00:02",
+        ),
+        (Phase::WritingCatalog, "Gravando o catálogo · 00:02"),
+        (Phase::ReadingInstalled, "Lendo os apps instalados · 00:02"),
+        (Phase::Correlating, "Comparando com o catálogo · 00:02"),
+    ] {
+        assert_eq!(phase_text(&phase, two), text);
+        assert_eq!(phase_status(&phase, two), text);
+    }
+}

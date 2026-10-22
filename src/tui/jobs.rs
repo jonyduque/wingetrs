@@ -120,7 +120,12 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::Bridge { .. }
             | Phase::RunningScript { .. }
             | Phase::RunningPackageInstaller { .. }
-            | Phase::SelfUpdate(_)),
+            | Phase::SelfUpdate(_)
+            | Phase::WaitingUpdate
+            | Phase::FetchingCatalog { .. }
+            | Phase::WritingCatalog
+            | Phase::ReadingInstalled
+            | Phase::Correlating),
         ) => Some(Msg::InstallPhase(p.clone())),
     }
 }

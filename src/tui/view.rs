@@ -1459,7 +1459,7 @@ pub fn running_text(app: &App, g: &Glyphs) -> Option<String> {
             let mut t = format!("{} {}", spinner(app, g), r.label);
             if let Some(p) = &r.progress {
                 t.push(' ');
-                t.push_str(&progress_text(p, app.now));
+                t.push_str(&progress_text(p, app.now, g));
             }
             t
         }
@@ -1477,27 +1477,14 @@ pub fn running_text(app: &App, g: &Glyphs) -> Option<String> {
     Some(text)
 }
 
-/// The phase with its clock (the CLI's text, without color), or the download bar.
-fn progress_text(p: &RunProgress, now: std::time::Instant) -> String {
+/// The phase with its clock, or the download bar with sizes and speed (the CLI's text,
+/// without color).
+fn progress_text(p: &RunProgress, now: std::time::Instant, g: &Glyphs) -> String {
+    use crate::install::progress::{download_parts, download_text, phase_status};
     if let Some((phase, since)) = &p.phase {
-        return crate::install::progress::phase_status(
-            phase,
-            now.saturating_duration_since(*since),
-        );
+        return phase_status(phase, now.saturating_duration_since(*since));
     }
-    match p.total.filter(|t| *t > 0) {
-        Some(total) => {
-            let pct = (p.done.saturating_mul(100) / total).min(100);
-            let filled = usize::try_from(pct / 5).unwrap_or(20);
-            format!(
-                "{} [{}{}] {pct}%",
-                p.label,
-                "#".repeat(filled),
-                "-".repeat(20 - filled.min(20))
-            )
-        }
-        None => format!("{} {} bytes", p.label, p.done),
-    }
+    download_text(&p.label, &download_parts(&p.meter, now, g))
 }
 
 fn draw_picker(

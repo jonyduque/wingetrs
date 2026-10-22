@@ -1,8 +1,10 @@
 //! Typed progress of an install: download bytes and the phase each slow step enters. Every
 //! consumer matches [`ProgressEvent`] and [`Phase`] exhaustively, so a new phase cannot be
 //! silently dropped by one of them (the `INSTALLER_RUNNING` label was, see ARMADILHAS).
+use crate::tui::theme::Glyphs;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Shown, the same in the CLI and the TUI, before every UAC prompt wingetrs opens or a
 /// self-elevating installer opens (Task 201), with the clock running until it is answered.
@@ -80,6 +82,16 @@ pub enum Phase {
     RunningPackageInstaller { file: String },
     /// `wingetrs self update` (Task 213): one of its steps.
     SelfUpdate(SelfUpdateStep),
+    /// `update`: another process holds the update lock and this one waits for it.
+    WaitingUpdate,
+    /// `update`: downloading the `sources` catalogs that are not up to date.
+    FetchingCatalog { sources: usize },
+    /// `update`: writing the downloaded catalogs into the local catalog.
+    WritingCatalog,
+    /// `list`: reading the installed apps (registry, winget, Scoop).
+    ReadingInstalled,
+    /// `list`: matching the installed apps against the catalog.
+    Correlating,
 }
 
 /// The steps of `wingetrs self update` (the download itself is `ProgressEvent::Download`).
@@ -154,6 +166,12 @@ pub fn phase_title(phase: &Phase) -> String {
             SelfUpdateStep::Swapping => "Trocando o executável".into(),
             SelfUpdateStep::Elevated => "Atualizando como administrador".into(),
         },
+        Phase::WaitingUpdate => "Aguardando outra atualização do catálogo".into(),
+        Phase::FetchingCatalog { sources: 1 } => "Baixando o catálogo".into(),
+        Phase::FetchingCatalog { sources } => format!("Baixando os catálogos ({sources} fontes)"),
+        Phase::WritingCatalog => "Gravando o catálogo".into(),
+        Phase::ReadingInstalled => "Lendo os apps instalados".into(),
+        Phase::Correlating => "Comparando com o catálogo".into(),
     }
 }
 
@@ -204,7 +222,12 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
             SelfUpdateStep::CheckingVersion
             | SelfUpdateStep::CheckingHash
             | SelfUpdateStep::Swapping,
-        ) => text,
+        )
+        | Phase::WaitingUpdate
+        | Phase::FetchingCatalog { .. }
+        | Phase::WritingCatalog
+        | Phase::ReadingInstalled
+        | Phase::Correlating => text,
     }
 }
 
@@ -230,4 +253,164 @@ pub fn helper_line_phase(line: &str, granted: &Phase) -> Option<Phase> {
         ELEVATION_GRANTED => Some(granted.clone()),
         _ => None,
     }
+}
+
+/// Window of the average download speed.
+const SPEED_WINDOW: Duration = Duration::from_secs(3);
+/// Download silence after which the line says so.
+pub const STALL_AFTER: Duration = Duration::from_secs(10);
+/// Cells of the download bar.
+const BAR_CELLS: usize = 20;
+
+/// Bytes of the downloads in progress (summed over their keys) with the recent samples the
+/// speed comes from. The CLI and the TUI feed it and draw it through [`download_parts`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DownloadMeter {
+    per_url: BTreeMap<String, (u64, Option<u64>)>,
+    /// `(when, summed bytes)` of recent reports, plus one anchor before the window.
+    samples: VecDeque<(Instant, u64)>,
+    /// When the summed bytes last grew (or the first report).
+    last_data: Option<Instant>,
+}
+
+impl DownloadMeter {
+    /// `url` has `done` of `total` bytes at `now`.
+    pub fn record_at(&mut self, url: &str, done: u64, total: Option<u64>, now: Instant) {
+        self.per_url.insert(url.to_string(), (done, total));
+        let sum = self.done();
+        if self.samples.back().is_none_or(|(_, last)| sum > *last) {
+            self.last_data = Some(now);
+        }
+        self.samples.push_back((now, sum));
+        while self.samples.len() >= 2 && self.samples[1].0 + SPEED_WINDOW <= now {
+            self.samples.pop_front();
+        }
+    }
+
+    /// No download reported yet.
+    pub fn is_empty(&self) -> bool {
+        self.per_url.is_empty()
+    }
+
+    /// Bytes so far, summed.
+    pub fn done(&self) -> u64 {
+        self.per_url
+            .values()
+            .fold(0u64, |a, (d, _)| a.saturating_add(*d))
+    }
+
+    /// Summed size, when every download knows its own and the sum is not zero.
+    pub fn total(&self) -> Option<u64> {
+        self.per_url
+            .values()
+            .try_fold(0u64, |a, (_, t)| t.map(|t| a.saturating_add(t)))
+            .filter(|t| *t > 0)
+    }
+
+    /// Every download reached its known size.
+    pub fn finished(&self) -> bool {
+        !self.per_url.is_empty()
+            && self
+                .per_url
+                .values()
+                .all(|(d, t)| t.is_some_and(|t| *d >= t))
+    }
+
+    /// Average bytes per second over the last ~3 s, or `None` without a measurable rise.
+    pub fn rate_at(&self, now: Instant) -> Option<f64> {
+        let (_, latest) = *self.samples.back()?;
+        let anchor = self
+            .samples
+            .iter()
+            .rev()
+            .find(|(t, _)| *t + SPEED_WINDOW <= now)
+            .or(self.samples.front())?;
+        let secs = now.saturating_duration_since(anchor.0).as_secs_f64();
+        let rate = latest.saturating_sub(anchor.1) as f64 / secs;
+        (secs >= 0.5 && rate > 0.0).then_some(rate)
+    }
+
+    /// Time since the bytes last grew, or `None` before the first report.
+    pub fn quiet_at(&self, now: Instant) -> Option<Duration> {
+        self.last_data.map(|at| now.saturating_duration_since(at))
+    }
+}
+
+/// The download line in pieces, so the CLI can paint the bar: `filled` and `empty` make
+/// [`BAR_CELLS`] cells (both empty when the size is unknown), `tail` is the percentage, sizes,
+/// speed and estimate, `warn` the stall notice (may be empty).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadParts {
+    pub open: &'static str,
+    pub filled: String,
+    pub empty: String,
+    pub close: &'static str,
+    pub tail: String,
+    pub warn: String,
+}
+
+fn mib(n: u64) -> String {
+    format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+}
+
+/// `~6 s` or `~3 min`.
+fn eta(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s < 60 {
+        format!("~{s} s")
+    } else {
+        format!("~{} min", s.div_ceil(60))
+    }
+}
+
+/// The one download formatting of the CLI and the TUI: bar, `34%  9.3 / 27.0 MiB`, speed,
+/// estimate and, past [`STALL_AFTER`] without data, `sem dados há N s`.
+pub fn download_parts(meter: &DownloadMeter, now: Instant, glyphs: &Glyphs) -> DownloadParts {
+    let done = meter.done();
+    let total = meter.total();
+    let (filled, empty, mut tail) = match total {
+        Some(t) => {
+            let pct = done.min(t).saturating_mul(100) / t;
+            let cells = usize::try_from(pct / 5).unwrap_or(BAR_CELLS).min(BAR_CELLS);
+            (
+                glyphs.bar_full.repeat(cells),
+                glyphs.bar_empty.repeat(BAR_CELLS - cells),
+                format!(
+                    "{pct}%  {:.1} / {}",
+                    done as f64 / (1024.0 * 1024.0),
+                    mib(t)
+                ),
+            )
+        }
+        None => (String::new(), String::new(), mib(done)),
+    };
+    if let Some(rate) = meter.rate_at(now) {
+        tail.push_str(&format!(" · {}/s", mib(rate as u64)));
+        if let Some(t) = total {
+            tail.push_str(&format!(" · {}", eta(t.saturating_sub(done) as f64 / rate)));
+        }
+    }
+    let warn = match meter.quiet_at(now) {
+        Some(quiet) if quiet >= STALL_AFTER => format!(" · sem dados há {} s", quiet.as_secs()),
+        _ => String::new(),
+    };
+    DownloadParts {
+        open: glyphs.bar_open,
+        filled,
+        empty,
+        close: glyphs.bar_close,
+        tail,
+        warn,
+    }
+}
+
+/// `{label} {bar} {tail}{warn}` without color (no bar when the size is unknown).
+pub fn download_text(label: &str, parts: &DownloadParts) -> String {
+    if parts.filled.is_empty() && parts.empty.is_empty() {
+        return format!("{label} {}{}", parts.tail, parts.warn);
+    }
+    format!(
+        "{label} {}{}{}{} {}{}",
+        parts.open, parts.filled, parts.empty, parts.close, parts.tail, parts.warn
+    )
 }

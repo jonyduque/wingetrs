@@ -151,24 +151,11 @@ impl TtyUi {
     }
 
     fn build(cfg: &crate::config::Config, term: Box<dyn Term + Send>, tty: bool) -> TtyUi {
-        use crate::tui::theme::{GlyphSet, Theme, detect_depth};
-        let set = match cfg.glyphs.as_str() {
-            "unicode" => GlyphSet::Unicode,
-            "ascii" => GlyphSet::Ascii,
-            _ => GlyphSet::Nerd,
-        };
-        let glyphs = Glyphs::for_set(set);
         TtyUi {
-            progress: Arc::new(LineProgress::new(tty, glyphs)),
+            progress: progress_for(cfg, tty),
             term: Mutex::new(term),
-            theme: Theme::new(
-                cfg.theme != "light",
-                detect_depth(
-                    std::env::var("COLORTERM").ok().as_deref(),
-                    std::env::var("NO_COLOR").ok().as_deref(),
-                ),
-            ),
-            glyphs,
+            theme: theme_of(cfg),
+            glyphs: glyphs_of(cfg),
         }
     }
 
@@ -176,6 +163,41 @@ impl TtyUi {
     pub fn progress(&self) -> Arc<LineProgress> {
         Arc::clone(&self.progress)
     }
+}
+
+/// The TUI theme the config picks (dark or light, at the terminal's color depth).
+fn theme_of(cfg: &crate::config::Config) -> crate::tui::theme::Theme {
+    use crate::tui::theme::{Theme, detect_depth};
+    Theme::new(
+        cfg.theme != "light",
+        detect_depth(
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("NO_COLOR").ok().as_deref(),
+        ),
+    )
+}
+
+/// The glyph set the config picks.
+fn glyphs_of(cfg: &crate::config::Config) -> &'static Glyphs {
+    use crate::tui::theme::GlyphSet;
+    Glyphs::for_set(match cfg.glyphs.as_str() {
+        "unicode" => GlyphSet::Unicode,
+        "ascii" => GlyphSet::Ascii,
+        _ => GlyphSet::Nerd,
+    })
+}
+
+/// The progress line on stderr with the config's glyphs and the theme's colors; animated
+/// when not a tty, one plain line per phase otherwise.
+fn progress_for(cfg: &crate::config::Config, tty: bool) -> Arc<LineProgress> {
+    let styles = super::style::ProgressStyles::of(&theme_of(cfg));
+    Arc::new(LineProgress::new(tty, glyphs_of(cfg), styles))
+}
+
+/// The progress line of a command (`update`, `list`, an install): animated when stderr is a
+/// terminal.
+pub fn line_progress(cfg: &crate::config::Config) -> Arc<LineProgress> {
+    progress_for(cfg, emit::stderr_is_terminal())
 }
 
 impl TtyUi {
@@ -269,6 +291,7 @@ const LOG_POLL: Duration = Duration::from_secs(1);
 
 struct ProgressState {
     glyphs: &'static Glyphs,
+    styles: super::style::ProgressStyles,
     phases: Mutex<Phases>,
     frame: AtomicUsize,
     /// Chars of the line on screen (0 = none): the next draw pads to it, the erase clears it.
@@ -277,15 +300,6 @@ struct ProgressState {
     closed: AtomicBool,
     /// A line to print once above the progress line ([`LineProgress::notice`]).
     notice: Mutex<Option<String>>,
-}
-
-/// `main` then `warn` cut to `cols` chars (the warning goes first).
-fn fit_cols(main: String, warn: String, cols: usize) -> (String, String) {
-    let n = main.chars().count();
-    if n >= cols {
-        return (main.chars().take(cols).collect(), String::new());
-    }
-    (main, warn.chars().take(cols - n).collect())
 }
 
 impl ProgressState {
@@ -320,14 +334,13 @@ impl ProgressState {
             let width = self.drawn.swap(0, Ordering::Relaxed);
             err.line_above(width, &notice);
         }
-        let Some((main, warn)) = parts else {
+        let Some(parts) = parts else {
             err.flush();
             return;
         };
-        let (main, warn) = fit_cols(main, warn, cols);
-        let len = main.chars().count() + warn.chars().count();
+        let (line, len) = output::progress_frame(&parts, cols, &self.styles);
         let pad = self.drawn.load(Ordering::Relaxed).saturating_sub(len);
-        err.redraw(&output::progress_line(&main, &warn), pad);
+        err.redraw(&line, pad);
         self.drawn.store(len, Ordering::Relaxed);
     }
 
@@ -368,11 +381,16 @@ pub struct LineProgress {
 }
 
 impl LineProgress {
-    pub fn new(tty: bool, glyphs: &'static Glyphs) -> LineProgress {
+    pub fn new(
+        tty: bool,
+        glyphs: &'static Glyphs,
+        styles: super::style::ProgressStyles,
+    ) -> LineProgress {
         LineProgress {
             tty,
             state: Arc::new(ProgressState {
                 glyphs,
+                styles,
                 phases: Mutex::new(Phases::new()),
                 frame: AtomicUsize::new(0),
                 drawn: AtomicUsize::new(0),

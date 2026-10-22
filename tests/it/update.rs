@@ -14,7 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const MSIX: &[u8] = include_bytes!("../fixtures/winget/source2-mini.msix");
 const TGZ: &[u8] = include_bytes!("../fixtures/scoop/Main-mini.tar.gz");
 
-async fn setup() -> (MockServer, Endpoints) {
+pub async fn setup() -> (MockServer, Endpoints) {
     let s = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/source2.msix"))

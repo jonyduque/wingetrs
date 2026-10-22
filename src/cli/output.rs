@@ -10,11 +10,12 @@ use crate::install::plan::{InstallPlan, Step};
 use crate::install::planner;
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::progress::SelfUpdateStep;
-use crate::install::progress::{Phase, ProgressEvent, phase_status, phase_text, phase_title};
+use crate::install::progress::{
+    DownloadMeter, Phase, ProgressEvent, download_parts, phase_status, phase_text, phase_title,
+};
 use crate::install::script_scan::{self, CallRoots, ScriptReport, Verdict, printable};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
-use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -807,11 +808,6 @@ pub fn residues_left(residues: &[crate::install::residue::Residue]) -> String {
     s
 }
 
-/// The animated progress line: `main`, then its warning (`sem dados há N s`) in yellow.
-pub fn progress_line(main: &str, warn: &str) -> String {
-    format!("{main}{}", paint(WARN, warn))
-}
-
 /// `Label: value` with the label in header style (the `--dry-run` details and the license
 /// lines are built this way by their plans).
 fn labeled(line: &str) -> String {
@@ -1332,14 +1328,7 @@ pub fn repair_text(r: &crate::install::ops::RepairReport) -> String {
     )
 }
 
-fn mib(n: u64) -> String {
-    format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
-}
-
-/// Window of the average download speed.
-const SPEED_WINDOW: Duration = Duration::from_secs(3);
-/// Download silence after which the line says so.
-pub const STALL_AFTER: Duration = Duration::from_secs(10);
+pub use crate::install::progress::STALL_AFTER;
 /// Log silence of the Windows Installer after which the line warns.
 pub const INSTALLER_IDLE: Duration = Duration::from_secs(60);
 
@@ -1388,14 +1377,68 @@ fn fit_left(text: &str, room: usize) -> String {
     format!("…{tail}")
 }
 
-/// `~6 s` or `~3 min`.
-fn eta(secs: f64) -> String {
-    let s = secs.round() as u64;
-    if s < 60 {
-        format!("~{s} s")
-    } else {
-        format!("~{} min", s.div_ceil(60))
+/// The progress line in pieces: [`progress_frame`] cuts the plain text, then paints each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineParts {
+    pub spinner: String,
+    /// The phase with its clock, or `Baixando`.
+    pub label: String,
+    /// Download bar; all four empty outside a download of known size.
+    pub open: String,
+    pub filled: String,
+    pub empty: String,
+    pub close: String,
+    /// After the label or the bar (sizes, speed, estimate).
+    pub rest: String,
+    /// `sem dados há N s` and the like (may be empty).
+    pub warn: String,
+}
+
+impl LineParts {
+    /// The pieces in order, each with the style it is painted in (`None`: plain).
+    fn pieces(&self, styles: &style::ProgressStyles) -> Vec<(String, Option<Style>)> {
+        let mut out = vec![
+            (self.spinner.clone(), Some(styles.spinner)),
+            (format!(" {}", self.label), None),
+        ];
+        if !self.filled.is_empty() || !self.empty.is_empty() {
+            out.push((format!(" {}", self.open), None));
+            out.push((self.filled.clone(), Some(styles.fill)));
+            out.push((self.empty.clone(), Some(styles.empty)));
+            out.push((self.close.clone(), None));
+        }
+        out.push((self.rest.clone(), None));
+        out.push((self.warn.clone(), Some(WARN)));
+        out
     }
+
+    /// The whole line without color.
+    pub fn plain(&self) -> String {
+        self.pieces(&style::ProgressStyles::default())
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+}
+
+/// The progress line cut to `cols` chars on its plain text (the warning goes first, then the
+/// end of the line), then painted piece by piece; with its visible width.
+pub fn progress_frame(
+    parts: &LineParts,
+    cols: usize,
+    styles: &style::ProgressStyles,
+) -> (String, usize) {
+    let mut room = cols;
+    let mut out = String::new();
+    for (text, piece_style) in parts.pieces(styles) {
+        let kept: String = text.chars().take(room).collect();
+        room -= kept.chars().count();
+        match piece_style {
+            Some(s) => out.push_str(&paint(s, &kept)),
+            None => out.push_str(&kept),
+        }
+    }
+    (out, cols - room)
 }
 
 /// Phase of an install as the CLI shows it on one stderr line: the phase with its clock,
@@ -1403,13 +1446,9 @@ fn eta(secs: f64) -> String {
 /// with what its log says. Pure state with an injected clock; the caller draws.
 #[derive(Default)]
 pub struct Phases {
-    per_url: std::collections::BTreeMap<String, (u64, Option<u64>)>,
+    meter: DownloadMeter,
     /// The phase and when it started; `None` while downloads are the latest news.
     phase: Option<(Phase, Instant)>,
-    /// `(when, summed bytes)` of recent download reports, plus one anchor before the window.
-    samples: VecDeque<(Instant, u64)>,
-    /// When the summed bytes last grew (or the first report).
-    last_data: Option<Instant>,
     log: Option<LogWatch>,
     notice_shown: bool,
 }
@@ -1429,18 +1468,7 @@ impl Phases {
         match ev {
             ProgressEvent::Download { url, done, total } => {
                 self.phase = None;
-                self.per_url.insert(url.clone(), (*done, *total));
-                let sum = self
-                    .per_url
-                    .values()
-                    .fold(0u64, |a, (d, _)| a.saturating_add(*d));
-                if self.samples.back().is_none_or(|(_, last)| sum > *last) {
-                    self.last_data = Some(now);
-                }
-                self.samples.push_back((now, sum));
-                while self.samples.len() >= 2 && self.samples[1].0 + SPEED_WINDOW <= now {
-                    self.samples.pop_front();
-                }
+                self.meter.record_at(url, *done, *total, now);
             }
             ProgressEvent::Phase(p) => {
                 if self.phase.as_ref().is_some_and(|(cur, _)| cur == p) {
@@ -1478,7 +1506,12 @@ impl Phases {
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
                 | Phase::RunningPackageInstaller { .. }
-                | Phase::SelfUpdate(_),
+                | Phase::SelfUpdate(_)
+                | Phase::WaitingUpdate
+                | Phase::FetchingCatalog { .. }
+                | Phase::WritingCatalog
+                | Phase::ReadingInstalled
+                | Phase::Correlating,
                 _,
             ))
             | None => None,
@@ -1542,7 +1575,12 @@ impl Phases {
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
                 | Phase::RunningPackageInstaller { .. }
-                | Phase::SelfUpdate(_),
+                | Phase::SelfUpdate(_)
+                | Phase::WaitingUpdate
+                | Phase::FetchingCatalog { .. }
+                | Phase::WritingCatalog
+                | Phase::ReadingInstalled
+                | Phase::Correlating,
                 _,
             ))
             | None => return None,
@@ -1566,29 +1604,29 @@ impl Phases {
         glyphs: &crate::tui::theme::Glyphs,
         now: Instant,
     ) -> Option<String> {
-        self.parts_at(frame, glyphs, now)
-            .map(|(main, warn)| main + &warn)
+        self.parts_at(frame, glyphs, now).map(|p| p.plain())
     }
 
-    /// The line split in its plain part and its warning (painted by the caller; may be empty).
+    /// The line in pieces (painted by [`progress_frame`]).
     pub fn parts_at(
         &self,
         frame: usize,
         glyphs: &crate::tui::theme::Glyphs,
         now: Instant,
-    ) -> Option<(String, String)> {
+    ) -> Option<LineParts> {
         let spin = glyphs.spinner.get(frame % glyphs.spinner.len().max(1))?;
+        let spinner = spin.to_string();
         if let Some((phase, since)) = &self.phase {
             let elapsed = now.saturating_duration_since(*since);
-            let mut main = format!("{spin} {}", phase_text(phase, elapsed));
+            let mut label = phase_text(phase, elapsed);
             let mut warn = String::new();
             match phase {
                 Phase::Installer { .. } => match &self.log {
-                    None => main = format!("{spin} {}", phase_status(phase, elapsed)),
+                    None => label = phase_status(phase, elapsed),
                     Some(w) => {
                         if w.files > 0 {
                             let approx = if w.estimated { "~" } else { "" };
-                            main.push_str(&format!(" · {approx}{} arquivos", thousands(w.files)));
+                            label.push_str(&format!(" · {approx}{} arquivos", thousands(w.files)));
                         }
                         let idle = now.saturating_duration_since(w.changed_at);
                         if idle >= INSTALLER_IDLE {
@@ -1598,8 +1636,9 @@ impl Phases {
                                 idle.as_secs() / 60
                             );
                         } else if let Some(f) = &w.last_file {
-                            let room = LINE_COLUMNS.saturating_sub(main.chars().count() + 3);
-                            main.push_str(&format!(" · {}", fit_left(f, room)));
+                            let used = spinner.chars().count() + 1 + label.chars().count();
+                            let room = LINE_COLUMNS.saturating_sub(used + 3);
+                            label.push_str(&format!(" · {}", fit_left(f, room)));
                         }
                     }
                 },
@@ -1617,7 +1656,12 @@ impl Phases {
                     SelfUpdateStep::CheckingVersion
                     | SelfUpdateStep::CheckingHash
                     | SelfUpdateStep::Swapping,
-                ) => {}
+                )
+                | Phase::WaitingUpdate
+                | Phase::FetchingCatalog { .. }
+                | Phase::WritingCatalog
+                | Phase::ReadingInstalled
+                | Phase::Correlating => {}
                 // The native installer and uninstaller cannot be cancelled either; they have
                 // no log to follow: past `NATIVE_QUIET` the line says a window may be waiting.
                 Phase::RunningInstaller { .. }
@@ -1629,7 +1673,7 @@ impl Phases {
                 | Phase::RunningScript { .. }
                 | Phase::RunningPackageInstaller { .. }
                 | Phase::SelfUpdate(SelfUpdateStep::Elevated) => {
-                    main = format!("{spin} {}", phase_status(phase, elapsed));
+                    label = phase_status(phase, elapsed);
                     if elapsed >= NATIVE_QUIET && !matches!(phase, Phase::CheckingRemoval { .. }) {
                         warn = format!(
                             " · rodando há {} min; pode haver uma janela esperando resposta",
@@ -1638,64 +1682,34 @@ impl Phases {
                     }
                 }
             }
-            return Some((main, warn));
+            return Some(LineParts {
+                spinner,
+                label,
+                warn,
+                ..LineParts::default()
+            });
         }
-        if self.per_url.is_empty() {
+        if self.meter.is_empty() {
             return None;
         }
-        let done: u64 = self.per_url.values().map(|(d, _)| d).sum();
-        let known = self.per_url.values().all(|(_, t)| t.is_some());
-        let total: u64 = self.per_url.values().filter_map(|(_, t)| *t).sum();
-        let finished = self
-            .per_url
-            .values()
-            .all(|(d, t)| t.is_some_and(|t| *d >= t));
-        if finished {
-            return Some((format!("{spin} Instalando…"), String::new()));
+        if self.meter.finished() {
+            return Some(LineParts {
+                spinner,
+                label: "Instalando…".into(),
+                ..LineParts::default()
+            });
         }
-        let total = known.then_some(total).filter(|t| *t > 0);
-        let mut main = match total {
-            Some(t) => {
-                let pct = done.min(t) * 100 / t;
-                let filled = usize::try_from(pct / 5).unwrap_or(20).min(20);
-                format!(
-                    "{spin} Baixando [{}{}] {pct}%  {:.1} / {}",
-                    "#".repeat(filled),
-                    "-".repeat(20 - filled),
-                    done as f64 / (1024.0 * 1024.0),
-                    mib(t)
-                )
-            }
-            None => format!("{spin} Baixando {}", mib(done)),
-        };
-        if let Some(rate) = self.speed_at(now) {
-            main.push_str(&format!(" · {}/s", mib(rate as u64)));
-            if let Some(t) = total {
-                main.push_str(&format!(" · {}", eta(t.saturating_sub(done) as f64 / rate)));
-            }
-        }
-        let mut warn = String::new();
-        if let Some(at) = self.last_data {
-            let quiet = now.saturating_duration_since(at);
-            if quiet >= STALL_AFTER {
-                warn = format!(" · sem dados há {} s", quiet.as_secs());
-            }
-        }
-        Some((main, warn))
-    }
-
-    /// Average bytes per second over the last ~3 s, or `None` without a measurable rise.
-    fn speed_at(&self, now: Instant) -> Option<f64> {
-        let (_, latest) = *self.samples.back()?;
-        let anchor = self
-            .samples
-            .iter()
-            .rev()
-            .find(|(t, _)| *t + SPEED_WINDOW <= now)
-            .or(self.samples.front())?;
-        let secs = now.saturating_duration_since(anchor.0).as_secs_f64();
-        let rate = latest.saturating_sub(anchor.1) as f64 / secs;
-        (secs >= 0.5 && rate > 0.0).then_some(rate)
+        let d = download_parts(&self.meter, now, glyphs);
+        Some(LineParts {
+            spinner,
+            label: "Baixando".into(),
+            open: d.open.into(),
+            filled: d.filled,
+            empty: d.empty,
+            close: d.close.into(),
+            rest: format!(" {}", d.tail),
+            warn: d.warn,
+        })
     }
 }
 
