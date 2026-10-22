@@ -16,6 +16,13 @@
 | 232 | I — barra de progresso na extração (CLI e TUI) | 230, 205, 207 |
 | 233 | `uninstall_by_winget` sem PATH (segurança) | — |
 
+**Decisões do usuário (2026-10-22):**
+- d-E = B: um pwsh reaproveitado por execução, cache por SHA, e o AST nunca deixa o veredito mais brando.
+- d-H = A: token do Explorer + `CreateProcessWithTokenW`, depois das sondas S1–S3 do usuário.
+- G: sonda autorizada (~3 GB, sem executar nada). O modo cobre só MSI (D-G1), `msiexec /a` é recusado (D-G3), só a flag sem config (D-G4) e arquivos para pastas do Windows são bloqueados (D-G5). A D-G2 fica para depois da sonda.
+- Demais decisões aceitas como recomendadas: C1 (avisos fora do `--json`), D1 (Esc pula só o item), D2 (cada item confirma), D-A1 (cache dos nomes MSIX em disco se a Fase 1 der ≥ 50 ms), D-B1 (o usuário roda o `tui_frame console`), D-B2 (Fase 2 sem nova consulta para o buffer; consultar para o Sixel), D-I1 (tar sem total), D-I2 (230 e 232 separadas).
+- O exemplo da 227 que lê scripts reais do catálogo ainda precisa de pedido explícito.
+
 ## Bloco 233
 
 ### Task 233: Ponte do winget sem PATH quando o processo é elevado
