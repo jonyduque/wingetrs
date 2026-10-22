@@ -17,6 +17,8 @@ use crate::install::msi_layout;
 /// Base custom action types (`Type & 0x3F`) that run code: DLL, EXE and script, from
 /// `Binary`, an installed file, a directory, text or a property.
 const CODE_TYPES: [i32; 14] = [1, 2, 5, 6, 17, 18, 21, 22, 34, 37, 38, 50, 53, 54];
+/// Base types that install another MSI (nested install): they block whether deferred or not.
+const NESTED_TYPES: [i32; 3] = [7, 23, 39];
 /// `msidbCustomActionTypeInScript`: the action is deferred (runs in the install script).
 const IN_SCRIPT: i32 = 0x400;
 /// Directory ids whose files land in Windows folders.
@@ -32,6 +34,10 @@ const SYSTEM_DIRS: [&str; 6] = [
 const WORD_COUNT_NO_ELEVATION: i32 = 0x8;
 /// `Registry.Root` of `HKEY_LOCAL_MACHINE`.
 const ROOT_HKLM: i32 = 2;
+/// `Registry.Root` `msidbRegistryRootDependent`: HKLM in a per-machine install.
+const ROOT_DEPENDENT: i32 = -1;
+/// Registry keys (under HKCR, or `Software\Classes\` + key) that register COM.
+const COM_KEYS: [&str; 4] = ["clsid\\", "typelib\\", "appid\\", "interface\\"];
 
 /// What portable mode cannot do for the app.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,8 +48,12 @@ pub enum Blocker {
     Driver(String),
     #[error("ação personalizada {0} roda código durante a instalação")]
     DeferredAction(String),
+    #[error("ação personalizada {0} instala outro pacote MSI")]
+    NestedInstall(String),
     #[error("registra componente COM {0}")]
     Com(String),
+    #[error("instala assembly .NET no cache global (GAC) ({0})")]
+    Gac(String),
     #[error("grava em HKLM\\{0}")]
     SystemRegistry(String),
     #[error("{0} arquivo(s) para pastas do Windows")]
@@ -126,10 +136,14 @@ fn facts(pkg: &mut Pkg) -> Result<MsiFacts, ExtractError> {
         let (Some(action), Some(kind)) = (text(&r, "Action"), int(&r, "Type")) else {
             continue;
         };
-        if !sequenced.contains(&action) || !CODE_TYPES.contains(&(kind & 0x3F)) {
+        if !sequenced.contains(&action) {
             continue;
         }
-        if kind & IN_SCRIPT != 0 {
+        if NESTED_TYPES.contains(&(kind & 0x3F)) {
+            push(&mut blockers, Blocker::NestedInstall(action));
+        } else if !CODE_TYPES.contains(&(kind & 0x3F)) {
+            continue;
+        } else if kind & IN_SCRIPT != 0 {
             push(&mut blockers, Blocker::DeferredAction(action));
         } else {
             push(&mut losses, Loss::ImmediateAction(action));
@@ -143,17 +157,36 @@ fn facts(pkg: &mut Pkg) -> Result<MsiFacts, ExtractError> {
             }
         }
     }
+    for r in rows(pkg, "SelfReg")? {
+        push(
+            &mut blockers,
+            Blocker::Com(text(&r, "File_").unwrap_or_default()),
+        );
+    }
     let mut system_registry = Vec::new();
     let mut other_registry = 0;
     for r in rows(pkg, "Registry")? {
         let key = text(&r, "Key").unwrap_or_default();
         let lower = key.to_ascii_lowercase();
-        if lower.starts_with("clsid\\") || lower.starts_with("software\\classes\\clsid\\") {
+        let class_key = lower.strip_prefix("software\\classes\\").unwrap_or(&lower);
+        let root = int(&r, "Root");
+        if COM_KEYS.iter().any(|k| class_key.starts_with(k)) {
             push(&mut blockers, Blocker::Com(key));
-        } else if int(&r, "Root") == Some(ROOT_HKLM) && lower.starts_with("system\\") {
+        } else if (root == Some(ROOT_HKLM) || root == Some(ROOT_DEPENDENT))
+            && lower.starts_with("system\\")
+        {
             push(&mut system_registry, Blocker::SystemRegistry(key));
         } else {
             other_registry += 1;
+        }
+    }
+    for r in rows(pkg, "MsiAssembly")? {
+        // No `File_Application`: the assembly goes to the global assembly cache.
+        if text(&r, "File_Application").is_none_or(|f| f.is_empty()) {
+            push(
+                &mut blockers,
+                Blocker::Gac(text(&r, "Component_").unwrap_or_default()),
+            );
         }
     }
     for b in system_registry {

@@ -5,6 +5,7 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 
 use msi::{Column, Insert, Package, PackageType, Value};
+use wingetrs::install::extract::ExtractError;
 use wingetrs::winget_install::portable_msi::{Blocker, Loss, MsiFacts, analyze};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/msi");
@@ -468,4 +469,157 @@ fn own_extraction_lands_where_the_analysis_says() {
         let p = rel.iter().fold(dest.clone(), |p, c| p.join(c));
         assert!(p.is_file(), "{}", p.display());
     }
+}
+#[test]
+fn system_key_blocks_only_under_hklm_or_the_dependent_root() {
+    let f = facts(&build(AppMsi {
+        extra: vec![registry(&[("r4", 1, "SYSTEM\\Foo")])],
+        ..app()
+    }));
+    assert_eq!(f.blockers, Vec::<Blocker>::new());
+    assert_eq!(f.losses, vec![Loss::Registry(1)]);
+    let f = facts(&build(AppMsi {
+        extra: vec![registry(&[("r5", -1, "SYSTEM\\Foo")])],
+        ..app()
+    }));
+    assert_eq!(
+        f.blockers,
+        vec![Blocker::SystemRegistry("SYSTEM\\Foo".into())]
+    );
+}
+
+#[test]
+fn nested_install_blocks_even_when_immediate() {
+    for t in [7, 23, 39] {
+        let extra = custom_actions(&[("Nested", t, true)]);
+        let f = facts(&build(AppMsi { extra, ..app() }));
+        assert_eq!(
+            f.blockers,
+            vec![Blocker::NestedInstall("Nested".into())],
+            "type {t}"
+        );
+        assert_eq!(f.losses, Vec::<Loss>::new(), "type {t}");
+    }
+}
+
+#[test]
+fn self_registration_blocks() {
+    let extra = vec![Extra {
+        name: "SelfReg",
+        columns: vec![
+            Column::build("File_").primary_key().id_string(72),
+            Column::build("Cost").nullable().int16(),
+        ],
+        rows: vec![vec!["f_b".into(), Value::Null]],
+    }];
+    let f = facts(&build(AppMsi { extra, ..app() }));
+    assert_eq!(f.blockers, vec![Blocker::Com("f_b".into())]);
+}
+
+#[test]
+fn com_registry_keys_block() {
+    for key in [
+        "TypeLib\\{00000000-0000-0000-0000-000000000003}",
+        "AppID\\{00000000-0000-0000-0000-000000000004}",
+        "Interface\\{00000000-0000-0000-0000-000000000005}",
+        "Software\\Classes\\Interface\\{00000000-0000-0000-0000-000000000006}",
+    ] {
+        let f = facts(&build(AppMsi {
+            extra: vec![registry(&[("r1", 1, key)])],
+            ..app()
+        }));
+        assert_eq!(f.blockers, vec![Blocker::Com(key.into())], "{key}");
+        assert_eq!(f.losses, Vec::<Loss>::new(), "{key}");
+    }
+}
+
+#[test]
+fn gac_assembly_blocks_private_assembly_does_not() {
+    let assembly = |application: Value| Extra {
+        name: "MsiAssembly",
+        columns: vec![
+            Column::build("Component_").primary_key().id_string(72),
+            Column::build("Feature_").id_string(38),
+            Column::build("File_Manifest").nullable().id_string(72),
+            Column::build("File_Application").nullable().id_string(72),
+            Column::build("Attributes").nullable().int16(),
+        ],
+        rows: vec![vec![
+            "C_BIN".into(),
+            "F".into(),
+            Value::Null,
+            application,
+            Value::Int(0),
+        ]],
+    };
+    let f = facts(&build(AppMsi {
+        extra: vec![assembly(Value::Null)],
+        ..app()
+    }));
+    assert_eq!(f.blockers, vec![Blocker::Gac("C_BIN".into())]);
+    let f = facts(&build(AppMsi {
+        extra: vec![assembly("f_a".into())],
+        ..app()
+    }));
+    assert_eq!(f.blockers, Vec::<Blocker>::new());
+}
+
+#[test]
+fn garbage_is_an_error_not_a_panic() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("x.msi");
+    std::fs::write(&f, vec![0xA5u8; 4096]).unwrap();
+    let err = analyze(&f).unwrap_err();
+    assert!(
+        matches!(err, ExtractError::Archive(_) | ExtractError::Decoder(_)),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn directory_cycle_is_a_layout_error() {
+    let mut p = Package::create(PackageType::Installer, Cursor::new(Vec::new())).unwrap();
+    p.create_table(
+        "Directory",
+        vec![
+            Column::build("Directory").primary_key().id_string(72),
+            Column::build("Directory_Parent").nullable().id_string(72),
+            Column::build("DefaultDir").text_string(255),
+        ],
+    )
+    .unwrap();
+    p.create_table(
+        "Component",
+        vec![
+            Column::build("Component").primary_key().id_string(72),
+            Column::build("Directory_").id_string(72),
+        ],
+    )
+    .unwrap();
+    p.create_table(
+        "File",
+        vec![
+            Column::build("File").primary_key().id_string(72),
+            Column::build("Component_").id_string(72),
+            Column::build("FileName").text_string(255),
+            Column::build("Sequence").int32(),
+        ],
+    )
+    .unwrap();
+    p.insert_rows(
+        Insert::into("Directory")
+            .row(vec!["A".into(), "B".into(), "a".into()])
+            .row(vec!["B".into(), "A".into(), "b".into()]),
+    )
+    .unwrap();
+    p.insert_rows(Insert::into("Component").row(vec!["C".into(), "A".into()]))
+        .unwrap();
+    p.insert_rows(Insert::into("File").row(vec!["f".into(), "C".into(), "f.txt".into(), 1.into()]))
+        .unwrap();
+    let bytes = p.into_inner().unwrap().into_inner();
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("x.msi");
+    std::fs::write(&f, bytes).unwrap();
+    let err = analyze(&f).unwrap_err();
+    assert!(matches!(err, ExtractError::MsiLayout(_)), "{err:?}");
 }

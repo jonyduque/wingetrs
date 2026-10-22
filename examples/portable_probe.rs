@@ -6,7 +6,7 @@
 //! Usage: `cargo run --release --example portable_probe -- <catalog.db> <work dir> [id...]`
 #[cfg(windows)]
 mod probe {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,6 +15,7 @@ mod probe {
     use wingetrs::catalog::Catalog;
     use wingetrs::config::InstallerMode;
     use wingetrs::http::Http;
+    use wingetrs::install::extract::catch_decoder;
     use wingetrs::install::progress::ProgressEvent;
     use wingetrs::sources::winget::CDN_BASE;
     use wingetrs::sources::winget::details::merged_manifest;
@@ -23,7 +24,7 @@ mod probe {
     use wingetrs::winget_install::host_win;
     use wingetrs::winget_install::launch::Elevation;
     use wingetrs::winget_install::plan::{PlanOrBridge, plan_with_mode};
-    use wingetrs::winget_install::portable_msi::analyze;
+    use wingetrs::winget_install::portable_msi::{Blocker, Loss, analyze};
     use wingetrs::winget_install::select::{Refusal, Scope, ScopeWanted};
 
     /// Larger installers are reported as "grande" and not analyzed.
@@ -153,6 +154,18 @@ mod probe {
         let list = |v: Vec<String>| clean(&v.join("; "));
         let blockers = list(facts.blockers.iter().map(ToString::to_string).collect());
         let losses = list(facts.losses.iter().map(ToString::to_string).collect());
+        let mut actions: Vec<&str> = Vec::new();
+        for b in &facts.blockers {
+            if let Blocker::DeferredAction(a) | Blocker::NestedInstall(a) = b {
+                actions.push(a);
+            }
+        }
+        for l in &facts.losses {
+            if let Loss::ImmediateAction(a) = l {
+                actions.push(a);
+            }
+        }
+        let types = action_types(&path, &actions);
         let extraction = match &facts.main_dir {
             Some(dir) => {
                 let out = data.root().join("probe-extract");
@@ -194,9 +207,53 @@ mod probe {
         drop(file);
         remove_installers(data)?;
         Ok(format!(
-            "{id}\t{kind}\t{elevation}\t{verdict}\t{blockers}\t{losses}\t{}\t{extraction}\t{mb:.1}",
+            "{id}\t{kind}\t{elevation}\t{verdict}\t{blockers}\t{losses}\t{}\t{extraction}\t{mb:.1}\t{types}",
             facts.per_user_capable
         ))
+    }
+
+    /// `Action=Type` (hex) of each listed custom action, read from the `CustomAction` table.
+    fn action_types(path: &Path, actions: &[&str]) -> String {
+        if actions.is_empty() {
+            return String::new();
+        }
+        let read = || -> std::io::Result<HashMap<String, i32>> {
+            let mut pkg = msi::open(path)?;
+            let mut out = HashMap::new();
+            for r in pkg.select_rows(msi::Select::table("CustomAction"))? {
+                if let (Some(a), Some(t)) = (r["Action"].as_str(), r["Type"].as_int()) {
+                    out.insert(a.to_string(), t);
+                }
+            }
+            Ok(out)
+        };
+        // The `msi` parsers read external data: a panic is reported, not propagated.
+        let types = match catch_decoder(read) {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return clean(&format!("erro: {e}")),
+            Err(_) => return "erro: pânico no leitor de MSI".to_string(),
+        };
+        let shown: Vec<String> = actions
+            .iter()
+            .map(|a| match types.get(*a) {
+                Some(t) => format!("{a}=0x{t:X}"),
+                None => format!("{a}=?"),
+            })
+            .collect();
+        clean(&shown.join("; "))
+    }
+
+    /// Deletes the work folder when the probe ends, on every path.
+    struct WorkDir(PathBuf);
+
+    impl Drop for WorkDir {
+        fn drop(&mut self) {
+            if self.0.exists()
+                && let Err(e) = std::fs::remove_dir_all(&self.0)
+            {
+                eprintln!("não apagou {}: {e}", self.0.display());
+            }
+        }
     }
 
     /// Files per folder two levels below `root` (`a\b: n`), most files first.
@@ -255,10 +312,13 @@ mod probe {
             IDS.to_vec()
         };
         let catalog = Catalog::open_read_only(Path::new(db))?;
+        let _cleanup = WorkDir(work.clone());
         let data = DataDir::new(&work);
         data.ensure()?;
         let http = Http::new()?;
-        println!("id\ttipo\televação\tveredito\tbloqueios\tperdas\tper_user_capable\textração\tMB");
+        println!(
+            "id\ttipo\televação\tveredito\tbloqueios\tperdas\tper_user_capable\textração\tMB\ttipos das ações"
+        );
         for id in ids {
             match probe(&http, &catalog, &data, id).await {
                 Ok(line) => println!("{line}"),
@@ -266,7 +326,6 @@ mod probe {
             }
             remove_installers(&data)?;
         }
-        std::fs::remove_dir_all(&work)?;
         Ok(())
     }
 }
