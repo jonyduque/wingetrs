@@ -10,8 +10,9 @@ $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8)
 $writer = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8)
 $globalIf = '^\s*\$global(\s+-and\s+\$\w+)?\s*$'
 # `using module`/`using assembly` are resolved (loaded) while parsing, by ParseInput and by
-# PSParser.Tokenize alike: a script with one is never parsed here (script_ast::parse_time_load).
-$usingLoad = '(?is)(?<!\w)using(\s|<#.*?#>)*(module|assembly)(?!\w)'
+# PSParser.Tokenize alike: any `using` not followed by `namespace` (after spaces, line breaks
+# and comments) is never parsed here (script_ast::parse_time_load).
+$usingLoad = '(?is)(?<![\w$])(?<!\$\{)using(?!\w)(?>(?:\s|<#.*?#>|#[^\n]*)*)(?!namespace(?!\w))'
 
 function Esc([string]$s) {
     if ($null -eq $s) { return '' }
@@ -104,6 +105,10 @@ function Facts([string]$text, $sb) {
             Line $sb $f.ToArray()
         } elseif ($k -eq 'AssignmentStatementAst' -and $n.Left.GetType().Name -eq 'VariableExpressionAst') {
             Line $sb @('SET', $at, (Chain $n), $n.Left.VariablePath.UserPath)
+        } elseif ($k -eq 'ParameterAst') {
+            Line $sb @('SET', $at, (Chain $n), $n.Name.VariablePath.UserPath)
+        } elseif ($k -eq 'ForEachStatementAst') {
+            Line $sb @('SET', $at, (Chain $n), $n.Variable.VariablePath.UserPath)
         } elseif ($k -eq 'FunctionDefinitionAst') {
             Line $sb @('FN', $at, (Chain $n), $n.Name)
         }

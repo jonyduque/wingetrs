@@ -491,15 +491,25 @@ fn parse_time_load_cases() {
         ("using<# c #>module x", 1),
         ("#requires -Version 5\nusing module x", 2),
         ("using `\n  module x", 1),
+        ("using #c\nmodule x", 1),
+        ("using #<#\nmodule x", 1),
+        ("using <# a #> # b\n assembly y", 1),
+        ("using <# unclosed", 1),
+        ("Write-Output 1\nusing", 2),
+        ("using x", 1),
+        // Conservative: a `using` in a string, or before any other word, refuses too.
+        ("Write-Output 'Using modules'", 1),
+        ("using modulex", 1),
     ] {
         assert_eq!(script_ast::parse_time_load(text), Some(line), "{text:?}");
     }
     for text in [
         "using namespace System.IO",
+        "using <# a #> # b\n namespace System.IO",
+        "Start-Job { $using:x }",
+        "Write-Output ${using:x}",
         "$using:x module",
-        "Write-Output 'Using modules'",
         "x_using module y",
-        "using modulex",
         "",
     ] {
         assert_eq!(script_ast::parse_time_load(text), None, "{text:?}");
@@ -598,4 +608,57 @@ fn merge_keeps_every_reason_of_a_line() {
             .any(|(v, d)| *v == Verdict::Refuse && *d != lexer_env[0].detail),
         "{env:?}"
     );
+}
+
+/// The dead `if ($global)` body of every case: refused once `$global` is bound.
+const DEAD_BODY: &str = "CMD\t9\tnone\tStringConstant\tG\tRemove-Item\ts:C:\\Windows\\x\n";
+
+/// Each way a script binds its own `$global` refuses it, and makes the `if ($global)` body live.
+#[test]
+fn any_global_binding_refuses_and_revives_the_dead_branch() {
+    assert!(flags(DEAD_BODY).is_empty(), "alone, the body is dead code");
+    let mut bindings = vec![
+        "SET\t1\t.\tglobal\n".to_string(),
+        "SET\t1\tF\tglobal\n".to_string(),
+        "SET\t1\t.\tscript:global\n".to_string(),
+        "CMD\t1\tnone\tStringConstant\t.\tSet-Variable\tp:Name\ts:global\ts:1\n".to_string(),
+        "CMD\t1\tnone\tStringConstant\t.\tNew-Variable\tp:Name\ts:global\n".to_string(),
+    ];
+    for p in [
+        "OutVariable",
+        "ov",
+        "PipelineVariable",
+        "pv",
+        "ErrorVariable",
+        "ev",
+        "WarningVariable",
+        "wv",
+        "InformationVariable",
+        "iv",
+        "OutVar",
+    ] {
+        bindings.push(format!(
+            "CMD\t1\tnone\tStringConstant\t.\tWrite-Output\ts:x\tp:{p}\ts:global\n"
+        ));
+    }
+    bindings.push("CMD\t1\tnone\tStringConstant\t.\tWrite-Output\ts:x\tp:ov\ts:+global\n".into());
+    for b in &bindings {
+        let got = flags(&format!("{b}{DEAD_BODY}"));
+        assert!(
+            got.contains(&(FlagKind::GlobalName, Verdict::Refuse)),
+            "{b:?}: {got:?}"
+        );
+        assert!(
+            got.contains(&(FlagKind::SystemWrite, Verdict::Refuse)),
+            "{b:?}: {got:?}"
+        );
+    }
+    // Look-alikes: another variable, `global` as a plain value.
+    for b in [
+        "SET\t1\t.\tglobal:x\n",
+        "CMD\t1\tnone\tStringConstant\t.\tWrite-Output\ts:global\n",
+        "CMD\t1\tnone\tStringConstant\t.\tWrite-Output\ts:x\tp:ov\ts:other\n",
+    ] {
+        assert!(flags(&format!("{b}{DEAD_BODY}")).is_empty(), "{b:?}");
+    }
 }

@@ -210,12 +210,15 @@ fn arg(field: &str) -> Result<Arg, String> {
     })
 }
 
-/// The 1-based line of the first `using module`/`using assembly` of `script`, read as text:
-/// PowerShell's parser (`ParseInput`, and `PSParser.Tokenize` too) resolves these while parsing,
-/// so such a script never reaches it. Backticks are dropped first, a comment `<# #>` or any
-/// whitespace (line breaks included) may sit between the words, and the position is not
-/// checked (a misplaced `using` is resolved as well). `using namespace` passes: it only names
-/// where types are looked up and loads nothing.
+/// The 1-based line of the first `using` of `script` that is not `using namespace`, read as
+/// text: PowerShell's parser (`ParseInput`, and `PSParser.Tokenize` too) resolves `using module`
+/// and `using assembly` while parsing, so such a script never reaches it. Conservative: backticks
+/// are dropped first; any mix of whitespace (line breaks included), `<# #>` and `#` line
+/// comments may sit after `using`; whatever follows that is not the word `namespace` refuses
+/// (an unclosed `<#`, the end of the text, a `using` in a string or a comment too). The position
+/// is not checked (a misplaced `using` is resolved as well). Only `$using:x`/`${using:x}` (a
+/// variable scope, not the keyword) is skipped. `using namespace` passes: it only names where
+/// types are looked up and loads nothing.
 pub fn parse_time_load(script: &str) -> Option<usize> {
     let text: String = script.chars().filter(|c| *c != '`').collect();
     let lower = text.to_lowercase();
@@ -224,25 +227,28 @@ pub fn parse_time_load(script: &str) -> Option<usize> {
     while let Some(pos) = lower[from..].find("using") {
         let at = from + pos;
         from = at + "using".len();
-        if word(lower[..at].chars().next_back()) {
+        let before = &lower[..at];
+        let variable = before.ends_with('$') || before.ends_with("${");
+        if variable || word(before.chars().next_back()) || word(lower[from..].chars().next()) {
             continue;
         }
         let mut rest = &lower[from..];
         loop {
             let trimmed = rest.trim_start();
-            if let Some(comment) = trimmed.strip_prefix("<#") {
-                rest = comment.split_once("#>").map_or("", |(_, after)| after);
+            if let Some(block) = trimmed.strip_prefix("<#") {
+                rest = block.split_once("#>").map_or("", |(_, after)| after);
+            } else if let Some(line) = trimmed.strip_prefix('#') {
+                rest = line.split_once('\n').map_or("", |(_, after)| after);
             } else {
                 rest = trimmed;
                 break;
             }
         }
-        let loads = ["module", "assembly"].iter().any(|k| {
-            rest.strip_prefix(k)
-                .is_some_and(|after| !word(after.chars().next()))
-        });
-        if loads {
-            return Some(lower[..at].matches('\n').count() + 1);
+        let namespace = rest
+            .strip_prefix("namespace")
+            .is_some_and(|after| !word(after.chars().next()));
+        if !namespace {
+            return Some(before.matches('\n').count() + 1);
         }
     }
     None
@@ -368,6 +374,58 @@ fn dead(chain: &str) -> bool {
     chain.contains('G') && !chain.contains('B')
 }
 
+/// Common parameters that bind a variable by name (`-OutVariable x`), and their aliases.
+const VARIABLE_PARAMS: &[&str] = &[
+    "outvariable",
+    "pipelinevariable",
+    "errorvariable",
+    "warningvariable",
+    "informationvariable",
+];
+const VARIABLE_ALIASES: &[&str] = &["ov", "pv", "ev", "wv", "iv"];
+
+/// `-<p>` names one of [`VARIABLE_PARAMS`] (alias or any prefix of 2 letters or more).
+fn variable_param(p: &str) -> bool {
+    let p = p.to_lowercase();
+    VARIABLE_ALIASES.contains(&p.as_str())
+        || (p.len() >= 2 && VARIABLE_PARAMS.iter().any(|v| v.starts_with(&p)))
+}
+
+/// A variable name given as text is `global` (`+global` appends, `global:`/`script:` scopes).
+fn names_global(arg: &Arg) -> bool {
+    arg.text()
+        .is_some_and(|t| unscoped(t.trim_start_matches('+')).eq_ignore_ascii_case("global"))
+}
+
+/// Lines where the script binds its own `$global` in any form, whatever the chain: an
+/// assignment, `param($global)`, `foreach ($global in ..)` (`SET`), `Set-Variable`/`New-Variable`
+/// with `global`, or `-OutVariable global` and the other variable parameters. The runner's
+/// constant `$global` should make these fail, but not in another runspace: the gate never
+/// relies on it (any binding refuses, and no `if ($global)` body counts as dead code).
+fn global_bindings(facts: &AstFacts) -> Vec<usize> {
+    let mut lines: Vec<usize> = facts
+        .assignments
+        .iter()
+        .filter(|s| unscoped(&s.name).eq_ignore_ascii_case("global"))
+        .map(|s| s.line)
+        .collect();
+    for c in &facts.commands {
+        let name = file_name(c.name.as_deref().unwrap_or(""));
+        let set_variable = named(&name, &["set-variable", "new-variable", "sv", "nv"])
+            && c.args.iter().any(names_global);
+        let variable_arg = c
+            .args
+            .windows(2)
+            .any(|w| matches!(&w[0], Arg::Param(p) if variable_param(p)) && names_global(&w[1]));
+        if set_variable || variable_arg {
+            lines.push(c.line);
+        }
+    }
+    lines.sort_unstable();
+    lines.dedup();
+    lines
+}
+
 /// The command's file name in lowercase (`C:\x\Msiexec.EXE` ⇒ `msiexec.exe`).
 fn file_name(name: &str) -> String {
     name.rsplit(['\\', '/'])
@@ -441,6 +499,17 @@ pub fn ast_flags(facts: &AstFacts, supported: &[&str]) -> Vec<Flag> {
             );
         }
     }
+    let bindings = global_bindings(facts);
+    for line in &bindings {
+        push(
+            FlagKind::GlobalName,
+            Verdict::Refuse,
+            D_GLOBAL_NAME.into(),
+            *line,
+        );
+    }
+    // With its own `$global`, an `if ($global)` body may run: nothing is dead code.
+    let dead = |chain: &str| bindings.is_empty() && dead(chain);
     for c in facts.commands.iter().filter(|c| !dead(&c.chain)) {
         command_flags(c, supported, &mut push);
     }
@@ -448,14 +517,6 @@ pub fn ast_flags(facts: &AstFacts, supported: &[&str]) -> Vec<Flag> {
         member_flags(m, &mut push);
     }
     for s in facts.assignments.iter().filter(|s| !dead(&s.chain)) {
-        if unscoped(&s.name).eq_ignore_ascii_case("global") {
-            push(
-                FlagKind::GlobalName,
-                Verdict::Refuse,
-                D_GLOBAL_NAME.into(),
-                s.line,
-            );
-        }
         if s.name.to_ascii_lowercase().contains("__wr") {
             push(
                 FlagKind::PreludeInternal,

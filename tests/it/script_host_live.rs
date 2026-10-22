@@ -451,3 +451,30 @@ fn real_parser_never_resolves_using() {
         assert!(!t.path().join("sentinel.txt").exists(), "{script}");
     }
 }
+
+/// The host reports `param($global)` and `foreach ($global ...)` as bindings (`SET`).
+#[test]
+#[ignore = "live: real PowerShell parser"]
+fn real_parser_reports_global_bindings() {
+    use wingetrs::install::prelude::PRELUDE_FUNCTIONS;
+    use wingetrs::install::script_ast::{self, AstGate};
+    use wingetrs::install::script_scan::{FlagKind, Verdict};
+    let ast = real_parser();
+    for script in [
+        "param($global)\nif ($global) { Remove-Item C:\\Windows\\x }",
+        "function f($global) { }\nif ($global) { Remove-Item C:\\Windows\\x }",
+        "foreach ($global in 1) { }\nif ($global) { Remove-Item C:\\Windows\\x }",
+        "Write-Output 1 -ov global\nif ($global) { Remove-Item C:\\Windows\\x }",
+    ] {
+        let facts = ast.facts(script).unwrap();
+        let flags = script_ast::ast_flags(&facts, PRELUDE_FUNCTIONS);
+        for kind in [FlagKind::GlobalName, FlagKind::SystemWrite] {
+            assert!(
+                flags
+                    .iter()
+                    .any(|f| f.kind == kind && f.verdict == Verdict::Refuse),
+                "{script}: {kind:?} {flags:?}"
+            );
+        }
+    }
+}
