@@ -147,6 +147,19 @@ fn policy_and_missing_program_start_no_parser() {
     }
 }
 
+/// A `using` the parser would resolve never reaches the process: refused without starting it.
+#[test]
+fn using_module_starts_no_parser() {
+    let (t, p) = fake("echo x>\"%~dp0started.txt\"\nset /p L=\necho END\t1");
+    let gate = ast(p, Duration::from_secs(20), Duration::from_secs(10));
+    let facts = gate.facts("using assembly C:\\x\\nao_existe.dll").unwrap();
+    assert_eq!(facts.usings.len(), 1);
+    assert_eq!(facts.usings[0].kind, "module");
+    drop(gate);
+    assert!(!t.path().join("started.txt").exists());
+    assert!(t.path().join("fake.cmd").is_file());
+}
+
 #[test]
 fn encoded_host_fits_command_line() {
     let args = host_args();
@@ -186,4 +199,9 @@ fn host_script_runs_nothing() {
         }
     }
     assert!(host.contains("$PSModuleAutoLoadingPreference = 'None'"));
+    // The host's own `using` check comes before the only parse.
+    let check = host.find("[regex]::Match($plain, $usingLoad)").unwrap();
+    let parse = host.find("::ParseInput(").unwrap();
+    assert!(check < parse);
+    assert_eq!(host.matches("::ParseInput(").count(), 1);
 }

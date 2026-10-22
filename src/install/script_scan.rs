@@ -972,9 +972,18 @@ pub fn scan_gated(
 }
 
 /// Adds the parser's flags for `script` to `report` (same kind and line: the worst verdict
-/// stays) and recomputes the verdict.
+/// stays) and recomputes the verdict. The parser never sees a script the lexer already refuses
+/// (nothing to add) nor one with a `using` it would resolve while parsing
+/// ([`script_ast::parse_time_load`]): that one is refused here.
 fn add_ast_flags(report: &mut ScriptReport, script: &str, supported: &[&str], ast: &dyn AstGate) {
-    let extra = match ast.facts(script) {
+    if report.verdict == Verdict::Refuse {
+        return;
+    }
+    let answer = match script_ast::parse_time_load(script) {
+        Some(line) => Ok(script_ast::parse_time_load_facts(line)),
+        None => ast.facts(script),
+    };
+    let extra = match answer {
         Ok(facts) => script_ast::ast_flags(&facts, supported),
         Err(e) => {
             tracing::warn!(error = ?e, "PowerShell parser gave no facts; script refused");

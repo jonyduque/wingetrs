@@ -210,6 +210,55 @@ fn arg(field: &str) -> Result<Arg, String> {
     })
 }
 
+/// The 1-based line of the first `using module`/`using assembly` of `script`, read as text:
+/// PowerShell's parser (`ParseInput`, and `PSParser.Tokenize` too) resolves these while parsing,
+/// so such a script never reaches it. Backticks are dropped first, a comment `<# #>` or any
+/// whitespace (line breaks included) may sit between the words, and the position is not
+/// checked (a misplaced `using` is resolved as well). `using namespace` passes: it only names
+/// where types are looked up and loads nothing.
+pub fn parse_time_load(script: &str) -> Option<usize> {
+    let text: String = script.chars().filter(|c| *c != '`').collect();
+    let lower = text.to_lowercase();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("using") {
+        let at = from + pos;
+        from = at + "using".len();
+        if word(lower[..at].chars().next_back()) {
+            continue;
+        }
+        let mut rest = &lower[from..];
+        loop {
+            let trimmed = rest.trim_start();
+            if let Some(comment) = trimmed.strip_prefix("<#") {
+                rest = comment.split_once("#>").map_or("", |(_, after)| after);
+            } else {
+                rest = trimmed;
+                break;
+            }
+        }
+        let loads = ["module", "assembly"].iter().any(|k| {
+            rest.strip_prefix(k)
+                .is_some_and(|after| !word(after.chars().next()))
+        });
+        if loads {
+            return Some(lower[..at].matches('\n').count() + 1);
+        }
+    }
+    None
+}
+
+/// Facts of a script [`parse_time_load`] keeps away from the parser: its `using` refuses it.
+pub fn parse_time_load_facts(line: usize) -> AstFacts {
+    AstFacts {
+        usings: vec![UsingFact {
+            line,
+            kind: "module".into(),
+        }],
+        ..AstFacts::default()
+    }
+}
+
 /// Decodes the records of one answer (`END` lines are skipped). Any malformed line is an
 /// error: a fact the gate cannot read must not vanish.
 pub fn decode(wire: &str) -> Result<AstFacts, AstError> {

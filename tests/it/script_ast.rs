@@ -474,3 +474,82 @@ fn unavailable_is_the_safe_default() {
         Err(AstError::NoPowerShell)
     );
 }
+
+// ---- Task 227, review: `using` the parser would resolve ----
+
+#[test]
+fn parse_time_load_cases() {
+    for (text, line) in [
+        ("using module x", 1),
+        ("Write-Output 1\n  USING <# c #>\n assembly x.dll", 2),
+        ("us`ing mod`ule x", 1),
+        ("& { using module y }", 1),
+        ("x\n\nusing\tmodule y", 3),
+        ("using\nassembly y", 1),
+    ] {
+        assert_eq!(script_ast::parse_time_load(text), Some(line), "{text:?}");
+    }
+    for text in [
+        "using namespace System.IO",
+        "$using:x module",
+        "Write-Output 'Using modules'",
+        "x_using module y",
+        "using modulex",
+        "",
+    ] {
+        assert_eq!(script_ast::parse_time_load(text), None, "{text:?}");
+    }
+}
+
+/// A gate that counts the scripts it is asked about.
+#[derive(Default)]
+struct Counting(std::sync::atomic::AtomicUsize);
+impl AstGate for Counting {
+    fn facts(&self, _: &str) -> Result<AstFacts, AstError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(AstFacts::default())
+    }
+}
+
+#[test]
+fn using_and_lexer_refusals_never_reach_the_parser() {
+    for text in [
+        "using module .\\m.psm1\nWrite-Output 1",
+        "using assembly C:\\x\\nao_existe.dll\nWrite-Output 1",
+    ] {
+        let gate = Counting::default();
+        let (report, _) =
+            script_scan::scan_gated(text, PRELUDE_FUNCTIONS, &CallRoots::default(), &gate);
+        assert_eq!(report.verdict, Verdict::Refuse, "{text:?}");
+        assert!(
+            report
+                .flags
+                .iter()
+                .any(|f| f.kind == FlagKind::DynamicCode && f.verdict == Verdict::Refuse),
+            "{:?}",
+            report.flags
+        );
+        assert_eq!(
+            gate.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{text:?}"
+        );
+    }
+    let gate = Counting::default();
+    let (report, _) = script_scan::scan_gated(
+        "Start-Process x -Verb RunAs",
+        PRELUDE_FUNCTIONS,
+        &CallRoots::default(),
+        &gate,
+    );
+    assert_eq!(report.verdict, Verdict::Refuse);
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Anything else is asked.
+    script_scan::scan_gated(
+        "using namespace System.IO",
+        PRELUDE_FUNCTIONS,
+        &CallRoots::default(),
+        &gate,
+    );
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

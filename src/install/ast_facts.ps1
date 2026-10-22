@@ -9,6 +9,9 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8)
 $writer = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8)
 $globalIf = '^\s*\$global(\s+-and\s+\$\w+)?\s*$'
+# `using module`/`using assembly` are resolved (loaded) while parsing, by ParseInput and by
+# PSParser.Tokenize alike: a script with one is never parsed here (script_ast::parse_time_load).
+$usingLoad = '(?is)(?<!\w)using(\s|<#.*?#>)*(module|assembly)(?!\w)'
 
 function Esc([string]$s) {
     if ($null -eq $s) { return '' }
@@ -58,6 +61,12 @@ function Line($sb, [object[]]$fields) {
 }
 
 function Facts([string]$text, $sb) {
+    $plain = $text.Replace('`', '')
+    $found = [regex]::Match($plain, $usingLoad)
+    if ($found.Success) {
+        Line $sb @('USE', $plain.Substring(0, $found.Index).Split("`n").Count, 'module')
+        return
+    }
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)

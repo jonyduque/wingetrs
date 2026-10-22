@@ -24,7 +24,9 @@ use sha2::{Digest, Sha256};
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::UI::Shell::{FOLDERID_System, FOLDERID_Windows};
 
-use crate::install::script_ast::{AstError, AstFacts, AstGate, HOST_SCRIPT, decode_lines};
+use crate::install::script_ast::{
+    AstError, AstFacts, AstGate, HOST_SCRIPT, decode_lines, parse_time_load, parse_time_load_facts,
+};
 use crate::install::script_host_win::{child_path, known, read_gpo};
 use crate::install::script_policy::{GpoValues, gpo_blocks};
 use crate::winget_install::launch_win::is_elevated;
@@ -113,6 +115,10 @@ impl PwshAst {
         }
         if let Some(m) = gpo_blocks(&(self.gpo)(&self.program)) {
             return Err(AstError::Policy(m));
+        }
+        // The parser would resolve (load) it: refused before the process sees it.
+        if let Some(line) = parse_time_load(script) {
+            return Ok(parse_time_load_facts(line));
         }
         let mut slot = self.proc.lock().unwrap_or_else(PoisonError::into_inner);
         let proc = match slot.as_mut() {

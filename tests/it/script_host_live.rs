@@ -419,3 +419,35 @@ fn real_parser_batch_reuses_process() {
     );
     assert!(total - first < first * 19, "{first:?} {total:?}");
 }
+/// A `using` the parser would resolve is refused and nothing it names is loaded: the module
+/// that writes a sentinel when loaded never runs.
+#[test]
+#[ignore = "live: real PowerShell parser"]
+fn real_parser_never_resolves_using() {
+    use wingetrs::install::prelude::PRELUDE_FUNCTIONS;
+    use wingetrs::install::script_scan::{self, CallRoots, Verdict};
+    let t = tempfile::tempdir().unwrap();
+    let tmp = t.path().display().to_string();
+    std::fs::write(
+        t.path().join("m.psm1"),
+        format!("Set-Content '{tmp}\\sentinel.txt' x\r\n"),
+    )
+    .unwrap();
+    let ast = real_parser();
+    for script in [
+        "using assembly C:\\x\\nao_existe.dll\nWrite-Output 1".to_string(),
+        format!("using module '{tmp}\\m.psm1'\nWrite-Output 1"),
+        "using module .\\m.psm1\nWrite-Output 1".to_string(),
+    ] {
+        let (report, _) =
+            script_scan::scan_gated(&script, PRELUDE_FUNCTIONS, &CallRoots::default(), &ast);
+        assert_eq!(
+            report.verdict,
+            Verdict::Refuse,
+            "{script}: {:?}",
+            report.flags
+        );
+        assert!(t.path().join("m.psm1").is_file());
+        assert!(!t.path().join("sentinel.txt").exists(), "{script}");
+    }
+}
