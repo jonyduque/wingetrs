@@ -98,11 +98,14 @@ do {
     $chars = 1..32 | ForEach-Object { $alphabet[[Security.Cryptography.RandomNumberGenerator]::GetInt32($alphabet.Length)] }
     $plain = -join $chars
 } until ($plain -cmatch '[A-Z]' -and $plain -cmatch '[a-z]' -and $plain -match '[0-9]' -and $plain -match '[^A-Za-z0-9]')
-if ($env:GITHUB_ACTIONS -eq 'true') { "::add-mask::$plain" }
+"::add-mask::$plain"
 $secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
 $plain = $null
 
+# Fallback (warning, step passes) only when the standard user cannot exist or log on: creating
+# it, or the secondary logon. Anything else in the preparation fails the step.
 $fallback = ''
+$setupError = ''
 $code = $null
 $sid = $null
 $rc = 1
@@ -111,23 +114,38 @@ try {
         if ((Get-Service seclogon).Status -ne 'Running') { Start-Service seclogon }
         $sid = (New-LocalUser -Name $user -Password $secure -AccountNeverExpires -PasswordNeverExpires `
                 -UserMayNotChangePassword -Description 'wingetrs CI (temporary)').SID.Value
-        # Users (by SID: the group name is localized) holds "allow log on locally".
-        Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user -ErrorAction SilentlyContinue
-        & icacls $root /grant "${user}:(OI)(CI)RX" /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "icacls na raiz saiu com $LASTEXITCODE" }
-        New-Item -ItemType Directory -Force $work, $childEnv.APPDATA, $childEnv.LOCALAPPDATA | Out-Null
-        & icacls $work /grant "${user}:(OI)(CI)M" /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "icacls na pasta de trabalho saiu com $LASTEXITCODE" }
-        $cred = [pscredential]::new($user, $secure)
-        $p = Start-Process -FilePath $exe -ArgumentList $testArgs -Credential $cred -WorkingDirectory $root `
-            -Environment $childEnv -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
-            -Wait -PassThru
-        $code = $p.ExitCode
     } catch {
-        $fallback = "$_"
+        $fallback = "criação do usuário: $_"
     }
-    if ($fallback) {
-        $msg = "os $($names.Count) testes não elevados ficaram só pulados nesta execução (usuário comum indisponível: $fallback)"
+    if (-not $fallback) {
+        try {
+            # Users (by SID: the group name is localized) holds "allow log on locally".
+            Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user -ErrorAction SilentlyContinue
+            & icacls $root /grant "${user}:(OI)(CI)RX" /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls na raiz saiu com $LASTEXITCODE" }
+            New-Item -ItemType Directory -Force $work, $childEnv.APPDATA, $childEnv.LOCALAPPDATA | Out-Null
+            & icacls $work /grant "${user}:(OI)(CI)M" /Q | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "icacls na pasta de trabalho saiu com $LASTEXITCODE" }
+        } catch {
+            $setupError = "$_"
+        }
+    }
+    if (-not $fallback -and -not $setupError) {
+        try {
+            $cred = [pscredential]::new($user, $secure)
+            $p = Start-Process -FilePath $exe -ArgumentList $testArgs -Credential $cred -WorkingDirectory $root `
+                -Environment $childEnv -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
+                -Wait -PassThru
+            $code = $p.ExitCode
+        } catch {
+            $fallback = "logon secundário: $_"
+        }
+    }
+    if ($setupError) {
+        "[FAIL] preparação do usuário comum: $setupError"
+        Add-Summary "Usuário comum: FALHOU na preparação ($setupError)"
+    } elseif ($fallback) {
+        $msg = "os $($names.Count) testes não elevados ficaram só pulados nesta execução (usuário comum indisponível na $fallback)"
         "::warning::$msg"
         Add-Summary "Usuário comum: $msg"
         $rc = 0

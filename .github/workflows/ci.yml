@@ -63,6 +63,8 @@ jobs:
           $listed = @(Get-Content tests/it/non_elevated.txt | Where-Object { $_.Trim() }).Count
           "Gate: $n de $listed testes pulados por processo elevado na CI." | Add-Content $env:GITHUB_STEP_SUMMARY
           "pulados no gate: $n de $listed"
+          # Exactly the list: fewer means a listed test ran elevated, more a skip outside it.
+          if ($n -ne $listed) { "::error::esperado $listed linhas 'pulado: processo elevado na CI', achadas $n"; exit 1 }
 
       - name: testes não elevados como usuário comum
         run: pwsh -NoProfile -File scripts/ci_non_elevated.ps1

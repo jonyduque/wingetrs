@@ -75,6 +75,8 @@ $elevCases = @(
     @{ Name = 'lista com teste que nao existe'; A = "#[test]`nfn t() {`n$skip}`n"; List = "a::t`na::sumiu"; Want = 1 },
     @{ Name = 'lista com fn que nao e teste'; A = "fn t() {}`n"; List = 'a::t'; Want = 1 },
     @{ Name = 'pulo em ajudante'; A = "#[test]`nfn t() {`n    h();`n}`n`nfn h() {`n$skip}`n"; List = 'a::t'; Want = 1 },
+    @{ Name = 'apelido via use'; A = "use crate::non_elevated::skip_if_elevated_in_ci as s;`n`n#[test]`nfn t() {`n$skip}`n"; List = 'a::t'; Want = 1 },
+    @{ Name = 'ponteiro'; A = "#[test]`nfn t() {`n$skip}`n`n#[test]`nfn u() {`n    let f = skip_if_elevated_in_ci;`n    if f(`"x`") {`n        return;`n    }`n}`n"; List = 'a::t'; Want = 1 },
     @{ Name = 'pulo em mod aninhado'; A = $nested; List = 'a::win::t'; Want = 0 },
     @{ Name = 'mod aninhado sem o nome do mod'; A = $nested; List = 'a::t'; Want = 1 }
 )

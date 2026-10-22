@@ -3,8 +3,9 @@
 //! `scripts/ci_non_elevated.ps1` then runs them for real as a standard user. Outside CI an
 //! elevated run still fails them. `check_rules.ps1` refuses a call outside that list.
 
-/// Whether a test that needs an unelevated process is skipped.
-pub fn skip_decision(ci: bool, elevated: bool) -> bool {
+/// Whether a test that needs an unelevated process is skipped. Private: only through
+/// [`skip_if_elevated_in_ci`], which `check_rules.ps1` keeps to the listed tests.
+fn skip_decision(ci: bool, elevated: bool) -> bool {
     ci && elevated
 }
 

@@ -152,7 +152,7 @@ if ($ItDir -and (Test-Path (Join-Path $ItDir 'main.rs'))) {
     }
 }
 # Task 222: the GitHub runner is elevated, and `skip_if_elevated_in_ci` ends a test early there.
-# Only the tests named in tests/it/non_elevated.txt may call it (the CI runs those again as a
+# Only the tests named in tests/it/non_elevated.txt may name it (the CI runs those again as a
 # standard user), so CI never becomes a way to skip a new test; and every name there must still
 # be a test, so the list does not rot. Blocks are tracked by indentation (rustfmt's).
 if ($ItDir -and (Test-Path $ItDir)) {
@@ -168,6 +168,7 @@ if ($ItDir -and (Test-Path $ItDir)) {
         # Only files that call the helper or hold a listed test are walked (the gate's time).
         $text = [IO.File]::ReadAllText($f.FullName)
         $prefix = if ($base.Count) { ($base -join '::') + '::' } else { '' }
+        $isHelperFile = $prefix -ceq 'non_elevated::'
         if (-not $text.Contains('skip_if_elevated_in_ci') -and
             -not @($allowed | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) }).Count) { continue }
         $stack = [Collections.Generic.List[object]]::new()
@@ -199,7 +200,8 @@ if ($ItDir -and (Test-Path $ItDir)) {
                     $stack.Add([pscustomobject]@{ Kind = 'fn'; Name = $name; Indent = $indent; Test = $isTest })
                 }
             }
-            if ($line -match '\bskip_if_elevated_in_ci\s*\(' -and $line -notmatch '\bfn\s+skip_if_elevated_in_ci\b') {
+            # Any mention, not only a call: an alias (`use ... as s`) or a pointer would hide one.
+            if (-not $isHelperFile -and $line -match '\bskip_if_elevated_in_ci\b') {
                 if (-not $outer -or -not $outer.Test -or $allowed -cnotcontains $outer.Name) {
                     $where = if ($outer) { $outer.Name } else { '(fora de fn)' }
                     $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'pulo de elevado fora de tests/it/non_elevated.txt', $where
