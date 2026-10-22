@@ -1060,7 +1060,9 @@ mod win {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("source2.msix");
         std::fs::write(&file, &bytes).unwrap();
-        let signer = WinTrustVerifier.verify(&file).unwrap();
+        let verified = WinTrustVerifier.verify(&file).unwrap();
+        assert_eq!(verified.bytes, bytes);
+        let signer = verified.signer;
         assert_eq!(signer.common_name, SIGNER_NAME);
         assert_eq!(signer.organization, SIGNER_NAME);
         check_signer(&signer, SystemTime::now()).unwrap();
@@ -1105,8 +1107,8 @@ mod signed {
     use std::time::{Duration, SystemTime};
     use wingetrs::bridge::signed_install::{
         CATALOG_FILE, CATALOG_MAX_AGE, CHECKING_CATALOG, CatalogVerifier, DOWNLOADING_INSTALLER,
-        SIGNER_NAME, SOURCE_IDENTITY, SignedCtx, SignedError, Signer, Staged, check_signer,
-        prepare,
+        SIGNER_NAME, SOURCE_IDENTITY, SignedCtx, SignedError, Signer, Staged, Verified,
+        check_signer, prepare,
     };
     use wingetrs::bridge::worker::{ModeArg, PackageRequest};
     use wingetrs::http::Http;
@@ -1224,6 +1226,8 @@ mod signed {
         /// How many times the installer may be fetched (`None`: any).
         installer_hits: Option<u64>,
         identity: String,
+        /// What the verifier answers as the verified bytes (`None`: the file's).
+        verified: Option<Vec<u8>>,
     }
 
     impl Cdn {
@@ -1242,6 +1246,7 @@ mod signed {
                 installer,
                 installer_hits: None,
                 identity: SOURCE_IDENTITY.into(),
+                verified: None,
             };
             c.seal();
             c
@@ -1300,6 +1305,8 @@ mod signed {
     struct FakeVerifier {
         result: Result<Signer, String>,
         seen: Mutex<Vec<(PathBuf, Vec<u8>)>>,
+        /// Bytes answered as verified instead of the file's (what its handle would have read).
+        bytes: Option<Vec<u8>>,
     }
 
     impl FakeVerifier {
@@ -1307,15 +1314,20 @@ mod signed {
             FakeVerifier {
                 result,
                 seen: Mutex::new(Vec::new()),
+                bytes: None,
             }
         }
     }
 
     impl CatalogVerifier for FakeVerifier {
-        fn verify(&self, msix: &Path) -> Result<Signer, String> {
+        fn verify(&self, msix: &Path) -> Result<Verified, String> {
             let bytes = std::fs::read(msix).unwrap_or_default();
-            self.seen.lock().unwrap().push((msix.to_path_buf(), bytes));
-            self.result.clone()
+            self.seen
+                .lock()
+                .unwrap()
+                .push((msix.to_path_buf(), bytes.clone()));
+            let bytes = self.bytes.clone().unwrap_or(bytes);
+            self.result.clone().map(|signer| Verified { signer, bytes })
         }
     }
 
@@ -1365,7 +1377,8 @@ mod signed {
         edit(&mut cdn, &server.uri());
         cdn.mount(&server).await;
         let now = SystemTime::now();
-        let verifier = FakeVerifier::new(signer.unwrap_or_else(|| Ok(microsoft(now))));
+        let mut verifier = FakeVerifier::new(signer.unwrap_or_else(|| Ok(microsoft(now))));
+        verifier.bytes = cdn.verified.clone();
         let dir = tempfile::tempdir().unwrap();
         let http = Http::new().unwrap();
         let base = format!("{}/cdn/", server.uri());
@@ -1535,6 +1548,24 @@ mod signed {
         .await;
         let e = r.result.as_ref().unwrap_err();
         assert!(matches!(e, SignedError::Signature(_)), "{e:?}");
+        assert!(e.to_string().contains("Microsoft.Other.Package"), "{e}");
+
+        // The identity is read from the bytes the signature was verified on, not from the
+        // path again: a good catalog on disk does not save a foreign one that was verified.
+        let r = run_with(
+            |c, _| {
+                let good = c.msix.clone();
+                c.identity = "Microsoft.Other.Package".into();
+                c.seal();
+                c.verified = Some(std::mem::replace(&mut c.msix, good));
+                c.installer_hits = Some(0);
+            },
+            request(),
+            None,
+            true,
+        )
+        .await;
+        let e = r.result.as_ref().unwrap_err();
         assert!(e.to_string().contains("Microsoft.Other.Package"), "{e}");
     }
 

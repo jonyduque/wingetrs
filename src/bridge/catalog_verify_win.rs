@@ -9,11 +9,13 @@
 //! Nothing here reaches the network: no revocation check and cache-only URL retrieval, since a
 //! CryptoAPI fetch would follow the user's proxy settings (the elevated side's network goes only
 //! through `Http::for_elevated`).
-use super::signed_install::{CatalogVerifier, Signer};
-use std::io::Read;
+use super::signed_install::{CatalogVerifier, Signer, Verified};
+use std::io::{Read, Seek};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
-use windows::Win32::Foundation::{FILETIME, HWND, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE};
 use windows::Win32::Security::Cryptography::{
     CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
     CERT_CHAIN_POLICY_MICROSOFT_ROOT, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS,
@@ -30,6 +32,7 @@ use windows::Win32::Security::WinTrust::{
     WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE,
     WTD_STATEACTION_IGNORE, WTD_UI_NONE, WinVerifyTrust,
 };
+use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 use windows::core::{HSTRING, PCWSTR};
 
 /// The package's signature inside the msix.
@@ -44,21 +47,44 @@ const FILETIME_UNIX: u64 = 116_444_736_000_000_000;
 /// The production verifier.
 pub struct WinTrustVerifier;
 
+/// Largest catalog read back (as `signed_install::MSIX_MAX`).
+const CATALOG_MAX: u64 = super::signed_install::MSIX_MAX as u64;
+
 impl CatalogVerifier for WinTrustVerifier {
-    fn verify(&self, msix: &Path) -> Result<Signer, String> {
-        verify_trust(msix)?;
-        let blob = signature_blob(msix)?;
-        signer_of(&blob)
+    /// One handle for everything: opened denying write and delete, `WinVerifyTrust` on that
+    /// handle, then the signature and the bytes read through it, so what is parsed is what was
+    /// verified even if the path could be swapped.
+    fn verify(&self, msix: &Path) -> Result<Verified, String> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(msix)
+            .map_err(|e| e.to_string())?;
+        verify_trust_handle(msix, &file)?;
+        file.rewind().map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(CATALOG_MAX + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > CATALOG_MAX {
+            return Err("catálogo grande demais".into());
+        }
+        let blob = signature_blob(&bytes)?;
+        let signer = signer_of(&blob)?;
+        Ok(Verified { signer, bytes })
     }
 }
 
-/// `WinVerifyTrust` with the generic Authenticode action on the file at `path`, no UI, no
-/// revocation, no URL retrieval.
-pub fn verify_trust(path: &Path) -> Result<(), String> {
+/// `WinVerifyTrust` with the generic Authenticode action on the open `handle` of the file at
+/// `path` (the path only names it; the content read is the handle's), no UI, no revocation, no
+/// URL retrieval.
+fn verify_trust_handle(path: &Path, handle: &std::fs::File) -> Result<(), String> {
     let wide = HSTRING::from(path.as_os_str());
     let mut file = WINTRUST_FILE_INFO {
         cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
         pcwszFilePath: PCWSTR(wide.as_ptr()),
+        hFile: HANDLE(handle.as_raw_handle()),
         ..Default::default()
     };
     let mut data = WINTRUST_DATA {
@@ -90,11 +116,10 @@ pub fn verify_trust(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The PKCS #7 signature of the msix at `path`: its `AppxSignature.p7x` without the `PKCX`
+/// The PKCS #7 signature of the msix `bytes`: its `AppxSignature.p7x` without the `PKCX`
 /// marker.
-fn signature_blob(path: &Path) -> Result<Vec<u8>, String> {
-    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+fn signature_blob(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let entry = zip
         .by_name(SIGNATURE_ENTRY)
         .map_err(|e| format!("{SIGNATURE_ENTRY}: {e}"))?;

@@ -57,10 +57,19 @@ pub struct Signer {
     pub not_before: SystemTime,
 }
 
+/// A verified catalog: its signer and its bytes, read through the same open handle the
+/// signature was verified on (never by reopening the path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    pub signer: Signer,
+    pub bytes: Vec<u8>,
+}
+
 /// Verifies the signature of the catalog file at `msix` (the whole package, its chain to a
-/// Microsoft root) and returns its signer; the reason (Portuguese) otherwise.
+/// Microsoft root) and returns its signer and the bytes verified; the reason (Portuguese)
+/// otherwise.
 pub trait CatalogVerifier {
-    fn verify(&self, msix: &Path) -> Result<Signer, String>;
+    fn verify(&self, msix: &Path) -> Result<Verified, String>;
 }
 
 /// What `prepare` needs from the helper.
@@ -232,10 +241,10 @@ async fn catalog_hash(
     write_new(&msix, &body)?;
     drop(body);
     let checked = (|| {
-        let signer = ctx.verifier.verify(&msix).map_err(SignedError::Signature)?;
+        let Verified { signer, bytes } =
+            ctx.verifier.verify(&msix).map_err(SignedError::Signature)?;
         check_signer(&signer, ctx.now)?;
-        // What the verifier checked, read back from the administrator-only folder.
-        let bytes = std::fs::read(&msix).map_err(io)?;
+        // Exactly the bytes the signature was verified on.
         check_identity(&bytes)?;
         let index =
             index::validate_msix(&bytes).map_err(|e| SignedError::Catalog(e.to_string()))?;
