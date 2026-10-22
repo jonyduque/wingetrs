@@ -331,6 +331,13 @@ fn tail_splits_lines() {
     assert_eq!(t.last(), Some("l59"));
 }
 
+/// Absolute `cmd.exe`: the elevated run (the CI runner) refuses a bare program name.
+#[cfg(windows)]
+fn cmd_exe() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    format!(r"{root}\System32\cmd.exe")
+}
+
 #[cfg(windows)]
 #[test]
 fn spawn_runs_fake_tool() {
@@ -338,7 +345,7 @@ fn spawn_runs_fake_tool() {
     let cmd = |script: &str| vec!["/d".to_string(), "/c".to_string(), script.to_string()];
     let mut seen = Vec::new();
     let (code, tail) = run(
-        "cmd.exe",
+        &cmd_exe(),
         &cmd("echo um& echo erro 1>&2& echo dois& (set /p x=fim<nul) 1>&2& exit /b -1978335212"),
         |l| seen.push(l.to_string()),
     )
@@ -351,14 +358,24 @@ fn spawn_runs_fake_tool() {
     assert_eq!(tail, seen);
 
     // Stdin is closed: `set /p` returns at once instead of waiting for input.
-    let (code, tail) = run("cmd.exe", &cmd("set /p x=& echo depois& exit /b 3"), |_| {}).unwrap();
+    let (code, tail) = run(
+        &cmd_exe(),
+        &cmd("set /p x=& echo depois& exit /b 3"),
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(code, 3);
     assert_eq!(tail.last().map(String::as_str), Some("depois"));
 
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("out.bin");
     std::fs::write(&file, b"ok\xff\xfe\r\nmeio\rfim\n\nsem-fim").unwrap();
-    let (code, tail) = run("cmd.exe", &cmd(&format!("type {}", file.display())), |_| {}).unwrap();
+    let (code, tail) = run(
+        &cmd_exe(),
+        &cmd(&format!("type {}", file.display())),
+        |_| {},
+    )
+    .unwrap();
     assert_eq!(code, 0);
     assert_eq!(tail, ["ok\u{FFFD}\u{FFFD}", "fim", "sem-fim"]);
 
@@ -384,7 +401,7 @@ fn run_bounded(
     let start = std::time::Instant::now();
     let h = std::thread::spawn(move || {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_with_grace("cmd.exe", &args, grace, |l| on_line(l))
+            run_with_grace(&cmd_exe(), &args, grace, |l| on_line(l))
         }));
         let _ = tx.send(r);
     });
