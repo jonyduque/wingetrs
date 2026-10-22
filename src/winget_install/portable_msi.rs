@@ -31,8 +31,9 @@ const SYSTEM_DIRS: [&str; 6] = [
     "WindowsVolume",
 ];
 /// Standard Windows Installer folders: a file's main folder is the first `Directory` below them.
-const STANDARD_DIRS: [&str; 39] = [
+const STANDARD_DIRS: [&str; 40] = [
     "TARGETDIR",
+    "ROOTDRIVE",
     "ProgramFilesFolder",
     "ProgramFiles64Folder",
     "ProgramFiles6432Folder",
@@ -74,6 +75,8 @@ const STANDARD_DIRS: [&str; 39] = [
 ];
 /// Rollback-only custom action (`msidbCustomActionTypeRollback`): runs only when an install fails.
 const ROLLBACK: i32 = 0x100;
+/// `msidbCustomActionTypeRollback | msidbCustomActionTypeCommit`: both set is not rollback-only.
+const ROLLBACK_COMMIT: i32 = 0x300;
 /// Deferred actions of the WiX standard library whose only effect is internet shortcuts.
 const INTERNET_SHORTCUT_ACTIONS: [&str; 3] = [
     "Wix4CreateInternetShortcuts_X86",
@@ -199,7 +202,7 @@ fn facts(pkg: &mut Pkg) -> Result<MsiFacts, ExtractError> {
             continue;
         } else if kind & IN_SCRIPT == 0 {
             push(&mut losses, Loss::ImmediateAction(action));
-        } else if kind & ROLLBACK != 0 {
+        } else if kind & ROLLBACK_COMMIT == ROLLBACK {
             push(&mut losses, Loss::RollbackAction(action));
         } else if INTERNET_SHORTCUT_ACTIONS.contains(&action.as_str()) {
             push(&mut losses, Loss::InternetShortcuts);
@@ -302,7 +305,11 @@ fn facts(pkg: &mut Pkg) -> Result<MsiFacts, ExtractError> {
         let i = ids.iter().position(|d| !STANDARD_DIRS.contains(d))?;
         let below = ids[i + 1..]
             .iter()
-            .filter(|d| default_dir.get(*d).is_some_and(|v| source_name(v) != "."))
+            .filter(|d| {
+                default_dir
+                    .get(*d)
+                    .is_some_and(|v| msi_layout::source_name(v) != ".")
+            })
             .count();
         let dir_len = p.rel.len().checked_sub(1 + below)?;
         Some(p.rel[..dir_len].to_vec())
@@ -405,10 +412,4 @@ fn first_column(r: &Row) -> String {
 /// Windows folder names compare without case (`msiexec /a` writes both into one folder).
 fn same(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
-}
-
-/// Source-side name of a `DefaultDir` (as in `msi_layout`): after `:`, long form of `short|long`.
-fn source_name(default_dir: &str) -> &str {
-    let src = default_dir.split_once(':').map_or(default_dir, |(_, s)| s);
-    src.split_once('|').map_or(src, |(_, long)| long)
 }

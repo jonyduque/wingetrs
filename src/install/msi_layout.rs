@@ -49,7 +49,7 @@ pub enum LayoutError {
 }
 
 /// Source-side name of a `DefaultDir`: after `:` if present, long form of `short|long`.
-fn source_name(default_dir: &str) -> &str {
+pub(crate) fn source_name(default_dir: &str) -> &str {
     let src = default_dir
         .split_once(':')
         .map_or(default_dir, |(_, src)| src);

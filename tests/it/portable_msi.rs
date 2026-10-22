@@ -725,3 +725,11 @@ fn look_alike_of_the_wix_shortcut_action_blocks() {
         );
     }
 }
+
+#[test]
+fn rollback_and_commit_together_is_not_rollback_only() {
+    let extra = custom_actions(&[("Both", 1 | 0x400 | 0x300, true)]);
+    let f = facts(&build(AppMsi { extra, ..app() }));
+    assert_eq!(f.blockers, vec![Blocker::DeferredAction("Both".into())]);
+    assert_eq!(f.losses, Vec::<Loss>::new());
+}
