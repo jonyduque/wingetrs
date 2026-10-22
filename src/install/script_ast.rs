@@ -806,7 +806,12 @@ fn command_flags(
             };
             verb && unread
         });
-    if computed_verb {
+    // A splat (`Start-Process @a`) may hide `-Verb RunAs`.
+    let splat = launcher
+        && c.args
+            .iter()
+            .any(|a| matches!(a, Arg::Other(t) if t == "Splat"));
+    if computed_verb || splat {
         flag(
             FlagKind::Elevation,
             Verdict::Refuse,

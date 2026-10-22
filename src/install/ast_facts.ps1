@@ -37,6 +37,8 @@ function ArgOf($a, [bool]$raw) {
     if ($k -eq 'StringConstantExpressionAst') { return 's:' + $a.Value }
     if ($k -eq 'ExpandableStringExpressionAst') { return 'e:' + $a.Value }
     if ($raw) { return '?:' + $a.Extent.Text }
+    # A splat (`@args`) can carry any parameter: told apart from a plain variable.
+    if ($k -eq 'VariableExpressionAst' -and $a.Splatted) { return '?:Splat' }
     return '?:' + (Short $k)
 }
 

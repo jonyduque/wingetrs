@@ -889,6 +889,18 @@ fn unread_variable_names_are_bindings() {
 /// `Start-Process -Verb` with a value the gate cannot read may be `RunAs`.
 #[test]
 fn computed_verb_refused() {
+    // A splat may hide `-Verb RunAs`; a plain variable (the file) does not.
+    for cmd in ["Start-Process", "saps", "start"] {
+        let got = flags(&format!(
+            "CMD\t1\tnone\tStringConstant\t.\t{cmd}\t?:Splat\n"
+        ));
+        assert!(
+            got.contains(&(FlagKind::Elevation, Verdict::Refuse)),
+            "{cmd}: {got:?}"
+        );
+    }
+    let got = flags("CMD\t1\tnone\tStringConstant\t.\tStart-Process\t?:Variable\n");
+    assert!(!got.iter().any(|f| f.0 == FlagKind::Elevation), "{got:?}");
     for verb in ["?:Paren", "?:Variable", "e:$v", "e:Run$($a)"] {
         for (cmd, p) in [("Start-Process", "Verb"), ("saps", "v"), ("start", "VERB")] {
             let wire = format!("CMD\t1\tnone\tStringConstant\t.\t{cmd}\ts:x\tp:{p}\t{verb}\n");
