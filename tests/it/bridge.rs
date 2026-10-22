@@ -379,7 +379,14 @@ fn spawn_runs_fake_tool() {
     assert_eq!(code, 0);
     assert_eq!(tail, ["ok\u{FFFD}\u{FFFD}", "fim", "sem-fim"]);
 
-    let missing = run("wingetrs-ferramenta-inexistente", &[], |_| {}).unwrap_err();
+    let missing = run(
+        &std::path::Path::new(&cmd_exe())
+            .with_file_name("wingetrs-ferramenta-inexistente.exe")
+            .to_string_lossy(),
+        &[],
+        |_| {},
+    )
+    .unwrap_err();
     assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
 }
 
