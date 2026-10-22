@@ -2,7 +2,7 @@
 //! (`WINTRUST_ACTION_GENERIC_VERIFY_V2`, which for an msix checks every file of the package,
 //! the block map and the signature, with its timestamp) on the copy in the administrator-only
 //! run folder; then the signer certificate, taken from the package's `AppxSignature.p7x` (read
-//! through the zip, decoded by `CryptQueryObject`), must chain to a Microsoft root
+//! by the package reader, decoded by `CryptQueryObject`), must chain to a Microsoft root
 //! (`CERT_CHAIN_POLICY_MICROSOFT_ROOT`, application roots included). Its name and age are
 //! checked by `signed_install::check_signer`.
 //!
