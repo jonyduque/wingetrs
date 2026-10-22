@@ -4,6 +4,7 @@ Status: DONE
 
 Commits:
 ```
+b0293d9 fix(bridge): review of 202: package reader, newest version only, plan hash compared, 4 GiB cap
 7590e1b fix(bridge): verify the catalog and read it through one handle; identity checked on the verified bytes
 ebba7af feat(bridge): elevated side derives the installer hash from the signed catalog and runs it from admin-only staging
 ```
@@ -11,15 +12,15 @@ ebba7af feat(bridge): elevated side derives the installer hash from the signed c
 Gate:
 ```
 [OK]   rules 13s
-[OK]   rules-selftest 55s
-[OK]   fmt 4s
-[OK]   licenses 17s
-[OK]   clippy 30s
-[OK]   test (2064 passed, 90 ignored) 137s
+[OK]   rules-selftest 62s
+[OK]   fmt 7s
+[OK]   licenses 16s
+[OK]   clippy 52s
+[OK]   test (2071 passed, 90 ignored) 136s
 [OK]   gate verde
 ```
 
-Live test (authorized by the orchestrator, run once; downloads source2.msix into a tempdir, no elevation, nothing in Program Files):
+Live test before the review fixes (authorized by the orchestrator, run once; downloads source2.msix into a tempdir, no elevation, nothing in Program Files):
 ```
 $ cargo test --release --test it elevated_install::win::live_real_catalog_verifies -- --ignored
 running 1 test
@@ -66,3 +67,27 @@ Concerns:
 - The installer download on the elevated side has no size cap (as on the unelevated side); a hostile download host could fill the disk under Program Files before the SHA check.
 - Each 1618 retry is a new request: the helper downloads the catalog and the installer again.
 - `.join` with external data: none on disk (run-folder names are constants); `rel_path` from `versionData` goes into a URL only, after `valid_rel_path`; `id` is `valid_target` and must exist in the signed index.
+
+## Review fixes (CHANGES_REQUESTED, b0293d9)
+
+1. Parser differential: the real verifier reads the verified bytes with `IAppxFactory::CreatePackageReader` over `SHCreateMemStream` (features already enabled): identity from `GetManifest()->GetPackageId()->GetName()`, index from `GetPayloadFile("Public\index.db")` (blocks checked by the reader), signer p7x from `GetFootprintFile(APPX_FOOTPRINT_FILE_TYPE_SIGNATURE)`; the zip crate no longer supplies the signature. Neutral checks also run: `check_zip_shape` (repeated names ignoring case; entry count must equal the last EOCD's, zip64 read when it says so), the zip identity and `validate_msix` index must equal the reader's. The chain must have `TrustStatus.dwErrorStatus == 0` before `MICROSOFT_ROOT` (not testable offline; the orchestrator reruns the live test).
+2. Manifest id/version check now has `manifest_of_another_package_is_refused`.
+3. Only the newest version of the signed versionData (`Version::parse` max; equal spellings: the one written as asked); anything else is `VersionMissing` ("atualize o catálogo").
+4. Elevated installer download capped at `INSTALLER_MAX` (4 GiB), injectable as `SignedCtx::installer_max`; the partial file is removed.
+5. The request carries `plan_sha256`, only compared with the signed manifest's; a difference is `SignedError::Stale` before any download. The `sha256` field from before stays refused (`deny_unknown_fields`).
+
+Mutation proofs (review):
+```
+[OK] mutação PEGA: '    if !m.package_identifier.eq_ignore_ascii_case(id)
+        || Version::parse(&m.package_version) != wanted
+    {' -> '    if false {' (manifest_of_another_package_is_refused)
+[OK] mutação PEGA: 'if newest.as_ref() != Some(&wanted) {' -> 'if false {' fez o teste falhar (exit 101).
+[OK] mutação PEGA: 'if !req.plan_sha256.eq_ignore_ascii_case(&sha) {' -> 'if false {' fez o teste falhar (exit 101).
+[OK] mutação PEGA: 'if done > max || total.is_some_and(|t| t > max) {' -> 'if false {' fez o teste falhar (exit 101).
+[OK] mutação PEGA: 'if identity != SOURCE_IDENTITY {' -> 'if false {' fez o teste falhar (exit 101).
+[OK] mutação PEGA: 'if zip_index != index {' -> 'if false {' fez o teste falhar (exit 101).
+[OK] mutação PEGA: 'if zip.len() as u64 != declared {' -> 'if false {' fez o teste falhar (exit 101).
+[OK] mutação PEGA: 'if !seen.insert(name.to_lowercase()) {' -> 'if !seen.insert(name.to_string()) {' fez o teste falhar (exit 101).
+```
+(The first form of the last mutation, `if false {`, did not compile: the set's type is then unknown.)
+Not verified offline: the AppX reader path and `dwErrorStatus == 0` (live test, run by the orchestrator).
