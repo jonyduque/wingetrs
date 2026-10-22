@@ -947,6 +947,37 @@ mod tests {
         unsafe { text.to_string() }.unwrap()
     }
 
+    /// `sddl` parsed and written back the way `dacl` writes it (Windows abbreviates some SIDs,
+    /// e.g. the built-in Administrator to `LA`, so raw text with the SID never matches).
+    fn round_trip(sddl: &str) -> String {
+        use windows::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        use windows::Win32::Security::DACL_SECURITY_INFORMATION;
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+        }
+        .unwrap();
+        let _free = Local(sd.0);
+        let mut text = PWSTR::null();
+        unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                None,
+            )
+        }
+        .unwrap();
+        let _text = Local(text.0.cast());
+        unsafe { text.to_string() }.unwrap()
+    }
+
     #[test]
     fn pipe_names_are_only_ours() {
         let good = format!("{PIPE_PREFIX}{}", "0123456789abcdef".repeat(2));
@@ -1018,7 +1049,7 @@ mod tests {
         // A second instance of the same name is refused (one instance, first-instance flag).
         assert!(create_pipe(&name).is_err());
         // GRGW is stored as FILE_GENERIC_READ | FILE_GENERIC_WRITE; protected, nobody else.
-        let expected = format!("D:P(A;;0x12019f;;;{})", user_sid().unwrap());
+        let expected = round_trip(&format!("D:P(A;;0x12019f;;;{})", user_sid().unwrap()));
         assert_eq!(dacl(&server), expected);
         let client = open_client(&name);
         accept(&server, &process(me()), Duration::from_secs(5)).unwrap();
