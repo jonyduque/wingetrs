@@ -1176,6 +1176,32 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
     }
 }
 
+/// Where `WINGETRS_TRANSCRIPT` says to record the command's text; `None` for the elevated
+/// helper and the detached background refresh (neither writes to the user's disk or terminal
+/// on its own) and for an empty value.
+pub fn transcript_path(cli: &Cli, var: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    match &cli.command {
+        Some(
+            Command::BridgeWorker { .. }
+            | Command::Update {
+                background: true, ..
+            },
+        ) => None,
+        _ => var.filter(|v| !v.is_empty()).map(std::path::PathBuf::from),
+    }
+}
+
+/// Opens the transcript the environment asks for; a failure is one warning and the command
+/// goes on without it.
+fn open_transcript(cli: &Cli) {
+    let Some(path) = transcript_path(cli, std::env::var_os(crate::transcript::VAR)) else {
+        return;
+    };
+    if let Err(e) = crate::transcript::open(&path) {
+        emit::err_with(|| output::warning(&output::transcript_failed(&path, &e)));
+    }
+}
+
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     // The elevated helper never touches the disk: no data dir, no log (it runs as admin, and
     // %LOCALAPPDATA% is the user's to plant junctions in).
@@ -1190,6 +1216,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         anyhow::bail!("self apply-elevated fora do lugar");
     }
     style::init(cli.color);
+    if cli.command.is_some() {
+        open_transcript(&cli);
+    }
     let data = DataDir::from_env()?;
     // Start the search before logging, config and runtime setup: it only needs the file.
     let early: Option<EarlySearch> = match &cli.command {

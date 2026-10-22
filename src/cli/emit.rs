@@ -2,6 +2,7 @@
 //! `print!`/`println!`/`eprint!`/`eprintln!`/`dbg!` and any `stdout()`/`stderr()` anywhere else
 //! in `src/cli/`, the selector's terminal in `picker.rs` aside). The text always comes ready
 //! from `output.rs`: nothing here builds a message.
+use crate::transcript;
 use std::io::{IsTerminal, Write};
 
 /// Whether stdout is a terminal (color and the glyphs of stdout lines).
@@ -16,34 +17,42 @@ pub fn stderr_is_terminal() -> bool {
 
 /// One line of the command's result on stdout.
 pub fn out(text: &str) {
+    transcript::line(text);
     anstream::println!("{text}");
 }
 
 /// A block of the command's result on stdout; `text` carries its own line ends.
 pub fn out_block(text: &str) {
+    if !text.is_empty() {
+        transcript::line(text);
+    }
     anstream::print!("{text}");
 }
 
 /// One line on stdout, flushed at once (it shares the terminal with the progress line).
 pub fn out_flushed(text: &str) {
+    transcript::line(text);
     anstream::println!("{text}");
     let _ = std::io::stdout().flush();
 }
 
 /// One line on stderr whose text is already built (plain progress off a terminal, notices).
 pub fn err(text: &str) {
+    transcript::line(text);
     anstream::eprintln!("{text}");
 }
 
 /// One line on stderr built by `text` with the glyphs of stderr (`⚠ aviso: …`).
 pub fn err_with(text: impl FnOnce() -> String) {
     let line = super::style::on_stderr(text);
+    transcript::line(&line);
     anstream::eprintln!("{line}");
 }
 
 /// `value` as pretty JSON on stdout, never colored.
 pub fn json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
     let text = serde_json::to_string_pretty(value)?;
+    transcript::line(&text);
     writeln!(std::io::stdout().lock(), "{text}")?;
     Ok(())
 }
@@ -51,6 +60,7 @@ pub fn json<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
 /// The failed command's error on stderr (`main`): see [`super::output::error_report`].
 pub fn error(e: &anyhow::Error, verbose: bool) {
     let text = super::style::on_stderr(|| super::output::error_report(e, verbose));
+    transcript::line(&text);
     anstream::eprint!("{text}");
 }
 
@@ -76,6 +86,7 @@ impl Progress {
 
     /// Erases `width` columns, then prints `text` as a line of its own above the progress line.
     pub(super) fn line_above(&mut self, width: usize, text: &str) {
+        transcript::line(text);
         let _ = writeln!(self.0, "\r{:<width$}\r{text}", "");
     }
 

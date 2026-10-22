@@ -388,6 +388,7 @@ pub fn run(
     drop(s);
     if let Some(v) = &result {
         let line = summary(p.items(), v, prompt, glyphs);
+        crate::transcript::line(&line);
         let out = term.out();
         write!(out, "{line}\r\n")?;
         out.flush()?;
@@ -535,8 +536,10 @@ pub fn yes_no(
         draw_buttons(s.term.out(), question, yes, theme, cols, drawn)?;
     };
     drop(s);
+    let line = format!("{question} {}", if answer { "Sim" } else { "Não" });
+    crate::transcript::line(&line);
     let out = term.out();
-    write!(out, "{question} {}\r\n", if answer { "Sim" } else { "Não" })?;
+    write!(out, "{line}\r\n")?;
     out.flush()?;
     Ok(answer)
 }

@@ -227,6 +227,16 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
         .join(", ");
     app.icon_protocol = crate::tui::icons::choose_from_env(&cfg.icons);
     app.status = Some("carregando catálogo…".into());
+    // The path comes from the environment, like the CLI's; a bad one is one toast, not stderr.
+    if let Some(path) = std::env::var_os(crate::transcript::VAR).filter(|v| !v.is_empty()) {
+        let path = std::path::PathBuf::from(path);
+        if let Err(e) = crate::transcript::open(&path) {
+            app.push_toast(
+                crate::tui::app::ToastKind::Warning,
+                crate::cli::output::transcript_failed(&path, &e),
+            );
+        }
+    }
     // `ratatui::init` also installs a panic hook that restores the terminal before the message.
     let mut terminal = ratatui::init();
     // Mouse capture must be off again after a panic too: chain a hook that disables it
@@ -341,6 +351,7 @@ async fn event_loop(
     }
     let mut stats = LoopStats::new();
     let mut dark_now = app.dark;
+    let mut observer = crate::tui::transcript::Observer::default();
     let mut protocol_now = app.icon_protocol;
 
     loop {
@@ -534,6 +545,11 @@ async fn event_loop(
                 && let Some(age) = index_age(&ctx.data)
             {
                 app.index_age_secs = Some(age);
+            }
+        }
+        if crate::transcript::enabled() {
+            for line in observer.observe(&app) {
+                crate::transcript::line(&line);
             }
         }
         if draw {

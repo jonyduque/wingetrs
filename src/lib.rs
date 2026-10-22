@@ -16,6 +16,7 @@ pub mod job_log;
 pub mod pins;
 pub mod selfupdate;
 pub mod sources;
+pub mod transcript;
 pub mod tui;
 pub mod update;
 pub mod winget_install;

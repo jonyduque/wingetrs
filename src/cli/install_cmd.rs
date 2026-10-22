@@ -377,6 +377,8 @@ pub struct LineProgress {
     tty: bool,
     state: Arc<ProgressState>,
     plain: Mutex<output::PhaseLog>,
+    /// Phase lines for the transcript while the terminal shows the animated line.
+    transcribed: Mutex<output::PhaseLog>,
     animation: Mutex<Option<Animation>>,
 }
 
@@ -398,6 +400,7 @@ impl LineProgress {
                 notice: Mutex::new(None),
             }),
             plain: Mutex::new(output::PhaseLog::new()),
+            transcribed: Mutex::new(output::PhaseLog::new()),
             animation: Mutex::new(None),
         }
     }
@@ -416,6 +419,16 @@ impl LineProgress {
                 emit::err(&line);
             }
             return;
+        }
+        if crate::transcript::enabled() {
+            let line = self
+                .transcribed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .line(ev);
+            if let Some(line) = line {
+                crate::transcript::line(&line);
+            }
         }
         self.state.phases().update(ev);
         self.state.draw();

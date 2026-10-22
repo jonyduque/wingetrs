@@ -11,4 +11,5 @@ pub mod settings;
 pub mod tabs;
 pub mod theme;
 pub mod toast;
+pub mod transcript;
 pub mod view;

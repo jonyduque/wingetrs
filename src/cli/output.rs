@@ -66,6 +66,14 @@ pub fn warning(text: &str) -> String {
     format!("{head} {text}")
 }
 
+/// The transcript file could not be opened; the command runs without it.
+pub fn transcript_failed(path: &std::path::Path, e: &std::io::Error) -> String {
+    format!(
+        "não foi possível abrir o transcript {}: {e}; seguindo sem transcript",
+        path.display()
+    )
+}
+
 /// Text in the warning color, without glyph (notices said in full sentences).
 pub fn warn_text(text: &str) -> String {
     paint(WARN, text)

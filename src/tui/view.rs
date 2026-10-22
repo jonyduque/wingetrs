@@ -1186,6 +1186,18 @@ fn modal_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
     ))
 }
 
+/// The title of the dialog (the drawing and the transcript read it from here).
+pub fn modal_title(m: &Modal) -> String {
+    match m {
+        Modal::Confirm { .. } | Modal::ConfirmQuit { .. } => "Confirmar".to_string(),
+        Modal::Picking { .. } => "Escolha o pacote".to_string(),
+        Modal::Actions { app, .. } => app.clone(),
+        Modal::Choosing { .. } => "Escolha a correspondência".to_string(),
+        Modal::Residues { app, .. } => format!("Resíduos de {app}"),
+        Modal::Queue { .. } => "Fila".to_string(),
+    }
+}
+
 /// Draws the dialog; returns the icons of the confirmation items, drawn by `view` last.
 fn draw_modal<'a>(
     app: &'a App,
@@ -1194,6 +1206,7 @@ fn draw_modal<'a>(
     frame: &mut Frame,
     area: Rect,
 ) -> IconPlaces<'a> {
+    let title = modal_title(modal);
     match modal {
         Modal::Confirm {
             items,
@@ -1207,6 +1220,7 @@ fn draw_modal<'a>(
                 app,
                 (items, notes, scripts),
                 (*scroll, *cursor),
+                &title,
                 theme,
                 frame,
                 area,
@@ -1226,24 +1240,24 @@ fn draw_modal<'a>(
             render_dialog(
                 frame,
                 rect,
-                modal_block(theme, "Confirmar"),
+                modal_block(theme, &title),
                 Paragraph::new(lines).wrap(Wrap { trim: false }),
             );
         }
         Modal::Picking { picker, .. } => {
             draw_picker(
                 picker,
-                "Escolha o pacote",
+                &title,
                 "Enter escolhe · Esc cancela",
                 theme,
                 frame,
                 area,
             );
         }
-        Modal::Actions { picker, app, .. } => {
+        Modal::Actions { picker, .. } => {
             draw_picker(
                 picker,
-                app,
+                &title,
                 "Enter escolhe · Esc cancela",
                 theme,
                 frame,
@@ -1253,15 +1267,14 @@ fn draw_modal<'a>(
         Modal::Choosing { picker, .. } => {
             draw_picker(
                 picker,
-                "Escolha a correspondência",
+                &title,
                 "Enter escolhe · Esc cancela",
                 theme,
                 frame,
                 area,
             );
         }
-        Modal::Residues { picker, app, .. } => {
-            let title = format!("Resíduos de {app}");
+        Modal::Residues { picker, .. } => {
             draw_picker(
                 picker,
                 &title,
@@ -1276,7 +1289,7 @@ fn draw_modal<'a>(
             let at = ids.iter().position(|id| id == selected).unwrap_or(0);
             draw_picker(
                 &Picker::single_at(items, at),
-                "Fila",
+                &title,
                 "x/Delete tira da fila · Esc fecha",
                 theme,
                 frame,
@@ -1324,13 +1337,14 @@ fn draw_confirm<'a>(
     app: &'a App,
     (items, notes, scripts): (&[ConfirmItem], &[String], &ScriptSection),
     (scroll, cursor): (usize, usize),
+    title: &str,
     theme: &Theme,
     frame: &mut Frame,
     area: Rect,
 ) -> IconPlaces<'a> {
     let geom = confirm_geom(items.len(), notes, &scripts.lines, area);
     frame.render_widget(Clear, geom.dialog);
-    frame.render_widget(modal_block(theme, "Confirmar"), geom.dialog);
+    frame.render_widget(modal_block(theme, title), geom.dialog);
     let line = |frame: &mut Frame, rect: Rect, text: &str, style| {
         let text = clip(text, usize::from(rect.width));
         frame.render_widget(Paragraph::new(Span::styled(text, style)), rect);

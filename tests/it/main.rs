@@ -78,6 +78,7 @@ mod script_scan;
 mod search;
 mod self_update;
 mod spawn_env;
+mod transcript;
 mod tui_buckets;
 mod tui_jobs;
 mod tui_loop;
