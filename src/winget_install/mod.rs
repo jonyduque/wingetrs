@@ -22,6 +22,7 @@ pub mod orphans;
 pub mod orphans_win;
 pub mod plan;
 pub mod portable;
+pub mod portable_msi;
 pub mod post_check;
 pub mod previous;
 #[cfg(windows)]

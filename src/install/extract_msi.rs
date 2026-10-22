@@ -18,7 +18,7 @@ use crate::install::extract::{
 use crate::install::extract_7z::panic_message;
 use crate::install::msi_layout::{self, CompRow, DirRow, FileRow};
 
-type Pkg = Package<BufReader<File>>;
+pub(crate) type Pkg = Package<BufReader<File>>;
 
 /// Summary Information word count bit: files live in cabinets.
 const WORD_COUNT_COMPRESSED: i32 = 0x2;
@@ -325,7 +325,7 @@ fn open_cabinet(
     Cabinet::new(stream).map_err(|e| ExtractError::Archive(format!("gabinete {name}: {e}")))
 }
 
-fn rows(pkg: &mut Pkg, table: &str) -> Result<Vec<Row>, ExtractError> {
+pub(crate) fn rows(pkg: &mut Pkg, table: &str) -> Result<Vec<Row>, ExtractError> {
     if !pkg.has_table(table) {
         return Ok(Vec::new());
     }
@@ -345,14 +345,14 @@ fn msi_error(context: &str, e: io::Error) -> ExtractError {
     ExtractError::Archive(format!("{context}: {e}"))
 }
 
-fn text(row: &Row, column: &str) -> Option<String> {
+pub(crate) fn text(row: &Row, column: &str) -> Option<String> {
     if !row.has_column(column) {
         return None;
     }
     row[column].as_str().map(str::to_string)
 }
 
-fn int(row: &Row, column: &str) -> Option<i32> {
+pub(crate) fn int(row: &Row, column: &str) -> Option<i32> {
     if !row.has_column(column) {
         return None;
     }
@@ -396,9 +396,9 @@ fn cabinets(pkg: &mut Pkg) -> Result<Vec<String>, ExtractError> {
 }
 
 /// `Directory`, `Component` and `File` rows (each file with its `Attributes`).
-type Tables = (Vec<DirRow>, Vec<CompRow>, Vec<(FileRow, i32)>);
+pub(crate) type Tables = (Vec<DirRow>, Vec<CompRow>, Vec<(FileRow, i32)>);
 
-fn tables(pkg: &mut Pkg) -> Result<Tables, ExtractError> {
+pub(crate) fn tables(pkg: &mut Pkg) -> Result<Tables, ExtractError> {
     let mut dirs = Vec::new();
     for r in rows(pkg, "Directory")? {
         dirs.push(DirRow {

@@ -66,6 +66,7 @@ mod non_elevated;
 mod normalize;
 mod overrides;
 mod pins;
+mod portable_msi;
 mod prelude_core;
 mod prelude_effects;
 mod prelude_extract;
