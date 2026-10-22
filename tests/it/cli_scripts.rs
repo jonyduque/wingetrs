@@ -247,6 +247,8 @@ struct World {
     trash: FakeTrash,
     registry: FakeRegistry,
     host: Arc<CountHost>,
+    /// The parser of the gate (`LexerOnly` unless a test sets one).
+    ast: Arc<dyn wingetrs::install::script_ast::AstGate>,
 }
 
 impl World {
@@ -266,6 +268,7 @@ impl World {
             trash: FakeTrash::new(),
             registry: FakeRegistry::new(),
             host: Arc::new(CountHost::default()),
+            ast: Arc::new(wingetrs::install::script_ast::LexerOnly),
             _t: t,
         }
     }
@@ -333,6 +336,7 @@ impl World {
             msiexec: wingetrs::install::executor::Msiexec::DISABLED,
             launch: Default::default(),
             runners: Runners {
+                ast: self.ast.clone(),
                 scripts: Some(scripts),
                 installer: Some(count_installer),
                 ..Runners::disabled()
@@ -778,7 +782,8 @@ async fn installer_kind_follows_the_step() {
         file: "b.exe".into(),
         args: Vec::new(),
     });
-    let items = wingetrs::cli::output::plan_third_party(&plan);
+    let items =
+        wingetrs::cli::output::plan_third_party(&plan, &wingetrs::install::script_ast::LexerOnly);
     assert!(
         matches!(
             items.as_slice(),
@@ -809,7 +814,13 @@ fn resolved(extra: serde_json::Value) -> wingetrs::install::manifest::Resolved {
 fn removal_consent_lists_args_only_uninstaller() {
     let m = resolved(serde_json::json!({"uninstaller": {"args": "/S"}}));
     let vdir = Path::new(r"C:\w\apps\x\1.0");
-    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "", &CallRoots::default());
+    let items = wingetrs::cli::output::removal_third_party(
+        &m,
+        vdir,
+        "",
+        &CallRoots::default(),
+        &wingetrs::install::script_ast::LexerOnly,
+    );
     assert_eq!(
         items,
         [ThirdParty::Program {
@@ -821,7 +832,13 @@ fn removal_consent_lists_args_only_uninstaller() {
     assert_eq!(items[0].label(), "desinstalador x-1.0.zip");
     // `$dir` in the arguments is the version folder, as the executor passes it.
     let m = resolved(serde_json::json!({"uninstaller": {"file": "un.exe", "args": ["/D=$dir"]}}));
-    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "", &CallRoots::default());
+    let items = wingetrs::cli::output::removal_third_party(
+        &m,
+        vdir,
+        "",
+        &CallRoots::default(),
+        &wingetrs::install::script_ast::LexerOnly,
+    );
     assert_eq!(
         items,
         [ThirdParty::Program {
@@ -832,7 +849,13 @@ fn removal_consent_lists_args_only_uninstaller() {
     );
     // No uninstaller file and no args: nothing runs, nothing listed.
     let m = resolved(serde_json::json!({"uninstaller": {"script": "info 'x'"}}));
-    let items = wingetrs::cli::output::removal_third_party(&m, vdir, "", &CallRoots::default());
+    let items = wingetrs::cli::output::removal_third_party(
+        &m,
+        vdir,
+        "",
+        &CallRoots::default(),
+        &wingetrs::install::script_ast::LexerOnly,
+    );
     assert_eq!(
         items.iter().map(ThirdParty::label).collect::<Vec<_>>(),
         ["script uninstaller.script"]
@@ -853,6 +876,7 @@ fn removal_consent_order_matches_executor() {
         Path::new(r"C:\v"),
         ", na remoção",
         &CallRoots::default(),
+        &wingetrs::install::script_ast::LexerOnly,
     );
     assert_eq!(
         items.iter().map(ThirdParty::label).collect::<Vec<_>>(),
@@ -960,7 +984,8 @@ async fn consent_shows_called_bucket_script() {
         kind: HookKind::PostInstall,
         script: ". \"$bucketsdir\\extras\\scripts\\ok.ps1\"".into(),
     });
-    let items = wingetrs::cli::output::plan_third_party(&plan);
+    let items =
+        wingetrs::cli::output::plan_third_party(&plan, &wingetrs::install::script_ast::LexerOnly);
     let called = items.iter().find_map(|i| match i {
         ThirdParty::Script { hook, script, .. }
             if hook == "arquivo chamado por post_install: $bucketsdir\\extras\\scripts\\ok.ps1" =>
@@ -988,7 +1013,13 @@ fn removal_consent_shows_called_dir_script() {
     std::fs::write(vdir.join("un.ps1"), "Write-Host 'tchau'\r\n").unwrap();
     let m = resolved(serde_json::json!({"pre_uninstall": "& \"$dir\\un.ps1\""}));
     let roots = CallRoots::new(t.path(), Some(&vdir));
-    let items = wingetrs::cli::output::removal_third_party(&m, &vdir, "", &roots);
+    let items = wingetrs::cli::output::removal_third_party(
+        &m,
+        &vdir,
+        "",
+        &roots,
+        &wingetrs::install::script_ast::LexerOnly,
+    );
     let hooks: Vec<&str> = items
         .iter()
         .filter_map(|i| match i {
@@ -1163,4 +1194,71 @@ fn bucket_add_question_uses_selector() {
     assert!(add(&ui, &mut cfg, true).0.unwrap());
     assert!(has(&cfg));
     assert_eq!(screen.lock().unwrap().reads, 0);
+}
+
+// ---- Task 227 ----
+
+/// A parser that reports `wire` for the text `Write-Output ok`, nothing for others.
+struct WireFor(&'static str);
+
+impl wingetrs::install::script_ast::AstGate for WireFor {
+    fn facts(
+        &self,
+        script: &str,
+    ) -> Result<wingetrs::install::script_ast::AstFacts, wingetrs::install::script_ast::AstError>
+    {
+        wingetrs::install::script_ast::decode(if script == "Write-Output ok" {
+            self.0
+        } else {
+            ""
+        })
+    }
+}
+
+/// The confirmation shows what the plan's parser found, and a refusal of that parser stops the
+/// command before "Continuar?".
+#[tokio::test(flavor = "multi_thread")]
+async fn confirmation_and_plan_use_the_same_gate() {
+    use wingetrs::install::script_scan::Verdict;
+    let mut w = World::new().await;
+    w.publish(
+        "1.0",
+        serde_json::json!({"post_install": "Write-Output ok"}),
+    )
+    .await;
+    w.ast = Arc::new(WireFor("CMD\t1\tnone\tStringConstant\t.\tiwr\ts:x\n"));
+    {
+        let ctx = w.ctx();
+        let cand = match ops::resolve_target(&ctx, "x", None).unwrap() {
+            ops::Resolution::One(c) => c,
+            other => panic!("{other:?}"),
+        };
+        let plan = ops::plan_for(&ctx, &cand, false).unwrap().remove(0);
+        let items = wingetrs::cli::output::plan_third_party(&plan, &*ctx.runners.ast);
+        match items.as_slice() {
+            [ThirdParty::Script { report, .. }] => {
+                assert_eq!(report.verdict, Verdict::ConfirmStrong, "{report:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let block = wingetrs::cli::output::third_party_block(&items);
+        assert!(
+            block.contains("baixa arquivos da internet por conta própria (linha 1)"),
+            "{block}"
+        );
+    }
+    w.ast = Arc::new(WireFor(
+        "CMD\t1\tnone\tStringConstant\t.\tStart-Process\tp:Verb\ts:RunAs\n",
+    ));
+    let (ui, screen) = scripted_ui(vec![key(Char('s'))], true);
+    let e = w
+        .run(&ui, &["install", "x", "--allow-scripts"])
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("pede elevação (RunAs/sudo)"), "{e}");
+    let text = wingetrs::cli::picker::fake::plain(&screen.lock().unwrap().out);
+    assert!(!text.contains("Continuar?"), "{text:?}");
+    assert_eq!(w.requests().await, 0);
+    assert_eq!(w.runs(), 0);
+    assert_eq!(w.installed(), None);
 }

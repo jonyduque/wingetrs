@@ -390,6 +390,7 @@ impl World {
             msiexec: wingetrs::install::executor::Msiexec::DISABLED,
             launch: Default::default(),
             runners: Runners {
+                ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
                 scripts: Some(scripts),
                 ..Runners::disabled()
             },

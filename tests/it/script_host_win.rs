@@ -349,6 +349,7 @@ async fn world_with(extra: serde_json::Value) -> World {
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .unwrap();
     World {
@@ -392,6 +393,7 @@ impl World {
             msiexec: None,
             launch: gate,
             runners: Runners {
+                ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
                 scripts: Some(scripts),
                 installer: Some(installer_must_not_run),
                 ..Runners::disabled()

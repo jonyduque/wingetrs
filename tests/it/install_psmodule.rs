@@ -134,6 +134,7 @@ impl World {
             launcher_present: true,
             keep_old: false,
             manifest_sha256: "",
+            ast: &wingetrs::install::script_ast::LexerOnly,
         })
         .unwrap()
     }
@@ -374,6 +375,7 @@ async fn unsafe_module_names_refused_by_the_planner() {
             launcher_present: true,
             keep_old: false,
             manifest_sha256: "",
+            ast: &wingetrs::install::script_ast::LexerOnly,
         });
         assert!(r.is_err(), "{name:?} must be refused by the planner");
     }

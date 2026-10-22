@@ -13,6 +13,7 @@ use crate::install::progress::SelfUpdateStep;
 use crate::install::progress::{
     DownloadMeter, Phase, ProgressEvent, download_parts, phase_status, phase_text, phase_title,
 };
+use crate::install::script_ast::AstGate;
 use crate::install::script_scan::{self, CallRoots, ScriptReport, Verdict, printable};
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::update::{Outcome, SourceReport};
@@ -1066,9 +1067,15 @@ impl ThirdParty {
 }
 
 /// A manifest script, then each file it runs that `roots` can read (Task 192): the user
-/// sees what runs, and the script's report already carries their flags.
-fn script_items(hook: String, script: &str, roots: &CallRoots) -> Vec<ThirdParty> {
-    let (report, called) = script_scan::scan_called(script, PRELUDE_FUNCTIONS, roots);
+/// sees what runs, and the script's report already carries their flags. `ast`: the same
+/// parser the plan used (Task 227).
+fn script_items(
+    hook: String,
+    script: &str,
+    roots: &CallRoots,
+    ast: &dyn AstGate,
+) -> Vec<ThirdParty> {
+    let (report, called) = script_scan::scan_gated(script, PRELUDE_FUNCTIONS, roots, ast);
     let files = called.into_iter().map(|c| ThirdParty::Script {
         hook: format!("arquivo chamado por {hook}: {}", c.target),
         script: c.script,
@@ -1120,11 +1127,12 @@ pub fn removal_third_party(
     vdir: &Path,
     suffix: &str,
     roots: &CallRoots,
+    ast: &dyn AstGate,
 ) -> Vec<ThirdParty> {
     let name = |k: HookKind| format!("{}{suffix}", k.key());
     let mut out = Vec::new();
     if let Some(s) = &m.hooks.pre_uninstall {
-        out.extend(script_items(name(HookKind::PreUninstall), s, roots));
+        out.extend(script_items(name(HookKind::PreUninstall), s, roots, ast));
     }
     if let Some(u) = &m.uninstaller {
         match planner::uninstaller_command(m, u, vdir) {
@@ -1136,18 +1144,24 @@ pub fn removal_third_party(
             }),
         }
         if let Some(s) = &u.script {
-            out.extend(script_items(name(HookKind::UninstallerScript), s, roots));
+            out.extend(script_items(
+                name(HookKind::UninstallerScript),
+                s,
+                roots,
+                ast,
+            ));
         }
     }
     if let Some(s) = &m.hooks.post_uninstall {
-        out.extend(script_items(name(HookKind::PostUninstall), s, roots));
+        out.extend(script_items(name(HookKind::PostUninstall), s, roots, ast));
     }
     out
 }
 
 /// The third-party code `plan` runs now, then the one its manifest runs at removal time
-/// (installing it already needs the consent: Tasks 151 and 159).
-pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
+/// (installing it already needs the consent: Tasks 151 and 159). `ast`: the parser the plan
+/// was made with (`OpsCtx.runners.ast`), so what is shown is what was checked.
+pub fn plan_third_party(plan: &InstallPlan, ast: &dyn AstGate) -> Vec<ThirdParty> {
     let mut out = Vec::new();
     let layout = Layout::new(&plan.root);
     // The same roots the planner scanned with: nothing of the new version is extracted yet,
@@ -1161,11 +1175,11 @@ pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
     for step in &plan.steps {
         match step {
             Step::Hook { kind, script } => {
-                out.extend(script_items(kind.key().to_string(), script, &roots));
+                out.extend(script_items(kind.key().to_string(), script, &roots, ast));
             }
             Step::UpgradeUninstallHook { kind, script } => {
                 let hook = format!("{} da versão instalada", kind.key());
-                out.extend(script_items(hook, script, &old_roots));
+                out.extend(script_items(hook, script, &old_roots, ast));
             }
             Step::RunInstaller { file, args, .. } => out.push(program_item(false, file, args)),
             Step::RunPs1Installer { file, args } => out.push(ps1_item(false, file, args)),
@@ -1185,7 +1199,7 @@ pub fn plan_third_party(plan: &InstallPlan) -> Vec<ThirdParty> {
             .map(|m| {
                 let vdir = layout.version_dir(&plan.app, &plan.version);
                 let roots = CallRoots::new(&plan.root, Some(&vdir));
-                removal_third_party(&m, &vdir, ", na remoção", &roots)
+                removal_third_party(&m, &vdir, ", na remoção", &roots, ast)
             })
             .unwrap_or_default();
         if later.is_empty() {

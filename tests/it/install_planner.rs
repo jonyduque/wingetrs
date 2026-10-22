@@ -36,6 +36,7 @@ fn plan(
         launcher_present: launcher,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 
@@ -194,6 +195,7 @@ fn shortcut_names_are_sanitized_and_contained() {
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .unwrap();
     let links: Vec<PathBuf> = p
@@ -260,6 +262,7 @@ fn display_snapshots_for_every_supported_fixture() {
             launcher_present: false,
             keep_old: false,
             manifest_sha256: "",
+            ast: &wingetrs::install::script_ast::LexerOnly,
         })
         .unwrap();
         insta::assert_snapshot!(name.trim_end_matches(".json"), p.to_string());
@@ -292,6 +295,7 @@ fn scanner_refusal_of_a_real_manifest_script_stops_the_plan() {
         launcher_present: false,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .unwrap_err();
     assert!(
@@ -321,6 +325,7 @@ fn plan_raw(
         launcher_present: true,
         keep_old,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 
@@ -461,6 +466,7 @@ fn plan_bin(bin: &str) -> Result<wingetrs::install::plan::InstallPlan, PlanError
         launcher_present: false,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 
@@ -545,6 +551,7 @@ fn plan_url(
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 
@@ -653,6 +660,7 @@ fn plan_in(
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 
@@ -722,13 +730,73 @@ fn removal_check_reads_installed_dir() {
     let m = manifest_with(serde_json::json!({"post_uninstall": ". \"$dir\\un.ps1\""}));
     let vdir = l.version_dir("app", "2");
     let roots = CallRoots::new(l.root(), Some(&vdir));
-    check_uninstall_scripts(&m, &roots).unwrap();
+    check_uninstall_scripts(&m, &roots, &wingetrs::install::script_ast::LexerOnly).unwrap();
     std::fs::create_dir_all(&vdir).unwrap();
     std::fs::write(vdir.join("un.ps1"), BAD_PS1).unwrap();
     let roots = CallRoots::new(l.root(), Some(&vdir));
-    let e = check_uninstall_scripts(&m, &roots).unwrap_err();
+    let e =
+        check_uninstall_scripts(&m, &roots, &wingetrs::install::script_ast::LexerOnly).unwrap_err();
     assert!(
         matches!(&e, PlanError::ScriptRefused { hook, .. } if hook == "post_uninstall"),
+        "{e:?}"
+    );
+}
+
+// ---- Task 227 ----
+
+/// A parser that reports `Start-Process -Verb RunAs` for one exact text, nothing for others.
+struct RunAsFor(&'static str);
+
+impl wingetrs::install::script_ast::AstGate for RunAsFor {
+    fn facts(
+        &self,
+        script: &str,
+    ) -> Result<wingetrs::install::script_ast::AstFacts, wingetrs::install::script_ast::AstError>
+    {
+        let wire = if script == self.0 {
+            "CMD\t1\tnone\tStringConstant\t.\tStart-Process\tp:Verb\ts:RunAs\n"
+        } else {
+            ""
+        };
+        wingetrs::install::script_ast::decode(wire)
+    }
+}
+
+#[test]
+fn planner_refuses_on_ast_flag() {
+    let m = manifest_with(serde_json::json!({"post_install": ["Write-Output ok"]}));
+    let l = root();
+    let input = |ast: &'static dyn wingetrs::install::script_ast::AstGate| {
+        plan_install(&PlanInput {
+            app: "app",
+            bucket: "main",
+            manifest: &m,
+            layout: &l,
+            shortcut_root: Path::new(SC),
+            installed: None,
+            launcher_present: true,
+            keep_old: false,
+            manifest_sha256: "",
+            ast,
+        })
+    };
+    static FAKE: RunAsFor = RunAsFor("Write-Output ok");
+    match input(&FAKE) {
+        Err(PlanError::ScriptRefused { hook, reasons }) => {
+            assert_eq!(hook, "post_install");
+            assert!(
+                reasons.iter().any(|r| r == "pede elevação (RunAs/sudo)"),
+                "{reasons:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    input(&wingetrs::install::script_ast::LexerOnly).unwrap();
+    // The uninstall scripts of the manifest go through the same gate.
+    let m = manifest_with(serde_json::json!({"pre_uninstall": "Write-Output ok"}));
+    let e = check_uninstall_scripts(&m, &CallRoots::default(), &FAKE).unwrap_err();
+    assert!(
+        matches!(&e, PlanError::ScriptRefused { hook, .. } if hook == "pre_uninstall"),
         "{e:?}"
     );
 }

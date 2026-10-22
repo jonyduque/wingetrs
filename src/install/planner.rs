@@ -1,6 +1,6 @@
 //! Plan builder: turns a resolved manifest, the layout and the current state into
 //! an [`InstallPlan`]. Pure except for reading the files a script runs, for the gate
-//! (`script_scan::scan_called`, Task 192).
+//! (`script_scan::scan_gated`, Task 192), and asking PowerShell's parser (Task 227).
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,7 @@ use crate::install::plan::{
 };
 use crate::install::prelude::PRELUDE_FUNCTIONS;
 use crate::install::safepath;
+use crate::install::script_ast::AstGate;
 use crate::install::script_scan::{self, CallRoots, Verdict};
 use crate::install::shim;
 
@@ -24,7 +25,7 @@ pub struct InstalledInfo {
     pub old_manifest: Option<Resolved>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PlanInput<'a> {
     pub app: &'a str,
     pub bucket: &'a str,
@@ -36,6 +37,24 @@ pub struct PlanInput<'a> {
     pub keep_old: bool,
     /// SHA-256 (hex) of the manifest JSON, carried into the plan.
     pub manifest_sha256: &'a str,
+    /// PowerShell's parser for the script gate (`OpsCtx.runners.ast`).
+    pub ast: &'a dyn AstGate,
+}
+
+impl std::fmt::Debug for PlanInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanInput")
+            .field("app", &self.app)
+            .field("bucket", &self.bucket)
+            .field("manifest", &self.manifest)
+            .field("layout", &self.layout)
+            .field("shortcut_root", &self.shortcut_root)
+            .field("installed", &self.installed)
+            .field("launcher_present", &self.launcher_present)
+            .field("keep_old", &self.keep_old)
+            .field("manifest_sha256", &self.manifest_sha256)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -244,8 +263,13 @@ fn needs_powershell(spec: &InstallerSpec) -> bool {
 
 /// `Step::Hook` for a manifest script, refused at planning when the scanner refuses it (or
 /// a file it runs that `roots` can read).
-fn hook_step(kind: HookKind, script: &str, roots: &CallRoots) -> Result<Step, PlanError> {
-    let (report, _) = script_scan::scan_called(script, PRELUDE_FUNCTIONS, roots);
+fn hook_step(
+    kind: HookKind,
+    script: &str,
+    roots: &CallRoots,
+    ast: &dyn AstGate,
+) -> Result<Step, PlanError> {
+    let (report, _) = script_scan::scan_gated(script, PRELUDE_FUNCTIONS, roots, ast);
     if report.verdict == Verdict::Refuse {
         let reasons = report
             .flags
@@ -302,12 +326,13 @@ fn upgrade_uninstall_steps(
     old: &Resolved,
     old_vdir: &Path,
     root: &Path,
+    ast: &dyn AstGate,
 ) -> Result<Vec<Step>, PlanError> {
     let mut steps = Vec::new();
     // The old version is extracted: files its hooks run from `$dir` are read.
     let roots = CallRoots::new(root, Some(old_vdir));
     let hook = |kind: HookKind, script: &str| {
-        hook_step(kind, script, &roots).map(|s| match s {
+        hook_step(kind, script, &roots, ast).map(|s| match s {
             Step::Hook { kind, script } => Step::UpgradeUninstallHook { kind, script },
             other => other,
         })
@@ -351,7 +376,11 @@ pub fn uninstaller_command(
 /// Refuses (at planning, `ScriptRefused`) an installed manifest whose uninstall scripts the
 /// scanner refuses; a `.ps1` uninstaller file is scanned when it is about to run. `roots`:
 /// where the files the scripts run can be read (`CallRoots::new(root, Some(vdir))`).
-pub fn check_uninstall_scripts(m: &Resolved, roots: &CallRoots) -> Result<(), PlanError> {
+pub fn check_uninstall_scripts(
+    m: &Resolved,
+    roots: &CallRoots,
+    ast: &dyn AstGate,
+) -> Result<(), PlanError> {
     let scripts = [
         (HookKind::PreUninstall, m.hooks.pre_uninstall.as_deref()),
         (
@@ -362,7 +391,7 @@ pub fn check_uninstall_scripts(m: &Resolved, roots: &CallRoots) -> Result<(), Pl
     ];
     for (kind, script) in scripts {
         if let Some(script) = script {
-            hook_step(kind, script, roots)?;
+            hook_step(kind, script, roots, ast)?;
         }
     }
     Ok(())
@@ -382,7 +411,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     // Nothing of this version is extracted yet: only the buckets' guarded `scripts/` is read.
     let roots = CallRoots::new(layout.root(), None);
     // Its own uninstall hooks run at removal time: the scanner already looks at them here.
-    check_uninstall_scripts(m, &roots)?;
+    check_uninstall_scripts(m, &roots, input.ast)?;
     let upgrade_from = match &input.installed {
         Some(i) if i.version == m.version => {
             return Err(PlanError::AlreadyInstalled {
@@ -433,11 +462,12 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
             old,
             &layout.version_dir(app, &old.version),
             layout.root(),
+            input.ast,
         )?);
     }
     steps.push(Step::Promote);
     if let Some(script) = &m.hooks.pre_install {
-        steps.push(hook_step(HookKind::PreInstall, script, &roots)?);
+        steps.push(hook_step(HookKind::PreInstall, script, &roots, input.ast)?);
     }
     if let Some(spec) = &m.installer {
         // install.ps1 Invoke-Installer: the file runs only with `file` or `args`, then the script.
@@ -445,7 +475,12 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
             steps.push(installer_step(m, spec, &layout.version_dir(app, version))?);
         }
         if let Some(script) = &spec.script {
-            steps.push(hook_step(HookKind::InstallerScript, script, &roots)?);
+            steps.push(hook_step(
+                HookKind::InstallerScript,
+                script,
+                &roots,
+                input.ast,
+            )?);
         }
     }
     for p in &m.persist {
@@ -520,7 +555,7 @@ pub fn plan_install(input: &PlanInput<'_>) -> Result<InstallPlan, PlanError> {
     }
     steps.push(Step::EnsureShimsOnPath);
     if let Some(script) = &m.hooks.post_install {
-        steps.push(hook_step(HookKind::PostInstall, script, &roots)?);
+        steps.push(hook_step(HookKind::PostInstall, script, &roots, input.ast)?);
     }
     steps.push(Step::WriteManifest {
         json: m.raw_json.clone(),

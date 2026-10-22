@@ -181,6 +181,7 @@ fn plan_for(manifest: &str, layout: &Layout) -> InstallPlan {
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .unwrap()
 }
@@ -310,6 +311,7 @@ impl World {
             msiexec: None,
             launch: Default::default(),
             runners: Runners {
+                ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
                 innounp,
                 installer: None,
                 scripts: None,

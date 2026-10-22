@@ -34,6 +34,11 @@ $rules = @(
     # CurrentUser\Root (both writable without admin); the elevated side uses `Http::for_elevated`.
     # Task 202: the helper's signed-catalog install (signed_install, catalog_verify_win) too.
     @{ Name = 'Http::new no lado elevado'; Pattern = '\bHttp::new\s*\('; Skip = '^(?!(.*[\\/])?src[\\/](selfupdate[\\/]apply_win|bridge[\\/](worker|elevate_win|staging_win|arp_ops_win|signed_install|catalog_verify_win))\.rs$)' },
+    # Task 227: production code scans scripts only through `scan_gated` (the lexer plus
+    # PowerShell's parser); `scan_called` alone would skip the parser.
+    @{ Name = 'scan_called fora de script_scan.rs (use scan_gated)'; Pattern = '\bscan_called\s*\('; Skip = '(^|[\\/])src[\\/]install[\\/]script_scan\.rs$' },
+    # Task 227: `LexerOnly` drops the parser from the gate; it exists for tests only.
+    @{ Name = 'LexerOnly fora de script_ast.rs'; Pattern = '\bLexerOnly\b'; Skip = '(^|[\\/])src[\\/]install[\\/]script_ast\.rs$' },
     # Windows APIs only in *_win.rs.
     @{ Name = 'API Windows fora de *_win.rs'; Pattern = '(?<![\w:])(winreg|windows)::'; Skip = '_win\.rs$' }
 )

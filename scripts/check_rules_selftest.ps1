@@ -66,7 +66,11 @@ $cliCases = @(
     @{ Name = 'Http::new na instalação pelo catálogo assinado'; File = 'src/bridge/signed_install.rs'; Text = 'fn f() { let _ = Http::new(); }'; Want = 1 },
     @{ Name = 'Http::new na conferência do catálogo'; File = 'src/bridge/catalog_verify_win.rs'; Text = 'fn f() { let _ = crate::http::Http::new(); }'; Want = 1 },
     @{ Name = 'Http::new fora do lado elevado'; File = 'src/update.rs'; Text = 'fn f() { let _ = Http::new(); }'; Want = 0 },
-    @{ Name = 'for_elevated no selfupdate'; File = 'src/selfupdate/apply_win.rs'; Text = 'fn f() { let _ = Http::for_elevated(&r); }'; Want = 0 }
+    @{ Name = 'for_elevated no selfupdate'; File = 'src/selfupdate/apply_win.rs'; Text = 'fn f() { let _ = Http::for_elevated(&r); }'; Want = 0 },
+    @{ Name = 'scan_called no planner'; File = 'src/install/planner.rs'; Text = 'fn f() { let _ = script_scan::scan_called(s, p, r); }'; Want = 1 },
+    @{ Name = 'scan_called em script_scan.rs'; File = 'src/install/script_scan.rs'; Text = 'fn f() { let _ = scan_called(s, p, r); }'; Want = 0 },
+    @{ Name = 'LexerOnly no executor'; File = 'src/install/executor.rs'; Text = 'fn f() { let _ = Arc::new(script_ast::LexerOnly); }'; Want = 1 },
+    @{ Name = 'LexerOnly em script_ast.rs'; File = 'src/install/script_ast.rs'; Text = 'pub struct LexerOnly;'; Want = 0 }
 )
 # Task 222: `skip_if_elevated_in_ci` only in the tests of non_elevated.txt (files under it/, list).
 $skip = "    if skip_if_elevated_in_ci(`"x`") {`n        return;`n    }`n"

@@ -474,6 +474,7 @@ fn plan(app: &str, bucket: &str, m: &Resolved, layout: &Layout) -> Result<(), Pl
         launcher_present: false,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .map(|_| ())
 }

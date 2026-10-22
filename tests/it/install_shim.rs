@@ -411,6 +411,7 @@ fn plan_shim(
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })?;
     Ok(plan
         .steps

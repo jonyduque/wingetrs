@@ -28,6 +28,7 @@ fn plan(m: &Resolved) -> Result<wingetrs::install::plan::InstallPlan, PlanError>
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 

@@ -602,7 +602,9 @@ pub fn plans_admin_refusal(
             has_uninstall_scripts: false,
             ..p.clone()
         };
-        admin_code_refusal(elevated, &output::plan_third_party(&now), inno)
+        // Only the labels of the code count here (no report): no parser is asked.
+        let code = output::plan_third_party(&now, &crate::install::script_ast::Unavailable);
+        admin_code_refusal(elevated, &code, inno)
     })
 }
 
@@ -688,9 +690,10 @@ fn dry_run_done(ui: &dyn Ui, refusal: Option<&str>) {
 /// The plans that run third-party code, with that code.
 fn plans_code<'a>(
     plans: impl Iterator<Item = &'a crate::install::plan::InstallPlan>,
+    ast: &dyn crate::install::script_ast::AstGate,
 ) -> Vec<(String, Vec<ThirdParty>)> {
     plans
-        .map(|p| (p.app.clone(), output::plan_third_party(p)))
+        .map(|p| (p.app.clone(), output::plan_third_party(p, ast)))
         .filter(|(_, items)| !items.is_empty())
         .collect()
 }
@@ -947,7 +950,7 @@ pub(crate) async fn apply_install(
 ) -> anyhow::Result<()> {
     print_plans(ctx, ui, &plans, f);
     let refusal = admin_gate(plans_admin_refusal(elevated, &plans), f)?;
-    third_party_gate(&plans_code(plans.iter()), f)?;
+    third_party_gate(&plans_code(plans.iter(), &*ctx.runners.ast), f)?;
     if f.dry_run {
         dry_run_done(ui, refusal.as_deref());
         return Ok(());
@@ -1008,7 +1011,7 @@ async fn uninstall(
     let vdir = layout.version_dir(&plan.app, &plan.version);
     let roots = CallRoots::new(layout.root(), Some(&vdir));
     let code: Vec<_> = manifest
-        .map(|m| output::removal_third_party(&m, &vdir, "", &roots))
+        .map(|m| output::removal_third_party(&m, &vdir, "", &roots, &*ctx.runners.ast))
         .filter(|items| !items.is_empty())
         .map(|items| (plan.app.clone(), items))
         .into_iter()
@@ -1200,7 +1203,7 @@ async fn upgrade(
     if let Some(r) = split.fail {
         return Err(anyhow::Error::msg(r));
     }
-    third_party_gate(&plans_code(groups.iter().flatten()), f)?;
+    third_party_gate(&plans_code(groups.iter().flatten(), &*ctx.runners.ast), f)?;
     if f.dry_run {
         for w in &split.warnings {
             ui.output(&output::warning(w));

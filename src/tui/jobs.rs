@@ -384,7 +384,7 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
     let vdir = layout.version_dir(&plan.app, &plan.version);
     let roots = CallRoots::new(layout.root(), Some(&vdir));
     let code = manifest
-        .map(|m| removal_third_party(&m, &vdir, "", &roots))
+        .map(|m| removal_third_party(&m, &vdir, "", &roots, &*c.runners.ast))
         .unwrap_or_default();
     let action = Action::Remove(plan);
     if code.is_empty() {

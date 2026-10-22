@@ -8,6 +8,7 @@ use crate::config::{Behavior, Config, ConfirmMode, ResidueMode, WingetEngine};
 use crate::core::{PackageDetails, PackageEntry, SourceKind};
 use crate::install::plan::{InstallPlan, UninstallPlan};
 use crate::install::residue::{Confidence, Residue, ResidueKind};
+use crate::install::script_ast::AstGate;
 use crate::install::script_policy::elevated_or_unknown;
 use crate::install::script_scan::{ScriptReport, Verdict, printable};
 use crate::install::target::Candidate;
@@ -921,6 +922,9 @@ pub struct App {
     /// removals are refused in the plan. `App::new`: never; `tui::run`: the token's (an error
     /// counts as elevated).
     pub elevated: fn() -> std::io::Result<bool>,
+    /// PowerShell's parser for the scripts shown in a confirmation (Task 227): the one the plans
+    /// were made with. `App::new`: none (every script refused); `tui::run`: the production one.
+    pub ast: Arc<dyn AstGate>,
     /// Clock for toasts; the loop sets it before each batch, tests set it by hand.
     pub now: Instant,
     /// Toasts on screen, newest first.
@@ -1071,6 +1075,7 @@ impl App {
             planning_confirm: None,
             removal_code: HashMap::new(),
             elevated: crate::install::script_policy::not_elevated,
+            ast: Arc::new(crate::install::script_ast::Unavailable),
             now: Instant::now(),
             toasts: Vec::new(),
             refresh_forced: false,
@@ -2943,7 +2948,7 @@ fn actions_code(app: &App, actions: &[Action]) -> Vec<(String, Vec<ThirdParty>)>
         match action {
             Action::Apply(groups) => {
                 for p in groups.iter().flatten() {
-                    add(&p.app, plan_third_party(p));
+                    add(&p.app, plan_third_party(p, &*app.ast));
                 }
             }
             Action::Remove(p) => {

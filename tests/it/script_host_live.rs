@@ -119,6 +119,7 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .unwrap();
     let version_dir = layout.version_dir("app", "1.0");
@@ -156,6 +157,7 @@ async fn real_pwsh_runs_synthetic_hook_inside_the_sandbox() {
         msiexec: None,
         launch: Default::default(),
         runners: Runners {
+            ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
             scripts: Some(scripts),
             ..Runners::disabled()
         },
@@ -253,6 +255,7 @@ async fn constant_global_blocks_reassignment() {
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .unwrap();
     let version_dir = layout.version_dir("app", "1.0");
@@ -287,6 +290,7 @@ async fn constant_global_blocks_reassignment() {
         msiexec: None,
         launch: Default::default(),
         runners: Runners {
+            ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
             scripts: Some(scripts),
             ..Runners::disabled()
         },

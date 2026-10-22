@@ -143,6 +143,7 @@ impl World {
             launcher_present: true,
             keep_old: false,
             manifest_sha256: &sha,
+            ast: &wingetrs::install::script_ast::LexerOnly,
         })
         .unwrap()
     }
@@ -170,6 +171,7 @@ impl World {
             msiexec: None,
             launch: Default::default(),
             runners: Runners {
+                ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
                 installer,
                 ..Runners::disabled()
             },
@@ -242,6 +244,7 @@ fn plan_for(manifest: &serde_json::Value) -> Result<InstallPlan, PlanError> {
         launcher_present: true,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
 }
 

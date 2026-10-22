@@ -238,6 +238,7 @@ impl World {
             launcher_present: true,
             keep_old: false,
             manifest_sha256: &sha256_hex(manifest.as_bytes()),
+            ast: &wingetrs::install::script_ast::LexerOnly,
         })
     }
 
@@ -264,6 +265,7 @@ impl World {
             msiexec: None,
             launch: Default::default(),
             runners: Runners {
+                ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
                 installer,
                 scripts,
                 ..Runners::disabled()

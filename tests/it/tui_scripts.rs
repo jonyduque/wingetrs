@@ -45,6 +45,7 @@ fn app_with(mode: ConfirmMode) -> App {
     let mut a = App::new(Vec::new(), GlyphSet::Ascii);
     a.size = (80, 24);
     a.settings.behavior.confirm = mode;
+    a.ast = std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly);
     a
 }
 
@@ -269,6 +270,17 @@ fn refused_script_never_runs() {
     assert!(a.toasts.iter().any(|t| t.kind == ToastKind::Error));
 }
 
+/// Task 227: an `App` without the production parser refuses every script it would show.
+#[test]
+fn app_without_parser_refuses_scripts() {
+    let mut a = App::new(Vec::new(), GlyphSet::Ascii);
+    a.size = (80, 24);
+    apply_planned(&mut a, plan_with("tool", Some("$x = 1")));
+    update(&mut a, key(KeyCode::Enter));
+    assert!(a.running.is_none() && a.queue.is_empty());
+    assert!(a.toasts.iter().any(|t| t.kind == ToastKind::Error));
+}
+
 #[test]
 fn bidi_and_control_characters_are_shown_escaped() {
     let mut a = app_with(ConfirmMode::Never);
@@ -471,6 +483,7 @@ impl World {
             msiexec: wingetrs::install::executor::Msiexec::DISABLED,
             launch: Default::default(),
             runners: Runners {
+                ast: std::sync::Arc::new(wingetrs::install::script_ast::LexerOnly),
                 scripts: Some(scripts),
                 ..Runners::disabled()
             },

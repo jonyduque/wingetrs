@@ -623,6 +623,7 @@ pub fn plan_for(
             launcher_present,
             keep_old,
             manifest_sha256: &sha,
+            ast: &*ctx.runners.ast,
         })?);
     }
     Ok(plans)
@@ -665,6 +666,7 @@ pub fn plan_manifest(
         launcher_present: layout.launcher().exists(),
         keep_old,
         manifest_sha256: &sha,
+        ast: &*ctx.runners.ast,
     })?)
 }
 
@@ -961,7 +963,7 @@ pub fn plan_uninstall(ctx: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Uninst
         let layout = layout(ctx);
         let vdir = layout.version_dir(&plan.app, &plan.version);
         let roots = CallRoots::new(layout.root(), Some(&vdir));
-        planner::check_uninstall_scripts(&m, &roots)?;
+        planner::check_uninstall_scripts(&m, &roots, &*ctx.runners.ast)?;
     }
     Ok(plan)
 }

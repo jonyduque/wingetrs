@@ -460,3 +460,17 @@ fn gated_scans_called_files_with_ast() {
     assert_eq!(called.len(), 1);
     assert_eq!(called[0].report.verdict, Verdict::Refuse);
 }
+
+#[test]
+fn unavailable_is_the_safe_default() {
+    assert_eq!(
+        script_ast::Unavailable.facts("x"),
+        Err(AstError::NoPowerShell)
+    );
+    assert_eq!(
+        wingetrs::install::executor::Runners::disabled()
+            .ast
+            .facts("x"),
+        Err(AstError::NoPowerShell)
+    );
+}

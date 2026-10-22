@@ -57,6 +57,7 @@ fn check(app: &str, bucket: &str, raw: &str, layout: &Layout) -> Result<(), Stri
         launcher_present: false,
         keep_old: false,
         manifest_sha256: "",
+        ast: &wingetrs::install::script_ast::LexerOnly,
     })
     .map(|_| ())
     .map_err(|e| format!("plan: {e}"))

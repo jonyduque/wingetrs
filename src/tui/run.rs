@@ -211,6 +211,7 @@ pub fn run(glyphs: GlyphSet, glyphs_forced: bool) -> anyhow::Result<()> {
     let theme = Theme::new(dark, depth);
     let mut app = App::new(Vec::new(), glyphs);
     app.elevated = crate::winget_install::launch_win::is_elevated;
+    app.ast = crate::install::prod_win::production_ast();
     app.dark = dark;
     app.settings = SettingsState::new(cfg.behavior, glyphs, dark, glyphs_forced);
     app.settings.icons.clone_from(&cfg.icons);

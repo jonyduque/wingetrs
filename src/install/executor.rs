@@ -27,6 +27,7 @@ use crate::install::progress::{Phase, ProgressEvent};
 use crate::install::runner::{
     RunnerInput, ScriptBody, ScriptContext, ScriptOp, VarValue, runner_ps1, script_vars,
 };
+use crate::install::script_ast::{self, AstGate};
 use crate::install::script_effects::{self, ScriptEffect};
 use crate::install::state::{AppRecord, Artifact, ArtifactKind, StateDb};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
@@ -116,6 +117,9 @@ pub struct Runners {
     /// Runs manifest hooks (third-party code). `None` = the user gave no consent: a plan with
     /// a `Step::Hook` fails before any step.
     pub scripts: Option<Arc<dyn ScriptHost>>,
+    /// PowerShell's parser for the script gate (Task 227); not masked by the consent: the plan
+    /// and the confirmation need it before any script runs.
+    pub ast: Arc<dyn AstGate>,
 }
 
 impl std::fmt::Debug for Runners {
@@ -124,6 +128,7 @@ impl std::fmt::Debug for Runners {
             .field("innounp", &self.innounp)
             .field("installer", &self.installer)
             .field("scripts", &self.scripts.as_ref().map(|_| "ScriptHost"))
+            .field("ast", &"AstGate")
             .finish()
     }
 }
@@ -133,12 +138,14 @@ fn refuse_innounp(_: &Path, _: &[String], _: &Path) -> io::Result<(i32, Vec<Stri
 }
 
 impl Runners {
-    /// Runs nothing (non-Windows, tests, `WINGETRS_TEST_ENV_KEY`).
+    /// Runs nothing (non-Windows, tests, `WINGETRS_TEST_ENV_KEY`); no parser, so every script
+    /// is refused.
     pub fn disabled() -> Runners {
         Runners {
             innounp: refuse_innounp,
             installer: None,
             scripts: None,
+            ast: Arc::new(script_ast::Unavailable),
         }
     }
 }
@@ -1098,7 +1105,11 @@ const MAX_PS1_BYTES: u64 = 1024 * 1024;
 /// UTF-16; none: strict UTF-8, because PowerShell 5.1 reads a BOM-less file as ANSI) and runs
 /// `script_scan` over the text. A refused verdict, an oversized or undecodable file stops the
 /// step. Returns the exact text that was analysed.
-fn scan_ps1_file(program: &Path, roots: &script_scan::CallRoots) -> Result<String, String> {
+fn scan_ps1_file(
+    program: &Path,
+    roots: &script_scan::CallRoots,
+    ast: &dyn AstGate,
+) -> Result<String, String> {
     use std::io::Read;
     let name = program
         .file_name()
@@ -1120,7 +1131,7 @@ fn scan_ps1_file(program: &Path, roots: &script_scan::CallRoots) -> Result<Strin
         script_root: program.parent().map(Path::to_path_buf),
         ..roots.clone()
     };
-    let (report, _) = script_scan::scan_called(&text, PRELUDE_FUNCTIONS, &roots);
+    let (report, _) = script_scan::scan_gated(&text, PRELUDE_FUNCTIONS, &roots, ast);
     if report.verdict == script_scan::Verdict::Refuse {
         let reasons: Vec<String> = report
             .flags
@@ -1141,8 +1152,9 @@ fn refuse_called(
     kind: HookKind,
     script: &str,
     roots: &script_scan::CallRoots,
+    ast: &dyn AstGate,
 ) -> Result<(), String> {
-    let (report, _) = script_scan::scan_called(script, PRELUDE_FUNCTIONS, roots);
+    let (report, _) = script_scan::scan_gated(script, PRELUDE_FUNCTIONS, roots, ast);
     if report.verdict != script_scan::Verdict::Refuse {
         return Ok(());
     }
@@ -1277,6 +1289,7 @@ struct PreparedHook {
 /// Writes the hook, the prelude, the manifest, the environment seed and the runner into a fresh
 /// folder under `<root>\tmp` (which must exist). A `.ps1` file is third-party code the manifest
 /// does not contain: located inside `scope.version_dir` and scanned before anything is written.
+#[allow(clippy::too_many_arguments)]
 fn prepare_hook(
     layout: &Layout,
     env: &dyn EnvStore,
@@ -1285,18 +1298,19 @@ fn prepare_hook(
     kind: HookKind,
     body: &HookBody<'_>,
     scope: &HookScope,
+    ast: &dyn AstGate,
 ) -> Result<PreparedHook, String> {
     // `$dir` is extracted now: the files a script runs from it (or from a bucket's guarded
     // `scripts/`) are scanned again before it runs (Task 192).
     let roots = script_scan::CallRoots::new(layout.root(), Some(&scope.version_dir));
     let (script, ps1_program, copy_guard) = match body {
         HookBody::Script(s) => {
-            refuse_called(kind, s, &roots)?;
+            refuse_called(kind, s, &roots, ast)?;
             ((*s).to_string(), None, None)
         }
         HookBody::Ps1 { file, .. } => {
             let program = installer_program(&scope.version_dir, file)?;
-            let text = scan_ps1_file(&program, &roots)?;
+            let text = scan_ps1_file(&program, &roots, ast)?;
             // Only the analysed copy runs; the original is never executed.
             let (copy, guard) = write_ps1_copy(&program, &text)?;
             (text, Some(copy), Some(guard))
@@ -1442,6 +1456,7 @@ async fn run_hook(
         kind,
         &body,
         scope,
+        &*ctx.runners.ast,
     )?;
     let hook = kind.key();
     tracing::info!("rodando o script {hook} de {app}");
@@ -3508,7 +3523,7 @@ pub fn execute_uninstall(
     if let Some(inst) = &installed {
         // The scanner and the consent come before the first step: nothing runs, nothing goes.
         let roots = script_scan::CallRoots::new(layout.root(), Some(&inst.scope.version_dir));
-        planner::check_uninstall_scripts(&inst.manifest, &roots)
+        planner::check_uninstall_scripts(&inst.manifest, &roots, &*ctx.runners.ast)
             .map_err(|e| fail(0, "analisar scripts".into(), e.to_string()))?;
         if planner::has_uninstall_scripts(&inst.manifest) && ctx.runners.scripts.is_none() {
             return Err(ExecError::NeedsScriptConsent {
@@ -3765,6 +3780,7 @@ fn run_removal_hook(
         kind,
         &body,
         &scope,
+        &*ctx.runners.ast,
     )?;
     let hook = kind.key();
     tracing::info!("rodando o script {hook} de {app}");
