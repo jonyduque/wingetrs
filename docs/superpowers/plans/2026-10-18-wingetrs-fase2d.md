@@ -1332,6 +1332,8 @@ Mutação obrigatória: `mode_for` ignorar o ajuste ⇒ teste PEGA.
 
 **Modelo:** opus (revisor opus), com sonda antes. Pedido de implementação em 2026-10-19 (depois da 204). **Se a sonda pedir crate nova ou feature nova do crate `windows`, pare e devolva o relatório da sonda antes do código (decisão do usuário).** Decisão do usuário em 2026-10-19 ("Mitigar agora, B depois"): a revisão da Task 196 achou que o instalador elevado por `runas` roda de uma pasta que o usuário grava (`%LOCALAPPDATA%\wingetrs\installers`), então uma DLL plantada ao lado (ou no TEMP onde Inno/Burn extraem) carrega como administrador. A Task 196 mitigou (pasta de trabalho System32, caminho final pelo handle, cadeia sem junção, pasta nova e vazia por execução): risco igual ao do winget. Esta tarefa fecha o risco e devolve um UAC por sessão.
 
+> **Decisão do usuário (2026-10-21) sobre a sonda (`docs/superpowers/reports/2026-10-19-sonda-202.md`): opção A.** Ligar a feature `Win32_Security_WinTrust` do `windows` 0.62.2 (nenhuma crate nova; o `Cargo.lock` não muda de pacote) e verificar o `source2.msix` com `WinVerifyTrust` (`WINTRUST_ACTION_GENERIC_VERIFY_V2`), depois fixar a identidade: signatário `CN=Microsoft Corporation` pela política `MICROSOFT_ROOT` e `Identity Name="Microsoft.Winget.Source"`. Rede do lado elevado só por `Http::for_elevated` (regra do CLAUDE.md, verificada pelo `check_rules`).
+
 #### What binds this task
 
 1. Sonda (relatório antes do código): como verificar a assinatura Authenticode do `source2.msix` no lado elevado (`WinVerifyTrust` com a política da Microsoft), onde fica o índice dentro dele, como achar o hash do manifesto pelo id/versão, e o tamanho/tempo de baixar e abrir o msix elevado.

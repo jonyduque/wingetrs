@@ -564,23 +564,34 @@ Testes (`tests/it/admin_terminal.rs`, novo; `mod` no `main.rs`):
 2. Toda action fixada por **SHA de commit** (com a versão em comentário), não por tag: `actions/checkout`, a de toolchain Rust e a de cache (`Swatinem/rust-cache` ou `actions/cache` com chave do `Cargo.lock`). Nada de `pull_request_target`; nenhum `secrets.*`; `persist-credentials: false` no checkout.
 3. Passos: toolchain (com `rustfmt` e `clippy`) → `cargo fetch --locked` → `pwsh -File scripts/verify.ps1`. Se o gate falhar, o job imprime as linhas `[FAIL]` e o fim de `target/verify.log` (≤ 200 linhas) e sobe o log como artifact (retenção 7 dias).
 4. **Testes que exigem processo não elevado:** cada um checa `launch_win::is_elevated()` e, **só quando `CI=true` e o processo está elevado**, termina cedo com `eprintln!("pulado: processo elevado na CI ({motivo})")`. Fora da CI, elevado continua falhando como hoje (o aviso de reabrir o Claude sem elevação continua valendo). Um helper único (`tests/it/support` ou equivalente já existente) em vez de cópia em cada teste. O `check_rules.ps1` ganha uma regra: o helper só pode ser chamado nos testes da lista fechada (os 10 de hoje), para a CI não virar desculpa para pular teste novo.
-5. O job registra no resumo (`$GITHUB_STEP_SUMMARY`) quantos testes foram pulados por elevação (contando as linhas `pulado: processo elevado na CI`).
-6. Badge de CI no README, ao lado dos atuais.
-7. Fora do escopo: workflow de release (build, `.sha256`, anexar `NOTICE`/`THIRD_PARTY_LICENSES.txt`), assinatura do executável, matriz de plataformas.
+5. **Decisão do usuário (2026-10-21): os 10 testes também rodam de verdade, como usuário comum.** A lista fechada mora num arquivo só, `tests/it/non_elevated.txt` (um nome de teste completo por linha, como o libtest imprime, ex.: `script_host_win::refuses_elevated`), lido pela regra do `check_rules.ps1` e pelo script novo `scripts/ci_non_elevated.ps1`. Esse script, chamado por um passo da CI depois do gate:
+   - acha o executável de teste `it` (`cargo test --test it --no-run --locked --message-format=json`, campo `executable`; sem recompilar);
+   - cria um usuário local padrão (não membro de Administradores) com nome `wingetrs-ci-<aleatório>` e senha aleatória de 32 caracteres gerada no próprio passo (`RandomNumberGenerator`), nunca impressa nem gravada em disco, mascarada com `::add-mask::`;
+   - dá a esse usuário leitura e execução no checkout e em `target` (`icacls ... /grant <user>:(OI)(CI)RX`) e uma pasta de trabalho própria gravável (`TEMP`/`TMP` dele);
+   - roda o executável como esse usuário (`Start-Process -Credential -Wait -PassThru`, `-RedirectStandardOutput`/`-RedirectStandardError` para arquivos na pasta dele) com `--exact --test-threads=1` e os 10 nomes, e `CI` **sem** valor (o filho não é elevado, então o helper não pula de qualquer jeito);
+   - passa só se o código de saída for 0 **e** a saída tiver `test result: ok. 10 passed` (exatamente o tamanho da lista) e nenhuma linha `pulado:`;
+   - sempre remove o usuário e o perfil dele no fim (`finally`), mesmo em falha.
+   **Reserva (também decisão do usuário):** se a criação do usuário ou o logon secundário falhar (`New-LocalUser`/`Start-Process -Credential` lançam, serviço `seclogon` parado), o passo não reprova o job: emite `::warning::` com o motivo ("os 10 testes não elevados ficaram só pulados nesta execução") e escreve isso no resumo. Teste que **roda** e falha reprova o job.
+6. O job registra no resumo (`$GITHUB_STEP_SUMMARY`) quantos testes foram pulados por elevação no gate (contando as linhas `pulado: processo elevado na CI`) e o resultado da rodada como usuário comum (`10 passaram como usuário comum` ou o aviso da reserva).
+7. Badge de CI no README, ao lado dos atuais.
+8. Fora do escopo: workflow de release (build, `.sha256`, anexar `NOTICE`/`THIRD_PARTY_LICENSES.txt`), assinatura do executável, matriz de plataformas.
 
 Testes:
 1. `skip_helper_only_in_ci_and_elevated` (unitário do helper com as duas entradas injetadas: `ci=false, elevated=true` ⇒ não pula; `ci=true, elevated=false` ⇒ não pula; `ci=true, elevated=true` ⇒ pula).
-2. Regra nova do `check_rules.ps1` com caso no `check_rules_selftest.ps1` (chamada fora da lista ⇒ violação).
-3. Prova real: um push numa branch de teste mostra o job verde, e o log mostra os 10 "pulado" e nenhum outro. **Push só pelo orquestrador**, com pedido do usuário; o implementador termina com commits locais e o YAML validado por `actionlint` se estiver disponível (se não, diga "não validado").
+2. Regra nova do `check_rules.ps1` com caso no `check_rules_selftest.ps1` (chamada fora da lista ⇒ violação; nome na lista que não existe mais como teste ⇒ violação, para a lista não apodrecer).
+3. `scripts/ci_non_elevated.ps1 -DryRun` localmente (não cria usuário: imprime o executável achado, os 10 nomes e os comandos que rodaria, com a senha trocada por `***`) — saída colada no relatório. O implementador **nunca** roda o modo real localmente (cria usuário na máquina do usuário).
+4. Prova real: um push numa branch de teste mostra o job verde, o log com os 10 "pulado" no gate e nenhum outro, e o passo do usuário comum com `10 passed`. **Push só pelo orquestrador**, com pedido do usuário; o implementador termina com commits locais e o YAML validado por `actionlint` se estiver disponível (se não, diga "não validado").
 
-**Files:** `.github/workflows/ci.yml` (novo), helper de teste (novo ou existente em `tests/it/`), os testes da lista (só a chamada do helper), `scripts/check_rules.ps1`, `scripts/check_rules_selftest.ps1`, `README.md` (badge).
+**Files:** `.github/workflows/ci.yml` (novo), `scripts/ci_non_elevated.ps1` (novo), `tests/it/non_elevated.txt` (novo), helper de teste (novo ou existente em `tests/it/`), os testes da lista (só a chamada do helper), `scripts/check_rules.ps1`, `scripts/check_rules_selftest.ps1`, `README.md` (badge).
 
 #### Checks beyond the steps
 
 1. Mutação: helper pula sem checar `CI` ⇒ teste 1 **PEGA**.
 2. Mutação: chamada do helper num teste fora da lista ⇒ regra do `check_rules` **PEGA**.
 3. `grep -n "uses:" .github/workflows/ci.yml` colado no relatório: toda linha com `@<40 hex>`.
-4. Gate local: `pwsh -File scripts/verify.ps1` (num terminal não elevado).
+4. Mutação: o script aceita `test result: ok` sem conferir `10 passed` ⇒ caso do `-DryRun` com saída falsa de 9 testes (função pura `Test-RunOutput` testada pelo próprio script com `-SelfTest`) **PEGA**.
+5. `grep -n "password\|Password" scripts/ci_non_elevated.ps1`: nenhuma linha imprime ou grava a senha.
+6. Gate local: `pwsh -File scripts/verify.ps1` (num terminal não elevado).
 
 **Commit:** `ci: GitHub Actions running the verify gate on Windows`
 
@@ -589,6 +600,8 @@ Testes:
 **Modelo:** opus (revisor opus).
 
 **Depois de:** 212 (`src/cli/style.rs`) e 215 (`src/cli/output.rs`, `src/install/progress.rs`). Nenhum arquivo em comum com tarefa rodando em paralelo.
+
+> **Decisões do usuário (2026-10-21):** spinner e barra na cor `accent` do tema (como o item 4 abaixo já fixa); barra de progresso na extração fica fora desta tarefa (BACKLOG, item I).
 
 #### Where this fits
 
