@@ -72,6 +72,8 @@ mod prelude_effects;
 mod prelude_extract;
 mod scoop;
 mod scoop_winget_match;
+mod script_ast;
+mod script_ast_proc;
 mod script_host_live;
 mod script_host_win;
 mod script_runner;

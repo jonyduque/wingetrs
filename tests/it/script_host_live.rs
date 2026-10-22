@@ -302,3 +302,116 @@ async fn constant_global_blocks_reassignment() {
     assert!(!marker, "the if ($global) block ran: {result:?}");
     assert!(files_named(t.path(), "RAN").is_empty());
 }
+
+// ---- Task 227: PowerShell's parser on synthetic scripts (analysed, never run) ----
+
+/// The forms the lexer reads wrong or not at all (ARMADILHAS), one per line.
+const HOLES: &str = "Start-Process notepad \u{2013}Verb RunAs
+i`ex 'x'
+Start-Job { Remove-Item C:\\Windows\\x }
+&(\"i\" + \"ex\") 'y'
+.\\setup.ps1 /S
+cmd /c \"del x\"
+sal z iex
+if ($global) { Set-ItemProperty HKLM:\\x -Name a -Value 1 }
+[IO.File]::WriteAllText(\"$env:ProgramFiles\\x\", 'y')
+& $dir\\helper.ps1
+$a = 'abc\u{2019}; Write-Output HIDDEN; \u{2018}x'
+ForEach-Object -Parallel { reg add HKCU\\x } -InputObject 1
+";
+
+fn real_parser() -> wingetrs::install::script_ast_win::PwshAst {
+    wingetrs::install::script_ast_win::PwshAst::for_program(PwshHost::locate().program().into())
+}
+
+#[test]
+#[ignore = "live: real PowerShell parser"]
+fn real_parser_sees_the_holes() {
+    use wingetrs::install::prelude::PRELUDE_FUNCTIONS;
+    use wingetrs::install::script_ast::{self, AstGate};
+    use wingetrs::install::script_scan::{self, CallRoots, FlagKind};
+    let ast = real_parser();
+    let facts = ast.facts(HOLES).unwrap();
+    let pwsh7 = ast
+        .program()
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("pwsh.exe"));
+    // `` `e `` is ESC in pwsh 7: `i`ex` is another name there; 5.1 reads `iex`.
+    let iex_on_2 = facts
+        .commands
+        .iter()
+        .any(|c| c.line == 2 && c.name.as_deref() == Some("iex"));
+    assert_eq!(iex_on_2, !pwsh7, "{:?}", facts.commands);
+    // Line 8 is dead code: no flag of the parser there.
+    let own = script_ast::ast_flags(&facts, PRELUDE_FUNCTIONS);
+    assert!(!own.iter().any(|f| f.line == 8), "{own:?}");
+    let (report, _) =
+        script_scan::scan_gated(HOLES, PRELUDE_FUNCTIONS, &CallRoots::default(), &ast);
+    for (line, kind) in [
+        (1, FlagKind::Elevation),
+        (3, FlagKind::SystemWrite),
+        (4, FlagKind::CalledFile),
+        (6, FlagKind::CalledFile),
+        (7, FlagKind::Alias),
+        (9, FlagKind::SystemWrite),
+        (12, FlagKind::RegistryUser),
+    ] {
+        assert!(
+            report
+                .flags
+                .iter()
+                .any(|f| f.line == line && f.kind == kind),
+            "line {line} {kind:?}: {:?}",
+            report.flags
+        );
+    }
+}
+
+#[test]
+#[ignore = "live: real PowerShell parser"]
+fn real_parser_runs_nothing() {
+    use wingetrs::install::prelude::PRELUDE_FUNCTIONS;
+    use wingetrs::install::script_ast::{self, AstGate};
+    use wingetrs::install::script_scan::{FlagKind, Verdict};
+    let t = tempfile::tempdir().unwrap();
+    let tmp = t.path().display().to_string();
+    std::fs::write(
+        t.path().join("mark.psm1"),
+        format!("Set-Content '{tmp}\\marker.txt' x\r\n"),
+    )
+    .unwrap();
+    let script = format!(
+        "using module '{tmp}\\mark.psm1'\nclass A {{ }}\nSet-Content '{tmp}\\marker2.txt' y"
+    );
+    let facts = real_parser().facts(&script).unwrap();
+    assert!(t.path().join("mark.psm1").is_file());
+    assert!(!t.path().join("marker.txt").exists());
+    assert!(!t.path().join("marker2.txt").exists());
+    let flags = script_ast::ast_flags(&facts, PRELUDE_FUNCTIONS);
+    assert!(
+        flags
+            .iter()
+            .any(|f| f.kind == FlagKind::DynamicCode && f.verdict == Verdict::Refuse),
+        "{flags:?}"
+    );
+}
+
+#[test]
+#[ignore = "live: real PowerShell parser"]
+fn real_parser_batch_reuses_process() {
+    use std::time::Instant;
+    use wingetrs::install::script_ast::AstGate;
+    let ast = real_parser();
+    let start = Instant::now();
+    ast.facts("Write-Output 0").unwrap();
+    let first = start.elapsed();
+    for i in 1..20 {
+        ast.facts(&format!("Write-Output {i}")).unwrap();
+    }
+    let total = start.elapsed();
+    println!(
+        "primeira {first:?}, total {total:?}, demais {:?}",
+        total - first
+    );
+    assert!(total - first < first * 19, "{first:?} {total:?}");
+}

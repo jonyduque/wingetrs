@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use super::classify_2c::{commands_in, normalize_quotes};
 use super::manifest::{HookKind, InstallerSpec, Resolved};
 use super::prelude::PRELUDE_FUNCTIONS;
+use super::script_ast::{self, AstGate};
 
 /// Functions defined in Scoop's `lib/*.ps1` (`function <name>`, `global:` prefix dropped),
 /// read from ~/scoop/apps/scoop/current/lib at ScoopInstaller/Scoop commit
@@ -324,6 +325,11 @@ pub enum FlagKind {
     CalledFile,
     /// `Set-Alias`, `New-Alias`, the `alias:` drive.
     Alias,
+    /// PowerShell's parser reports a parse error (Task 227).
+    SyntaxError,
+    /// PowerShell's parser could not analyse the script (Task 227): no parser, elevated,
+    /// group policy, deadline, broken answer.
+    ParserFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,7 +353,7 @@ pub struct ScriptReport {
     pub verdict: Verdict,
 }
 
-const WRITE_CMDLETS: &[&str] = &[
+pub(crate) const WRITE_CMDLETS: &[&str] = &[
     "new-item",
     "copy-item",
     "move-item",
@@ -383,7 +389,7 @@ const WRITE_CMDLETS: &[&str] = &[
 ];
 /// .NET writers, matched as text (`[IO.File]::WriteAllText`, `[System.IO.File]::WriteAllBytes`).
 const WRITE_TEXT: &[&str] = &["io.file]::write"];
-const SYSTEM_DIRS: &[&str] = &[
+pub(crate) const SYSTEM_DIRS: &[&str] = &[
     "env:programfiles",
     "env:programw6432",
     "env:commonprogramfiles",
@@ -399,7 +405,7 @@ const REG_CMDLETS: &[&str] = &[
     "new-item",
     "remove-item",
 ];
-const DOWNLOAD_WORDS: &[&str] = &[
+pub(crate) const DOWNLOAD_WORDS: &[&str] = &[
     "invoke-webrequest",
     "iwr",
     "invoke-restmethod",
@@ -411,7 +417,7 @@ const DOWNLOAD_WORDS: &[&str] = &[
     "wget.exe",
 ];
 const DOWNLOAD_TEXT: &[&str] = &["net.webclient", "downloadfile", "downloadstring"];
-const TASK_WORDS: &[&str] = &[
+pub(crate) const TASK_WORDS: &[&str] = &[
     "register-scheduledtask",
     "schtasks",
     "schtasks.exe",
@@ -428,31 +434,33 @@ const USER_DIRS: &[&str] = &[
     "environment]::getfolderpath",
 ];
 
-const D_ELEVATION: &str = "pede elevação (RunAs/sudo)";
-const D_HKLM: &str = "mexe no registro da máquina (HKLM)";
-const D_GLOBAL: &str = "usa -Global (instalação para todos os usuários)";
-const D_SYSTEM: &str = "grava em Program Files/Windows";
-const D_SCOOP: &str = "chama o comando scoop (instalaria no ~/scoop); não suportado";
-const D_MSIEXEC: &str = "chama o msiexec; o wingetrs só usa msiexec /a pela fila própria";
-const D_DYNAMIC: &str = "executa código montado na hora (iex, scriptblock, & $var)";
-const D_DOWNLOAD: &str = "baixa arquivos da internet por conta própria";
-const D_REG_USER: &str = "mexe no registro do usuário (HKCU ou reg)";
-const D_TASK: &str = "cria ou mexe em tarefa agendada ou serviço do Windows";
-const D_ABSOLUTE: &str = "caminho absoluto fora da pasta do app";
-const D_PRELUDE_INTERNAL: &str = "mexe nos internos do prelúdio do wingetrs (__wr)";
-const D_ENV_PERSISTENT: &str =
+pub(crate) const D_ELEVATION: &str = "pede elevação (RunAs/sudo)";
+pub(crate) const D_HKLM: &str = "mexe no registro da máquina (HKLM)";
+pub(crate) const D_GLOBAL: &str = "usa -Global (instalação para todos os usuários)";
+pub(crate) const D_SYSTEM: &str = "grava em Program Files/Windows";
+pub(crate) const D_SCOOP: &str = "chama o comando scoop (instalaria no ~/scoop); não suportado";
+pub(crate) const D_MSIEXEC: &str =
+    "chama o msiexec; o wingetrs só usa msiexec /a pela fila própria";
+pub(crate) const D_DYNAMIC: &str = "executa código montado na hora (iex, scriptblock, & $var)";
+pub(crate) const D_DOWNLOAD: &str = "baixa arquivos da internet por conta própria";
+pub(crate) const D_REG_USER: &str = "mexe no registro do usuário (HKCU ou reg)";
+pub(crate) const D_TASK: &str = "cria ou mexe em tarefa agendada ou serviço do Windows";
+pub(crate) const D_ABSOLUTE: &str = "caminho absoluto fora da pasta do app";
+pub(crate) const D_PRELUDE_INTERNAL: &str = "mexe nos internos do prelúdio do wingetrs (__wr)";
+pub(crate) const D_ENV_PERSISTENT: &str =
     "grava variável de ambiente do usuário ou da máquina por [Environment]::SetEnvironmentVariable";
-const D_ENV_PROCESS: &str = "muda variável de ambiente por [Environment]::SetEnvironmentVariable";
-const D_HIDDEN: &str = "possível código escondido em comentário ou here-string";
-const D_GLOBAL_NAME: &str =
+pub(crate) const D_ENV_PROCESS: &str =
+    "muda variável de ambiente por [Environment]::SetEnvironmentVariable";
+pub(crate) const D_HIDDEN: &str = "possível código escondido em comentário ou here-string";
+pub(crate) const D_GLOBAL_NAME: &str =
     "usa `$global` como nome próprio (incompatível com o `$global` fixo do wingetrs)";
 
 /// Detail of a flag found only inside an `if ($global) { ... }` body.
-const D_CALLED: &str = "roda um arquivo que não é mostrado";
-const D_ALIAS: &str = "redefine comando por apelido";
-const D_PROGRAM: &str = "roda um programa do pacote";
-const D_COMPUTED: &str = "roda um arquivo ou comando calculado na hora";
-const D_LAUNCHED: &str = "roda um arquivo que não é mostrado por outro programa";
+pub(crate) const D_CALLED: &str = "roda um arquivo que não é mostrado";
+pub(crate) const D_ALIAS: &str = "redefine comando por apelido";
+pub(crate) const D_PROGRAM: &str = "roda um programa do pacote";
+pub(crate) const D_COMPUTED: &str = "roda um arquivo ou comando calculado na hora";
+pub(crate) const D_LAUNCHED: &str = "roda um arquivo que não é mostrado por outro programa";
 
 fn global_only(detail: &str) -> String {
     format!("só roda em instalação global; não roda no wingetrs ({detail})")
@@ -946,16 +954,70 @@ pub fn scan_called(
     roots: &CallRoots,
 ) -> (ScriptReport, Vec<CalledScript>) {
     let mut stack = Vec::new();
-    scan_called_at(script, supported, roots, &mut stack)
+    scan_called_at(script, supported, roots, None, &mut stack)
+}
+
+/// [`scan_called`], with the flags of PowerShell's parser ([`script_ast::ast_flags`]) added to
+/// the lexer's for the script and for each file it runs (Task 227). The parser only adds: the
+/// verdict is the worst of both, and a script the parser cannot analyse is refused
+/// (`FlagKind::ParserFailed`). The one entry point of production code.
+pub fn scan_gated(
+    script: &str,
+    supported: &[&str],
+    roots: &CallRoots,
+    ast: &dyn AstGate,
+) -> (ScriptReport, Vec<CalledScript>) {
+    let mut stack = Vec::new();
+    scan_called_at(script, supported, roots, Some(ast), &mut stack)
+}
+
+/// Adds the parser's flags for `script` to `report` (same kind and line: the worst verdict
+/// stays) and recomputes the verdict.
+fn add_ast_flags(report: &mut ScriptReport, script: &str, supported: &[&str], ast: &dyn AstGate) {
+    let extra = match ast.facts(script) {
+        Ok(facts) => script_ast::ast_flags(&facts, supported),
+        Err(e) => {
+            tracing::warn!(error = ?e, "PowerShell parser gave no facts; script refused");
+            vec![Flag {
+                kind: FlagKind::ParserFailed,
+                verdict: Verdict::Refuse,
+                detail: e.to_string(),
+                line: 1,
+            }]
+        }
+    };
+    for f in extra {
+        match report
+            .flags
+            .iter_mut()
+            .find(|k| k.kind == f.kind && k.line == f.line)
+        {
+            Some(k) if k.verdict >= f.verdict => {}
+            Some(k) => *k = f,
+            None => report.flags.push(f),
+        }
+    }
+    report.flags.sort_by_key(|f| f.line);
+    dedupe_reasons(&mut report.flags);
+    report.verdict = report
+        .flags
+        .iter()
+        .map(|f| f.verdict)
+        .max()
+        .unwrap_or(Verdict::Confirm);
 }
 
 fn scan_called_at(
     script: &str,
     supported: &[&str],
     roots: &CallRoots,
+    ast: Option<&dyn AstGate>,
     stack: &mut Vec<PathBuf>,
 ) -> (ScriptReport, Vec<CalledScript>) {
     let (mut report, calls) = scan_inner(script, supported);
+    if let Some(ast) = ast {
+        add_ast_flags(&mut report, script, supported, ast);
+    }
     let mut called: Vec<CalledScript> = Vec::new();
     if stack.len() >= MAX_CALL_DEPTH {
         return (report, called);
@@ -976,7 +1038,7 @@ fn scan_called_at(
             ..roots.clone()
         };
         stack.push(path.clone());
-        let (sub, nested) = scan_called_at(&text, supported, &sub_roots, stack);
+        let (sub, nested) = scan_called_at(&text, supported, &sub_roots, ast, stack);
         stack.pop();
         let unshown = format!("{D_CALLED}: {target}");
         for f in report.flags.iter_mut() {

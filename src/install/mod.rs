@@ -24,6 +24,7 @@ pub mod progress;
 pub mod residue;
 pub mod runner;
 pub mod safepath;
+pub mod script_ast;
 pub mod script_effects;
 pub mod script_policy;
 pub mod script_scan;
@@ -48,6 +49,8 @@ pub mod msiexec_win;
 pub mod prod_win;
 #[cfg(windows)]
 pub mod registry_win;
+#[cfg(windows)]
+pub mod script_ast_win;
 #[cfg(windows)]
 pub mod script_host_win;
 #[cfg(windows)]

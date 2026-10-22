@@ -159,7 +159,7 @@ pub fn child_path(program: &Path) -> io::Result<OsString> {
 }
 
 /// A known folder's path.
-fn known(id: &GUID) -> io::Result<PathBuf> {
+pub(crate) fn known(id: &GUID) -> io::Result<PathBuf> {
     // SAFETY: the returned string is freed below with CoTaskMemFree.
     let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -174,7 +174,7 @@ fn known(id: &GUID) -> io::Result<PathBuf> {
 /// The group policy that applies to `program` (read only): pwsh 7 reads `PowerShellCore`,
 /// unless that scope says `UseWindowsPowerShellPolicySetting = 1`; Windows PowerShell reads
 /// `Windows\PowerShell`.
-fn read_gpo(program: &Path) -> GpoValues {
+pub(crate) fn read_gpo(program: &Path) -> GpoValues {
     let core = program
         .file_name()
         .is_some_and(|n| n.eq_ignore_ascii_case("pwsh.exe"));
