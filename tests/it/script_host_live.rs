@@ -349,8 +349,19 @@ fn real_parser_sees_the_holes() {
     // Line 8 is dead code: no flag of the parser there.
     let own = script_ast::ast_flags(&facts, PRELUDE_FUNCTIONS);
     assert!(!own.iter().any(|f| f.line == 8), "{own:?}");
+    // Line 1 (`RunAs`) makes the lexer refuse, so `scan_gated` never asks the parser: the
+    // holes are checked in the lexer's report and the parser's own flags together.
     let (report, _) =
         script_scan::scan_gated(HOLES, PRELUDE_FUNCTIONS, &CallRoots::default(), &ast);
+    assert_eq!(report.verdict, script_scan::Verdict::Refuse);
+    let flags: Vec<_> = report.flags.iter().chain(&own).collect();
+    // Only the parser sees these: `cmd /c` (6) and the block run by `Start-Job` (3).
+    for (line, kind) in [(3, FlagKind::SystemWrite), (6, FlagKind::CalledFile)] {
+        assert!(
+            own.iter().any(|f| f.line == line && f.kind == kind),
+            "line {line} {kind:?}: {own:?}"
+        );
+    }
     for (line, kind) in [
         (1, FlagKind::Elevation),
         (3, FlagKind::SystemWrite),
@@ -361,12 +372,8 @@ fn real_parser_sees_the_holes() {
         (12, FlagKind::RegistryUser),
     ] {
         assert!(
-            report
-                .flags
-                .iter()
-                .any(|f| f.line == line && f.kind == kind),
-            "line {line} {kind:?}: {:?}",
-            report.flags
+            flags.iter().any(|f| f.line == line && f.kind == kind),
+            "line {line} {kind:?}: {flags:?}"
         );
     }
 }
