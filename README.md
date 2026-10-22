@@ -44,7 +44,7 @@ Num terminal normal, o script pergunta para quem instalar. "Para todos os usuár
 
 Abra um terminal novo depois de instalar.
 
-- **Atualizar:** rode o mesmo comando de novo.
+- **Atualizar:** `wingetrs self update` (a partir da 0.3.0), ou rode o mesmo comando de novo. A TUI avisa quando há versão nova e `Ctrl+U` atualiza.
 - **Versão específica:** `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/jonyduque/wingetrs/main/install.ps1))) -Version v0.2.1`
 - **Remover:** o mesmo comando com `-Uninstall`. Os dados em `%LOCALAPPDATA%\wingetrs` (catálogo e apps instalados pelo wingetrs) ficam; para tirar os apps, use `wingetrs uninstall` antes.
 
@@ -70,7 +70,7 @@ wingetrs upgrade --all         atualiza tudo que o wingetrs instalou
 wingetrs bucket add extras     adiciona um bucket do Scoop
 ```
 
-Outros comandos: `uninstall`, `repair` (reconstrói o estado a partir do disco) e `cleanup` (limpa registros de apps cujo desinstalador sumiu).
+Outros comandos: `uninstall`, `self update` (atualiza o próprio wingetrs), `repair` (reconstrói o estado a partir do disco) e `cleanup` (limpa registros de apps cujo desinstalador sumiu).
 
 `wingetrs <comando> --help` mostra as opções e exemplos de cada comando.
 
