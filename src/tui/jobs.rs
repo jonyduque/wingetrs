@@ -520,6 +520,77 @@ pub fn self_update_done(
     }
 }
 
+fn bucket_fail(e: crate::buckets::BucketError) -> InstallFail {
+    match e {
+        crate::buckets::BucketError::Busy => InstallFail::Busy,
+        e => InstallFail::Other(e.to_string()),
+    }
+}
+
+/// `wingetrs bucket add` for the TUI queue: reads `config.toml` again (the dialog's copy may be
+/// old), applies the same rule (`buckets::add`, a bucket wingetrs does not know only with
+/// `confirmed`) and downloads it under the update lock, which saves the config. A held lock is
+/// `InstallFail::Busy` (the queue tries again). `url` overrides the tarball URL (tests).
+pub async fn bucket_add(
+    data: &crate::cache::DataDir,
+    http: &crate::http::Http,
+    name: &str,
+    spec: &str,
+    confirmed: bool,
+    url: Option<&str>,
+    progress: crate::install::download::Progress<'_>,
+) -> Result<Done, InstallFail> {
+    let mut cfg = crate::config::Config::load(&data.config_path())
+        .map_err(|e| InstallFail::Other(e.to_string()))?;
+    crate::buckets::add(&mut cfg, name, spec, confirmed).map_err(bucket_fail)?;
+    let apps = crate::buckets::add_downloaded_progress(data, http, &cfg, name, url, progress)
+        .await
+        .map_err(bucket_fail)?;
+    Ok(Done {
+        summary: format!("Bucket adicionado: {name} ({apps} apps no catálogo)"),
+        residues: None,
+    })
+}
+
+/// `wingetrs bucket rm` for the TUI queue: refused while apps from the bucket are installed;
+/// `confirmed` is needed for `main` and `extras`.
+pub fn bucket_remove(
+    data: &crate::cache::DataDir,
+    name: &str,
+    confirmed: bool,
+) -> Result<Done, InstallFail> {
+    let mut cfg = crate::config::Config::load(&data.config_path())
+        .map_err(|e| InstallFail::Other(e.to_string()))?;
+    let state_db = data.install_layout().state_db();
+    crate::buckets::remove_and_cleanup_confirmed(data, &mut cfg, name, &state_db, confirmed)
+        .map_err(bucket_fail)?;
+    Ok(Done {
+        summary: format!("Bucket removido: {name}"),
+        residues: None,
+    })
+}
+
+/// The buckets dialog's data: `config.toml`, each bucket with its catalog numbers and the apps
+/// installed from it.
+pub fn load_buckets(
+    data: &crate::cache::DataDir,
+    now: i64,
+) -> Result<(crate::config::Config, Vec<crate::tui::app::BucketInfo>), String> {
+    let cfg = crate::config::Config::load(&data.config_path()).map_err(|e| e.to_string())?;
+    let state_db = data.install_layout().state_db();
+    let rows = crate::buckets::rows(data, &cfg).map_err(|e| e.to_string())?;
+    let infos = rows
+        .into_iter()
+        .map(|row| crate::tui::app::BucketInfo {
+            age: row.updated.map(|t| (now - t).max(0)),
+            installed: crate::buckets::installed_from_bucket(&state_db, &row.name)
+                .map_err(|e| e.to_string()),
+            row,
+        })
+        .collect();
+    Ok((cfg, infos))
+}
+
 /// The `job.start` data of an action run by the own installer; `None` for a bridge job
 /// (`run_bridge` logs it).
 fn action_info(action: &Action) -> Option<JobInfo> {
@@ -540,7 +611,10 @@ fn action_info(action: &Action) -> Option<JobInfo> {
             to: None,
             cmd: None,
         }),
-        Action::Bridge(_) | Action::SelfUpdate { .. } => None,
+        Action::Bridge(_)
+        | Action::SelfUpdate { .. }
+        | Action::BucketAdd { .. }
+        | Action::BucketRemove { .. } => None,
         Action::WingetInstall(p) => Some(winget_info("install", p, None)),
         Action::WingetUpgrade { plan, .. } => {
             Some(winget_info("upgrade", plan, plan.upgrade_from.clone()))

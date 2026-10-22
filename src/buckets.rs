@@ -4,7 +4,7 @@ use crate::sources::scoop::ScoopError;
 use std::path::Path;
 
 /// Well-known buckets (official scoop `buckets.json`, checked 2026-10-10).
-const KNOWN: [(&str, &str); 10] = [
+pub const KNOWN: [(&str, &str); 10] = [
     ("main", "ScoopInstaller/Main"),
     ("extras", "ScoopInstaller/Extras"),
     ("versions", "ScoopInstaller/Versions"),
@@ -58,7 +58,7 @@ pub fn known_repo(name: &str) -> Option<&'static str> {
     KNOWN.iter().find(|(n, _)| *n == name).map(|(_, r)| *r)
 }
 
-fn is_known_repo(repo: &str) -> bool {
+pub fn is_known_repo(repo: &str) -> bool {
     KNOWN.iter().any(|(_, r)| r.eq_ignore_ascii_case(repo))
 }
 
@@ -188,7 +188,7 @@ pub fn remove(cfg: &mut Config, name: &str, state_db: &Path) -> Result<(), Bucke
 }
 
 /// Buckets that ship with Scoop; `rm` asks before dropping them.
-fn is_default_bucket(name: &str) -> bool {
+pub fn is_default_bucket(name: &str) -> bool {
     matches!(name, "main" | "extras")
 }
 

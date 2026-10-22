@@ -214,6 +214,8 @@ pub enum Msg {
     },
     /// Newest output line of the bridge upgrade in progress.
     BridgeLine(String),
+    /// Answer of `Cmd::LoadBuckets`: the configuration read from disk and its buckets.
+    BucketsLoaded(Result<(Config, Vec<BucketInfo>), String>),
 }
 
 /// What the user is asked to confirm, or to choose from.
@@ -284,6 +286,19 @@ pub enum Action {
     SelfUpdate {
         tag: String,
     },
+    /// Adds the scoop bucket `name` from `spec` and downloads it (`wingetrs bucket add`);
+    /// `confirmed`: the user accepted a bucket wingetrs does not know.
+    BucketAdd {
+        name: String,
+        spec: String,
+        confirmed: bool,
+    },
+    /// Removes the scoop bucket `name` (`wingetrs bucket rm`); `confirmed`: the user accepted
+    /// removing a default bucket.
+    BucketRemove {
+        name: String,
+        confirmed: bool,
+    },
 }
 
 impl Action {
@@ -318,6 +333,8 @@ impl Action {
             Action::WingetUpgrade { plan, .. } => format!("Atualizando {}", plan.name),
             Action::RemoveOrphan(o) => format!("Removendo registro órfão de {}", o.name),
             Action::SelfUpdate { .. } => "Atualizando o wingetrs".to_string(),
+            Action::BucketAdd { name, .. } => format!("Adicionando bucket {name}"),
+            Action::BucketRemove { name, .. } => format!("Removendo bucket {name}"),
         }
     }
 }
@@ -484,6 +501,73 @@ pub struct ScriptSection {
     pub shas: Vec<(String, String)>,
 }
 
+/// One bucket of the buckets dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BucketInfo {
+    pub row: crate::buckets::BucketRow,
+    /// Seconds since its last download when the list was read.
+    pub age: Option<i64>,
+    /// Apps installed from it (`state.db`); `Err` when that could not be read, which refuses
+    /// the removal like the CLI.
+    pub installed: Result<Vec<String>, String>,
+}
+
+impl BucketInfo {
+    /// The repo is a well-known bucket's: adding it needs no confirmation.
+    pub fn known(&self) -> bool {
+        crate::buckets::is_known_repo(&self.row.repo)
+    }
+}
+
+/// Free-form item of the add picker.
+pub const OTHER_REPO: &str = "Outro repositório do GitHub…";
+
+/// Warning of a bucket wingetrs does not know.
+pub const THIRD_PARTY_BUCKET: &str = "bucket de terceiro: código e binários de terceiros";
+
+/// What the buckets dialog is showing.
+pub enum BucketStage {
+    List,
+    /// `a`: the well-known buckets not configured (`names`), then `OTHER_REPO`.
+    Add {
+        picker: Picker,
+        names: Vec<String>,
+    },
+    /// `owner/repo` or GitHub URL being typed.
+    Typing {
+        text: String,
+    },
+    /// A bucket wingetrs does not know: Enter adds it anyway.
+    ThirdParty {
+        name: String,
+        repo: String,
+    },
+    Remove {
+        name: String,
+    },
+    /// Second question for a default bucket (`main`, `extras`).
+    RemoveDefault {
+        name: String,
+    },
+    /// The removal is refused: apps from the bucket are installed (or `state.db` is unreadable,
+    /// then `apps` holds the reason).
+    InUse {
+        name: String,
+        apps: Vec<String>,
+    },
+}
+
+/// The buckets dialog (`b` in Settings).
+pub struct BucketsDialog {
+    /// `config.toml` as read with the list; the add rule (`buckets::add`) runs on a copy.
+    pub cfg: Config,
+    pub rows: Vec<BucketInfo>,
+    pub cursor: usize,
+    /// The list is being read.
+    pub loading: bool,
+    pub stage: BucketStage,
+}
+
 /// The dialog on top of the screen; it takes every key until it closes.
 pub enum Modal {
     Confirm {
@@ -503,7 +587,9 @@ pub enum Modal {
     },
     /// Quitting with work in progress or queued: Enter drops the queue and quits once the
     /// operation in progress ends.
-    ConfirmQuit { text: String },
+    ConfirmQuit {
+        text: String,
+    },
     Picking {
         picker: Picker,
         candidates: Vec<Candidate>,
@@ -544,7 +630,10 @@ pub enum Modal {
         candidates: Vec<String>,
     },
     /// The operation queue; `selected` is the id of the row under the cursor.
-    Queue { selected: u64 },
+    Queue {
+        selected: u64,
+    },
+    Buckets(Box<BucketsDialog>),
 }
 
 /// What an item of the single-row actions menu does.
@@ -706,6 +795,11 @@ pub enum Cmd {
         query: String,
         kind: Option<SourceKind>,
     },
+    /// Read `config.toml`, the buckets and their installed apps; answers with
+    /// `Msg::BucketsLoaded`.
+    LoadBuckets,
+    /// Read the catalog into the search index again (`Msg::CatalogLoaded`).
+    ReloadCatalog,
 }
 
 /// What kind of event a toast reports; decides its color, glyph and lifetime.
@@ -837,7 +931,7 @@ pub struct App {
     pub settings: SettingsState,
     /// Dark palette in use (the loop rebuilds the theme when it changes).
     pub dark: bool,
-    /// Bucket names for the read-only sources section.
+    /// Bucket names for the sources section of Settings (`b` manages them).
     pub buckets_summary: String,
     /// The values (behavior, glyphs, dark) of the one save in flight. Further changes only
     /// update the state; when the save ends, one more save carries the newest values.
@@ -2019,6 +2113,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.waiting_lock = false;
             pump(app)
         }
+        Msg::BucketsLoaded(result) => on_buckets_loaded(app, result),
         Msg::ResiduesCleaned(errors) => {
             app.running = None;
             if errors.is_empty() {
@@ -2274,6 +2369,7 @@ fn settings_key(app: &mut App, key: KeyEvent) -> Option<Vec<Cmd>> {
         KeyCode::Char('h') => change_setting(app, false),
         KeyCode::Char('q') => request_quit(app),
         KeyCode::Char('f') => open_queue(app),
+        KeyCode::Char('b') => open_buckets(app),
         KeyCode::Char('?') => {
             app.show_help = true;
             Vec::new()
@@ -2697,6 +2793,17 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                 if registry_only {
                     items.push(option_item(REGISTRY_ONLY_ITEM, false));
                 }
+            }
+            // Confirmed in the buckets dialog, never through this one.
+            Action::BucketAdd { name, .. } | Action::BucketRemove { name, .. } => {
+                items.push(ConfirmItem {
+                    name: format!("bucket {name}"),
+                    key: None,
+                    from: None,
+                    to: None,
+                    manager: "wingetrs",
+                    checked: true,
+                });
             }
             Action::SelfUpdate { tag } => items.push(ConfirmItem {
                 name: "wingetrs".to_string(),
@@ -4072,11 +4179,23 @@ fn can_start(app: &App) -> bool {
 
 fn start(app: &mut App, q: Queued) -> Vec<Cmd> {
     app.bridge_last_line = matches!(q.action, Action::Bridge(_)).then_some(app.now);
-    // A bridge job reports only lines: its phase (spinner and clock) starts now.
+    use crate::install::progress::Phase;
+    // A bridge job reports only lines: its phase (spinner and clock) starts now. So does a
+    // bucket job, before its first download event.
     let progress = match &q.action {
         Action::Bridge(job) => Some(phase_progress(
-            crate::install::progress::Phase::Bridge {
+            Phase::Bridge {
                 tool: job.tool.name().to_string(),
+            },
+            app.now,
+        )),
+        Action::BucketAdd { .. } => Some(phase_progress(
+            Phase::FetchingCatalog { sources: 1 },
+            app.now,
+        )),
+        Action::BucketRemove { name, .. } => Some(phase_progress(
+            Phase::Removing {
+                app: format!("bucket {name}"),
             },
             app.now,
         )),
@@ -4618,10 +4737,18 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
     }
     app.installer_running = false;
     app.bridge_last_line = None;
+    let bucket = matches!(
+        finished.as_ref().and_then(|r| r.action.as_ref()),
+        Some(Action::BucketAdd { .. } | Action::BucketRemove { .. })
+    );
     // Success or not, the disk may have changed.
     let mut cmds = vec![Cmd::ScanInstalled];
     match result {
         Ok(done) => {
+            if bucket {
+                // The summary line, the open dialog and the search see the new catalog.
+                cmds.extend([Cmd::LoadBuckets, Cmd::ReloadCatalog]);
+            }
             app.push_toast(ToastKind::Success, done.summary);
             if let Some((name, residues)) = done.residues
                 && !residues.is_empty()
@@ -4630,7 +4757,12 @@ fn on_finished(app: &mut App, result: Result<Done, InstallFail>) -> Vec<Cmd> {
             }
         }
         Err(InstallFail::Busy) => {
-            app.push_toast(ToastKind::Warning, "outra instalação em andamento");
+            let text = if bucket {
+                "uma atualização está em andamento; o bucket espera na fila"
+            } else {
+                "outra instalação em andamento"
+            };
+            app.push_toast(ToastKind::Warning, text);
             // It never ran: first in line again, tried once the other process may be done.
             if let Some(Running {
                 id,
@@ -5150,6 +5282,7 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
             }
         },
         Modal::Queue { selected } => queue_key(app, selected, key),
+        Modal::Buckets(dialog) => buckets_key(app, *dialog, key),
         Modal::Residues {
             mut picker,
             app: name,
@@ -5200,4 +5333,212 @@ pub fn prev_tab(tab: Tab) -> Tab {
         Tab::Updates => Tab::Installed,
         Tab::Settings => Tab::Updates,
     }
+}
+/// `b` in Settings: the buckets dialog, filled when `Msg::BucketsLoaded` arrives.
+fn open_buckets(app: &mut App) -> Vec<Cmd> {
+    app.modal = Some(Modal::Buckets(Box::new(BucketsDialog {
+        cfg: Config::default(),
+        rows: Vec::new(),
+        cursor: 0,
+        loading: true,
+        stage: BucketStage::List,
+    })));
+    vec![Cmd::LoadBuckets]
+}
+
+/// New bucket list: the Settings summary line always, the dialog when it is open.
+fn on_buckets_loaded(app: &mut App, result: Result<(Config, Vec<BucketInfo>), String>) -> Vec<Cmd> {
+    let (cfg, rows) = match result {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            app.push_toast(ToastKind::Error, format!("falha ao ler os buckets: {e}"));
+            if let Some(Modal::Buckets(d)) = &mut app.modal {
+                d.loading = false;
+            }
+            return Vec::new();
+        }
+    };
+    app.buckets_summary = rows
+        .iter()
+        .map(|b| b.row.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(Modal::Buckets(d)) = &mut app.modal {
+        d.cursor = d.cursor.min(rows.len().saturating_sub(1));
+        d.cfg = cfg;
+        d.rows = rows;
+        d.loading = false;
+    }
+    Vec::new()
+}
+
+/// The add picker: the well-known buckets not configured, then `OTHER_REPO`.
+fn add_picker(d: &BucketsDialog) -> BucketStage {
+    let missing: Vec<(&str, &str)> = crate::buckets::KNOWN
+        .iter()
+        .filter(|(n, _)| !d.rows.iter().any(|b| b.row.name == *n))
+        .copied()
+        .collect();
+    let mut items: Vec<PickerItem> = missing
+        .iter()
+        .map(|(n, repo)| PickerItem {
+            label: n.to_string(),
+            detail: repo.to_string(),
+            selectable: true,
+            note: None,
+        })
+        .collect();
+    items.push(PickerItem {
+        label: OTHER_REPO.to_string(),
+        detail: String::new(),
+        selectable: true,
+        note: None,
+    });
+    BucketStage::Add {
+        picker: Picker::single(items),
+        names: missing.iter().map(|(n, _)| n.to_string()).collect(),
+    }
+}
+
+/// The bucket name an `owner/repo` gets when added from the free-form field.
+pub fn bucket_name_of(repo: &str) -> String {
+    repo.rsplit('/').next().unwrap_or(repo).to_lowercase()
+}
+
+/// Adds `name` from `spec` by the CLI's rule (`buckets::add` on a copy of the config): a
+/// bucket wingetrs does not know asks first; anything else wrong is a toast.
+fn try_add(app: &mut App, d: &mut BucketsDialog, name: &str, spec: &str) -> Vec<Cmd> {
+    use crate::buckets::BucketError;
+    let mut probe = d.cfg.clone();
+    match crate::buckets::add(&mut probe, name, spec, false) {
+        Ok(()) => enqueue(
+            app,
+            Action::BucketAdd {
+                name: name.to_string(),
+                spec: spec.to_string(),
+                confirmed: false,
+            },
+        ),
+        Err(BucketError::NeedsConfirmation { name, repo }) => {
+            d.stage = BucketStage::ThirdParty { name, repo };
+            Vec::new()
+        }
+        Err(e) => {
+            app.push_toast(ToastKind::Error, e.to_string());
+            Vec::new()
+        }
+    }
+}
+
+/// `d`/Delete on a bucket: refused with the installed apps (the CLI's rule), else asked.
+fn ask_remove(d: &mut BucketsDialog) {
+    let Some(b) = d.rows.get(d.cursor) else {
+        return;
+    };
+    let name = b.row.name.clone();
+    d.stage = match &b.installed {
+        Ok(apps) if apps.is_empty() => BucketStage::Remove { name },
+        Ok(apps) => BucketStage::InUse {
+            name,
+            apps: apps.clone(),
+        },
+        Err(e) => BucketStage::InUse {
+            name,
+            apps: vec![e.clone()],
+        },
+    };
+}
+
+/// Keys of the buckets dialog: `a` adds, `d`/Delete removes, `Esc` goes back or closes.
+fn buckets_key(app: &mut App, mut d: BucketsDialog, key: KeyEvent) -> Vec<Cmd> {
+    let stage = std::mem::replace(&mut d.stage, BucketStage::List);
+    let mut cmds = Vec::new();
+    match stage {
+        BucketStage::List => match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'b') => return Vec::new(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                d.cursor = (d.cursor + 1).min(d.rows.len().saturating_sub(1));
+            }
+            KeyCode::Up | KeyCode::Char('k') => d.cursor = d.cursor.saturating_sub(1),
+            KeyCode::Home => d.cursor = 0,
+            KeyCode::End => d.cursor = d.rows.len().saturating_sub(1),
+            KeyCode::Char('a') | KeyCode::Insert if !d.loading => d.stage = add_picker(&d),
+            KeyCode::Char('d') | KeyCode::Delete if !d.loading => ask_remove(&mut d),
+            _ => {}
+        },
+        BucketStage::Add { mut picker, names } => match picker.key(key) {
+            PickOutcome::Pending => d.stage = BucketStage::Add { picker, names },
+            PickOutcome::Cancelled => {}
+            PickOutcome::Picked(chosen) => match chosen.first().and_then(|&i| names.get(i)) {
+                Some(name) => {
+                    let repo = crate::buckets::known_repo(name).unwrap_or_default();
+                    cmds = try_add(app, &mut d, name, repo);
+                }
+                None => {
+                    d.stage = BucketStage::Typing {
+                        text: String::new(),
+                    };
+                }
+            },
+        },
+        BucketStage::Typing { mut text } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => match crate::buckets::parse_repo(&text) {
+                Ok(repo) => cmds = try_add(app, &mut d, &bucket_name_of(&repo), text.trim()),
+                Err(_) => d.stage = BucketStage::Typing { text },
+            },
+            KeyCode::Backspace => {
+                text.pop();
+                d.stage = BucketStage::Typing { text };
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                text.push(c);
+                d.stage = BucketStage::Typing { text };
+            }
+            _ => d.stage = BucketStage::Typing { text },
+        },
+        BucketStage::ThirdParty { name, repo } => match key.code {
+            KeyCode::Enter => {
+                let action = Action::BucketAdd {
+                    name,
+                    spec: repo,
+                    confirmed: true,
+                };
+                cmds = enqueue(app, action);
+            }
+            KeyCode::Esc => {}
+            _ => d.stage = BucketStage::ThirdParty { name, repo },
+        },
+        BucketStage::Remove { name } => match key.code {
+            KeyCode::Enter if crate::buckets::is_default_bucket(&name) => {
+                d.stage = BucketStage::RemoveDefault { name };
+            }
+            KeyCode::Enter => {
+                let action = Action::BucketRemove {
+                    name,
+                    confirmed: false,
+                };
+                cmds = enqueue(app, action);
+            }
+            KeyCode::Esc => {}
+            _ => d.stage = BucketStage::Remove { name },
+        },
+        BucketStage::RemoveDefault { name } => match key.code {
+            KeyCode::Enter => {
+                let action = Action::BucketRemove {
+                    name,
+                    confirmed: true,
+                };
+                cmds = enqueue(app, action);
+            }
+            KeyCode::Esc => {}
+            _ => d.stage = BucketStage::RemoveDefault { name },
+        },
+        BucketStage::InUse { name, apps } => match key.code {
+            KeyCode::Enter | KeyCode::Esc => {}
+            _ => d.stage = BucketStage::InUse { name, apps },
+        },
+    }
+    app.modal = Some(Modal::Buckets(Box::new(d)));
+    cmds
 }

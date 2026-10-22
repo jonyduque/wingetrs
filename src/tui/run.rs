@@ -536,6 +536,10 @@ async fn event_loop(
                     query,
                     kind,
                 } => spawn_search(&ctx, Arc::clone(&app.search), generation, query, kind),
+                Cmd::LoadBuckets => spawn_job(&ctx, |c, _| {
+                    Msg::BucketsLoaded(jobs::load_buckets(&c.data, now_unix()))
+                }),
+                Cmd::ReloadCatalog => spawn_reload(&ctx),
             }
         }
         if refresh_msg {
@@ -823,7 +827,7 @@ fn spawn_refresh(ctx: &Arc<Ctx>, force: bool) {
                 },
             }]
         };
-        let reports = match Endpoints::production(&ctx.cfg) {
+        let reports = match Endpoints::production(&current_cfg(&ctx)) {
             Ok(ep) => match run_update(&ctx.data, &ep, &ctx.http, force, LockWait::NoWait).await {
                 Ok(r) => r,
                 Err(UpdateError::Busy) => return Msg::RefreshBusy,
@@ -852,6 +856,16 @@ pub async fn join_refresh(h: tokio::task::JoinHandle<Msg>) -> Msg {
             },
         }]),
     }
+}
+
+/// `config.toml` as it is now: the buckets dialog changes the bucket list during the session,
+/// and a refresh must neither miss an added bucket nor fetch a removed one again. An unreadable
+/// file keeps the one read at startup.
+fn current_cfg(ctx: &Ctx) -> Config {
+    Config::load(&ctx.data.config_path()).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "config.toml unreadable; using the one read at startup");
+        ctx.cfg.clone()
+    })
 }
 
 fn spawn_reload(ctx: &Arc<Ctx>) {
@@ -1779,6 +1793,9 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
     if jobs::is_winget_action(&action) {
         return spawn_winget(ctx, action);
     }
+    if let Action::BucketAdd { .. } | Action::BucketRemove { .. } = action {
+        return spawn_bucket(ctx, action);
+    }
     spawn_job(ctx, move |c, handle| {
         let tx = c.tx.clone();
         let throttle = jobs::ProgressThrottle::new(Instant::now());
@@ -1796,6 +1813,49 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
             InstallFail::Other(e)
         })
         .and_then(|r| r);
+        Msg::InstallFinished(result)
+    });
+}
+
+/// Runs a bucket add or removal of the buckets dialog (`jobs::bucket_add`/`bucket_remove`, the
+/// CLI's steps) under the update lock; no ops context and no `install.lock`.
+fn spawn_bucket(ctx: &Arc<Ctx>, action: Action) {
+    spawn_job(ctx, move |c, handle| {
+        let tx = c.tx.clone();
+        let throttle = jobs::ProgressThrottle::new(Instant::now());
+        let progress = move |ev: &crate::install::progress::ProgressEvent| {
+            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), ev) {
+                let _ = tx.send(msg);
+            }
+        };
+        let result = match action {
+            Action::BucketAdd {
+                name,
+                spec,
+                confirmed,
+            } => {
+                // Same override as `update` and `bucket add`, so offline tests serve the tarball.
+                let url = std::env::var("WINGETRS_SCOOP_BASE_URL")
+                    .ok()
+                    .map(|base| format!("{}/{name}.tgz", base.trim_end_matches('/')));
+                handle.block_on(jobs::bucket_add(
+                    &c.data,
+                    &c.http,
+                    &name,
+                    &spec,
+                    confirmed,
+                    url.as_deref(),
+                    &progress,
+                ))
+            }
+            Action::BucketRemove { name, confirmed } => {
+                jobs::bucket_remove(&c.data, &name, confirmed)
+            }
+            other => Err(InstallFail::Other(format!(
+                "{}: não é uma operação de bucket",
+                other.label()
+            ))),
+        };
         Msg::InstallFinished(result)
     });
 }

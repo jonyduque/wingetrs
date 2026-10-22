@@ -54,13 +54,13 @@ pub fn setting_line(i: usize) -> usize {
 }
 
 /// Number of lines of the settings body: the settings plus the blank line, heading and
-/// buckets line of the read-only section.
+/// buckets line of the sources section.
 pub fn settings_body_lines() -> usize {
     setting_line(ORDER.len() - 1) + 4
 }
 
 /// First body line shown when `body_h` lines fit and setting `selected` must stay visible;
-/// the last setting also pulls the read-only section below it into view.
+/// the last setting also pulls the sources section below it into view.
 pub fn settings_scroll(selected: usize, body_h: usize) -> usize {
     let last = ORDER.len() - 1;
     let target = if selected >= last {

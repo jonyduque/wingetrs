@@ -3,8 +3,9 @@ use crate::core::{PackageDetails, SourceKind};
 use crate::install::residue::OTHER_INSTALL_NOTE;
 use crate::installed::correlate::{Correlation, ListRow, UpdateState};
 use crate::tui::app::{
-    ActionId, App, CONFIRM_BUTTONS, ConfirmButton, ConfirmItem, ITEM_ROWS, Modal, RunProgress,
-    ScriptLineKind, ScriptSection, ShowFilter, SourceFilter, Tab, buttons, queue_rows,
+    ActionId, App, BucketStage, BucketsDialog, CONFIRM_BUTTONS, ConfirmButton, ConfirmItem,
+    ITEM_ROWS, Modal, RunProgress, ScriptLineKind, ScriptSection, ShowFilter, SourceFilter,
+    THIRD_PARTY_BUCKET, Tab, bucket_name_of, buttons, queue_rows,
 };
 use crate::tui::help::{help_line, hints};
 use crate::tui::icons::IconProtocol;
@@ -283,11 +284,15 @@ fn draw_settings(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: 
         lines.push(row(i, *id));
     }
     lines.push(Line::raw(""));
-    lines.push(heading("Fontes (somente leitura)"));
+    lines.push(heading("Fontes"));
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled("Buckets do scoop  ", theme.fg()),
         Span::styled(app.buckets_summary.clone(), theme.fg_dim()),
+        Span::styled(
+            "  (b gerencia)",
+            theme.fg_dim().add_modifier(Modifier::ITALIC),
+        ),
     ]));
     let body_h = area.height.saturating_sub(2);
     let body = Rect::new(area.x, area.y, area.width, body_h.min(area.height));
@@ -1195,6 +1200,7 @@ pub fn modal_title(m: &Modal) -> String {
         Modal::Choosing { .. } => "Escolha a correspondência".to_string(),
         Modal::Residues { app, .. } => format!("Resíduos de {app}"),
         Modal::Queue { .. } => "Fila".to_string(),
+        Modal::Buckets(_) => "Buckets do scoop".to_string(),
     }
 }
 
@@ -1296,8 +1302,141 @@ fn draw_modal<'a>(
                 area,
             );
         }
+        Modal::Buckets(d) => draw_buckets(app, d, &title, theme, frame, area),
     }
     Vec::new()
+}
+
+/// One line per bucket: name, repo, apps, age of the last download and known/third party.
+fn bucket_lines<'a>(d: &BucketsDialog, theme: &Theme, g: &Glyphs) -> Vec<Line<'a>> {
+    let name_w = d.rows.iter().map(|b| b.row.name.len()).max().unwrap_or(0);
+    let repo_w = d.rows.iter().map(|b| b.row.repo.len()).max().unwrap_or(0);
+    d.rows
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let here = i == d.cursor && matches!(d.stage, BucketStage::List);
+            let (cursor, style) = if here {
+                (g.selected, theme.bg_selected())
+            } else {
+                (" ", theme.fg())
+            };
+            let apps = match (b.row.apps, b.age) {
+                (Some(n), Some(age)) if age < 60 => format!("{n} apps · agora"),
+                (Some(n), Some(age)) => format!("{n} apps · há {}", format_age(age)),
+                (Some(n), None) => format!("{n} apps"),
+                (None, _) => "não baixado".to_string(),
+            };
+            let (kind, kind_style) = if b.known() {
+                ("conhecido", theme.fg_dim())
+            } else {
+                ("de terceiro", theme.warn())
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{cursor} {:<name_w$}  {:<repo_w$}  ",
+                        b.row.name, b.row.repo
+                    ),
+                    style,
+                ),
+                Span::styled(format!("{apps:<22} "), theme.fg_dim()),
+                Span::styled(kind, kind_style),
+            ])
+        })
+        .collect()
+}
+
+/// The buckets dialog: the list, then what the stage asks (its picker is drawn on top).
+fn draw_buckets(
+    app: &App,
+    d: &BucketsDialog,
+    title: &str,
+    theme: &Theme,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let g = Glyphs::for_set(app.glyphs);
+    let mut lines = if d.loading {
+        vec![Line::from(Span::styled(
+            format!("{} lendo os buckets…", spinner(app, g)),
+            theme.fg_dim(),
+        ))]
+    } else {
+        bucket_lines(d, theme, g)
+    };
+    lines.push(Line::raw(""));
+    let say = |text: String, style| Line::from(Span::styled(text, style));
+    let footer = match &d.stage {
+        BucketStage::List | BucketStage::Add { .. } => {
+            "a adiciona · d remove · Esc fecha".to_string()
+        }
+        BucketStage::Typing { text } => {
+            lines.push(say(
+                "Repositório do GitHub (dono/repo ou URL):".to_string(),
+                theme.fg(),
+            ));
+            lines.push(say(format!("{} {text}_", g.search), theme.accent()));
+            lines.push(match crate::buckets::parse_repo(text) {
+                _ if text.trim().is_empty() => Line::raw(""),
+                Ok(repo) => say(
+                    format!("bucket {} {} {repo}", bucket_name_of(&repo), g.arrow),
+                    theme.fg_dim(),
+                ),
+                Err(e) => say(e.to_string(), theme.err()),
+            });
+            "Enter continua · Esc volta".to_string()
+        }
+        BucketStage::ThirdParty { name, repo } => {
+            lines.push(say(
+                format!("O bucket {name} ({repo}) não é conhecido."),
+                theme.fg(),
+            ));
+            lines.push(say(
+                format!("{} {THIRD_PARTY_BUCKET}", g.toast_warn),
+                theme.warn().add_modifier(Modifier::BOLD),
+            ));
+            "Enter adiciona mesmo assim · Esc cancela".to_string()
+        }
+        BucketStage::Remove { name } => {
+            lines.push(say(format!("Remover o bucket {name}?"), theme.fg()));
+            "Enter remove · Esc cancela".to_string()
+        }
+        BucketStage::RemoveDefault { name } => {
+            lines.push(say(
+                format!("{name} é um bucket padrão. Remover mesmo assim?"),
+                theme.warn().add_modifier(Modifier::BOLD),
+            ));
+            "Enter remove · Esc cancela".to_string()
+        }
+        BucketStage::InUse { name, apps } => {
+            lines.push(say(
+                format!("O bucket {name} não pode ser removido; apps instalados dele:"),
+                theme.err(),
+            ));
+            lines.push(say(format!("  {}", apps.join(", ")), theme.fg()));
+            "Enter ou Esc volta".to_string()
+        }
+    };
+    lines.push(say(footer, theme.accent()));
+    let h = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let rect = dialog_size(area, 98, h);
+    render_dialog(
+        frame,
+        rect,
+        modal_block(theme, title),
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+    );
+    if let BucketStage::Add { picker, .. } = &d.stage {
+        draw_picker(
+            picker,
+            "Adicionar bucket",
+            "Enter escolhe · Esc volta",
+            theme,
+            frame,
+            area,
+        );
+    }
 }
 
 /// Check box of a confirmation item.
