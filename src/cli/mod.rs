@@ -1056,15 +1056,17 @@ async fn run_bucket(
                 return Ok(());
             }
             let progress = ui.progress();
-            progress.update(&ProgressEvent::Phase(Phase::Extracting {
-                file: format!("bucket {name}"),
-                engine: "GitHub".to_string(),
-            }));
+            // The download phase `update` uses; `Extracting` follows once the tarball is in.
+            progress.update(&ProgressEvent::Phase(Phase::FetchingCatalog { sources: 1 }));
             // Same override as `update`, so offline tests can serve the tarball.
             let url = std::env::var("WINGETRS_SCOOP_BASE_URL")
                 .ok()
                 .map(|base| format!("{}/{name}.tgz", base.trim_end_matches('/')));
-            let added = buckets::add_downloaded(data, http, &cfg, &name, url.as_deref()).await;
+            let added =
+                buckets::add_downloaded_progress(data, http, &cfg, &name, url.as_deref(), &|ev| {
+                    progress.update(ev)
+                })
+                .await;
             ui.end_progress();
             let apps = added?;
             emit::out(&output::success("Bucket adicionado:", &output::name(&name)));
@@ -1091,7 +1093,6 @@ async fn run_bucket(
                 buckets::remove_and_cleanup_confirmed(data, &mut cfg, &name, &state_db, confirmed);
             ui.end_progress();
             removed?;
-            cfg.save(&data.config_path())?;
             emit::out(&output::success("Bucket removido:", &output::name(&name)));
             Ok(())
         }

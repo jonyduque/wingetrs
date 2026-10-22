@@ -167,9 +167,22 @@ pub async fn fetch_bucket(
     url: &str,
     prev: Option<&HttpEntry>,
 ) -> Result<ScoopFetch, ScoopError> {
-    match http.get_conditional(url, prev).await? {
+    fetch_bucket_progress(http, url, prev, |_, _| {}, || {}).await
+}
+
+/// [`fetch_bucket`] reporting the download as `(done, total)` and calling `downloaded` once
+/// the body is complete, before the tarball is read.
+pub async fn fetch_bucket_progress(
+    http: &Http,
+    url: &str,
+    prev: Option<&HttpEntry>,
+    progress: impl Fn(u64, Option<u64>),
+    downloaded: impl FnOnce(),
+) -> Result<ScoopFetch, ScoopError> {
+    match http.get_conditional_progress(url, prev, progress).await? {
         Fetch::NotModified => Ok(ScoopFetch::NotModified),
         Fetch::Modified { body, entry } => {
+            downloaded();
             let import = tracing::debug_span!("update.parse").in_scope(|| read_tarball(&body))?;
             Ok(ScoopFetch::Modified { import, entry })
         }

@@ -283,6 +283,17 @@ impl Http {
         url: &str,
         prev: Option<&HttpEntry>,
     ) -> Result<Fetch, HttpError> {
+        self.get_conditional_progress(url, prev, |_, _| {}).await
+    }
+
+    /// [`Http::get_conditional`] reporting `(done, total)` as the body streams in.
+    pub async fn get_conditional_progress(
+        &self,
+        url: &str,
+        prev: Option<&HttpEntry>,
+        progress: impl Fn(u64, Option<u64>),
+    ) -> Result<Fetch, HttpError> {
+        use futures_util::StreamExt;
         let mut req = self.client.get(url);
         if let Some(p) = prev {
             if let Some(etag) = &p.etag {
@@ -312,7 +323,13 @@ impl Http {
             source_version: hv("x-ms-meta-sourceversion"),
             checked_at: now_unix(),
         };
-        let body = resp.bytes().await.map_err(map_err)?.to_vec();
+        let total = resp.content_length();
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.map_err(map_err)?);
+            progress(body.len() as u64, total);
+        }
         Ok(Fetch::Modified { body, entry })
     }
 

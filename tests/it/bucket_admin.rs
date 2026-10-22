@@ -247,3 +247,182 @@ fn rm_drops_legacy_master_url() {
     assert!(st.get(legacy).is_none());
     assert!(st.get(other).is_some());
 }
+
+/// Puts a folder where `path` was, so the next write to it fails.
+fn replace_with_dir(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    std::fs::create_dir_all(path).unwrap();
+}
+
+#[test]
+fn rm_saves_config_under_the_lock() {
+    let (d, data, mut cfg) = setup();
+    let db = d.path().join("state.db");
+    let held = UpdateLock::try_acquire(&data.lock_path()).unwrap().unwrap();
+    let before = std::fs::read(data.config_path()).unwrap();
+    let e = remove_and_cleanup_confirmed(&data, &mut cfg, "mine", &db, true).unwrap_err();
+    assert_eq!(e, BucketError::Busy);
+    assert_eq!(std::fs::read(data.config_path()).unwrap(), before);
+    drop(held);
+    // The config on disk is the caller's `cfg` plus `mine`: save it as `add` would have.
+    cfg.save(&data.config_path()).unwrap();
+    assert!(
+        Config::load(&data.config_path())
+            .unwrap()
+            .buckets
+            .iter()
+            .any(|b| b.name == "mine")
+    );
+    remove_and_cleanup_confirmed(&data, &mut cfg, "mine", &db, true).unwrap();
+    let saved = Config::load(&data.config_path()).unwrap();
+    assert!(!saved.buckets.iter().any(|b| b.name == "mine"), "{saved:?}");
+}
+
+/// The catalog source rows of `name` after a failed `add`.
+fn catalog_has(data: &DataDir, source: &str) -> bool {
+    Catalog::open(&data.catalog_path())
+        .unwrap()
+        .sources()
+        .unwrap()
+        .iter()
+        .any(|s| s.source == source)
+}
+
+#[tokio::test]
+async fn add_late_failure_rolls_back_catalog() {
+    let (_d, data, cfg) = setup();
+    seed(&data);
+    let s = serve(bucket_tgz(), 200).await;
+    let url = format!("{}/mine.tgz", s.uri());
+    replace_with_dir(&data.http_state_path());
+    let e = add_downloaded(&data, &Http::new().unwrap(), &cfg, "mine", Some(&url))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, BucketError::State(_)), "{e:?}");
+    assert!(!catalog_has(&data, "scoop:mine"));
+    assert!(catalog_has(&data, "scoop:main"), "other sources stay");
+    let found = index_file::search(&data.search_index_path(), "zebra", None, 10)
+        .unwrap()
+        .unwrap_or_default();
+    assert!(found.is_empty(), "{found:?}");
+    assert!(!data.buckets_dir().join("mine").exists());
+    let saved = Config::load(&data.config_path()).unwrap();
+    assert!(saved.buckets.is_empty(), "{saved:?}");
+}
+
+#[tokio::test]
+async fn add_config_failure_rolls_back_catalog() {
+    let (_d, data, cfg) = setup();
+    seed(&data);
+    let s = serve(bucket_tgz(), 200).await;
+    let url = format!("{}/mine.tgz", s.uri());
+    replace_with_dir(&data.config_path());
+    let e = add_downloaded(&data, &Http::new().unwrap(), &cfg, "mine", Some(&url))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, BucketError::State(_)), "{e:?}");
+    assert!(!catalog_has(&data, "scoop:mine"));
+    assert!(!data.buckets_dir().join("mine").exists());
+    // The URL must not stay in http.json: a later `update` would get 304 and skip the bucket.
+    assert!(HttpState::load(&data.http_state_path()).get(&url).is_none());
+}
+
+#[tokio::test]
+async fn add_reports_download_progress() {
+    use std::sync::Mutex;
+    use wingetrs::install::progress::{Phase, ProgressEvent};
+    let (_d, data, cfg) = setup();
+    let tgz = bucket_tgz();
+    let size = tgz.len() as u64;
+    let s = serve(tgz, 200).await;
+    let url = format!("{}/mine.tgz", s.uri());
+    let events = Mutex::new(Vec::new());
+    let rec = |ev: &ProgressEvent| events.lock().unwrap().push(ev.clone());
+    wingetrs::buckets::add_downloaded_progress(
+        &data,
+        &Http::new().unwrap(),
+        &cfg,
+        "mine",
+        Some(&url),
+        &rec,
+    )
+    .await
+    .unwrap();
+    let events = events.into_inner().unwrap();
+    let first_extract = events
+        .iter()
+        .position(|e| matches!(e, ProgressEvent::Phase(Phase::Extracting { .. })))
+        .expect("an Extracting phase");
+    assert!(
+        events[..first_extract].iter().any(|e| matches!(
+            e,
+            ProgressEvent::Download { total: Some(t), .. } if *t == size
+        )),
+        "{events:?}"
+    );
+}
+
+struct AskUi {
+    interactive: bool,
+    answer: bool,
+}
+
+impl wingetrs::cli::install_cmd::Ui for AskUi {
+    fn interactive(&self) -> bool {
+        self.interactive
+    }
+    fn confirm(&self, _: &str) -> anyhow::Result<bool> {
+        Ok(self.answer)
+    }
+    fn pick(&self, _: Vec<wingetrs::tui::picker::PickerItem>) -> anyhow::Result<Option<usize>> {
+        Ok(None)
+    }
+    fn pick_many(
+        &self,
+        _: Vec<wingetrs::tui::picker::PickerItem>,
+        _: &[bool],
+    ) -> anyhow::Result<Option<Vec<usize>>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn add_interactive_yes_and_no() {
+    let repo = "https://github.com/x/meu".to_string();
+    let run = |ui: &AskUi, yes: bool| {
+        let mut cfg = Config::default();
+        let mut said = Vec::new();
+        let r = wingetrs::cli::bucket_add(ui, &mut cfg, "meu", Some(repo.clone()), yes, &mut |l| {
+            said.push(l.to_string())
+        });
+        (r, cfg, said)
+    };
+    let (r, cfg, said) = run(
+        &AskUi {
+            interactive: true,
+            answer: false,
+        },
+        false,
+    );
+    assert!(!r.unwrap());
+    assert!(said.iter().any(|l| l.contains("Cancelado.")), "{said:?}");
+    assert!(cfg.buckets.is_empty(), "{cfg:?}");
+    let (r, cfg, _) = run(
+        &AskUi {
+            interactive: true,
+            answer: true,
+        },
+        false,
+    );
+    assert!(r.unwrap());
+    assert!(cfg.buckets.iter().any(|b| b.name == "meu"), "{cfg:?}");
+    let (r, cfg, _) = run(
+        &AskUi {
+            interactive: false,
+            answer: true,
+        },
+        false,
+    );
+    assert!(format!("{:#}", r.unwrap_err()).contains("--yes"));
+    assert!(cfg.buckets.is_empty(), "{cfg:?}");
+}

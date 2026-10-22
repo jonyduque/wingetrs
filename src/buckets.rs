@@ -220,7 +220,21 @@ pub async fn add_downloaded(
     name: &str,
     url: Option<&str>,
 ) -> Result<usize, BucketError> {
-    use crate::sources::scoop::bucket::{ScoopFetch, fetch_bucket, repo_tarball_url};
+    add_downloaded_progress(data, http, cfg, name, url, &|_| {}).await
+}
+
+/// [`add_downloaded`] reporting the download as `ProgressEvent::Download` and then
+/// `Phase::Extracting` while the tarball is read and the catalog written.
+pub async fn add_downloaded_progress(
+    data: &crate::cache::DataDir,
+    http: &crate::http::Http,
+    cfg: &Config,
+    name: &str,
+    url: Option<&str>,
+    progress: crate::install::download::Progress<'_>,
+) -> Result<usize, BucketError> {
+    use crate::install::progress::{Phase, ProgressEvent};
+    use crate::sources::scoop::bucket::{ScoopFetch, fetch_bucket_progress, repo_tarball_url};
     let _lock = lock(data)?;
     let repo = resolved(cfg)
         .map_err(|e| BucketError::Catalog(e.to_string()))?
@@ -229,7 +243,26 @@ pub async fn add_downloaded(
         .map(|(_, r)| r)
         .ok_or_else(|| BucketError::NotConfigured(name.to_string()))?;
     let url = url.map_or_else(|| repo_tarball_url(&repo), str::to_string);
-    let (import, mut entry) = match fetch_bucket(http, &url, None).await {
+    let fetched = fetch_bucket_progress(
+        http,
+        &url,
+        None,
+        |done, total| {
+            progress(&ProgressEvent::Download {
+                url: url.clone(),
+                done,
+                total,
+            })
+        },
+        || {
+            progress(&ProgressEvent::Phase(Phase::Extracting {
+                file: format!("bucket {name}"),
+                engine: "GitHub".to_string(),
+            }))
+        },
+    )
+    .await;
+    let (import, mut entry) = match fetched {
         Ok(ScoopFetch::Modified { import, entry }) => (import, entry),
         Ok(ScoopFetch::NotModified) => {
             return Err(BucketError::Download("resposta sem conteúdo".to_string()));
@@ -265,9 +298,11 @@ pub async fn add_downloaded(
         tracing::warn!("falha ao gravar o índice de busca: {e}");
         let _ = std::fs::remove_file(&idx);
     }
-    if let Some(dir) = bucket_dir(data, name) {
+    let dir = bucket_dir(data, name);
+    let dir_existed = dir.as_ref().is_some_and(|d| d.exists());
+    if let Some(dir) = &dir {
         let tag = std::process::id().to_string();
-        if let Err(e) = crate::sources::scoop::bucket::write_scripts(&dir, &import.scripts, &tag) {
+        if let Err(e) = crate::sources::scoop::bucket::write_scripts(dir, &import.scripts, &tag) {
             tracing::warn!(bucket = name, error = %e, "could not store the bucket scripts");
             let _ = std::fs::remove_file(dir.join(".scripts-ok"));
         }
@@ -276,12 +311,50 @@ pub async fn add_downloaded(
     let path = data.http_state_path();
     let mut state = crate::cache::HttpState::load(&path);
     state.set(&url, entry);
-    state
+    let saved = state
         .save(&path)
-        .map_err(|e| BucketError::State(e.to_string()))?;
-    cfg.save(&data.config_path())
-        .map_err(|e| BucketError::State(e.to_string()))?;
+        .map_err(|e| BucketError::State(e.to_string()))
+        .and_then(|()| {
+            cfg.save(&data.config_path())
+                .map_err(|e| BucketError::State(e.to_string()))
+        });
+    if let Err(e) = saved {
+        undo_add(data, &mut catalog, name, &url, dir.filter(|_| !dir_existed));
+        return Err(e);
+    }
     Ok(stats.packages)
+}
+
+/// Undoes what `add_downloaded` stored after the catalog write (the update lock is held):
+/// the catalog source, the index, the URL in `http.json` and the bucket folder this call
+/// created. A step that fails is only logged; the caller keeps the original error.
+fn undo_add(
+    data: &crate::cache::DataDir,
+    catalog: &mut crate::catalog::Catalog,
+    name: &str,
+    url: &str,
+    created_dir: Option<std::path::PathBuf>,
+) {
+    if let Err(e) = catalog.remove_source(&crate::sources::scoop::source_name(name)) {
+        tracing::warn!(bucket = name, error = %e, "could not undo the catalog source");
+    }
+    let idx = data.search_index_path();
+    if let Err(e) = crate::catalog::index_file::write(catalog, &idx) {
+        tracing::warn!("falha ao regravar o índice de busca: {e}");
+        let _ = std::fs::remove_file(&idx);
+    }
+    let path = data.http_state_path();
+    let mut state = crate::cache::HttpState::load(&path);
+    if state.entries.remove(url).is_some()
+        && let Err(e) = state.save(&path)
+    {
+        tracing::warn!(bucket = name, error = %e, "could not undo the http state");
+    }
+    if let Some(dir) = created_dir
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+    {
+        tracing::warn!(bucket = name, error = %e, "could not remove the bucket folder");
+    }
 }
 
 /// One line of `bucket list`.
@@ -337,7 +410,8 @@ pub fn rows(data: &crate::cache::DataDir, cfg: &Config) -> Result<Vec<BucketRow>
 
 /// Full `bucket rm`: checks `state.db`, drops the `scoop:<name>` source from the catalog,
 /// forgets its URL in `http.json` (so a later `add` refetches) and rewrites `search.idx`
-/// (deleting it when that fails; search then falls back to SQLite). The caller saves `cfg`.
+/// (deleting it when that fails; search then falls back to SQLite). Saves `cfg` last, under
+/// the lock.
 pub fn remove_and_cleanup(
     data: &crate::cache::DataDir,
     cfg: &mut Config,
@@ -402,5 +476,7 @@ pub fn remove_and_cleanup_confirmed(
                 .map_err(|e| BucketError::State(e.to_string()))?;
         }
     }
+    cfg.save(&data.config_path())
+        .map_err(|e| BucketError::State(e.to_string()))?;
     Ok(())
 }
