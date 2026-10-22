@@ -486,6 +486,11 @@ fn parse_time_load_cases() {
         ("& { using module y }", 1),
         ("x\n\nusing\tmodule y", 3),
         ("using\nassembly y", 1),
+        ("USING MODULE x", 1),
+        ("us`ing module x", 1),
+        ("using<# c #>module x", 1),
+        ("#requires -Version 5\nusing module x", 2),
+        ("using `\n  module x", 1),
     ] {
         assert_eq!(script_ast::parse_time_load(text), Some(line), "{text:?}");
     }
@@ -552,4 +557,45 @@ fn using_and_lexer_refusals_never_reach_the_parser() {
         &gate,
     );
     assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Two reasons of one kind on one line both stay; the parser's worse one sets the verdict.
+#[test]
+fn merge_keeps_every_reason_of_a_line() {
+    let text = "[Environment]::SetEnvironmentVariable('a', 'b')";
+    let gate = fake(&[(
+        text,
+        Ok("MEM\t1\t1\t.\t[Environment]\tSetEnvironmentVariable\ts:a\ts:b\ts:User\n"),
+    )]);
+    let (lexer, _) = script_scan::scan_gated(
+        text,
+        PRELUDE_FUNCTIONS,
+        &CallRoots::default(),
+        &script_ast::LexerOnly,
+    );
+    let lexer_env: Vec<_> = lexer
+        .flags
+        .iter()
+        .filter(|f| f.kind == FlagKind::EnvironmentVariable)
+        .collect();
+    assert_eq!(lexer_env.len(), 1, "{:?}", lexer.flags);
+    assert_eq!(lexer_env[0].verdict, Verdict::ConfirmStrong);
+    let (report, _) =
+        script_scan::scan_gated(text, PRELUDE_FUNCTIONS, &CallRoots::default(), &gate);
+    assert_eq!(report.verdict, Verdict::Refuse);
+    let env: Vec<_> = report
+        .flags
+        .iter()
+        .filter(|f| f.kind == FlagKind::EnvironmentVariable && f.line == 1)
+        .map(|f| (f.verdict, f.detail.as_str()))
+        .collect();
+    assert!(
+        env.contains(&(Verdict::ConfirmStrong, lexer_env[0].detail.as_str())),
+        "{env:?}"
+    );
+    assert!(
+        env.iter()
+            .any(|(v, d)| *v == Verdict::Refuse && *d != lexer_env[0].detail),
+        "{env:?}"
+    );
 }

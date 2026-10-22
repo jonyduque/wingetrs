@@ -971,8 +971,7 @@ pub fn scan_gated(
     scan_called_at(script, supported, roots, Some(ast), &mut stack)
 }
 
-/// Adds the parser's flags for `script` to `report` (same kind and line: the worst verdict
-/// stays) and recomputes the verdict. The parser never sees a script the lexer already refuses
+/// Adds the parser's flags for `script` to `report` and recomputes the verdict. The parser never sees a script the lexer already refuses
 /// (nothing to add) nor one with a `using` it would resolve while parsing
 /// ([`script_ast::parse_time_load`]): that one is refused here.
 fn add_ast_flags(report: &mut ScriptReport, script: &str, supported: &[&str], ast: &dyn AstGate) {
@@ -995,17 +994,9 @@ fn add_ast_flags(report: &mut ScriptReport, script: &str, supported: &[&str], as
             }]
         }
     };
-    for f in extra {
-        match report
-            .flags
-            .iter_mut()
-            .find(|k| k.kind == f.kind && k.line == f.line)
-        {
-            Some(k) if k.verdict >= f.verdict => {}
-            Some(k) => *k = f,
-            None => report.flags.push(f),
-        }
-    }
+    // Every reason stays (two reasons of one kind on one line are both shown); only exact
+    // duplicates go (`dedupe_reasons`), and the verdict is the worst of all.
+    report.flags.extend(extra);
     report.flags.sort_by_key(|f| f.line);
     dedupe_reasons(&mut report.flags);
     report.verdict = report
