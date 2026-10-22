@@ -48,6 +48,13 @@ const OTHER_OS: &[&str] = &[
     "dragonfly",
     "solaris",
     "illumos",
+    "mac",
+    "ios",
+    "ubuntu",
+    "debian",
+    "fedora",
+    "alpine",
+    "musl",
 ];
 const SOURCE: &[&str] = &["source", "src"];
 

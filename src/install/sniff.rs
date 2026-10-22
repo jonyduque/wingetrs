@@ -115,16 +115,15 @@ pub fn classify_pe(bytes: &[u8]) -> Result<PeKind, PeError> {
     if !bytes.starts_with(b"MZ") {
         return Err(PeError("sem assinatura MZ"));
     }
-    let pe = u32_at(0x3C).ok_or(PeError("arquivo truncado"))?;
-    if pe >= len {
-        return Err(PeError("cabeçalho PE fora do arquivo"));
-    }
-    let pe = pe as usize;
+    let pe = u32_at(0x3C).ok_or(PeError("arquivo truncado"))? as usize;
     if bytes.get(pe..pe + 4) != Some(b"PE\0\0".as_slice()) {
         return Err(PeError("sem assinatura PE"));
     }
     let sections = u16_at(pe + 6).ok_or(PeError("arquivo truncado"))?;
-    if sections == 0 || sections > MAX_SECTIONS {
+    if sections == 0 {
+        return Err(PeError("nenhuma seção"));
+    }
+    if sections > MAX_SECTIONS {
         return Err(PeError("número de seções absurdo"));
     }
     let opt_size = u16_at(pe + 20).ok_or(PeError("arquivo truncado"))?;

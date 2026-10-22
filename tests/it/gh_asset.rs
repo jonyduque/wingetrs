@@ -324,6 +324,13 @@ fn nothing_for_windows_is_none() {
         "tool-1.0-linux.tar.gz",
     ]);
     assert!(matches!(pick(&arm_only, Arch::X64), Pick::None(_)));
+    // Distribution names are other systems too, never "no token" builds.
+    let ubuntu = from_names(&["t-x64-ubuntu.tar.gz", "t-arm64-windows.zip"]);
+    assert!(matches!(pick(&ubuntu, Arch::X64), Pick::None(_)));
+    for n in ["mac", "ios", "musl", "android", "debian"] {
+        let list = from_names(&[&format!("t-x64-{n}.tar.gz"), "t-x64-windows.zip"]);
+        assert_eq!(names(&pick(&list, Arch::X64)), ["t-x64-windows.zip"], "{n}");
+    }
 }
 
 #[test]
@@ -570,23 +577,41 @@ fn overlay_thresholds_need_both_quarter_and_mib() {
 
 #[test]
 fn absurd_headers_are_errors() {
-    assert!(classify_pe(&pe(0xFFFF, &[], None, TEXT)).is_err());
-    assert!(classify_pe(b"MZ").is_err());
-    assert!(classify_pe(b"not a pe at all").is_err());
-    // Certificate entry pointing past the end of the file.
-    let bytes = pe(1, &[0u8; 16], Some((IMAGE_END as u32, 0x7FFF_FFFF)), TEXT);
-    assert!(classify_pe(&bytes).is_err());
-    // Certificate entry inside the image.
-    let bytes = pe(1, &[0u8; 16], Some((0x400, 16)), TEXT);
-    assert!(classify_pe(&bytes).is_err());
+    let err = |bytes: &[u8]| classify_pe(bytes).unwrap_err().to_string();
+    let cases: Vec<(Vec<u8>, &str)> = vec![
+        (pe(0xFFFF, &[], None, TEXT), "número de seções absurdo"),
+        (pe(97, &[], None, TEXT), "número de seções absurdo"),
+        (pe(0, &[], None, TEXT), "nenhuma seção"),
+        (b"MZ".to_vec(), "arquivo truncado"),
+        (b"not a pe at all".to_vec(), "sem assinatura MZ"),
+        (
+            pe(1, &[0u8; 16], Some((IMAGE_END as u32, 0x7FFF_FFFF)), TEXT),
+            "assinatura fora do overlay",
+        ),
+        (
+            pe(1, &[0u8; 16], Some((0x400, 16)), TEXT),
+            "assinatura fora do overlay",
+        ),
+    ];
+    for (bytes, want) in cases {
+        assert!(err(&bytes).contains(want), "{want}: {}", err(&bytes));
+    }
+    // e_lfanew past the end of the file.
+    let mut far = pe(1, &[], None, TEXT);
+    far[0x3C..0x40].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+    assert!(err(&far).contains("sem assinatura PE"));
+    // Optional header far larger than any real one.
+    let mut huge = pe(1, &[], None, TEXT);
+    huge[0x94..0x96].copy_from_slice(&0x2000u16.to_le_bytes());
+    assert!(err(&huge).contains("cabeçalho opcional grande demais"));
     // Unknown optional header magic.
     let mut odd = pe(1, &[], None, TEXT);
     odd[0x98..0x9A].copy_from_slice(&0x107u16.to_le_bytes());
-    assert!(classify_pe(&odd).is_err());
+    assert!(err(&odd).contains("cabeçalho opcional desconhecido"));
     // Section past the end of the file.
     let mut cut = pe(1, &[], None, TEXT);
     cut.truncate(0x800);
-    assert!(classify_pe(&cut).is_err());
+    assert!(err(&cut).contains("seção além do fim do arquivo"));
 }
 
 #[test]
