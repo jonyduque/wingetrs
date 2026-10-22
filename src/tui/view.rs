@@ -1484,6 +1484,10 @@ fn progress_text(p: &RunProgress, now: std::time::Instant, g: &Glyphs) -> String
     if let Some((phase, since)) = &p.phase {
         return phase_status(phase, now.saturating_duration_since(*since));
     }
+    // Like the CLI: once every download is complete, the next step is under way, not a stall.
+    if p.meter.finished() {
+        return format!("{} Instalando…", p.label);
+    }
     download_text(&p.label, &download_parts(&p.meter, now, g))
 }
 

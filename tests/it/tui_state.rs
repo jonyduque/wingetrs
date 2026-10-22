@@ -3246,7 +3246,7 @@ fn navigation_works_while_running() {
         },
     );
     let progress = a.running.as_ref().and_then(|r| r.progress.as_ref());
-    assert_eq!(progress.map(|p| p.done), Some(5));
+    assert_eq!(progress.map(|p| p.meter.done()), Some(5));
 }
 
 #[test]

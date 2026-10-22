@@ -358,8 +358,6 @@ pub const NATIVE_QUIT: &str =
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunProgress {
     pub label: String,
-    pub done: u64,
-    pub total: Option<u64>,
     /// The step under way and when it started (`App::now`); `None` while downloading.
     pub phase: Option<(crate::install::progress::Phase, Instant)>,
     /// The downloads since the last phase, with the samples their speed comes from.
@@ -370,8 +368,6 @@ pub struct RunProgress {
 fn phase_progress(phase: crate::install::progress::Phase, now: Instant) -> RunProgress {
     RunProgress {
         label: String::new(),
-        done: 0,
-        total: None,
         phase: Some((phase, now)),
         meter: Default::default(),
     }
@@ -1945,8 +1941,6 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                 meter.record_at(METER_KEY, done, total, app.now);
                 r.progress = Some(RunProgress {
                     label,
-                    done,
-                    total,
                     phase: None,
                     meter,
                 });

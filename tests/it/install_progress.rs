@@ -1816,6 +1816,55 @@ async fn update_waits_for_lock_with_phase() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn update_no_wait_busy_without_waiting_phase() {
+    use wingetrs::update::{UpdateError, run_update_with};
+    let (_s, ep) = crate::update::setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let data = DataDir::new(dir.path());
+    data.ensure().unwrap();
+    let _held = wingetrs::cache::UpdateLock::try_acquire(&data.lock_path())
+        .unwrap()
+        .unwrap();
+    let trace = PhaseTrace::default();
+    let sink = phase_sink(&trace);
+    let e = tokio::time::timeout(
+        Duration::from_secs(60),
+        run_update_with(
+            &data,
+            &ep,
+            &Http::new().unwrap(),
+            true,
+            LockWait::NoWait,
+            &sink,
+        ),
+    )
+    .await
+    .expect("NoWait must not wait for the held lock")
+    .unwrap_err();
+    assert!(matches!(e, UpdateError::Busy), "{e:?}");
+    assert_eq!(*trace.lock().unwrap(), [Phase::Preparing]);
+}
+
+#[test]
+fn tui_finished_download_is_no_stall() {
+    use wingetrs::tui::app::{Msg, update};
+    let base = Instant::now();
+    let mut a = tui_running(base);
+    update(
+        &mut a,
+        Msg::InstallProgress {
+            label: "rust.msi".into(),
+            done: 27 * MIB,
+            total: Some(27 * MIB),
+        },
+    );
+    a.now = base + Duration::from_secs(15);
+    let text = wingetrs::tui::view::running_text(&a, ascii()).unwrap();
+    assert!(!text.contains("sem dados"), "{text}");
+    assert!(text.ends_with("rust.msi Instalando…"), "{text}");
+}
+
 #[test]
 fn new_phase_titles() {
     use wingetrs::install::progress::phase_status;

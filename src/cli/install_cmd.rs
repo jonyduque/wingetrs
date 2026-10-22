@@ -188,7 +188,7 @@ fn glyphs_of(cfg: &crate::config::Config) -> &'static Glyphs {
 }
 
 /// The progress line on stderr with the config's glyphs and the theme's colors; animated
-/// when not a tty, one plain line per phase otherwise.
+/// when `tty`, one plain line per phase otherwise.
 fn progress_for(cfg: &crate::config::Config, tty: bool) -> Arc<LineProgress> {
     let styles = super::style::ProgressStyles::of(&theme_of(cfg));
     Arc::new(LineProgress::new(tty, glyphs_of(cfg), styles))
