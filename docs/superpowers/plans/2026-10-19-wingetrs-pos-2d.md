@@ -725,3 +725,85 @@ Testes (`tests/it/transcript.rs`, novo; o `mod transcript;` em `tests/it/main.rs
 8. Gate: `pwsh -File scripts/verify.ps1`.
 
 **Commit:** `feat: WINGETRS_TRANSCRIPT records CLI and TUI text for the live proof`
+
+### Task 219: Minors da revisão da 206 (buckets)
+
+**Modelo:** sonnet (revisor sonnet).
+
+**Depois de:** 216 (fase de download do `update` e o medidor de download do CLI; `src/cli/mod.rs`, `src/install/progress.rs`). Nenhum arquivo em comum com 220.
+
+> Origem: revisão tardia da Task 206 (ledger, linha 206): APPROVE com quatro Minors, agora pedidos.
+
+#### Where this fits
+
+- `src/buckets.rs`: `lock` (`:196`, `UpdateLock::try_acquire(data.lock_path())`, ocupado ⇒ `BucketError::Busy`); `add_downloaded` (`:216-285`): lock `:224` ⇒ `fetch_bucket` `:232` ⇒ `catalog.replace_source("scoop:<nome>")` `:253` ⇒ `index_file::write` `:264` ⇒ `write_scripts` em `buckets\<nome>` `:268-274` ⇒ `http.json` `:276-281` ⇒ `cfg.save` `:282`. O comentário de `:214` promete "Any failure leaves config, catalog and index untouched", mas uma falha em `http.json` ou `cfg.save` deixa o catálogo e o índice com o bucket e o config sem ele. `remove_and_cleanup_confirmed` (`:351`): lock `:358` ⇒ `remove(cfg)` ⇒ `remove_source` ⇒ índice ⇒ apaga `buckets\<nome>` ⇒ `http.json`; devolve e **solta o lock**; o `cfg.save` é feito depois pelo chamador (`src/cli/mod.rs:1059`), fora do lock (um `update` ou `bucket add` que começa nessa janela lê o config antigo e reimporta o bucket).
+- `src/cli/mod.rs`: `bucket_add` (`:969`, seletor `ui.confirm` `:990-997`), `run_bucket` (`:1004`): `add` manda `Phase::Extracting { file: "bucket <nome>", engine: "GitHub" }` (`:1024-1027`), mostrado como "Extraindo bucket X (GitHub)" durante o **download** (sem tamanho, sem "sem dados há N s"); `rm` usa `Phase::Removing` (`:1052`). `WINGETRS_SCOOP_BASE_URL` (`:1029`) troca a URL nos testes.
+- `fetch_bucket(http, url, prev)` (`src/sources/scoop/bucket.rs:165`) chama `http.get_conditional`, sem progresso. A Task 216 deu ao `update` uma fase de download com o medidor do CLI (`DownloadMeter`/`download_parts` em `src/install/progress.rs`) e eventos `ProgressEvent::Download { url, done, total }`; use o mesmo caminho de progresso que o `update` usa para o tarball dos buckets (procure em `src/update.rs` como a 216 passa o `download::Progress` ao baixar os tarballs) em vez de criar outro.
+- Testes existentes: `tests/it/bucket_admin.rs` (`add_downloads_and_indexes_now` `:105`, `add_404_writes_nothing` `:138`, `add_tarball_without_manifests_refused` `:153`, `add_and_rm_refuse_while_update_lock_held` `:169`, `rm_default_bucket_needs_confirmation` `:215`, `rm_drops_legacy_master_url` `:227`); `tests/it/buckets.rs` (`add_unknown_needs_confirmation` `:45`, `remove_and_cleanup_purges_catalog_index_and_http_state` `:223`); `tests/it/cli_install.rs:367` `bucket_add_list_rm_round_trip` (binário real, `--yes`, sem TTY). Nenhum teste passa pelo seletor. Seletor falso: `cli::picker::fake::ScriptedTerm` (Task 212) e o `Ui` falso de `tests/it/cli_install.rs`/`install_cmd` (procure `impl Ui for` nos testes).
+
+#### What binds this task
+
+1. **`rm` grava o config dentro do lock.** `remove_and_cleanup_confirmed` ganha o `config_path` (ou o `DataDir` já basta: `data.config_path()`) e chama `cfg.save` **antes** de soltar o lock, depois de `http.json`. O `cfg.save` sai de `run_bucket` (`cli/mod.rs:1059`). `remove_and_cleanup` (sem confirmação) também grava. Atualize o doc comment (`:338-340`, "The caller saves `cfg`" deixa de valer).
+2. **`add` não deixa meio estado.** Uma falha depois do `replace_source` (índice é só aviso, como hoje; `http.json` e `cfg.save` são erros) desfaz: `catalog.remove_source("scoop:<nome>")`, regrava o índice (ou apaga, como hoje em falha), apaga `buckets\<nome>` se esta chamada o criou, e devolve o erro original. Desfazer que falha vai para `tracing::warn!` e não troca o erro. O comentário de `:214` passa a ser verdade.
+3. **Fase de download no `bucket add`.** No lugar do `Phase::Extracting` durante o download: a mesma fase de download que o `update` usa para os tarballs (216), com `ProgressEvent::Download` alimentando o medidor (tamanho, velocidade e `sem dados há N s` depois de 10 s); depois do download, `Phase::Extracting { file: "bucket <nome>", .. }` só enquanto lê o tarball e grava o catálogo. `fetch_bucket` ganha o parâmetro de progresso se for preciso (as outras chamadas passam progresso vazio, sem mudar comportamento).
+4. **Testes da CLI no caminho interativo e no `--yes`.**
+
+Testes (em `tests/it/bucket_admin.rs`, salvo o 6):
+1. `rm_saves_config_under_the_lock` (depois de `remove_and_cleanup_confirmed` devolver `Ok`, o `config.toml` em disco já não tem o bucket, sem nenhuma chamada a `cfg.save` pelo teste; e um `UpdateLock::try_acquire` tomado **antes** da chamada faz ela devolver `Busy` sem mudar o `config.toml`).
+2. `add_late_failure_rolls_back_catalog` (servidor wiremock com tarball válido; `http.json` substituído por uma **pasta** com o mesmo nome para o `save` falhar ⇒ `Err(BucketError::State(_))`; o catálogo não tem linha com `source = 'scoop:<nome>'`, o `config.toml` não tem o bucket, `buckets\<nome>` não existe).
+3. `add_config_failure_rolls_back_catalog` (o mesmo com `config.toml` substituído por uma pasta ⇒ catálogo sem a fonte).
+4. `add_reports_download_progress` (progresso gravador: a sequência de eventos tem pelo menos um `ProgressEvent::Download` com `total = Some(tamanho do tarball)` antes do primeiro `Phase::Extracting`).
+5. `add_interactive_yes_and_no` (Ui falsa interativa: `bucket_add` com bucket desconhecido e resposta "Não" ⇒ `Ok(false)`, `say` recebeu `Cancelado.`, `cfg` sem o bucket; resposta "Sim" ⇒ `Ok(true)` e `cfg` com o bucket; Ui não interativa sem `--yes` ⇒ erro que cita `--yes`).
+6. `bucket_add_unknown_with_yes_end_to_end` (em `tests/it/cli_install.rs`, binário real com `WINGETRS_SCOOP_BASE_URL` do wiremock: `bucket add meu https://github.com/x/meu --yes` ⇒ sucesso, `bucket list` mostra `meu`, stdout tem `Bucket adicionado:`).
+
+**Files:** `src/buckets.rs`, `src/cli/mod.rs` (só `run_bucket`), `src/sources/scoop/bucket.rs` (só se o progresso precisar), `tests/it/bucket_admin.rs`, `tests/it/cli_install.rs` (só o teste 6).
+
+#### Checks beyond the steps
+
+1. Mutação: tirar o desfazer do `add` ⇒ testes 2 e 3 **PEGAM**.
+2. Mutação: `cfg.save` do `rm` de volta para depois do lock (no chamador) ⇒ teste 1 **PEGA**.
+3. Mutação: não mandar `ProgressEvent::Download` ⇒ teste 4 **PEGA**.
+4. Prova no binário (orquestrador): `wingetrs bucket add java` num terminal mostra a barra de download com tamanho e depois "Extraindo bucket java".
+5. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix(buckets): rm saves config under the lock, add rolls back a late failure, download phase with progress`
+
+### Task 220: `JobLog.elevated` em todo caminho elevado; Ctrl+C não deixa `apps\<app>`
+
+**Modelo:** sonnet (revisor sonnet).
+
+**Depois de:** 216 (`src/cli/install_cmd.rs`). Nenhum arquivo em comum com 219.
+
+> Origem: prova ao vivo de 2026-10-21 (`docs/superpowers/reports/2026-10-21-prova-ao-vivo.md`, achados D4 e A2).
+
+#### Where this fits
+
+- `JobLog` (`src/job_log.rs`): campo `elevated: bool` (`:104-105`, doc "Whether the tool ran through the elevated bridge helper"), padrão `false` (`:158`), escrito em `job.start`/`job.end` (`:183`, `:193`). Hoje só `run_bridge_as` (`src/tui/jobs.rs:1031`, valor `chosen.elevated()` de `run_elevated_as` `:1018-1028`, gravado em `:1061`) liga o campo: a ponte `winget` elevada (CLI e TUI). Ficam sempre `false`:
+  - instalador nativo do winget de escopo máquina, que roda com o próprio UAC (`runas`, Task 196): CLI `src/cli/winget_cmd.rs:475` (`JobLog::start_accepting`), TUI `src/tui/jobs.rs:605`/`:742`; a decisão é `WingetPlan.elevation: Elevation` (`src/winget_install/plan.rs:50`; `enum Elevation { Never, Helper }` em `src/winget_install/launch.rs:58`, calculada por `install_elevation` `:68`);
+  - remoção de pacote winget cujo desinstalador ou chave ARP vai pelo auxiliar elevado (HKLM): CLI `src/cli/winget_cmd.rs:834` (`JobLog::start` com `kind: "remove"`), TUI equivalente em `src/tui/jobs.rs`.
+  O auxiliar (`bridge-worker`) não tem `JobLog` e continua sem (código elevado não grava em pasta do usuário).
+- Ctrl+C na instalação de app do Scoop: o download (`Step::Download`, `src/install/executor.rs:2500-2513`) vem antes de qualquer pasta do app; o arquivo parcial é apagado pelo `TmpGuard` (`src/install/download.rs:202-207`). A pasta `apps\<app>` nasce no `Step::Extract` (`own_staging` `:914`, `run.ensure_dirs(layout.app_dir(app))` `:930`, staging `apps\<app>\.staging-<v>`). Cancelado ⇒ `AwaitWorker::drop` (`:2960-2993`): espera o passo, apaga o staging e tenta `fs::remove_dir(app_dir)`, que falha calado se sobrar algo, por exemplo a pasta de trabalho do `msiexec /a` ao lado (`.staging-<v>.msiexec`) ou um temporário de extração (`extract::TEMP_PREFIX`). `is_dead_run_leftover` (`:2999`) já reconhece esses nomes, e `remove_dead_run_leftovers` (`:3005`) só roda no **próximo** `own_staging` (`:929`). Na prova, `rust` (MSI pelo `msiexec /a`) cancelado deixou `apps\rust`. O diário de desfazer (`rollback`, `:573`) só roda em `Err` (`:740`), não no cancelamento.
+
+#### What binds this task
+
+1. **`elevated` diz se algo rodou como administrador**, por qualquer caminho: doc do campo passa a "Whether anything in the job ran elevated (bridge helper or the installer's own UAC prompt)". Instalação nativa do winget com `plan.elevation == Elevation::Helper` (o mesmo valor que já decide o `runas`) ⇒ `log.elevated = true` antes do `finish`, no CLI e na TUI. Remoção que passou pelo auxiliar elevado (desinstalador HKLM ou `delete_arp_key`) ⇒ `true`. Uma função só decide isso por plano (ex.: `fn plan_runs_elevated(plan: &WingetPlan) -> bool` em `winget_install`, e a equivalente da remoção), chamada pelos dois lados.
+2. **Cancelamento limpa a pasta de um app novo.** No `AwaitWorker::drop`, depois de apagar o staging: apagar também os vizinhos que `is_dead_run_leftover` reconhece **e que esta execução criou** (`.staging-<v>.msiexec` da mesma versão, temporários de extração), e só então `remove_dir(app_dir)`. Nunca apaga nada de outra versão já instalada (`current`, `<versão>` antigas, `persist`). Falha ⇒ `tracing::warn!` com o caminho, como hoje.
+3. Nada muda no caminho de erro (o `rollback` continua igual).
+
+Testes:
+1. `job_log_native_machine_install_is_elevated` (`tests/it/job_log.rs`: plano de instalador nativo com `elevation: Elevation::Helper` e `Launcher` falso de sucesso ⇒ a linha `job.end` tem `elevated=true`; com `Elevation::Never` ⇒ `elevated=false`).
+2. `job_log_helper_removal_is_elevated` (remoção com o auxiliar falso ⇒ `elevated=true`; remoção HKCU sem auxiliar ⇒ `false`).
+3. `cancel_during_extract_removes_new_app_dir` (`tests/it/` do executor, extrator falso que cria `apps\<app>\.staging-<v>.msiexec\x` e bloqueia até o cancelamento; cancelar ⇒ depois do drop, `apps\<app>` não existe).
+4. `cancel_keeps_installed_versions` (o mesmo com `apps\<app>\1.0\` e `current` já presentes ⇒ continuam lá; só o staging e o `.msiexec` da versão nova somem).
+5. `cancel_during_download_creates_no_app_dir` (wiremock que segura o corpo; cancelar no meio ⇒ `apps\<app>` nunca existiu e não sobra arquivo em `cache`).
+
+**Files:** `src/job_log.rs` (doc), `src/cli/winget_cmd.rs`, `src/tui/jobs.rs`, `src/winget_install/` (a função de decisão), `src/install/executor.rs` (`AwaitWorker::drop`), `tests/it/job_log.rs`, testes do executor em `tests/it/` (arquivo existente de cancelamento, procure `AwaitWorker` ou `try_cancel` nos testes).
+
+#### Checks beyond the steps
+
+1. Mutação: `elevated` fixo em `false` na instalação nativa ⇒ teste 1 **PEGA**.
+2. Mutação: `drop` sem apagar o `.msiexec` ⇒ teste 3 **PEGA**.
+3. Mutação: `drop` apaga todo `is_dead_run_leftover` e também `1.0` (troca o filtro por "tudo") ⇒ teste 4 **PEGA**.
+4. Gate: `pwsh -File scripts/verify.ps1`.
+
+**Commit:** `fix: job log marks every elevated run; cancelled install leaves no new app folder`
