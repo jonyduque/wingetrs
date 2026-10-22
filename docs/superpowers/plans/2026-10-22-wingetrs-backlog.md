@@ -15,6 +15,7 @@
 | 231 | G — `install --portable` (MSI sem UAC) | 229, 205, decisões D-G |
 | 232 | I — barra de progresso na extração (CLI e TUI) | 230, 205, 207 |
 | 233 | `uninstall_by_winget` sem PATH (segurança) | — |
+| 234 | `reg.exe`/`msiexec.exe` por KnownFolder (segurança, revisão da 233) | — |
 
 **Decisões do usuário (2026-10-22):**
 - d-E = B: um pwsh reaproveitado por execução, cache por SHA, e o AST nunca deixa o veredito mais brando.
@@ -2543,3 +2544,24 @@ Testes (`tests/it/wi_msi_portable.rs`, novo; `mod wi_msi_portable;` do orquestra
 
 ---
 
+
+## Bloco 234
+
+### Task 234: Caminhos de sistema por KnownFolder, não pelo ambiente (`reg.exe`, `msiexec.exe`)
+
+**Modelo:** sonnet (revisor opus: segurança). Origem: revisão da Task 233 (2026-10-22).
+- `src/install/registry_win.rs` (`reg_exe()`, perto da linha 402) monta o caminho de `reg.exe` a partir de `%SystemRoot%` do ambiente. Num terminal de administrador, o ambiente vem do usuário (o `HKCU\Environment` é gravável sem admin). Um `SystemRoot` trocado faria o `export` rodar como admin o `reg.exe` que o usuário quiser. Se o Windows deixa o HKCU sobrescrever `SystemRoot` não foi verificado; a correção vale de qualquer jeito.
+- `src/install/msiexec_win.rs` (perto da linha 57) usa `Command::new("msiexec.exe")` com nome solto. A busca do std olha a pasta do exe antes da System32.
+
+**Files:** `src/install/registry_win.rs`, `src/install/msiexec_win.rs`, os testes do módulo.
+
+**Contrato:**
+- `reg_exe()` usa `FOLDERID_System`, como `orphans_win.rs` (perto da linha 20). Nenhuma leitura de `SystemRoot`/`windir` do ambiente para montar caminho de executável.
+- O `msiexec` da extração usa `launch_win::msiexec_path()` (KnownFolder) ou um equivalente já existente.
+- Uma regra do `check_rules.ps1` recusa `env::var("SystemRoot")`, `env::var("windir")` e `Command::new("<nome>.exe")` com nome solto em `src/` fora de `#[cfg(test)]`. Use lista de exceções só se houver caso legítimo, justificado no relatório. Prove a regra plantando a violação, vendo o gate falhar e restaurando.
+
+#### Verificação (cole cada `[OK] mutação PEGA`)
+- Um teste confere que `reg_exe()` termina em `System32\reg.exe` mesmo com `SystemRoot` trocado no ambiente do teste (`std::env::set_var` dentro de um teste serializado, restaurado no fim). Mutação: voltar ao `%SystemRoot%` faz o teste falhar.
+- O selftest do `check_rules` ganha um caso de cada padrão proibido.
+
+**Relatório:** `.claude/tasks/task-234-report.md`.
