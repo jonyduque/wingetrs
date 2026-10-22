@@ -31,6 +31,7 @@
     - os tipos 7, 23 e 39 bloqueiam sempre;
     - as ações imediatas viram perda avisada.
   - Na 231, `Shortcut.Name` passa por `install::safepath` antes de virar `.lnk`.
+  - Na 231, `main_dir = Some([])` (INSTALLDIR com DefaultDir "." direto sob TARGETDIR) é tratado como "sem extract_dir" ou recusado, com teste.
 
 ## Bloco 233
 
