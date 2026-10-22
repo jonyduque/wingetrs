@@ -2,6 +2,8 @@
 
 Decisão do usuário (2026-10-18): estes itens esperam o fim das fases 2c e 2d. Cada um vira tarefa com brief quando chegar a vez.
 
+Planejados em 2026-10-22 (A, B, C, D, E, G, H, I ⇒ Tasks 223–232, mais 233): `docs/superpowers/plans/2026-10-22-wingetrs-backlog.md`. F ⇒ Tasks 209–211 do plano pós-2d.
+
 | # | Item | Dado medido | Antes de começar |
 |---|---|---|---|
 | A | `list` mais rápido: `scan_msix_props` | 2026-10-17, release: `list` 293 ms (delta 262 ms sobre o processo vazio); `scan_all` 195 ms, dos quais `scan_msix_props` 155–168 ms; `normalizer_new` 64 ms em paralelo; `correlate` 30 ms. Ganho estimado ~150 ms. | Spans por etapa já existem; A/B com `scripts/bench.ps1 -Baseline`. |
