@@ -4,6 +4,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/licen%C3%A7a-MIT-blue" alt="Licença MIT"></a>
   <a href="https://github.com/jonyduque/wingetrs/releases"><img src="https://img.shields.io/github/v/release/jonyduque/wingetrs" alt="Último release"></a>
   <img src="https://img.shields.io/badge/plataforma-Windows-0078D6" alt="Plataforma Windows">
+  <a href="https://github.com/jonyduque/wingetrs/actions/workflows/ci.yml"><img src="https://github.com/jonyduque/wingetrs/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
 
 # wingetrs

@@ -638,6 +638,9 @@ mod win {
 
     #[test]
     fn staging_dacl_has_no_users() {
+        if crate::non_elevated::skip_if_elevated_in_ci("o administrador grava no staging") {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();

@@ -1,0 +1,77 @@
+# The same gate as scripts/verify.ps1, on Windows, at every push and pull request (Task 222).
+# No secrets, nothing published; every action pinned by commit SHA.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate (windows)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-21
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: cargo fetch
+        run: cargo fetch --locked
+
+      # The runner is elevated without UAC: the tests of tests/it/non_elevated.txt print
+      # `pulado: processo elevado na CI` and end early. No capture, so those lines reach the log.
+      - name: gate (scripts/verify.ps1)
+        id: gate
+        env:
+          RUST_TEST_NOCAPTURE: '1'
+        run: |
+          pwsh -NoProfile -File scripts/verify.ps1 | Tee-Object -FilePath target/verify-summary.txt
+          exit $LASTEXITCODE
+
+      - name: linhas [FAIL] e fim do log
+        if: failure() && steps.gate.outcome == 'failure'
+        run: |
+          Select-String -Path target/verify-summary.txt -Pattern '^\[FAIL\]' -ErrorAction SilentlyContinue |
+            ForEach-Object Line
+          '---- fim de target/verify.log ----'
+          Get-Content target/verify.log -Tail 200 -ErrorAction SilentlyContinue
+
+      - name: pulados por elevação no gate
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
+        run: |
+          $n = @(Select-String -Path target/verify.log -Pattern 'pulado: processo elevado na CI' -SimpleMatch -ErrorAction SilentlyContinue).Count
+          $listed = @(Get-Content tests/it/non_elevated.txt | Where-Object { $_.Trim() }).Count
+          "Gate: $n de $listed testes pulados por processo elevado na CI." | Add-Content $env:GITHUB_STEP_SUMMARY
+          "pulados no gate: $n de $listed"
+
+      - name: testes não elevados como usuário comum
+        run: pwsh -NoProfile -File scripts/ci_non_elevated.ps1
+
+      - name: subir target/verify.log
+        if: failure() && steps.gate.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-log
+          path: target/verify.log
+          retention-days: 7
+          if-no-files-found: ignore

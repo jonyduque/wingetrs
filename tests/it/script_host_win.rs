@@ -106,6 +106,9 @@ impl Unit {
 
 #[test]
 fn args_exact() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let u = unit();
     let out = u.host(0, "").run(&u.job()).unwrap();
     assert_eq!(out.code, 0);
@@ -118,6 +121,9 @@ fn args_exact() {
 
 #[test]
 fn env_scoop_set_psmodulepath_removed() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let u = unit();
     u.host(0, "").run(&u.job()).unwrap();
     assert_eq!(
@@ -129,6 +135,9 @@ fn env_scoop_set_psmodulepath_removed() {
 
 #[test]
 fn env_path_is_fixed_not_inherited() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let u = unit();
     let program = fake_pwsh(u.t.path(), &u.out, 0, "");
     PwshHost::with_program(program.clone())
@@ -165,6 +174,9 @@ fn env_path_is_fixed_not_inherited() {
 
 #[test]
 fn cwd_is_workdir() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let u = unit();
     u.host(0, "").run(&u.job()).unwrap();
     let cwd = u.value("CWD").unwrap();
@@ -177,6 +189,9 @@ fn cwd_is_workdir() {
 
 #[test]
 fn exit_code_and_lines() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let u = unit();
     let out = u
         .host(3, "echo linha1\r\necho linha2\r\n")
@@ -188,6 +203,9 @@ fn exit_code_and_lines() {
 
 #[test]
 fn policy_error_mapped() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let u = unit();
     let extra = "echo Arquivo runner.ps1 nao pode ser carregado. UnauthorizedAccess segredo-QX\r\n";
     let err = u.host(1, extra).run(&u.job()).unwrap_err();
@@ -396,6 +414,9 @@ impl World {
 
 #[tokio::test]
 async fn workdir_removed_with_code_1() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let w = world().await;
     let out = w.t.path().join("record.txt");
     let host = PwshHost::with_program(fake_pwsh(w.t.path(), &out, 1, "echo falhou\r\n"));
@@ -437,6 +458,9 @@ async fn cancel_before_launch_runs_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_after_launch_waits_for_the_hook() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let w = world().await;
     let out = w.t.path().join("record.txt");
     let started = w.t.path().join("started.txt");

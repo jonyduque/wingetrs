@@ -66,6 +66,18 @@ $cliCases = @(
     @{ Name = 'Http::new fora do lado elevado'; File = 'src/update.rs'; Text = 'fn f() { let _ = Http::new(); }'; Want = 0 },
     @{ Name = 'for_elevated no selfupdate'; File = 'src/selfupdate/apply_win.rs'; Text = 'fn f() { let _ = Http::for_elevated(&r); }'; Want = 0 }
 )
+# Task 222: `skip_if_elevated_in_ci` only in the tests of non_elevated.txt (files under it/, list).
+$skip = "    if skip_if_elevated_in_ci(`"x`") {`n        return;`n    }`n"
+$nested = "mod win {`n    #[test]`n    fn t() {`n        if skip_if_elevated_in_ci(`"x`") {`n            return;`n        }`n    }`n}`n"
+$elevCases = @(
+    @{ Name = 'pulo em teste da lista'; A = "#[test]`nfn t() {`n$skip}`n"; List = 'a::t'; Want = 0 },
+    @{ Name = 'pulo em teste fora da lista'; A = "#[test]`nfn t() {}`n`n#[test]`nfn u() {`n$skip}`n"; List = 'a::t'; Want = 1 },
+    @{ Name = 'lista com teste que nao existe'; A = "#[test]`nfn t() {`n$skip}`n"; List = "a::t`na::sumiu"; Want = 1 },
+    @{ Name = 'lista com fn que nao e teste'; A = "fn t() {}`n"; List = 'a::t'; Want = 1 },
+    @{ Name = 'pulo em ajudante'; A = "#[test]`nfn t() {`n    h();`n}`n`nfn h() {`n$skip}`n"; List = 'a::t'; Want = 1 },
+    @{ Name = 'pulo em mod aninhado'; A = $nested; List = 'a::win::t'; Want = 0 },
+    @{ Name = 'mod aninhado sem o nome do mod'; A = $nested; List = 'a::t'; Want = 1 }
+)
 $base = Join-Path ([IO.Path]::GetTempPath()) ("check_rules_selftest-" + [guid]::NewGuid())
 $bad = @()
 try {
@@ -110,9 +122,20 @@ try {
         pwsh -NoProfile -File $checker -Path $dir *> $null
         if ($LASTEXITCODE -ne $c.Want) { $bad += "  [$($c.Name)] exit $LASTEXITCODE, esperado $($c.Want)" }
     }
+    foreach ($c in $elevCases) {
+        $n++
+        $dir = Join-Path $base "case$n"
+        $it = Join-Path $dir 'it'
+        New-Item -ItemType Directory -Force (Join-Path $dir 'src'), $it | Out-Null
+        [IO.File]::WriteAllText((Join-Path $it 'main.rs'), "mod a;`n")
+        [IO.File]::WriteAllText((Join-Path $it 'a.rs'), $c.A)
+        [IO.File]::WriteAllText((Join-Path $it 'non_elevated.txt'), $c.List + "`n")
+        pwsh -NoProfile -File $checker -Path (Join-Path $dir 'src') -ItDir $it *> $null
+        if ($LASTEXITCODE -ne $c.Want) { $bad += "  [$($c.Name)] exit $LASTEXITCODE, esperado $($c.Want)" }
+    }
 } finally {
     Remove-Item -Recurse -Force $base -ErrorAction SilentlyContinue
 }
 if ($bad.Count -gt 0) { $bad; exit 1 }
-"[OK] check_rules: $($cases.Count + $testCases.Count + $cliCases.Count + 2) casos plantados"
+"[OK] check_rules: $($cases.Count + $testCases.Count + $cliCases.Count + $elevCases.Count + 2) casos plantados"
 exit 0

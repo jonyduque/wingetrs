@@ -1,0 +1,10 @@
+elevated_install::win::staging_dacl_has_no_users
+install_file_installer::installer_win_runs_a_cmd_with_fixed_path_cwd_and_args
+script_host_win::args_exact
+script_host_win::cancel_after_launch_waits_for_the_hook
+script_host_win::cwd_is_workdir
+script_host_win::env_path_is_fixed_not_inherited
+script_host_win::env_scoop_set_psmodulepath_removed
+script_host_win::exit_code_and_lines
+script_host_win::policy_error_mapped
+script_host_win::workdir_removed_with_code_1

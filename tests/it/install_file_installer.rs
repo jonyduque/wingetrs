@@ -639,6 +639,9 @@ async fn uninstaller_runs_before_removal() {
 #[cfg(windows)]
 #[test]
 fn installer_win_runs_a_cmd_with_fixed_path_cwd_and_args() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa instalador com o processo elevado") {
+        return;
+    }
     let t = tempfile::tempdir().unwrap();
     let app = t.path().join("app dir");
     let work = t.path().join("work");

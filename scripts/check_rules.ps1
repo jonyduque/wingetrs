@@ -151,6 +151,68 @@ if ($ItDir -and (Test-Path (Join-Path $ItDir 'main.rs'))) {
         }
     }
 }
+# Task 222: the GitHub runner is elevated, and `skip_if_elevated_in_ci` ends a test early there.
+# Only the tests named in tests/it/non_elevated.txt may call it (the CI runs those again as a
+# standard user), so CI never becomes a way to skip a new test; and every name there must still
+# be a test, so the list does not rot. Blocks are tracked by indentation (rustfmt's).
+if ($ItDir -and (Test-Path $ItDir)) {
+    $itRoot = (Resolve-Path $ItDir).Path
+    $listFile = Join-Path $itRoot 'non_elevated.txt'
+    $allowed = @(if (Test-Path $listFile) { Get-Content $listFile | ForEach-Object Trim | Where-Object { $_ } })
+    $testNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($f in @(Get-ChildItem -Recurse -File -Path $itRoot -Filter *.rs)) {
+        $rel = [IO.Path]::GetRelativePath($root, $f.FullName)
+        # tests/it/a.rs => `a`, tests/it/a/mod.rs => `a`, main.rs => no prefix.
+        $base = @(([IO.Path]::GetRelativePath($itRoot, $f.FullName) -replace '\.rs$', '') -split '[\\/]' |
+            Where-Object { $_ -ne 'mod' -and $_ -ne 'main' })
+        # Only files that call the helper or hold a listed test are walked (the gate's time).
+        $text = [IO.File]::ReadAllText($f.FullName)
+        $prefix = if ($base.Count) { ($base -join '::') + '::' } else { '' }
+        if (-not $text.Contains('skip_if_elevated_in_ci') -and
+            -not @($allowed | Where-Object { $_.StartsWith($prefix, [StringComparison]::Ordinal) }).Count) { continue }
+        $stack = [Collections.Generic.List[object]]::new()
+        $pendingTest = $false
+        $lines = $text -split '\r?\n'
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+            if ($line -match '^(\s*)\}' -and $stack.Count -gt 0 -and $stack[$stack.Count - 1].Indent -eq $Matches[1].Length) {
+                $stack.RemoveAt($stack.Count - 1)
+                continue
+            }
+            if ($line -match '^\s*//') { continue }
+            if ($line -match '^\s*#\[(tokio::)?test\b') { $pendingTest = $true }
+            $outer = $null
+            $mods = @()
+            foreach ($b in $stack) {
+                if ($b.Kind -eq 'fn') { if (-not $outer) { $outer = $b } } else { $mods += $b.Name }
+            }
+            if ($line -match '^(\s*)(pub(\([^)]*\))?\s+)?mod\s+(\w+)\s*\{\s*$') {
+                $stack.Add([pscustomobject]@{ Kind = 'mod'; Name = $Matches[4]; Indent = $Matches[1].Length })
+            } elseif ($line -match '^(\s*)(pub(\([^)]*\))?\s+)?(async\s+)?fn\s+(\w+)') {
+                $indent = $Matches[1].Length
+                $name = (@($base) + $mods + $Matches[5]) -join '::'
+                $isTest = $pendingTest -and -not $outer
+                if ($isTest) { [void]$testNames.Add($name) }
+                $pendingTest = $false
+                # One-line bodies and declarations open no block.
+                if ($line -notmatch '(\}|;)\s*$') {
+                    $stack.Add([pscustomobject]@{ Kind = 'fn'; Name = $name; Indent = $indent; Test = $isTest })
+                }
+            }
+            if ($line -match '\bskip_if_elevated_in_ci\s*\(' -and $line -notmatch '\bfn\s+skip_if_elevated_in_ci\b') {
+                if (-not $outer -or -not $outer.Test -or $allowed -cnotcontains $outer.Name) {
+                    $where = if ($outer) { $outer.Name } else { '(fora de fn)' }
+                    $violations += "{0}:{1}: [{2}] {3}" -f $rel, ($i + 1), 'pulo de elevado fora de tests/it/non_elevated.txt', $where
+                }
+            }
+        }
+    }
+    foreach ($a in $allowed) {
+        if (-not $testNames.Contains($a)) {
+            $violations += "{0}: [{1}] {2}" -f $listFile, 'teste da lista non_elevated nao existe', $a
+        }
+    }
+}
 # Task 204: a raw NUL byte in a .rs file (a test literal) makes git treat it as binary, so
 # diffs and reviews show nothing. Write `\0` instead.
 if ($Path -eq 'src') {

@@ -62,6 +62,7 @@ mod install_written_manifest;
 mod installed;
 mod job_log;
 mod manifest_2c;
+mod non_elevated;
 mod normalize;
 mod overrides;
 mod pins;
