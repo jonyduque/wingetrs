@@ -461,6 +461,9 @@ fn stdout(o: &std::process::Output) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn confirmation_block_has_header_flags_numbered_script() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let server = MockServer::start().await;
     let lab = binary_lab(&server, "t161-block", post_install()).await;
     let o = lab.run(&["install", "s", "--allow-scripts"]);
@@ -601,6 +604,9 @@ async fn plan_without_scripts_needs_no_flag() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn text_never_says_seguro() {
+    if crate::non_elevated::skip_if_elevated_in_ci("recusa scripts com o processo elevado") {
+        return;
+    }
     let server = MockServer::start().await;
     let installer = serde_json::json!({
         "pre_install": "Write-Host 'a'",

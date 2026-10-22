@@ -8,3 +8,5 @@ script_host_win::env_scoop_set_psmodulepath_removed
 script_host_win::exit_code_and_lines
 script_host_win::policy_error_mapped
 script_host_win::workdir_removed_with_code_1
+cli_scripts::confirmation_block_has_header_flags_numbered_script
+cli_scripts::text_never_says_seguro
