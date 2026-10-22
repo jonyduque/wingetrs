@@ -485,3 +485,52 @@ async fn tui_and_cli_bucket_ops_are_equivalent() {
     assert_eq!(removed.1.len(), 2, "{removed:?}");
     assert!(removed.2.is_empty(), "{removed:?}");
 }
+
+/// The job applies the same rule as the dialog: a third-party bucket without `confirmed` is
+/// refused before any download, and nothing is saved.
+#[tokio::test]
+async fn job_refuses_unconfirmed_third_party_add() {
+    let s = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/mine.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bucket_tgz()))
+        .mount(&s)
+        .await;
+    let url = format!("{}/mine.tgz", s.uri());
+    let d = tempfile::tempdir().unwrap();
+    let data = DataDir::new(d.path());
+    Config::default().save(&data.config_path()).unwrap();
+    let before = std::fs::read(data.config_path()).unwrap();
+    let r = jobs::bucket_add(
+        &data,
+        &Http::new().unwrap(),
+        "mine",
+        "someone/scoop-mine",
+        false,
+        Some(&url),
+        &|_| {},
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(InstallFail::Other(m)) if m.contains("não é conhecido")),
+        "{r:?}"
+    );
+    assert!(s.received_requests().await.unwrap().is_empty());
+    assert_eq!(std::fs::read(data.config_path()).unwrap(), before);
+    assert!(!data.catalog_path().exists());
+}
+
+/// A default bucket is removed by the job only with `confirmed`.
+#[test]
+fn job_refuses_unconfirmed_default_remove() {
+    let d = tempfile::tempdir().unwrap();
+    let data = DataDir::new(d.path());
+    Config::default().save(&data.config_path()).unwrap();
+    let before = std::fs::read(data.config_path()).unwrap();
+    let r = jobs::bucket_remove(&data, "extras", false);
+    assert!(
+        matches!(&r, Err(InstallFail::Other(m)) if m.contains("bucket padrão")),
+        "{r:?}"
+    );
+    assert_eq!(std::fs::read(data.config_path()).unwrap(), before);
+}

@@ -34,7 +34,7 @@ fn show_hint(app: &App) -> &'static str {
 pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let queue = app.running.is_some() || !app.queue.is_empty();
     if app.tab == Tab::Settings {
-        let mut out = vec![("enter", "mudar")];
+        let mut out = vec![("enter", "mudar"), ("b", "gerenciar buckets")];
         if queue {
             out.push(("f", "fila"));
         }

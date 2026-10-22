@@ -1117,7 +1117,7 @@ fn draw_status(app: &App, theme: &Theme, g: &Glyphs, frame: &mut Frame, area: Re
 }
 
 fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
-    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 18 + 2 * DIALOG_PAD_Y);
+    let rect = centered(area, 52 + 2 * DIALOG_PAD_X, 19 + 2 * DIALOG_PAD_Y);
     let key = |k: &str, d: &str| {
         Line::from(vec![
             Span::styled(
@@ -1138,6 +1138,7 @@ fn draw_help(theme: &Theme, frame: &mut Frame, area: Rect) {
         key("u", "remover (aba Instalados)"),
         key("U", "atualizar (aba Atualizações)"),
         key("f", "fila de operações"),
+        key("b", "gerenciar buckets (aba Ajustes)"),
         key("Ctrl+S", "filtrar fonte"),
         key("Ctrl+E", "mostrar (aba Instalados)"),
         key("Ctrl+R", "atualizar catálogo"),
