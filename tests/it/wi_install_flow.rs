@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
-use wingetrs::bridge::worker::{DeleteReason, MachineHive};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive, PackageRequest};
 use wingetrs::cache::{DataDir, UpdateLock, sha256_hex};
 use wingetrs::http::Http;
 use wingetrs::install::executor::LaunchGate;
@@ -22,8 +22,8 @@ use wingetrs::winget_install::launch::{LaunchSpec, Launcher, Show, Verb};
 use wingetrs::winget_install::msix::{AddResult, MsixError, MsixOps};
 use wingetrs::winget_install::ops::{WingetCtx, WingetOpsError, install};
 use wingetrs::winget_install::plan::{
-    ADMIN_PROMPT, ADMIN_PROMPT_MSI, MSIX_SCOPE_STEP, MSIX_STEP, PlanOrBridge, RUN_FOLDER_NOTE,
-    SELF_ADMIN_PROMPT, WingetPlan, plan, plan_with_mode,
+    ADMIN_PROMPT, MSIX_SCOPE_STEP, MSIX_STEP, PlanOrBridge, RUN_FOLDER_NOTE, SELF_ADMIN_PROMPT,
+    WingetPlan, plan, plan_with_mode,
 };
 use wingetrs::winget_install::post_check::find_installed;
 use wingetrs::winget_install::select::{Host, Scope, ScopeWanted};
@@ -100,10 +100,27 @@ impl Launcher for FakeLauncher {
     }
 }
 
-/// The session's helper: no install flow may ask it anything (Task 196).
+/// The session's helper. Uninstalls and key deletions are never asked by an install flow.
+/// Installs (Task 202) get the queued answers in order; with none left, the helper cannot exist
+/// (wingetrs outside an administrator-only folder) and the flow falls back to the installer's
+/// own UAC prompt (Task 196).
 #[derive(Default)]
 struct FakeElevated {
     calls: Mutex<Vec<String>>,
+    installs: Mutex<VecDeque<Result<i32, ElevatedError>>>,
+    requests: Mutex<Vec<PackageRequest>>,
+    /// Lines sent back on every install request, before its answer.
+    lines: Mutex<Vec<String>>,
+}
+
+impl FakeElevated {
+    fn answer(&self, r: Result<i32, ElevatedError>) {
+        self.installs.lock().unwrap().push_back(r);
+    }
+
+    fn requests(&self) -> Vec<PackageRequest> {
+        self.requests.lock().unwrap().clone()
+    }
 }
 
 impl ElevatedRunner for FakeElevated {
@@ -136,6 +153,27 @@ impl ElevatedRunner for FakeElevated {
     ) -> Result<(), ElevatedError> {
         self.calls.lock().unwrap().push(format!("delete {key}"));
         Err(ElevatedError::Remote("not used".into()))
+    }
+    fn install_package_lines(
+        &self,
+        req: &PackageRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        self.requests.lock().unwrap().push(req.clone());
+        for l in self.lines.lock().unwrap().iter() {
+            on_line(l);
+        }
+        self.installs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                Err(ElevatedError::NotAdminFolder(
+                    wingetrs::bridge::helper_folder::refusal_text(Path::new(
+                        r"C:\Users\u\Downloads",
+                    )),
+                ))
+            })
     }
 }
 #[derive(Default)]
@@ -736,9 +774,9 @@ fn plan_text_is_the_confirmation() {
         eula,
     );
     let text = native(&msi, Scope::Machine).to_string();
-    assert!(text.contains(ADMIN_PROMPT_MSI), "{text}");
+    // Task 202: the same line for msi and exe (the session's helper runs both).
+    assert!(text.contains(ADMIN_PROMPT), "{text}");
     assert!(text.contains(RUN_FOLDER_NOTE), "{text}");
-    assert!(!text.contains(ADMIN_PROMPT), "{text}");
     let inno_machine = manifest_of("inno", Some("machine"), "https://h/setup.exe", &sha, "", "");
     let machine_text = native(&inno_machine, Scope::Machine).to_string();
     assert!(machine_text.contains(ADMIN_PROMPT), "{machine_text}");
@@ -760,7 +798,6 @@ fn plan_text_is_the_confirmation() {
     let inno = manifest_of("inno", Some("user"), "https://h/setup.exe", &sha, "", "");
     let text = native(&inno, Scope::User).to_string();
     assert!(!text.contains(ADMIN_PROMPT), "{text}");
-    assert!(!text.contains(ADMIN_PROMPT_MSI), "{text}");
     assert!(!text.contains(RUN_FOLDER_NOTE), "{text}");
     assert!(!text.contains("Abre a janela"), "{text}");
 
@@ -902,7 +939,13 @@ fn consumers_show_new_phases() {
     let running = Phase::RunningInstaller { name: "X".into() };
     assert!(phase_status(&running, Duration::ZERO).contains("não pode ser cancelado"));
     assert!(!phase_status(&Phase::Verifying, Duration::ZERO).contains("não pode"));
-    let phases = [Phase::WaitingElevation, running.clone(), Phase::Verifying];
+    let preparing = Phase::HelperPreparing { name: "X".into() };
+    let phases = [
+        Phase::WaitingElevation,
+        preparing.clone(),
+        running.clone(),
+        Phase::Verifying,
+    ];
 
     let glyphs = Glyphs::for_set(GlyphSet::Ascii);
     let throttle = ProgressThrottle::new(Instant::now());
@@ -944,6 +987,10 @@ fn consumers_show_new_phases() {
         "Instalador de X rodando (pode abrir janelas)"
     );
     assert_eq!(phase_title(&Phase::Verifying), "Conferindo a instalação");
+    assert_eq!(
+        phase_title(&preparing),
+        "Baixando e conferindo o instalador de X como administrador"
+    );
 
     // TUI status bar: the running installer cannot be cancelled.
     let mut a = App::new(Vec::new(), GlyphSet::Ascii);
@@ -955,6 +1002,10 @@ fn consumers_show_new_phases() {
     });
     update(&mut a, Msg::InstallPhase(Phase::Verifying));
     assert!(!a.installer_running);
+    // Task 202: the helper's catalog and download checks are already past the gate.
+    update(&mut a, Msg::InstallPhase(preparing));
+    assert!(a.installer_running);
+    a.installer_running = false;
     // Sent after the launch gate: the elevated installer may already run.
     update(&mut a, Msg::InstallPhase(Phase::WaitingElevation));
     assert!(a.installer_running);
@@ -1442,4 +1493,208 @@ fn dry_run_hash_is_upper_case() {
         ),
         "{details:?}"
     );
+}
+// ---- Task 202: installers that run elevated go through the session's helper ----
+
+/// A plan for an installer the server must never serve: the helper downloads it itself.
+async fn unserved_plan(kind: &str, scope: Option<&str>, extra: &str) -> (MockServer, WingetPlan) {
+    let body = bytes();
+    let sha = sha256_hex(&body);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/setup"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let m = manifest_of(
+        kind,
+        scope,
+        &format!("{}/setup", server.uri()),
+        &sha,
+        extra,
+        "",
+    );
+    (server, native(&m, Scope::Machine))
+}
+
+fn helper_lines() -> Vec<String> {
+    use wingetrs::bridge::signed_install::{
+        CHECKING_CATALOG, DOWNLOADING_INSTALLER, INSTALLER_RUNNING,
+    };
+    use wingetrs::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE};
+    [
+        ELEVATION_NOTICE,
+        ELEVATION_GRANTED,
+        CHECKING_CATALOG,
+        DOWNLOADING_INSTALLER,
+        INSTALLER_RUNNING,
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+/// A machine-scope installer: one request to the helper with the package, the installer's
+/// position and the mode (nothing about the file); nothing downloaded nor launched here; the
+/// helper's lines move the phases (its UAC, its catalog and download checks, the installer);
+/// the operation is recorded with the manifest's SHA-256.
+#[tokio::test]
+async fn machine_installer_goes_through_the_helper() {
+    use wingetrs::bridge::worker::{ModeArg, ScopeArg};
+    let env = Env::new();
+    let (server, p) = unserved_plan("inno", Some("machine"), "").await;
+    env.elevated.answer(Ok(0));
+    *env.elevated.lines.lock().unwrap() = helper_lines();
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await.unwrap();
+    assert_eq!(r.outcome, Outcome::Ok);
+    assert_eq!(r.log, None);
+    assert_eq!(
+        env.elevated.requests(),
+        [PackageRequest {
+            id: "Pub.App".into(),
+            version: "1.0".into(),
+            installer: 0,
+            scope: ScopeArg::Machine,
+            mode: ModeArg::SilentWithProgress,
+            upgrade: false,
+        }]
+    );
+    assert_eq!(env.calls(), (0, 0, 0));
+    assert!(
+        !env.root().join("installers").exists(),
+        "nothing downloaded here"
+    );
+    let events = env.events.lock().unwrap().clone();
+    let at = |p: Phase| {
+        events
+            .iter()
+            .position(|e| *e == ProgressEvent::Phase(p.clone()))
+            .unwrap_or_else(|| panic!("{p:?} missing: {events:?}"))
+    };
+    let preparing = Phase::HelperPreparing {
+        name: "Contoso App".into(),
+    };
+    let running = Phase::RunningInstaller {
+        name: "Contoso App".into(),
+    };
+    assert!(
+        at(Phase::WaitingElevation) < at(preparing.clone()),
+        "{events:?}"
+    );
+    assert!(at(preparing) < at(running.clone()), "{events:?}");
+    assert!(at(running) < at(Phase::Verifying), "{events:?}");
+    let conn = rusqlite::Connection::open(env.root().join("state.db")).unwrap();
+    let sha: String = conn
+        .query_row("SELECT sha256 FROM winget_ops", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sha, sha256_hex(&bytes()));
+    drop(server);
+
+    // An MSI: the same request, its own mode.
+    let env = Env::new();
+    let (_server, p) = unserved_plan("msi", Some("machine"), "").await;
+    env.elevated.answer(Ok(0));
+    let ctx = ctx!(env);
+    install(&ctx, &p).await.unwrap();
+    let reqs = env.elevated.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].mode, ModeArg::SilentWithProgress);
+    assert_eq!(env.calls(), (0, 0, 0));
+}
+
+/// What the helper answers decides the result: a refused UAC, a refusal or a lost helper are
+/// errors with nothing launched here; an exit code is classified like any installer's.
+#[tokio::test]
+async fn helper_answers_are_the_result() {
+    let cases: [(Result<i32, ElevatedError>, &str); 4] = [
+        (Err(ElevatedError::Refused), UAC_REFUSED),
+        (
+            Err(ElevatedError::Remote("catálogo recusado".into())),
+            "catálogo recusado",
+        ),
+        (Err(ElevatedError::Lost("canal".into())), "canal"),
+        (Ok(1603), "1603"),
+    ];
+    for (answer, text) in cases {
+        let env = Env::new();
+        let (_server, p) = unserved_plan("msi", Some("machine"), "").await;
+        env.elevated.answer(answer);
+        let ctx = ctx!(env);
+        let e = install(&ctx, &p).await.unwrap_err();
+        assert!(e.to_string().contains(text), "{e}");
+        assert_eq!(env.elevated.requests().len(), 1);
+        assert_eq!(env.launcher.calls.lock().unwrap().len(), 0, "{e}");
+        assert!(!env.root().join("state.db").exists());
+    }
+    let env = Env::new();
+    let (_server, p) = unserved_plan("msi", Some("machine"), "").await;
+    env.elevated.answer(Err(ElevatedError::Refused));
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::UacRefused), "{e:?}");
+}
+
+/// Without a helper this session (wingetrs outside an administrator-only folder), the
+/// installer asks for its own UAC prompt (Task 196) after one request; the launch gate is
+/// free again for the fallback's download.
+#[tokio::test]
+async fn no_helper_falls_back_to_runas() {
+    let env = Env::new();
+    let (_s, p, _) = served_plan("inno", Some("machine"), Scope::Machine, "", "").await;
+    let gate = env.gate.clone();
+    *env.on_phase.lock().unwrap() = Some(Box::new(move |p: &Phase| {
+        // The fallback's download starts with `Preparing`, after the request came back.
+        if *p == Phase::Preparing {
+            assert!(gate.running().is_none(), "gate still taken: {p:?}");
+        }
+    }));
+    let ctx = ctx!(env);
+    install(&ctx, &p).await.unwrap();
+    *env.on_phase.lock().unwrap() = None;
+    assert_eq!(env.elevated.requests().len(), 1);
+    let calls = env.launcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].verb, Verb::RunAs);
+}
+
+/// A cancel before the launch gate sends nothing to the helper.
+#[tokio::test]
+async fn cancel_before_the_helper_sends_nothing() {
+    let env = Env::new();
+    let (_s, p) = unserved_plan("inno", Some("machine"), "").await;
+    env.elevated.answer(Ok(0));
+    assert!(env.gate.try_cancel());
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await;
+    assert!(matches!(r, Err(WingetOpsError::Cancelled)), "{r:?}");
+    assert!(env.elevated.requests().is_empty());
+}
+
+/// Windows Installer types: a 1618 from the helper is retried with a new request.
+#[tokio::test]
+async fn helper_1618_is_retried() {
+    let env = Env::new();
+    let (_s, p) = unserved_plan("msi", Some("machine"), "").await;
+    env.elevated.answer(Ok(1618));
+    env.elevated.answer(Ok(0));
+    let ctx = ctx!(env);
+    let r = install(&ctx, &p).await.unwrap();
+    assert_eq!(r.outcome, Outcome::Ok);
+    assert_eq!(env.elevated.requests().len(), 2);
+    assert!(!env.sleeps.lock().unwrap().is_empty());
+}
+
+/// A plan whose command line the helper would not build itself is refused before any request.
+#[tokio::test]
+async fn changed_command_line_never_reaches_the_helper() {
+    let env = Env::new();
+    let (_s, mut p) = unserved_plan("inno", Some("machine"), "").await;
+    p.command.as_mut().unwrap().args.push_str(" /NOICONS");
+    env.elevated.answer(Ok(0));
+    let ctx = ctx!(env);
+    let e = install(&ctx, &p).await.unwrap_err();
+    assert!(matches!(e, WingetOpsError::Elevated(_)), "{e:?}");
+    assert!(env.elevated.requests().is_empty());
+    assert_eq!(env.calls(), (0, 0, 0));
 }

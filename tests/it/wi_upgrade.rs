@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use wingetrs::bridge::elevated::{ElevatedError, ElevatedRunner};
-use wingetrs::bridge::worker::{DeleteReason, MachineHive};
+use wingetrs::bridge::worker::{DeleteReason, MachineHive, PackageRequest};
 use wingetrs::bridge::{Applicability, host_arch, winget_applicability};
 use wingetrs::cache::{DataDir, UpdateLock, sha256_hex};
 use wingetrs::config::{DefaultScope, InstallerMode, WingetEngine};
@@ -454,6 +454,37 @@ impl ElevatedRunner for NoElevated {
     }
 }
 
+/// The session's helper for installs (Task 202): records `helper_install` and the request;
+/// answers `code`, or, without one, cannot exist (wingetrs outside an administrator-only
+/// folder), so the flow falls back to the installer's own UAC prompt (Task 196).
+struct FakeHelper {
+    events: Events,
+    code: Option<i32>,
+    requests: Mutex<Vec<PackageRequest>>,
+}
+
+impl ElevatedRunner for FakeHelper {
+    fn install_package_lines(
+        &self,
+        req: &PackageRequest,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        self.requests.lock().unwrap().push(req.clone());
+        match self.code {
+            Some(code) => {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push("helper_install".to_string());
+                Ok(code)
+            }
+            None => Err(ElevatedError::NotAdminFolder(
+                wingetrs::bridge::helper_folder::refusal_text(Path::new(r"C:\Users\u\Downloads")),
+            )),
+        }
+    }
+}
+
 struct NoMsix;
 
 impl MsixOps for NoMsix {
@@ -533,6 +564,8 @@ struct World {
     events: Events,
     install: FakeLauncher,
     uninstall: FakeLauncher,
+    /// The helper the install asks first (none by default: the `runas` fallback).
+    helper: FakeHelper,
     clock: FakeClock,
     /// Whether the ARP key is still there after the uninstaller ran.
     key_stays: bool,
@@ -605,6 +638,11 @@ impl World {
         World {
             install: launcher("install", None),
             uninstall: launcher("uninstall", Some(gate.clone())),
+            helper: FakeHelper {
+                events: events.clone(),
+                code: None,
+                requests: Mutex::new(Vec::new()),
+            },
             events: events.clone(),
             _tmp: tmp,
             _server: server,
@@ -664,7 +702,7 @@ impl World {
             },
             gate: self.gate.clone(),
             launcher: &self.install,
-            elevated: &NoElevated,
+            elevated: &self.helper,
             msix: &NoMsix,
             scan: &scan,
             msiexec: msiexec.clone(),
@@ -1219,6 +1257,34 @@ async fn uninstall_first_machine_install_runs_elevated_without_log() {
         !low.contains("/log") && !low.contains("<logpath>"),
         "{params:?}"
     );
+}
+
+/// Task 202: with the session's helper, the fresh install after removing the previous version
+/// is one helper request without the `Upgrade` switch; the installer is still downloaded and
+/// verified here before anything is removed (a failed download removes nothing), and nothing
+/// is launched here.
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_first_machine_install_goes_through_the_helper() {
+    let mut w = World::new_scoped("inno", Some("uninstallPrevious"), "", false, "machine").await;
+    w.helper.code = Some(0);
+    let p = native(&w.manifest, ScopeWanted::Only(Scope::Machine), Some("0.9"));
+    let r = w.run(&p).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        w.events(),
+        [
+            "fetch",
+            "launch_gate",
+            "uninstall",
+            "wait_key",
+            "helper_install"
+        ]
+    );
+    assert!(w.install.verbs.lock().unwrap().is_empty());
+    let reqs = w.helper.requests.lock().unwrap().clone();
+    assert_eq!(reqs.len(), 1);
+    assert!(!reqs[0].upgrade, "{reqs:?}");
+    assert_eq!(reqs[0].installer as usize, p.index);
 }
 
 /// The bridge runner of an `UninstallCtx` whose uninstall never goes through winget.

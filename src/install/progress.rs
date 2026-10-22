@@ -61,6 +61,9 @@ pub enum Phase {
     WaitingElevation,
     /// Native winget install: the installer of `name` is running (cannot be cancelled).
     RunningInstaller { name: String },
+    /// Native winget install through the elevated helper (Task 202): it checks the signed
+    /// catalog and downloads and checks the installer of `name` (cannot be cancelled).
+    HelperPreparing { name: String },
     /// Native winget install: looking for the app among the installed ones.
     Verifying,
     /// Native removal: copying the data folders another installation shares to the backups.
@@ -144,6 +147,9 @@ pub fn phase_title(phase: &Phase) -> String {
         Phase::RunningInstaller { name } => {
             format!("Instalador de {name} rodando (pode abrir janelas)")
         }
+        Phase::HelperPreparing { name } => {
+            format!("Baixando e conferindo o instalador de {name} como administrador")
+        }
         Phase::Verifying => "Conferindo a instalação".into(),
         Phase::CopyingFolders => "Copiando as pastas de dados para backups".into(),
         Phase::Uninstalling { name } => {
@@ -200,6 +206,7 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
     match phase {
         Phase::Installer { .. }
         | Phase::RunningInstaller { .. }
+        | Phase::HelperPreparing { .. }
         | Phase::WaitingElevation
         | Phase::Uninstalling { .. }
         | Phase::CheckingRemoval { .. }

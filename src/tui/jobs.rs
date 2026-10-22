@@ -114,6 +114,7 @@ pub fn progress_msg(throttle: &ProgressThrottle, now: Instant, ev: &ProgressEven
             | Phase::Scanning
             | Phase::WaitingElevation
             | Phase::RunningInstaller { .. }
+            | Phase::HelperPreparing { .. }
             | Phase::Verifying
             | Phase::CopyingFolders
             | Phase::Uninstalling { .. }

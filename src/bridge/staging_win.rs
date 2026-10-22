@@ -393,6 +393,43 @@ pub fn run_tool(
     out
 }
 
+/// How long the helper waits for the processes an installer left in its job after it exited.
+pub const INSTALL_LINGER: Duration = Duration::from_secs(60);
+/// Line the helper sends while it waits for them.
+pub const WAITING_INSTALLER: &str = "aguardando os processos do instalador terminarem";
+
+/// Runs a staged installer (Task 202): `staged.program` must be the checked installer in its run
+/// folder `staged.dir` (or the system `msiexec` for a package there); it runs from that folder in
+/// a job (`spawn_win::run_in_job`) with `installer_env` and `TEMP`/`TMP` in a new `tmp` inside it,
+/// so nothing it loads or unpacks sits in a folder the user writes. The other processes of the
+/// job are waited for up to `linger`. The installer's exit code and whether they all ended.
+pub fn run_staged(
+    staged: &super::signed_install::Staged,
+    sys: &SystemEnv,
+    linger: Duration,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<super::spawn_win::JobEnd> {
+    let in_dir = staged.installer.parent() == Some(staged.dir.as_path());
+    let program_ok = staged.program == staged.installer
+        || (staged.kind.is_msi() && staged.program == sys.system32.join("msiexec.exe"));
+    if !in_dir || !program_ok {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "instalador fora da pasta de execução",
+        ));
+    }
+    let tmp = staged.dir.join(TMP_NAME);
+    std::fs::create_dir(&tmp)?;
+    super::spawn_win::run_in_job(
+        &staged.program,
+        &staged.params,
+        &staged.dir,
+        &installer_env(sys, &tmp),
+        linger,
+        &mut || on_line(WAITING_INSTALLER),
+    )
+}
+
 /// Whether `name` is an execution folder name (32 lowercase hex).
 fn run_name(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

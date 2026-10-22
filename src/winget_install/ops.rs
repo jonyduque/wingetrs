@@ -1,10 +1,12 @@
 //! Native install flow (Task 181): download, verify, launch (unelevated, or elevated through
-//! the installer's own UAC prompt, Task 196), classify the exit code and look for the app among
-//! the installed ones.
+//! the session's helper, which takes the installer from the signed catalog itself, Task 202;
+//! the installer's own UAC prompt when the helper cannot run, Task 196), classify the exit code
+//! and look for the app among the installed ones.
 //!
 //! Order: `install.lock` → download → hash again through a share-deny handle → `msi.lock`
 //! (command-line installers) → launch gate → launch → share-deny handle released → classify →
-//! post-check → record.
+//! post-check → record. Through the helper: `install.lock` → `msi.lock` → launch gate → request
+//! → classify → post-check → record.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,8 +18,9 @@ use super::msix::{self, MsixOps};
 use super::plan::{WingetPlan, elevated_kind};
 use super::post_check::find_installed;
 use super::switches::{self, ArgsError, CommandLine, Program};
-use crate::bridge::elevated::ElevatedRunner;
-use crate::bridge::worker::InstallerRequest;
+use crate::bridge::elevated::{ElevatedError, ElevatedRunner};
+use crate::bridge::signed_install;
+use crate::bridge::worker::{InstallerRequest, PackageRequest, ScopeArg};
 use crate::cache::{DataDir, UpdateLock};
 use crate::http::Http;
 use crate::install::download::DownloadError;
@@ -45,7 +48,8 @@ pub struct WingetCtx<'a> {
     /// Shared with the caller: Ctrl+C cancels through it until the installer is launched.
     pub gate: LaunchGate,
     pub launcher: &'a dyn Launcher,
-    /// The session's elevated helper (uninstallers and ARP keys; never an installer).
+    /// The session's elevated helper (uninstallers, ARP keys, and installers it derives from
+    /// the signed catalog, Task 202).
     pub elevated: &'a dyn ElevatedRunner,
     pub msix: &'a dyn MsixOps,
     pub scan: &'a (dyn Fn() -> Vec<InstalledApp> + Send + Sync),
@@ -241,14 +245,22 @@ pub async fn install(
 }
 
 /// [`install`] under an `install.lock` the caller already holds (a removal and an install that
-/// must not be interleaved with another operation).
+/// must not be interleaved with another operation). An installer that runs elevated goes
+/// through the session's helper, which downloads it itself (Task 202): nothing is downloaded
+/// here unless the helper cannot exist this session.
 pub async fn install_locked(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
     install_lock: &UpdateLock,
 ) -> Result<InstallReport, WingetOpsError> {
+    if let Some(cmd) = by_helper(plan) {
+        phase(ctx, Phase::Preparing);
+        if let Some(report) = install_by_helper(ctx, plan, cmd)? {
+            return Ok(report);
+        }
+    }
     let file = fetch_verified(ctx, plan).await?;
-    install_fetched(ctx, plan, file, install_lock)
+    install_with_file(ctx, plan, file, install_lock)
 }
 
 /// Downloads the plan's installer and hashes it again through a handle that denies write,
@@ -281,8 +293,25 @@ pub async fn fetch_verified(
 }
 
 /// The rest of [`install_locked`] for a file [`fetch_verified`] returned: `msi.lock`, launch
-/// gate, launch, classification, post-check and record.
+/// gate, launch, classification, post-check and record. An installer that runs elevated goes
+/// through the session's helper (Task 202; `file` is then only released), or else asks for its
+/// own UAC prompt on `file` (Task 196).
 pub fn install_fetched(
+    ctx: &WingetCtx<'_>,
+    plan: &WingetPlan,
+    file: Materialized,
+    install_lock: &UpdateLock,
+) -> Result<InstallReport, WingetOpsError> {
+    if let Some(cmd) = by_helper(plan)
+        && let Some(report) = install_by_helper(ctx, plan, cmd)?
+    {
+        return Ok(report);
+    }
+    install_with_file(ctx, plan, file, install_lock)
+}
+
+/// [`install_fetched`] on the downloaded `file`, never through the helper.
+fn install_with_file(
     ctx: &WingetCtx<'_>,
     plan: &WingetPlan,
     mut file: Materialized,
@@ -352,6 +381,19 @@ pub fn install_fetched(
         }
     };
 
+    Ok(finish(ctx, plan, outcome, log, extra, file.sha256()))
+}
+
+/// After a run that did not fail: looks for the app among the installed ones and records the
+/// operation (`sha256` of the installer that ran).
+fn finish(
+    ctx: &WingetCtx<'_>,
+    plan: &WingetPlan,
+    outcome: Outcome,
+    log: Option<PathBuf>,
+    extra: Option<String>,
+    sha256: &str,
+) -> InstallReport {
     phase(ctx, Phase::Verifying);
     let apps = (ctx.scan)();
     let found = find_installed(plan, &apps).cloned();
@@ -360,15 +402,163 @@ pub fn install_fetched(
         (None, None) => Some(NOT_FOUND_WARNING.to_string()),
         (Some(_), None) => None,
     };
-    if let Err(e) = record(&layout.state_db(), plan, file.sha256(), found.as_ref()) {
+    let db = ctx.data.install_layout().state_db();
+    if let Err(e) = record(&db, plan, sha256, found.as_ref()) {
         tracing::warn!(error = %e, "winget_ops: registro não gravado");
     }
-    Ok(InstallReport {
+    InstallReport {
         outcome,
         found,
         warning,
         log,
+    }
+}
+
+/// The command line of a plan whose installer runs elevated (and so through the helper).
+fn by_helper(plan: &WingetPlan) -> Option<&CommandLine> {
+    match (plan.elevation, &plan.command) {
+        (Elevation::Helper, Some(cmd)) => Some(cmd),
+        _ => None,
+    }
+}
+
+/// The helper's request for `plan`: the package, the installer's position and the mode, plus
+/// the `upgrade` flag with which `install_args_unlogged` (what the helper runs) rebuilds `cmd`
+/// itself; a plan whose command line the helper would not rebuild is refused.
+pub fn package_request(
+    plan: &WingetPlan,
+    cmd: &CommandLine,
+) -> Result<PackageRequest, WingetOpsError> {
+    let upgrade = [false, true]
+        .into_iter()
+        .find(|&u| {
+            switches::install_args_unlogged(
+                &plan.installer.kind,
+                &plan.installer.switches,
+                plan.mode,
+                u,
+            )
+            .as_ref()
+                == Ok(cmd)
+        })
+        .ok_or_else(|| {
+            WingetOpsError::Elevated(
+                "linha de comando diferente da que o auxiliar elevado monta".into(),
+            )
+        })?;
+    let installer = u32::try_from(plan.index)
+        .map_err(|_| WingetOpsError::Elevated("índice do instalador inválido".into()))?;
+    Ok(PackageRequest {
+        id: plan.id.clone(),
+        version: plan.version.clone(),
+        installer,
+        scope: ScopeArg::Machine,
+        mode: plan.mode.into(),
+        upgrade,
     })
+}
+
+/// The phase a line of the helper installing `name` moves to: `progress::ELEVATION_NOTICE`
+/// right before its UAC prompt, then the catalog and download checks
+/// ([`Phase::HelperPreparing`]), then the installer running; `None` for any other line.
+pub fn helper_install_phase(line: &str, name: &str) -> Option<Phase> {
+    let preparing = Phase::HelperPreparing {
+        name: name.to_string(),
+    };
+    if let Some(p) = crate::install::progress::helper_line_phase(line, &preparing) {
+        return Some(p);
+    }
+    match line {
+        signed_install::CHECKING_CATALOG | signed_install::DOWNLOADING_INSTALLER => Some(preparing),
+        signed_install::INSTALLER_RUNNING => Some(Phase::RunningInstaller {
+            name: name.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Installs `plan` through the session's helper (Task 202): it gets only the package, the
+/// installer's position and the mode, and takes everything else from the signed catalog. Under
+/// `msi.lock` and the launch gate; Windows Installer types wait for the mutex and retry 1618
+/// (each retry is a new request). `None`, with nothing run and the gate free again, when the
+/// helper cannot exist this session (wingetrs is not in an administrator-only folder): the
+/// caller then falls back to the installer's own UAC prompt (Task 196).
+fn install_by_helper(
+    ctx: &WingetCtx<'_>,
+    plan: &WingetPlan,
+    cmd: &CommandLine,
+) -> Result<Option<InstallReport>, WingetOpsError> {
+    let sha = plan.installer.sha256.trim().to_ascii_lowercase();
+    elevation_allowed(plan, cmd, &sha)?;
+    let req = package_request(plan, cmd)?;
+    let layout = ctx.data.install_layout();
+    let msi_lock = msi_queue::lock_msi(&layout.msi_lock(), &mut |_| {
+        phase(ctx, Phase::WaitingInstaller)
+    })
+    .map_err(|e| WingetOpsError::Lock(e.to_string()))?;
+    let reserve = std::cell::Cell::new(false);
+    let mut attempt = || -> Result<i32, WingetOpsError> {
+        if !ctx.gate.try_launch() {
+            return Err(WingetOpsError::Cancelled);
+        }
+        let r = ctx.elevated.install_package_lines(&req, &mut |l: &str| {
+            if let Some(p) = helper_install_phase(l, &plan.name) {
+                phase(ctx, p);
+            }
+        });
+        match r {
+            Ok(code) => Ok(code),
+            Err(ElevatedError::NotAdminFolder(why)) => {
+                reserve.set(true);
+                Err(WingetOpsError::Elevated(why))
+            }
+            Err(ElevatedError::Refused) => Err(WingetOpsError::UacRefused),
+            Err(e) => Err(WingetOpsError::Elevated(e.context("instalação elevada"))),
+        }
+    };
+    let code = if queued(&plan.installer.kind) {
+        match retry_1618(
+            ctx.busy,
+            ctx.sleep,
+            &mut || phase(ctx, Phase::WaitingInstaller),
+            &mut attempt,
+        ) {
+            Ok(c) => Ok(c),
+            Err(Queued::Attempt(e)) => Err(e),
+            Err(Queued::Queue(text)) => Err(WingetOpsError::Queue(text)),
+        }
+    } else {
+        attempt()
+    };
+    drop(msi_lock);
+    let code = match code {
+        Err(e) if reserve.get() => {
+            tracing::info!(reason = %e, "winget_ops: no elevated helper; the installer asks for its own UAC");
+            // Nothing launched: Ctrl+C may cancel the download of the fallback.
+            ctx.gate.next_plan();
+            return Ok(None);
+        }
+        other => other?,
+    };
+    let outcome = codes::classify_install(
+        &plan.installer.kind,
+        code,
+        &plan.installer.success_codes,
+        &plan.installer.expected_codes,
+    );
+    if let Outcome::Failed {
+        category,
+        code,
+        message,
+    } = outcome
+    {
+        return Err(WingetOpsError::Failed {
+            category,
+            code,
+            message,
+        });
+    }
+    Ok(Some(finish(ctx, plan, outcome, None, None, &sha)))
 }
 
 /// Runs a command-line installer: unelevated (`Never`) with the log filled in, or elevated
@@ -384,7 +574,7 @@ fn run_command(
 ) -> Result<Ran, WingetOpsError> {
     let verb = match plan.elevation {
         Elevation::Helper => {
-            elevation_allowed(plan, cmd, file)?;
+            elevation_allowed(plan, cmd, file.sha256())?;
             Verb::RunAs
         }
         Elevation::Never => Verb::Open,
@@ -511,12 +701,13 @@ fn elevated_copy(
     ))
 }
 
-/// The elevation allowlist (the rules the helper applied before Task 196) on what an elevated
-/// launch runs: the installer type, the verified file's SHA-256 and the parameters.
+/// The elevation allowlist (Task 180) on what an elevated launch runs: the installer type, the
+/// SHA-256 (the verified file's, or the plan's for the helper, which checks it again against
+/// the signed catalog) and the parameters.
 fn elevation_allowed(
     plan: &WingetPlan,
     cmd: &CommandLine,
-    file: &Materialized,
+    sha: &str,
 ) -> Result<(), WingetOpsError> {
     let kind = elevated_kind(&plan.installer.kind).ok_or_else(|| {
         WingetOpsError::Elevated("tipo de instalador que não roda elevado".into())
@@ -526,8 +717,6 @@ fn elevation_allowed(
             "o instalador elevado não grava log (elevação)".into(),
         ));
     }
-    // `fetch` already required 64 hex digits.
-    let sha = file.sha256();
     let req = InstallerRequest {
         // The download cache's name for the file (the shape the allowlist expects).
         source: format!(r"C:\wingetrs\blobs\{sha}"),

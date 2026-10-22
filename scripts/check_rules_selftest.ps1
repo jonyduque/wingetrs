@@ -63,6 +63,8 @@ $cliCases = @(
     @{ Name = 'stderr em cli/emit.rs'; File = 'src/cli/emit.rs'; Text = 'fn f() { let _ = std::io::stderr().lock(); }'; Want = 0 },
     @{ Name = 'Http::new no selfupdate elevado'; File = 'src/selfupdate/apply_win.rs'; Text = 'fn f() { let _ = crate::http::Http::new(); }'; Want = 1 },
     @{ Name = 'Http::new no bridge-worker'; File = 'src/bridge/worker.rs'; Text = 'fn f() { let _ = Http::new(); }'; Want = 1 },
+    @{ Name = 'Http::new na instalação pelo catálogo assinado'; File = 'src/bridge/signed_install.rs'; Text = 'fn f() { let _ = Http::new(); }'; Want = 1 },
+    @{ Name = 'Http::new na conferência do catálogo'; File = 'src/bridge/catalog_verify_win.rs'; Text = 'fn f() { let _ = crate::http::Http::new(); }'; Want = 1 },
     @{ Name = 'Http::new fora do lado elevado'; File = 'src/update.rs'; Text = 'fn f() { let _ = Http::new(); }'; Want = 0 },
     @{ Name = 'for_elevated no selfupdate'; File = 'src/selfupdate/apply_win.rs'; Text = 'fn f() { let _ = Http::for_elevated(&r); }'; Want = 0 }
 )

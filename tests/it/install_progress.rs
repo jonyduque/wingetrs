@@ -771,9 +771,20 @@ impl Launcher for TraceLauncher {
     }
 }
 
-/// No install flow asks the session's helper anything.
+/// A session without a helper (wingetrs outside an administrator-only folder): an install
+/// that runs elevated falls back to the installer's own UAC prompt (Task 196).
 struct NoHelper;
-impl ElevatedRunner for NoHelper {}
+impl ElevatedRunner for NoHelper {
+    fn install_package_lines(
+        &self,
+        _req: &wingetrs::bridge::worker::PackageRequest,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, wingetrs::bridge::elevated::ElevatedError> {
+        Err(wingetrs::bridge::elevated::ElevatedError::NotAdminFolder(
+            wingetrs::bridge::helper_folder::refusal_text(Path::new(r"C:\Users\u\Downloads")),
+        ))
+    }
+}
 
 struct NoMsix;
 impl MsixOps for NoMsix {

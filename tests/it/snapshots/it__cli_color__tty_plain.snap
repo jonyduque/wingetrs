@@ -47,12 +47,12 @@ Instalar app 2.0  main · 64bit
 ⚠ aviso: o manifesto pede uma reinicialização
 -- install (winget, confirmação)
 Contoso App 1.0 (msi, máquina)
-  1. ⚠ Pede permissão de administrador para o Windows Installer
+  1. ⚠ Roda como administrador (pede permissão de administrador)
   2. Roda numa pasta temporária do wingetrs
   3. Mostra o progresso do instalador
 -- install --dry-run (winget)
 Contoso App 1.0 (msi, máquina)
-  1. ⚠ Pede permissão de administrador para o Windows Installer
+  1. ⚠ Roda como administrador (pede permissão de administrador)
   2. Roda numa pasta temporária do wingetrs
   3. Mostra o progresso do instalador
   Instalador: https://h/setup

@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 pub mod arp_ops_win;
 #[cfg(windows)]
+pub mod catalog_verify_win;
+#[cfg(windows)]
 pub mod elevate_win;
 pub mod elevated;
 pub mod helper_folder;
+pub mod signed_install;
 #[cfg(windows)]
 pub mod spawn_win;
 #[cfg(windows)]

@@ -52,15 +52,16 @@ pub trait Launcher: Send + Sync {
     }
 }
 
-/// Whether the program runs elevated. For an install, `Helper` is the installer's own UAC
-/// prompt (`Verb::RunAs`, Task 196); for an uninstall, the elevated helper.
+/// Whether the program runs elevated. For an install, `Helper` is the elevated helper (Task
+/// 202), or the installer's own UAC prompt when the helper cannot run (`Verb::RunAs`, Task
+/// 196); for an uninstall, the elevated helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Elevation {
     Never,
     Helper,
 }
 
-/// Whether an install runs elevated (its own UAC prompt), from the installer type, its `Scope`
+/// Whether an install runs elevated (see [`Elevation`]), from the installer type, its `Scope`
 /// and its `ElevationRequirement` (all comparisons case-insensitive). A `user` scope never runs
 /// elevated, not even with `elevationRequired`: elevated through another account it would
 /// install into the administrator's profile; the installer asks for UAC by itself. An unknown

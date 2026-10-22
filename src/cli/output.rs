@@ -832,11 +832,10 @@ pub fn license(line: &str) -> String {
 
 /// The steps that ask for the administrator's permission (they get the warning glyph).
 fn asks_admin(step: &str) -> bool {
-    use crate::winget_install::plan::{ADMIN_PROMPT, ADMIN_PROMPT_MSI, SELF_ADMIN_PROMPT};
+    use crate::winget_install::plan::{ADMIN_PROMPT, SELF_ADMIN_PROMPT};
     use crate::winget_install::uninstall::{UNINSTALL_ADMIN_PROMPT, WINGET_ADMIN_PROMPT};
     [
         ADMIN_PROMPT,
-        ADMIN_PROMPT_MSI,
         SELF_ADMIN_PROMPT,
         UNINSTALL_ADMIN_PROMPT,
         WINGET_ADMIN_PROMPT,
@@ -1506,6 +1505,7 @@ impl Phases {
                 | Phase::Scanning
                 | Phase::WaitingElevation
                 | Phase::RunningInstaller { .. }
+                | Phase::HelperPreparing { .. }
                 | Phase::Verifying
                 | Phase::CopyingFolders
                 | Phase::Uninstalling { .. }
@@ -1575,6 +1575,7 @@ impl Phases {
                 | Phase::Scanning
                 | Phase::WaitingElevation
                 | Phase::RunningInstaller { .. }
+                | Phase::HelperPreparing { .. }
                 | Phase::Verifying
                 | Phase::CopyingFolders
                 | Phase::Uninstalling { .. }
@@ -1673,6 +1674,7 @@ impl Phases {
                 // The native installer and uninstaller cannot be cancelled either; they have
                 // no log to follow: past `NATIVE_QUIET` the line says a window may be waiting.
                 Phase::RunningInstaller { .. }
+                | Phase::HelperPreparing { .. }
                 | Phase::WaitingElevation
                 | Phase::Uninstalling { .. }
                 | Phase::CheckingRemoval { .. }

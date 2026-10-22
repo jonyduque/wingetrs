@@ -1973,6 +1973,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                 if matches!(
                     phase,
                     crate::install::progress::Phase::RunningInstaller { .. }
+                        | crate::install::progress::Phase::HelperPreparing { .. }
                         | crate::install::progress::Phase::WaitingElevation
                         | crate::install::progress::Phase::Uninstalling { .. }
                         | crate::install::progress::Phase::CheckingRemoval { .. }

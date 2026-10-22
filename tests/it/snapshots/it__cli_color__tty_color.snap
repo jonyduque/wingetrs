@@ -47,12 +47,12 @@ Simulação: nada foi alterado.
 ␛[33m⚠ aviso:␛[0m o manifesto pede uma reinicialização
 -- install (winget, confirmação)
 ␛[1mContoso App 1.0␛[0m␛[90m (msi, máquina)␛[0m
-  ␛[1m1␛[0m. ␛[33m⚠␛[0m Pede permissão de administrador para o Windows Installer
+  ␛[1m1␛[0m. ␛[33m⚠␛[0m Roda como administrador (pede permissão de administrador)
   ␛[1m2␛[0m. Roda numa pasta temporária do wingetrs
   ␛[1m3␛[0m. Mostra o progresso do instalador
 -- install --dry-run (winget)
 ␛[1mContoso App 1.0␛[0m␛[90m (msi, máquina)␛[0m
-  ␛[1m1␛[0m. ␛[33m⚠␛[0m Pede permissão de administrador para o Windows Installer
+  ␛[1m1␛[0m. ␛[33m⚠␛[0m Roda como administrador (pede permissão de administrador)
   ␛[1m2␛[0m. Roda numa pasta temporária do wingetrs
   ␛[1m3␛[0m. Mostra o progresso do instalador
   ␛[1m␛[35mInstalador␛[0m: https://h/setup

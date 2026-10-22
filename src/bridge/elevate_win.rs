@@ -604,8 +604,8 @@ pub fn worker_main_with(
     super::worker::serve(&mut reader, &mut writer, &mut SystemOps)
 }
 
-/// The worker's real operations: winget (`run_winget`), HKLM uninstallers and ARP deletions
-/// (never an installer, Task 196).
+/// The worker's real operations: winget (`run_winget`), HKLM uninstallers, ARP deletions and
+/// installers it derives from the signed catalog (Task 202; never one named by the request).
 struct SystemOps;
 
 impl super::worker::WorkerOps for SystemOps {
@@ -678,6 +678,60 @@ impl super::worker::WorkerOps for SystemOps {
     ) -> std::io::Result<super::worker::ArpDelete> {
         super::arp_ops_win::delete_key(hive, key, confirm)
     }
+
+    fn install_package(
+        &mut self,
+        req: &super::worker::PackageRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> std::io::Result<i32> {
+        install_package(req, on_line)
+    }
+}
+
+/// The real `install_package` (Task 202): a fresh run folder under the staging root; the catalog
+/// and the installer downloaded through `Http::for_elevated` (never `Http::new`: the user's proxy
+/// and roots), the catalog verified by `WinTrustVerifier` (`signed_install::prepare`); then
+/// `run_staged`. The folder goes once everything ended, or stays for the 24 h prune when the
+/// installer left processes running.
+fn install_package(
+    req: &super::worker::PackageRequest,
+    on_line: &mut dyn FnMut(&str),
+) -> std::io::Result<i32> {
+    use super::signed_install::{INSTALLER_RUNNING, SignedCtx, prepare};
+    use super::staging_win::{
+        INSTALL_LINGER, RUN_SDDL, RunDir, SystemEnv, run_staged, staging_root,
+    };
+    let sys = SystemEnv::query()?;
+    let root = staging_root(&sys.program_files)?;
+    let run = RunDir::create(&root, RUN_SDDL)?;
+    let roots = crate::selfupdate::apply_win::machine_roots()?;
+    let http = crate::http::Http::for_elevated(&roots)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let program_files = sys.program_files_roots();
+    let msiexec = sys.system32.join("msiexec.exe");
+    let ctx = SignedCtx {
+        http: &http,
+        cdn_base: crate::sources::winget::CDN_BASE,
+        verifier: &super::catalog_verify_win::WinTrustVerifier,
+        now: std::time::SystemTime::now(),
+        program_files: &program_files,
+        msiexec: &msiexec,
+        allow_http: false,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let staged = rt
+        .block_on(prepare(&ctx, req, run.path(), on_line))
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    drop(rt);
+    on_line(INSTALLER_RUNNING);
+    let end = run_staged(&staged, &sys, INSTALL_LINGER, on_line)?;
+    if !end.all_ended {
+        let kept = run.keep();
+        tracing::warn!(folder = %kept.display(), "bridge worker: installer left processes running; folder kept for prune");
+    }
+    Ok(end.code)
 }
 
 /// The worker's exec: only `winget`, and only the one Windows installed (see `winget_exe`),

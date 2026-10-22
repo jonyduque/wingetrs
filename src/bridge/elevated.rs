@@ -1,10 +1,10 @@
 //! One elevated helper per session for machine-wide winget upgrades, HKLM uninstallers and ARP
 //! key deletions: the first such job asks for UAC once and starts `wingetrs bridge-worker`;
 //! later ones reuse it. A refusal is final for the session (the jobs run unelevated, as
-//! before). It never runs an installer: each native installer that needs elevation asks for
-//! its own UAC (Task 196). The Win32 side is `elevate_win`.
+//! before). It runs native installers only as `InstallPackage` (Task 202): the helper derives
+//! the installer from the signed catalog. The Win32 side is `elevate_win`.
 use super::helper_folder::is_refusal;
-use super::worker::{self, DeleteReason, MachineHive, Reply, Request};
+use super::worker::{self, DeleteReason, MachineHive, PackageRequest, Reply, Request};
 use super::{BridgeExec, BridgeJob, BridgeOp, Tail, Tool};
 use crate::install::progress::{ELEVATION_GRANTED, ELEVATION_NOTICE, ELEVATION_REFUSED};
 use crate::installed::correlate::InstallScope;
@@ -318,7 +318,7 @@ impl std::fmt::Display for ElevatedError {
 impl std::error::Error for ElevatedError {}
 
 /// What the native flows ask the elevated helper (Task 182): uninstallers and ARP keys of
-/// HKLM. Installers never go through it (Task 196).
+/// HKLM, and winget packages it installs from the signed catalog (Task 202).
 pub trait ElevatedRunner: Send + Sync {
     /// Runs the uninstaller of an HKLM ARP entry (Task 182): the helper recomputes the command
     /// from the key and refuses when its rule is not `rule`. The uninstaller's exit code.
@@ -370,6 +370,20 @@ pub trait ElevatedRunner: Send + Sync {
         _on_line: &mut dyn FnMut(&str),
     ) -> Result<(), ElevatedError> {
         self.delete_arp_key(hive, key, reason)
+    }
+
+    /// Installs a winget package through the helper (Task 202), which derives the installer
+    /// from the signed catalog itself; its lines (`progress::ELEVATION_NOTICE` before its UAC
+    /// prompt, `ELEVATION_GRANTED`, `signed_install`'s progress) go to `on_line`. The
+    /// installer's exit code. `NotAdminFolder` means the helper cannot exist this session.
+    fn install_package_lines(
+        &self,
+        _req: &PackageRequest,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        Err(ElevatedError::Remote(
+            "instalação elevada não suportada".to_string(),
+        ))
     }
 }
 
@@ -433,6 +447,25 @@ impl ElevatedRunner for ElevatedBridge {
                 "resposta inesperada {code} ao apagar a chave"
             ))),
         }
+    }
+
+    fn install_package_lines(
+        &self,
+        req: &PackageRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<i32, ElevatedError> {
+        let request = Request::InstallPackage {
+            id: req.id.clone(),
+            version: req.version.clone(),
+            installer: req.installer,
+            scope: req.scope,
+            mode: req.mode,
+            upgrade: req.upgrade,
+        };
+        self.ask_elevated(&request, &mut |l: &str| {
+            tracing::info!(line = l, "elevated install");
+            on_line(l);
+        })
     }
 }
 

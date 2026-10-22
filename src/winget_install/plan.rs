@@ -15,13 +15,12 @@ use crate::sources::winget::manifest::{
     Agreement, EffectiveInstaller, InstallerKind, MergedManifest,
 };
 
-/// Plan line of an installer that runs elevated: it asks for its own UAC (Task 196).
-pub const ADMIN_PROMPT: &str = "Pede permissão de administrador para este instalador";
+/// Plan line of an installer that runs elevated: through the session's elevated helper (one UAC
+/// prompt per session, Task 202), or with its own UAC prompt when the helper cannot run
+/// (Task 196).
+pub const ADMIN_PROMPT: &str = "Roda como administrador (pede permissão de administrador)";
 /// Plan line of an elevated installer: it runs from a fresh folder holding only its copy.
 pub const RUN_FOLDER_NOTE: &str = "Roda numa pasta temporária do wingetrs";
-/// The same line for msi/wix: the UAC prompt names the Windows Installer (`msiexec`), not the
-/// package's publisher; the verified file stays held until it ends, so it is the one that runs.
-pub const ADMIN_PROMPT_MSI: &str = "Pede permissão de administrador para o Windows Installer";
 /// Plan line of an installer that is not elevated by wingetrs but may ask for its own UAC
 /// (`ElevationRequirement: elevatesSelf`, or `elevationRequired` with a user scope).
 pub const SELF_ADMIN_PROMPT: &str = "O instalador pode pedir permissão de administrador";
@@ -56,7 +55,7 @@ pub struct WingetPlan {
     pub upgrade_from: Option<String>,
 }
 
-/// Whether the installer of `plan` runs as administrator (its own UAC prompt); what the job
+/// Whether the installer of `plan` runs as administrator (see `launch::Elevation`); what the job
 /// log records as `elevated`.
 pub fn plan_runs_elevated(plan: &WingetPlan) -> bool {
     plan.elevation == Elevation::Helper
@@ -341,10 +340,7 @@ impl WingetPlan {
     pub fn steps(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.elevation == Elevation::Helper {
-            out.push(match self.command.as_ref().map(|c| c.program) {
-                Some(Program::Msiexec) => ADMIN_PROMPT_MSI.to_string(),
-                _ => ADMIN_PROMPT.to_string(),
-            });
+            out.push(ADMIN_PROMPT.to_string());
             out.push(RUN_FOLDER_NOTE.to_string());
         } else if self.command.is_some() && self.elevates_itself() {
             out.push(SELF_ADMIN_PROMPT.to_string());

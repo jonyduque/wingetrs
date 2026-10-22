@@ -1,8 +1,10 @@
 //! Protocol and loop of the elevated bridge helper (`wingetrs bridge-worker`): one JSON object
 //! per line each way. The helper only ever runs `bridge::command` of a winget upgrade or install
 //! with a valid id, `bridge::winget_source_update`, an HKLM uninstaller it recomputes from the
-//! key, or an ARP key deletion it checks again; anything else is refused or closes the channel.
-//! It never runs an installer (Task 196): a `run_installer` request gets a fixed error.
+//! key, an ARP key deletion it checks again, or a winget package whose installer it derives
+//! from the signed catalog (Task 202); anything else is refused or closes the channel. It never
+//! runs an installer named by the request (Task 196): a `run_installer` request gets a fixed
+//! error.
 use super::{BridgeJob, BridgeOp, Tool};
 use crate::installed::Hive;
 use crate::installed::correlate::InstallScope;
@@ -11,6 +13,7 @@ use crate::winget_install::elevated_rules::{
     KnownFolders, args_in_admin_folder, elevated_duplicate, expand_known, in_program_files,
     is_system_rundll32, names_interpreter, parse_rundll32, refused_location, still_orphan,
 };
+use crate::winget_install::switches::Mode;
 use crate::winget_install::uninstall_cmd::{ArpDetails, Rule, uninstall_command, valid_arp_key};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -59,6 +62,19 @@ pub enum Request {
         key: String,
         reason: DeleteReason,
     },
+    /// Installs a winget package (Task 202): the helper derives the installer, its SHA-256, its
+    /// URL and its parameters from the signed catalog it downloads itself (`signed_install`);
+    /// none of them comes from the request.
+    InstallPackage {
+        id: String,
+        version: String,
+        /// Position of the installer in `MergedManifest::effective()`.
+        installer: u32,
+        scope: ScopeArg,
+        mode: ModeArg,
+        /// The command line carries the manifest's `Upgrade` switch.
+        upgrade: bool,
+    },
     /// Ends the helper.
     Quit {},
 }
@@ -69,6 +85,73 @@ pub enum Request {
 pub enum ScopeArg {
     User,
     Machine,
+}
+
+/// The installer's mode (`switches::Mode`) in a request: a closed set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModeArg {
+    Silent,
+    SilentWithProgress,
+    Interactive,
+}
+
+impl From<Mode> for ModeArg {
+    fn from(m: Mode) -> ModeArg {
+        match m {
+            Mode::Silent => ModeArg::Silent,
+            Mode::SilentWithProgress => ModeArg::SilentWithProgress,
+            Mode::Interactive => ModeArg::Interactive,
+        }
+    }
+}
+
+impl From<ModeArg> for Mode {
+    fn from(m: ModeArg) -> Mode {
+        match m {
+            ModeArg::Silent => Mode::Silent,
+            ModeArg::SilentWithProgress => Mode::SilentWithProgress,
+            ModeArg::Interactive => Mode::Interactive,
+        }
+    }
+}
+
+/// What an `install_package` request asks (see `Request::InstallPackage`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageRequest {
+    pub id: String,
+    pub version: String,
+    pub installer: u32,
+    pub scope: ScopeArg,
+    pub mode: ModeArg,
+    pub upgrade: bool,
+}
+
+/// Longest `version` accepted in a request, in bytes.
+pub const VERSION_MAX: usize = 128;
+
+impl PackageRequest {
+    /// Checks every field before anything is downloaded; the refusal reason otherwise. The id
+    /// is a winget id (`bridge::valid_target`), the version printable text without a path
+    /// separator, and the scope the machine's (the helper never installs for a user).
+    pub fn check(&self) -> Result<(), &'static str> {
+        if !super::valid_target(Tool::Winget, &self.id) {
+            return Err("identificador inválido");
+        }
+        if self.version.is_empty()
+            || self.version.len() > VERSION_MAX
+            || self
+                .version
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+        {
+            return Err("versão inválida");
+        }
+        if self.scope != ScopeArg::Machine {
+            return Err("o auxiliar elevado só instala para todos os usuários");
+        }
+        Ok(())
+    }
 }
 
 /// An HKLM ARP view. HKCU has no value on purpose: the user writes it, so nothing from it
@@ -176,21 +259,30 @@ impl InstallerRequest {
         if !valid_file_name(&self.file_name, self.kind) {
             return Err("nome do instalador inválido");
         }
-        if crate::winget_install::switches::validate(&self.params).is_err()
-            || self.params.contains("\\\"")
-        {
-            return Err("parâmetros do instalador inválidos");
-        }
-        let allowed = if self.kind.is_msi() {
-            msi_params_allowed_in(&self.params, program_files)
-        } else {
-            exe_params_allowed(self.kind, &self.params, program_files)
-        };
-        if !allowed {
-            return Err("parâmetros do instalador fora da lista permitida");
-        }
-        Ok(())
+        params_check(self.kind, &self.params, program_files)
     }
+}
+
+/// The elevation allowlist (Task 180) on the parameters of an installer of `kind`: valid for
+/// a command line, no escaped quote, and only what `msi_params_allowed_in` or
+/// `exe_params_allowed` accepts; the refusal reason otherwise.
+pub fn params_check(
+    kind: ElevatedKind,
+    params: &str,
+    program_files: &[String],
+) -> Result<(), &'static str> {
+    if crate::winget_install::switches::validate(params).is_err() || params.contains("\\\"") {
+        return Err("parâmetros do instalador inválidos");
+    }
+    let allowed = if kind.is_msi() {
+        msi_params_allowed_in(params, program_files)
+    } else {
+        exe_params_allowed(kind, params, program_files)
+    };
+    if !allowed {
+        return Err("parâmetros do instalador fora da lista permitida");
+    }
+    Ok(())
 }
 
 /// `...\blobs\<sha256 in lowercase>`: the download cache's name for the file.
@@ -560,6 +652,17 @@ pub trait WorkerOps {
     ) -> std::io::Result<ArpDelete> {
         Err(unsupported())
     }
+    /// Installs the package of a checked `req` (Task 202): downloads and verifies the signed
+    /// catalog, derives the installer from it, downloads, checks and runs it from a fresh
+    /// administrator-only folder (`signed_install`). `on_line` gets the helper's progress lines.
+    /// The installer's exit code.
+    fn install_package(
+        &mut self,
+        _req: &PackageRequest,
+        _on_line: &mut dyn FnMut(&str),
+    ) -> std::io::Result<i32> {
+        Err(unsupported())
+    }
 }
 
 /// Line the helper sends while it waits for the processes an uninstaller left running after
@@ -714,6 +817,25 @@ pub fn serve(
             }
             Request::DeleteArpKey { hive, key, reason } => {
                 serve_delete(writer, ops, hive, &key, reason)?;
+                continue;
+            }
+            Request::InstallPackage {
+                id,
+                version,
+                installer,
+                scope,
+                mode,
+                upgrade,
+            } => {
+                let req = PackageRequest {
+                    id,
+                    version,
+                    installer,
+                    scope,
+                    mode,
+                    upgrade,
+                };
+                serve_package(writer, ops, &req)?;
                 continue;
             }
             Request::Upgrade { target } => (target, BridgeOp::Upgrade),
@@ -1072,6 +1194,45 @@ fn serve_uninstaller(
     let reply = match result {
         Ok(code) => Reply::End { code },
         Err(e) => failure(&e),
+    };
+    send(writer, &reply)
+}
+
+/// `InstallPackage`: checks the request, then installs it through `ops` (everything about the
+/// installer comes from the signed catalog, Task 202) and answers the installer's exit code; a
+/// refused request runs nothing.
+fn serve_package(
+    writer: &mut dyn Write,
+    ops: &mut dyn WorkerOps,
+    req: &PackageRequest,
+) -> std::io::Result<()> {
+    if let Err(reason) = req.check() {
+        tracing::warn!(reason, "bridge worker: install request refused");
+        return send(writer, &refusal(reason));
+    }
+    tracing::info!(id = %req.id, version = %req.version, installer = req.installer, "bridge worker: installing from the signed catalog");
+    let mut broken = None;
+    let result = ops.install_package(req, &mut |text: &str| {
+        if broken.is_none()
+            && let Err(e) = send(
+                writer,
+                &Reply::Line {
+                    text: clip(text).to_string(),
+                },
+            )
+        {
+            broken = Some(e);
+        }
+    });
+    if let Some(e) = broken {
+        return Err(e);
+    }
+    let reply = match result {
+        Ok(code) => Reply::End { code },
+        Err(e) => {
+            tracing::warn!(error = %e, "bridge worker: install failed");
+            failure(&e)
+        }
     };
     send(writer, &reply)
 }
