@@ -171,6 +171,9 @@ pub struct AstFacts {
     pub assignments: Vec<NamedFact>,
     /// `FN`: the function name.
     pub functions: Vec<NamedFact>,
+    /// The word `global` appears in the script outside `if ($global)` conditions (set by the
+    /// gate from the text, [`global_named_elsewhere`]): no `if ($global)` body is dead code.
+    pub global_named: bool,
 }
 
 /// Undoes the wire escapes; any other `%` is an error.
@@ -210,26 +213,39 @@ fn arg(field: &str) -> Result<Arg, String> {
     })
 }
 
-/// The 1-based line of the first `using` of `script` that is not `using namespace`, read as
-/// text: PowerShell's parser (`ParseInput`, and `PSParser.Tokenize` too) resolves `using module`
-/// and `using assembly` while parsing, so such a script never reaches it. Conservative: backticks
-/// are dropped first; any mix of whitespace (line breaks included), `<# #>` and `#` line
-/// comments may sit after `using`; whatever follows that is not the word `namespace` refuses
-/// (an unclosed `<#`, the end of the text, a `using` in a string or a comment too). The position
-/// is not checked (a misplaced `using` is resolved as well). Only `$using:x`/`${using:x}` (a
-/// variable scope, not the keyword) is skipped. `using namespace` passes: it only names where
-/// types are looked up and loads nothing.
-pub fn parse_time_load(script: &str) -> Option<usize> {
-    let text: String = script.chars().filter(|c| *c != '`').collect();
-    let lower = text.to_lowercase();
-    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+/// A word character of the text checks, on both sides (`[A-Za-z0-9_]`, the host's class): any
+/// other character ends a word, which can only make a check match more.
+fn word_char(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Words that make PowerShell's parser load modules or engines while parsing: DSC
+/// (`configuration`, `Import-DscResource`, dynamic keywords) looks the module up, even on a UNC
+/// path, and `workflow` loads the workflow engine in 5.1.
+const PARSE_TIME_WORDS: &[&str] = &[
+    "configuration",
+    "import-dscresource",
+    "workflow",
+    "dynamickeyword",
+];
+
+/// The dashes PowerShell reads as `-`.
+const DASHES: [char; 4] = ['-', '\u{2013}', '\u{2014}', '\u{2015}'];
+
+/// [`parse_time_load`] for `using`: the 1-based line of the first `using` not followed by
+/// `namespace` (after any mix of whitespace, `<# #>` and `#` comments; an unclosed `<#` or the
+/// end of the text refuses). `$using:x`/`${using:x}` is a variable scope, not the keyword.
+fn using_load(lower: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(pos) = lower[from..].find("using") {
         let at = from + pos;
         from = at + "using".len();
         let before = &lower[..at];
         let variable = before.ends_with('$') || before.ends_with("${");
-        if variable || word(before.chars().next_back()) || word(lower[from..].chars().next()) {
+        if variable
+            || word_char(before.chars().next_back())
+            || word_char(lower[from..].chars().next())
+        {
             continue;
         }
         let mut rest = &lower[from..];
@@ -246,7 +262,7 @@ pub fn parse_time_load(script: &str) -> Option<usize> {
         }
         let namespace = rest
             .strip_prefix("namespace")
-            .is_some_and(|after| !word(after.chars().next()));
+            .is_some_and(|after| !word_char(after.chars().next()));
         if !namespace {
             return Some(before.matches('\n').count() + 1);
         }
@@ -254,15 +270,173 @@ pub fn parse_time_load(script: &str) -> Option<usize> {
     None
 }
 
-/// Facts of a script [`parse_time_load`] keeps away from the parser: its `using` refuses it.
-pub fn parse_time_load_facts(line: usize) -> AstFacts {
+/// [`parse_time_load`] for [`PARSE_TIME_WORDS`]: the first line with one of them as a word, in
+/// any position (a string or a comment too), unless it is part of a variable, member, scope or
+/// parameter name (`$configuration`, `${workflow}`, `$env:workflow`, `-Configuration`); a
+/// member or type name (`$x.Configuration`, `[..Language.DynamicKeyword]`) refuses too.
+fn keyword_load(lower: &str) -> Option<usize> {
+    let mut first: Option<usize> = None;
+    for w in PARSE_TIME_WORDS {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(w) {
+            let at = from + pos;
+            from = at + w.len();
+            let before = &lower[..at];
+            let prev = before.chars().next_back();
+            let named =
+                word_char(prev) || matches!(prev, Some('$' | ':' | '-')) || before.ends_with("${");
+            if named || word_char(lower[from..].chars().next()) {
+                continue;
+            }
+            let line = before.matches('\n').count() + 1;
+            first = Some(first.map_or(line, |f| f.min(line)));
+            break;
+        }
+    }
+    first
+}
+
+/// The rest of a `#requires` line loads nothing: only `-Version <digits and dots>` and
+/// `-RunAsAdministrator` (full names, any dash), in any number, then blanks.
+fn requires_allowed(rest: &str) -> bool {
+    let mut r = rest;
+    loop {
+        r = r.trim_start_matches([' ', '\t']);
+        if r.trim_start_matches([' ', '\t', '\r']).is_empty() {
+            return true;
+        }
+        let Some(after) = r.strip_prefix(DASHES) else {
+            return false;
+        };
+        if let Some(v) = after.strip_prefix("version") {
+            let v2 = v.trim_start_matches([' ', '\t']);
+            let digits = v2.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+            if v2.len() == v.len() || digits.len() == v2.len() {
+                return false;
+            }
+            r = digits;
+        } else if let Some(a) = after.strip_prefix("runasadministrator") {
+            r = a;
+        } else {
+            return false;
+        }
+    }
+}
+
+/// [`parse_time_load`] for `#requires`: `-Modules`, `-Assembly` and `-PSSnapin` load what they
+/// name. The first line of a `#requires` (any whitespace, line breaks too, after the `#`) whose
+/// rest is not [`requires_allowed`].
+fn requires_load(lower: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find('#') {
+        let at = from + pos;
+        from = at + 1;
+        let Some(after) = lower[from..].trim_start().strip_prefix("requires") else {
+            continue;
+        };
+        if word_char(after.chars().next()) {
+            continue;
+        }
+        let rest = after.split('\n').next().unwrap_or("");
+        if !requires_allowed(rest) {
+            return Some(lower[..at].matches('\n').count() + 1);
+        }
+    }
+    None
+}
+
+/// What [`parse_time_load`] found: the line and the `USE` kind that refuses it.
+pub fn parse_time_load_kind(script: &str) -> Option<(usize, &'static str)> {
+    let text: String = script.chars().filter(|c| *c != '`').collect();
+    let lower = text.to_lowercase();
+    [
+        using_load(&lower).map(|l| (l, "module")),
+        keyword_load(&lower).map(|l| (l, "dsc")),
+        requires_load(&lower).map(|l| (l, "requires")),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(l, _)| *l)
+}
+
+/// The 1-based line of the first construct of `script` that PowerShell's parser (`ParseInput`,
+/// and `PSParser.Tokenize` too) would resolve or load while parsing, read as text so that such a
+/// script never reaches it: a `using` that is not `using namespace`, a DSC or workflow word
+/// ([`PARSE_TIME_WORDS`]), or a `#requires` with more than `-Version`/`-RunAsAdministrator`.
+/// Conservative: backticks are dropped first, the position is not checked (a misplaced `using`
+/// is resolved too), and a match inside a string or a comment refuses as well. `using
+/// namespace` passes: it only names where types are looked up and loads nothing. The host runs
+/// the same checks as regexes (`$usingLoad`, `$parseLoad`, `$requiresLoad` of `ast_facts.ps1`);
+/// a test keeps both equivalent.
+pub fn parse_time_load(script: &str) -> Option<usize> {
+    parse_time_load_kind(script).map(|(line, _)| line)
+}
+
+/// Facts of a script [`parse_time_load`] keeps away from the parser: one `USE` that refuses it.
+pub fn parse_time_load_facts(line: usize, kind: &str) -> AstFacts {
     AstFacts {
         usings: vec![UsingFact {
             line,
-            kind: "module".into(),
+            kind: kind.into(),
         }],
         ..AstFacts::default()
     }
+}
+
+/// The word `global` appears in `script` outside the conditions `if ($global)` and
+/// `if ($global -and $x)` (backticks dropped, any case, strings and comments too). Then the
+/// script may bind its own `$global` in a way the parser cannot name (`[bool]$global = ..`,
+/// `variable:global`, `[ref]$global`, a splat), and no `if ($global)` body is dead code.
+pub fn global_named_elsewhere(script: &str) -> bool {
+    let text: String = script.chars().filter(|c| *c != '`').collect();
+    let mut rest = text.to_lowercase();
+    // Each `if ( $global [-and $name] )` blanked, then any `global` left counts.
+    let mut out = String::with_capacity(rest.len());
+    while let Some(at) = rest.find("if") {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        match global_condition_len(tail) {
+            Some(n) if !word_char(head.chars().next_back()) => {
+                out.push(' ');
+                rest = tail[n..].to_string();
+            }
+            _ => {
+                out.push_str("if");
+                rest = tail[2..].to_string();
+            }
+        }
+    }
+    out.push_str(&rest);
+    let mut from = 0;
+    while let Some(pos) = out[from..].find("global") {
+        let at = from + pos;
+        from = at + "global".len();
+        if !word_char(out[..at].chars().next_back()) && !word_char(out[from..].chars().next()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Length of `if ( $global )` or `if ( $global -and $name )` at the start of `t` (lowercase).
+fn global_condition_len(t: &str) -> Option<usize> {
+    let r = t.strip_prefix("if")?.trim_start();
+    let r = r.strip_prefix('(')?.trim_start();
+    let r = r.strip_prefix("$global")?;
+    if word_char(r.chars().next()) {
+        return None;
+    }
+    let mut r = r.trim_start();
+    if let Some(and) = r.strip_prefix("-and") {
+        let v = and.trim_start().strip_prefix('$')?;
+        let name_end = v.find(|c: char| !word_char(Some(c))).unwrap_or(v.len());
+        if name_end == 0 {
+            return None;
+        }
+        r = v[name_end..].trim_start();
+    }
+    let r = r.strip_prefix(')')?;
+    Some(t.len() - r.len())
 }
 
 /// Decodes the records of one answer (`END` lines are skipped). Any malformed line is an
@@ -411,14 +585,24 @@ fn global_bindings(facts: &AstFacts) -> Vec<usize> {
         .collect();
     for c in &facts.commands {
         let name = file_name(c.name.as_deref().unwrap_or(""));
+        // A name it cannot read (`('glo' + 'bal')`, a splat) counts as `global`.
         let set_variable = named(&name, &["set-variable", "new-variable", "sv", "nv"])
-            && c.args.iter().any(names_global);
+            && c.args
+                .iter()
+                .any(|a| names_global(a) || matches!(a, Arg::Other(_)));
         let variable_arg = c
             .args
             .windows(2)
             .any(|w| matches!(&w[0], Arg::Param(p) if variable_param(p)) && names_global(&w[1]));
         if set_variable || variable_arg {
             lines.push(c.line);
+        }
+    }
+    // `$ExecutionContext.SessionState.PSVariable.Set(..)` with any name.
+    for m in &facts.members {
+        let target: String = m.target.chars().filter(|c| !c.is_whitespace()).collect();
+        if target.to_ascii_lowercase().contains("psvariable") {
+            lines.push(m.line);
         }
     }
     lines.sort_unstable();
@@ -489,15 +673,22 @@ pub fn ast_flags(facts: &AstFacts, supported: &[&str]) -> Vec<Flag> {
             e.line,
         );
     }
-    for u in &facts.usings {
-        if u.kind == "module" || u.kind == "assembly" {
-            push(
-                FlagKind::DynamicCode,
-                Verdict::Refuse,
-                "carrega módulo ou assembly (using)".into(),
-                u.line,
-            );
-        }
+    // Every kind but `namespace` loads something while parsing.
+    for u in facts.usings.iter().filter(|u| u.kind != "namespace") {
+        let detail = match u.kind.as_str() {
+            "module" | "assembly" => "carrega módulo ou assembly (using)",
+            "dsc" => {
+                "usa configuration, workflow ou Import-DscResource (carrega módulos na análise)"
+            }
+            "requires" => "#requires carrega módulo, assembly ou snap-in",
+            _ => "carrega código na análise do script",
+        };
+        push(
+            FlagKind::DynamicCode,
+            Verdict::Refuse,
+            detail.into(),
+            u.line,
+        );
     }
     let bindings = global_bindings(facts);
     for line in &bindings {
@@ -509,7 +700,7 @@ pub fn ast_flags(facts: &AstFacts, supported: &[&str]) -> Vec<Flag> {
         );
     }
     // With its own `$global`, an `if ($global)` body may run: nothing is dead code.
-    let dead = |chain: &str| bindings.is_empty() && dead(chain);
+    let dead = |chain: &str| bindings.is_empty() && !facts.global_named && dead(chain);
     for c in facts.commands.iter().filter(|c| !dead(&c.chain)) {
         command_flags(c, supported, &mut push);
     }
@@ -603,6 +794,25 @@ fn command_flags(
         flag(FlagKind::SystemWrite, Verdict::Refuse, D_SYSTEM);
     }
     let launcher = is(&["start-process", "saps", "start"]);
+    // `-Verb` (or a prefix) with a value it cannot read (`('Run' + 'As')`, `$v`, `"$v"`) may
+    // be `RunAs`.
+    let computed_verb = launcher
+        && c.args.windows(2).any(|w| {
+            let verb = matches!(&w[0], Arg::Param(p) if !p.is_empty() && "verb".starts_with(p.to_ascii_lowercase().as_str()));
+            let unread = match &w[1] {
+                Arg::Str(_) => false,
+                Arg::Expandable(e) => e.contains(['$', '(']),
+                Arg::Param(_) | Arg::Other(_) => true,
+            };
+            verb && unread
+        });
+    if computed_verb {
+        flag(
+            FlagKind::Elevation,
+            Verdict::Refuse,
+            "Start-Process com -Verb calculado (pode pedir elevação)",
+        );
+    }
     let msiexec_arg = any_text(&|t| named(&file_name(t), &["msiexec"]));
     if is(&["msiexec"]) || (launcher && msiexec_arg) {
         flag(FlagKind::Msiexec, Verdict::Refuse, D_MSIEXEC);

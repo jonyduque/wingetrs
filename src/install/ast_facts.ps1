@@ -9,10 +9,15 @@ $utf8 = [System.Text.UTF8Encoding]::new($false)
 $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8)
 $writer = [System.IO.StreamWriter]::new([Console]::OpenStandardOutput(), $utf8)
 $globalIf = '^\s*\$global(\s+-and\s+\$\w+)?\s*$'
-# `using module`/`using assembly` are resolved (loaded) while parsing, by ParseInput and by
-# PSParser.Tokenize alike: any `using` not followed by `namespace` (after spaces, line breaks
-# and comments) is never parsed here (script_ast::parse_time_load).
-$usingLoad = '(?is)(?<![\w$])(?<!\$\{)using(?!\w)(?>(?:\s|<#.*?#>|#[^\n]*)*)(?!namespace(?!\w))'
+# What the parser resolves or loads while parsing (ParseInput and PSParser.Tokenize alike) never
+# reaches it; the same checks as script_ast::parse_time_load, kept equivalent by a test.
+# Word characters are [0-9_\x41-\x5A\x61-\x7A] on both sides. A `using` not followed by `namespace` (after
+# spaces, line breaks and comments):
+$usingLoad = '(?is)(?<![0-9_\x41-\x5A\x61-\x7A$])(?<!\$\{)using(?![0-9_\x41-\x5A\x61-\x7A])(?>(?:\s|<#.*?#>|#[^\n]*)*)(?!namespace(?![0-9_\x41-\x5A\x61-\x7A]))'
+# DSC and workflow words (the module of Import-DscResource is looked up, even on a UNC path):
+$parseLoad = '(?i)(?<![0-9_\x41-\x5A\x61-\x7A$:\-])(?<!\$\{)(?:configuration|import\-dscresource|workflow|dynamickeyword)(?![0-9_\x41-\x5A\x61-\x7A])'
+# A #requires line with more than -Version <n> and -RunAsAdministrator (modules, assemblies):
+$requiresLoad = '(?im)#\s*requires(?![0-9_\x41-\x5A\x61-\x7A])(?!(?:[ \t]*[\-–—―](?:version[ \t]+[0-9.]+|runasadministrator))*[ \t\r]*$)'
 
 function Esc([string]$s) {
     if ($null -eq $s) { return '' }
@@ -63,11 +68,15 @@ function Line($sb, [object[]]$fields) {
 
 function Facts([string]$text, $sb) {
     $plain = $text.Replace('`', '')
-    $found = [regex]::Match($plain, $usingLoad)
-    if ($found.Success) {
-        Line $sb @('USE', $plain.Substring(0, $found.Index).Split("`n").Count, 'module')
-        return
+    $refused = $false
+    foreach ($check in @(@($usingLoad, 'module'), @($parseLoad, 'dsc'), @($requiresLoad, 'requires'))) {
+        $found = [regex]::Match($plain, $check[0])
+        if ($found.Success) {
+            Line $sb @('USE', $plain.Substring(0, $found.Index).Split("`n").Count, $check[1])
+            $refused = $true
+        }
     }
+    if ($refused) { return }
     $tokens = $null
     $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)

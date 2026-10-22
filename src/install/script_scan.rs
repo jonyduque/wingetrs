@@ -978,10 +978,14 @@ fn add_ast_flags(report: &mut ScriptReport, script: &str, supported: &[&str], as
     if report.verdict == Verdict::Refuse {
         return;
     }
-    let answer = match script_ast::parse_time_load(script) {
-        Some(line) => Ok(script_ast::parse_time_load_facts(line)),
+    let answer = match script_ast::parse_time_load_kind(script) {
+        Some((line, kind)) => Ok(script_ast::parse_time_load_facts(line, kind)),
         None => ast.facts(script),
     };
+    let answer = answer.map(|mut facts| {
+        facts.global_named |= script_ast::global_named_elsewhere(script);
+        facts
+    });
     let extra = match answer {
         Ok(facts) => script_ast::ast_flags(&facts, supported),
         Err(e) => {

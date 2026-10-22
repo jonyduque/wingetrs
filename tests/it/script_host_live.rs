@@ -478,3 +478,38 @@ fn real_parser_reports_global_bindings() {
         }
     }
 }
+/// DSC, `workflow` and `#requires -Modules` are refused and never reach the parser: the module
+/// that writes a sentinel when loaded never runs.
+#[test]
+#[ignore = "live: real PowerShell parser"]
+fn real_parser_never_sees_dsc_or_requires() {
+    use wingetrs::install::prelude::PRELUDE_FUNCTIONS;
+    use wingetrs::install::script_scan::{self, CallRoots, Verdict};
+    let t = tempfile::tempdir().unwrap();
+    let tmp = t.path().display().to_string();
+    let module = t.path().join("M");
+    std::fs::create_dir_all(&module).unwrap();
+    std::fs::write(
+        module.join("M.psm1"),
+        format!("Set-Content '{tmp}\\sentinel.txt' x\r\n"),
+    )
+    .unwrap();
+    let ast = real_parser();
+    for script in [
+        format!("configuration C {{ Import-DscResource -ModuleName '{tmp}\\M' }}"),
+        format!("Import-DscResource -ModuleName '{tmp}\\M'"),
+        "workflow W { Write-Output 1 }".to_string(),
+        format!("#requires -Modules '{tmp}\\M\\M.psm1'\nWrite-Output 1"),
+    ] {
+        let (report, _) =
+            script_scan::scan_gated(&script, PRELUDE_FUNCTIONS, &CallRoots::default(), &ast);
+        assert_eq!(
+            report.verdict,
+            Verdict::Refuse,
+            "{script}: {:?}",
+            report.flags
+        );
+        assert!(module.join("M.psm1").is_file());
+        assert!(!t.path().join("sentinel.txt").exists(), "{script}");
+    }
+}

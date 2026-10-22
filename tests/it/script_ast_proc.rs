@@ -90,6 +90,22 @@ fn fake_parser_wrong_id_refuses_and_restarts() {
     assert_eq!(starts.lines().count(), 2, "{starts:?}");
 }
 
+/// An answer above 1 MiB is refused even when it ends well (12 000 valid records, ~1.4 MB).
+#[test]
+fn fake_parser_answer_cap_refuses() {
+    let record = format!("CMD\t1\tnone\tStringConstant\t.\tx\ts:{}", "a".repeat(90));
+    let (_t, p) = fake(&format!(
+        "set /p L=\nfor /L %%i in (1,1,12000) do echo {record}\necho END\t1"
+    ));
+    let gate = ast(p, Duration::from_secs(20), Duration::from_secs(10));
+    let got = gate.facts("q");
+    assert!(
+        matches!(&got, Err(AstError::Protocol(m)) if m.contains("1 MiB")),
+        "{:?}",
+        got.as_ref().map(|f| f.commands.len())
+    );
+}
+
 #[test]
 fn fake_parser_bad_record_refuses() {
     let (_t, p) = fake("set /p L=\necho BOGUS\t1\necho END\t1");
@@ -199,8 +215,11 @@ fn host_script_runs_nothing() {
         }
     }
     assert!(host.contains("$PSModuleAutoLoadingPreference = 'None'"));
-    // The host's own `using` check comes before the only parse.
-    let check = host.find("[regex]::Match($plain, $usingLoad)").unwrap();
+    // The host's own text checks come before the only parse.
+    let check = host
+        .find("@(@($usingLoad, 'module'), @($parseLoad, 'dsc'), @($requiresLoad, 'requires'))")
+        .unwrap();
+    assert!(host.contains("[regex]::Match($plain, $check[0])"));
     let parse = host.find("::ParseInput(").unwrap();
     assert!(check < parse);
     assert_eq!(host.matches("::ParseInput(").count(), 1);

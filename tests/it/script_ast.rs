@@ -662,3 +662,252 @@ fn any_global_binding_refuses_and_revives_the_dead_branch() {
         assert!(flags(&format!("{b}{DEAD_BODY}")).is_empty(), "{b:?}");
     }
 }
+// ---- Task 227, adversarial review ----
+
+/// DSC and workflow words refuse before the parser, in any spelling.
+#[test]
+fn parse_time_words_refuse() {
+    for (text, line) in [
+        ("configuration C { }", 1),
+        (
+            "Write-Output 1\nImport-DscResource -ModuleName '\\\\host\\share\\M'",
+            2,
+        ),
+        ("workflow W { }", 1),
+        (
+            "[System.Management.Automation.Language.DynamicKeyword]::GetKeyword('x')",
+            1,
+        ),
+        ("CONFIGURATION C { }", 1),
+        ("work`flow W { }", 1),
+        ("x; configuration c { }", 1),
+        ("Write-Output 'a configuration file'", 1),
+        ("$x.Configuration", 1),
+    ] {
+        assert_eq!(script_ast::parse_time_load(text), Some(line), "{text:?}");
+    }
+    for text in [
+        "$configuration = 1",
+        "Write-Output ${workflow}",
+        "$env:workflow",
+        "dotnet build -Configuration Release",
+        "Write-Output configurations myworkflow",
+    ] {
+        assert_eq!(script_ast::parse_time_load(text), None, "{text:?}");
+    }
+    let (report, _) = script_scan::scan_gated(
+        "configuration C { Import-DscResource -ModuleName X }",
+        PRELUDE_FUNCTIONS,
+        &CallRoots::default(),
+        &Counting::default(),
+    );
+    assert_eq!(report.verdict, Verdict::Refuse);
+    assert!(
+        report
+            .flags
+            .iter()
+            .any(|f| f.detail.contains("Import-DscResource")),
+        "{:?}",
+        report.flags
+    );
+}
+
+/// `#requires` refuses unless it only asks for a version or an administrator.
+#[test]
+fn requires_refuses_unless_version_or_admin() {
+    for (text, line) in [
+        ("#requires -Modules X", 1),
+        ("Write-Output 1\n#Requires -Version 5 -Modules X", 2),
+        ("#requires -PSSnapin x", 1),
+        ("#requires -Assembly x.dll", 1),
+        ("# requires -Modules x", 1),
+        ("#requires \u{2013}Modules x", 1),
+        ("#requires -Ver 5", 1),
+        ("#requires -Version x", 1),
+        ("#requires -Version 5 junk", 1),
+        ("#\nrequires -Modules x", 1),
+        ("#req`uires -Modules x", 1),
+    ] {
+        assert_eq!(script_ast::parse_time_load(text), Some(line), "{text:?}");
+    }
+    for text in [
+        "#requires -Version 5.1",
+        "#Requires -RunAsAdministrator",
+        "#requires -Version 5 -RunAsAdministrator\r\nWrite-Output 1",
+        "#requires \u{2013}Version 7.2",
+        "#requiresx -Modules x",
+    ] {
+        assert_eq!(script_ast::parse_time_load(text), None, "{text:?}");
+    }
+}
+
+/// Every case of the text checks, for the equivalence test.
+const PARSE_TIME_CASES: &[&str] = &[
+    "using module x",
+    "Write-Output 1\n  USING <# c #>\n assembly x.dll",
+    "us`ing mod`ule x",
+    "& { using module y }",
+    "x\n\nusing\tmodule y",
+    "using\nassembly y",
+    "USING MODULE x",
+    "using<# c #>module x",
+    "#requires -Version 5\nusing module x",
+    "using `\n  module x",
+    "using #c\nmodule x",
+    "using #<#\nmodule x",
+    "using <# a #> # b\n assembly y",
+    "using <# unclosed",
+    "Write-Output 1\nusing",
+    "using x",
+    "Write-Output 'Using modules'",
+    "using modulex",
+    "using namespace System.IO",
+    "using <# a #> # b\n namespace System.IO",
+    "Start-Job { $using:x }",
+    "Write-Output ${using:x}",
+    "$using:x module",
+    "x_using module y",
+    "",
+    "configuration C { }",
+    "Import-DscResource -ModuleName X",
+    "workflow W { }",
+    "DynamicKeyword",
+    "CONFIGURATION C { }",
+    "work`flow W { }",
+    "$configuration = 1",
+    "Write-Output ${workflow}",
+    "$x.Configuration",
+    "$env:workflow",
+    "dotnet build -Configuration Release",
+    "Write-Output configurations myworkflow",
+    "#requires -Modules X",
+    "#Requires -Version 5 -Modules X",
+    "# requires -Modules x",
+    "#requires \u{2013}Modules x",
+    "#requires -Ver 5",
+    "#requires -Version x",
+    "#\nrequires -Modules x",
+    "#requires -Version 5.1",
+    "#Requires -RunAsAdministrator",
+    "#requires -Version 5 -RunAsAdministrator\r\nWrite-Output 1",
+    "#requires \u{2013}Version 7.2",
+    "#requiresx -Modules x",
+    "\u{e9}using module x",
+    "using\u{e9} module x",
+    "workflow\u{e9}",
+];
+
+/// The host's regexes (`$usingLoad`, `$parseLoad`, `$requiresLoad` of `ast_facts.ps1`) and
+/// `parse_time_load` agree on every case (backticks dropped first on both sides).
+#[test]
+fn host_and_rust_text_checks_agree() {
+    let host = script_ast::HOST_SCRIPT;
+    let regex = |name: &str| {
+        let start = format!("{name} = '");
+        let line = host
+            .lines()
+            .find(|l| l.starts_with(&start))
+            .unwrap_or_else(|| panic!("{name} missing"));
+        let pattern = line[start.len()..].trim_end().strip_suffix('\'').unwrap();
+        fancy_regex::Regex::new(pattern).unwrap()
+    };
+    let checks = [
+        regex("$usingLoad"),
+        regex("$parseLoad"),
+        regex("$requiresLoad"),
+    ];
+    for text in PARSE_TIME_CASES {
+        let plain = text.replace('`', "");
+        let host_refuses = checks.iter().any(|r| r.is_match(&plain).unwrap());
+        assert_eq!(
+            host_refuses,
+            script_ast::parse_time_load(text).is_some(),
+            "{text:?}"
+        );
+    }
+}
+
+/// `global` named outside `if ($global)` conditions, in ways the parser cannot read as a
+/// binding, makes the `if ($global)` body live.
+#[test]
+fn global_named_elsewhere_revives_the_dead_branch() {
+    let body = "CMD\t2\tnone\tStringConstant\tG\tRemove-Item\ts:C:\\Windows\\x\n";
+    let refused_body = |text: &str| {
+        let gate = fake(&[(text, Ok(body))]);
+        let (report, _) =
+            script_scan::scan_gated(text, PRELUDE_FUNCTIONS, &CallRoots::default(), &gate);
+        report
+            .flags
+            .iter()
+            .any(|f| f.kind == FlagKind::SystemWrite && f.verdict == Verdict::Refuse && f.line == 2)
+    };
+    let tail = "\nif ($global) { Remove-Item C:\\Windows\\x }";
+    assert!(
+        !refused_body(&format!("Write-Output 1{tail}")),
+        "alone, dead code"
+    );
+    for head in [
+        // The lexer already revives the body for these (measured)...
+        "Write-Output ([ref]$global)",
+        "Get-Item variable:global",
+        "$p = @{ Name = 'glo' + 'bal'; Value = 1 }; Write-Output 'global'",
+        // ...and not for these: only the parser's facts (`global_named`) revive it.
+        "# global",
+        "<# global #>",
+        "if ($global -or $y) { Write-Output 1 }",
+    ] {
+        let text = format!("{head}{tail}");
+        assert!(refused_body(&text), "{text:?}");
+    }
+    assert!(script_ast::global_named_elsewhere("$GLOBAL:x = 1"));
+    assert!(!script_ast::global_named_elsewhere(
+        "if ( $Global ) { }\nif ($global -and $x) { }"
+    ));
+    assert!(script_ast::global_named_elsewhere("elseif ($global) { }"));
+}
+
+/// Bindings whose name the parser cannot read count as `global`.
+#[test]
+fn unread_variable_names_are_bindings() {
+    for wire in [
+        "CMD\t1\tnone\tStringConstant\t.\tSet-Variable\tp:Name\t?:Paren\tp:Value\ts:1\n",
+        "CMD\t1\tnone\tStringConstant\t.\tsv\t?:Variable\n",
+        "MEM\t1\t0\t.\t$ExecutionContext.SessionState.PSVariable\tSet\t?:('glo' + 'bal')\ts:1\n",
+    ] {
+        let got = flags(&format!("{wire}{DEAD_BODY}"));
+        assert!(
+            got.contains(&(FlagKind::GlobalName, Verdict::Refuse)),
+            "{wire:?}: {got:?}"
+        );
+        assert!(
+            got.contains(&(FlagKind::SystemWrite, Verdict::Refuse)),
+            "{wire:?}: {got:?}"
+        );
+    }
+}
+
+/// `Start-Process -Verb` with a value the gate cannot read may be `RunAs`.
+#[test]
+fn computed_verb_refused() {
+    for verb in ["?:Paren", "?:Variable", "e:$v", "e:Run$($a)"] {
+        for (cmd, p) in [("Start-Process", "Verb"), ("saps", "v"), ("start", "VERB")] {
+            let wire = format!("CMD\t1\tnone\tStringConstant\t.\t{cmd}\ts:x\tp:{p}\t{verb}\n");
+            let got = flags(&wire);
+            assert!(
+                got.contains(&(FlagKind::Elevation, Verdict::Refuse)),
+                "{wire:?}: {got:?}"
+            );
+        }
+    }
+    for wire in [
+        "CMD\t1\tnone\tStringConstant\t.\tStart-Process\ts:x\tp:Verb\ts:open\n",
+        "CMD\t1\tnone\tStringConstant\t.\tStart-Process\ts:x\tp:Verb\te:open\n",
+        "CMD\t1\tnone\tStringConstant\t.\tWrite-Output\tp:Verb\t?:Variable\n",
+    ] {
+        let got = flags(wire);
+        assert!(
+            !got.iter().any(|f| f.0 == FlagKind::Elevation),
+            "{wire:?}: {got:?}"
+        );
+    }
+}
