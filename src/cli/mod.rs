@@ -1177,7 +1177,7 @@ fn row_kind(r: &ListRow) -> Option<SourceKind> {
 }
 
 /// Where `WINGETRS_TRANSCRIPT` says to record the command's text; `None` for the elevated
-/// helper and the detached background refresh (neither writes to the user's disk or terminal
+/// helper (`bridge-worker`, `self apply-elevated`) and the detached background refresh (neither writes to the user's disk or terminal
 /// on its own) and for an empty value.
 pub fn transcript_path(cli: &Cli, var: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
     match &cli.command {
@@ -1185,6 +1185,9 @@ pub fn transcript_path(cli: &Cli, var: Option<std::ffi::OsString>) -> Option<std
             Command::BridgeWorker { .. }
             | Command::Update {
                 background: true, ..
+            }
+            | Command::SelfCmd {
+                action: SelfAction::ApplyElevated,
             },
         ) => None,
         _ => var.filter(|v| !v.is_empty()).map(std::path::PathBuf::from),

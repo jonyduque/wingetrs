@@ -94,6 +94,14 @@ fn emit_lines_are_plain() {
 }
 
 #[test]
+fn strip_ansi_drops_csi_and_osc() {
+    assert_eq!(
+        transcript::strip_ansi("\x1b]8;;http://x\x1b\\texto\x1b]8;;\x07\x1b[1;32mok\x1b[0m\r"),
+        "textook"
+    );
+}
+
+#[test]
 fn appends_to_existing_file() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("t.txt");
@@ -238,6 +246,8 @@ fn elevated_worker_and_background_never_transcribe() {
     assert_eq!(transcript_path(&worker, var()), None);
     let background = parse(&["wingetrs", "update", "--background"]);
     assert_eq!(transcript_path(&background, var()), None);
+    let apply = parse(&["wingetrs", "self", "apply-elevated"]);
+    assert_eq!(transcript_path(&apply, var()), None);
     let list = parse(&["wingetrs", "list"]);
     assert_eq!(transcript_path(&list, var()), Some("t.txt".into()));
     assert_eq!(transcript_path(&list, Some(OsString::new())), None);

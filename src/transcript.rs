@@ -7,7 +7,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
-/// The environment variable that names the transcript file.
+/// The environment variable that names the transcript file. The file keeps everything the
+/// CLI shows (URLs of `--dry-run`, text of manifest scripts): do not share it unreviewed.
 pub const VAR: &str = "WINGETRS_TRANSCRIPT";
 
 static FILE: Mutex<Option<File>> = Mutex::new(None);
