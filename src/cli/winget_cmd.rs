@@ -28,6 +28,7 @@ use crate::winget_install::ops::{InstallReport, WingetOpsError};
 use crate::winget_install::orphans::Orphan;
 use crate::winget_install::plan::{
     PlanOrBridge, WingetPlan, bridge_reason, bridge_step, name_version, plan_runs_elevated,
+    upgrade_runs_elevated,
 };
 use crate::winget_install::portable::PortableSpec;
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
@@ -465,6 +466,7 @@ async fn run_native<E: std::fmt::Display + Send + 'static>(
     gate: &LaunchGate,
     info: JobInfo,
     plan: &WingetPlan,
+    elevated: bool,
     ok: &str,
     op: Op<Result<InstallReport, E>>,
     say: Say<'_>,
@@ -473,7 +475,7 @@ async fn run_native<E: std::fmt::Display + Send + 'static>(
     // Held from before `job.start` until after `job.end`: the log always gets its end.
     stop.interrupts.hold();
     let mut log = JobLog::start_accepting(info, &agreements);
-    log.elevated = plan_runs_elevated(plan);
+    log.elevated = elevated;
     let out = run_blocking(ui, stop.interrupts, gate, op).await;
     ui.end_progress();
     let out = match out {
@@ -588,6 +590,7 @@ pub async fn install<F: WingetFlows>(
         &gate,
         info,
         &plan,
+        plan_runs_elevated(&plan),
         "instalado",
         op,
         &mut *say,
@@ -965,6 +968,7 @@ pub async fn upgrade<F: WingetFlows>(
         &gate,
         info,
         &plan,
+        upgrade_runs_elevated(&plan, previous.as_ref()),
         "atualizado",
         op,
         &mut *say,

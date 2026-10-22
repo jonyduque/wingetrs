@@ -20,7 +20,9 @@ use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use crate::winget_install::engine::{self, UpgradeError, UpgradeRoute, upgrade_route};
 use crate::winget_install::ops::{self as winget_ops, WingetCtx, WingetOpsError};
 use crate::winget_install::orphans::{ArpRegistry, remove_orphan_with};
-use crate::winget_install::plan::{WingetPlan as NativePlan, plan_runs_elevated};
+use crate::winget_install::plan::{
+    WingetPlan as NativePlan, plan_runs_elevated, upgrade_runs_elevated,
+};
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::uninstall::{
     KEY_STAYED, MsiQueue, UninstallCtx, UninstallPlan as WingetUninstallPlan, UninstallStatus,
@@ -743,22 +745,45 @@ fn install_done(
 }
 
 /// Whether a native winget action runs anything as administrator (installer UAC or helper).
-fn winget_action_elevated(action: &Action) -> bool {
+fn winget_action_elevated(action: &Action, previous: Option<&Option<WingetUninstallPlan>>) -> bool {
     match action {
-        Action::WingetInstall(p) | Action::WingetUpgrade { plan: p, .. } => plan_runs_elevated(p),
+        Action::WingetInstall(p) => plan_runs_elevated(p),
+        Action::WingetUpgrade { plan, .. } => {
+            upgrade_runs_elevated(plan, previous.and_then(|p| p.as_ref()))
+        }
         Action::WingetUninstall(p) => removal_runs_elevated(p, false),
         Action::WingetRegistryOnly(p) => removal_runs_elevated(p, true),
         _ => false,
     }
 }
 
+/// The installed version an upgrade of this action removes first (`UninstallFirst` route).
+fn upgrade_previous(
+    env: &WingetEnv<'_>,
+    action: &Action,
+) -> Result<Option<WingetUninstallPlan>, String> {
+    match action {
+        Action::WingetUpgrade { plan, row_key }
+            if upgrade_route(&plan.installer) == UpgradeRoute::UninstallFirst =>
+        {
+            (env.previous)(row_key, plan).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Executes a confirmed native winget action and logs it as a job.
 pub async fn run_winget_action(env: &WingetEnv<'_>, action: Action) -> Result<Done, InstallFail> {
     let mut log = action_info(&action).map(JobLog::start);
+    // The version an upgrade removes first decides `elevated` too.
+    let previous = upgrade_previous(env, &action);
     if let Some(log) = &mut log {
-        log.elevated = winget_action_elevated(&action);
+        log.elevated = winget_action_elevated(&action, previous.as_ref().ok());
     }
-    let (result, outcome) = run_winget_inner(env, action).await;
+    let (result, outcome) = match previous {
+        Ok(previous) => run_winget_inner(env, action, previous).await,
+        Err(e) => (Err(InstallFail::Other(e)), Outcome::Ok),
+    };
     if let Some(log) = log {
         match &result {
             Ok(done) => log.finish(outcome, &done.summary),
@@ -779,6 +804,7 @@ pub async fn run_winget_action(env: &WingetEnv<'_>, action: Action) -> Result<Do
 async fn run_winget_inner(
     env: &WingetEnv<'_>,
     action: Action,
+    previous: Option<WingetUninstallPlan>,
 ) -> (Result<Done, InstallFail>, Outcome) {
     let failed = |f: InstallFail| (Err(f), Outcome::Ok);
     match action {
@@ -786,15 +812,7 @@ async fn run_winget_inner(
             Ok(r) => install_done("Instalado", &plan.name, r),
             Err(e) => failed(winget_fail(e)),
         },
-        Action::WingetUpgrade { plan, row_key } => {
-            let previous = if upgrade_route(&plan.installer) == UpgradeRoute::UninstallFirst {
-                match (env.previous)(&row_key, &plan) {
-                    Ok(p) => Some(p),
-                    Err(e) => return failed(InstallFail::Other(e)),
-                }
-            } else {
-                None
-            };
+        Action::WingetUpgrade { plan, .. } => {
             match engine::upgrade(&env.install, &env.uninstall, &plan, previous.as_ref()).await {
                 Ok(r) => install_done("Atualizado", &plan.name, r),
                 Err(e) => failed(upgrade_fail(e)),

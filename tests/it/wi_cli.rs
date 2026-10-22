@@ -144,6 +144,8 @@ struct Fake {
     elevation: Option<Elevation>,
     lock_hook: Option<LockHook>,
     run_hook: Option<RunHook>,
+    /// The version an upgrade removes first (`UninstallFirst` route).
+    previous: Option<UninstallPlan>,
 }
 
 fn report_ok() -> InstallReport {
@@ -306,14 +308,17 @@ impl WingetFlows for Fake {
         _: &str,
         _: ScopeWanted,
     ) -> anyhow::Result<(Result<PlanOrBridge, Refusal>, Option<UninstallPlan>)> {
-        Ok((Ok(self.planned.clone().expect("no plan")), None))
+        Ok((
+            Ok(self.planned.clone().expect("no plan")),
+            self.previous.clone(),
+        ))
     }
     fn upgrade(
         &self,
         _: &WingetPlan,
         _: Option<&UninstallPlan>,
     ) -> Op<Result<InstallReport, UpgradeError>> {
-        unreachable!("no upgrade in these tests")
+        Box::new(|| Box::pin(async { Ok(report_ok()) }))
     }
     /// winget through the session's helper: its UAC notice, then winget's own line.
     fn upgrade_bridge(
@@ -2327,5 +2332,51 @@ async fn job_log_helper_removal_is_elevated() {
             expected,
             "registry-only {key}"
         );
+    }
+}
+
+/// Task 220: an upgrade whose new installer never elevates but whose previous version is
+/// removed through the elevated helper is an elevated job.
+#[tokio::test]
+async fn job_log_upgrade_with_helper_previous_is_elevated() {
+    use wingetrs::winget_install::uninstall::UninstallTarget;
+    for (previous, expected) in [
+        (Some(Elevation::Helper), true),
+        (Some(Elevation::Never), false),
+        (None, false),
+    ] {
+        let log = crate::spans::Log::default();
+        let _installed = log.install();
+        let mut p = native_plan();
+        p.elevation = Elevation::Never;
+        let fake = Fake {
+            rows: vec![row("Contoso App", "arp/hklm32/{G}", Some("Pub.App"))],
+            planned: Some(PlanOrBridge::Native(p)),
+            previous: previous.map(|elevation| UninstallPlan {
+                target: UninstallTarget::Arp {
+                    hive: Hive::MachineX86,
+                    key: "{G}".into(),
+                },
+                name: "Contoso App".into(),
+                version: Some("0.9".into()),
+                command: None,
+                elevation,
+                shared: None,
+            }),
+            ..Default::default()
+        };
+        let (_tx, mut rx) = quiet();
+        let gate = LaunchGate::default();
+        winget_cmd::upgrade(
+            &fake,
+            &FakeUi::default(),
+            "Pub.App",
+            yes(),
+            Stop::new(&mut rx, &gate),
+            &mut |_: &str| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(logged_elevated(&log.text()), expected, "{previous:?}");
     }
 }

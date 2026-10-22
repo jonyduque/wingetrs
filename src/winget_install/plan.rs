@@ -6,6 +6,7 @@ use super::select::{Host, Refusal, Scope, ScopeWanted, Verdict, choose};
 use super::switches::{
     CommandLine, LOG_TOKEN, Mode, Program, install_args, install_args_unlogged, mode_for,
 };
+use super::uninstall::{UninstallPlan, removal_runs_elevated};
 use crate::bridge::worker::{
     ElevatedKind, InstallerRequest, exe_params_allowed, msi_params_allowed_in,
 };
@@ -59,6 +60,12 @@ pub struct WingetPlan {
 /// log records as `elevated`.
 pub fn plan_runs_elevated(plan: &WingetPlan) -> bool {
     plan.elevation == Elevation::Helper
+}
+
+/// Whether an upgrade runs anything as administrator: the new installer (see
+/// [`plan_runs_elevated`]) or the uninstaller of the `previous` version removed first.
+pub fn upgrade_runs_elevated(plan: &WingetPlan, previous: Option<&UninstallPlan>) -> bool {
+    plan_runs_elevated(plan) || previous.is_some_and(|p| removal_runs_elevated(p, false))
 }
 
 /// Run natively, or hand the package to winget (the text says why).
