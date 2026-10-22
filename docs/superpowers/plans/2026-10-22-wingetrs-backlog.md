@@ -23,6 +23,14 @@
 - G: sonda autorizada (~3 GB, sem executar nada). O modo cobre só MSI (D-G1), `msiexec /a` é recusado (D-G3), só a flag sem config (D-G4) e arquivos para pastas do Windows são bloqueados (D-G5). A D-G2 fica para depois da sonda.
 - Demais decisões aceitas como recomendadas: C1 (avisos fora do `--json`), D1 (Esc pula só o item), D2 (cada item confirma), D-A1 (cache dos nomes MSIX em disco se a Fase 1 der ≥ 50 ms), D-B1 (o usuário roda o `tui_frame console`), D-B2 (Fase 2 sem nova consulta para o buffer; consultar para o Sixel), D-I1 (tar sem total), D-I2 (230 e 232 separadas).
 - O exemplo da 227 que lê scripts reais do catálogo ainda precisa de pedido explícito.
+- Depois da sonda da 229 (2026-10-22):
+  - Regra "espalhado": a pasta principal é um `Directory` cujo id não é pasta padrão do Windows Installer, e 1 componente basta.
+  - D-G2 como o revisor propôs:
+    - ação de código adiada bloqueia;
+    - viram perda avisada: só rollback (`Type & 0x100`) e `Wix4CreateInternetShortcuts_{X86,X64,A64}`;
+    - os tipos 7, 23 e 39 bloqueiam sempre;
+    - as ações imediatas viram perda avisada.
+  - Na 231, `Shortcut.Name` passa por `install::safepath` antes de virar `.lnk`.
 
 ## Bloco 233
 
