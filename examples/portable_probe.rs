@@ -161,7 +161,7 @@ mod probe {
             }
         }
         for l in &facts.losses {
-            if let Loss::ImmediateAction(a) = l {
+            if let Loss::ImmediateAction(a) | Loss::RollbackAction(a) = l {
                 actions.push(a);
             }
         }

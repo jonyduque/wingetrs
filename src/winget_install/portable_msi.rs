@@ -30,6 +30,56 @@ const SYSTEM_DIRS: [&str; 6] = [
     "FontsFolder",
     "WindowsVolume",
 ];
+/// Standard Windows Installer folders: a file's main folder is the first `Directory` below them.
+const STANDARD_DIRS: [&str; 39] = [
+    "TARGETDIR",
+    "ProgramFilesFolder",
+    "ProgramFiles64Folder",
+    "ProgramFiles6432Folder",
+    "CommonFilesFolder",
+    "CommonFiles64Folder",
+    "CommonFiles6432Folder",
+    "AppDataFolder",
+    "LocalAppDataFolder",
+    "CommonAppDataFolder",
+    "AdminToolsFolder",
+    "DesktopFolder",
+    "FavoritesFolder",
+    "FontsFolder",
+    "MyPicturesFolder",
+    "NetHoodFolder",
+    "PersonalFolder",
+    "PrintHoodFolder",
+    "ProgramMenuFolder",
+    "RecentFolder",
+    "SendToFolder",
+    "StartMenuFolder",
+    "StartupFolder",
+    "System16Folder",
+    "System64Folder",
+    "SystemFolder",
+    "System6432Folder",
+    "TempFolder",
+    "TemplateFolder",
+    "WindowsFolder",
+    "WindowsVolume",
+    "PerUserProgramFilesFolder",
+    "PerUserCommonFilesFolder",
+    "ProgramFilesFolderX86",
+    "CommonFilesFolderX86",
+    "UserProfileFolder",
+    "MyMusicFolder",
+    "MyVideoFolder",
+    "GlobalAssemblyCache",
+];
+/// Rollback-only custom action (`msidbCustomActionTypeRollback`): runs only when an install fails.
+const ROLLBACK: i32 = 0x100;
+/// Deferred actions of the WiX standard library whose only effect is internet shortcuts.
+const INTERNET_SHORTCUT_ACTIONS: [&str; 3] = [
+    "Wix4CreateInternetShortcuts_X86",
+    "Wix4CreateInternetShortcuts_X64",
+    "Wix4CreateInternetShortcuts_A64",
+];
 /// Summary Information word count bit: elevated privileges are not required.
 const WORD_COUNT_NO_ELEVATION: i32 = 0x8;
 /// `Registry.Root` of `HKEY_LOCAL_MACHINE`.
@@ -67,6 +117,10 @@ pub enum Blocker {
 pub enum Loss {
     #[error("ação personalizada {0} não roda")]
     ImmediateAction(String),
+    #[error("ação personalizada {0} (só de rollback) não roda")]
+    RollbackAction(String),
+    #[error("atalhos de internet")]
+    InternetShortcuts,
     #[error("{0} valor(es) de registro não gravado(s)")]
     Registry(usize),
     #[error("associação de arquivos: {}", .0.join(", "))]
@@ -143,10 +197,14 @@ fn facts(pkg: &mut Pkg) -> Result<MsiFacts, ExtractError> {
             push(&mut blockers, Blocker::NestedInstall(action));
         } else if !CODE_TYPES.contains(&(kind & 0x3F)) {
             continue;
-        } else if kind & IN_SCRIPT != 0 {
-            push(&mut blockers, Blocker::DeferredAction(action));
-        } else {
+        } else if kind & IN_SCRIPT == 0 {
             push(&mut losses, Loss::ImmediateAction(action));
+        } else if kind & ROLLBACK != 0 {
+            push(&mut losses, Loss::RollbackAction(action));
+        } else if INTERNET_SHORTCUT_ACTIONS.contains(&action.as_str()) {
+            push(&mut losses, Loss::InternetShortcuts);
+        } else {
+            push(&mut blockers, Blocker::DeferredAction(action));
         }
     }
 
@@ -216,28 +274,50 @@ fn facts(pkg: &mut Pkg) -> Result<MsiFacts, ExtractError> {
         .iter()
         .map(|f| (f.file.as_str(), f.component.as_str()))
         .collect();
-    let in_system = |file: &str| {
-        let Some(mut cur) = file_comp.get(file).and_then(|c| comp_dir.get(c)).copied() else {
-            return false;
-        };
+    let default_dir: HashMap<&str, &str> = dirs
+        .iter()
+        .map(|d| (d.directory.as_str(), d.default_dir.as_str()))
+        .collect();
+    // Directory ids from the root down to the folder of `file`.
+    let chain = |file: &str| -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut cur = file_comp.get(file).and_then(|c| comp_dir.get(c)).copied();
         // `layout` already refused cycles; the bound only keeps this walk finite.
-        for _ in 0..=dirs.len() {
-            if SYSTEM_DIRS.contains(&cur) {
-                return true;
-            }
-            match parent.get(cur) {
-                Some(p) if *p != cur => cur = p,
-                _ => break,
-            }
+        while let Some(d) = cur.filter(|_| out.len() <= dirs.len()) {
+            out.push(d);
+            cur = parent.get(d).copied().filter(|p| *p != d);
         }
-        false
+        out.reverse();
+        out
     };
+    let in_system = |file: &str| chain(file).iter().any(|d| SYSTEM_DIRS.contains(d));
     let (system, app): (Vec<_>, Vec<_>) = placed.into_iter().partition(|p| in_system(&p.file));
     if !system.is_empty() {
         push(&mut blockers, Blocker::SystemFiles(system.len()));
     }
-    let main_dir = common_dir(app.iter().map(|p| &p.rel[..p.rel.len().saturating_sub(1)]))
-        .filter(|d| d.len() >= 2);
+    // Main folder of one file: the path of the first non-standard `Directory` of its chain
+    // (`None` when the file sits in a standard folder).
+    let app_root = |p: &msi_layout::Placed| -> Option<Vec<String>> {
+        let ids = chain(&p.file);
+        let i = ids.iter().position(|d| !STANDARD_DIRS.contains(d))?;
+        let below = ids[i + 1..]
+            .iter()
+            .filter(|d| default_dir.get(*d).is_some_and(|v| source_name(v) != "."))
+            .count();
+        let dir_len = p.rel.len().checked_sub(1 + below)?;
+        Some(p.rel[..dir_len].to_vec())
+    };
+    let mut roots = app.iter().map(app_root);
+    let main_dir = match roots.next() {
+        Some(Some(first)) => roots
+            .all(|r| {
+                r.is_some_and(|r| {
+                    r.len() == first.len() && r.iter().zip(&first).all(|(a, b)| same(a, b))
+                })
+            })
+            .then_some(first),
+        _ => None,
+    };
     if main_dir.is_none() {
         push(&mut blockers, Blocker::Scattered);
     }
@@ -327,12 +407,8 @@ fn same(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
 }
 
-/// Longest common prefix (by component) of `dirs`; `None` when there is none.
-fn common_dir<'a>(mut dirs: impl Iterator<Item = &'a [String]>) -> Option<Vec<String>> {
-    let mut common = dirs.next()?.to_vec();
-    for d in dirs {
-        let n = common.iter().zip(d).take_while(|(a, b)| same(a, b)).count();
-        common.truncate(n);
-    }
-    Some(common)
+/// Source-side name of a `DefaultDir` (as in `msi_layout`): after `:`, long form of `short|long`.
+fn source_name(default_dir: &str) -> &str {
+    let src = default_dir.split_once(':').map_or(default_dir, |(_, s)| s);
+    src.split_once('|').map_or(src, |(_, long)| long)
 }

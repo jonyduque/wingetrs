@@ -60,3 +60,12 @@ Go e Audacity têm a pasta do app direto abaixo de `SourceDir` (a pasta de Progr
 - **D-G3 (`msiexec /a` como reserva):** o extrator próprio aceitou 9 de 9 MSI medidos; a reserva não seria usada nesta amostra.
 - **D-G5 (`SystemFiles` sempre bloqueia?):** nenhum dos 10 grava em pasta do Windows; a decisão não muda nada nesta amostra.
 - **D-G1 (MSI dual-purpose por usuário):** `per_user_capable` 0 de 10; o caminho `ALLUSERS=2 MSIINSTALLPERUSER=1` não teria uso nesta amostra.
+
+## Regras decididas depois da sonda (2026-10-22)
+
+O usuário decidiu os dois pontos e o filtro mudou na mesma tarefa:
+
+- **Pasta principal pelo id do `Directory`:** é o primeiro `Directory` da cadeia do arquivo cujo id não é pasta padrão do Windows Installer (`TARGETDIR`, `ProgramFiles64Folder`, `CommonFilesFolder` etc.); vale com 1 componente. Arquivo direto numa pasta padrão, ou arquivos com pastas principais diferentes (ex.: `PFiles\Vendor\App` e `PFiles\Common Files\Vendor`), dão `Scattered`.
+- **D-G2:** ação de código adiada bloqueia, exceto as só de rollback (`Type & 0x100`, perda avisada) e `Wix4CreateInternetShortcuts_{X86,X64,A64}` por nome exato (perda "atalhos de internet"); tipos 7, 23 e 39 (instalação aninhada) bloqueiam sempre; imediatas são perda avisada.
+
+**Contagem esperada com as regras novas: 8 de 10 MSI aceitos** (os 5 de antes mais Go e Audacity pela pasta principal e Node pela D-G2; Chrome e Zoom continuam recusados por ações adiadas e arquivo fora da pasta principal). O número é **derivado** das tabelas desta sonda, **não medido de novo**: a sonda não rodou outra vez, e o Node só passa se `Wix4RollbackInternetShortcuts_X64` tiver o bit `0x100` (o `Type` não foi registrado nesta rodada; a sonda agora imprime o `Type` de cada ação listada).

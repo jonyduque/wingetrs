@@ -16,7 +16,12 @@ pub(crate) struct Extra {
     pub(crate) rows: Vec<Vec<Value>>,
 }
 
+/// `(Directory, Directory_Parent, DefaultDir)`.
+pub(crate) type Dir = (&'static str, Option<&'static str>, &'static str);
+
 pub(crate) struct AppMsi {
+    /// Rows of `Directory`; `INSTALLDIR`, `BIN` and `f_c_dir` must be among them.
+    pub(crate) dirs: Vec<Dir>,
     /// Directory of `readme.txt` (f_c); `foo.exe` (f_a) is in INSTALLDIR, `lib.dll` (f_b) in BIN.
     pub(crate) f_c_dir: &'static str,
     pub(crate) word_count: i32,
@@ -26,6 +31,17 @@ pub(crate) struct AppMsi {
 
 pub(crate) fn app() -> AppMsi {
     AppMsi {
+        dirs: vec![
+            ("TARGETDIR", None, "SourceDir"),
+            ("ProgramFiles64Folder", Some("TARGETDIR"), "PFiles"),
+            (
+                "INSTALLDIR",
+                Some("ProgramFiles64Folder"),
+                "FOOT~1|Foo Target:FOOS~1|Foo Source",
+            ),
+            ("BIN", Some("INSTALLDIR"), "bin"),
+            ("System64Folder", Some("TARGETDIR"), "System64"),
+        ],
         f_c_dir: "INSTALLDIR",
         word_count: 2,
         properties: vec![("ProductName", "Foo")],
@@ -84,18 +100,7 @@ pub(crate) fn build(s: AppMsi) -> Vec<u8> {
         ],
     )
     .unwrap();
-    let dirs: [(&str, Option<&str>, &str); 5] = [
-        ("TARGETDIR", None, "SourceDir"),
-        ("ProgramFiles64Folder", Some("TARGETDIR"), "PFiles"),
-        (
-            "INSTALLDIR",
-            Some("ProgramFiles64Folder"),
-            "FOOT~1|Foo Target:FOOS~1|Foo Source",
-        ),
-        ("BIN", Some("INSTALLDIR"), "bin"),
-        ("System64Folder", Some("TARGETDIR"), "System64"),
-    ];
-    for (d, parent, default) in dirs {
+    for (d, parent, default) in s.dirs {
         let parent = parent.map_or(Value::Null, Value::from);
         p.insert_rows(Insert::into("Directory").row(vec![d.into(), parent, default.into()]))
             .unwrap();
@@ -622,4 +627,101 @@ fn directory_cycle_is_a_layout_error() {
     std::fs::write(&f, bytes).unwrap();
     let err = analyze(&f).unwrap_err();
     assert!(matches!(err, ExtractError::MsiLayout(_)), "{err:?}");
+}
+
+#[test]
+fn one_folder_right_under_the_root_is_the_main_folder() {
+    // Go and Audacity: the app folder is a direct child of `SourceDir`.
+    let dirs = vec![
+        ("TARGETDIR", None, "SourceDir"),
+        ("INSTALLDIR", Some("TARGETDIR"), "Go"),
+        ("BIN", Some("INSTALLDIR"), "bin"),
+    ];
+    let f = facts(&build(AppMsi { dirs, ..app() }));
+    assert_eq!(f.blockers, Vec::<Blocker>::new());
+    assert_eq!(f.main_dir, Some(s(&["Go"])));
+    assert_eq!(
+        f.files,
+        vec![s(&["bin", "lib.dll"]), s(&["foo.exe"]), s(&["readme.txt"])]
+    );
+}
+
+#[test]
+fn dot_default_dir_adds_no_folder() {
+    let dirs = vec![
+        ("TARGETDIR", None, "SourceDir"),
+        ("ProgramFiles64Folder", Some("TARGETDIR"), "."),
+        ("INSTALLDIR", Some("ProgramFiles64Folder"), "Foo"),
+        ("BIN", Some("INSTALLDIR"), "."),
+    ];
+    let f = facts(&build(AppMsi { dirs, ..app() }));
+    assert_eq!(f.blockers, Vec::<Blocker>::new());
+    assert_eq!(f.main_dir, Some(s(&["Foo"])));
+    assert_eq!(
+        f.files,
+        vec![s(&["foo.exe"]), s(&["lib.dll"]), s(&["readme.txt"])]
+    );
+}
+
+#[test]
+fn sibling_folders_under_program_files_are_scattered() {
+    // `PFiles\Vendor\App` and `PFiles\Common Files\Vendor`: they share only `PFiles`.
+    let dirs = vec![
+        ("TARGETDIR", None, "SourceDir"),
+        ("ProgramFiles64Folder", Some("TARGETDIR"), "PFiles"),
+        ("VENDOR", Some("ProgramFiles64Folder"), "Vendor"),
+        ("INSTALLDIR", Some("VENDOR"), "App"),
+        ("BIN", Some("INSTALLDIR"), "bin"),
+        (
+            "CommonFiles64Folder",
+            Some("ProgramFiles64Folder"),
+            "Common Files",
+        ),
+        ("SHARED", Some("CommonFiles64Folder"), "Vendor"),
+    ];
+    let f = facts(&build(AppMsi {
+        dirs,
+        f_c_dir: "SHARED",
+        ..app()
+    }));
+    assert_eq!(f.blockers, vec![Blocker::Scattered]);
+    assert_eq!(f.main_dir, None);
+}
+
+#[test]
+fn rollback_only_action_is_a_loss() {
+    let extra = custom_actions(&[("Undo", 1 | 0x400 | 0x100, true)]);
+    let f = facts(&build(AppMsi { extra, ..app() }));
+    assert_eq!(f.blockers, Vec::<Blocker>::new());
+    assert_eq!(f.losses, vec![Loss::RollbackAction("Undo".into())]);
+}
+
+#[test]
+fn wix_internet_shortcuts_are_a_loss() {
+    for name in [
+        "Wix4CreateInternetShortcuts_X86",
+        "Wix4CreateInternetShortcuts_X64",
+        "Wix4CreateInternetShortcuts_A64",
+    ] {
+        let extra = custom_actions(&[(name, 1 | 0x400, true)]);
+        let f = facts(&build(AppMsi { extra, ..app() }));
+        assert_eq!(f.blockers, Vec::<Blocker>::new(), "{name}");
+        assert_eq!(f.losses, vec![Loss::InternetShortcuts], "{name}");
+    }
+}
+
+#[test]
+fn look_alike_of_the_wix_shortcut_action_blocks() {
+    for name in [
+        "Wix4CreateInternetShortcuts_X64_Extra",
+        "wix4createinternetshortcuts_x64",
+    ] {
+        let extra = custom_actions(&[(name, 1 | 0x400, true)]);
+        let f = facts(&build(AppMsi { extra, ..app() }));
+        assert_eq!(
+            f.blockers,
+            vec![Blocker::DeferredAction(name.into())],
+            "{name}"
+        );
+    }
 }
