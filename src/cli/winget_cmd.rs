@@ -27,14 +27,14 @@ use crate::winget_install::engine::{Engine, UpgradeError, choose_engine, upgrade
 use crate::winget_install::ops::{InstallReport, WingetOpsError};
 use crate::winget_install::orphans::Orphan;
 use crate::winget_install::plan::{
-    PlanOrBridge, WingetPlan, bridge_reason, bridge_step, name_version,
+    PlanOrBridge, WingetPlan, bridge_reason, bridge_step, name_version, plan_runs_elevated,
 };
 use crate::winget_install::portable::PortableSpec;
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::select::{Refusal, Scope, ScopeWanted};
 use crate::winget_install::uninstall::{
     SharedData, UninstallPlan, UninstallReport, UninstallStatus, UninstallTarget, human_size,
-    target_of,
+    removal_runs_elevated, target_of,
 };
 use anyhow::{Context, anyhow, bail};
 use std::collections::BTreeSet;
@@ -472,7 +472,8 @@ async fn run_native<E: std::fmt::Display + Send + 'static>(
     let agreements: Vec<String> = plan.agreements.iter().map(bridge::agreement_log).collect();
     // Held from before `job.start` until after `job.end`: the log always gets its end.
     stop.interrupts.hold();
-    let log = JobLog::start_accepting(info, &agreements);
+    let mut log = JobLog::start_accepting(info, &agreements);
+    log.elevated = plan_runs_elevated(plan);
     let out = run_blocking(ui, stop.interrupts, gate, op).await;
     ui.end_progress();
     let out = match out {
@@ -831,7 +832,7 @@ async fn run_removal<F: WingetFlows>(
         })
     });
     stop.interrupts.hold();
-    let log = JobLog::start(JobInfo {
+    let mut log = JobLog::start(JobInfo {
         kind: "remove",
         tool: "wingetrs",
         target: record.to_string(),
@@ -840,6 +841,7 @@ async fn run_removal<F: WingetFlows>(
         to: None,
         cmd: None,
     });
+    log.elevated = removal_runs_elevated(&plan, choice == RemovalChoice::RegistryOnly);
     let out = run_blocking(ui, stop.interrupts, &gate, job).await;
     ui.end_progress();
     let out = match out {

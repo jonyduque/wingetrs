@@ -2233,3 +2233,99 @@ fn no_bridge(
 ) -> std::io::Result<(i32, Vec<String>)> {
     panic!("winget bridge not expected")
 }
+
+/// The `elevated=` value of the one `job.end` line in `logged`.
+fn logged_elevated(logged: &str) -> bool {
+    let end = logged.lines().find(|l| l.contains("job.end")).unwrap();
+    assert!(
+        end.contains("elevated=true") != end.contains("elevated=false"),
+        "{end}"
+    );
+    end.contains("elevated=true")
+}
+
+/// Task 220: an installer that runs with its own UAC prompt marks the job as elevated.
+#[tokio::test]
+async fn job_log_native_machine_install_is_elevated() {
+    for (elevation, expected) in [
+        (wingetrs::winget_install::launch::Elevation::Helper, true),
+        (wingetrs::winget_install::launch::Elevation::Never, false),
+    ] {
+        let log = crate::spans::Log::default();
+        let _installed = log.install();
+        let mut p = native_plan();
+        p.elevation = elevation;
+        let fake = Fake {
+            planned: Some(PlanOrBridge::Native(p)),
+            ..Default::default()
+        };
+        let ui = FakeUi::default();
+        let (_tx, mut rx) = quiet();
+        let gate = LaunchGate::default();
+        winget_cmd::install(
+            &fake,
+            &ui,
+            &candidate(),
+            None,
+            yes(),
+            Stop::new(&mut rx, &gate),
+            &mut |_: &str| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(fake.installs.load(Ordering::SeqCst), 1);
+        assert_eq!(logged_elevated(&log.text()), expected, "{elevation:?}");
+    }
+}
+
+/// Task 220: a removal through the elevated helper (uninstaller or HKLM key) marks the job.
+#[tokio::test]
+async fn job_log_helper_removal_is_elevated() {
+    // Uninstaller: through the helper for a machine record, never for a user one.
+    for (key, elevation, expected) in [
+        ("arp/hklm32/{G}", Elevation::Helper, true),
+        ("arp/hkcu/{G}", Elevation::Never, false),
+    ] {
+        let log = crate::spans::Log::default();
+        let _installed = log.install();
+        let fake = Fake {
+            rows: vec![row("Contoso App", key, Some("Pub.App"))],
+            elevation: Some(elevation),
+            ..Default::default()
+        };
+        let (_tx, mut rx) = quiet();
+        let gate = fake.gate.clone();
+        winget_cmd::uninstall(
+            &fake,
+            &FakeUi::default(),
+            "Pub.App",
+            false,
+            yes(),
+            Stop::new(&mut rx, &gate),
+            &mut |_: &str| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(logged_elevated(&log.text()), expected, "{key}");
+    }
+    // Registry only: the HKLM key is deleted through the helper, the HKCU one in-process.
+    for (key, expected) in [("arp/hklm32/Kindle", true), ("arp/hkcu/Kindle", false)] {
+        let log = crate::spans::Log::default();
+        let _installed = log.install();
+        let t = TempDir::new().unwrap();
+        let mut fake = kindle(&t, true);
+        fake.rows = vec![row("Amazon Kindle", key, None)];
+        let ui = FakeUi {
+            interactive: true,
+            pick: Some(1),
+            ..Default::default()
+        };
+        let (r, _) = uninstall_with(&fake, &ui, Flags::default()).await;
+        r.unwrap();
+        assert_eq!(
+            logged_elevated(&log.text()),
+            expected,
+            "registry-only {key}"
+        );
+    }
+}

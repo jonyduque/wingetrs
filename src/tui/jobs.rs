@@ -20,11 +20,11 @@ use crate::tui::app::{Action, Cmd, Done, InstallFail, Msg, Planned};
 use crate::winget_install::engine::{self, UpgradeError, UpgradeRoute, upgrade_route};
 use crate::winget_install::ops::{self as winget_ops, WingetCtx, WingetOpsError};
 use crate::winget_install::orphans::{ArpRegistry, remove_orphan_with};
-use crate::winget_install::plan::WingetPlan as NativePlan;
+use crate::winget_install::plan::{WingetPlan as NativePlan, plan_runs_elevated};
 use crate::winget_install::removal::{self, RemovalChoice, RemovalError, Removed, Steps};
 use crate::winget_install::uninstall::{
     KEY_STAYED, MsiQueue, UninstallCtx, UninstallPlan as WingetUninstallPlan, UninstallStatus,
-    UninstallTarget, remove_registry_only_with,
+    UninstallTarget, removal_runs_elevated, remove_registry_only_with,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -742,9 +742,22 @@ fn install_done(
     }
 }
 
+/// Whether a native winget action runs anything as administrator (installer UAC or helper).
+fn winget_action_elevated(action: &Action) -> bool {
+    match action {
+        Action::WingetInstall(p) | Action::WingetUpgrade { plan: p, .. } => plan_runs_elevated(p),
+        Action::WingetUninstall(p) => removal_runs_elevated(p, false),
+        Action::WingetRegistryOnly(p) => removal_runs_elevated(p, true),
+        _ => false,
+    }
+}
+
 /// Executes a confirmed native winget action and logs it as a job.
 pub async fn run_winget_action(env: &WingetEnv<'_>, action: Action) -> Result<Done, InstallFail> {
-    let log = action_info(&action).map(JobLog::start);
+    let mut log = action_info(&action).map(JobLog::start);
+    if let Some(log) = &mut log {
+        log.elevated = winget_action_elevated(&action);
+    }
     let (result, outcome) = run_winget_inner(env, action).await;
     if let Some(log) = log {
         match &result {

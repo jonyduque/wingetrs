@@ -112,6 +112,16 @@ pub fn human_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
+/// Whether a removal goes through the elevated helper: the uninstaller of a machine record, or
+/// (`registry_only`) the deletion of a machine ARP key; what the job log records as `elevated`.
+pub fn removal_runs_elevated(plan: &UninstallPlan, registry_only: bool) -> bool {
+    if registry_only {
+        matches!(&plan.target, UninstallTarget::Arp { hive, .. } if machine_hive(*hive).is_some())
+    } else {
+        plan.elevation == Elevation::Helper
+    }
+}
+
 /// Plan line of a removal that runs elevated (its own UAC).
 pub const UNINSTALL_ADMIN_PROMPT: &str = "Pede permissão de administrador (UAC)";
 /// Plan line of a machine record removed by winget: winget may open the uninstaller's UAC

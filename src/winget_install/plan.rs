@@ -55,6 +55,12 @@ pub struct WingetPlan {
     pub upgrade_from: Option<String>,
 }
 
+/// Whether the installer of `plan` runs as administrator (its own UAC prompt); what the job
+/// log records as `elevated`.
+pub fn plan_runs_elevated(plan: &WingetPlan) -> bool {
+    plan.elevation == Elevation::Helper
+}
+
 /// Run natively, or hand the package to winget (the text says why).
 // Built once per install and matched right away; boxing would only change the brief's shape.
 #[allow(clippy::large_enum_variant)]

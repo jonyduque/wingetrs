@@ -101,7 +101,7 @@ pub struct JobLog {
     pub failure: Outcome,
     /// Runs of the tool; 2 when the job refreshed the source and ran again.
     pub attempts: u32,
-    /// Whether the tool ran through the elevated bridge helper.
+    /// Whether anything in the job ran elevated (bridge helper or the installer's own UAC prompt).
     pub elevated: bool,
 }
 

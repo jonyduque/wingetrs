@@ -1002,3 +1002,142 @@ mod selector {
         assert!(text.ends_with("> item 2\r\n"), "{text:?}");
     }
 }
+
+/// Task 220: like the `msiexec /a` fallback and the extractors do, leaves work folders beside
+/// the staging folder (one of this run's temp pattern, one `msiexec` work folder), raises
+/// `flag` and pauses: the cancel arrives meanwhile.
+fn leave_work_then_pause(
+    flag: &AtomicBool,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    let app_dir = dest.parent().unwrap();
+    std::fs::create_dir_all(dest).unwrap();
+    let work = app_dir.join(".staging-1.0.msiexec");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("x"), b"x").unwrap();
+    let temp = app_dir.join(format!(
+        "{}{}-99",
+        wingetrs::install::extract::TEMP_PREFIX,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::write(temp.join("y"), b"y").unwrap();
+    flag.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(300));
+    Ok(())
+}
+
+static WORKING_NEW_APP: AtomicBool = AtomicBool::new(false);
+
+fn work_new_app(
+    _: &Path,
+    _: &str,
+    _: Option<&str>,
+    _: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    leave_work_then_pause(&WORKING_NEW_APP, dest)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_during_extract_removes_new_app_dir() {
+    let w = World::new().await;
+    let (url, sha) = w.serve("pkg-1.0.zip", fixture_zip(), None).await;
+    let plan = w.plan(&manifest(&url, &sha, Some("pkg")));
+    let mut state = StateDb::open(&w.state_path).unwrap();
+    let mut ctx = w.ctx(&mut state, &no_progress);
+    let gate = ctx.launch.clone();
+    let mut ctrl_c = When(&WORKING_NEW_APP, false);
+    let r = until_interrupted(
+        wingetrs::install::executor::execute_install_with(&plan, &mut ctx, work_new_app),
+        &mut ctrl_c,
+        &gate,
+        &|| panic!("nada recusado antes do Windows Installer"),
+    )
+    .await;
+    assert!(r.is_none(), "esperava cancelado: {r:?}");
+    assert!(ctrl_c.1);
+    assert!(
+        !w.layout.app_dir("app").exists(),
+        "sobrou: {:?}",
+        std::fs::read_dir(w.layout.app_dir("app")).map(|d| d.count())
+    );
+    assert_eq!(w.apps(), 0);
+}
+
+static WORKING_OLD_APP: AtomicBool = AtomicBool::new(false);
+
+fn work_old_app(
+    _: &Path,
+    _: &str,
+    _: Option<&str>,
+    _: Option<&str>,
+    dest: &Path,
+) -> Result<(), wingetrs::install::extract::ExtractError> {
+    leave_work_then_pause(&WORKING_OLD_APP, dest)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_keeps_installed_versions() {
+    let w = World::new().await;
+    let (url, sha) = w.serve("pkg-1.0.zip", fixture_zip(), None).await;
+    let plan = w.plan(&manifest(&url, &sha, Some("pkg")));
+    // An older version is installed, plus the data around it.
+    let app_dir = w.layout.app_dir("app");
+    let old = app_dir.join("0.9");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("tool.exe"), b"old").unwrap();
+    let current = w.layout.current("app");
+    std::fs::create_dir_all(&current).unwrap();
+    std::fs::write(current.join("tool.exe"), b"old").unwrap();
+    let mut state = StateDb::open(&w.state_path).unwrap();
+    let mut ctx = w.ctx(&mut state, &no_progress);
+    let gate = ctx.launch.clone();
+    let mut ctrl_c = When(&WORKING_OLD_APP, false);
+    let r = until_interrupted(
+        wingetrs::install::executor::execute_install_with(&plan, &mut ctx, work_old_app),
+        &mut ctrl_c,
+        &gate,
+        &|| panic!("nada recusado antes do Windows Installer"),
+    )
+    .await;
+    assert!(r.is_none(), "esperava cancelado: {r:?}");
+    assert!(old.join("tool.exe").exists());
+    assert!(current.join("tool.exe").exists());
+    let mut left: Vec<String> = std::fs::read_dir(&app_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["0.9", "current"]);
+}
+
+#[tokio::test]
+async fn cancel_during_download_creates_no_app_dir() {
+    let w = World::new().await;
+    let (url, sha) = w
+        .serve("pkg-1.0.zip", fixture_zip(), Some(Duration::from_secs(600)))
+        .await;
+    let plan = w.plan(&manifest(&url, &sha, Some("pkg")));
+    let mut state = StateDb::open(&w.state_path).unwrap();
+    let mut ctx = w.ctx(&mut state, &no_progress);
+    let gate = ctx.launch.clone();
+    let mut ctrl_c = WhenRequested {
+        server: &w.server,
+        fired: false,
+    };
+    let r = until_interrupted(
+        wingetrs::install::executor::execute_install(&plan, &mut ctx),
+        &mut ctrl_c,
+        &gate,
+        &|| {},
+    )
+    .await;
+    assert!(r.is_none(), "esperava cancelado: {r:?}");
+    assert!(ctrl_c.fired);
+    assert!(!w.layout.app_dir("app").exists());
+    // The partial download is gone: the blob folder holds no file (it may not exist at all).
+    let blobs = w.data.blobs_dir();
+    let files = std::fs::read_dir(&blobs).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(files, 0, "sobrou arquivo em {}", blobs.display());
+}

@@ -2988,6 +2988,7 @@ impl<T> Drop for AwaitWorker<T> {
         // The app folder the extraction step created, when nothing else is in it (a fresh
         // install); `remove_dir` refuses a folder that is not empty.
         if let Some(app_dir) = self.staging.parent() {
+            remove_own_run_leftovers(app_dir, &self.staging);
             let _ = fs::remove_dir(app_dir);
         }
     }
@@ -2998,6 +2999,36 @@ impl<T> Drop for AwaitWorker<T> {
 /// extraction temp (`.wingetrs-extract-*`). Only ever touched under `install.lock`.
 pub fn is_dead_run_leftover(name: &str) -> bool {
     name.starts_with(".staging-") || name.starts_with(extract::TEMP_PREFIX)
+}
+
+/// Whether `name`, in an app folder, was made by the run that owns the staging folder
+/// `staging_name`: the `msiexec` work folder beside it, or an extraction temp of this process.
+fn is_own_run_leftover(name: &str, staging_name: &str) -> bool {
+    let own_temp = format!("{}{}-", extract::TEMP_PREFIX, std::process::id());
+    name == format!("{staging_name}{MSIEXEC_SUFFIX}") || name.starts_with(&own_temp)
+}
+
+/// After a cancel: removes what this run left beside its staging folder, so a fresh app folder
+/// can go. Never touches anything else (installed versions, `current`, `persist`).
+fn remove_own_run_leftovers(app_dir: &Path, staging: &Path) {
+    let Some(staging_name) = staging.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(app_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let own = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| is_dead_run_leftover(n) && is_own_run_leftover(n, staging_name));
+        if own {
+            let p = entry.path();
+            if let Err(e) = not_found_ok(remove_any(&p)) {
+                tracing::warn!("{}: {e}", p.display());
+            }
+        }
+    }
 }
 
 /// Removes every [`is_dead_run_leftover`] in `app_dir`, best effort: a leftover that cannot
