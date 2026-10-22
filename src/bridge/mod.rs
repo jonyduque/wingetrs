@@ -169,6 +169,12 @@ pub const NO_APPLICABLE_INSTALLER: u32 = 0x8A15_0010;
 /// winget found no installer for that scope.
 pub const SCOPE_FALLBACK_NOTE: &str = "sem instalador para máquina; instalando para o usuário";
 
+/// Exit code of winget 1.29 for any `--scope` argument (`Argument.cpp(512)`; see ARMADILHAS).
+pub const WINGET_SCOPE_CRASH: u32 = 0x8000_FFFF;
+
+/// Progress line of an install retried without `--scope` after winget 1.29 crashed on it.
+pub const SCOPE_CRASH_NOTE: &str = "o winget falhou com --scope (defeito do winget 1.29); instalando sem escopo: o winget escolhe usuário ou máquina";
+
 /// The bridge job installing winget package `id` (catalog version `version`) with `scope`
 /// (`--scope`, `None` to let winget pick). It runs elevated (`scope == Some(Machine)`) when
 /// `--scope machine` is passed or when every installer for an `arch` machine installs for the
@@ -579,6 +585,7 @@ pub fn winget_message(code: i32) -> String {
     let text = match code as u32 {
         0 => "Atualizado.",
         NO_APPLICABLE_INSTALLER => "Nenhum instalador do pacote serve para esta máquina.",
+        WINGET_SCOPE_CRASH => "o winget falhou internamente (0x8000FFFF)",
         0x8A15_002B => "Nenhuma atualização aplicável para este pacote.",
         0x8A15_0014 => "O winget não encontrou este pacote instalado.",
         0x8A15_0114 => {

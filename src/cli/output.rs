@@ -1752,10 +1752,11 @@ pub fn bridge_progress<R>(
 
 /// Progress lines the wingetrs itself pushes through the bridge sink (closed list): shown
 /// without the `winget:` prefix, which is only for lines from the process output.
-pub const WINGETRS_LINES: [&str; 6] = [
+pub const WINGETRS_LINES: [&str; 7] = [
     crate::install::progress::ELEVATION_GRANTED,
     crate::install::progress::ELEVATION_REFUSED,
     crate::bridge::SCOPE_FALLBACK_NOTE,
+    crate::bridge::SCOPE_CRASH_NOTE,
     crate::tui::jobs::WAITING_INSTALLER,
     crate::tui::jobs::STARTING_WINGET,
     crate::bridge::winget_out::UPDATING_SOURCE,

@@ -232,6 +232,7 @@ fn wingetrs_own_lines_have_no_winget_prefix() {
     }
     for l in [
         wingetrs::bridge::SCOPE_FALLBACK_NOTE,
+        wingetrs::bridge::SCOPE_CRASH_NOTE,
         wingetrs::tui::jobs::WAITING_INSTALLER,
         wingetrs::tui::jobs::STARTING_WINGET,
         wingetrs::bridge::winget_out::UPDATING_SOURCE,

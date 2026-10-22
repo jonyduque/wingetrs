@@ -1022,6 +1022,25 @@ pub fn run_bridge_install(
         pwsh: "",
     };
     let (result, code) = run_elevated_as(bridge, job, &env, &mut *current, on_line);
+    if result.is_err()
+        && code.is_some_and(|c| c as u32 == bridge::WINGET_SCOPE_CRASH)
+        && let BridgeOp::Install {
+            scope: Some(_),
+            agreements,
+        } = &job.op
+    {
+        tracing::info!(target = %job.target, "{}", bridge::SCOPE_CRASH_NOTE);
+        on_line(bridge::SCOPE_CRASH_NOTE);
+        // Same path as the first run: `job.scope` still says whether it is elevated.
+        let retry = BridgeJob {
+            op: BridgeOp::Install {
+                scope: None,
+                agreements: agreements.clone(),
+            },
+            ..job.clone()
+        };
+        return run_elevated_as(bridge, &retry, &env, current, on_line).0;
+    }
     let no_installer = code.is_some_and(|c| c as u32 == bridge::NO_APPLICABLE_INSTALLER);
     let from_settings = matches!(
         job.op,
