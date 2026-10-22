@@ -1107,8 +1107,8 @@ mod signed {
     use std::time::{Duration, SystemTime};
     use wingetrs::bridge::signed_install::{
         CATALOG_FILE, CATALOG_MAX_AGE, CHECKING_CATALOG, CatalogVerifier, DOWNLOADING_INSTALLER,
-        SIGNER_NAME, SOURCE_IDENTITY, SignedCtx, SignedError, Signer, Staged, Verified,
-        check_signer, prepare,
+        INSTALLER_MAX, SIGNER_NAME, SOURCE_IDENTITY, SignedCtx, SignedError, Signer, Staged,
+        Verified, check_identity, check_signer, check_zip_shape, prepare,
     };
     use wingetrs::bridge::worker::{ModeArg, PackageRequest};
     use wingetrs::http::Http;
@@ -1228,6 +1228,13 @@ mod signed {
         identity: String,
         /// What the verifier answers as the verified bytes (`None`: the file's).
         verified: Option<Vec<u8>>,
+        /// The index inside `msix`.
+        db: Vec<u8>,
+        /// What the package reader answers instead of `identity` / `db`.
+        reader_identity: Option<String>,
+        reader_index: Option<Vec<u8>>,
+        /// `SignedCtx::installer_max`.
+        installer_max: u64,
     }
 
     impl Cdn {
@@ -1247,6 +1254,10 @@ mod signed {
                 installer_hits: None,
                 identity: SOURCE_IDENTITY.into(),
                 verified: None,
+                db: Vec::new(),
+                reader_identity: None,
+                reader_index: None,
+                installer_max: INSTALLER_MAX,
             };
             c.seal();
             c
@@ -1260,8 +1271,8 @@ mod signed {
             }
             self.vd = mszip_of(yaml.as_bytes());
             self.hash = Sha256::digest(&self.vd).to_vec();
-            let db = index_db(ID, &self.hash, "2");
-            self.msix = msix_of(&db, &db, &self.identity);
+            self.db = index_db(ID, &self.hash, "2");
+            self.msix = msix_of(&self.db, &self.db, &self.identity);
         }
 
         async fn mount(&self, server: &MockServer) {
@@ -1307,6 +1318,9 @@ mod signed {
         seen: Mutex<Vec<(PathBuf, Vec<u8>)>>,
         /// Bytes answered as verified instead of the file's (what its handle would have read).
         bytes: Option<Vec<u8>>,
+        /// What the package reader read: identity name and index.
+        identity: String,
+        index: Vec<u8>,
     }
 
     impl FakeVerifier {
@@ -1315,6 +1329,8 @@ mod signed {
                 result,
                 seen: Mutex::new(Vec::new()),
                 bytes: None,
+                identity: SOURCE_IDENTITY.into(),
+                index: Vec::new(),
             }
         }
     }
@@ -1327,7 +1343,12 @@ mod signed {
                 .unwrap()
                 .push((msix.to_path_buf(), bytes.clone()));
             let bytes = self.bytes.clone().unwrap_or(bytes);
-            self.result.clone().map(|signer| Verified { signer, bytes })
+            self.result.clone().map(|signer| Verified {
+                signer,
+                bytes,
+                identity: self.identity.clone(),
+                index: self.index.clone(),
+            })
         }
     }
 
@@ -1339,6 +1360,7 @@ mod signed {
             scope: ScopeArg::Machine,
             mode: ModeArg::SilentWithProgress,
             upgrade: false,
+            plan_sha256: sha_hex(&body()),
         }
     }
 
@@ -1379,6 +1401,8 @@ mod signed {
         let now = SystemTime::now();
         let mut verifier = FakeVerifier::new(signer.unwrap_or_else(|| Ok(microsoft(now))));
         verifier.bytes = cdn.verified.clone();
+        verifier.identity = cdn.reader_identity.clone().unwrap_or(cdn.identity.clone());
+        verifier.index = cdn.reader_index.clone().unwrap_or(cdn.db.clone());
         let dir = tempfile::tempdir().unwrap();
         let http = Http::new().unwrap();
         let base = format!("{}/cdn/", server.uri());
@@ -1392,6 +1416,7 @@ mod signed {
             program_files: &pf,
             msiexec: &msiexec,
             allow_http,
+            installer_max: cdn.installer_max,
         };
         let mut lines = Vec::new();
         let result = prepare(&ctx, &req, dir.path(), &mut |l: &str| {
@@ -1600,8 +1625,8 @@ mod signed {
         // An index of another major version.
         let r = run_with(
             |c, _| {
-                let db = index_db(ID, &c.hash, "3");
-                c.msix = msix_of(&db, &db, SOURCE_IDENTITY);
+                c.db = index_db(ID, &c.hash, "3");
+                c.msix = msix_of(&c.db, &c.db, SOURCE_IDENTITY);
             },
             request(),
             None,
@@ -1825,7 +1850,8 @@ mod signed {
             let req = package_request(plan, cmd).unwrap();
             assert_eq!(req.upgrade, upgrade, "{}", cmd.args);
             let now = SystemTime::now();
-            let verifier = FakeVerifier::new(Ok(microsoft(now)));
+            let mut verifier = FakeVerifier::new(Ok(microsoft(now)));
+            verifier.index = cdn.db.clone();
             let dir = tempfile::tempdir().unwrap();
             let http = Http::new().unwrap();
             let cdn_base = format!("{base}/cdn/");
@@ -1839,6 +1865,7 @@ mod signed {
                 program_files: &pf,
                 msiexec: &msiexec,
                 allow_http: true,
+                installer_max: INSTALLER_MAX,
             };
             let staged = prepare(&ctx, &req, dir.path(), &mut |_| {}).await.unwrap();
             assert_eq!(staged.params, cmd.args);
@@ -1895,6 +1922,7 @@ mod signed {
             scope: req.scope,
             mode: req.mode,
             upgrade: req.upgrade,
+            plan_sha256: req.plan_sha256.clone(),
         })
     }
 
@@ -1941,5 +1969,275 @@ mod signed {
             matches!(&replies[..], [Reply::Error { message, .. }] if message.contains("todos os usuários")),
             "{replies:?}"
         );
+    }
+
+    /// Review of Task 202 (parser differential): a repeated name is refused, compared without
+    /// case and also when the two entries differ only by the bytes renamed in place.
+    #[test]
+    fn repeated_or_hidden_entries_are_refused() {
+        let appx = |identity: &str| {
+            format!(
+                r#"<Package><Identity Name="{identity}" Publisher="CN=x" Version="1.0.0.0"/></Package>"#
+            )
+        };
+        let other = appx("Other");
+        let good = appx(SOURCE_IDENTITY);
+        let mut z = zip_of(&[
+            ("AppxManifest.xml", other.as_bytes()),
+            ("AppxManifest.xmZ", good.as_bytes()),
+        ]);
+        let (from, to) = (b"AppxManifest.xmZ", b"AppxManifest.xml");
+        let mut i = 0;
+        let mut renamed = 0;
+        while i + from.len() <= z.len() {
+            if &z[i..i + from.len()] == from {
+                z[i..i + from.len()].copy_from_slice(to);
+                renamed += 1;
+            }
+            i += 1;
+        }
+        assert_eq!(renamed, 2, "local header and central directory");
+        assert!(check_identity(&z).is_err());
+        let e = check_zip_shape(&z).unwrap_err();
+        assert!(matches!(e, SignedError::Catalog(_)), "{e:?}");
+
+        // Names equal without case.
+        let z = zip_of(&[
+            ("AppxManifest.xml", good.as_bytes()),
+            ("appxmanifest.XML", other.as_bytes()),
+        ]);
+        let e = check_zip_shape(&z).unwrap_err();
+        assert!(e.to_string().contains("nome repetido"), "{e}");
+
+        // One entry fewer than the last end-of-central-directory record declares.
+        let mut z = zip_of(&[("AppxManifest.xml", good.as_bytes())]);
+        let eocd = z.len() - 22;
+        assert_eq!(&z[eocd..eocd + 4], b"PK\x05\x06");
+        z[eocd + 8] = 2;
+        z[eocd + 10] = 2;
+        assert!(check_zip_shape(&z).is_err());
+
+        // The well-formed catalog passes.
+        let db = index_db(ID, &[1u8; 32], "2");
+        check_identity(&msix_of(&db, &db, SOURCE_IDENTITY)).unwrap();
+    }
+
+    /// The package reader's identity and index decide too: a reader that sees another identity
+    /// or another index than the zip refuses the catalog.
+    #[tokio::test]
+    async fn package_reader_must_agree() {
+        let r = run_with(
+            |c, _| {
+                c.reader_identity = Some("Microsoft.Other.Package".into());
+                c.installer_hits = Some(0);
+            },
+            request(),
+            None,
+            true,
+        )
+        .await;
+        let e = r.result.as_ref().unwrap_err();
+        assert!(e.to_string().contains("Microsoft.Other.Package"), "{e}");
+        let r = run_with(
+            |c, _| {
+                c.reader_index = Some(index_db(ID, &[9u8; 32], "2"));
+                c.installer_hits = Some(0);
+            },
+            request(),
+            None,
+            true,
+        )
+        .await;
+        let e = r.result.as_ref().unwrap_err();
+        assert!(e.to_string().contains("difere entre os leitores"), "{e}");
+    }
+
+    /// The manifest reached by the right hash must still name the package and version asked.
+    #[tokio::test]
+    async fn manifest_of_another_package_is_refused() {
+        for (id, version) in [("Other.App", "1.0"), (ID, "0.9")] {
+            let r = run_with(
+                |c, base| {
+                    let sha = sha_hex(&c.installer);
+                    let yaml =
+                        manifest_yaml(&format!("{base}/setup"), &sha, &format!("{base}/setup"))
+                            .replacen(
+                                "PackageIdentifier: Pub.App",
+                                &format!("PackageIdentifier: {id}"),
+                                1,
+                            )
+                            .replacen(
+                                "PackageVersion: '1.0'",
+                                &format!("PackageVersion: '{version}'"),
+                                1,
+                            );
+                    c.manifest = yaml.into_bytes();
+                    c.entries = vec![("1.0".into(), REL.into(), sha_hex(&c.manifest))];
+                    c.installer_hits = Some(0);
+                    c.seal();
+                },
+                request(),
+                None,
+                true,
+            )
+            .await;
+            let e = r.result.as_ref().unwrap_err();
+            assert!(
+                matches!(e, SignedError::Manifest(_)),
+                "{id} {version}: {e:?}"
+            );
+            assert!(e.to_string().contains("outro pacote ou versão"), "{e}");
+        }
+    }
+
+    /// `versionData` listing `versions`, all pointing at one manifest of version `newest`.
+    fn listing(c: &mut Cdn, base: &str, versions: &[&str], newest: &str) {
+        let sha = sha_hex(&c.installer);
+        let yaml = manifest_yaml(&format!("{base}/setup"), &sha, &format!("{base}/setup"))
+            .replacen(
+                "PackageVersion: '1.0'",
+                &format!("PackageVersion: '{newest}'"),
+                1,
+            );
+        c.manifest = yaml.into_bytes();
+        let s = sha_hex(&c.manifest);
+        c.entries = versions
+            .iter()
+            .map(|v| (v.to_string(), REL.to_string(), s.clone()))
+            .collect();
+        c.seal();
+    }
+
+    /// Review of Task 202 (downgrade through the pipe): only the newest version of the signed
+    /// `versionData` is installed; an older one is "update the catalog".
+    #[tokio::test]
+    async fn only_the_newest_version() {
+        let asked = |v: &str| PackageRequest {
+            version: v.into(),
+            ..request()
+        };
+        let r = run_with(
+            |c, b| {
+                listing(c, b, &["1.0", "2.0"], "2.0");
+                c.installer_hits = Some(0);
+            },
+            asked("1.0"),
+            None,
+            true,
+        )
+        .await;
+        let e = r.result.as_ref().unwrap_err();
+        assert!(matches!(e, SignedError::VersionMissing(_)), "{e:?}");
+        assert!(e.to_string().contains("atualize o catálogo"), "{e}");
+        drop(r);
+        let r = run_with(
+            |c, b| listing(c, b, &["1.0", "2.0"], "2.0"),
+            asked("2.0"),
+            None,
+            true,
+        )
+        .await;
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        // A pre-release is older than the release, in either order.
+        for list in [["2.0-beta", "2.0"], ["2.0", "2.0-beta"]] {
+            let r = run_with(
+                |c, b| listing(c, b, &list, "2.0"),
+                asked("2.0-beta"),
+                None,
+                true,
+            )
+            .await;
+            assert!(
+                matches!(r.result, Err(SignedError::VersionMissing(_))),
+                "{list:?}: {:?}",
+                r.result
+            );
+            let r = run_with(|c, b| listing(c, b, &list, "2.0"), asked("2.0"), None, true).await;
+            assert!(r.result.is_ok(), "{list:?}: {:?}", r.result);
+        }
+    }
+
+    /// The newest version, asked as written among equal spellings ("2.0" and "2.0.0").
+    #[tokio::test]
+    async fn newest_version_as_written() {
+        for (asked, want) in [("2.0.0", "2.0.0"), ("2.0", "2.0")] {
+            let r = run_with(
+                |c, base| {
+                    let sha = sha_hex(&c.installer);
+                    let make = |v: &str| {
+                        manifest_yaml(&format!("{base}/setup"), &sha, &format!("{base}/setup"))
+                            .replacen(
+                                "PackageVersion: '1.0'",
+                                &format!("PackageVersion: '{v}'"),
+                                1,
+                            )
+                    };
+                    // `2.0.0` at REL, `2.0` at another path whose manifest is broken: asking
+                    // `2.0.0` must take REL, asking `2.0` the other one (and fail there).
+                    c.manifest = make("2.0.0").into_bytes();
+                    c.entries = vec![
+                        (
+                            "2.0".into(),
+                            "manifests/p/Pub/App/2.0/other".into(),
+                            "0".repeat(64),
+                        ),
+                        ("2.0.0".into(), REL.into(), sha_hex(&c.manifest)),
+                    ];
+                    c.seal();
+                },
+                PackageRequest {
+                    version: asked.into(),
+                    ..request()
+                },
+                None,
+                true,
+            )
+            .await;
+            match want {
+                "2.0.0" => assert!(r.result.is_ok(), "{asked}: {:?}", r.result),
+                _ => assert!(r.result.is_err(), "{asked}: {:?}", r.result),
+            }
+        }
+    }
+
+    /// Review of Task 202: the plan's SHA-256 is only compared; a different one stops before
+    /// any download, telling to update the catalog.
+    #[tokio::test]
+    async fn plan_hash_differing_from_the_signed_one_is_refused() {
+        let r = run_with(
+            |c, _| c.installer_hits = Some(0),
+            PackageRequest {
+                plan_sha256: sha_hex(b"other"),
+                ..request()
+            },
+            None,
+            true,
+        )
+        .await;
+        let e = r.result.as_ref().unwrap_err();
+        assert!(matches!(e, SignedError::Stale), "{e:?}");
+        assert!(e.to_string().contains("atualize o catálogo"), "{e}");
+        assert!(r.names().is_empty(), "{:?}", r.names());
+        // Upper case is the same hash.
+        let r = run(PackageRequest {
+            plan_sha256: sha_hex(&body()).to_uppercase(),
+            ..request()
+        })
+        .await;
+        assert!(r.result.is_ok(), "{:?}", r.result);
+    }
+
+    /// The installer download stops past `installer_max` and leaves nothing.
+    #[tokio::test]
+    async fn installer_over_the_cap_is_refused() {
+        let r = run_with(|c, _| c.installer_max = 1000, request(), None, true).await;
+        let e = r.result.as_ref().unwrap_err();
+        assert!(matches!(e, SignedError::Refused(_)), "{e:?}");
+        assert!(e.to_string().contains("maior que 1000 bytes"), "{e}");
+        assert!(r.names().is_empty(), "{:?}", r.names());
+        let len = body().len() as u64;
+        let r = run_with(|c, _| c.installer_max = len, request(), None, true).await;
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(INSTALLER_MAX, 4 * 1024 * 1024 * 1024);
     }
 }

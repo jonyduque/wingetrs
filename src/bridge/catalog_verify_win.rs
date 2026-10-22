@@ -15,7 +15,9 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
-use windows::Win32::Foundation::{FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE, RPC_E_CHANGED_MODE,
+};
 use windows::Win32::Security::Cryptography::{
     CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
     CERT_CHAIN_POLICY_MICROSOFT_ROOT, CERT_CHAIN_POLICY_PARA, CERT_CHAIN_POLICY_STATUS,
@@ -33,7 +35,15 @@ use windows::Win32::Security::WinTrust::{
     WTD_STATEACTION_IGNORE, WTD_UI_NONE, WinVerifyTrust,
 };
 use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
-use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Storage::Packaging::Appx::{
+    APPX_FOOTPRINT_FILE_TYPE_SIGNATURE, AppxFactory, IAppxFactory,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, IStream,
+};
+use windows::Win32::UI::Shell::SHCreateMemStream;
+use windows::core::{HSTRING, PCWSTR, w};
 
 /// The package's signature inside the msix.
 const SIGNATURE_ENTRY: &str = "AppxSignature.p7x";
@@ -70,9 +80,14 @@ impl CatalogVerifier for WinTrustVerifier {
         if bytes.len() as u64 > CATALOG_MAX {
             return Err("catálogo grande demais".into());
         }
-        let blob = signature_blob(&bytes)?;
-        let signer = signer_of(&blob)?;
-        Ok(Verified { signer, bytes })
+        let package = read_package(&bytes)?;
+        let signer = signer_of(&package.signature)?;
+        Ok(Verified {
+            signer,
+            bytes,
+            identity: package.identity,
+            index: package.index,
+        })
     }
 }
 
@@ -116,24 +131,102 @@ fn verify_trust_handle(path: &Path, handle: &std::fs::File) -> Result<(), String
     Ok(())
 }
 
-/// The PKCS #7 signature of the msix `bytes`: its `AppxSignature.p7x` without the `PKCX`
-/// marker.
-fn signature_blob(bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
-    let entry = zip
-        .by_name(SIGNATURE_ENTRY)
-        .map_err(|e| format!("{SIGNATURE_ENTRY}: {e}"))?;
-    let mut p7x = Vec::new();
-    entry
-        .take(SIGNATURE_MAX + 1)
-        .read_to_end(&mut p7x)
-        .map_err(|e| format!("{SIGNATURE_ENTRY}: {e}"))?;
-    if p7x.len() as u64 > SIGNATURE_MAX {
-        return Err(format!("{SIGNATURE_ENTRY} grande demais"));
+/// What the platform's package reader reads in a catalog.
+struct Package {
+    identity: String,
+    index: Vec<u8>,
+    /// The PKCS #7 signature: `AppxSignature.p7x` without the `PKCX` marker.
+    signature: Vec<u8>,
+}
+
+/// Per-thread COM apartment for the package reader; uninitializes only what it initialized.
+struct ComInit {
+    owned: bool,
+}
+
+impl ComInit {
+    fn new() -> Result<ComInit, String> {
+        // SAFETY: plain COM initialization for the current thread.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr == RPC_E_CHANGED_MODE {
+            return Ok(ComInit { owned: false });
+        }
+        hr.ok().map_err(|e| e.message())?;
+        Ok(ComInit { owned: true })
     }
-    p7x.strip_prefix(b"PKCX")
-        .map(<[u8]>::to_vec)
-        .ok_or_else(|| format!("{SIGNATURE_ENTRY} sem o marcador PKCX"))
+}
+
+impl Drop for ComInit {
+    fn drop(&mut self) {
+        if self.owned {
+            // SAFETY: balances the successful CoInitializeEx in `new`.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+/// The whole of `stream`, refused past `max` bytes.
+fn read_all(stream: &IStream, max: u64) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let mut n = 0u32;
+        // SAFETY: `buf` holds `buf.len()` writable bytes; `n` receives how many were read.
+        unsafe { stream.Read(buf.as_mut_ptr().cast(), buf.len() as u32, Some(&mut n)) }
+            .ok()
+            .map_err(|e| e.message())?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n as usize]);
+        if out.len() as u64 > max {
+            return Err(format!("arquivo do pacote com mais de {max} bytes"));
+        }
+    }
+}
+
+/// The catalog `bytes` read by the platform's package reader (`IAppxPackageReader`, never the
+/// `zip` crate): the manifest's identity name, `Public\index.db` (whose blocks the reader checks
+/// against the block map as they are read) and the signature footprint file.
+// Port: AppInstallerMsixInfo (IAppxFactory::CreatePackageReader) on a memory stream.
+fn read_package(bytes: &[u8]) -> Result<Package, String> {
+    let _com = ComInit::new()?;
+    let os = |e: windows::core::Error| e.message();
+    // SAFETY: COM is initialized above; every object is used on this thread only, and the
+    // memory stream holds its own copy of `bytes`.
+    unsafe {
+        let stream = SHCreateMemStream(Some(bytes)).ok_or("fluxo de memória indisponível")?;
+        let factory: IAppxFactory =
+            CoCreateInstance(&AppxFactory, None, CLSCTX_INPROC_SERVER).map_err(os)?;
+        let reader = factory.CreatePackageReader(&stream).map_err(os)?;
+        let id = reader
+            .GetManifest()
+            .and_then(|m| m.GetPackageId())
+            .map_err(os)?;
+        let name = id.GetName().map_err(os)?;
+        let identity = name.to_string();
+        CoTaskMemFree(Some(name.0 as *const core::ffi::c_void));
+        let identity = identity.map_err(|e| e.to_string())?;
+        let index = reader
+            .GetPayloadFile(w!("Public\\index.db"))
+            .and_then(|f| f.GetStream())
+            .map_err(os)?;
+        let index = read_all(&index, CATALOG_MAX)?;
+        let p7x = reader
+            .GetFootprintFile(APPX_FOOTPRINT_FILE_TYPE_SIGNATURE)
+            .and_then(|f| f.GetStream())
+            .map_err(os)?;
+        let p7x = read_all(&p7x, SIGNATURE_MAX)?;
+        let signature = p7x
+            .strip_prefix(b"PKCX")
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| format!("{SIGNATURE_ENTRY} sem o marcador PKCX"))?;
+        Ok(Package {
+            identity,
+            index,
+            signature,
+        })
+    }
 }
 
 /// Closes a message and a store from `CryptQueryObject` on drop.
@@ -293,6 +386,11 @@ fn signer_of(blob: &[u8]) -> Result<Signer, String> {
         )
     }
     .map_err(os)?;
+    // SAFETY: a valid chain from the call above.
+    let trust = unsafe { (*chain.0).TrustStatus.dwErrorStatus };
+    if trust != 0 {
+        return Err(format!("cadeia do signatário com erro (0x{trust:08X})"));
+    }
     let policy = CERT_CHAIN_POLICY_PARA {
         cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as u32,
         dwFlags: MICROSOFT_ROOT_CERT_CHAIN_POLICY_CHECK_APPLICATION_ROOT_FLAG,

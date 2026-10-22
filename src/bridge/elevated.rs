@@ -461,6 +461,7 @@ impl ElevatedRunner for ElevatedBridge {
             scope: req.scope,
             mode: req.mode,
             upgrade: req.upgrade,
+            plan_sha256: req.plan_sha256.clone(),
         };
         self.ask_elevated(&request, &mut |l: &str| {
             tracing::info!(line = l, "elevated install");

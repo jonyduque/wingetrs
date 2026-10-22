@@ -455,6 +455,7 @@ pub fn package_request(
         scope: ScopeArg::Machine,
         mode: plan.mode.into(),
         upgrade,
+        plan_sha256: plan.installer.sha256.trim().to_ascii_lowercase(),
     })
 }
 

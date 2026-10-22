@@ -717,6 +717,7 @@ fn install_package(
         program_files: &program_files,
         msiexec: &msiexec,
         allow_http: false,
+        installer_max: super::signed_install::INSTALLER_MAX,
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -1558,6 +1558,7 @@ async fn machine_installer_goes_through_the_helper() {
             scope: ScopeArg::Machine,
             mode: ModeArg::SilentWithProgress,
             upgrade: false,
+            plan_sha256: sha256_hex(&bytes()),
         }]
     );
     assert_eq!(env.calls(), (0, 0, 0));

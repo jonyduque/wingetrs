@@ -74,6 +74,10 @@ pub enum Request {
         mode: ModeArg,
         /// The command line carries the manifest's `Upgrade` switch.
         upgrade: bool,
+        /// SHA-256 of the installer in the requester's plan: only compared with the signed
+        /// manifest's (a different one means the requester's catalog is stale); never used to
+        /// check the download.
+        plan_sha256: String,
     },
     /// Ends the helper.
     Quit {},
@@ -125,6 +129,8 @@ pub struct PackageRequest {
     pub scope: ScopeArg,
     pub mode: ModeArg,
     pub upgrade: bool,
+    /// See `Request::InstallPackage`.
+    pub plan_sha256: String,
 }
 
 /// Longest `version` accepted in a request, in bytes.
@@ -149,6 +155,10 @@ impl PackageRequest {
         }
         if self.scope != ScopeArg::Machine {
             return Err("o auxiliar elevado só instala para todos os usuários");
+        }
+        if self.plan_sha256.len() != 64 || !self.plan_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err("hash do plano inválido");
         }
         Ok(())
     }
@@ -826,6 +836,7 @@ pub fn serve(
                 scope,
                 mode,
                 upgrade,
+                plan_sha256,
             } => {
                 let req = PackageRequest {
                     id,
@@ -834,6 +845,7 @@ pub fn serve(
                     scope,
                     mode,
                     upgrade,
+                    plan_sha256,
                 };
                 serve_package(writer, ops, &req)?;
                 continue;

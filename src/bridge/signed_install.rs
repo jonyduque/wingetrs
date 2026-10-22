@@ -31,6 +31,8 @@ pub const MSIX_MAX: usize = 64 << 20;
 pub const VERSION_DATA_MAX: usize = 1 << 20;
 /// Largest manifest accepted (about 5 KB measured).
 pub const MANIFEST_MAX: usize = 1 << 20;
+/// Largest installer the helper downloads (4 GiB).
+pub const INSTALLER_MAX: u64 = 4 << 30;
 /// Largest `AppxManifest.xml` read from the catalog.
 const APPX_MANIFEST_MAX: u64 = 1 << 20;
 /// Oldest signing certificate accepted. The catalog is signed again at each publication with a
@@ -58,11 +60,16 @@ pub struct Signer {
 }
 
 /// A verified catalog: its signer and its bytes, read through the same open handle the
-/// signature was verified on (never by reopening the path).
+/// signature was verified on (never by reopening the path), and what the platform's package
+/// reader (not the `zip` crate) reads in those bytes: the identity name and the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verified {
     pub signer: Signer,
     pub bytes: Vec<u8>,
+    /// `Identity Name` of the package manifest.
+    pub identity: String,
+    /// `Public\index.db`, its blocks checked against the block map.
+    pub index: Vec<u8>,
 }
 
 /// Verifies the signature of the catalog file at `msix` (the whole package, its chain to a
@@ -86,6 +93,8 @@ pub struct SignedCtx<'a> {
     pub msiexec: &'a Path,
     /// Plain `http://` installer URLs accepted (only the tests' local server serves them).
     pub allow_http: bool,
+    /// Largest installer downloaded (`INSTALLER_MAX` in production).
+    pub installer_max: u64,
 }
 
 /// The installer ready to run: `program params` from `dir`, the run folder holding the checked
@@ -117,6 +126,10 @@ pub enum SignedError {
     Manifest(String),
     #[error("instalador recusado para elevação: {0}")]
     Refused(String),
+    #[error(
+        "o instalador do catálogo assinado não é o do plano (atualize o catálogo e tente de novo)"
+    )]
+    Stale,
     #[error(transparent)]
     Http(#[from] HttpError),
     #[error("E/S: {0}")]
@@ -160,8 +173,66 @@ pub fn check_signer(s: &Signer, now: SystemTime) -> Result<(), SignedError> {
     Ok(())
 }
 
-/// The package identity in the catalog's `AppxManifest.xml` must be `SOURCE_IDENTITY`.
+/// Total entries of the last end-of-central-directory record of `zip` (the one whose comment
+/// ends the file; zip64 when it says so); `None` when there is no such record.
+fn eocd_entries(zip: &[u8]) -> Option<u64> {
+    const EOCD: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
+    const LOCATOR: [u8; 4] = [0x50, 0x4B, 0x06, 0x07];
+    const EOCD64: [u8; 4] = [0x50, 0x4B, 0x06, 0x06];
+    let u16_at = |at: usize| {
+        zip.get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let at = (0..=zip.len().checked_sub(22)?).rev().find(|&i| {
+        zip[i..i + 4] == EOCD
+            && u16_at(i + 20).is_some_and(|c| i + 22 + usize::from(c) == zip.len())
+    })?;
+    let total = u16_at(at + 10)?;
+    if total != u16::MAX {
+        return Some(u64::from(total));
+    }
+    let loc = at.checked_sub(20)?;
+    if zip.get(loc..loc + 4)? != LOCATOR {
+        return None;
+    }
+    let off = u64::from_le_bytes(zip.get(loc + 8..loc + 16)?.try_into().ok()?);
+    let rec = usize::try_from(off).ok()?;
+    if zip.get(rec..rec + 4)? != EOCD64 {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        zip.get(rec + 32..rec + 40)?.try_into().ok()?,
+    ))
+}
+
+/// The catalog as a zip read the same way by every reader: as many entries as its last
+/// end-of-central-directory record says (no fallback to an earlier one, no entry hidden by a
+/// repeated name) and no two names equal ignoring case (`zip` returns the last of a repeated
+/// name, the package reader may not).
+pub fn check_zip_shape(msix: &[u8]) -> Result<(), SignedError> {
+    let bad = |e: String| SignedError::Catalog(e);
+    let zip = zip::ZipArchive::new(std::io::Cursor::new(msix)).map_err(|e| bad(e.to_string()))?;
+    let declared =
+        eocd_entries(msix).ok_or_else(|| bad("fim do diretório central ausente".into()))?;
+    if zip.len() as u64 != declared {
+        return Err(bad(format!(
+            "{} entradas lidas, {declared} declaradas",
+            zip.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in zip.file_names() {
+        if !seen.insert(name.to_lowercase()) {
+            return Err(bad(format!("nome repetido no pacote: {name}")));
+        }
+    }
+    Ok(())
+}
+
+/// The package identity in the catalog's `AppxManifest.xml` must be `SOURCE_IDENTITY` (the
+/// zip first passes `check_zip_shape`).
 pub fn check_identity(msix: &[u8]) -> Result<(), SignedError> {
+    check_zip_shape(msix)?;
     let bad = |e: String| SignedError::Catalog(e);
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(msix)).map_err(|e| bad(e.to_string()))?;
@@ -241,13 +312,27 @@ async fn catalog_hash(
     write_new(&msix, &body)?;
     drop(body);
     let checked = (|| {
-        let Verified { signer, bytes } =
-            ctx.verifier.verify(&msix).map_err(SignedError::Signature)?;
+        let Verified {
+            signer,
+            bytes,
+            identity,
+            index,
+        } = ctx.verifier.verify(&msix).map_err(SignedError::Signature)?;
         check_signer(&signer, ctx.now)?;
-        // Exactly the bytes the signature was verified on.
+        // The package reader's identity, and the same bytes read as a zip: both must agree.
+        if identity != SOURCE_IDENTITY {
+            return Err(SignedError::Signature(format!(
+                "identidade do pacote {identity}"
+            )));
+        }
         check_identity(&bytes)?;
-        let index =
+        let zip_index =
             index::validate_msix(&bytes).map_err(|e| SignedError::Catalog(e.to_string()))?;
+        if zip_index != index {
+            return Err(SignedError::Catalog(
+                "o índice difere entre os leitores do pacote".into(),
+            ));
+        }
         drop(bytes);
         write_new(&db, &index)?;
         package_hash(&db, id)
@@ -297,6 +382,12 @@ async fn signed_manifest(
     let vd =
         version_data::decode_and_parse(&vd).map_err(|e| SignedError::Manifest(e.to_string()))?;
     let wanted = Version::parse(version);
+    // Only the newest version: a requester cannot pick an older (maybe vulnerable) one to run
+    // as administrator.
+    let newest = vd.entries.iter().map(|e| Version::parse(&e.version)).max();
+    if newest.as_ref() != Some(&wanted) {
+        return Err(SignedError::VersionMissing(version.to_string()));
+    }
     let equal: Vec<_> = vd
         .entries
         .iter()
@@ -409,6 +500,10 @@ pub async fn prepare(
     let hash = catalog_hash(ctx, &req.id, run_dir).await?;
     let m = signed_manifest(ctx, &req.id, &req.version, &hash).await?;
     let (kind, cmd, url, sha) = installer_of(ctx, &m, req)?;
+    // The plan's hash is only compared: the download is checked against the signed one.
+    if !req.plan_sha256.eq_ignore_ascii_case(&sha) {
+        return Err(SignedError::Stale);
+    }
     on_line(DOWNLOADING_INSTALLER);
     let installer = run_dir.join(if kind.is_msi() {
         "installer.msi"
@@ -416,11 +511,29 @@ pub async fn prepare(
         "installer.exe"
     });
     let http = ctx.http.with_strict_download_redirects()?;
+    let max = ctx.installer_max;
+    let over = std::sync::atomic::AtomicBool::new(false);
+    let size = |done: u64, total: Option<u64>| {
+        if done > max || total.is_some_and(|t| t > max) {
+            over.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    };
     let complete = http
-        .get_to_file_until(url.as_str(), &installer, |_, _| {}, &|| false)
+        .get_to_file_until(url.as_str(), &installer, size, &|| {
+            over.load(std::sync::atomic::Ordering::SeqCst)
+        })
         .await?;
     if !complete {
-        return Err(SignedError::Io("download interrompido".into()));
+        if let Err(e) = std::fs::remove_file(&installer)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(error = %e, "signed install: partial installer left in the run folder");
+        }
+        return Err(if over.load(std::sync::atomic::Ordering::SeqCst) {
+            SignedError::Refused(format!("instalador maior que {max} bytes"))
+        } else {
+            SignedError::Io("download interrompido".into())
+        });
     }
     if file_sha256(&installer)? != sha {
         if let Err(e) = std::fs::remove_file(&installer) {
