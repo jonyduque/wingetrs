@@ -9,6 +9,11 @@ Produces (all under tests/fixtures/):
   winget/powertoys.versionData.mszyml / .yaml (decoded oracle)
   winget/powertoys-0.101.2362.0.merged.yaml
   scoop/Main-mini.tar.gz            codeload layout (Main-master/bucket/*.json), KEEP_SCOOP manifests + one invalid
+
+Not produced by this script (needs 7-Zip, kept out of the gate): zip/deflate64.zip, made by hand from
+a.txt (22 B line x20) and sub/b.txt (22 B line x20) with
+  7z a -tzip -mm=Deflate64 tests/fixtures/zip/deflate64.zip <tmp>/*
+(check with `7z l -slt`: Method = Deflate64). See tests/install_extract.rs.
 """
 import base64, hashlib, io, os, shutil, sqlite3, struct, sys, tarfile, zipfile, zlib
 

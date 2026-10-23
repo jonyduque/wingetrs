@@ -1003,3 +1003,21 @@ mod cab_files {
         assert_eq!(std::fs::read(out.join("big.txt")).unwrap(), body);
     }
 }
+
+// Fixture made with `7z a -tzip -mm=Deflate64` (see scripts/make_fixtures.py docstring).
+#[test]
+fn extract_zip_with_deflate64_entries() {
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join("a.zip");
+    std::fs::copy("tests/fixtures/zip/deflate64.zip", &f).unwrap();
+    let dest = d.path().join("out");
+    extract(&f, "a.zip", None, None, &dest).unwrap();
+    assert_eq!(
+        std::fs::read(dest.join("a.txt")).unwrap(),
+        "hello deflate64 alpha\n".repeat(20).as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(dest.join("sub/b.txt")).unwrap(),
+        "nested deflate64 beta\n".repeat(20).as_bytes()
+    );
+}
