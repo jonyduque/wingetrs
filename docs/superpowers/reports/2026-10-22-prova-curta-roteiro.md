@@ -96,3 +96,17 @@ Copy-Item 'C:\Program Files\wingetrs\wingetrs-0.3.0.exe' 'C:\Program Files\winge
 ```
 
 Diga ao orquestrador o resultado de cada letra (ok / o que apareceu). Os registros ficam em `%TEMP%\wr-prova-user.txt` e `%TEMP%\wr-prova-admin.txt`.
+
+## Resultado (usuário, 2026-10-23)
+
+| Passo | Resultado |
+|---|---|
+| A | ✗ Extração falhou: `compression method not supported: 9` (zip Deflate64; defeito da 2a, não destas tasks). Desfazer ok. ⇒ Task 235. Repetir A depois dela. |
+| B | ✓ Recusado antes do script ("o wingetrs não analisa scripts com o processo elevado"). |
+| C | ✓ Um UAC, fase "Baixando e conferindo… como administrador", instalado. 1ª tentativa: "o pacote está em uso" com o Notepad++ aberto (mensagem certa, vinda do código de retorno do manifesto). |
+| D | Não feito (o usuário usa o Notepad++). Remoção pelo auxiliar segue sem prova nesta rodada. |
+| E | ✓ Aviso da pasta de administrador, UAC do próprio instalador, instalado (UAC aceito; "nada foi alterado" ao recusar não testado aqui). |
+| F | ✓ TUI no terminal de admin mostra os pacotes do winget. |
+| G | ✓ Seletor de escopo, UAC com a mensagem, recusa ⇒ "nada foi alterado". |
+
+O transcript do terminal de administrador não foi criado; B aparece no arquivo do terminal normal.
