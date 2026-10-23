@@ -16,6 +16,7 @@
 | 232 | I — barra de progresso na extração (CLI e TUI) | 230, 205, 207 |
 | 233 | `uninstall_by_winget` sem PATH (segurança) | — |
 | 234 | `reg.exe`/`msiexec.exe` por KnownFolder (segurança, revisão da 233) | — |
+| 235 | Zip com Deflate64 (feature `deflate64` do `zip`, decisão do usuário) | — |
 
 **Decisões do usuário (2026-10-22):**
 - d-E = B: um pwsh reaproveitado por execução, cache por SHA, e o AST nunca deixa o veredito mais brando.
@@ -2574,3 +2575,24 @@ Testes (`tests/it/wi_msi_portable.rs`, novo; `mod wi_msi_portable;` do orquestra
 - O selftest do `check_rules` ganha um caso de cada padrão proibido.
 
 **Relatório:** `.claude/tasks/task-234-report.md`.
+
+## Bloco 235
+
+### Task 235: Zip com Deflate64 (método 9)
+
+**Modelo:** sonnet (revisor sonnet). Origem: prova curta de 2026-10-23, passo A. `wingetrs install nano --allow-scripts` falhou na extração de `nano-for-windows_win64_v7.2-22.1.zip` com `arquivo inválido: compression method not supported: 9`. O método 9 é o Deflate64, e o crate `zip` (8.6.0) está compilado só com a feature `deflate`. O desfazer funcionou. **Decisão do usuário (2026-10-23):** ligar a feature `deflate64` do `zip`, o que traz o crate novo `deflate64`.
+
+**Files:** `Cargo.toml` (só a lista de features do `zip`), `Cargo.lock` (gerado pelo build; **nunca** `cargo update`), `THIRD_PARTY_LICENSES.txt` (regenerado com `pwsh -File scripts/third_party.ps1`), `tests/fixtures/zip/deflate64.zip` (novo, pequeno), o teste de extração de zip existente (`grep -rn "extract_zip\|fn .*zip" tests/` para achar o arquivo).
+
+**Contrato:**
+- `zip = { version = "8.6.0", default-features = false, features = ["deflate", "deflate64"] }`. Nenhuma outra versão muda no `Cargo.lock` além do crate novo; confira com `git diff Cargo.lock` e cole no relatório os pacotes adicionados.
+- A fixture é gerada com o 7-Zip da máquina, a partir de 2 arquivos de texto pequenos (um deles numa subpasta), com tamanho final menor que 4 KiB:
+  `& 'C:\Program Files\7-Zip\7z.exe' a -tzip -mm=Deflate64 tests\fixtures\zip\deflate64.zip <pasta temporária>\*`.
+  Confira com `7z l -slt` que o `Method` é `Deflate64` e registre esse comando e a saída no relatório. Se houver script ou documentação de fixtures (`scripts/make_fixtures.py`), registre ali como a fixture é gerada (sem 7-Zip no gate).
+
+#### Verificação (cole cada `[OK] mutação PEGA`)
+- Teste: extrair `deflate64.zip` produz os 2 arquivos com o conteúdo exato. Ele falha antes da mudança (cole a mensagem `compression method not supported: 9`).
+- Mutação: tirar `"deflate64"` das features do `zip` no `Cargo.toml` (`-Path Cargo.toml -Anchor '"deflate", "deflate64"' -Replacement '"deflate"'`) faz o teste falhar.
+- Gate verde, incluindo `licenses`.
+
+**Relatório:** `.claude/tasks/task-235-report.md`.
