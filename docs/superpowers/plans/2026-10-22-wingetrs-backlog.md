@@ -17,6 +17,7 @@
 | 233 | `uninstall_by_winget` sem PATH (segurança) | — |
 | 234 | `reg.exe`/`msiexec.exe` por KnownFolder (segurança, revisão da 233) | — |
 | 235 | Zip com Deflate64 (feature `deflate64` do `zip`, decisão do usuário) | — |
+| 236 | Ícone do wingetrs no topo da TUI (imagem + glifo de reserva) | — |
 
 **Decisões do usuário (2026-10-22):**
 - d-E = B: um pwsh reaproveitado por execução, cache por SHA, e o AST nunca deixa o veredito mais brando.
@@ -2596,3 +2597,29 @@ Testes (`tests/it/wi_msi_portable.rs`, novo; `mod wi_msi_portable;` do orquestra
 - Gate verde, incluindo `licenses`.
 
 **Relatório:** `.claude/tasks/task-235-report.md`.
+
+## Bloco 236
+
+### Task 236: Ícone do wingetrs no topo da TUI
+
+**Modelo:** sonnet (revisor sonnet). Pedido do usuário (2026-10-23), opção escolhida: "Imagem + reserva". O ícone `docs/assets/icon.svg` (caixa laranja `#FF6A4E` com prompt) fica à esquerda das abas, na linha do rótulo das abas. Ocupa 2 colunas mais 1 de espaço e é desenhado como imagem pelo mesmo mecanismo dos ícones de pacote (`src/tui/icons.rs`: Sixel no Windows Terminal, iTerm2 no WezTerm, conforme o ajuste `icons`). Onde não há imagem (protocolo `Off`, terminal sem suporte, `icons = "off"`) entra um glifo na cor `accent`, conforme o conjunto `--glyphs`: Nerd, Unicode `▣` ou ASCII `[w]` (3 colunas no ASCII).
+
+**Files:** `assets/icon.png` (novo; gerado), `src/tui/theme.rs` (campo novo `app` em `Glyphs` nos três conjuntos), `src/tui/tabs.rs` e/ou `src/tui/layout.rs` (reservar as colunas do ícone à esquerda das abas, nos modos largo e estreito), `src/tui/view.rs` (desenhar o glifo e, com imagem, pôr o ícone na lista de `IconPlaces` desenhada depois do quadro), `src/tui/app.rs` ou o cache de ícones existente (o ícone do app é codificado uma vez por tamanho, nunca por quadro), testes em `tests/it/tui_view.rs` (snapshots).
+
+**Contrato:**
+- O PNG é gerado UMA vez e commitado:
+  `& 'C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe' -background none -density 384 docs/assets/icon.svg -resize 64x64 assets/icon.png`.
+  Ele entra no binário por `include_bytes!`. Registre o comando num comentário de uma linha junto ao `include_bytes!`. Nenhum crate novo.
+- Nenhuma cor fora de `tui/theme.rs` (regra ⚙). O glifo usa o token `accent`.
+- O ícone não pode empurrar as abas para fora: quando as abas não cabem com o ícone, o ícone some primeiro, e as abas continuam como hoje. Com altura menor que `MIN_HEIGHT_FOR_CHROME` não há abas nem ícone.
+- A imagem é codificada fora do laço de desenho (como os ícones de pacote, `icons::encode` com o `Picker` existente) e guardada. O quadro só a reaproveita. Meça com o `examples/tui_frame.rs`: o tempo por quadro não pode subir de forma mensurável (cole antes e depois, 3 rodadas).
+- Glifo Nerd: escolha um da faixa Material Design que lembre caixa ou terminal (ex.: U+F0B7A ou similar), confirmando que existe na Nerd Font 3; diga qual no relatório.
+
+#### Verificação (cole cada `[OK] mutação PEGA`)
+- Snapshots em 80×24 com os glifos Unicode e ASCII: o glifo aparece à esquerda das abas, e as abas continuam inteiras.
+- Teste: largura onde o ícone e as abas não cabem juntos ⇒ o ícone some e as abas ficam iguais às de hoje (compare com o snapshot de antes).
+- Teste: com protocolo de imagem, o retângulo do ícone entra na lista de ícones do quadro (2×1 células na linha das abas) e o glifo não é desenhado embaixo.
+- Mutação: tirar a regra "ícone some antes das abas" faz o teste de largura falhar.
+- Rodar o binário real (`target/release/wingetrs.exe`) no Windows Terminal não é possível para o agente (sem console); diga ao orquestrador o que o usuário deve ver.
+
+**Relatório:** `.claude/tasks/task-236-report.md`.
