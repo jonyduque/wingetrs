@@ -7,7 +7,7 @@ use crate::tui::layout::{
     BORDER, DIALOG_PAD_X, DIALOG_PAD_Y, FILTER_GAP, ITEM_GAP, PAD_X, inset, split_with_gutter,
 };
 use crate::tui::settings::ORDER;
-use crate::tui::tabs::tab_rects;
+use crate::tui::tabs::{icon_lead, tab_rects_at};
 use crate::tui::view::{MIN_HEIGHT_FOR_CHROME, MIN_WIDTH_FOR_DETAILS, list_window, tab_labels};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::{Block, BorderType, Borders};
@@ -97,7 +97,9 @@ pub fn regions(app: &App, area: Rect) -> Regions {
         r.status = rows[2];
         r.help = rows[3];
         let glyphs = crate::tui::theme::Glyphs::for_set(app.glyphs);
-        r.tabs = tab_rects(rows[0], &tab_labels(app, glyphs))
+        let labels = tab_labels(app, glyphs);
+        let lead = icon_lead(rows[0], &labels, glyphs.app);
+        r.tabs = tab_rects_at(rows[0], &labels, lead)
             .into_iter()
             .zip(TAB_ORDER)
             .collect();

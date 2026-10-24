@@ -14,7 +14,9 @@ use crate::install::script_scan::{ScriptReport, Verdict, printable};
 use crate::install::target::Candidate;
 use crate::installed::correlate::{Correlation, InstallScope, ListRow, Rule, UpdateState};
 use crate::installed::overrides::Choice;
-use crate::tui::icons::{IconCache, IconProtocol, choose_from_env};
+use crate::tui::icons::{
+    APP_ICON_KEY, APP_ICON_PNG, APP_ICON_SIZE, IconCache, IconProtocol, choose_from_env,
+};
 use crate::tui::layout::{
     DETAIL_ICON_COLS, DETAIL_ICON_ROWS, FILTER_GAP, ITEM_GAP, LIST_ICON_COLS,
 };
@@ -1467,6 +1469,28 @@ impl App {
     /// True while something on screen animates the spinner.
     pub fn animating(&self) -> bool {
         self.refreshing || self.details_pending.is_some() || self.running.is_some()
+    }
+
+    /// Requests encoding the app icon (once per protocol; `apply_icons` forgets it).
+    /// Asked by the event loop, not `update`, after it points the picker at the live protocol.
+    pub fn app_icon_cmd(&mut self) -> Vec<Cmd> {
+        let size = APP_ICON_SIZE;
+        if self.icon_protocol == IconProtocol::Off
+            || self.icon_none.contains(APP_ICON_KEY)
+            || self
+                .icon_in_flight
+                .contains(&(APP_ICON_KEY.to_string(), size))
+            || self.icons.get(APP_ICON_KEY, size).is_some()
+        {
+            return Vec::new();
+        }
+        self.icon_in_flight.insert((APP_ICON_KEY.to_string(), size));
+        vec![Cmd::EncodeIcon {
+            generation: self.icon_gen,
+            key: APP_ICON_KEY.to_string(),
+            bytes: APP_ICON_PNG.to_vec(),
+            size,
+        }]
     }
 
     /// Requests encoding the selected package's icon when its bytes are here and it is

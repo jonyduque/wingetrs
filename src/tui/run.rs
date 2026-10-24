@@ -402,7 +402,7 @@ async fn event_loop(
                 refresh_msg |= matches!(msg, Msg::RefreshFinished(_));
             })
             .collect();
-        let cmds = loop_turn(&mut app, Instant::now(), batch, &helper_notice);
+        let mut cmds = loop_turn(&mut app, Instant::now(), batch, &helper_notice);
         if app.icon_protocol != protocol_now {
             // The Ícones setting changed: encode with the new protocol from here on.
             protocol_now = app.icon_protocol;
@@ -417,6 +417,7 @@ async fn event_loop(
                 });
             }
         }
+        cmds.extend(app.app_icon_cmd());
         for cmd in last_details_only(cmds) {
             match cmd {
                 Cmd::Quit => {

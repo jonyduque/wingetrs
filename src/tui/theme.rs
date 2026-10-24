@@ -36,6 +36,8 @@ pub struct Glyphs {
     pub spinner: &'static [&'static str],
     /// Between an old and a new value (`1.0 -> 2.0`).
     pub arrow: &'static str,
+    /// The app icon left of the tabs when no image is drawn.
+    pub app: &'static str,
     pub tab_search: &'static str,
     pub tab_installed: &'static str,
     pub tab_updates: &'static str,
@@ -77,6 +79,7 @@ static NERD: Glyphs = Glyphs {
     pin: "\u{f08d}",
     spinner: BRAILLE,
     arrow: "\u{f061}",
+    app: "\u{f018d}",
     tab_search: "\u{f002}",
     tab_installed: "\u{f0a0}",
     tab_updates: "\u{f06b0}",
@@ -112,6 +115,7 @@ static UNICODE: Glyphs = Glyphs {
     pin: "⚲",
     spinner: BRAILLE,
     arrow: "→",
+    app: "▣",
     tab_search: "⌕",
     tab_installed: "▤",
     tab_updates: "↑",
@@ -147,6 +151,7 @@ static ASCII: Glyphs = Glyphs {
     pin: "!",
     spinner: ASCII_SPINNER,
     arrow: "->",
+    app: "[w]",
     tab_search: "",
     tab_installed: "",
     tab_updates: "",

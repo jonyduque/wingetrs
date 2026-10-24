@@ -1,10 +1,10 @@
 ---
-source: tests/tui_view.rs
+source: tests/it/tui_view.rs
 expression: "render(&App::new(vec![], GlyphSet::Ascii), 80, 12)"
 ---
-"╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                          "
-"│ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │                wingetrs  "
-"│           └┴────────────┴┴──────────────┴┴─────────┴─────────────────────────╮"
+"    ╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                      "
+"[w] │ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │            wingetrs  "
+"╭───┘           └┴────────────┴┴──────────────┴┴─────────┴─────────────────────╮"
 "│ / digite para buscar…                                                        │"
 "│                                                                              │"
 "│ | baixando catálogo…                      │ nenhum pacote selecionado        │"

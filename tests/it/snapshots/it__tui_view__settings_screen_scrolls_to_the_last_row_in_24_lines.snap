@@ -2,9 +2,9 @@
 source: tests/it/tui_view.rs
 expression: "render(&a, 100, 24)"
 ---
-"╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                                              "
-"│ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │                                    wingetrs  "
-"├───────────┴┴────────────┴┴──────────────┴┘         └─────────────────────────────────────────────╮"
+"    ╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                                          "
+"[w] │ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │                                wingetrs  "
+"╭───┴───────────┴┴────────────┴┴──────────────┴┘         └─────────────────────────────────────────╮"
 "│   Ao atualizar, manter versão antiga  ‹ não ›  sim                                               │"
 "│   Resíduos após remover               ‹ perguntar ›  só alta confiança  manter                   │"
 "│                                                                                                  │"

@@ -2481,3 +2481,153 @@ fn bench_confirm_with_many_items() {
         t.elapsed() / 100
     );
 }
+
+// Task 236: the app icon left of the tabs.
+mod app_icon {
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use wingetrs::tui::icons::{APP_ICON_KEY, APP_ICON_PNG, APP_ICON_SIZE, IconProtocol};
+    use wingetrs::tui::tabs::{draw_tabs, draw_tabs_at, icon_lead, icon_rect};
+
+    fn row(b: &Buffer, y: u16) -> String {
+        (0..b.area.width).map(|x| b[(x, y)].symbol()).collect()
+    }
+
+    fn with_icon(w: u16, glyph: &str) -> Buffer {
+        let labels = tab_labels();
+        let theme = Theme::new(true, ColorDepth::NoColor);
+        let mut t = Terminal::new(TestBackend::new(w, 3)).unwrap();
+        t.draw(|f| {
+            let lead = icon_lead(f.area(), &labels, glyph);
+            draw_tabs_at(f, f.area(), &labels, 0, &theme, lead, Some(glyph));
+        })
+        .unwrap();
+        t.backend().buffer().clone()
+    }
+
+    fn plain(w: u16) -> Buffer {
+        tab_buffer(w, 0, &Theme::new(true, ColorDepth::NoColor))
+    }
+
+    #[test]
+    fn glyph_shows_left_of_whole_tabs_in_unicode_and_ascii() {
+        for glyph in ["▣", "[w]"] {
+            let b = with_icon(80, glyph);
+            assert!(row(&b, 1).starts_with(glyph), "{glyph}: {}", row(&b, 1));
+            let lead = icon_lead(Rect::new(0, 0, 80, 3), &tab_labels(), glyph);
+            // The first tab sits right after the icon and its space, hanging off the top edge.
+            let tabs: String = row(&b, 0).chars().skip(usize::from(lead)).collect();
+            assert!(tabs.starts_with('╭'), "{tabs}");
+            assert!(row(&b, 2).starts_with("╭─"), "{}", row(&b, 2));
+            assert_eq!(row(&b, 2).chars().nth(usize::from(lead)), Some('┘'));
+            for name in ["Pesquisar", "Instalados", "Atualizações 2"] {
+                assert!(row(&b, 1).contains(name), "{name} missing");
+            }
+        }
+        insta::assert_snapshot!(
+            "app_icon_unicode",
+            render(&App::new(entries(), GlyphSet::Unicode), 80, 24)
+        );
+        insta::assert_snapshot!(
+            "app_icon_ascii",
+            render(&App::new(entries(), GlyphSet::Ascii), 80, 24)
+        );
+    }
+
+    #[test]
+    fn icon_disappears_before_the_tabs_move() {
+        // Three boxes need 46 columns (45 plus the closing one); the icon needs 3 more.
+        let labels = tab_labels();
+        let theme = Theme::new(true, ColorDepth::NoColor);
+        for w in [46u16, 47, 48] {
+            let area = Rect::new(0, 0, w, 3);
+            assert_eq!(icon_lead(area, &labels, "▣"), 0, "width {w}");
+            let b = with_icon(w, "▣");
+            assert_eq!(b, plain(w), "width {w}: tabs must stay as they are");
+        }
+        assert_eq!(icon_lead(Rect::new(0, 0, 49, 3), &labels, "▣"), 3);
+        assert!(row(&with_icon(49, "▣"), 1).starts_with('▣'));
+        // Narrow form: the same rule on the one-line titles.
+        let narrow = Rect::new(0, 0, 44, 3);
+        let lead = icon_lead(narrow, &labels, "▣");
+        assert_eq!(lead, 3);
+        let mut t = Terminal::new(TestBackend::new(44, 3)).unwrap();
+        t.draw(|f| draw_tabs(f, f.area(), &labels, 0, &theme))
+            .unwrap();
+        let before = row(t.backend().buffer(), 1);
+        assert!(row(&with_icon(44, "▣"), 1).contains(before.trim()));
+        // Too narrow for even the one-line titles plus the icon: the icon goes.
+        // The titles take 40 columns, so 42 cannot hold the icon too, and 43 can.
+        let tight = 42;
+        assert_eq!(icon_lead(Rect::new(0, 0, 43, 3), &labels, "▣"), 3);
+        assert_eq!(icon_lead(Rect::new(0, 0, tight, 3), &labels, "▣"), 0);
+        assert_eq!(with_icon(tight, "▣"), {
+            let mut t = Terminal::new(TestBackend::new(tight, 3)).unwrap();
+            t.draw(|f| draw_tabs(f, f.area(), &labels, 0, &theme))
+                .unwrap();
+            t.backend().buffer().clone()
+        });
+    }
+
+    fn with_image() -> App {
+        let mut a = App::new(entries(), GlyphSet::Unicode);
+        a.icon_protocol = IconProtocol::Sixel;
+        let picker = wingetrs::tui::icons::picker(IconProtocol::Sixel).unwrap();
+        let proto = wingetrs::tui::icons::encode(&picker, APP_ICON_PNG, APP_ICON_SIZE).unwrap();
+        a.icons
+            .insert(APP_ICON_KEY.to_string(), APP_ICON_SIZE, proto);
+        a
+    }
+
+    #[test]
+    fn image_takes_the_glyph_place() {
+        let a = with_image();
+        let theme = Theme::new(true, ColorDepth::NoColor);
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| view(&a, &theme, f)).unwrap();
+        let b = t.backend().buffer().clone();
+        // The image paints the 2x1 cells at the start of the label line: no glyph there.
+        assert!(!row(&b, 1).contains('▣'), "{}", row(&b, 1));
+        assert!(
+            b[(0, 1)].symbol().contains('\x1b'),
+            "{:?}",
+            b[(0, 1)].symbol()
+        );
+        let labels = tab_labels();
+        let lead = icon_lead(Rect::new(0, 0, 80, 3), &labels, "▣");
+        assert_eq!(
+            icon_rect(Rect::new(0, 0, 80, 3), lead),
+            Some(Rect::new(0, 1, 2, 1))
+        );
+        // The ASCII glyph is wider than the image: nothing of it is left beside the image.
+        let mut ascii = with_image();
+        ascii.glyphs = GlyphSet::Ascii;
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| view(&ascii, &theme, f)).unwrap();
+        assert_eq!(t.backend().buffer()[(2, 1)].symbol(), " ");
+        // Without a protocol the glyph is drawn.
+        let mut off = with_image();
+        off.icon_protocol = IconProtocol::Off;
+        assert!(
+            render(&off, 80, 24)
+                .lines()
+                .nth(1)
+                .is_some_and(|l| l.contains('▣'))
+        );
+    }
+
+    #[test]
+    fn app_icon_is_encoded_once_per_protocol() {
+        let mut a = App::new(entries(), GlyphSet::Unicode);
+        assert!(a.app_icon_cmd().is_empty(), "Off asks nothing");
+        a.icon_protocol = IconProtocol::Sixel;
+        let first = a.app_icon_cmd();
+        assert!(
+            matches!(first.as_slice(), [Cmd::EncodeIcon { key, size, .. }]
+                if key == APP_ICON_KEY && *size == APP_ICON_SIZE),
+            "{first:?}"
+        );
+        assert!(a.app_icon_cmd().is_empty(), "in flight: not again");
+    }
+}

@@ -2,9 +2,9 @@
 source: tests/it/tui_view.rs
 expression: "render(&a, 100, 26)"
 ---
-"╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                                              "
-"│ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │                                    wingetrs  "
-"├───────────┴┴────────────┴┴──────────────┴┘         └─────────────────────────────────────────────╮"
+"    ╭───────────╮╭────────────╮╭──────────────╮╭─────────╮                                          "
+"[w] │ Pesquisar ││ Instalados ││ Atualizações ││ Ajustes │                                wingetrs  "
+"╭───┴───────────┴┴────────────┴┴──────────────┴┘         └─────────────────────────────────────────╮"
 "│ Operações                                                                                        │"
 "│ | Confirmar antes de aplicar          ‹ sempre ›  só remoções  nunca                             │"
 "│   Ao remover, apagar dados (purge)    ‹ não ›  sim                                               │"

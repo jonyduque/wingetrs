@@ -8,7 +8,7 @@ use crate::tui::app::{
     THIRD_PARTY_BUCKET, Tab, bucket_name_of, buttons, queue_rows,
 };
 use crate::tui::help::{help_line, hints};
-use crate::tui::icons::IconProtocol;
+use crate::tui::icons::{APP_ICON_KEY, APP_ICON_SIZE, IconProtocol};
 use crate::tui::layout::{
     BAR_PAD_X, BORDER, DETAIL_ICON_COLS, DETAIL_ICON_GAP, DETAIL_ICON_ROWS, DIALOG_PAD_X,
     DIALOG_PAD_Y, ITEM_GAP, LIST_ICON_COLS, LIST_ICON_GAP, PICKER_FOOTER_SLACK, inset, split_icon,
@@ -19,7 +19,7 @@ use crate::tui::regions::{
     script_max_scroll,
 };
 use crate::tui::settings::{ORDER, SettingId};
-use crate::tui::tabs::{TabLabel, draw_tabs};
+use crate::tui::tabs::{TabLabel, draw_tabs_at, icon_lead, icon_rect};
 use crate::tui::theme::{GlyphSet, Glyphs, Theme};
 use crate::tui::toast::draw_toasts;
 use ratatui::Frame;
@@ -79,6 +79,14 @@ fn selected_icon(app: &App) -> Option<&Protocol> {
     )
 }
 
+/// The encoded app icon, when one may be shown (same conditions as a package icon).
+fn app_icon(app: &App) -> Option<&Protocol> {
+    if !icon_visible(app) {
+        return None;
+    }
+    app.icons.get(APP_ICON_KEY, APP_ICON_SIZE)
+}
+
 /// On a small terminal or with a dialog open toasts are not boxes: the newest shows in the
 /// status bar.
 fn toasts_in_status_bar(app: &App, area: Rect) -> bool {
@@ -110,24 +118,32 @@ fn draw_screen<'a>(
         }
         return (None, Vec::new());
     }
-    draw_tabs(
+    let labels = tab_labels(app, g);
+    let lead = icon_lead(r.tabs_area, &labels, g.app);
+    // The app icon is an image when one is encoded and nothing covers it, else the glyph.
+    let app_image = app_icon(app)
+        .zip(icon_rect(r.tabs_area, lead))
+        .map(|(proto, rect)| (rect, proto));
+    draw_tabs_at(
         frame,
         r.tabs_area,
-        &tab_labels(app, g),
+        &labels,
         tab_index(app.tab),
         theme,
+        lead,
+        app_image.is_none().then_some(g.app),
     );
     let window = Block::default()
         .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
         .border_type(BorderType::Rounded)
         .border_style(theme.accent());
     frame.render_widget(window, r.window);
-    let mut icons = Vec::new();
+    let mut icons: IconPlaces<'a> = app_image.into_iter().collect();
     if app.tab == Tab::Settings {
         draw_settings(app, theme, g, frame, r.settings);
     } else if let Some(divider) = r.divider {
         draw_search_line(app, theme, g, frame, r.search_line);
-        icons = draw_list(app, theme, g, frame, r.list);
+        icons.extend(draw_list(app, theme, g, frame, r.list));
         let divider_style = theme.border();
         for y in r.list.y..r.list.bottom() {
             frame
@@ -138,7 +154,7 @@ fn draw_screen<'a>(
         draw_buttons(app, theme, frame, &r.buttons);
     } else {
         draw_search_line(app, theme, g, frame, r.search_line);
-        icons = draw_list(app, theme, g, frame, r.list);
+        icons.extend(draw_list(app, theme, g, frame, r.list));
     }
     let help_rows = r.help.height;
     draw_status(app, theme, g, frame, r.status);

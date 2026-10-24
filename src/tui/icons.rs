@@ -7,6 +7,13 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{FontSize, Resize};
 use std::collections::VecDeque;
 
+/// The wingetrs icon shown left of the tabs, encoded once per protocol like a package icon.
+// Generated once: magick -background none -density 384 docs/assets/icon.svg -resize 64x64 assets/icon.png
+pub const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
+/// Key and size (columns, rows) of the app icon in the `IconCache`.
+pub const APP_ICON_KEY: &str = "wingetrs/app";
+pub const APP_ICON_SIZE: (u16, u16) = (2, 1);
+
 /// Graphics protocol used to draw icons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconProtocol {
@@ -103,7 +110,7 @@ pub fn decode(bytes: &[u8]) -> Result<image::DynamicImage, String> {
 /// Most encoded icons kept at once.
 pub const ICON_CACHE_MAX: usize = 64;
 
-/// Encoded icons keyed by `(package key, columns, rows)`; past `ICON_CACHE_MAX` the oldest goes.
+/// Encoded icons keyed by `(package key, columns, rows)`; past `ICON_CACHE_MAX` the oldest goes (never the app icon).
 #[derive(Default)]
 pub struct IconCache {
     entries: VecDeque<((String, u16, u16), Protocol)>,
@@ -122,7 +129,12 @@ impl IconCache {
             .retain(|((k, c, r), _)| !(*k == key && (*c, *r) == size));
         self.entries.push_back(((key, size.0, size.1), proto));
         while self.entries.len() > ICON_CACHE_MAX {
-            self.entries.pop_front();
+            // The app icon stays: it is drawn on every frame.
+            let oldest = self
+                .entries
+                .iter()
+                .position(|((k, ..), _)| k != APP_ICON_KEY);
+            self.entries.remove(oldest.unwrap_or(0));
         }
     }
 
