@@ -2618,6 +2618,20 @@ mod app_icon {
     }
 
     #[test]
+    fn app_icon_survives_cache_eviction() {
+        let mut a = with_image();
+        let picker = wingetrs::tui::icons::picker(IconProtocol::Sixel).unwrap();
+        for n in 0..wingetrs::tui::icons::ICON_CACHE_MAX {
+            let proto = wingetrs::tui::icons::encode(&picker, APP_ICON_PNG, APP_ICON_SIZE).unwrap();
+            a.icons
+                .insert(format!("winget/pkg{n}"), APP_ICON_SIZE, proto);
+        }
+        assert_eq!(a.icons.len(), wingetrs::tui::icons::ICON_CACHE_MAX);
+        assert!(a.icons.get(APP_ICON_KEY, APP_ICON_SIZE).is_some());
+        assert!(a.icons.get("winget/pkg0", APP_ICON_SIZE).is_none());
+    }
+
+    #[test]
     fn app_icon_is_encoded_once_per_protocol() {
         let mut a = App::new(entries(), GlyphSet::Unicode);
         assert!(a.app_icon_cmd().is_empty(), "Off asks nothing");
