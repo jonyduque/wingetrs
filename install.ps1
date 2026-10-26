@@ -31,16 +31,24 @@
     Removes wingetrs.exe and its PATH entry for the chosen scope. Data in
     %LOCALAPPDATA%\wingetrs (catalog, apps installed by wingetrs) is kept.
 
+.PARAMETER DryRun
+    Shows what would be done (download, folder, PATH, UAC) without changing anything, then
+    asks whether to run it for real.
+
 .PARAMETER Relaunched
     Internal: set on the elevated copy this script starts, which waits for Enter at the end.
 #>
-[CmdletBinding()]
+# No positional parameters: `.\install.ps1 --dry-run` used to land in -Version and fail with a
+# 404 on a release named "--dry-run"; now an unknown word is an error before anything runs.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Version = '',
     [string]$Dir = '',
     [ValidateSet('', 'User', 'Machine')]
     [string]$Scope = '',
     [switch]$Uninstall,
+    [Alias('dry-run')]
+    [switch]$DryRun,
     [switch]$Relaunched
 )
 
@@ -49,40 +57,144 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $repo = 'jonyduque/wingetrs'
+# A release tag (v0.3.0, v0.4.0-rc1), checked before any question or download.
+if ($Version -and $Version -notmatch '^v?\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') {
+    Write-Host "x versão inválida: '$Version' (use uma tag de release, ex.: v0.3.0)" -ForegroundColor Red
+    return
+}
 $scriptUrl = "https://raw.githubusercontent.com/$repo/main/install.ps1"
+
+# Estilos ANSI. Montados com o caractere ESC: `$PSStyle` e o escape `` `e `` só existem no
+# PowerShell 7, e o script também roda no Windows PowerShell 5.1.
+$esc = [char]27
+function Get-Rgb([int]$R, [int]$G, [int]$B) { "$esc[38;2;$R;$G;${B}m" }
+$cPurple = Get-Rgb 154 92 219
+$cPeach  = Get-Rgb 255 117 117
+$cGray   = Get-Rgb 128 128 128
+$cPink   = Get-Rgb 224 91 191
+$cDim    = "$esc[2m"
+$cBold   = "$esc[1m"
+$cReset  = "$esc[0m"
+
+# UTF-8 para as setas e o "·"; o valor anterior volta no fim (Restore-Console), porque sob
+# `irm | iex` a mudança ficaria valendo no terminal de quem rodou.
+$prevOutputEncoding = [Console]::OutputEncoding
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Restore-Console { try { [Console]::OutputEncoding = $prevOutputEncoding } catch { } }
+
+function Write-Title([string]$Text) {
+    Write-Host "$cBold$cPink`n$Text$cReset`n"
+}
+# One step line: the text in the default color, the value (a path, a hash) highlighted.
+function Write-Step([string]$Text, [string]$Value = '') {
+    Write-Host "  - " -NoNewline
+    if ($Value) {
+        Write-Host "$cGray$Text$cReset " -NoNewline
+        Write-Host "$cPeach$Value$cReset"
+    } else {
+        Write-Host $Text
+    }
+}
+function Write-Ok([string]$Text) { Write-Host "  ok $Text" -ForegroundColor Green }
+function Write-Note([string]$Text) { Write-Host "  $cGray$Text$cReset" }
+function Write-Warn([string]$Text) { Write-Host "  ! $Text" -ForegroundColor Yellow }
 
 function Test-Elevated {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Key=Hotkey; Value=Binding
+function Get-Footer([System.Collections.IDictionary]$keybinds){
+    $divisor = " · "
+    $sKey = "$esc[1m$(Get-Rgb 150 150 150)"
+    $sBind = "$esc[22m$(Get-Rgb 110 110 110)"
+    $reset = $cReset
+
+    $keys =  @($keybinds.Keys)
+    $total = $keys.Count
+    $parts = [System.Collections.Generic.List[string]]::new()
+
+    for ($i=0;$i -lt $Total; $i++){
+        $key  = $keys[$i].ToString().Trim()
+        $bind = $keybinds[$keys[$i]].ToString().Trim()
+        $parts.Add("$sKey$key $sBind$bind")
+    }
+
+    $footer = "  " + ($parts -join $divisor) + $reset
+    Write-Host $footer
+}
+
 # Arrow-key choice in the TUI style: up/down (or left/right, Tab) move, Enter picks, Esc
 # cancels ($null). Returns $Default when there is no console to read keys from.
-function Read-Choice([string]$Question, [string[]]$Options, [int]$Default = 0) {
+function Read-Choice([string]$Question, [System.Collections.IDictionary]$Options, [int]$Default = 0) {
     try { if ([Console]::IsInputRedirected) { return $Default } } catch { return $Default }
-    Write-Host $Question -ForegroundColor Cyan
-    $sel = $Default
-    $top = [Console]::CursorTop
-    $draw = {
-        [Console]::SetCursorPosition(0, $top)
-        for ($i = 0; $i -lt $Options.Count; $i++) {
-            $line = $Options[$i].PadRight([Math]::Max(0, [Console]::WindowWidth - 5))
-            if ($i -eq $sel) { Write-Host '  > ' -ForegroundColor Cyan -NoNewline; Write-Host $line -ForegroundColor Cyan }
-            else { Write-Host "    $line" -ForegroundColor DarkGray }
-        }
-        Write-Host '  setas movem · Enter escolhe · Esc cancela' -ForegroundColor DarkGray
+    if ($Options.Count -eq 0) { return $null }
+
+    Write-Title $Question
+
+    # [Math]::Clamp não existe no .NET Framework do 5.1.
+    $sel = [Math]::Max(0, [Math]::Min($Default, $Options.Count - 1))
+    $keyOptions = @($Options.Keys)
+    $keybinds = [ordered]@{
+        # Arrows as [char]: a 5.1 reading this file without a BOM decodes it as ANSI, and the
+        # UTF-8 bytes of these symbols contain a smart quote that ends the string.
+        "$([char]0x2193)$([char]0x2191)" = "movem"
+        "Enter" = "escolhe"
+        "Esc"   = "cancela"
     }
-    & $draw
-    $top = [Console]::CursorTop - $Options.Count - 1
-    while ($true) {
-        $k = [Console]::ReadKey($true)
-        switch ($k.Key) {
-            { $_ -in 'UpArrow', 'LeftArrow' } { $sel = ($sel + $Options.Count - 1) % $Options.Count }
-            { $_ -in 'DownArrow', 'RightArrow', 'Tab' } { $sel = ($sel + 1) % $Options.Count }
-            'Enter' { return $sel }
-            'Escape' { return $null }
+
+    # The first draw writes where the cursor is; its top line is only known after it, because
+    # writing at the bottom of the window scrolls the buffer (a top read before the draw goes
+    # stale and SetCursorPosition then fails with "Actual value was 43").
+    $startTop = -1
+    $cursorVisibleOriginal = [Console]::CursorVisible
+
+    $draw = {
+        if ($startTop -ge 0) { [Console]::SetCursorPosition(0, $startTop) }
+
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $k = $keyOptions[$i]
+            $v = $Options[$k]
+
+            if ($i -eq $sel) {
+                # Colunas 1 e 2 recebem roxo + negrito; a última coluna recebe roxo + DimOn
+                $colArrow = "$cPurple$cBold{0,-2}$cReset" -f " $([char]0x2192)"
+                $colKey   = "$cPurple$cBold{0,-25}$cReset" -f $k
+                $colDesc  = "$cPurple$cDim{0,-30}$cReset" -f $v
+
+                Write-Host "  $colArrow $colKey $colDesc"
+            } else {
+                $colArrow = "$cGray{0,-2}$cReset" -f "  "
+                $colKey   = "{0,-25}" -f $k
+                $colDesc  = "$cDim{0,-30}$cReset" -f $v
+
+                Write-Host "  $colArrow $colKey $colDesc"
+            }
         }
+
+        Get-Footer $keybinds
+    }
+
+    try {
+        [Console]::CursorVisible = $false
         & $draw
+        $startTop = [Math]::Max(0, [Console]::CursorTop - $Options.Count - 1)
+
+        while ($true) {
+            $k = [Console]::ReadKey($true)
+            # Each draw ends below the footer, so Enter and Esc leave the cursor there as is.
+            switch ($k.Key) {
+                { $_ -in 'UpArrow', 'LeftArrow' }           { $sel = ($sel + $Options.Count - 1) % $Options.Count }
+                { $_ -in 'DownArrow', 'RightArrow', 'Tab' } { $sel = ($sel + 1) % $Options.Count }
+                'Enter'  { return $sel }
+                'Escape' { return $null }
+            }
+            & $draw
+        }
+    }
+    finally {
+        [Console]::CursorVisible = $cursorVisibleOriginal
     }
 }
 
@@ -97,9 +209,11 @@ if ($Scope) {
     $machine = $true
 } else {
     $verb = if ($Uninstall) { 'Remover' } else { 'Instalar' }
-    $pick = Read-Choice "$verb o wingetrs para quem?" @(
-        'Só para você          sem administrador',
-        'Para todos os usuários   pede autorização de administrador (necessário para o auxiliar elevado)')
+    # [ordered]: a posição decide o escopo ($pick -eq 1 = todos os usuários).
+    $pick = Read-Choice "$verb o wingetrs para quem?" ([ordered]@{
+        'Só para você' = 'Sem administrador'
+        'Para todos os usuários' = 'Pede autorização de administrador.'
+    })
     $cancelled = $null -eq $pick
     $machine = $pick -eq 1
 }
@@ -120,20 +234,6 @@ $envKey = if ($testKey) { $testKey } elseif ($machine) { 'SYSTEM\CurrentControlS
 $scopeText = if ($machine) { 'todos os usuários' } else { 'só para você' }
 $pathText = if ($machine) { 'PATH da máquina' } else { 'PATH do usuário' }
 
-function Write-Title([string]$Text) { Write-Host $Text -ForegroundColor Cyan }
-# One step line: the text in the default color, the value (a path, a hash) highlighted.
-function Write-Step([string]$Text, [string]$Value = '') {
-    Write-Host '  - ' -ForegroundColor DarkGray -NoNewline
-    if ($Value) {
-        Write-Host "$Text " -NoNewline
-        Write-Host $Value -ForegroundColor Cyan
-    } else {
-        Write-Host $Text
-    }
-}
-function Write-Ok([string]$Text) { Write-Host "  ok $Text" -ForegroundColor Green }
-function Write-Note([string]$Text) { Write-Host "  $Text" -ForegroundColor DarkGray }
-function Write-Warn([string]$Text) { Write-Host "  ! $Text" -ForegroundColor Yellow }
 # Errors end the run with one red line; `exit` would close the terminal under `irm | iex`.
 function Fail([string]$Text) { throw $Text }
 
@@ -209,12 +309,12 @@ function Invoke-Relaunch {
     $installed = & $exe --version
     Write-Host ''
     Write-Host "Pronto: $installed (todos os usuários)" -ForegroundColor Green
-    Write-Note 'terminais abertos antes da instalação precisam ser reabertos para achar o wingetrs'
+    Write-Note 'Terminais abertos antes da instalação precisam ser reabertos para achar o wingetrs'
 }
 
 function Invoke-Main {
     if ($cancelled) {
-        Write-Note 'cancelado; nada foi alterado'
+        Write-Note 'Cancelado. Nada foi alterado.'
         return
     }
     if ($machine -and -not $elevated) {
@@ -297,14 +397,67 @@ function Invoke-Main {
     $installed = & $exe --version
     Write-Host ''
     Write-Host "Pronto: $installed" -ForegroundColor Green
-    Write-Note 'terminais abertos antes da instalação precisam ser reabertos para achar o wingetrs'
+    Write-Note 'Terminais abertos antes da instalação precisam ser reabertos para achar o wingetrs'
     if (-not $machine) {
-        Write-Note 'operações de administrador (ponte elevada, remoções em HKLM) pedem a instalação para todos os usuários: rode de novo e escolha "Para todos os usuários"'
+        Write-Note 'Operações de administrador (ponte elevada, remoções em HKLM) pedem a instalação para todos os usuários: rode de novo e escolha "Para todos os usuários"'
     }
 }
 
+# -DryRun: the same decisions as Invoke-Main, printed instead of done (no download, no write).
+# Returns $true when the user then asks for the real run.
+function Invoke-DryRun {
+    if ($cancelled) {
+        Write-Note 'Cancelado. Nada foi alterado.'
+        return $false
+    }
+    $exe = Join-Path $Dir 'wingetrs.exe'
+    $label = if ($Version) { $Version } else { 'último release' }
+    $action = if ($Uninstall) { 'remover' } else { 'instalar' }
+    Write-Title "Simulação: $action o wingetrs ($(if ($Uninstall) { $scopeText } else { "$label, $scopeText" }))"
+    if ($machine -and -not $elevated) {
+        Write-Step 'pediria autorização de administrador (UAC) e continuaria numa janela elevada'
+    }
+    $hasDir = @(Split-PathList (Get-EnvPath) | Where-Object { Same-Dir $_ $Dir }).Count -gt 0
+    if ($Uninstall) {
+        if ($hasDir) { Write-Step "tiraria do $pathText" $Dir } else { Write-Step "$pathText não tem a pasta" }
+        if (Test-Path -LiteralPath $exe) { Write-Step 'apagaria' $exe } else { Write-Step 'não há wingetrs em' $Dir }
+        Write-Step 'apagaria a pasta se ficar vazia' $Dir
+        Write-Note "dados em $(Join-Path $env:LOCALAPPDATA 'wingetrs') ficariam"
+    } else {
+        $base = if ($Version) { "https://github.com/$repo/releases/download/$Version" } else { "https://github.com/$repo/releases/latest/download" }
+        Write-Step 'baixaria' "$base/wingetrs.exe"
+        Write-Step 'conferiria o SHA-256 com' "$base/wingetrs.exe.sha256"
+        if (Test-Path -LiteralPath $exe) {
+            $current = try { & $exe --version 2>$null } catch { 'versão desconhecida' }
+            Write-Step "substituiria $current em" $exe
+        } else {
+            Write-Step 'salvaria em' $exe
+        }
+        if ($hasDir) { Write-Step "$pathText já tem a pasta" } else { Write-Step "poria no $pathText" $Dir }
+        $userCopy = Join-Path $env:LOCALAPPDATA 'Programs\wingetrs\wingetrs.exe'
+        if ($machine -and -not (Same-Dir (Split-Path $userCopy) $Dir) -and (Test-Path -LiteralPath $userCopy)) {
+            Write-Warn "há também uma instalação só para você em $userCopy; a da máquina viria antes no PATH"
+        }
+    }
+    Write-Host ''
+    Write-Note 'Simulação: nada foi alterado.'
+    $verbReal = if ($Uninstall) { 'remoção' } else { 'instalação' }
+    # Default "Não": without a console to ask on, a dry run never turns into a real one.
+    $go = Read-Choice "Iniciar a $verbReal real?" ([ordered]@{
+        'Sim' = "faz a $verbReal agora"
+        'Não' = 'sai sem alterar nada'
+    }) -Default 1
+    return ($go -eq 0)
+}
+
 $failed = $false
-try { Invoke-Main } catch { $failed = $true; Write-Host "x $($_.Exception.Message)" -ForegroundColor Red }
+try {
+    if ($DryRun) {
+        if (Invoke-DryRun) { Invoke-Main }
+    } else {
+        Invoke-Main
+    }
+} catch { $failed = $true; Write-Host "x $($_.Exception.Message)" -ForegroundColor Red } finally { Restore-Console }
 if ($Relaunched) {
     # The elevated copy runs in its own window: keep it open until the user has read it.
     Read-Host 'Enter fecha esta janela' | Out-Null

@@ -47,6 +47,7 @@ Abra um terminal novo depois de instalar.
 
 - **Atualizar:** `wingetrs self update` (a partir da 0.3.0), ou rode o mesmo comando de novo. A TUI avisa quando há versão nova e `Ctrl+U` atualiza.
 - **Versão específica:** `& ([scriptblock]::Create((irm https://raw.githubusercontent.com/jonyduque/wingetrs/main/install.ps1))) -Version v0.2.1`
+- **Simular antes:** o mesmo comando com `-DryRun` mostra o que seria feito (download, pasta, PATH, UAC) sem mudar nada e, no fim, pergunta se você quer instalar de verdade.
 - **Remover:** o mesmo comando com `-Uninstall`. Os dados em `%LOCALAPPDATA%\wingetrs` (catálogo e apps instalados pelo wingetrs) ficam; para tirar os apps, use `wingetrs uninstall` antes.
 
 Também dá para baixar o `wingetrs.exe` direto da página de [releases](https://github.com/jonyduque/wingetrs/releases).
