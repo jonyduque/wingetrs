@@ -4,8 +4,8 @@ use futures_util::StreamExt;
 use tokio::time::MissedTickBehavior;
 use wingetrs::tui::app::{Cmd, Msg};
 use wingetrs::tui::run::{
-    clock_turn, drain_ready, join_details, join_refresh, join_search, last_details_only,
-    needs_draw, spinner_ticker,
+    clock_turn, drain_ready, join_details, join_refresh, join_release_check, join_search,
+    last_details_only, needs_draw, spinner_ticker,
 };
 
 fn key(c: KeyCode) -> Msg {
@@ -95,6 +95,16 @@ async fn drain_ready_leaves_the_task_waker_with_a_pending_stream() {
     assert_eq!(drain_ready(key(KeyCode::Down), &mut s, 256).await.len(), 1);
     let recorded = s.0.expect("the stream was polled");
     assert!(recorded.will_wake(&task));
+}
+
+#[tokio::test]
+async fn release_check_worker_panic_reaches_the_loop() {
+    let msg = join_release_check(tokio::spawn(async { panic!("x") })).await;
+    assert!(matches!(msg, Some(Msg::Panicked(_))));
+    let h = tokio::spawn(std::future::pending::<()>());
+    h.abort();
+    assert!(join_release_check(h).await.is_none());
+    assert!(join_release_check(tokio::spawn(async {})).await.is_none());
 }
 
 #[tokio::test]

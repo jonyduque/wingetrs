@@ -222,6 +222,8 @@ pub enum Msg {
     /// The latest release of the GitHub release app `app_key` (Task 211): its version, or why
     /// it was not checked (`não conferido (…)`).
     ReleaseChecked {
+        /// The `Cmd::CheckReleases` it answers; an older one is dropped.
+        generation: u64,
         app_key: String,
         latest: Result<String, String>,
     },
@@ -800,6 +802,8 @@ pub enum Cmd {
     /// Read the latest tag of each `(app_key, repository)` (web redirect, a few at a time) and
     /// answer, per row, with `Msg::ReleaseChecked`.
     CheckReleases {
+        /// `App::release_gen` when asked: a newer list supersedes the answers.
+        generation: u64,
         rows: Vec<(String, crate::github::GhRepo)>,
     },
     Execute(Action),
@@ -1033,6 +1037,8 @@ pub struct App {
     pub bridge_last_line: Option<Instant>,
     /// Native upgrade plans by `app_key`, with the catalog version each is for.
     pub native_upgrades: HashMap<String, (String, WingetPlan)>,
+    /// Generation of the newest `Cmd::CheckReleases` (Task 211).
+    pub release_gen: u64,
     /// Where `.reg` backups go (`install::layout::Layout::backups`), shown in confirmations.
     pub backups_dir: PathBuf,
 }
@@ -1162,6 +1168,7 @@ impl App {
             pwsh: "pwsh".to_string(),
             bridge_last_line: None,
             native_upgrades: HashMap::new(),
+            release_gen: 0,
             backups_dir: PathBuf::new(),
         };
         app.research();
@@ -1894,7 +1901,15 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             cmds.extend(release_check_cmd(app));
             cmds
         }
-        Msg::ReleaseChecked { app_key, latest } => {
+        Msg::ReleaseChecked {
+            generation,
+            app_key,
+            latest,
+        } => {
+            // An answer about an installed list that was replaced since.
+            if generation != app.release_gen {
+                return Vec::new();
+            }
             if let Some(r) = app.installed.iter_mut().find(|r| r.app_key == app_key) {
                 crate::install::ops::set_release_state(r, latest);
             }
@@ -3486,7 +3501,7 @@ fn installer_release(r: &ListRow) -> bool {
 }
 
 /// The release apps whose latest tag the Updates tab reads (Task 211).
-fn release_check_cmd(app: &App) -> Option<Cmd> {
+fn release_check_cmd(app: &mut App) -> Option<Cmd> {
     let rows: Vec<(String, crate::github::GhRepo)> = app
         .installed
         .iter()
@@ -3504,7 +3519,14 @@ fn release_check_cmd(app: &App) -> Option<Cmd> {
             _ => None,
         })
         .collect();
-    (!rows.is_empty()).then_some(Cmd::CheckReleases { rows })
+    if rows.is_empty() {
+        return None;
+    }
+    app.release_gen += 1;
+    Some(Cmd::CheckReleases {
+        generation: app.release_gen,
+        rows,
+    })
 }
 
 /// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.

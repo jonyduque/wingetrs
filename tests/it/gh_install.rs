@@ -2300,6 +2300,7 @@ fn tui_release_rows_never_reach_winget() {
     // The Updates tab reads their latest tags; never winget's applicability.
     assert!(
         seen.contains(&Cmd::CheckReleases {
+            generation: 1,
             rows: vec![
                 ("wingetrs/tool".into(), GhRepo::parse("o/tool").unwrap()),
                 ("wingetrs/setup".into(), GhRepo::parse("o/setup").unwrap()),
@@ -2384,6 +2385,7 @@ fn tui_release_rows_never_reach_winget() {
     update(
         &mut a,
         Msg::ReleaseChecked {
+            generation: 1,
             app_key: "wingetrs/tool".into(),
             latest: Err(note.clone()),
         },
@@ -2403,6 +2405,7 @@ fn tui_release_rows_never_reach_winget() {
     update(
         &mut a,
         Msg::ReleaseChecked {
+            generation: 1,
             app_key: "wingetrs/tool".into(),
             latest: Ok("1.10.0".into()),
         },
@@ -3053,4 +3056,37 @@ async fn tui_upgrade_all_names_release_apps_without_network() {
     );
     assert_eq!(w.api_requests().await, 0);
     assert_eq!(w.requests().await, 2);
+}
+
+#[test]
+fn tui_release_check_answer_of_a_replaced_list_is_dropped() {
+    let rows = || vec![release_row("tool", "github:o/tool", false)];
+    let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+    let first = update(&mut a, Msg::InstalledLoaded(rows()));
+    assert!(
+        first
+            .iter()
+            .any(|c| matches!(c, Cmd::CheckReleases { generation: 1, .. }))
+    );
+    let second = update(&mut a, Msg::InstalledLoaded(rows()));
+    assert!(
+        second
+            .iter()
+            .any(|c| matches!(c, Cmd::CheckReleases { generation: 2, .. }))
+    );
+    let answer = |generation| Msg::ReleaseChecked {
+        generation,
+        app_key: "wingetrs/tool".into(),
+        latest: Ok("2.0.0".into()),
+    };
+    // The answer about the first list arrives late: nothing changes.
+    update(&mut a, answer(1));
+    assert_eq!(a.installed[0].state, UpdateState::UpToDate);
+    update(&mut a, answer(2));
+    assert_eq!(
+        a.installed[0].state,
+        UpdateState::Available {
+            latest: "2.0.0".into()
+        }
+    );
 }

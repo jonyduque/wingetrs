@@ -519,7 +519,9 @@ async fn event_loop(
                     });
                     Msg::Planned(planned.and_then(|r| r).and_then(|r| r))
                 }),
-                Cmd::CheckReleases { rows } => spawn_release_check(&ctx, rows),
+                Cmd::CheckReleases { generation, rows } => {
+                    spawn_release_check(&ctx, generation, rows);
+                }
                 Cmd::SaveSettings {
                     behavior,
                     glyphs,
@@ -2015,22 +2017,53 @@ fn spawn_release(ctx: &Arc<Ctx>, action: Action) {
 }
 
 /// Reads the latest tag of each release app (`ops::latest_release_versions`: the web
-/// redirect, a few at a time) and answers per row.
-fn spawn_release_check(ctx: &Arc<Ctx>, rows: Vec<(String, crate::github::GhRepo)>) {
+/// redirect, a few at a time) and answers per row. The work runs in its own task, always
+/// awaited: a panic reaches the loop ([`join_release_check`]).
+fn spawn_release_check(
+    ctx: &Arc<Ctx>,
+    generation: u64,
+    rows: Vec<(String, crate::github::GhRepo)>,
+) {
     let ctx = Arc::clone(ctx);
     tokio::spawn(async move {
-        let repos: Vec<crate::github::GhRepo> = rows.iter().map(|(_, r)| r.clone()).collect();
-        let versions = crate::install::ops::latest_release_versions(
-            &ctx.http,
-            crate::github::install::WEB_BASE,
-            &repos,
-        )
-        .await;
-        for ((app_key, _), latest) in rows.into_iter().zip(versions) {
-            let latest = latest.map_err(|e| crate::install::ops::release_unchecked(&e));
-            let _ = ctx.tx.send(Msg::ReleaseChecked { app_key, latest });
+        let work = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move {
+                let repos: Vec<crate::github::GhRepo> =
+                    rows.iter().map(|(_, r)| r.clone()).collect();
+                let versions = crate::install::ops::latest_release_versions(
+                    &ctx.http,
+                    crate::github::install::WEB_BASE,
+                    &repos,
+                )
+                .await;
+                for ((app_key, _), latest) in rows.into_iter().zip(versions) {
+                    let latest = latest.map_err(|e| crate::install::ops::release_unchecked(&e));
+                    let _ = ctx.tx.send(Msg::ReleaseChecked {
+                        generation,
+                        app_key,
+                        latest,
+                    });
+                }
+            }
+        });
+        if let Some(msg) = join_release_check(work).await {
+            let _ = ctx.tx.send(msg);
         }
     });
+}
+
+/// Awaits the release check: a panic travels to the loop as `Msg::Panicked`; a cancellation
+/// (the runtime shutting down) leaves the rows as they are.
+pub async fn join_release_check(h: tokio::task::JoinHandle<()>) -> Option<Msg> {
+    match h.await {
+        Ok(()) => None,
+        Err(e) if e.is_panic() => Some(Msg::Panicked(e.into_panic())),
+        Err(e) => {
+            tracing::debug!(error = %e, "release check cancelled");
+            None
+        }
+    }
 }
 
 /// Runs `f` with the production release environment: the GitHub bases, the shell launcher
