@@ -179,7 +179,9 @@ fn install_flags_parse() {
             yes: true,
             allow_msiexec: false,
             allow_scripts: false,
-            scope: None
+            scope: None,
+            allow_unreviewed: false,
+            asset: None
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--bucket", "main"]).unwrap();
@@ -192,7 +194,9 @@ fn install_flags_parse() {
             yes: false,
             allow_msiexec: false,
             allow_scripts: false,
-            scope: None
+            scope: None,
+            allow_unreviewed: false,
+            asset: None
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "install", "x", "--allow-msiexec"]).unwrap();

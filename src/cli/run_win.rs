@@ -10,6 +10,7 @@ use crate::bridge::worker::ScopeArg;
 use crate::cache::{BlobStore, DataDir};
 use crate::catalog::Catalog;
 use crate::config::{Behavior, Config};
+use crate::github::install::{API_BASE, ArpKey, ArpView, GhEnv, WEB_BASE};
 use crate::http::Http;
 use crate::install::download::Progress;
 use crate::install::executor::LaunchGate;
@@ -19,7 +20,7 @@ use crate::install::progress::ProgressEvent;
 use crate::install::script_policy::elevated_or_unknown;
 use crate::install::target::Candidate;
 use crate::installed::correlate::{ListRow, correlate};
-use crate::installed::{Hive, InstalledApp};
+use crate::installed::{Hive, InstallSource, InstalledApp};
 use crate::sources::winget::manifest::MergedManifest;
 use crate::tui::app::{Done, InstallFail};
 use crate::update::LockWait;
@@ -115,6 +116,33 @@ fn scan(data: &DataDir) -> Vec<InstalledApp> {
         tracing::warn!("coleta de instalados: {e}");
     }
     scan.apps
+}
+
+/// The ARP a GitHub release installer writes to (HKCU and HKLM 64/32-bit, Task 210).
+struct ReleaseArp;
+
+impl ArpView for ReleaseArp {
+    fn keys(&self) -> std::io::Result<Vec<ArpKey>> {
+        let apps = crate::installed::read_arp().map_err(std::io::Error::other)?;
+        Ok(apps
+            .into_iter()
+            .filter_map(|a| match a.source {
+                InstallSource::Arp(hive) => Some(ArpKey {
+                    hive,
+                    key: a.key,
+                    name: a.name,
+                }),
+                _ => None,
+            })
+            .collect())
+    }
+
+    fn uninstall_string(&self, hive: Hive, key: &str) -> Option<String> {
+        read_details(hive, key)
+            .ok()
+            .flatten()
+            .and_then(|d| d.uninstall_string)
+    }
 }
 
 /// The record still there (a read error counts as there: never "removed" by mistake).
@@ -334,6 +362,15 @@ impl WingetFlows for ProdFlows<'_, '_> {
 
     fn elevated(&self) -> fn() -> std::io::Result<bool> {
         crate::winget_install::launch_win::is_elevated
+    }
+
+    fn github(&self) -> Option<GhEnv<'_>> {
+        Some(GhEnv {
+            api: API_BASE.into(),
+            web: WEB_BASE.into(),
+            launcher: &ShellLauncher,
+            arp: &ReleaseArp,
+        })
     }
 
     async fn plan_upgrade(

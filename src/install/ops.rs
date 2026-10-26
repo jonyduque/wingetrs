@@ -601,32 +601,71 @@ pub fn plan_for(
         raw,
         manifest: target,
     });
-    let shortcut_root = ctx.effects.shortcuts.root();
-    let launcher_present = layout.launcher().exists();
     let mut plans = Vec::with_capacity(nodes.len());
     for n in &nodes {
-        let installed = match state.get(&n.id)? {
-            Some((r, _)) => Some(InstalledInfo {
-                old_manifest: old_manifest(&layout, &n.id, &r)?,
-                version: r.version,
-            }),
-            None => None,
-        };
-        let sha = crate::cache::sha256_hex(n.raw.as_bytes());
-        plans.push(planner::plan_install(&PlanInput {
-            app: &n.id,
-            bucket: &n.bucket,
-            manifest: &n.manifest,
-            layout: &layout,
-            shortcut_root: &shortcut_root,
-            installed,
-            launcher_present,
-            keep_old,
-            manifest_sha256: &sha,
-            ast: &*ctx.runners.ast,
-        })?);
+        plans.push(plan_node(ctx, &layout, &state, n, keep_old)?);
     }
     Ok(plans)
+}
+
+/// The one planning step of [`plan_for`] and [`plan_for_raw`]: `n` against what `state` has.
+fn plan_node(
+    ctx: &OpsCtx<'_>,
+    layout: &Layout,
+    state: &StateDb,
+    n: &Node,
+    keep_old: bool,
+) -> Result<InstallPlan, OpsError> {
+    let installed = match state.get(&n.id)? {
+        Some((r, _)) => Some(InstalledInfo {
+            old_manifest: old_manifest(layout, &n.id, &r)?,
+            version: r.version,
+        }),
+        None => None,
+    };
+    let sha = crate::cache::sha256_hex(n.raw.as_bytes());
+    Ok(planner::plan_install(&PlanInput {
+        app: &n.id,
+        bucket: &n.bucket,
+        manifest: &n.manifest,
+        layout,
+        shortcut_root: &ctx.effects.shortcuts.root(),
+        installed,
+        launcher_present: layout.launcher().exists(),
+        keep_old,
+        manifest_sha256: &sha,
+        ast: &*ctx.runners.ast,
+    })?)
+}
+
+/// [`plan_for`] of a manifest that is not in the catalog (a GitHub release, Task 210): no
+/// catalog, no dependencies. An app of another bucket with the same name is refused.
+pub fn plan_for_raw(
+    ctx: &OpsCtx<'_>,
+    app: &str,
+    bucket: &str,
+    raw_json: &str,
+    keep_old: bool,
+) -> Result<InstallPlan, OpsError> {
+    let _span = tracing::debug_span!("plan.build").entered();
+    let manifest = manifest::resolve(raw_json, Arch::host())?;
+    let layout = layout(ctx);
+    let state = read_state(&layout)?;
+    if let Some((r, _)) = state.get(app)?
+        && r.bucket != bucket
+    {
+        return Err(OpsError::Unsupported(format!(
+            "já existe um app {app} de {}",
+            r.bucket
+        )));
+    }
+    let node = Node {
+        bucket: bucket.to_string(),
+        id: app.to_string(),
+        raw: raw_json.to_string(),
+        manifest,
+    };
+    plan_node(ctx, &layout, &state, &node, keep_old)
 }
 
 /// Plans app `app` of `bucket` from a manifest that is not in a scoop bucket (a winget portable
@@ -638,36 +677,16 @@ pub fn plan_manifest(
     raw: &str,
     keep_old: bool,
 ) -> Result<InstallPlan, OpsError> {
-    let _span = tracing::debug_span!("plan.build").entered();
-    let target = manifest::resolve(raw, Arch::host())?;
-    let layout = layout(ctx);
-    let state = read_state(&layout)?;
-    let installed = match state.get(app)? {
-        Some((r, _)) if r.bucket != bucket => {
-            return Err(OpsError::Unsupported(format!(
-                "{app} já está instalado pelo wingetrs a partir do bucket {}",
-                r.bucket
-            )));
-        }
-        Some((r, _)) => Some(InstalledInfo {
-            old_manifest: old_manifest(&layout, app, &r)?,
-            version: r.version,
-        }),
-        None => None,
-    };
-    let sha = crate::cache::sha256_hex(raw.as_bytes());
-    Ok(planner::plan_install(&PlanInput {
-        app,
-        bucket,
-        manifest: &target,
-        layout: &layout,
-        shortcut_root: &ctx.effects.shortcuts.root(),
-        installed,
-        launcher_present: layout.launcher().exists(),
-        keep_old,
-        manifest_sha256: &sha,
-        ast: &*ctx.runners.ast,
-    })?)
+    let state = read_state(&layout(ctx))?;
+    if let Some((r, _)) = state.get(app)?
+        && r.bucket != bucket
+    {
+        return Err(OpsError::Unsupported(format!(
+            "{app} já está instalado pelo wingetrs a partir do bucket {}",
+            r.bucket
+        )));
+    }
+    plan_for_raw(ctx, app, bucket, raw, keep_old)
 }
 
 /// The manifest written when `rec` was installed (never the catalog's), resolved for the

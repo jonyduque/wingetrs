@@ -1,6 +1,7 @@
 //! GitHub releases client: assets with their SHA-256 `digest`, and the latest tag through
 //! the web redirect (which does not spend the API rate limit).
 
+pub mod install;
 pub mod pick;
 
 use serde::Deserialize;
@@ -30,6 +31,10 @@ pub enum GhError {
     InvalidRepo(String),
     #[error("{0}")]
     UntrustedCertificate(String),
+    #[error("endereço do GitHub não reconhecido: {0}")]
+    UnsupportedUrl(String),
+    #[error("tag de release inválida: {0}")]
+    InvalidTag(String),
 }
 
 impl GhError {
@@ -51,7 +56,7 @@ pub struct GhRepo {
     pub repo: String,
 }
 
-fn valid_part(s: &str) -> bool {
+pub(crate) fn valid_part(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
@@ -279,7 +284,7 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-fn percent_decode(s: &str) -> Option<String> {
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

@@ -259,6 +259,47 @@ pub fn write_install_json(
     crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &dst))
 }
 
+/// The ARP record of an app its own installer put in place (a GitHub release, Task 210):
+/// what removal and update read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallerRecord {
+    pub hive: crate::installed::Hive,
+    pub key: String,
+    pub uninstall_string: Option<String>,
+}
+
+/// `user`, `machine64` or `machine32` (the `hive` of `install.json`).
+pub fn hive_name(h: crate::installed::Hive) -> &'static str {
+    match h {
+        crate::installed::Hive::User => "user",
+        crate::installed::Hive::MachineX64 => "machine64",
+        crate::installed::Hive::MachineX86 => "machine32",
+    }
+}
+
+/// Writes `<version_dir>\install.json` of an app installed by its own installer: the fields
+/// of [`write_install_json`] plus `mode: "installer"` and the ARP key.
+pub fn write_installer_json(
+    version_dir: &Path,
+    bucket: &str,
+    version: &str,
+    rec: &InstallerRecord,
+) -> std::io::Result<()> {
+    let v = serde_json::json!({
+        "bucket": bucket,
+        "version": version,
+        "wingetrs": 1,
+        "mode": "installer",
+        "arp": { "hive": hive_name(rec.hive), "key": rec.key },
+        "uninstall_string": rec.uninstall_string,
+    });
+    let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;
+    let tmp = version_dir.join("install.json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    let dst = version_dir.join("install.json");
+    crate::fs_retry::retry("renomear", &tmp, || std::fs::rename(&tmp, &dst))
+}
+
 /// Upper bound for a written manifest (real ones are a few KiB).
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 

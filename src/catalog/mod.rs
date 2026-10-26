@@ -563,6 +563,17 @@ impl Catalog {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Scoop packages whose manifest contains `needle` (ASCII case-insensitive), rowid order.
+    pub fn scoop_raw_containing(&self, needle: &str) -> Result<Vec<StoredPackage>, CatalogError> {
+        let sql = format!(
+            "SELECT {PKG_COLS} FROM packages WHERE source LIKE 'scoop:%' \
+             AND instr(lower(raw), lower(?1)) > 0 ORDER BY rowid"
+        );
+        let mut st = self.conn.prepare_cached(&sql)?;
+        let rows = st.query_map(params![needle], stored_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Package ids (winget source) whose map key equals `key` (case rules above).
     pub fn lookup(&self, table: MapTable, key: &str) -> Result<Vec<String>, CatalogError> {
         let key = if table.lowercases() {

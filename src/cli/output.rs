@@ -904,6 +904,103 @@ pub fn bridge_plan_text(name_version: &str, steps: &[String], details: &[String]
     numbered_plan(via_winget(name_version), steps, &[], details)
 }
 
+/// The trust lines of an install from a GitHub release (Task 210): nobody reviewed it, and
+/// whether the release can still change under the same tag.
+pub fn gh_trust(slug: &str, immutable: bool) -> String {
+    format!(
+        "{} {}\n{}\n",
+        paint(WARN, style::glyphs().toast_warn),
+        paint(WARN, &format!("origem não revisada: {slug}")),
+        paint(
+            DIM,
+            &format!(
+                "release imutável: {}",
+                if immutable { "sim" } else { "não" }
+            )
+        )
+    )
+}
+
+/// `--dry-run` only: the file, URL and SHA-256 of each release asset `(name, url, digest)`.
+pub fn gh_details(assets: &[(&str, &str, &str)]) -> String {
+    let mut s = String::new();
+    for (name, url, digest) in assets {
+        for line in [
+            format!("Arquivo: {name}"),
+            format!("URL: {url}"),
+            format!("Digest: {digest}"),
+        ] {
+            s.push_str(&format!("  {}\n", labeled(&line)));
+        }
+    }
+    s
+}
+
+/// The plan of a release installer: `<app> <version> (github:<owner>/<repo>)`, then what runs
+/// and, when there is one, the program the install falls back to.
+pub fn gh_installer_plan(
+    app_version: &str,
+    bucket: &str,
+    generator: &str,
+    file: &str,
+    fallback: Option<&str>,
+    asks_admin: bool,
+) -> String {
+    let title = format!(
+        "{} {}",
+        paint(NAME, app_version),
+        paint(DIM, &format!("({bucket})"))
+    );
+    let mut steps = vec![format!(
+        "Roda o instalador {generator} (origem não revisada): {file}"
+    )];
+    if asks_admin {
+        steps.push(crate::winget_install::plan::SELF_ADMIN_PROMPT.to_string());
+    }
+    steps.push(
+        "O instalador roda com os seus privilégios e pode alterar qualquer arquivo seu".into(),
+    );
+    if let Some(p) = fallback {
+        steps.push(format!("Se falhar: instala só {p}"));
+    }
+    numbered_plan(title, &steps, &[], &[])
+}
+
+/// An install from a GitHub release without `--allow-unreviewed` (never implied by `--yes`).
+pub fn gh_unreviewed_refusal(slug: &str) -> Advice {
+    Advice::new(
+        format!("{slug} vem de um release do GitHub, sem a revisão de um bucket"),
+        "revise com --dry-run e rode de novo com --allow-unreviewed",
+    )
+}
+
+/// The installer of a release failed: the program asset goes instead.
+pub fn gh_fallback(reason: &str) -> String {
+    warning(&format!(
+        "o instalador falhou ({reason}); instalando só o executável"
+    ))
+}
+
+/// More than one asset fits and nobody can choose: the names and `--asset`.
+pub fn gh_ambiguous(tag: &str, names: &[&str]) -> Advice {
+    let mut what = format!("o release {tag} tem mais de um arquivo para Windows:");
+    for n in names {
+        what.push_str("\n  ");
+        what.push_str(&paint(ID, n));
+    }
+    Advice::new(what, "escolha um com --asset <nome>")
+}
+
+/// `--asset <name>` names no asset of the release.
+pub fn gh_missing_asset(tag: &str, name: &str, names: &[&str]) -> Advice {
+    let mut what = format!("o release {tag} não tem o arquivo {name}; arquivos:");
+    for n in names {
+        what.push_str("\n  ");
+        what.push_str(&paint(ID, n));
+    }
+    Advice::new(what, "escolha um com --asset <nome>")
+}
+
 /// The removal of an app of the Windows list (ARP/MSIX): `Desinstalar` as a header and the
 /// name in bold, then [`numbered_plan`] of `UninstallPlan::steps` (the TUI lists the same).
 pub fn winget_uninstall_text(

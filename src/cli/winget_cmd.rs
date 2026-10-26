@@ -352,6 +352,11 @@ pub trait WingetFlows {
     fn elevated(&self) -> fn() -> std::io::Result<bool> {
         crate::install::script_policy::not_elevated
     }
+    /// What an install from a GitHub release needs (Task 210): API and download bases,
+    /// launcher and ARP. The default is for fakes that never install from a release.
+    fn github(&self) -> Option<crate::github::install::GhEnv<'_>> {
+        None
+    }
     /// `engine::plan_upgrade` of `row` to the catalog version of `package_id`, and the plan
     /// removing the installed record (for `uninstallPrevious`).
     fn plan_upgrade(

@@ -14,6 +14,8 @@ pub mod tiebreak;
 pub mod winget_tracking;
 
 pub use arp::{filter_arp, missing_uninstaller};
+#[cfg(windows)]
+pub use arp_win::read_arp;
 pub use guid::{pack_guid, unpack_guid};
 pub use scoop::read_scoop;
 

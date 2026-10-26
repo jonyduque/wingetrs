@@ -198,10 +198,12 @@ pub enum Command {
   wingetrs install ripgrep
   wingetrs install extras/vscode --dry-run
   wingetrs install git --bucket main --yes
-  wingetrs install Git.Git --scope machine"
+  wingetrs install Git.Git --scope machine
+  wingetrs install gh:sharkdp/bat --allow-unreviewed
+  wingetrs install https://github.com/sharkdp/bat --asset <arquivo> --allow-unreviewed"
     )]
     Install {
-        /// App a instalar (id, ou bucket/id)
+        /// App a instalar (id, bucket/id, gh:dono/repo[@tag] ou endereço do GitHub)
         #[arg(help_heading = "Argumentos", value_name = "ALVO")]
         target: String,
         /// Restringe a um bucket
@@ -222,6 +224,12 @@ pub enum Command {
         /// Escopo de um pacote do winget: user ou machine
         #[arg(long, value_parser = parse_scope, value_name = "ESCOPO")]
         scope: Option<crate::bridge::worker::ScopeArg>,
+        /// Permite instalar de um release do GitHub (origem não revisada por um bucket)
+        #[arg(long)]
+        allow_unreviewed: bool,
+        /// Arquivo do release do GitHub a instalar (nome exato)
+        #[arg(long, value_name = "ARQUIVO")]
+        asset: Option<String>,
     },
     /// Remove um app do wingetrs, ou um app do Windows pelo id do winget ou pelo nome
     #[command(
