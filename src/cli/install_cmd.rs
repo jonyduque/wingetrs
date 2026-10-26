@@ -1612,6 +1612,14 @@ async fn uninstall_installer_app(
         ui.output(&output::gh_key_gone(app));
         return forget_record(ctx, ui, rec, r.f, stop).await;
     };
+    // The key's name could have been reused by another product: never run its uninstaller.
+    let now_uninstall = winget
+        .github()
+        .and_then(|env| env.arp.uninstall_string(arp.hive, &arp.key));
+    if !crate::github::install::same_program(&arp, &row.name, now_uninstall.as_deref()) {
+        let (what, todo) = crate::github::flow::other_program(app, &row.name);
+        return Err(output::Advice::new(what, todo).into());
+    }
     let ran =
         winget_cmd::uninstall_row(winget, ui, &row, r.f, stop.reborrow(), &mut stdout_line).await?;
     if !ran {

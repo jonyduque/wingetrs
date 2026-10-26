@@ -122,7 +122,7 @@ enum Answer {
 struct FakeLauncher {
     specs: Mutex<Vec<LaunchSpec>>,
     answers: Mutex<VecDeque<Answer>>,
-    writes_key: bool,
+    writes_key: std::sync::atomic::AtomicBool,
     /// `DisplayName` of the key it writes.
     key_name: Mutex<String>,
     /// `DisplayVersion` of the key it writes.
@@ -148,7 +148,8 @@ impl Launcher for FakeLauncher {
         match answer {
             Answer::Os(e) => Err(std::io::Error::from_raw_os_error(e)),
             Answer::Code(c) => {
-                if self.writes_key && (c == 0 || c == 3010) {
+                let writes = self.writes_key.load(std::sync::atomic::Ordering::Relaxed);
+                if writes && (c == 0 || c == 3010) {
                     // Inno writes `Tool_is1`, replacing the one an older version left.
                     let mut keys = self.keys.lock().unwrap();
                     keys.retain(|k| k.key != "Tool_is1");
@@ -242,8 +243,9 @@ struct GhFlows {
     backups: PathBuf,
     /// The ARP uninstallers that ran (the targets of their plans).
     uninstalled: Arc<Mutex<Vec<UninstallTarget>>>,
-    /// What each uninstaller answers, in order (`Ok` removes its key); none left = `Ok`.
-    uninstall_answers: Arc<Mutex<VecDeque<Result<(), String>>>>,
+    /// What each uninstaller answers, in order: `Ok(true)` removes its key, `Ok(false)` ends
+    /// well but leaves it; none left = `Ok(true)`.
+    uninstall_answers: Arc<Mutex<VecDeque<Result<bool, String>>>>,
 }
 
 fn arp_row(k: &ArpKey) -> ListRow {
@@ -341,7 +343,13 @@ impl WingetFlows for GhFlows {
         let target = plan.target.clone();
         Box::new(move |_: &dyn Fn(&ProgressEvent)| {
             done.lock().unwrap().push(target.clone());
-            answers.lock().unwrap().pop_front().unwrap_or(Ok(()))?;
+            if !answers.lock().unwrap().pop_front().unwrap_or(Ok(true))? {
+                return Ok(UninstallReport {
+                    status: UninstallStatus::NoEffect,
+                    warning: None,
+                    reboot: None,
+                });
+            }
             if let UninstallTarget::Arp { hive, key } = &target {
                 keys.lock()
                     .unwrap()
@@ -491,7 +499,7 @@ impl World {
                 launcher: FakeLauncher {
                     specs: Mutex::new(Vec::new()),
                     answers: Mutex::new(answers.into()),
-                    writes_key,
+                    writes_key: writes_key.into(),
                     key_name: Mutex::new("Tool 1.0.0".into()),
                     key_version: Mutex::new("1.0.0".into()),
                     keys: keys.clone(),
@@ -2002,6 +2010,22 @@ async fn version_compared_semantically() {
             .into_iter()
             .collect();
         assert_eq!(w.upgradable().await.upgradable, want, "{tag}");
+        // `list` and the TUI's rows: the same rule.
+        let mut rows = vec![wingetrs_row("tool", "1.9.0")];
+        let uri = w.server.uri();
+        ops::release_rows(&w.layout(), &w.http, Some(&uri), &mut rows).await;
+        assert_eq!(
+            matches!(rows[0].state, UpdateState::Available { .. }),
+            newer.is_some(),
+            "{tag}"
+        );
+    }
+    // `upgrade <app>`: an older or equal release is not installed; a newer one is.
+    for (tag, installs) in [("v1.8.10", false), ("v1.9", false), ("v1.10.0", true)] {
+        w.publish(tag, vec![a(ZIP, tool_zip())]).await;
+        w.run(&no_tty(), &UPGRADE_TOOL).await.unwrap();
+        let want = if installs { "1.10.0" } else { "1.9.0" };
+        assert_eq!(w.record("tool").unwrap().version, want, "{tag}");
     }
 }
 
@@ -2826,4 +2850,207 @@ async fn tui_release_remove_without_key_forgets_and_failure_keeps_record() {
         "{e:?}"
     );
     assert!(w.record("tool").is_some());
+}
+
+// ---- Task 211, review of the CLI part ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_installer_key_reused_by_another_program_refuses() {
+    let w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    assert_eq!(w.install_json("tool")["arp"]["name"], "Tool 1.0.0");
+    // Another version of the same program: its uninstaller runs (checked by the TUI's plan).
+    let rename = |name: &str| {
+        for k in w.flows.arp.keys.lock().unwrap().iter_mut() {
+            if k.key == "Tool_is1" {
+                k.name = name.into();
+            }
+        }
+    };
+    rename("Tool v1.0.1");
+    let planned = jobs::plan_release_remove(&w.ctx(), "tool", &w.flows.arp, &record_plan).unwrap();
+    assert!(
+        matches!(
+            planned,
+            Planned::Ready {
+                action: Action::ReleaseUninstall { .. },
+                ..
+            }
+        ),
+        "{planned:?}"
+    );
+    // Another product took the key's name: never its uninstaller, in the CLI or the TUI.
+    rename("Outro Produto 2.0");
+    let e = w
+        .run(&no_tty(), &["uninstall", "tool", "--yes"])
+        .await
+        .unwrap_err();
+    let text = e.to_string();
+    assert!(
+        text.contains("agora é de outro programa (Outro Produto 2.0)"),
+        "{text}"
+    );
+    assert!(text.contains("wingetrs uninstall tool --forget"), "{text}");
+    assert!(w.uninstalled().is_empty());
+    assert!(w.record("tool").is_some());
+    let planned = jobs::plan_release_remove(&w.ctx(), "tool", &w.flows.arp, &record_plan).unwrap();
+    let Planned::Ready { action, text } = planned else {
+        panic!("expected a plan");
+    };
+    assert!(matches!(action, Action::ReleaseForget { .. }), "{action:?}");
+    assert!(text.contains("outro programa"), "{text}");
+    // A record of the 210 (no name): the uninstaller's program decides.
+    let json = w.layout().current("tool").join("install.json");
+    let mut j = w.install_json("tool");
+    j["arp"].as_object_mut().unwrap().remove("name");
+    j["uninstall_string"] = r#""C:\Outro\unins000.exe""#.into();
+    std::fs::write(&json, j.to_string()).unwrap();
+    let e = w
+        .run(&no_tty(), &["uninstall", "tool", "--yes"])
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("outro programa"), "{e:#}");
+    j["uninstall_string"] = UNINSTALL.into();
+    std::fs::write(&json, j.to_string()).unwrap();
+    w.run(&no_tty(), &["uninstall", "tool", "--yes"])
+        .await
+        .unwrap();
+    assert_eq!(w.uninstalled().len(), 1);
+    assert_eq!(w.record("tool"), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn uninstall_installer_ok_but_key_stays_keeps_record() {
+    let w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    w.flows
+        .uninstall_answers
+        .lock()
+        .unwrap()
+        .push_back(Ok(false));
+    let ui = no_tty();
+    w.run(&ui, &["uninstall", "tool", "--yes"]).await.unwrap();
+    assert_eq!(w.uninstalled().len(), 1);
+    assert!(
+        ui.text()
+            .contains("tool continua em Programas instalados; o registro do wingetrs foi mantido"),
+        "{}",
+        ui.text()
+    );
+    assert!(w.record("tool").is_some());
+    assert!(w.layout().app_dir("tool").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_marks_installer_apps() {
+    let w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    let mut rows = vec![wingetrs_row("tool", "1.0.0")];
+    ops::release_rows(&w.layout(), &w.http, None, &mut rows).await;
+    assert_eq!(
+        rows[0].correlation,
+        Correlation::Matched {
+            source: "github:o/tool (instalador)".into(),
+            package_id: "tool".into(),
+            rule: Rule::ScoopManifest,
+        }
+    );
+    let text = wingetrs::cli::output::list_text(&rows, false);
+    assert!(text.contains("github:o/tool (instalador)"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn release_refusals_purge_and_portable_turned_installer() {
+    // `--purge` on an app its installer put in place.
+    let w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    let e = w
+        .run(&no_tty(), &["uninstall", "tool", "--purge", "--yes"])
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("--purge não vale para tool"),
+        "{e:#}"
+    );
+    assert!(w.uninstalled().is_empty());
+    assert!(w.record("tool").is_some());
+    // A portable app whose new release file is an installer now.
+    let w = World::new().await;
+    w.release("v1.0.0", vec![a(PLAIN, program())]).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    assert_eq!(w.install_json("tool").get("mode"), None);
+    w.publish("v1.1.0", vec![a("tool-1.1.0-windows-amd64.exe", inno())])
+        .await;
+    let e = w.run(&no_tty(), &UPGRADE_TOOL).await.unwrap_err();
+    assert!(e.to_string().contains("agora é um instalador"), "{e:#}");
+    assert_eq!(w.record("tool").unwrap().version, "1.0.0");
+    assert!(w.launches().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_installer_without_new_key_keeps_the_prior_one() {
+    let w = installer_app_and_newer(vec![Answer::Code(0), Answer::Code(0)]).await;
+    // The new installer updates nothing it can be told by.
+    w.flows
+        .launcher
+        .writes_key
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let ui = no_tty();
+    w.run(&ui, &UPGRADE_TOOL).await.unwrap();
+    let j = w.install_json("tool");
+    assert_eq!(j["version"], "1.1.0");
+    assert_eq!(j["arp"]["key"], "Tool_is1");
+    assert!(!ui.text().contains("não se registrou"), "{}", ui.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrade_picker_offers_only_installable_files() {
+    let w = World::new().await;
+    w.release("v1.2.0", vec![a(ZIP, tool_zip())]).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    // Nothing for this host by name: only installable formats are offered.
+    w.publish(
+        "v1.3.0",
+        vec![
+            a("tool-1.3.0-linux.zip", zip_at("1.3.0", &[])),
+            a("notes.txt", b"x".to_vec()),
+            a("install.ps1", b"x".to_vec()),
+        ],
+    )
+    .await;
+    let ui = TestUi::new(true, None);
+    w.run(&ui, &["upgrade", "tool", "--allow-unreviewed"])
+        .await
+        .unwrap();
+    assert_eq!(
+        ui.picked.lock().unwrap().clone(),
+        vec![vec!["tool-1.3.0-linux.zip".to_string()]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_upgrade_all_names_release_apps_without_network() {
+    let w = World::new().await;
+    w.release("v1.2.0", vec![a(ZIP, tool_zip())]).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    w.server.reset().await;
+    w.latest_tag("v1.3.0").await;
+    let src = jobs::WingetSrc {
+        handle: tokio::runtime::Handle::current(),
+        cdn_base: String::new(),
+        github_web: w.server.uri(),
+    };
+    // A blocking job, as the TUI runs it (it blocks on the runtime).
+    let planned = tokio::task::block_in_place(|| jobs::plan_upgrade_all(&w.ctx(), &src, false));
+    let e = planned.unwrap_err();
+    assert!(
+        e.contains("tool 1.3.0 vem de um release do GitHub: atualize no terminal com wingetrs upgrade tool --allow-unreviewed"),
+        "{e}"
+    );
+    assert_eq!(w.api_requests().await, 0);
+    assert_eq!(w.requests().await, 2);
 }

@@ -294,6 +294,9 @@ fn winget_host() -> Result<crate::winget_install::select::Host, String> {
 pub struct WingetSrc {
     pub handle: tokio::runtime::Handle,
     pub cdn_base: String,
+    /// Where the latest release tags are read (`github::install::WEB_BASE`; tests: a local
+    /// server).
+    pub github_web: String,
 }
 
 impl WingetSrc {
@@ -302,6 +305,7 @@ impl WingetSrc {
         WingetSrc {
             handle: handle.clone(),
             cdn_base: crate::sources::winget::CDN_BASE.to_string(),
+            github_web: crate::github::install::WEB_BASE.to_string(),
         }
     }
 }
@@ -424,11 +428,8 @@ fn installer_app(c: &OpsCtx<'_>, app: &str) -> bool {
 pub fn plan_upgrade_all(c: &OpsCtx<'_>, w: &WingetSrc, keep: bool) -> Result<Planned, String> {
     let mut list = ops::upgradable(c).map_err(|e| e.to_string())?;
     if !list.releases.is_empty() {
-        w.handle.block_on(ops::check_releases(
-            c.http,
-            crate::github::install::WEB_BASE,
-            &mut list,
-        ));
+        w.handle
+            .block_on(ops::check_releases(c.http, &w.github_web, &mut list));
     }
     let (list, _pinned) = list.without_pinned(&crate::pins::load(c.data));
     let layout = c.data.install_layout();
@@ -895,6 +896,15 @@ pub fn plan_release_remove(
     else {
         return Ok(forget(flow::key_gone_text(&rec.app)));
     };
+    // The key's name could have been reused by another product: never its uninstaller.
+    let now_uninstall = arp.uninstall_string(now.hive, &now.key);
+    if !crate::github::install::same_program(&k, &now.name, now_uninstall.as_deref()) {
+        let (what, _) = flow::other_program(&rec.app, &now.name);
+        return Ok(forget(format!(
+            "{what}. Se {} já foi removido, Continuar esquece o app no wingetrs (o --forget).",
+            rec.app
+        )));
+    }
     let req = crate::winget_install::previous::RemovalRequest {
         app_key: crate::github::install::arp_app_key(&k),
         name: now.name.clone(),

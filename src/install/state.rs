@@ -265,6 +265,9 @@ pub fn write_install_json(
 pub struct InstallerRecord {
     pub hive: crate::installed::Hive,
     pub key: String,
+    /// `DisplayName` when it was recorded (Task 211; `None` in records of the 210): removal
+    /// checks the key still names the same program.
+    pub name: Option<String>,
     pub uninstall_string: Option<String>,
 }
 
@@ -291,7 +294,9 @@ pub fn write_installer_json(
         "version": version,
         "wingetrs": 1,
         "mode": "installer",
-        "arp": rec.map(|r| serde_json::json!({ "hive": hive_name(r.hive), "key": r.key })),
+        "arp": rec.map(|r| {
+            serde_json::json!({ "hive": hive_name(r.hive), "key": r.key, "name": r.name })
+        }),
         "uninstall_string": rec.and_then(|r| r.uninstall_string.clone()),
     });
     let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;

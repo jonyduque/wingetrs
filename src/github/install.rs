@@ -416,6 +416,7 @@ pub fn installed_mode(layout: &Layout, app: &str, version: &str) -> std::io::Res
         crate::winget_install::uninstall_cmd::valid_arp_key(key).then(|| InstallerRecord {
             hive,
             key: key.to_string(),
+            name: a.get("name").and_then(|n| n.as_str()).map(str::to_string),
             uninstall_string: v
                 .get("uninstall_string")
                 .and_then(|u| u.as_str())
@@ -586,6 +587,57 @@ pub fn run_installer(
     })
 }
 
+/// A `DisplayName` without its version: lowercase, words that start with a digit (or `v` and a
+/// digit) dropped, spaces collapsed. `Tool 1.0.0` and `Tool v1.1` are both `tool`.
+fn product_name(name: &str) -> String {
+    let version = |w: &str| {
+        let mut c = w.chars();
+        match c.next() {
+            Some(d) if d.is_ascii_digit() => true,
+            Some('v' | 'V') => c.next().is_some_and(|d| d.is_ascii_digit()),
+            _ => false,
+        }
+    };
+    name.split_whitespace()
+        .filter(|w| !version(w))
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The program of an `UninstallString`: its quoted part, else up to `.exe`; lowercase.
+fn uninstall_program(s: &str) -> Option<String> {
+    let s = s.trim();
+    let program = match s.strip_prefix('"') {
+        Some(rest) => rest.split('"').next()?,
+        None => {
+            let lower = s.to_ascii_lowercase();
+            let end = lower.find(".exe").map_or(s.len(), |i| i + 4);
+            &s[..end]
+        }
+    };
+    let program = program.trim();
+    (!program.is_empty()).then(|| program.to_lowercase())
+}
+
+/// Whether the ARP key of `rec`, named `now_name` with `now_uninstall` today, is still the
+/// program wingetrs recorded (Task 211): the same `DisplayName` without its version; a record
+/// without the name (Task 210) compares the uninstaller's program. Nothing to compare ⇒ `false`
+/// (another product may have reused the key name: its uninstaller is never run).
+pub fn same_program(rec: &InstallerRecord, now_name: &str, now_uninstall: Option<&str>) -> bool {
+    if let Some(name) = &rec.name {
+        let recorded = product_name(name);
+        return !recorded.is_empty() && recorded == product_name(now_name);
+    }
+    match (
+        rec.uninstall_string.as_deref().and_then(uninstall_program),
+        now_uninstall.and_then(uninstall_program),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Whether `app` is a whole word of `display_name` (any case): bounded by the ends, a space, a
 /// hyphen or a dot. `git` names "Git" and "Git 2.47", not "GitHub Desktop" nor "Gitea".
 pub fn names_app(display_name: &str, app: &str) -> bool {
@@ -731,6 +783,7 @@ pub fn record_installer(
     let record = installed.arp.as_ref().map(|k| InstallerRecord {
         hive: k.hive,
         key: k.key.clone(),
+        name: Some(k.name.clone()),
         uninstall_string: installed.uninstall_string.clone(),
     });
     state::write_installer_json(&vdir, bucket, version, record.as_ref())?;

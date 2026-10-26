@@ -1201,6 +1201,12 @@ pub fn release_repo(bucket: &str) -> Option<GhRepo> {
     GhRepo::parse(bucket.strip_prefix("github:")?).ok()
 }
 
+/// The one rule for "the release is newer" (Task 211): `latest` above `installed`, compared as
+/// versions (never as text: `1.10.0` is above `1.9.0`; `1.9` and `1.9.0` are the same).
+pub fn release_newer(latest: &str, installed: &str) -> bool {
+    Version::parse(latest) > Version::parse(installed)
+}
+
 /// Most latest tags read at once (as the TUI reads manifests).
 const MAX_RELEASE_CHECKS: usize = 4;
 
@@ -1247,7 +1253,7 @@ pub async fn check_releases(http: &Http, web: &str, list: &mut UpgradeList) {
     let versions = latest_release_versions(http, web, &repos).await;
     for (a, latest) in apps.into_iter().zip(versions) {
         match latest {
-            Ok(v) if Version::parse(&v) > Version::parse(&a.version) => {
+            Ok(v) if release_newer(&v, &a.version) => {
                 list.upgradable.push((a.app, a.version, v));
             }
             Ok(_) => {}
@@ -1339,7 +1345,7 @@ pub fn set_release_state(r: &mut ListRow, latest: Result<String, String>) {
             let newer = r
                 .installed_version
                 .as_deref()
-                .is_some_and(|cur| Version::parse(&v) > Version::parse(cur));
+                .is_some_and(|cur| release_newer(&v, cur));
             r.state = if newer {
                 UpdateState::Available { latest: v.clone() }
             } else {

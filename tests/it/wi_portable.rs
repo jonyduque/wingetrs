@@ -1048,6 +1048,7 @@ fn tui_upgrade_world() -> (tokio::runtime::Runtime, World, jobs::WingetSrc) {
     let src = jobs::WingetSrc {
         handle: rt.handle().clone(),
         cdn_base: base,
+        github_web: String::new(),
     };
     (rt, w, src)
 }

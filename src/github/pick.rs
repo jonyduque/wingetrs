@@ -118,7 +118,8 @@ fn token_arch(t: &str) -> Option<NameArch> {
     }
 }
 
-fn installable(name: &str) -> bool {
+/// Whether `name` has an installable format (its extension).
+pub fn installable(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     EXTENSIONS.iter().any(|e| lower.ends_with(e))
 }

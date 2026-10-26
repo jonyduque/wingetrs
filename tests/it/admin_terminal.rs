@@ -521,6 +521,7 @@ fn wsrc() -> jobs::WingetSrc {
     jobs::WingetSrc {
         handle: tokio::runtime::Handle::current(),
         cdn_base: String::new(),
+        github_web: String::new(),
     }
 }
 

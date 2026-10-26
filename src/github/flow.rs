@@ -219,7 +219,8 @@ pub async fn run_release_installer(
         version: &rel.version,
         asks_admin: inst.asks_admin,
     };
-    let ran = blocking(|| gh::run_installer(rel.env, &ctx.launch, ctx.progress, &run));
+    let ran = blocking(|| gh::run_installer(rel.env, &ctx.launch, ctx.progress, &run))
+        .map(|done| prior_key(rel, done));
     drop(scratch);
     match &ran {
         Ok(done) => {
@@ -259,6 +260,35 @@ pub async fn run_release_installer(
         }
     }
     Ok(ran)
+}
+
+/// An upgrade whose installer wrote no key it can be told by: the key of the version it
+/// replaced, while that key is still in the ARP (the installer updated it in place).
+fn prior_key(
+    rel: &Rel<'_>,
+    mut done: crate::github::install::Installed,
+) -> crate::github::install::Installed {
+    if done.arp.is_some() {
+        return done;
+    }
+    let Some(Prior {
+        mode: Mode::Installer(Some(k)),
+        ..
+    }) = &rel.prior
+    else {
+        return done;
+    };
+    let Ok(keys) = rel.env.arp.keys() else {
+        return done;
+    };
+    if let Some(now) = keys
+        .into_iter()
+        .find(|x| x.hive == k.hive && x.key.eq_ignore_ascii_case(&k.key))
+    {
+        done.uninstall_string = rel.env.arp.uninstall_string(now.hive, &now.key);
+        done.arp = Some(now);
+    }
+    done
 }
 
 /// After an upgrade of an app its installer had put in place: when the app is portable now
@@ -364,7 +394,6 @@ pub async fn start_upgrade(
     env: &GhEnv<'_>,
     rec: &AppRecord,
 ) -> anyhow::Result<Option<UpgradeStart>> {
-    use crate::core::version::Version;
     use crate::github::install as gh;
     use crate::github::pick::{Pick, pick};
     let Some(repo) = ops::release_repo(&rec.bucket) else {
@@ -376,7 +405,7 @@ pub async fn start_upgrade(
     let t = GhTarget { repo, tag: None };
     let release = crate::github::latest(ctx.http, &env.api, &t.repo).await?;
     let version = gh::version_of(&release.tag)?;
-    if Version::parse(&version) <= Version::parse(&rec.version) {
+    if !ops::release_newer(&version, &rec.version) {
         return Ok(None);
     }
     // The saved rule: the file the installed version came from (an altered record has none).
@@ -393,7 +422,13 @@ pub async fn start_upgrade(
     let candidates = match pick(&release.assets, crate::install::manifest::Arch::host()) {
         Pick::One(a) => vec![a],
         Pick::Choose(list) => list,
-        Pick::None(_) => release.assets.clone(),
+        // Nothing fits this host: the user may still pick, among the installable files only.
+        Pick::None(_) => release
+            .assets
+            .iter()
+            .filter(|a| crate::github::pick::installable(&a.name))
+            .cloned()
+            .collect(),
     };
     Ok(Some(UpgradeStart {
         rec: rec.clone(),
@@ -621,6 +656,17 @@ pub fn cannot_uninstall(app: &str) -> (String, String) {
         format!(
             "use o desinstalador do próprio programa e depois `wingetrs uninstall {app} --forget`"
         ),
+    )
+}
+
+/// The key recorded for `app` now names another program (`now`): `(what, what to do)`. Its
+/// uninstaller is never run.
+pub fn other_program(app: &str, now: &str) -> (String, String) {
+    (
+        format!(
+            "a chave de {app} em Programas instalados agora é de outro programa ({now}); o wingetrs não roda o desinstalador dela"
+        ),
+        format!("se {app} já foi removido, use `wingetrs uninstall {app} --forget`"),
     )
 }
 
