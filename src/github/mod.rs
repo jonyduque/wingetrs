@@ -92,6 +92,8 @@ pub struct Release {
     pub prerelease: bool,
     pub immutable: bool,
     pub assets: Vec<Asset>,
+    /// Assets left out for lacking a valid SHA-256 `digest` (releases before 2025).
+    pub no_digest: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +195,12 @@ fn parse_release(repo: &GhRepo, body: &[u8]) -> Result<Release, GhError> {
     let Some(tag) = tag.filter(|_| !raw.draft) else {
         return Err(GhError::NoRelease);
     };
+    let no_digest = raw
+        .assets
+        .iter()
+        .filter(|a| a.digest.as_deref().and_then(parse_digest).is_none())
+        .filter_map(|a| a.name.clone())
+        .collect();
     Ok(Release {
         tag,
         prerelease: raw.prerelease,
@@ -202,6 +210,7 @@ fn parse_release(repo: &GhRepo, body: &[u8]) -> Result<Release, GhError> {
             .into_iter()
             .filter_map(|a| convert_asset(repo, a))
             .collect(),
+        no_digest,
     })
 }
 

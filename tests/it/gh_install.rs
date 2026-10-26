@@ -462,10 +462,12 @@ impl World {
                 "https://github.com/o/tool/releases/download/{tag}/{}",
                 x.name
             );
-            let digest = x
-                .digest
-                .clone()
-                .unwrap_or_else(|| format!("sha256:{}", sha_hex(&x.bytes)));
+            // `Some("")`: an old release, no digest published.
+            let digest = match x.digest.as_deref() {
+                Some("") => serde_json::Value::Null,
+                Some(d) => d.into(),
+                None => format!("sha256:{}", sha_hex(&x.bytes)).into(),
+            };
             listed.push(serde_json::json!({
                 "name": x.name,
                 "size": x.bytes.len(),
@@ -485,11 +487,13 @@ impl World {
             "immutable": false,
             "assets": listed,
         });
-        Mock::given(method("GET"))
-            .and(path("/repos/o/tool/releases/latest"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(&self.server)
-            .await;
+        for at in ["latest".to_string(), format!("tags/{tag}")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/o/tool/releases/{at}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+                .mount(&self.server)
+                .await;
+        }
     }
 
     /// Puts `tool` in scoop source `source` with `manifest`.
@@ -672,6 +676,13 @@ fn gh_url_forms_parse() {
         );
     }
     for input in [
+        "https://x@github.com/o/r",
+        "https://github.com@evil.com/o/r",
+        "https://github.com:443/o/r",
+    ] {
+        assert!(!matches!(parse_target(input), Some(Ok(_))), "{input}");
+    }
+    for input in [
         "ripgrep",
         "extras/vscode",
         "Git.Git",
@@ -782,6 +793,19 @@ async fn gh_offers_bucket_manifest_first() {
         .await
         .unwrap();
     assert_eq!(w.api_requests().await, 1);
+    // An explicit tag asks for the release: the bucket is skipped with a line.
+    let ui = TestUi::new(true, None);
+    w.run(&ui, &["install", "gh:o/tool@v1.2.0", "--dry-run"])
+        .await
+        .unwrap();
+    assert_eq!(ui.picked.lock().unwrap().len(), 0);
+    assert!(
+        ui.text()
+            .contains("extras/tool vem de um bucket, mas você pediu o release"),
+        "{}",
+        ui.text()
+    );
+    assert_eq!(w.api_requests().await, 2);
     assert!(
         ui.text().contains("origem não revisada: o/tool"),
         "{}",
@@ -873,6 +897,34 @@ async fn gh_asset_flag_picks_by_name() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("tool-gui-windows.zip"), "{e}");
+    let old = World::new().await;
+    old.release(
+        "v1.2.0",
+        vec![A {
+            name: "tool-old-windows.zip",
+            bytes: tool_zip(),
+            digest: Some(String::new()),
+        }],
+    )
+    .await;
+    let e = old
+        .run(
+            &no_tty(),
+            &[
+                "install",
+                "gh:o/tool",
+                "--asset",
+                "tool-old-windows.zip",
+                "--yes",
+                "--allow-unreviewed",
+            ],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        e.to_string(),
+        "o arquivo tool-old-windows.zip não tem SHA-256 publicado (release antigo); o wingetrs não instala sem conferir"
+    );
     let e = w
         .run(&no_tty(), &["install", "ripgrep", "--asset", "x.zip"])
         .await
@@ -1062,29 +1114,29 @@ async fn gh_installer_is_default() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+// One thread: the job log is read from this thread's events.
+#[tokio::test]
 async fn gh_installer_failure_falls_back_to_exe() {
     let cases = [
-        (Answer::Code(1), true, "saiu com o código 1"),
-        (
-            Answer::Os(1223),
-            true,
-            "autorização de administrador recusada",
-        ),
+        (Answer::Code(1), "saiu com o código 1"),
+        (Answer::Os(1223), "autorização de administrador recusada"),
+        (Answer::Os(2), "não iniciou: "),
     ];
-    for (answer, writes_key, reason) in cases {
-        let w = World::with(vec![answer], writes_key).await;
+    for (answer, reason) in cases {
+        let log = crate::spans::Log::default();
+        let installed = log.install();
+        let w = World::with(vec![answer], true).await;
         installer_release(&w, inno()).await;
         let ui = no_tty();
         w.run(&ui, &YES_UNREVIEWED).await.unwrap();
+        drop(installed);
         assert_eq!(w.launches().len(), 1, "{reason}");
         let text = ui.text();
         assert!(
-            text.contains(&format!(
-                "o instalador falhou ({reason}); instalando só o executável"
-            )),
+            text.contains(&format!("o instalador falhou ({reason}")),
             "{text}"
         );
+        assert!(text.contains("); instalando só o executável"), "{text}");
         let rec = w.record("tool").unwrap();
         assert_eq!(rec.bucket, "github:o/tool");
         assert!(
@@ -1095,7 +1147,43 @@ async fn gh_installer_failure_falls_back_to_exe() {
             "{reason}"
         );
         assert_eq!(w.install_json("tool").get("mode"), None, "{reason}");
+        // Both attempts in the job log: the installer failed, the program installed.
+        let logged = log.text();
+        let ends: Vec<&str> = logged.lines().filter(|l| l.contains("job.end")).collect();
+        assert_eq!(ends.len(), 2, "{logged}");
+        assert!(
+            ends[0].contains("falhou") && ends[0].contains(reason.trim_end()),
+            "{logged}"
+        );
+        assert!(ends[1].contains("instalado"), "{logged}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_fallback_failure_installs_nothing() {
+    let w = World::with(vec![Answer::Code(1)], true).await;
+    w.release(
+        "v1.0.0",
+        vec![
+            a(SETUP, inno()),
+            // Fetched only by the fallback, and it does not match its digest.
+            A {
+                name: "tool-1.0.0-windows-amd64.zip",
+                bytes: tool_zip(),
+                digest: Some(format!("sha256:{}", "0".repeat(64))),
+            },
+        ],
+    )
+    .await;
+    let e = w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap_err();
+    assert!(
+        e.to_string().contains(
+            "o instalador falhou (saiu com o código 1) e a instalação só do executável também falhou"
+        ),
+        "{e:#}"
+    );
+    assert_eq!(w.record("tool"), None);
+    assert!(!w.layout().app_dir("tool").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1347,7 +1435,7 @@ fn gh_arp_name_rule_is_whole_word_and_unique() {
         version: Some("1".into()),
     };
     // Nothing new or changed: only the name can tell.
-    let pick = |keys: Vec<ArpKey>, app: &str| installed_key(&keys.clone(), keys, app);
+    let pick = |keys: Vec<ArpKey>, app: &str| installed_key(&keys.clone(), keys, app, "1.0.0");
     let got = pick(vec![key("gh", "GitHub Desktop"), key("git", "Git")], "git");
     assert_eq!(got.map(|k| k.key).as_deref(), Some("git"));
     assert_eq!(
@@ -1356,6 +1444,45 @@ fn gh_arp_name_rule_is_whole_word_and_unique() {
     );
     assert_eq!(
         pick(vec![key("a", "Foo"), key("b", "Foo Tools")], "foo"),
+        None
+    );
+    // Unnamed candidates: only the one candidate; a changed one only at the release's version.
+    let run =
+        |before: Vec<ArpKey>, after: Vec<ArpKey>| installed_key(&before, after, "tool", "1.0.0");
+    let other = key("o", "Other app");
+    assert_eq!(
+        run(
+            vec![other.clone()],
+            vec![other.clone(), key("n1", "Setup A"), key("n2", "Setup B")]
+        ),
+        None
+    );
+    assert_eq!(
+        run(
+            vec![other.clone()],
+            vec![other.clone(), key("n1", "Ferramenta")]
+        )
+        .map(|k| k.key)
+        .as_deref(),
+        Some("n1")
+    );
+    let edge = |v: &str| ArpKey {
+        version: Some(v.into()),
+        ..key("edge", "Microsoft Edge")
+    };
+    assert_eq!(run(vec![edge("120.0")], vec![edge("121.0")]), None);
+    assert_eq!(
+        run(vec![edge("0.9")], vec![edge("1.0.0")])
+            .map(|k| k.key)
+            .as_deref(),
+        Some("edge")
+    );
+    // A new unnamed key and a changed one: two candidates, none is taken.
+    assert_eq!(
+        run(
+            vec![edge("0.9")],
+            vec![edge("1.0.0"), key("n1", "Ferramenta")]
+        ),
         None
     );
     for (name, app, want) in [

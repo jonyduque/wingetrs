@@ -100,11 +100,17 @@ pub fn parse_target(input: &str) -> Option<Result<GhTarget, GhError>> {
     }
     let rest = strip_prefix_ci(s, "https://").or_else(|| strip_prefix_ci(s, "http://"))?;
     let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = strip_prefix_ci(host, "www.").unwrap_or(host);
-    if !host.eq_ignore_ascii_case("github.com") {
+    let unsupported = || Err(GhError::UnsupportedUrl(s.to_string()));
+    // `user@github.com` or `github.com:443`: refused, never read as plain GitHub.
+    let bare = host.rsplit('@').next().unwrap_or(host);
+    let bare = bare.split(':').next().unwrap_or(bare);
+    let bare = strip_prefix_ci(bare, "www.").unwrap_or(bare);
+    if !bare.eq_ignore_ascii_case("github.com") {
         return None;
     }
-    let unsupported = || Err(GhError::UnsupportedUrl(s.to_string()));
+    if host.contains(['@', ':']) {
+        return Some(unsupported());
+    }
     if strip_prefix_ci(s, "http://").is_some() || path.contains(['?', '#']) {
         return Some(unsupported());
     }
@@ -440,6 +446,8 @@ pub struct InstallerRun<'a> {
     pub generator: &'static str,
     /// The app (for the phase and to prefer its ARP key).
     pub app: &'a str,
+    /// The release's version (an existing key that changed to it may be the app's).
+    pub version: &'a str,
     /// The installer's manifest asks for an administrator: its UAC prompt is announced.
     pub asks_admin: bool,
 }
@@ -490,7 +498,7 @@ pub fn run_installer(
         tracing::warn!(error = %e, "registro de programas ilegível depois do instalador");
         Vec::new()
     });
-    let arp = installed_key(&before, after, run.app);
+    let arp = installed_key(&before, after, run.app, run.version);
     let uninstall_string = arp
         .as_ref()
         .and_then(|k| env.arp.uninstall_string(k.hive, &k.key));
@@ -515,28 +523,43 @@ pub fn names_app(display_name: &str, app: &str) -> bool {
     })
 }
 
-/// The ARP key of the app after its installer ran: a new key (the one naming `app` first);
-/// else a key that was already there and whose `DisplayVersion` changed (an update or a
-/// reinstall reuses it); else the only key whose `DisplayName` names `app` as a whole word
-/// ([`names_app`]). `None`: the installer did not register itself, or the name matches no key
-/// or more than one (a wrong key would make removal run another product's uninstaller).
-pub fn installed_key(before: &[ArpKey], after: Vec<ArpKey>, app: &str) -> Option<ArpKey> {
+/// The ARP key of the app after its installer ran. Candidates are the new keys and the keys
+/// that were already there and whose `DisplayVersion` changed (an update or a reinstall reuses
+/// its key). A candidate whose `DisplayName` names `app` as a whole word ([`names_app`]) wins
+/// (new before changed). A candidate without the name counts only as the one candidate, and a
+/// changed one only when its new `DisplayVersion` is the release's `version` (Edge and Chrome
+/// update themselves in the background). Else the only key of all that names `app`. `None`:
+/// the installer did not register itself, or nothing tells which key is its own (a wrong key
+/// would make removal run another product's uninstaller).
+pub fn installed_key(
+    before: &[ArpKey],
+    after: Vec<ArpKey>,
+    app: &str,
+    version: &str,
+) -> Option<ArpKey> {
+    use crate::core::version::Version;
     let named = |k: &ArpKey| names_app(&k.name, app);
     let old = |k: &ArpKey| before.iter().find(|b| same_key(b, k));
     let new: Vec<&ArpKey> = after.iter().filter(|k| old(k).is_none()).collect();
-    if let Some(k) = new.iter().find(|k| named(k)).or_else(|| new.first()) {
-        return Some((*k).clone());
-    }
     let changed: Vec<&ArpKey> = after
         .iter()
         .filter(|k| old(k).is_some_and(|b| b.version != k.version))
         .collect();
-    if let Some(k) = changed
-        .iter()
-        .find(|k| named(k))
-        .or_else(|| changed.first())
-    {
+    if let Some(k) = new.iter().chain(&changed).find(|k| named(k)) {
         return Some((*k).clone());
+    }
+    let release = Version::parse(version);
+    match (new.as_slice(), changed.as_slice()) {
+        ([only], []) => return Some((*only).clone()),
+        ([], [only])
+            if only
+                .version
+                .as_deref()
+                .is_some_and(|v| Version::parse(v) == release) =>
+        {
+            return Some((*only).clone());
+        }
+        _ => {}
     }
     match after
         .iter()

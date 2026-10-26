@@ -985,6 +985,20 @@ pub fn gh_not_registered() -> String {
     )
 }
 
+/// `--asset <name>` names an asset the release lists without a SHA-256 digest.
+pub fn gh_no_digest(name: &str) -> String {
+    format!(
+        "o arquivo {name} não tem SHA-256 publicado (release antigo); o wingetrs não instala sem conferir"
+    )
+}
+
+/// A bucket has the repository, but the user asked for a tag or an asset of the release.
+pub fn gh_bucket_skipped(bucket_app: &str) -> String {
+    warning(&format!(
+        "{bucket_app} vem de um bucket, mas você pediu o release; instalando o release"
+    ))
+}
+
 /// More than one asset fits and nobody can choose: the names and `--asset`.
 pub fn gh_ambiguous(tag: &str, names: &[&str]) -> Advice {
     let mut what = format!("o release {tag} tem mais de um arquivo para Windows:");

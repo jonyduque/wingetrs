@@ -1154,7 +1154,12 @@ async fn install_github(
         .into());
     }
     let elevated = elevated_or_unknown(winget.elevated());
-    let found = gh::bucket_manifests(ctx.catalog, &t.repo)?;
+    let mut found = gh::bucket_manifests(ctx.catalog, &t.repo)?;
+    // An explicit tag or asset asks for the release itself.
+    if let (Some((bucket, app)), true) = (found.first(), t.tag.is_some() || asset.is_some()) {
+        ui.output(&output::gh_bucket_skipped(&format!("{bucket}/{app}")));
+        found.clear();
+    }
     if !found.is_empty() {
         match choose_bucket(ui, &found, f)? {
             Some(i) if i < found.len() => {
@@ -1344,6 +1349,9 @@ async fn select_assets(
     let candidates = match wanted {
         Some(name) => match rel.release.assets.iter().find(|a| a.name == name) {
             Some(a) => vec![a.clone()],
+            None if rel.release.no_digest.iter().any(|n| n == name) => {
+                bail!("{}", output::gh_no_digest(name));
+            }
             None => return Err(output::gh_missing_asset(tag, name, &names()).into()),
         },
         None => match pick(&rel.release.assets, crate::install::manifest::Arch::host()) {
@@ -1510,11 +1518,16 @@ async fn install_release_installer(
         bail!("o instalador falhou: {failure}");
     };
     ui.output(&output::gh_fallback(&failure.to_string()));
-    let plan = release_plan(ctx, rel, &program).await;
-    ui.end_progress();
-    let plans = vec![plan?];
-    print_plans(ctx, ui, &plans, f);
-    run_plans(ctx, ui, &plans, f, stop).await
+    let fallback = async {
+        let plan = release_plan(ctx, rel, &program).await;
+        ui.end_progress();
+        let plans = vec![plan?];
+        print_plans(ctx, ui, &plans, f);
+        run_plans(ctx, ui, &plans, f, stop).await
+    };
+    anyhow::Context::with_context(fallback.await, || {
+        format!("o instalador falhou ({failure}) e a instalação só do executável também falhou")
+    })
 }
 
 type InstallerRan =
@@ -1551,6 +1564,7 @@ async fn run_release_installer(
         program: &program,
         generator: inst.generator,
         app: &rel.app,
+        version: &rel.version,
         asks_admin: inst.asks_admin,
     };
     let ran = blocking(|| gh::run_installer(rel.env, &ctx.launch, ctx.progress, &run));
