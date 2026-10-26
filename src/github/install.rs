@@ -528,7 +528,9 @@ pub fn names_app(display_name: &str, app: &str) -> bool {
 /// its key). A candidate whose `DisplayName` names `app` as a whole word ([`names_app`]) wins
 /// (new before changed). A candidate without the name counts only as the one candidate, and a
 /// changed one only when its new `DisplayVersion` is the release's `version` (Edge and Chrome
-/// update themselves in the background). Else the only key of all that names `app`. `None`:
+/// update themselves in the background); a changed one with the name also needs the
+/// release's version. Else the only key that names `app` and is at the release's version (a
+/// reinstall of the same version). `None`:
 /// the installer did not register itself, or nothing tells which key is its own (a wrong key
 /// would make removal run another product's uninstaller).
 pub fn installed_key(
@@ -540,15 +542,25 @@ pub fn installed_key(
     use crate::core::version::Version;
     let named = |k: &ArpKey| names_app(&k.name, app);
     let old = |k: &ArpKey| before.iter().find(|b| same_key(b, k));
+    let release = Version::parse(version);
     let new: Vec<&ArpKey> = after.iter().filter(|k| old(k).is_none()).collect();
     let changed: Vec<&ArpKey> = after
         .iter()
         .filter(|k| old(k).is_some_and(|b| b.version != k.version))
         .collect();
-    if let Some(k) = new.iter().chain(&changed).find(|k| named(k)) {
+    if let Some(k) = new.iter().find(|k| named(k)) {
         return Some((*k).clone());
     }
-    let release = Version::parse(version);
+    // A key with the app's name that changed counts only at the release's version: at any
+    // other, the product updated itself (repo `edge` and Microsoft Edge).
+    if let Some(k) = changed.iter().find(|k| {
+        named(k)
+            && k.version
+                .as_deref()
+                .is_some_and(|v| Version::parse(v) == release)
+    }) {
+        return Some((*k).clone());
+    }
     match (new.as_slice(), changed.as_slice()) {
         ([only], []) => return Some((*only).clone()),
         ([], [only])
@@ -561,12 +573,17 @@ pub fn installed_key(
         }
         _ => {}
     }
-    match after
+    // An unchanged key (a reinstall of the same version): its name and the release's version.
+    let unchanged: Vec<&ArpKey> = after
         .iter()
         .filter(|k| named(k))
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
+        .filter(|k| {
+            k.version
+                .as_deref()
+                .is_some_and(|v| Version::parse(v) == release)
+        })
+        .collect();
+    match unchanged.as_slice() {
         [only] => Some((*only).clone()),
         _ => None,
     }

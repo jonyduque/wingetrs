@@ -1477,6 +1477,45 @@ fn gh_arp_name_rule_is_whole_word_and_unique() {
             .as_deref(),
         Some("edge")
     );
+    // An unchanged key is taken by its name only at the release's version.
+    let desktop = ArpKey {
+        version: Some("3.4".into()),
+        ..key("gd", "GitHub Desktop")
+    };
+    assert_eq!(
+        installed_key(
+            std::slice::from_ref(&desktop),
+            vec![desktop.clone()],
+            "desktop",
+            "1.0.0"
+        ),
+        None
+    );
+    let reinstall = ArpKey {
+        version: Some("1.0.0".into()),
+        ..key("abc", "TOOL desktop")
+    };
+    assert_eq!(
+        run(vec![reinstall.clone()], vec![reinstall])
+            .map(|k| k.key)
+            .as_deref(),
+        Some("abc")
+    );
+    // A changed key with the name: only at the release's version (repo `edge`).
+    let ms_edge = |v: &str| ArpKey {
+        version: Some(v.into()),
+        ..key("edge", "Microsoft Edge")
+    };
+    assert_eq!(
+        installed_key(&[ms_edge("120.0")], vec![ms_edge("121.0")], "edge", "1.0.0"),
+        None
+    );
+    assert_eq!(
+        installed_key(&[ms_edge("0.9")], vec![ms_edge("1.0.0")], "edge", "1.0.0")
+            .map(|k| k.key)
+            .as_deref(),
+        Some("edge")
+    );
     // A new unnamed key and a changed one: two candidates, none is taken.
     assert_eq!(
         run(
