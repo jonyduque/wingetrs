@@ -356,18 +356,7 @@ fn extra_suffix(r: &ListRow) -> String {
     }
 }
 
-/// Why a release app's row was not checked (`não conferido (…)`, Task 211): its `latest` while
-/// its state is `Unknown`.
-pub fn release_note(r: &ListRow) -> Option<&str> {
-    match (&r.correlation, &r.state) {
-        (Correlation::Matched { source, .. }, UpdateState::Unknown)
-            if source.starts_with("github:") =>
-        {
-            r.latest.as_deref()
-        }
-        _ => None,
-    }
-}
+pub use crate::install::ops::release_note;
 
 /// `Nome  Id  Instalada  Disponível  Fonte  Origem` for correlated rows, followed by the
 /// ambiguous and unmatched sections unless `upgradable_only`. A broken wingetrs install
@@ -993,9 +982,7 @@ pub fn gh_fallback(reason: &str) -> String {
 
 /// A release installer that succeeded without an entry in the Windows list.
 pub fn gh_not_registered() -> String {
-    warning(
-        "o instalador não se registrou em Programas instalados; para remover, use o desinstalador do próprio programa",
-    )
+    warning(crate::github::flow::NOT_REGISTERED)
 }
 
 /// `--asset <name>` names an asset the release lists without a SHA-256 digest.
@@ -1034,14 +1021,8 @@ pub fn gh_missing_asset(tag: &str, name: &str, names: &[&str]) -> Advice {
 
 /// `uninstall` of an app whose installer did not register itself (Task 211).
 pub fn gh_cannot_uninstall(app: &str) -> Advice {
-    Advice::new(
-        format!(
-            "o wingetrs não sabe desinstalar {app}: o instalador não se registrou em Programas instalados"
-        ),
-        format!(
-            "use o desinstalador do próprio programa e depois `wingetrs uninstall {app} --forget`"
-        ),
-    )
+    let (what, todo) = crate::github::flow::cannot_uninstall(app);
+    Advice::new(what, todo)
 }
 
 /// `--forget` on an app wingetrs put in place itself.
@@ -1064,16 +1045,12 @@ pub fn gh_forget_plan(app_version: &str) -> String {
 
 /// The ARP key of an installer app is gone: removed outside wingetrs.
 pub fn gh_key_gone(app: &str) -> String {
-    warning(&format!(
-        "{app} já foi removido por fora (sumiu de Programas instalados); o wingetrs só apaga o registro dele"
-    ))
+    warning(&crate::github::flow::key_gone_text(app))
 }
 
 /// The uninstaller ran but the key stayed: the record of wingetrs stays too.
 pub fn gh_key_stayed(app: &str) -> String {
-    warning(&format!(
-        "{app} continua em Programas instalados; o registro do wingetrs foi mantido"
-    ))
+    warning(&crate::github::flow::key_stayed_text(app))
 }
 
 /// The record of wingetrs was deleted.
@@ -1083,9 +1060,7 @@ pub fn gh_forgotten(app_version: &str) -> String {
 
 /// An upgrade that ended portable leaves the program the old installer put in place.
 pub fn gh_old_program_stays(name: &str) -> String {
-    warning(&format!(
-        "a versão anterior, instalada pelo instalador, continua no Windows: {name} em Programas instalados"
-    ))
+    warning(&crate::github::flow::old_program_text(name))
 }
 
 /// The upgrade's release has no file under the installed file's name with the new version,

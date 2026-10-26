@@ -496,6 +496,30 @@ async fn event_loop(
                 Cmd::PlanUpgradeAll { keep } => {
                     spawn_plan(&ctx, move |o, w| jobs::plan_upgrade_all(o, w, keep));
                 }
+                Cmd::PlanReleaseUpgrade { app, asset, keep } => spawn_job(&ctx, move |c, h| {
+                    let planned = with_ops(c, &no_progress, |o| {
+                        with_github(|g| {
+                            h.block_on(jobs::plan_release_upgrade(
+                                o,
+                                g,
+                                &app,
+                                asset.as_deref(),
+                                keep,
+                            ))
+                        })
+                    });
+                    Msg::Planned(planned.and_then(|r| r).and_then(|r| r))
+                }),
+                Cmd::PlanReleaseRemove { app } => spawn_job(&ctx, move |c, h| {
+                    let plan_record = |req: &crate::winget_install::previous::RemovalRequest| {
+                        plan_winget_uninstall(c, h, req)
+                    };
+                    let planned = with_ops(c, &no_progress, |o| {
+                        with_github(|g| jobs::plan_release_remove(o, &app, g.arp, &plan_record))
+                    });
+                    Msg::Planned(planned.and_then(|r| r).and_then(|r| r))
+                }),
+                Cmd::CheckReleases { rows } => spawn_release_check(&ctx, rows),
                 Cmd::SaveSettings {
                     behavior,
                     glyphs,
@@ -900,7 +924,11 @@ fn spawn_scan(ctx: &Arc<Ctx>) {
                 &overrides,
             )
         }) {
-            Ok(rows) => Msg::InstalledLoaded(rows),
+            Ok(mut rows) => {
+                // GitHub release apps: their repository as the source (Task 211).
+                crate::install::ops::mark_release_rows(&c.data.install_layout(), &mut rows);
+                Msg::InstalledLoaded(rows)
+            }
             Err(e) => {
                 tracing::warn!("correlação falhou: {e}");
                 Msg::InstalledFailed(e.to_string())
@@ -943,6 +971,14 @@ fn spawn_details(ctx: &Arc<Ctx>, source: String, id: String) {
         // Details first; the icon (and the Scoop twin search) comes afterwards so a slow
         // host never delays them.
         let _ = ctx.tx.send(msg);
+        if crate::install::ops::is_release_source(&source) {
+            // No icon to look for: no catalog package, no winget twin.
+            let _ = ctx.tx.send(Msg::PrefetchDone {
+                key,
+                outcome: IconOutcome::Absent,
+            });
+            return;
+        }
         let Some(details) = details else { return };
         let outcome = match details_icon(&ctx, &source, &id, &details).await {
             Ok((icon, bytes)) => {
@@ -1513,6 +1549,10 @@ async fn load_details(
     source: &str,
     id: &str,
 ) -> anyhow::Result<crate::core::PackageDetails> {
+    // A GitHub release app: its own record, never a catalog's (Task 211).
+    if crate::install::ops::is_release_source(source) {
+        return crate::github::flow::release_details(&ctx.data.install_layout(), id);
+    }
     let pkg = read_package(ctx, source, id).await?;
     match pkg.entry.source {
         SourceKind::Winget => winget_details(ctx, &pkg).await,
@@ -1795,6 +1835,9 @@ fn spawn_execute(ctx: &Arc<Ctx>, action: Action) {
     if jobs::is_winget_action(&action) {
         return spawn_winget(ctx, action);
     }
+    if jobs::is_release_action(&action) {
+        return spawn_release(ctx, action);
+    }
     if let Action::BucketAdd { .. } | Action::BucketRemove { .. } = action {
         return spawn_bucket(ctx, action);
     }
@@ -1938,6 +1981,75 @@ fn spawn_winget(ctx: &Arc<Ctx>, action: Action) {
         .and_then(|r| r);
         Msg::InstallFinished(result)
     });
+}
+
+/// Runs an action of a GitHub release app (Task 211) on a blocking thread: the ops context,
+/// the winget environment (the native removal of its ARP record) and the release's launcher and
+/// ARP; the TUI never waits for `install.lock`. Its launch gate is the one `CancelNative`
+/// cancels until the installer starts.
+fn spawn_release(ctx: &Arc<Ctx>, action: Action) {
+    spawn_job(ctx, move |c, handle| {
+        let tx = c.tx.clone();
+        let throttle = jobs::ProgressThrottle::new(Instant::now());
+        let progress = move |ev: &crate::install::progress::ProgressEvent| {
+            if let Some(msg) = jobs::progress_msg(&throttle, Instant::now(), ev) {
+                let _ = tx.send(msg);
+            }
+        };
+        let logged = action.clone();
+        let result = with_ops(c, &progress, |o| {
+            *c.winget_gate.lock().unwrap_or_else(|p| p.into_inner()) = Some(o.launch.clone());
+            with_winget(c, &progress, o.launch.clone(), |w| {
+                with_github(|g| handle.block_on(jobs::run_release_action(o, g, w, action)))
+            })
+        })
+        .and_then(|r| r)
+        .and_then(|r| r)
+        .map_err(|e| {
+            jobs::log_not_started(&logged, &e);
+            InstallFail::Other(e)
+        })
+        .and_then(|r| r);
+        Msg::InstallFinished(result)
+    });
+}
+
+/// Reads the latest tag of each release app (`ops::latest_release_versions`: the web
+/// redirect, a few at a time) and answers per row.
+fn spawn_release_check(ctx: &Arc<Ctx>, rows: Vec<(String, crate::github::GhRepo)>) {
+    let ctx = Arc::clone(ctx);
+    tokio::spawn(async move {
+        let repos: Vec<crate::github::GhRepo> = rows.iter().map(|(_, r)| r.clone()).collect();
+        let versions = crate::install::ops::latest_release_versions(
+            &ctx.http,
+            crate::github::install::WEB_BASE,
+            &repos,
+        )
+        .await;
+        for ((app_key, _), latest) in rows.into_iter().zip(versions) {
+            let latest = latest.map_err(|e| crate::install::ops::release_unchecked(&e));
+            let _ = ctx.tx.send(Msg::ReleaseChecked { app_key, latest });
+        }
+    });
+}
+
+/// Runs `f` with the production release environment: the GitHub bases, the shell launcher
+/// (never elevated by wingetrs) and the ARP read from the registry.
+#[cfg(windows)]
+fn with_github<R>(f: impl FnOnce(&crate::github::install::GhEnv<'_>) -> R) -> Result<R, String> {
+    use crate::github::install::{API_BASE, GhEnv, WEB_BASE};
+    let env = GhEnv {
+        api: API_BASE.into(),
+        web: WEB_BASE.into(),
+        launcher: &crate::winget_install::launch_win::ShellLauncher,
+        arp: &crate::github::arp_win::ReleaseArp,
+    };
+    Ok(f(&env))
+}
+
+#[cfg(not(windows))]
+fn with_github<R>(_f: impl FnOnce(&crate::github::install::GhEnv<'_>) -> R) -> Result<R, String> {
+    Err("releases do GitHub só funcionam no Windows".to_string())
 }
 
 /// The record still there (a read error counts as there: never "removed" by mistake).

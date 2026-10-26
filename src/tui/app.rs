@@ -219,6 +219,12 @@ pub enum Msg {
     BridgeLine(String),
     /// Answer of `Cmd::LoadBuckets`: the configuration read from disk and its buckets.
     BucketsLoaded(Result<(Config, Vec<BucketInfo>), String>),
+    /// The latest release of the GitHub release app `app_key` (Task 211): its version, or why
+    /// it was not checked (`não conferido (…)`).
+    ReleaseChecked {
+        app_key: String,
+        latest: Result<String, String>,
+    },
 }
 
 /// What the user is asked to confirm, or to choose from.
@@ -240,6 +246,13 @@ pub enum Planned {
     },
     /// The text matched more than one package.
     Choose(Vec<Candidate>),
+    /// The upgrade of release app `app`: its release has no file under the installed one's
+    /// name with the new version (`expected`); the user picks among `names` (Task 211).
+    ChooseAsset {
+        app: String,
+        expected: Option<String>,
+        names: Vec<String>,
+    },
 }
 
 /// A confirmed operation, executed by the runtime under `install.lock`.
@@ -302,6 +315,24 @@ pub enum Action {
         name: String,
         confirmed: bool,
     },
+    /// Upgrade of a GitHub release app (Task 211), the same steps as `wingetrs upgrade`; its
+    /// confirmation is the consent to the unreviewed origin (`--allow-unreviewed`).
+    ReleaseUpgrade(Box<crate::github::flow::ReleaseUpgrade>),
+    /// Removal of an app its release installer put in place: its ARP record through the native
+    /// removal (`plan`), then the wingetrs record once the key is gone.
+    ReleaseUninstall {
+        app: String,
+        version: String,
+        arp: crate::install::state::InstallerRecord,
+        plan: WingetUninstallPlan,
+    },
+    /// Deletes only the wingetrs record of an app its release installer put in place (the
+    /// `--forget`); `why` is what the confirmation says first.
+    ReleaseForget {
+        app: String,
+        version: String,
+        why: String,
+    },
 }
 
 impl Action {
@@ -338,6 +369,9 @@ impl Action {
             Action::SelfUpdate { .. } => "Atualizando o wingetrs".to_string(),
             Action::BucketAdd { name, .. } => format!("Adicionando bucket {name}"),
             Action::BucketRemove { name, .. } => format!("Removendo bucket {name}"),
+            Action::ReleaseUpgrade(up) => format!("Atualizando {}", up.app),
+            Action::ReleaseUninstall { app, .. } => format!("Removendo {app}"),
+            Action::ReleaseForget { app, .. } => format!("Esquecendo {app}"),
         }
     }
 }
@@ -437,6 +471,8 @@ pub enum Target {
         plan: Box<WingetPlan>,
         row_key: String,
     },
+    /// A GitHub release app (Task 211): planned by `Cmd::PlanReleaseUpgrade`, never winget.
+    Release(String),
 }
 
 /// Whether the bridge tools exist; `None` until the startup check answers (enabled meanwhile:
@@ -599,6 +635,13 @@ pub enum Modal {
         /// `keep` of the plan that asked (install: false; upgrade: setting at key time).
         keep: bool,
     },
+    /// The file of a release app's upgrade (`Planned::ChooseAsset`).
+    PickingAsset {
+        picker: Picker,
+        app: String,
+        names: Vec<String>,
+        keep: bool,
+    },
     /// Actions of an installed app: [upgrade, remove].
     Actions {
         picker: Picker,
@@ -741,6 +784,23 @@ pub enum Cmd {
     /// Plan upgrading every app with a newer catalog version.
     PlanUpgradeAll {
         keep: bool,
+    },
+    /// Plan upgrading GitHub release app `app` (Task 211) to its latest release; `asset`: the
+    /// file the user picked. Answers with `Msg::Planned`.
+    PlanReleaseUpgrade {
+        app: String,
+        asset: Option<String>,
+        keep: bool,
+    },
+    /// Plan removing release app `app`, which its own installer put in place. Answers with
+    /// `Msg::Planned`.
+    PlanReleaseRemove {
+        app: String,
+    },
+    /// Read the latest tag of each `(app_key, repository)` (web redirect, a few at a time) and
+    /// answer, per row, with `Msg::ReleaseChecked`.
+    CheckReleases {
+        rows: Vec<(String, crate::github::GhRepo)>,
     },
     Execute(Action),
     /// Cancel the native winget job in progress through its `LaunchGate` (refused once its
@@ -1171,7 +1231,9 @@ impl App {
             .installed
             .iter()
             .filter(|r| {
-                self.tab != Tab::Updates || matches!(r.state, UpdateState::Available { .. })
+                self.tab != Tab::Updates
+                    || matches!(r.state, UpdateState::Available { .. })
+                    || crate::install::ops::release_note(r).is_some()
             })
             .filter(|r| q.is_empty() || r.name.to_lowercase().contains(&q))
             .filter(|r| match (self.filter, &r.correlation) {
@@ -1502,6 +1564,9 @@ impl App {
         let Some((source, id)) = self.selected_key() else {
             return Vec::new();
         };
+        if is_release_source(&source) {
+            return Vec::new();
+        }
         let key = format!("{source}/{id}");
         let size = (DETAIL_ICON_COLS, DETAIL_ICON_ROWS);
         if self.icon_none.contains(&key)
@@ -1544,6 +1609,7 @@ impl App {
                 .skip(window.start)
                 .take(window.len())
                 .map(|r| match &r.correlation {
+                    Correlation::Matched { source, .. } if is_release_source(source) => None,
                     Correlation::Matched {
                         source, package_id, ..
                     } => key(source, package_id),
@@ -1563,6 +1629,7 @@ impl App {
     /// have no package to take one from; ambiguous ones are not known yet.
     fn row_placeholder(&self, c: &Correlation) -> bool {
         match c {
+            Correlation::Matched { source, .. } if is_release_source(source) => true,
             Correlation::Matched {
                 source, package_id, ..
             } => self.icon_known_absent(&format!("{source}/{package_id}")),
@@ -1824,7 +1891,15 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
             app.clamp();
             let mut cmds = app.details_cmd();
             cmds.extend(applicability_cmd(app));
+            cmds.extend(release_check_cmd(app));
             cmds
+        }
+        Msg::ReleaseChecked { app_key, latest } => {
+            if let Some(r) = app.installed.iter_mut().find(|r| r.app_key == app_key) {
+                crate::install::ops::set_release_state(r, latest);
+            }
+            app.clamp();
+            Vec::new()
         }
         Msg::ApplicabilityLoaded {
             app_key,
@@ -2091,6 +2166,7 @@ fn apply(app: &mut App, msg: Msg) -> Vec<Cmd> {
                         Action::WingetUninstall(_)
                             | Action::WingetRegistryOnly(_)
                             | Action::RemoveOrphan(_)
+                            | Action::ReleaseUninstall { .. }
                     )
                 );
                 if matches!(
@@ -2626,6 +2702,12 @@ fn upgrade_target(app: &App, r: &ListRow) -> Result<Target, Cow<'static, str>> {
             return Err(PINNED_NOTE.into());
         }
         return match (&r.correlation, &r.state) {
+            // A GitHub release app: its own plan (Task 211), never a catalog's nor winget.
+            (Correlation::Matched { source, .. }, UpdateState::Available { .. })
+                if is_release_source(source) =>
+            {
+                Ok(Target::Release(r.name.clone()))
+            }
             (
                 Correlation::Matched {
                     source, package_id, ..
@@ -2835,6 +2917,27 @@ fn confirm_items(app: &App, actions: &[Action]) -> Vec<ConfirmItem> {
                     checked: true,
                 });
             }
+            Action::ReleaseUpgrade(up) => items.push(ConfirmItem {
+                name: up.app.clone(),
+                key: None,
+                from: Some(up.prior.version.clone()),
+                to: Some(up.version.clone()),
+                manager: "wingetrs",
+                checked: true,
+            }),
+            Action::ReleaseUninstall {
+                app: name, version, ..
+            }
+            | Action::ReleaseForget {
+                app: name, version, ..
+            } => items.push(ConfirmItem {
+                name: name.clone(),
+                key: None,
+                from: Some(version.clone()),
+                to: None,
+                manager: "wingetrs",
+                checked: true,
+            }),
             Action::SelfUpdate { tag } => items.push(ConfirmItem {
                 name: "wingetrs".to_string(),
                 key: None,
@@ -2914,7 +3017,14 @@ fn action_notes(app: &App, action: &Action) -> Vec<String> {
             p.app
         )],
         Action::WingetInstall(p) | Action::WingetUpgrade { plan: p, .. } => lines(p.to_string()),
-        Action::WingetUninstall(p) => lines(p.to_string()),
+        Action::WingetUninstall(p) | Action::ReleaseUninstall { plan: p, .. } => {
+            lines(p.to_string())
+        }
+        Action::ReleaseUpgrade(up) => up.notes(),
+        Action::ReleaseForget { why, .. } => vec![
+            why.clone(),
+            "Apaga só o registro do wingetrs; nada é desinstalado.".to_string(),
+        ],
         Action::RemoveOrphan(o) => vec![
             format!("O desinstalador de {} não existe: {}", o.name, o.missing),
             "O app pode ter mudado de lugar (ex.: Steam em outra pasta).".to_string(),
@@ -3338,8 +3448,63 @@ fn plan_upgrade(app: &mut App, source_name: String, id: String) -> Vec<Cmd> {
 }
 
 fn plan_remove(app: &mut App, name: String) -> Vec<Cmd> {
+    // An app its release installer put in place: its own uninstaller (Task 211).
+    if app
+        .installed
+        .iter()
+        .any(|r| r.origin == "wingetrs" && r.name == name && installer_release(r))
+    {
+        return start_planning(app, Cmd::PlanReleaseRemove { app: name });
+    }
     let purge = app.settings.behavior.purge;
     start_planning(app, Cmd::PlanRemove { app: name, purge })
+}
+
+/// `U` on a GitHub release app: its plan (latest release, the saved file), then the
+/// confirmation that is the consent to its origin.
+fn plan_release_upgrade(app: &mut App, name: String) -> Vec<Cmd> {
+    let keep = app.settings.behavior.keep_old;
+    start_planning(
+        app,
+        Cmd::PlanReleaseUpgrade {
+            app: name,
+            asset: None,
+            keep,
+        },
+    )
+}
+
+/// Whether `source` is a GitHub release's (`github:<owner>/<repo>`).
+fn is_release_source(source: &str) -> bool {
+    crate::install::ops::is_release_source(source)
+}
+
+/// A release app its own installer put in place (its source ends in `(instalador)`).
+fn installer_release(r: &ListRow) -> bool {
+    matches!(&r.correlation, Correlation::Matched { source, .. }
+        if is_release_source(source) && source.ends_with(crate::install::ops::INSTALLER_SUFFIX))
+}
+
+/// The release apps whose latest tag the Updates tab reads (Task 211).
+fn release_check_cmd(app: &App) -> Option<Cmd> {
+    let rows: Vec<(String, crate::github::GhRepo)> = app
+        .installed
+        .iter()
+        .filter(|r| r.origin == "wingetrs" && r.state != UpdateState::Broken)
+        .filter_map(|r| match &r.correlation {
+            Correlation::Matched { source, .. } if is_release_source(source) => {
+                let bucket = source
+                    .strip_suffix(crate::install::ops::INSTALLER_SUFFIX)
+                    .unwrap_or(source);
+                Some((
+                    r.app_key.clone(),
+                    crate::install::ops::release_repo(bucket)?,
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    (!rows.is_empty()).then_some(Cmd::CheckReleases { rows })
 }
 
 /// `U`: plan upgrading the selected app; with nothing selected, every upgradable app.
@@ -3365,6 +3530,7 @@ fn upgrade_one(app: &mut App) -> Vec<Cmd> {
     };
     match target {
         Ok(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
+        Ok(Target::Release(name)) => plan_release_upgrade(app, name),
         Ok(Target::Bridge(job)) => start_bridge(app, *job),
         Ok(Target::Native { plan, row_key }) => {
             let confirm = app.settings.behavior.confirm;
@@ -3544,7 +3710,8 @@ fn upgrade_marked(app: &mut App, rows: &[usize], hidden: usize, left_out: usize)
                 plan: *plan,
                 row_key,
             }),
-            Err(_) => skipped.push(r.name.clone()),
+            // Each release app asks for its own consent: never in a batch.
+            Ok(Target::Release(_)) | Err(_) => skipped.push(r.name.clone()),
         }
     }
     start_batch(app, items, bridges, skipped, hidden, left_out)
@@ -3557,7 +3724,7 @@ fn remove_marked(app: &mut App, rows: &[usize], hidden: usize, left_out: usize) 
     let mut skipped = Vec::new();
     let view = app.installed_view();
     for r in rows.iter().filter_map(|&i| view.get(i)) {
-        if r.origin == "wingetrs" {
+        if r.origin == "wingetrs" && !installer_release(r) {
             items.push((
                 r.name.clone(),
                 Cmd::PlanRemove {
@@ -4037,6 +4204,7 @@ fn run_action(
         ActionId::Install => install_one(app),
         ActionId::Upgrade => match upgrade {
             Some(Target::Ours(source_name, id)) => plan_upgrade(app, source_name, id),
+            Some(Target::Release(name)) => plan_release_upgrade(app, name),
             Some(Target::Bridge(job)) => start_bridge(app, *job),
             Some(Target::Native { plan, row_key }) => {
                 let confirm = app.settings.behavior.confirm;
@@ -4168,11 +4336,21 @@ fn residue_item(r: &Residue) -> PickerItem {
 
 /// Whether a ready plan asks before executing, per the `confirm` setting.
 pub fn needs_confirm(mode: ConfirmMode, action: &Action) -> bool {
+    // The consent to an unreviewed origin, and a record dropped without uninstalling.
+    if matches!(
+        action,
+        Action::ReleaseUpgrade(_) | Action::ReleaseForget { .. }
+    ) {
+        return true;
+    }
     match mode {
         ConfirmMode::Always => true,
         ConfirmMode::Removals => matches!(
             action,
-            Action::Remove(_) | Action::WingetUninstall(_) | Action::WingetRegistryOnly(_)
+            Action::Remove(_)
+                | Action::WingetUninstall(_)
+                | Action::WingetRegistryOnly(_)
+                | Action::ReleaseUninstall { .. }
         ),
         ConfirmMode::Never => false,
     }
@@ -4287,7 +4465,9 @@ fn request_quit(app: &mut App) -> Vec<Cmd> {
             .running
             .as_ref()
             .and_then(|r| r.action.as_ref())
-            .is_some_and(crate::tui::jobs::is_winget_action);
+            .is_some_and(|a| {
+                crate::tui::jobs::is_winget_action(a) || crate::tui::jobs::is_release_action(a)
+            });
         let mut text = if native {
             NATIVE_QUIT.to_string()
         } else {
@@ -4328,7 +4508,9 @@ fn cancel_native(app: &App) -> Vec<Cmd> {
         .running
         .as_ref()
         .and_then(|r| r.action.as_ref())
-        .is_some_and(crate::tui::jobs::is_winget_action);
+        .is_some_and(|a| {
+            crate::tui::jobs::is_winget_action(a) || crate::tui::jobs::is_release_action(a)
+        });
     if native && !job_uncancellable(app) {
         vec![Cmd::CancelNative]
     } else {
@@ -4419,7 +4601,21 @@ fn admin_refusal(app: &App, action: &Action, elevated: bool) -> Option<String> {
             let code = code.map(|(_, c)| c.as_slice()).unwrap_or_default();
             admin_code_refusal(elevated, code, false)
         }
-        Action::WingetUninstall(p) => winget_admin_refusal(p, elevated),
+        Action::WingetUninstall(p) | Action::ReleaseUninstall { plan: p, .. } => {
+            winget_admin_refusal(p, elevated)
+        }
+        // The release's installer is third-party code, refused elevated as in the CLI.
+        Action::ReleaseUpgrade(up) => up.installer.as_ref().and_then(|i| {
+            let code = [ThirdParty::Program {
+                uninstaller: false,
+                file: i.asset.name.clone(),
+                args: crate::github::install::silent_args(i.generator)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+            }];
+            admin_code_refusal(elevated, &code, false)
+        }),
         _ => None,
     }
 }
@@ -4506,6 +4702,37 @@ fn on_planned(app: &mut App, result: Result<Planned, String>) -> Vec<Cmd> {
                 return Vec::new();
             };
             return ready_one(app, action, confirm);
+        }
+        Ok(Planned::ChooseAsset {
+            app: name,
+            expected,
+            names,
+        }) => {
+            let items = names
+                .iter()
+                .map(|n| PickerItem {
+                    label: n.clone(),
+                    detail: String::new(),
+                    selectable: true,
+                    note: None,
+                })
+                .collect();
+            if let Some(e) = expected {
+                app.push_toast(
+                    ToastKind::Info,
+                    format!("o release não tem {e}: escolha o arquivo"),
+                );
+            }
+            let keep = app.planning_keep;
+            open_modal(
+                app,
+                Modal::PickingAsset {
+                    picker: Picker::single(items),
+                    app: name,
+                    names,
+                    keep,
+                },
+            );
         }
         Ok(Planned::Choose(candidates)) => {
             let items = candidates.iter().map(candidate_item).collect();
@@ -4730,7 +4957,7 @@ fn on_batch_planned(app: &mut App, results: Vec<Result<Planned, String>>) -> Vec
                 }
                 removals.extend(admin_batch_item(app, &label, action));
             }
-            Ok(Planned::Choose(_)) => ambiguous.push(label),
+            Ok(Planned::Choose(_) | Planned::ChooseAsset { .. }) => ambiguous.push(label),
             Err(message) => app.push_toast(ToastKind::Error, format!("{label}: {message}")),
         }
     }
@@ -5241,6 +5468,34 @@ fn modal_key(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
                     start_planning(app, cmd)
                 }
                 _ => Vec::new(),
+            },
+        },
+        Modal::PickingAsset {
+            mut picker,
+            app: name,
+            names,
+            keep,
+        } => match picker.key(key) {
+            PickOutcome::Pending => {
+                app.modal = Some(Modal::PickingAsset {
+                    picker,
+                    app: name,
+                    names,
+                    keep,
+                });
+                Vec::new()
+            }
+            PickOutcome::Cancelled => Vec::new(),
+            PickOutcome::Picked(chosen) => match chosen.first().and_then(|&i| names.get(i)) {
+                Some(asset) => {
+                    let cmd = Cmd::PlanReleaseUpgrade {
+                        app: name,
+                        asset: Some(asset.clone()),
+                        keep,
+                    };
+                    start_planning(app, cmd)
+                }
+                None => Vec::new(),
             },
         },
         Modal::Actions {

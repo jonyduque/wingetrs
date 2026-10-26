@@ -428,6 +428,10 @@ fn row_source_glyph<'a>(theme: &Theme, g: &Glyphs, row: &ListRow) -> Span<'a> {
         Correlation::Matched { source, .. } if source.starts_with("scoop") => {
             source_glyph(theme, g, SourceKind::Scoop)
         }
+        // A GitHub release app (Task 211): never the winget glyph.
+        Correlation::Matched { source, .. } if crate::install::ops::is_release_source(source) => {
+            Span::styled(g.github, theme.src_github())
+        }
         Correlation::Matched { .. } => source_glyph(theme, g, SourceKind::Winget),
         Correlation::Ambiguous { .. } => Span::styled(g.ambiguous, theme.alert()),
         Correlation::Unmatched => Span::styled(g.unknown, theme.muted()),
@@ -620,7 +624,10 @@ fn list_lines<'a>(
                 let detail = match &r.correlation {
                     Correlation::Matched {
                         source, package_id, ..
-                    } => format!("{package_id} · {source}"),
+                    } => match crate::install::ops::release_note(r) {
+                        Some(note) => format!("{package_id} · {source} · {note}"),
+                        None => format!("{package_id} · {source}"),
+                    },
                     Correlation::Unmatched => "sem correspondência no catálogo".to_string(),
                     Correlation::Ambiguous { .. } => "correspondência ambígua".to_string(),
                 };
@@ -1213,6 +1220,7 @@ pub fn modal_title(m: &Modal) -> String {
     match m {
         Modal::Confirm { .. } | Modal::ConfirmQuit { .. } => "Confirmar".to_string(),
         Modal::Picking { .. } => "Escolha o pacote".to_string(),
+        Modal::PickingAsset { app, .. } => format!("Arquivo do release de {app}"),
         Modal::Actions { app, .. } => app.clone(),
         Modal::Choosing { .. } => "Escolha a correspondência".to_string(),
         Modal::Residues { app, .. } => format!("Resíduos de {app}"),
@@ -1267,7 +1275,7 @@ fn draw_modal<'a>(
                 Paragraph::new(lines).wrap(Wrap { trim: false }),
             );
         }
-        Modal::Picking { picker, .. } => {
+        Modal::Picking { picker, .. } | Modal::PickingAsset { picker, .. } => {
             draw_picker(
                 picker,
                 &title,

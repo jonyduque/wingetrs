@@ -371,7 +371,7 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
     // Its own uninstaller removes an app a release installer put in place (Task 211): the CLI.
     if installer_app(c, app) {
         return Err(format!(
-            "{app} foi instalado pelo instalador de um release; remova no terminal: wingetrs uninstall {app}"
+            "{app} foi instalado pelo instalador de um release: remova-o sozinho, pelo menu dele, ou com wingetrs uninstall {app}"
         ));
     }
     let plan = ops::plan_uninstall(c, app, purge).map_err(|e| e.to_string())?;
@@ -684,6 +684,17 @@ fn action_info(action: &Action) -> Option<JobInfo> {
             to: None,
             cmd: None,
         }),
+        Action::ReleaseUninstall { plan, .. } => Some(JobInfo {
+            kind: "remove",
+            tool: "wingetrs",
+            target: record_of(&plan.target),
+            name: plan.name.clone(),
+            from: plan.version.clone(),
+            to: None,
+            cmd: None,
+        }),
+        // Logged by their steps (`github::flow`): the installer's run, the fallback, the record.
+        Action::ReleaseUpgrade(_) | Action::ReleaseForget { .. } => None,
     }
 }
 
@@ -780,6 +791,210 @@ async fn run_action_inner(o: &OpsCtx<'_>, action: Action) -> Result<Done, Instal
         // Run by `run_winget_action`, without the scoop ops context.
         other => Err(InstallFail::Other(format!(
             "{}: ação nativa do winget fora do seu executor",
+            other.label()
+        ))),
+    }
+}
+
+/// Whether `action` belongs to a GitHub release app (`run_release_action`, Task 211).
+pub fn is_release_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::ReleaseUpgrade(_) | Action::ReleaseUninstall { .. } | Action::ReleaseForget { .. }
+    )
+}
+
+/// Plans the upgrade of release app `app` (Task 211) with the CLI's steps (`github::flow`): the
+/// latest release, the installed file's name with the new version, or the user's `asset`; no
+/// such file ⇒ `Planned::ChooseAsset`. The confirmation of the action is the consent to the
+/// unreviewed origin.
+pub async fn plan_release_upgrade(
+    o: &OpsCtx<'_>,
+    env: &crate::github::install::GhEnv<'_>,
+    app: &str,
+    asset: Option<&str>,
+    keep: bool,
+) -> Result<Planned, String> {
+    use crate::github::flow;
+    let text = |e: anyhow::Error| format!("{e:#}");
+    let Some((rec, _)) = flow::release_record(o, app).map_err(text)? else {
+        return Err(format!("{app} não vem de um release do GitHub"));
+    };
+    let Some(start) = flow::start_upgrade(o, env, &rec).await.map_err(text)? else {
+        return Err(format!("{app} já está na versão mais recente"));
+    };
+    let chosen = match asset {
+        Some(name) => start
+            .candidate(name)
+            .cloned()
+            .ok_or_else(|| format!("o release {} não tem {name}", start.release.tag))?,
+        None => match start.found() {
+            Some(a) => a.clone(),
+            None => {
+                return Ok(Planned::ChooseAsset {
+                    app: rec.app.clone(),
+                    expected: start.expected.clone(),
+                    names: start.names().into_iter().map(str::to_string).collect(),
+                });
+            }
+        },
+    };
+    let sel = {
+        let rel = start.rel(env, keep);
+        flow::select_upgrade(o, &rel, &start.candidates, chosen)
+            .await
+            .map_err(text)?
+    };
+    let up = flow::ReleaseUpgrade::new(start, keep, sel);
+    Ok(Planned::Ready {
+        text: up.notes().join("\n"),
+        action: Action::ReleaseUpgrade(Box::new(up)),
+    })
+}
+
+/// Plans removing release app `app`, which its own installer put in place (Task 211), as the
+/// CLI does: its ARP key read now from `arp`; gone ⇒ only the record; present ⇒ the native
+/// removal planned by `plan_record` (the same request as a Windows-list row, no winget
+/// package); no key recorded ⇒ the CLI's refusal, with "esquecer" as the confirmation.
+pub fn plan_release_remove(
+    o: &OpsCtx<'_>,
+    app: &str,
+    arp: &dyn crate::github::install::ArpView,
+    plan_record: &dyn Fn(
+        &crate::winget_install::previous::RemovalRequest,
+    ) -> Result<WingetUninstallPlan, String>,
+) -> Result<Planned, String> {
+    use crate::github::flow;
+    use crate::github::install::Mode;
+    let found = flow::release_record(o, app).map_err(|e| format!("{e:#}"))?;
+    let Some((rec, Mode::Installer(recorded))) = found else {
+        return Err(format!(
+            "{app} não foi instalado pelo instalador de um release"
+        ));
+    };
+    let forget = |why: String| Planned::Ready {
+        text: why.clone(),
+        action: Action::ReleaseForget {
+            app: rec.app.clone(),
+            version: rec.version.clone(),
+            why,
+        },
+    };
+    let Some(k) = recorded else {
+        let (what, _) = flow::cannot_uninstall(&rec.app);
+        return Ok(forget(format!(
+            "{what}. Use o desinstalador do próprio programa; Continuar esquece o app no wingetrs (o --forget)."
+        )));
+    };
+    let keys = arp
+        .keys()
+        .map_err(|e| format!("registro de programas ilegível: {e}"))?;
+    let Some(now) = keys
+        .iter()
+        .find(|x| x.hive == k.hive && x.key.eq_ignore_ascii_case(&k.key))
+    else {
+        return Ok(forget(flow::key_gone_text(&rec.app)));
+    };
+    let req = crate::winget_install::previous::RemovalRequest {
+        app_key: crate::github::install::arp_app_key(&k),
+        name: now.name.clone(),
+        version: now.version.clone(),
+        package: None,
+        others: Vec::new(),
+        is_main: true,
+    };
+    let plan = plan_record(&req)?;
+    Ok(Planned::Ready {
+        text: plan.to_string(),
+        action: Action::ReleaseUninstall {
+            app: rec.app.clone(),
+            version: rec.version.clone(),
+            arp: k,
+            plan,
+        },
+    })
+}
+
+/// Executes a confirmed action of a release app and logs it (Task 211): the upgrade
+/// (`flow::run_upgrade`, the CLI's steps), the removal (the native removal of its ARP record,
+/// then the wingetrs record once the key is gone; a failure keeps the record) or the record
+/// alone.
+pub async fn run_release_action(
+    o: &OpsCtx<'_>,
+    env: &crate::github::install::GhEnv<'_>,
+    w: &WingetEnv<'_>,
+    action: Action,
+) -> Result<Done, InstallFail> {
+    let log = action_info(&action).map(JobLog::start);
+    let (result, outcome) = run_release_inner(o, env, w, action).await;
+    if let Some(log) = log {
+        match &result {
+            Ok(done) => log.finish(outcome, &done.summary),
+            Err(fail) => {
+                let (failed, detail) = fail_log(fail);
+                let outcome = if outcome == Outcome::Ok {
+                    failed
+                } else {
+                    outcome
+                };
+                log.finish(outcome, &detail);
+            }
+        }
+    }
+    result
+}
+
+async fn run_release_inner(
+    o: &OpsCtx<'_>,
+    env: &crate::github::install::GhEnv<'_>,
+    w: &WingetEnv<'_>,
+    action: Action,
+) -> (Result<Done, InstallFail>, Outcome) {
+    use crate::github::flow;
+    let failed = |f: InstallFail| (Err(f), Outcome::Ok);
+    let done = |summary: String| {
+        (
+            Ok(Done {
+                summary,
+                residues: None,
+            }),
+            Outcome::Ok,
+        )
+    };
+    match action {
+        Action::ReleaseUpgrade(up) => match flow::run_upgrade(o, env, &up).await {
+            Ok(Some(d)) => done(match d.warning {
+                Some(w) => format!("{} ({w})", d.summary),
+                None => d.summary,
+            }),
+            Ok(None) => failed(InstallFail::Other(WingetOpsError::Cancelled.to_string())),
+            Err(e) => failed(InstallFail::Other(format!("{e:#}"))),
+        },
+        Action::ReleaseUninstall {
+            app,
+            version,
+            arp,
+            plan,
+        } => {
+            let (removed, outcome) = winget_removal(w, &plan, RemovalChoice::Remove).await;
+            if let Err(f) = removed {
+                return (Err(f), outcome);
+            }
+            if (w.uninstall.key_exists)(arp.hive, &arp.key) {
+                return failed(InstallFail::Other(flow::key_stayed_text(&app)));
+            }
+            match flow::forget_release(o, &app, &version) {
+                Ok(()) => done(format!("{app} removido")),
+                Err(e) => failed(fail(e)),
+            }
+        }
+        Action::ReleaseForget { app, version, .. } => match flow::forget_release(o, &app, &version)
+        {
+            Ok(()) => done(format!("Registro de {app} removido do wingetrs")),
+            Err(e) => failed(fail(e)),
+        },
+        other => failed(InstallFail::Other(format!(
+            "{}: não é uma ação de release do GitHub",
             other.label()
         ))),
     }

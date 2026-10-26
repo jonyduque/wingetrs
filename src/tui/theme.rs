@@ -18,6 +18,8 @@ pub enum ColorDepth {
 pub struct Glyphs {
     pub winget: &'static str,
     pub scoop: &'static str,
+    /// A GitHub release app (Task 211).
+    pub github: &'static str,
     pub search: &'static str,
     pub ok: &'static str,
     pub upgrade: &'static str,
@@ -64,6 +66,7 @@ const ASCII_SPINNER: &[&str] = &["|", "/", "-", "\\"];
 static NERD: Glyphs = Glyphs {
     winget: "\u{f17a}",
     scoop: "\u{f1b3}",
+    github: "\u{f09b}",
     search: "\u{f002}",
     ok: "\u{f00c}",
     upgrade: "\u{f062}",
@@ -100,6 +103,7 @@ static NERD: Glyphs = Glyphs {
 static UNICODE: Glyphs = Glyphs {
     winget: "●",
     scoop: "◆",
+    github: "◇",
     search: "⌕",
     ok: "✓",
     upgrade: "↑",
@@ -136,6 +140,7 @@ static UNICODE: Glyphs = Glyphs {
 static ASCII: Glyphs = Glyphs {
     winget: "W",
     scoop: "S",
+    github: "G",
     search: "/",
     ok: "+",
     upgrade: "^",
@@ -200,6 +205,7 @@ pub struct Theme {
     err: Style,
     src_winget: Style,
     src_scoop: Style,
+    src_github: Style,
     fg: Style,
     fg_dim: Style,
     bg_selected: Style,
@@ -284,6 +290,7 @@ impl Theme {
             err: fg(err),
             src_winget: fg(winget),
             src_scoop: fg(scoop),
+            src_github: fg(text),
             fg: fg(text),
             fg_dim: fg(dim),
             bg_selected: bg(sel),
@@ -349,6 +356,9 @@ impl Theme {
     }
     pub fn src_scoop(&self) -> Style {
         self.src_scoop
+    }
+    pub fn src_github(&self) -> Style {
+        self.src_github
     }
     pub fn fg(&self) -> Style {
         self.fg

@@ -2,7 +2,10 @@
 //! the web redirect (which does not spend the API rate limit).
 
 #[cfg(windows)]
+pub mod arp_win;
+#[cfg(windows)]
 mod clock_win;
+pub mod flow;
 pub mod install;
 pub mod pick;
 

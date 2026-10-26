@@ -4,7 +4,11 @@ use super::picker::{self, StdTerm, Term};
 use super::winget_cmd::{self, CleanupArgs, WingetFlows};
 use super::{Command, emit, output};
 use crate::github::Asset;
-use crate::github::install::{GhEnv, GhTarget};
+use crate::github::flow::{
+    AssetKind, InstallerAsset, Rel, Selection, classify_asset, old_program_left, release_plan,
+    run_release_installer,
+};
+use crate::github::install::GhTarget;
 use crate::install::executor::LaunchGate;
 use crate::install::ops::{self, AllowMsiexec, OpsCtx, Resolution};
 use crate::install::progress::ProgressEvent;
@@ -1083,80 +1087,6 @@ async fn run_plans(
 
 // ---- GitHub releases (Task 210) ----
 
-/// The release being installed and where it goes.
-struct Rel<'a> {
-    t: &'a GhTarget,
-    env: &'a GhEnv<'a>,
-    release: &'a crate::github::Release,
-    app: String,
-    bucket: String,
-    version: String,
-    /// What is installed now, on an upgrade (Task 211).
-    prior: Option<Prior>,
-    /// `--keep`: an upgrade keeps the old version on disk.
-    keep: bool,
-}
-
-/// The installed version an upgrade replaces, and how it was put in place.
-struct Prior {
-    version: String,
-    mode: crate::github::install::Mode,
-}
-
-/// An installer asset, downloaded and verified.
-struct InstallerAsset {
-    asset: Asset,
-    generator: &'static str,
-    blob: std::path::PathBuf,
-    asks_admin: bool,
-}
-
-/// The assets an install uses: the installer (the default) and the program (alone, or the
-/// installer's fallback).
-struct Selection {
-    installer: Option<InstallerAsset>,
-    program: Option<Asset>,
-}
-
-/// What one candidate asset is.
-enum AssetKind {
-    Installer(InstallerAsset),
-    Program(Asset),
-    /// MSI/MSIX/AppX: the reason it is out of scope.
-    Package(Asset, String),
-}
-
-impl AssetKind {
-    fn asset(&self) -> &Asset {
-        match self {
-            AssetKind::Installer(i) => &i.asset,
-            AssetKind::Program(a) | AssetKind::Package(a, _) => a,
-        }
-    }
-
-    fn detail(&self) -> String {
-        match self {
-            AssetKind::Installer(i) => format!("instalador {}", i.generator),
-            AssetKind::Program(_) => "programa".into(),
-            AssetKind::Package(_, why) => why.clone(),
-        }
-    }
-
-    fn into_selection(self) -> anyhow::Result<Selection> {
-        match self {
-            AssetKind::Installer(i) => Ok(Selection {
-                installer: Some(i),
-                program: None,
-            }),
-            AssetKind::Program(a) => Ok(Selection {
-                installer: None,
-                program: Some(a),
-            }),
-            AssetKind::Package(_, why) => bail!("{why}"),
-        }
-    }
-}
-
 /// `install gh:<owner>/<repo>[@<tag>]`: a bucket manifest of the same repository first; else
 /// the release, with its installer by default (the program as its fallback) or its portable
 /// program through the Scoop planner.
@@ -1321,59 +1251,6 @@ fn release_details(rel: &Rel<'_>, assets: &[&Asset]) -> String {
     output::gh_details(&refs)
 }
 
-/// Downloads `asset` into the cache and checks it against the API's digest.
-async fn fetch_asset(
-    ctx: &OpsCtx<'_>,
-    rel: &Rel<'_>,
-    asset: &Asset,
-) -> anyhow::Result<std::path::PathBuf> {
-    use crate::github::install as gh;
-    use crate::install::manifest::{HashAlgo, HashSpec, Source};
-    let source = Source {
-        url: gh::download_url(&rel.env.web, asset),
-        file_name: gh::safe_name(asset)?.to_string(),
-        hash: HashSpec {
-            algo: HashAlgo::Sha256,
-            hex: hex::encode(asset.sha256),
-        },
-        extract_dir: None,
-        extract_to: None,
-    };
-    let mut paths =
-        crate::install::download::fetch_all(ctx.http, ctx.data, &[source], ctx.progress).await?;
-    paths
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("{}: download sem arquivo", asset.name))
-}
-
-/// What `asset` is: a package out of scope, an installer or a program (`.exe` assets are
-/// downloaded and classified).
-async fn classify_asset(
-    ctx: &OpsCtx<'_>,
-    rel: &Rel<'_>,
-    asset: Asset,
-) -> anyhow::Result<AssetKind> {
-    use crate::github::install as gh;
-    use crate::install::sniff::PeKind;
-    if let Some(why) = crate::github::pick::unsupported(&asset.name) {
-        return Ok(AssetKind::Package(asset, why));
-    }
-    if !asset.name.to_ascii_lowercase().ends_with(".exe") {
-        return Ok(AssetKind::Program(asset));
-    }
-    let blob = fetch_asset(ctx, rel, &asset).await?;
-    let bytes = std::fs::read(&blob)?;
-    Ok(match gh::exe_kind(&bytes)? {
-        PeKind::Program => AssetKind::Program(asset),
-        PeKind::Installer(generator) => AssetKind::Installer(InstallerAsset {
-            asks_admin: gh::asks_admin(&bytes),
-            asset,
-            generator,
-            blob,
-        }),
-    })
-}
-
 /// Words that name an installer asset (only to order the candidates).
 const INSTALLER_NAMES: [&str; 3] = ["instalador", "installer", "setup"];
 
@@ -1480,38 +1357,6 @@ async fn select_assets(
     kinds.swap_remove(i).into_selection().map(Some)
 }
 
-/// The Scoop plan of a portable `asset`: downloaded, verified, looked into, then the
-/// synthetic manifest through `plan_for_raw`.
-async fn release_plan(
-    ctx: &OpsCtx<'_>,
-    rel: &Rel<'_>,
-    asset: &Asset,
-) -> anyhow::Result<crate::install::plan::InstallPlan> {
-    use crate::github::install as gh;
-    let blob = fetch_asset(ctx, rel, asset).await?;
-    let portable = {
-        let scratch = gh::Scratch::new(&ctx.data.tmp_dir(), "inspect")?;
-        gh::inspect(&blob, gh::safe_name(asset)?, scratch.path())?
-    };
-    let url = gh::download_url(&rel.env.web, asset);
-    let raw = gh::manifest_json(&url, asset, &portable, &rel.version);
-    Ok(ops::plan_for_raw(
-        ctx,
-        &rel.app,
-        &rel.bucket,
-        &raw,
-        rel.keep,
-    )?)
-}
-
-/// Runs `f` on this thread, letting a multi-thread runtime move its other tasks away.
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
-        _ => f(),
-    }
-}
-
 /// The installer of a release: plan, the third-party block of `installer.file` (the same
 /// text), gates, confirmation, the run under `install.lock` and its record; when it fails, the
 /// program asset through the Scoop plan (no new question). `--allow-unreviewed` is the consent
@@ -1608,109 +1453,6 @@ async fn install_release_installer(
     })
 }
 
-type InstallerRan =
-    Result<crate::github::install::Installed, crate::github::install::InstallerFailure>;
-
-/// The installer's run under `install.lock`, from a verified copy named as the asset, with its
-/// job log; a run that installed is recorded. The inner error is the installer's failure.
-async fn run_release_installer(
-    ctx: &OpsCtx<'_>,
-    rel: &Rel<'_>,
-    inst: &InstallerAsset,
-) -> anyhow::Result<InstallerRan> {
-    use crate::github::install::{self as gh, InstallerFailure, InstallerRun};
-    (ctx.progress)(&ProgressEvent::Phase(
-        crate::install::progress::Phase::Preparing,
-    ));
-    let layout = ctx.data.install_layout();
-    let _lock = crate::winget_install::ops::lock_install(&layout, ctx.wait)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let scratch = gh::Scratch::new(&ctx.data.tmp_dir(), "run")?;
-    let program = gh::launch_copy(&inst.blob, &inst.asset, scratch.path())?;
-    let args = gh::silent_args(inst.generator);
-    let mut log = JobLog::start(JobInfo {
-        kind: if rel.prior.is_some() {
-            "upgrade"
-        } else {
-            "install"
-        },
-        tool: "wingetrs",
-        target: format!("{}/{}", rel.bucket, rel.app),
-        name: rel.app.clone(),
-        from: rel.prior.as_ref().map(|p| p.version.clone()),
-        to: Some(rel.version.clone()),
-        cmd: Some(format!("{} {args}", inst.asset.name).trim_end().to_string()),
-    });
-    let run = InstallerRun {
-        program: &program,
-        generator: inst.generator,
-        app: &rel.app,
-        version: &rel.version,
-        asks_admin: inst.asks_admin,
-    };
-    let ran = blocking(|| gh::run_installer(rel.env, &ctx.launch, ctx.progress, &run));
-    drop(scratch);
-    match &ran {
-        Ok(done) => {
-            log.code = Some(done.code);
-            let url = gh::download_url(&rel.env.web, &inst.asset);
-            let manifest = gh::installer_manifest_json(&url, &inst.asset, &rel.version);
-            let recorded = gh::record_installer(
-                &layout,
-                &rel.app,
-                &rel.bucket,
-                &rel.version,
-                &manifest,
-                done,
-            );
-            finish_log(log, &recorded, "instalado");
-            recorded?;
-            // The installer replaced the old version: its record folder goes (it holds only
-            // `manifest.json` and `install.json`).
-            if let Some(p) = rel
-                .prior
-                .as_ref()
-                .filter(|p| matches!(p.mode, gh::Mode::Installer(_)))
-                .filter(|p| !rel.keep && p.version != rel.version)
-            {
-                let old = layout.version_dir(&rel.app, &p.version);
-                if let Err(e) = std::fs::remove_dir_all(&old) {
-                    tracing::warn!(dir = %old.display(), error = %e, "versão anterior não apagada");
-                }
-            }
-        }
-        Err(InstallerFailure::Cancelled) => log.finish(Outcome::Cancelled, "cancelado"),
-        Err(e) => {
-            if let InstallerFailure::Code(c) = e {
-                log.code = Some(*c);
-            }
-            log.finish(Outcome::Failed, &e.to_string());
-        }
-    }
-    Ok(ran)
-}
-
-/// The record and mode of `app` when it comes from a GitHub release.
-fn release_record(
-    ctx: &OpsCtx<'_>,
-    app: &str,
-) -> anyhow::Result<Option<(AppRecord, crate::github::install::Mode)>> {
-    let state = ops::read_state(&ctx.data.install_layout())?;
-    let Some((rec, _)) = state.get(app)? else {
-        return Ok(None);
-    };
-    if ops::release_repo(&rec.bucket).is_none() {
-        return Ok(None);
-    }
-    let mode =
-        crate::github::install::installed_mode(&ctx.data.install_layout(), &rec.app, &rec.version)
-            .map_err(|e| {
-                anyhow::anyhow!("{}: install.json ilegível ({e}); rode repair", rec.app)
-            })?;
-    Ok(Some((rec, mode)))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn uninstall(
     ctx: &OpsCtx<'_>,
@@ -1725,7 +1467,9 @@ async fn uninstall(
     // Installed apps are named by id only; accept `bucket/id` too.
     let app = target.rsplit('/').next().unwrap_or(target);
     // An app a release installer put in place: its own uninstaller, from the ARP (Task 211).
-    if let Some((rec, crate::github::install::Mode::Installer(arp))) = release_record(ctx, app)? {
+    if let Some((rec, crate::github::install::Mode::Installer(arp))) =
+        crate::github::flow::release_record(ctx, app)?
+    {
         let r = Removal { purge, forget, f };
         return uninstall_installer_app(ctx, ui, &rec, arp, r, stop, winget).await;
     }
@@ -1912,20 +1656,9 @@ fn remove_record(
     rec: &AppRecord,
     stop: Stop<'_, impl Interrupts>,
 ) -> anyhow::Result<()> {
-    let plan = ops::plan_uninstall(ctx, &rec.app, false)?;
     stop.interrupts.hold();
-    let log = JobLog::start(JobInfo {
-        kind: "remove",
-        tool: "wingetrs",
-        target: rec.app.clone(),
-        name: rec.app.clone(),
-        from: Some(rec.version.clone()),
-        to: None,
-        cmd: None,
-    });
-    let removed = ops::uninstall_with(ctx, &plan, None);
+    let removed = crate::github::flow::forget_release(ctx, &rec.app, &rec.version);
     ui.end_progress();
-    finish_log(log, &removed, "registro removido");
     stop.interrupts.release();
     removed?;
     emit::out(&output::gh_forgotten(&output::app_version(
@@ -2172,7 +1905,8 @@ async fn upgrade_catalog(
 
 /// `upgrade` of a release app: the latest release (API), the installed file's name with the
 /// new version (else the user picks), then the install path of a release with its gates
-/// (`--allow-unreviewed`, installer first, the program as its fallback).
+/// (`--allow-unreviewed`, installer first, the program as its fallback). The steps are
+/// `github::flow`'s, the TUI's too.
 async fn upgrade_release(
     ctx: &OpsCtx<'_>,
     ui: &dyn Ui,
@@ -2182,107 +1916,24 @@ async fn upgrade_release(
     stop: Stop<'_, impl Interrupts>,
     winget: &impl WingetFlows,
 ) -> anyhow::Result<()> {
-    use crate::core::version::Version;
-    use crate::github::install as gh;
+    use crate::github::flow;
     let Some(env) = winget.github() else {
         bail!("atualização por release do GitHub indisponível neste fluxo");
     };
-    let Some(repo) = ops::release_repo(&rec.bucket) else {
-        bail!("{} não vem de um release do GitHub", rec.app);
-    };
-    let layout = ctx.data.install_layout();
-    let mode = gh::installed_mode(&layout, &rec.app, &rec.version)
-        .map_err(|e| anyhow::anyhow!("{}: install.json ilegível ({e}); rode repair", rec.app))?;
-    let t = GhTarget { repo, tag: None };
-    let release = crate::github::latest(ctx.http, &env.api, &t.repo).await?;
-    let version = gh::version_of(&release.tag)?;
-    if Version::parse(&version) <= Version::parse(&rec.version) {
+    let Some(start) = flow::start_upgrade(ctx, &env, rec).await? else {
         emit::out(&output::up_to_date(&rec.app));
         return Ok(());
-    }
-    // The saved rule: the file the installed version came from (an altered record has none).
-    let installed = crate::install::state::installed_manifest(
-        &layout,
-        &rec.app,
-        &rec.version,
-        &rec.manifest_sha256,
-    )
-    .ok()
-    .flatten()
-    .and_then(|raw| gh::asset_of_manifest(&raw));
-    let rel = Rel {
-        t: &t,
-        env: &env,
-        release: &release,
-        app: rec.app.clone(),
-        bucket: rec.bucket.clone(),
-        version,
-        prior: Some(Prior {
-            version: rec.version.clone(),
-            mode,
-        }),
-        keep,
     };
-    let expected = installed.map(|n| gh::expected_asset(&n, &rec.version, &rel.version));
-    let selection = select_upgrade_assets(ctx, ui, &rel, expected.as_deref(), f).await;
-    ui.end_progress();
-    let Some(selection) = selection? else {
-        emit::out(&output::cancelled());
-        return Ok(());
-    };
-    if let (
-        Some(inst),
-        Some(Prior {
-            mode: gh::Mode::Portable,
-            ..
-        }),
-    ) = (&selection.installer, &rel.prior)
-    {
-        return Err(output::Advice::new(
-            format!(
-                "{} agora é um instalador ({}); a versão instalada é portátil",
-                inst.asset.name, inst.generator
-            ),
-            format!(
-                "remova com `wingetrs uninstall {}` e instale de novo",
-                rel.app
-            ),
-        )
-        .into());
-    }
-    let elevated = elevated_or_unknown(winget.elevated());
-    install_selection(ctx, ui, &rel, selection, f, elevated, stop).await?;
-    if let Some(name) = old_program_left(ctx, &rel) {
-        ui.output(&output::gh_old_program_stays(&name));
-    }
-    Ok(())
-}
-
-/// The assets of an upgrade: the file named `expected` (the installed one's name with the new
-/// version) as is; else the user picks among the files for this host (without a terminal or
-/// with `--yes`: an error listing them). An installer gets the other file of the same build as
-/// its fallback, as an install picks it. `None` = the user cancelled.
-async fn select_upgrade_assets(
-    ctx: &OpsCtx<'_>,
-    ui: &dyn Ui,
-    rel: &Rel<'_>,
-    expected: Option<&str>,
-    f: Flags,
-) -> anyhow::Result<Option<Selection>> {
-    use crate::github::pick::{Pick, pick};
-    let found = expected.and_then(|e| rel.release.assets.iter().find(|a| a.name == e));
-    let candidates = match pick(&rel.release.assets, crate::install::manifest::Arch::host()) {
-        Pick::One(a) => vec![a],
-        Pick::Choose(list) => list,
-        Pick::None(_) => rel.release.assets.clone(),
-    };
-    let asset = match found {
+    let rel = start.rel(&env, keep);
+    let asset = match start.found() {
         Some(a) => a.clone(),
         None => {
-            let names: Vec<&str> = candidates.iter().map(|a| a.name.as_str()).collect();
+            let names = start.names();
             if f.yes || !ui.interactive() {
-                let expected = expected.unwrap_or("o arquivo instalado");
-                return Err(output::gh_pattern_changed(&rel.release.tag, expected, &names).into());
+                let expected = start.expected.as_deref().unwrap_or("o arquivo instalado");
+                return Err(
+                    output::gh_pattern_changed(&start.release.tag, expected, &names).into(),
+                );
             }
             ui.end_progress();
             let items = names
@@ -2295,54 +1946,23 @@ async fn select_upgrade_assets(
                 })
                 .collect();
             match ui.pick(items)? {
-                Some(i) if i < candidates.len() => candidates[i].clone(),
-                _ => return Ok(None),
+                Some(i) if i < start.candidates.len() => start.candidates[i].clone(),
+                _ => {
+                    emit::out(&output::cancelled());
+                    return Ok(());
+                }
             }
         }
     };
-    match classify_asset(ctx, rel, asset).await? {
-        AssetKind::Installer(i) => {
-            let others: Vec<&crate::github::Asset> = candidates
-                .iter()
-                .filter(|a| a.name != i.asset.name)
-                .filter(|a| crate::github::pick::unsupported(&a.name).is_none())
-                .collect();
-            let program = match others.as_slice() {
-                [only] => Some((*only).clone()),
-                _ => None,
-            };
-            Ok(Some(Selection {
-                installer: Some(i),
-                program,
-            }))
-        }
-        other => other.into_selection().map(Some),
+    let selection = flow::select_upgrade(ctx, &rel, &start.candidates, asset).await;
+    ui.end_progress();
+    let selection = selection?;
+    let elevated = elevated_or_unknown(winget.elevated());
+    install_selection(ctx, ui, &rel, selection, f, elevated, stop).await?;
+    if let Some(name) = old_program_left(ctx, &rel) {
+        ui.output(&output::gh_old_program_stays(&name));
     }
-}
-
-/// After an upgrade of an app its installer had put in place: when the app is portable now
-/// (the new installer failed, or the release has none), the name in the Windows list of the
-/// old program, which stays installed.
-fn old_program_left(ctx: &OpsCtx<'_>, rel: &Rel<'_>) -> Option<String> {
-    use crate::github::install as gh;
-    let Some(Prior {
-        mode: gh::Mode::Installer(arp),
-        ..
-    }) = &rel.prior
-    else {
-        return None;
-    };
-    let now = gh::installed_mode(&ctx.data.install_layout(), &rel.app, &rel.version).ok()?;
-    if now != gh::Mode::Portable {
-        return None;
-    }
-    let name = arp.as_ref().and_then(|k| {
-        let keys = rel.env.arp.keys().ok()?;
-        keys.into_iter()
-            .find(|x| x.hive == k.hive && x.key.eq_ignore_ascii_case(&k.key))
-            .map(|x| x.name)
-    });
-    Some(name.unwrap_or_else(|| rel.app.clone()))
+    Ok(())
 }
 
 #[cfg(test)]

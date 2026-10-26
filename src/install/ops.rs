@@ -1261,18 +1261,33 @@ pub async fn check_releases(http: &Http, web: &str, list: &mut UpgradeList) {
 /// `web`, its latest tag says whether a newer version is available; one not checked keeps
 /// `Unknown` and says why in `latest`.
 pub async fn release_rows(layout: &Layout, http: &Http, web: Option<&str>, rows: &mut [ListRow]) {
-    use crate::installed::correlate::{Correlation, Rule, UpdateState};
-    if !rows.iter().any(|r| r.origin == "wingetrs") {
+    let checks = mark_release_rows(layout, rows);
+    let Some(web) = web else {
         return;
+    };
+    let repos: Vec<GhRepo> = checks.iter().map(|(_, r)| r.clone()).collect();
+    let versions = latest_release_versions(http, web, &repos).await;
+    for ((i, _), latest) in checks.into_iter().zip(versions) {
+        set_release_state(&mut rows[i], latest.map_err(|e| release_unchecked(&e)));
+    }
+}
+
+/// The sources of [`release_rows`], read from `state.db` and each `install.json` (the TUI's
+/// scan too): the rows of release apps become `Matched` to `github:<owner>/<repo>`. Returns the
+/// rows whose latest tag is worth reading, with their repository.
+pub fn mark_release_rows(layout: &Layout, rows: &mut [ListRow]) -> Vec<(usize, GhRepo)> {
+    use crate::installed::correlate::{Correlation, Rule, UpdateState};
+    let mut checks: Vec<(usize, GhRepo)> = Vec::new();
+    if !rows.iter().any(|r| r.origin == "wingetrs") {
+        return checks;
     }
     let state = match read_state(layout) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "state.db ilegível; apps de release sem fonte");
-            return;
+            return checks;
         }
     };
-    let mut checks: Vec<(usize, GhRepo)> = Vec::new();
     for (i, r) in rows.iter_mut().enumerate() {
         let Some(app) = r
             .app_key
@@ -1293,7 +1308,7 @@ pub async fn release_rows(layout: &Layout, http: &Http, web: Option<&str>, rows:
         );
         r.correlation = Correlation::Matched {
             source: if installer {
-                format!("{} (instalador)", rec.bucket)
+                format!("{}{INSTALLER_SUFFIX}", rec.bucket)
             } else {
                 rec.bucket.clone()
             },
@@ -1304,31 +1319,52 @@ pub async fn release_rows(layout: &Layout, http: &Http, web: Option<&str>, rows:
             checks.push((i, repo));
         }
     }
-    let Some(web) = web else {
-        return;
-    };
-    let repos: Vec<GhRepo> = checks.iter().map(|(_, r)| r.clone()).collect();
-    let versions = latest_release_versions(http, web, &repos).await;
-    for ((i, _), latest) in checks.into_iter().zip(versions) {
-        let r = &mut rows[i];
-        match latest {
-            Ok(v) => {
-                let newer = r
-                    .installed_version
-                    .as_deref()
-                    .is_some_and(|cur| Version::parse(&v) > Version::parse(cur));
-                r.state = if newer {
-                    UpdateState::Available { latest: v.clone() }
-                } else {
-                    UpdateState::UpToDate
-                };
-                r.latest = Some(v);
-            }
-            Err(e) => {
-                r.state = UpdateState::Unknown;
-                r.latest = Some(release_unchecked(&e));
-            }
+    checks
+}
+
+/// What `(instalador)` adds to the source of an app its release installer put in place.
+pub const INSTALLER_SUFFIX: &str = " (instalador)";
+
+/// Whether `source` (of a `Matched` row) is a GitHub release's; never a catalog's.
+pub fn is_release_source(source: &str) -> bool {
+    source.starts_with("github:")
+}
+
+/// The row's state from its latest release: the newer version (compared as versions), up to
+/// date, or `Unknown` with why it was not checked in `latest` (`Err`: [`release_unchecked`]).
+pub fn set_release_state(r: &mut ListRow, latest: Result<String, String>) {
+    use crate::installed::correlate::UpdateState;
+    match latest {
+        Ok(v) => {
+            let newer = r
+                .installed_version
+                .as_deref()
+                .is_some_and(|cur| Version::parse(&v) > Version::parse(cur));
+            r.state = if newer {
+                UpdateState::Available { latest: v.clone() }
+            } else {
+                UpdateState::UpToDate
+            };
+            r.latest = Some(v);
         }
+        Err(note) => {
+            r.state = UpdateState::Unknown;
+            r.latest = Some(note);
+        }
+    }
+}
+
+/// Why a release app's row was not checked (`não conferido (…)`): its `latest` while its
+/// state is `Unknown`.
+pub fn release_note(r: &ListRow) -> Option<&str> {
+    use crate::installed::correlate::{Correlation, UpdateState};
+    match (&r.correlation, &r.state) {
+        (Correlation::Matched { source, .. }, UpdateState::Unknown)
+            if is_release_source(source) =>
+        {
+            r.latest.as_deref()
+        }
+        _ => None,
     }
 }
 

@@ -1925,6 +1925,13 @@ async fn rate_limited_upgrade_reports_reset() {
     let at = wingetrs::github::reset_clock(1_700_000_000);
     assert!(e.to_string().contains(&format!("até {at}")), "{e:#}");
     assert_eq!(wingetrs::github::clock_at(1_700_000_000, 0), "22:13");
+    // The TUI's plan: the same error, the same hour.
+    let env = w.flows.github().unwrap();
+    let tui = wingetrs::tui::jobs::plan_release_upgrade(&w.ctx(), &env, "tool", None, false)
+        .await
+        .err()
+        .unwrap();
+    assert!(tui.contains(&format!("até {at}")), "{tui}");
     assert_eq!(
         wingetrs::github::clock_at(1_700_000_000, -3 * 3600),
         "19:13"
@@ -2187,4 +2194,636 @@ async fn upgrade_installer_failure_falls_back_and_says_old_program_stays() {
         .await
         .unwrap();
     assert!(w.uninstalled().is_empty());
+}
+// ---- Task 211: the TUI (rows, actions, jobs) ----
+
+use wingetrs::tui::app::{Action, App, Cmd, Msg, Planned, SourceFilter, Tab, update};
+use wingetrs::tui::jobs;
+use wingetrs::tui::theme::GlyphSet;
+use wingetrs::winget_install::uninstall_cmd::{Rule as UninstallRule, UninstallCommand};
+
+const UNINSTALL_EXE: &str = r"C:\Users\u\AppData\Local\Programs\Tool\unins000.exe";
+
+fn release_row(name: &str, source: &str, available: bool) -> ListRow {
+    ListRow {
+        name: name.into(),
+        app_key: format!("wingetrs/{name}"),
+        origin: "wingetrs".into(),
+        installed_version: Some("1.0.0".into()),
+        correlation: Correlation::Matched {
+            source: source.into(),
+            package_id: name.into(),
+            rule: Rule::ScoopManifest,
+        },
+        state: if available {
+            UpdateState::Available {
+                latest: "1.1.0".into(),
+            }
+        } else {
+            UpdateState::UpToDate
+        },
+        ..Default::default()
+    }
+}
+
+fn press(c: char) -> Msg {
+    Msg::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char(c),
+        crossterm::event::KeyModifiers::NONE,
+    ))
+}
+
+/// A command that would reach winget (bridge, native plan or install, its catalog, its
+/// manifests, its icons) or a catalog package of a release row.
+fn winget_cmd(c: &Cmd) -> bool {
+    match c {
+        Cmd::PlanWingetInstall { .. }
+        | Cmd::PlanWingetUninstall(_)
+        | Cmd::FetchApplicability { .. }
+        | Cmd::PlanPortable { .. } => true,
+        Cmd::PlanInstall { source_name, .. } => !source_name.starts_with("scoop:"),
+        Cmd::PrefetchIcons { keys, .. } => keys.iter().any(|(s, _)| s.starts_with("github:")),
+        Cmd::EncodeCachedIcon { source, .. } => source.starts_with("github:"),
+        Cmd::Execute(a) => matches!(
+            a,
+            Action::Bridge(_)
+                | Action::WingetInstall(_)
+                | Action::WingetUninstall(_)
+                | Action::WingetRegistryOnly(_)
+                | Action::WingetUpgrade { .. }
+        ),
+        Cmd::PlanBatch { items } => items.iter().any(winget_cmd),
+        _ => false,
+    }
+}
+
+fn select(a: &mut App, name: &str) {
+    a.selected = a
+        .installed_view()
+        .iter()
+        .position(|r| r.name == name)
+        .unwrap();
+}
+
+#[test]
+fn tui_release_rows_never_reach_winget() {
+    let rows = vec![
+        release_row("tool", "github:o/tool", true),
+        release_row("setup", "github:o/setup (instalador)", true),
+    ];
+    let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+    let mut seen: Vec<Cmd> = update(&mut a, Msg::InstalledLoaded(rows));
+    // The Updates tab reads their latest tags; never winget's applicability.
+    assert!(
+        seen.contains(&Cmd::CheckReleases {
+            rows: vec![
+                ("wingetrs/tool".into(), GhRepo::parse("o/tool").unwrap()),
+                ("wingetrs/setup".into(), GhRepo::parse("o/setup").unwrap()),
+            ]
+        }),
+        "{seen:?}"
+    );
+    a.tab = Tab::Updates;
+    assert_eq!(a.installed_view().len(), 2);
+    // `U`: the release's own plan.
+    select(&mut a, "tool");
+    let cmds = update(&mut a, press('U'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanReleaseUpgrade {
+            app: "tool".into(),
+            asset: None,
+            keep: false
+        }]
+    );
+    seen.extend(cmds);
+    update(&mut a, Msg::Planned(Err("x".into())));
+    a.tab = Tab::Installed;
+    // `u` on an app its installer put in place: its uninstaller; on a portable one: the
+    // wingetrs removal.
+    select(&mut a, "setup");
+    let cmds = update(&mut a, press('u'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanReleaseRemove {
+            app: "setup".into()
+        }]
+    );
+    seen.extend(cmds);
+    update(&mut a, Msg::Planned(Err("x".into())));
+    select(&mut a, "tool");
+    let cmds = update(&mut a, press('u'));
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanRemove {
+            app: "tool".into(),
+            purge: false
+        }]
+    );
+    seen.extend(cmds);
+    update(&mut a, Msg::Planned(Err("x".into())));
+    // No icon to fetch for them, and the winget filter leaves them out.
+    let window = 0..a.installed_view().len();
+    assert!(a.list_keys(window).iter().all(Option::is_none));
+    a.filter = SourceFilter::Winget;
+    assert!(a.installed_view().is_empty());
+    a.filter = SourceFilter::All;
+    // The actions menu and its upgrade item.
+    a.tab = Tab::Updates;
+    select(&mut a, "setup");
+    seen.extend(update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    ));
+    seen.extend(update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    ));
+    assert!(
+        seen.contains(&Cmd::PlanReleaseUpgrade {
+            app: "setup".into(),
+            asset: None,
+            keep: false
+        }),
+        "{seen:?}"
+    );
+    assert!(!seen.iter().any(winget_cmd), "{seen:?}");
+    // A limit: the row stays in the Updates tab and says why.
+    update(&mut a, Msg::Planned(Err("x".into())));
+    let note = "não conferido (limite do GitHub até 19:13)".to_string();
+    update(
+        &mut a,
+        Msg::ReleaseChecked {
+            app_key: "wingetrs/tool".into(),
+            latest: Err(note.clone()),
+        },
+    );
+    let row = a
+        .installed_view()
+        .into_iter()
+        .find(|r| r.name == "tool")
+        .cloned()
+        .unwrap();
+    assert_eq!(row.state, UpdateState::Unknown);
+    assert_eq!(
+        wingetrs::install::ops::release_note(&row),
+        Some(note.as_str())
+    );
+    // A newer version: Available, compared as versions.
+    update(
+        &mut a,
+        Msg::ReleaseChecked {
+            app_key: "wingetrs/tool".into(),
+            latest: Ok("1.10.0".into()),
+        },
+    );
+    let row = a
+        .installed
+        .iter()
+        .find(|r| r.name == "tool")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        row.state,
+        UpdateState::Available {
+            latest: "1.10.0".into()
+        }
+    );
+    // The saved file is not in the release: the user picks the file, then it is planned.
+    update(
+        &mut a,
+        Msg::Planned(Ok(Planned::ChooseAsset {
+            app: "tool".into(),
+            expected: Some("tool-1.10.0-windows.zip".into()),
+            names: vec!["tool-x64.zip".into()],
+        })),
+    );
+    assert!(matches!(
+        a.modal,
+        Some(wingetrs::tui::app::Modal::PickingAsset { .. })
+    ));
+    let cmds = update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    assert_eq!(
+        cmds,
+        vec![Cmd::PlanReleaseUpgrade {
+            app: "tool".into(),
+            asset: Some("tool-x64.zip".into()),
+            keep: false
+        }]
+    );
+}
+
+#[test]
+fn tui_release_upgrade_always_asks_and_forget_too() {
+    use wingetrs::config::ConfirmMode;
+    for mode in [
+        ConfirmMode::Never,
+        ConfirmMode::Removals,
+        ConfirmMode::Always,
+    ] {
+        let forget = Action::ReleaseForget {
+            app: "tool".into(),
+            version: "1.0.0".into(),
+            why: "x".into(),
+        };
+        assert!(wingetrs::tui::app::needs_confirm(mode, &forget), "{mode:?}");
+    }
+}
+
+// ---- equivalence of the TUI's jobs and the CLI ----
+
+/// The uninstaller an ARP record names: it removes its key.
+struct UninstallLauncher {
+    keys: Arc<Mutex<Vec<ArpKey>>>,
+    runs: Mutex<Vec<LaunchSpec>>,
+}
+
+impl Launcher for UninstallLauncher {
+    fn run(&self, spec: &LaunchSpec) -> std::io::Result<i32> {
+        self.runs.lock().unwrap().push(spec.clone());
+        self.keys.lock().unwrap().retain(|k| k.key != "Tool_is1");
+        Ok(0)
+    }
+}
+
+struct NoHelper;
+impl wingetrs::bridge::elevated::ElevatedRunner for NoHelper {
+    fn install_package_lines(
+        &self,
+        _: &wingetrs::bridge::worker::PackageRequest,
+        _: &mut dyn FnMut(&str),
+    ) -> Result<i32, wingetrs::bridge::elevated::ElevatedError> {
+        unreachable!("elevated helper")
+    }
+}
+
+struct NoMsix;
+impl wingetrs::winget_install::msix::MsixOps for NoMsix {
+    fn add(
+        &self,
+        _: &Path,
+    ) -> Result<wingetrs::winget_install::msix::AddResult, wingetrs::winget_install::msix::MsixError>
+    {
+        unreachable!("msix")
+    }
+    fn remove(&self, _: &str) -> Result<usize, wingetrs::winget_install::msix::MsixError> {
+        unreachable!("msix")
+    }
+}
+
+struct NoClock;
+impl wingetrs::winget_install::uninstall::Clock for NoClock {
+    fn now(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+    fn sleep(&self, _: std::time::Duration) {}
+}
+
+struct NoRegistry;
+impl wingetrs::winget_install::orphans::ArpRegistry for NoRegistry {
+    fn export(&self, _: &[String]) -> std::io::Result<()> {
+        unreachable!("registry-only removal")
+    }
+    fn delete_user_key(&self, _: &str) -> std::io::Result<()> {
+        unreachable!("registry-only removal")
+    }
+    fn still_orphan(&self, _: Hive, _: &str) -> bool {
+        unreachable!("orphan")
+    }
+}
+
+fn no_bridge(
+    _: &str,
+    _: &[String],
+    _: &mut dyn FnMut(&str),
+) -> std::io::Result<(i32, Vec<String>)> {
+    unreachable!("winget bridge")
+}
+
+/// The plan the TUI gets for an ARP record (production: `plain_removal_plan`): its Inno
+/// uninstaller.
+fn record_plan(
+    req: &wingetrs::winget_install::previous::RemovalRequest,
+) -> Result<UninstallPlan, String> {
+    Ok(UninstallPlan {
+        target: wingetrs::winget_install::uninstall::target_of(&req.app_key).unwrap(),
+        name: req.name.clone(),
+        version: req.version.clone(),
+        command: Some(UninstallCommand {
+            rule: UninstallRule::Inno,
+            program: UNINSTALL_EXE.into(),
+            args: "/VERYSILENT".into(),
+            interactive: false,
+        }),
+        elevation: Elevation::Never,
+        shared: None,
+    })
+}
+
+/// Runs `action` as the TUI's release job does, with a winget environment of fakes.
+async fn tui_release_job(
+    w: &World,
+    action: Action,
+) -> Result<wingetrs::tui::app::Done, wingetrs::tui::app::InstallFail> {
+    let ctx = w.ctx();
+    let env = w.flows.github().unwrap();
+    let launcher = UninstallLauncher {
+        keys: Arc::clone(&w.flows.arp.keys),
+        runs: Mutex::new(Vec::new()),
+    };
+    let keys = Arc::clone(&w.flows.arp.keys);
+    let key_exists = move |h: Hive, k: &str| {
+        keys.lock()
+            .unwrap()
+            .iter()
+            .any(|x| x.hive == h && x.key == k)
+    };
+    let msiexec = w.data.root().join("System32").join("msiexec.exe");
+    let wenv = jobs::WingetEnv {
+        install: wingetrs::winget_install::ops::WingetCtx {
+            data: &w.data,
+            http: &w.http,
+            wait: LockWait::NoWait,
+            progress: &*w.sink,
+            gate: LaunchGate::default(),
+            launcher: &launcher,
+            elevated: &NoHelper,
+            msix: &NoMsix,
+            scan: &Vec::new,
+            msiexec: msiexec.clone(),
+            busy: &|| false,
+            sleep: &|_| {},
+        },
+        uninstall: wingetrs::winget_install::uninstall::UninstallCtx {
+            launcher: &launcher,
+            elevated: &NoHelper,
+            msix: &NoMsix,
+            key_exists: &key_exists,
+            clock: &NoClock,
+            user_expand: &|_| None,
+            msiexec: &msiexec,
+            helper_line: &|_| {},
+            bridge: &no_bridge,
+        },
+        registry: &NoRegistry,
+        backups: w.data.root(),
+        free_space: &|_| None,
+        previous: &|_, _| Err("sem plano".into()),
+        stamp: "1".into(),
+    };
+    jobs::run_release_action(&ctx, &env, &wenv, action).await
+}
+
+/// `U` in the TUI: the plan job, then the action the confirmation queues.
+async fn tui_upgrade(w: &World, app: &str) {
+    let env = w.flows.github().unwrap();
+    let planned = jobs::plan_release_upgrade(&w.ctx(), &env, app, None, false)
+        .await
+        .unwrap();
+    let Planned::Ready { action, .. } = planned.clone() else {
+        panic!("{planned:?}");
+    };
+    assert!(matches!(action, Action::ReleaseUpgrade(_)), "{action:?}");
+    // The confirmation is the consent to the origin: it opens even with `confirm = never`,
+    // and Enter queues this very action.
+    let mut a = App::new(Vec::new(), GlyphSet::Nerd);
+    a.settings.behavior.confirm = wingetrs::config::ConfirmMode::Never;
+    update(&mut a, Msg::Planned(Ok(planned)));
+    assert!(
+        matches!(a.modal, Some(wingetrs::tui::app::Modal::Confirm { .. })),
+        "the consent must be asked"
+    );
+    let cmds = update(
+        &mut a,
+        Msg::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )),
+    );
+    assert!(cmds.contains(&Cmd::Execute(action.clone())), "{cmds:?}");
+    tui_release_job(w, action).await.unwrap();
+}
+
+/// `u` in the TUI: the installer's removal (release job) or the wingetrs removal.
+async fn tui_remove(w: &World, app: &str, installer: bool) {
+    if installer {
+        let planned = jobs::plan_release_remove(&w.ctx(), app, &w.flows.arp, &record_plan).unwrap();
+        let Planned::Ready { action, .. } = planned else {
+            panic!("{planned:?}");
+        };
+        tui_release_job(w, action).await.unwrap();
+    } else {
+        let Planned::Ready { action, .. } = jobs::plan_remove(&w.ctx(), app, false).unwrap() else {
+            panic!("expected a plan");
+        };
+        jobs::run_action(&w.ctx(), action).await.unwrap();
+    }
+}
+
+/// What an operation left: the record (without its time and hash, which hold the server's
+/// address), every file of the app's folders and of the shims, the user PATH and the ARP keys,
+/// with the root and the server's address replaced.
+fn disk(w: &World, app: &str) -> Vec<String> {
+    let root = w.data.root().display().to_string();
+    let uri = w.server.uri();
+    let norm = |s: &str| s.replace(&root, "ROOT").replace(&uri, "SERVER");
+    let mut out = Vec::new();
+    if let Some(r) = w.record(app) {
+        out.push(format!(
+            "record {} {} {} {:?}",
+            r.app, r.bucket, r.version, r.arch
+        ));
+    }
+    fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if e.file_name() == "current" {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else {
+                let rel = p.strip_prefix(base).unwrap().display().to_string();
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&w.layout().app_dir(app), w.data.root(), &mut files);
+    walk(&w.layout().shims(), w.data.root(), &mut files);
+    files.sort();
+    for (rel, bytes) in files {
+        match String::from_utf8(bytes) {
+            Ok(text) => out.push(format!("{rel}: {}", norm(&text))),
+            Err(e) => out.push(format!("{rel}: sha {}", sha_hex(e.as_bytes()))),
+        }
+    }
+    out.push(format!(
+        "PATH {}",
+        norm(&w.env.get_raw("Path").unwrap_or_default())
+    ));
+    let mut keys: Vec<String> = w
+        .flows
+        .arp
+        .keys
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|k| format!("{:?} {} {:?}", k.hive, k.key, k.version))
+        .collect();
+    keys.sort();
+    out.extend(keys);
+    out
+}
+
+/// Two identical worlds with `tool` installed portable (release v1.2.0) or by its installer
+/// (v1.0.0).
+async fn twins(installer: bool, answers: Vec<Answer>) -> (World, World) {
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        let w = World::with(answers.clone(), true).await;
+        if installer {
+            installer_release(&w, inno()).await;
+        } else {
+            w.release("v1.2.0", vec![a(ZIP, tool_zip())]).await;
+        }
+        w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+        out.push(w);
+    }
+    let tui = out.pop().unwrap();
+    (out.pop().unwrap(), tui)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_and_cli_remove_release_apps_alike() {
+    for installer in [false, true] {
+        let (cli, tui) = twins(installer, vec![Answer::Code(0)]).await;
+        assert_eq!(
+            disk(&cli, "tool"),
+            disk(&tui, "tool"),
+            "before, {installer}"
+        );
+        // The details of the row come from the record.
+        let d = wingetrs::github::flow::release_details(&tui.layout(), "tool").unwrap();
+        let text = d.description.unwrap();
+        assert!(text.contains("Release do GitHub de o/tool"), "{text}");
+        assert_eq!(
+            text.contains("Chave em Programas instalados: user"),
+            installer,
+            "{text}"
+        );
+        assert!(d.icon.is_none());
+        cli.run(&no_tty(), &["uninstall", "tool", "--yes"])
+            .await
+            .unwrap();
+        tui_remove(&tui, "tool", installer).await;
+        assert_eq!(cli.record("tool"), None, "{installer}");
+        assert_eq!(disk(&cli, "tool"), disk(&tui, "tool"), "after, {installer}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_and_cli_upgrade_release_apps_alike() {
+    for installer in [false, true] {
+        let (cli, tui) = twins(installer, vec![Answer::Code(0), Answer::Code(0)]).await;
+        for w in [&cli, &tui] {
+            *w.flows.launcher.key_name.lock().unwrap() = "Tool 1.1.0".into();
+            *w.flows.launcher.key_version.lock().unwrap() = "1.1.0".into();
+            let assets = if installer {
+                vec![
+                    a(SETUP_NEW, inno()),
+                    a(PLAIN_NEW, program()),
+                    a("SHA256SUMS.txt", b"x".to_vec()),
+                ]
+            } else {
+                vec![a("tool-1.3.0-windows.zip", zip_at("1.3.0", &[]))]
+            };
+            w.publish(if installer { "v1.1.0" } else { "v1.3.0" }, assets)
+                .await;
+        }
+        cli.run(&no_tty(), &UPGRADE_TOOL).await.unwrap();
+        tui_upgrade(&tui, "tool").await;
+        let want = if installer { "1.1.0" } else { "1.3.0" };
+        assert_eq!(cli.record("tool").unwrap().version, want);
+        assert_eq!(disk(&cli, "tool"), disk(&tui, "tool"), "{installer}");
+        assert_eq!(cli.launches().len(), tui.launches().len(), "{installer}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tui_release_remove_without_key_forgets_and_failure_keeps_record() {
+    // No key recorded: the CLI's refusal, with "esquecer" as the confirmation.
+    let w = World::with(vec![Answer::Code(0)], false).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    let planned = jobs::plan_release_remove(&w.ctx(), "tool", &w.flows.arp, &record_plan).unwrap();
+    let Planned::Ready { action, text } = planned else {
+        panic!("expected a plan");
+    };
+    assert!(
+        text.contains("o wingetrs não sabe desinstalar tool: o instalador não se registrou"),
+        "{text}"
+    );
+    assert!(matches!(action, Action::ReleaseForget { .. }), "{action:?}");
+    tui_release_job(&w, action).await.unwrap();
+    assert_eq!(w.record("tool"), None);
+    // A key gone: the record only.
+    let w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    w.flows
+        .arp
+        .keys
+        .lock()
+        .unwrap()
+        .retain(|k| k.key != "Tool_is1");
+    let planned = jobs::plan_release_remove(&w.ctx(), "tool", &w.flows.arp, &record_plan).unwrap();
+    let Planned::Ready { action, text } = planned else {
+        panic!("expected a plan");
+    };
+    assert!(text.contains("já foi removido"), "{text}");
+    tui_release_job(&w, action).await.unwrap();
+    assert_eq!(w.record("tool"), None);
+    // The uninstaller ran but the key stayed: the record stays.
+    let w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    let planned = jobs::plan_release_remove(&w.ctx(), "tool", &w.flows.arp, &record_plan).unwrap();
+    let Planned::Ready { action, .. } = planned else {
+        panic!("expected a plan");
+    };
+    let Action::ReleaseUninstall { arp, plan, .. } = action else {
+        panic!("expected the uninstaller");
+    };
+    let kept = Action::ReleaseUninstall {
+        app: "tool".into(),
+        version: "1.0.0".into(),
+        arp: wingetrs::install::state::InstallerRecord {
+            key: "Other".into(),
+            hive: Hive::MachineX64,
+            ..arp
+        },
+        plan,
+    };
+    let e = tui_release_job(&w, kept).await.unwrap_err();
+    assert!(
+        format!("{e:?}").contains("continua em Programas instalados"),
+        "{e:?}"
+    );
+    assert!(w.record("tool").is_some());
 }
