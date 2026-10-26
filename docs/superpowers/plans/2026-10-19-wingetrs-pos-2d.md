@@ -250,6 +250,28 @@ Testes (`tests/it/gh_asset.rs`): tabela com as listas reais de nomes dos 12 repo
 7. Confiança: o plano mostra "⚠ origem não revisada: <dono>/<repo>" e "release imutável: sim/não"; sem `--allow-unreviewed` ⇒ recusa com a dica (nunca implícito em `--yes`). `.exe` classificado como instalador ⇒ recusa "instalador <gerador>: fora do escopo da instalação por release".
 8. `--dry-run` mostra URL, digest e arquivo escolhido (regra do CLI: URL e hash só no `--dry-run`).
 
+**Emenda do usuário (2026-10-26) — substitui a recusa de instalador do item 7 e o teste 6.** Origem: `wingetrs install https://github.com/jonyduque/eprocia` caiu na busca do catálogo. O release v0.3.0 tem `eprocia-0.3.0-windows-amd64-instalador.exe`, `eprocia-0.3.0-windows-amd64.exe` e `SHA256SUMS.txt`.
+
+- **URL aceita.** `https://github.com/<dono>/<repo>` (com ou sem `/` no fim, `.git`, `www.`) e `https://github.com/<dono>/<repo>/releases/tag/<tag>` viram `gh:<dono>/<repo>[@<tag>]`, reconhecidos no mesmo ponto do item 1. Outras URLs do GitHub (issues, blob) são recusadas com uma dica. Dono e repositório só com `[A-Za-z0-9._-]`.
+- **Instalador é o padrão.** Quando o `pick` do mesmo build oferece um `.exe` classificado como instalador (`classify_pe`) e um programa, ou só o instalador, o plano usa o instalador sem perguntar. O plano mostra "instalador <gerador> (origem não revisada)" e "se falhar: instala só <programa>". `--asset` continua escolhendo pelo nome exato.
+- **Como o instalador roda.** O arquivo é baixado no cache do wingetrs e conferido pelo `digest` SHA-256 da API (sem digest, recusa). Ele roda com os privilégios do usuário e o wingetrs nunca o eleva. Se o próprio instalador pedir UAC, antes aparece "Aguardando autorização para executar como administrador". Os argumentos silenciosos saem por gerador, por lista fechada: Inno `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-`, NSIS `/S`. Gerador desconhecido roda sem argumentos, com a fase "Instalador de <app> rodando (pode abrir janelas)". Vale a regra da tela que não fica parada: spinner, fase e relógio. É código de terceiro, então exige `--allow-unreviewed` como o resto (nunca implícito em `--yes`), e a confirmação diz que o instalador roda com os privilégios do usuário. O que ele grava é aceito, como na exceção 2c (`installer.file`).
+- **Detecção.** O ARP (HKCU e HKLM 32/64) é lido antes e depois. A chave nova que aparecer é gravada no estado do app (`install.json`: modo `installer`, a chave ARP, o `UninstallString` lido) para a Task 211 remover e atualizar. O registro do usuário real só é tocado em produção; os testes usam o registro falso da 2d.
+- **Reserva: só o executável.** O instalador "falha" quando não inicia, sai com código diferente de 0 e de 3010 (3010 = ok, pede reinício), o UAC dele é recusado (1223) ou nenhuma chave ARP nova aparece. Aí o CLI mostra "o instalador falhou (<motivo>); instalando só o executável" e segue com o asset de programa do mesmo build, pelo caminho portátil dos itens 4–6 (shim etc.). Sem asset de programa, o erro é o do instalador e nada fica instalado. O JobLog registra as duas tentativas.
+- **`--scope machine` com release:** recusado com "releases do GitHub instalam só para o usuário; o instalador pode pedir administrador por conta própria".
+- **Testes que substituem o 6** (instalador falso pelo `Launcher` falso da 2d e registro falso; nunca instalador real):
+  - `gh_url_forms_parse` (tabela de URLs aceitas e recusadas);
+  - `gh_installer_is_default` (instalador e programa ⇒ roda o instalador com os args do gerador e grava a chave ARP);
+  - `gh_installer_failure_falls_back_to_exe` (código 1, UAC recusado e "nenhuma chave nova" ⇒ três casos; cada um termina com o programa instalado e a mensagem da reserva);
+  - `gh_installer_without_program_fails_clean` (nada instalado);
+  - `gh_installer_never_elevated` (o `Launcher` falso nunca recebe pedido de elevação do wingetrs);
+  - `gh_scope_machine_refused`.
+- **Mutações** que substituem a 2 do "Checks beyond":
+  - a reserva não roda depois de código 1 ⇒ `gh_installer_failure_falls_back_to_exe` PEGA;
+  - 3010 tratado como falha ⇒ um teste PEGA;
+  - args do Inno trocados ⇒ `gh_installer_is_default` PEGA.
+- **Files extras:** o executor de instalador e o registro falso da 2d por reuso (`grep` por `Launcher`), e `src/install/state.rs` (o modo e a chave ARP no `install.json`).
+- **Ao vivo (orquestrador, com pedido do usuário):** `wingetrs install https://github.com/jonyduque/eprocia --allow-unreviewed --dry-run` e depois a instalação real.
+
 Testes (`tests/it/gh_install.rs`, wiremock servindo a API e o zip montado no teste, raiz em tempdir, sem rede real):
 1. `gh_zip_installs_with_shim`.
 2. `gh_offers_bucket_manifest_first`.
