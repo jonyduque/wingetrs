@@ -314,6 +314,29 @@ Testes (`tests/it/gh_install.rs`, wiremock servindo a API e o zip montado no tes
 3. Limite da API atingido no `upgrade` ⇒ erro tipado com a hora de liberação; no `list --upgradable` ⇒ a linha diz "não conferido (limite do GitHub até HH:MM)".
 4. `uninstall` de app `github:` funciona como qualquer app do wingetrs.
 
+**Emenda (2026-10-26, depois da 210 com instalador):** a 210 instala de duas formas, e `install.json` diz qual (`mode`):
+- **portátil** (`.exe` solto ou compactado): já é um app comum do wingetrs; vale o texto acima;
+- **`installer`**: o programa foi instalado pelo instalador do release. O `install.json` guarda `arp` (a chave `…\Uninstall\<sub>` com a colmeia e a vista, o `UninstallString` lido) ou `null`. Hoje nada lê isso. Pela leitura do código, `uninstall` apagaria a pasta e a linha do `state.db` sem rodar o desinstalador, deixando o programa no Windows, e `upgrade` pula o app com "não está mais no catálogo".
+
+Regras novas (substituem o item 4 para `mode = installer`):
+1. **`uninstall` de app `installer` com `arp`:** roda o desinstalador do ARP pelo caminho que a 2d já usa para remover pacote do winget por chave (o mesmo motor da remoção nativa: `UninstallString`/`QuietUninstallString`, `msiexec /x` para MSI, auxiliar elevado quando a chave é HKLM, "Aguardando autorização…" antes do UAC). Releia a chave ARP ATUAL antes, sem usar o `UninstallString` gravado como fonte da verdade: se a chave sumiu, o programa já foi removido por fora e o wingetrs só limpa o registro, com um aviso. Depois de o desinstalador terminar bem e a chave sumir, apaga o registro do wingetrs (`state.db`, pasta da versão). Se o desinstalador falhar, mantém o registro e mostra o erro. Um caminho só com a remoção do winget, sem duplicar.
+2. **`uninstall` de app `installer` com `arp: null`:** recusa sem apagar nada: "o wingetrs não sabe desinstalar <app>: o instalador não se registrou em Programas instalados; use o desinstalador do próprio programa e depois `wingetrs uninstall <app> --forget`". `--forget` (novo) apaga só o registro do wingetrs. Teste dos dois caminhos.
+3. **`upgrade` de app `installer`:** a versão nova vem de `latest_tag`, como os portáteis. A atualização roda o instalador da versão nova pelo mesmo caminho da 210 (padrão instalador, reserva portátil, mesmas regras de ARP, `--allow-unreviewed`); o instalador costuma atualizar por cima. Depois, o registro e a chave ARP são regravados. Se o instalador falhar e a reserva instalar o portátil, o app vira portátil, o registro antigo do modo instalador sai e o CLI avisa que a versão anterior instalada pelo instalador continua no Windows e diz o nome dela em Programas instalados.
+4. **`list` e a TUI:** apps `installer` aparecem com a fonte `github:dono/repo` e "(instalador)".
+
+Testes extras:
+- `uninstall_installer_app_runs_arp_uninstaller` (Launcher falso, registro falso; a chave some ⇒ registro apagado);
+- `uninstall_installer_app_key_gone_cleans_record`;
+- `uninstall_installer_without_arp_refuses_and_forget_works`;
+- `uninstall_installer_failure_keeps_record`;
+- `upgrade_installer_app_runs_new_installer_and_rerecords_arp`.
+
+Mutações:
+- `uninstall` de `installer` cair no caminho portátil ⇒ `uninstall_installer_app_runs_arp_uninstaller` PEGA;
+- apagar o registro quando o desinstalador falha ⇒ `uninstall_installer_failure_keeps_record` PEGA.
+
+**Modelo:** opus (revisor opus), por causa da remoção elevada.
+
 Testes (`tests/it/gh_install.rs`, continuação):
 1. `upgradable_uses_redirect_tag`.
 2. `upgrade_keeps_asset_pattern`.

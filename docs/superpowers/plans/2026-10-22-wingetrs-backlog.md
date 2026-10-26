@@ -18,6 +18,7 @@
 | 234 | `reg.exe`/`msiexec.exe` por KnownFolder (segurança, revisão da 233) | — |
 | 235 | Zip com Deflate64 (feature `deflate64` do `zip`, decisão do usuário) | — |
 | 236 | Ícone do wingetrs no topo da TUI (imagem + glifo de reserva) | — |
+| 237 | "Já instalado?" em todos os modos + propriedade do winget (pedido do usuário) | 211 |
 
 **Decisões do usuário (2026-10-22):**
 - d-E = B: um pwsh reaproveitado por execução, cache por SHA, e o AST nunca deixa o veredito mais brando.
@@ -2623,3 +2624,37 @@ Testes (`tests/it/wi_msi_portable.rs`, novo; `mod wi_msi_portable;` do orquestra
 - Rodar o binário real (`target/release/wingetrs.exe`) no Windows Terminal não é possível para o agente (sem console); diga ao orquestrador o que o usuário deve ver.
 
 **Relatório:** `.claude/tasks/task-236-report.md`.
+
+## Bloco 237
+
+### Task 237: "Já instalado?" antes de instalar, em todos os modos, e registro de propriedade do winget
+
+**Modelo:** opus (revisor opus). Pedido do usuário (2026-10-26).
+
+Levantamento do código no mesmo dia (leitura, não testado):
+- **App do Scoop:** só o `state.db`. Mesma versão é recusada (`PlanError::AlreadyInstalled`); versão diferente vira atualização sem seletor; `plan_for` não compara o bucket (o mesmo id de outro bucket substituiria o app).
+- **winget pelo motor nativo:** não verifica nada; roda o instalador por cima. Só grava uma "dica" em `winget_ops`.
+- **winget pela ponte:** não verifica nada; grava só o JobLog.
+- **Release do GitHub:** recusa qualquer reinstalação, sem caminho de atualização (a 211 cobre o `upgrade`).
+- **Fora do wingetrs** (ARP, MSIX, winget, Scoop do usuário): nenhum modo olha.
+
+**Files:** `src/cli/install_cmd.rs`, `src/cli/winget_cmd.rs`, `src/install/ops.rs`, `src/winget_install/ops.rs`, `src/installed/*` (só a função de correlação, por reuso), `src/install/state.rs` (tabela de propriedade), `src/cli/output.rs`, `src/tui/jobs.rs`/`app.rs` (o mesmo seletor na TUI), testes `tests/it/already_installed.rs` (novo).
+
+**Contrato:**
+1. **Uma função só:** `existing_install(&InstalledIndex, target) -> Option<Existing>`, chamada por TODOS os modos antes do plano (Scoop, winget nativo, ponte, release). `Existing` = `{ quem: Wingetrs{bucket}|Arp{key}|Msix|Winget|ScoopUser, versão, nome }`. Reaproveita a correlação do `list` (a mesma que liga ARP ao id do winget), sem regra paralela; teste de equivalência com o `list`.
+2. **Seletor** (CLI no estilo TUI; TUI no mesmo texto): "{nome} {versão} já está instalado ({quem})", com as opções:
+   - **Atualizar a instalação existente** (só quando há versão mais nova e o wingetrs sabe atualizar aquela origem; senão, a opção some);
+   - **Instalar mesmo assim** (reinstala por cima, ou instala ao lado quando a origem é outra, com o aviso "ficarão duas cópias" quando for o caso);
+   - **Cancelar**.
+3. **Sem terminal ou com `--yes`:** nunca instala em dobro sozinho. Mesma origem e versão mais nova ⇒ atualiza (o comportamento de hoje do Scoop). Qualquer outro caso ⇒ cancela com a dica "use `--reinstall` para instalar mesmo assim". `--reinstall` (novo) é a forma explícita.
+4. **Bucket diferente** (mesmo id de outro bucket do Scoop): conta como "outra origem", nunca substitui em silêncio.
+5. **Registro de propriedade do winget:** instalação pelo motor nativo e pela ponte grava na tabela nova `owned(source, id, version, arp_key, installed_at)`, depois de achar a chave ARP/MSIX (a mesma busca do `find_installed`). O `list` mostra "(wingetrs)" nesses itens; `uninstall` e `upgrade` continuam pelo caminho do ARP, mas passam a saber que foi o wingetrs que instalou. Sem chave, o registro guarda `arp_key: None` e o aviso de "não apareceu na lista de instalados" que já existe.
+
+#### Verificação (cole cada `[OK] mutação PEGA`)
+- Um teste por modo × origem: Scoop/wingetrs, Scoop/outro bucket, winget/ARP, winget/MSIX, release/wingetrs e "nada instalado", com registro e lista falsos.
+- `--yes` sem terminal com origem diferente ⇒ cancela (mutação "instala mesmo assim" PEGA).
+- Equivalência: `existing_install` e o `list` dão a mesma origem e versão para o mesmo índice.
+- O registro de propriedade é gravado pela ponte e pelo nativo (mutação "não grava" PEGA).
+- A TUI mostra o mesmo seletor (teste de estado).
+
+**Relatório:** `.claude/tasks/task-237-report.md`.
