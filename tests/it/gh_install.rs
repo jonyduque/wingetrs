@@ -120,6 +120,8 @@ struct FakeLauncher {
     specs: Mutex<Vec<LaunchSpec>>,
     answers: Mutex<VecDeque<Answer>>,
     writes_key: bool,
+    /// `DisplayName` of the key it writes.
+    key_name: Mutex<String>,
     keys: Arc<Mutex<Vec<ArpKey>>>,
     /// Whether the launched file existed with the asset's bytes while it "ran".
     seen: Mutex<Vec<Option<String>>>,
@@ -142,10 +144,14 @@ impl Launcher for FakeLauncher {
             Answer::Os(e) => Err(std::io::Error::from_raw_os_error(e)),
             Answer::Code(c) => {
                 if self.writes_key && (c == 0 || c == 3010) {
-                    self.keys.lock().unwrap().push(ArpKey {
+                    // Inno writes `Tool_is1`, replacing the one an older version left.
+                    let mut keys = self.keys.lock().unwrap();
+                    keys.retain(|k| k.key != "Tool_is1");
+                    keys.push(ArpKey {
                         hive: Hive::User,
                         key: "Tool_is1".into(),
-                        name: "Tool 1.0.0".into(),
+                        name: self.key_name.lock().unwrap().clone(),
+                        version: Some("1.0.0".into()),
                     });
                 }
                 Ok(c)
@@ -392,19 +398,27 @@ impl World {
     }
 
     /// `answers`: what the installer returns, in order; `writes_key`: whether a successful
-    /// run adds its ARP key.
+    /// run writes its ARP key.
     async fn with(answers: Vec<Answer>, writes_key: bool) -> World {
+        World::with_keys(answers, writes_key, Vec::new()).await
+    }
+
+    /// [`World::with`] whose ARP also has `extra` before the install.
+    async fn with_keys(answers: Vec<Answer>, writes_key: bool, extra: Vec<ArpKey>) -> World {
         let t = tempfile::tempdir().unwrap();
         let data = DataDir::new(t.path().join("root"));
         let layout = data.install_layout();
         std::fs::create_dir_all(layout.launcher().parent().unwrap()).unwrap();
         std::fs::write(layout.launcher(), program()).unwrap();
         let server = MockServer::start().await;
-        let keys = Arc::new(Mutex::new(vec![ArpKey {
+        let mut before = vec![ArpKey {
             hive: Hive::MachineX64,
             key: "Other".into(),
             name: "Other app".into(),
-        }]));
+            version: Some("3.0".into()),
+        }];
+        before.extend(extra);
+        let keys = Arc::new(Mutex::new(before));
         let phases = Arc::new(Mutex::new(Vec::new()));
         let seen = phases.clone();
         let sink: Sink = Box::new(move |ev: &ProgressEvent| {
@@ -419,6 +433,7 @@ impl World {
                     specs: Mutex::new(Vec::new()),
                     answers: Mutex::new(answers.into()),
                     writes_key,
+                    key_name: Mutex::new("Tool 1.0.0".into()),
                     keys: keys.clone(),
                     seen: Mutex::new(Vec::new()),
                 },
@@ -1056,11 +1071,6 @@ async fn gh_installer_failure_falls_back_to_exe() {
             true,
             "autorização de administrador recusada",
         ),
-        (
-            Answer::Code(0),
-            false,
-            "nenhum registro novo em Programas instalados",
-        ),
     ];
     for (answer, writes_key, reason) in cases {
         let w = World::with(vec![answer], writes_key).await;
@@ -1086,6 +1096,82 @@ async fn gh_installer_failure_falls_back_to_exe() {
         );
         assert_eq!(w.install_json("tool").get("mode"), None, "{reason}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_installer_without_arp_is_success_with_warning() {
+    let w = World::with(vec![Answer::Code(0)], false).await;
+    installer_release(&w, inno()).await;
+    let ui = no_tty();
+    w.run(&ui, &YES_UNREVIEWED).await.unwrap();
+    assert_eq!(w.launches().len(), 1);
+    let text = ui.text();
+    assert!(
+        text.contains(
+            "o instalador não se registrou em Programas instalados; para remover, use o desinstalador do próprio programa"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("o instalador falhou"), "{text}");
+    let j = w.install_json("tool");
+    assert_eq!(j["mode"], "installer");
+    assert_eq!(j["arp"], serde_json::Value::Null);
+    assert_eq!(w.record("tool").unwrap().bucket, "github:o/tool");
+    // The program was not installed a second time.
+    assert!(
+        !w.layout()
+            .shims()
+            .join("tool-1.0.0-windows-amd64.shim")
+            .exists()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_installer_reusing_existing_arp_key_is_recorded() {
+    // An update: the key an older version left gets a new `DisplayVersion`.
+    let old = ArpKey {
+        hive: Hive::User,
+        key: "Tool_is1".into(),
+        name: "Tool 0.9".into(),
+        version: Some("0.9".into()),
+    };
+    let w = World::with_keys(vec![Answer::Code(0)], true, vec![old]).await;
+    installer_release(&w, inno()).await;
+    let ui = no_tty();
+    w.run(&ui, &YES_UNREVIEWED).await.unwrap();
+    let j = w.install_json("tool");
+    assert_eq!(j["mode"], "installer");
+    assert_eq!(j["arp"]["key"], "Tool_is1");
+    assert_eq!(j["uninstall_string"], UNINSTALL);
+    assert!(!ui.text().contains("não se registrou"), "{}", ui.text());
+    // Only the version tells it: a `DisplayName` without the app's name.
+    let old = ArpKey {
+        hive: Hive::User,
+        key: "Tool_is1".into(),
+        name: "Ferramenta 0.9".into(),
+        version: Some("0.9".into()),
+    };
+    let w = World::with_keys(vec![Answer::Code(0)], true, vec![old]).await;
+    *w.flows.launcher.key_name.lock().unwrap() = "Ferramenta 1.0".into();
+    installer_release(&w, inno()).await;
+    w.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
+    assert_eq!(w.install_json("tool")["arp"]["key"], "Tool_is1");
+    // A reinstall that leaves its key as it was: the key naming the app (any case).
+    let same = ArpKey {
+        hive: Hive::MachineX86,
+        key: "{ABC}".into(),
+        name: "TOOL desktop".into(),
+        version: Some("1.0.0".into()),
+    };
+    let w = World::with_keys(vec![Answer::Code(0)], false, vec![same]).await;
+    installer_release(&w, inno()).await;
+    let ui = no_tty();
+    w.run(&ui, &YES_UNREVIEWED).await.unwrap();
+    let j = w.install_json("tool");
+    assert_eq!(j["arp"]["key"], "{ABC}");
+    assert_eq!(j["arp"]["hive"], "machine32");
+    assert!(!ui.text().contains("não se registrou"), "{}", ui.text());
+    assert!(!ui.text().contains("o instalador falhou"), "{}", ui.text());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1119,9 +1205,9 @@ async fn gh_installer_never_elevated() {
     );
     let phases = w.phases.lock().unwrap().clone();
     assert!(
-        phases
-            .iter()
-            .any(|p| matches!(p, Phase::SelfElevating { name } if name == "tool")),
+        phases.iter().any(
+            |p| matches!(p, Phase::ReleaseInstaller { name, asks_admin: true } if name == "tool")
+        ),
         "{phases:?}"
     );
     // A plain installer: the running phase, never the UAC one.
@@ -1130,15 +1216,19 @@ async fn gh_installer_never_elevated() {
     w2.run(&no_tty(), &YES_UNREVIEWED).await.unwrap();
     let phases = w2.phases.lock().unwrap().clone();
     assert!(
-        phases
-            .iter()
-            .any(|p| matches!(p, Phase::RunningInstaller { name } if name == "tool")),
+        phases.iter().any(
+            |p| matches!(p, Phase::ReleaseInstaller { name, asks_admin: false } if name == "tool")
+        ),
         "{phases:?}"
     );
     assert!(
-        !phases
-            .iter()
-            .any(|p| matches!(p, Phase::SelfElevating { .. })),
+        !phases.iter().any(|p| matches!(
+            p,
+            Phase::ReleaseInstaller {
+                asks_admin: true,
+                ..
+            }
+        )),
         "{phases:?}"
     );
     for spec in w.launches().iter().chain(w2.launches().iter()) {
@@ -1180,4 +1270,106 @@ async fn gh_scope_machine_refused() {
     );
     assert_eq!(w.requests().await, 0);
     assert!(w.launches().is_empty());
+}
+
+#[test]
+fn gh_installer_phase_says_it_cannot_be_cancelled() {
+    use wingetrs::install::progress::{ELEVATION_NOTICE, phase_status, phase_title};
+    let no_cancel = "o instalador não pode ser cancelado pelo wingetrs; feche a janela dele";
+    for asks_admin in [false, true] {
+        let p = Phase::ReleaseInstaller {
+            name: "tool".into(),
+            asks_admin,
+        };
+        let title = phase_title(&p);
+        assert!(title.contains(no_cancel), "{title}");
+        assert!(
+            title.contains("instalador de tool rodando")
+                || title.contains("Instalador de tool rodando"),
+            "{title}"
+        );
+        assert_eq!(title.contains(ELEVATION_NOTICE), asks_admin, "{title}");
+        let status = phase_status(&p, std::time::Duration::from_secs(5));
+        assert!(
+            status.contains(no_cancel) && status.contains("00:05"),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_installer_block_matches_scoop_installer_file() {
+    use wingetrs::cli::output::{plan_third_party, third_party_block};
+    let mut w = World::with(vec![Answer::Code(0)], true).await;
+    installer_release(&w, inno()).await;
+    let ui = no_tty();
+    w.run(&ui, &["install", "gh:o/tool", "--dry-run"])
+        .await
+        .unwrap();
+    // The same installer as a bucket's `installer.file`.
+    let args: Vec<&str> = INNO_ARGS.split_whitespace().collect();
+    w.bucket_app(
+        "scoop:main",
+        serde_json::json!({
+            "version": "1.0.0",
+            "url": format!("https://example.invalid/{SETUP}"),
+            "hash": "a".repeat(64),
+            "installer": {"file": SETUP, "args": args},
+        }),
+    );
+    let ctx = w.ctx();
+    let Resolution::One(cand) = ops::resolve_target(&ctx, "tool", None).unwrap() else {
+        panic!("tool not found");
+    };
+    let plan = ops::plan_for(&ctx, &cand, false).unwrap().pop().unwrap();
+    let block = third_party_block(&plan_third_party(
+        &plan,
+        &wingetrs::install::script_ast::LexerOnly,
+    ));
+    assert!(!block.is_empty());
+    assert!(
+        ui.text().contains(&block),
+        "{}
+---
+{block}",
+        ui.text()
+    );
+    assert!(w.launches().is_empty());
+}
+
+#[test]
+fn gh_arp_name_rule_is_whole_word_and_unique() {
+    use wingetrs::github::install::{installed_key, names_app};
+    let key = |k: &str, name: &str| ArpKey {
+        hive: Hive::MachineX64,
+        key: k.into(),
+        name: name.into(),
+        version: Some("1".into()),
+    };
+    // Nothing new or changed: only the name can tell.
+    let pick = |keys: Vec<ArpKey>, app: &str| installed_key(&keys.clone(), keys, app);
+    let got = pick(vec![key("gh", "GitHub Desktop"), key("git", "Git")], "git");
+    assert_eq!(got.map(|k| k.key).as_deref(), Some("git"));
+    assert_eq!(
+        pick(vec![key("gh", "GitHub Desktop"), key("gt", "Gitea")], "git"),
+        None
+    );
+    assert_eq!(
+        pick(vec![key("a", "Foo"), key("b", "Foo Tools")], "foo"),
+        None
+    );
+    for (name, app, want) in [
+        ("Git", "git", true),
+        ("git-lfs", "git", true),
+        ("Tool 1.0.0", "tool", true),
+        ("x.TOOL", "tool", true),
+        ("my-tool helper", "my-tool", true),
+        ("GitHub Desktop", "git", false),
+        ("Gitea", "git", false),
+        ("Toolbox", "tool", false),
+        ("Multitool", "tool", false),
+        ("Git", "", false),
+    ] {
+        assert_eq!(names_app(name, app), want, "{name} / {app}");
+    }
 }

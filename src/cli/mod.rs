@@ -224,7 +224,8 @@ pub enum Command {
         /// Escopo de um pacote do winget: user ou machine
         #[arg(long, value_parser = parse_scope, value_name = "ESCOPO")]
         scope: Option<crate::bridge::worker::ScopeArg>,
-        /// Permite instalar de um release do GitHub (origem não revisada por um bucket)
+        /// Permite instalar de um release do GitHub (origem não revisada por um bucket); basta
+        /// também para rodar o instalador do release, sem --allow-scripts
         #[arg(long)]
         allow_unreviewed: bool,
         /// Arquivo do release do GitHub a instalar (nome exato)

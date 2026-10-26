@@ -131,6 +131,7 @@ impl ArpView for ReleaseArp {
                     hive,
                     key: a.key,
                     name: a.name,
+                    version: a.version,
                 }),
                 _ => None,
             })

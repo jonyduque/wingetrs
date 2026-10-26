@@ -957,9 +957,6 @@ pub fn gh_installer_plan(
     if asks_admin {
         steps.push(crate::winget_install::plan::SELF_ADMIN_PROMPT.to_string());
     }
-    steps.push(
-        "O instalador roda com os seus privilégios e pode alterar qualquer arquivo seu".into(),
-    );
     if let Some(p) = fallback {
         steps.push(format!("Se falhar: instala só {p}"));
     }
@@ -979,6 +976,13 @@ pub fn gh_fallback(reason: &str) -> String {
     warning(&format!(
         "o instalador falhou ({reason}); instalando só o executável"
     ))
+}
+
+/// A release installer that succeeded without an entry in the Windows list.
+pub fn gh_not_registered() -> String {
+    warning(
+        "o instalador não se registrou em Programas instalados; para remover, use o desinstalador do próprio programa",
+    )
 }
 
 /// More than one asset fits and nobody can choose: the names and `--asset`.
@@ -1625,6 +1629,7 @@ impl Phases {
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
                 | Phase::RunningPackageInstaller { .. }
+                | Phase::ReleaseInstaller { .. }
                 | Phase::SelfUpdate(_)
                 | Phase::WaitingUpdate
                 | Phase::FetchingCatalog { .. }
@@ -1695,6 +1700,7 @@ impl Phases {
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
                 | Phase::RunningPackageInstaller { .. }
+                | Phase::ReleaseInstaller { .. }
                 | Phase::SelfUpdate(_)
                 | Phase::WaitingUpdate
                 | Phase::FetchingCatalog { .. }
@@ -1793,6 +1799,7 @@ impl Phases {
                 | Phase::Bridge { .. }
                 | Phase::RunningScript { .. }
                 | Phase::RunningPackageInstaller { .. }
+                | Phase::ReleaseInstaller { .. }
                 | Phase::SelfUpdate(SelfUpdateStep::Elevated) => {
                     label = phase_status(phase, elapsed);
                     if elapsed >= NATIVE_QUIET && !matches!(phase, Phase::CheckingRemoval { .. }) {

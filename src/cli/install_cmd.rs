@@ -1430,8 +1430,10 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// The installer of a release: plan, gates, confirmation, the run under `install.lock` and its
-/// record; when it fails, the program asset through the Scoop plan (no new question).
+/// The installer of a release: plan, the third-party block of `installer.file` (the same
+/// text), gates, confirmation, the run under `install.lock` and its record; when it fails, the
+/// program asset through the Scoop plan (no new question). `--allow-unreviewed` is the consent
+/// for this third-party code: unlike a bucket's `installer.file`, no `--allow-scripts`.
 #[allow(clippy::too_many_arguments)]
 async fn install_release_installer(
     ctx: &OpsCtx<'_>,
@@ -1452,13 +1454,6 @@ async fn install_release_installer(
         program.as_ref().map(|p| p.name.as_str()),
         inst.asks_admin,
     ));
-    let mut note = output::gh_trust(&rel.t.slug(), rel.release.immutable);
-    if f.dry_run {
-        let mut shown = vec![&inst.asset];
-        shown.extend(program.as_ref());
-        note.push_str(&release_details(rel, &shown));
-    }
-    ui.plan(&note);
     let args: Vec<String> = gh::silent_args(inst.generator)
         .split_whitespace()
         .map(str::to_string)
@@ -1468,6 +1463,15 @@ async fn install_release_installer(
         file: inst.asset.name.clone(),
         args,
     }];
+    // The same block the Scoop path shows for an `installer.file`.
+    ui.plan(&output::third_party_block(&code));
+    let mut note = output::gh_trust(&rel.t.slug(), rel.release.immutable);
+    if f.dry_run {
+        let mut shown = vec![&inst.asset];
+        shown.extend(program.as_ref());
+        note.push_str(&release_details(rel, &shown));
+    }
+    ui.plan(&note);
     let refusal = admin_gate(admin_code_refusal(elevated, &code, false), f)?;
     unreviewed_gate(&rel.t.slug(), f)?;
     if f.dry_run {
@@ -1488,6 +1492,9 @@ async fn install_release_installer(
                 "Instalado:",
                 &output::app_version(&rel.app, &rel.version),
             ));
+            if done.arp.is_none() {
+                ui.output(&output::gh_not_registered());
+            }
             if done.code == REBOOT_CODE {
                 emit::out(&output::reboot(false));
             }

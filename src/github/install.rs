@@ -377,6 +377,8 @@ pub struct ArpKey {
     pub hive: Hive,
     pub key: String,
     pub name: String,
+    /// `DisplayVersion`.
+    pub version: Option<String>,
 }
 
 /// The ARP (HKCU and HKLM 64/32-bit) as the installer flow reads it. Production:
@@ -416,19 +418,17 @@ pub enum InstallerFailure {
     UacRefused,
     #[error("saiu com o código {0}")]
     Code(i32),
-    #[error("nenhum registro novo em Programas instalados")]
-    NoNewKey,
     #[error("registro de programas ilegível: {0}")]
     Registry(String),
     #[error("cancelado antes de iniciar")]
     Cancelled,
 }
 
-/// A run that installed: the new ARP key, its `UninstallString` and the exit code (0 or
-/// [`REBOOT_CODE`]).
+/// A run that installed (exit code 0 or [`REBOOT_CODE`]): its ARP key, when it wrote or
+/// changed one, and that key's `UninstallString`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
-    pub arp: ArpKey,
+    pub arp: Option<ArpKey>,
     pub uninstall_string: Option<String>,
     pub code: i32,
 }
@@ -470,13 +470,10 @@ pub fn run_installer(
     if !gate.try_launch_for("instalador") {
         return Err(InstallerFailure::Cancelled);
     }
-    let name = run.app.to_string();
-    let phase = if run.asks_admin {
-        Phase::SelfElevating { name }
-    } else {
-        Phase::RunningInstaller { name }
-    };
-    progress(&ProgressEvent::Phase(phase));
+    progress(&ProgressEvent::Phase(Phase::ReleaseInstaller {
+        name: run.app.to_string(),
+        asks_admin: run.asks_admin,
+    }));
     let code = match env.launcher.run(&spec) {
         Ok(c) => c,
         Err(e) if e.raw_os_error() == Some(UAC_REFUSED) => {
@@ -488,27 +485,68 @@ pub fn run_installer(
         return Err(InstallerFailure::Code(code));
     }
     progress(&ProgressEvent::Phase(Phase::Verifying));
-    let after = env
-        .arp
-        .keys()
-        .map_err(|e| InstallerFailure::Registry(e.to_string()))?;
-    let new: Vec<ArpKey> = after
-        .into_iter()
-        .filter(|k| !before.iter().any(|b| same_key(b, k)))
-        .collect();
-    let app = run.app.to_ascii_lowercase();
-    let arp = new
-        .iter()
-        .find(|k| k.name.to_ascii_lowercase().contains(&app))
-        .or_else(|| new.first())
-        .cloned()
-        .ok_or(InstallerFailure::NoNewKey)?;
-    let uninstall_string = env.arp.uninstall_string(arp.hive, &arp.key);
+    // The installer already succeeded: an unreadable registry only loses the key.
+    let after = env.arp.keys().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "registro de programas ilegível depois do instalador");
+        Vec::new()
+    });
+    let arp = installed_key(&before, after, run.app);
+    let uninstall_string = arp
+        .as_ref()
+        .and_then(|k| env.arp.uninstall_string(k.hive, &k.key));
     Ok(Installed {
         arp,
         uninstall_string,
         code,
     })
+}
+
+/// Whether `app` is a whole word of `display_name` (any case): bounded by the ends, a space, a
+/// hyphen or a dot. `git` names "Git" and "Git 2.47", not "GitHub Desktop" nor "Gitea".
+pub fn names_app(display_name: &str, app: &str) -> bool {
+    let name = display_name.to_lowercase();
+    let app = app.to_lowercase();
+    if app.is_empty() {
+        return false;
+    }
+    let sep = |c: Option<char>| c.is_none_or(|c| matches!(c, ' ' | '-' | '.'));
+    name.match_indices(&app).any(|(at, _)| {
+        sep(name[..at].chars().next_back()) && sep(name[at + app.len()..].chars().next())
+    })
+}
+
+/// The ARP key of the app after its installer ran: a new key (the one naming `app` first);
+/// else a key that was already there and whose `DisplayVersion` changed (an update or a
+/// reinstall reuses it); else the only key whose `DisplayName` names `app` as a whole word
+/// ([`names_app`]). `None`: the installer did not register itself, or the name matches no key
+/// or more than one (a wrong key would make removal run another product's uninstaller).
+pub fn installed_key(before: &[ArpKey], after: Vec<ArpKey>, app: &str) -> Option<ArpKey> {
+    let named = |k: &ArpKey| names_app(&k.name, app);
+    let old = |k: &ArpKey| before.iter().find(|b| same_key(b, k));
+    let new: Vec<&ArpKey> = after.iter().filter(|k| old(k).is_none()).collect();
+    if let Some(k) = new.iter().find(|k| named(k)).or_else(|| new.first()) {
+        return Some((*k).clone());
+    }
+    let changed: Vec<&ArpKey> = after
+        .iter()
+        .filter(|k| old(k).is_some_and(|b| b.version != k.version))
+        .collect();
+    if let Some(k) = changed
+        .iter()
+        .find(|k| named(k))
+        .or_else(|| changed.first())
+    {
+        return Some((*k).clone());
+    }
+    match after
+        .iter()
+        .filter(|k| named(k))
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
 }
 
 /// A fresh empty folder under `<root>\tmp`, removed with everything in it when dropped.
@@ -573,16 +611,12 @@ pub fn record_installer(
     let vdir = layout.version_dir(app, version);
     std::fs::create_dir_all(&vdir)?;
     std::fs::write(vdir.join("manifest.json"), manifest)?;
-    state::write_installer_json(
-        &vdir,
-        bucket,
-        version,
-        &InstallerRecord {
-            hive: installed.arp.hive,
-            key: installed.arp.key.clone(),
-            uninstall_string: installed.uninstall_string.clone(),
-        },
-    )?;
+    let record = installed.arp.as_ref().map(|k| InstallerRecord {
+        hive: k.hive,
+        key: k.key.clone(),
+        uninstall_string: installed.uninstall_string.clone(),
+    });
+    state::write_installer_json(&vdir, bucket, version, record.as_ref())?;
     let current = layout.current(app);
     if crate::install::link::target(&current).is_ok() {
         crate::install::link::remove(&current)?;

@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 /// Shown, the same in the CLI and the TUI, before every UAC prompt wingetrs opens or a
 /// self-elevating installer opens (Task 201), with the clock running until it is answered.
 pub const ELEVATION_NOTICE: &str = "Aguardando autorização para executar como administrador";
+/// The installer of a GitHub release (Task 210): Ctrl+C does not stop it.
+pub const RELEASE_NO_CANCEL: &str =
+    "o instalador não pode ser cancelado pelo wingetrs; feche a janela dele";
 /// A refused UAC prompt (the CLI and the TUI say it the same way).
 pub const ELEVATION_REFUSED: &str = "Permissão de administrador recusada.";
 /// Progress line of the elevated helper once its UAC prompt was accepted (or the session's
@@ -83,6 +86,9 @@ pub enum Phase {
     /// Scoop: the package's own installer (`installer.file`) or old uninstaller `file` is
     /// running; cannot be cancelled.
     RunningPackageInstaller { file: String },
+    /// GitHub release (Task 210): the installer of `name` runs unelevated; `asks_admin` when
+    /// its manifest asks for its own UAC prompt. wingetrs cannot cancel it.
+    ReleaseInstaller { name: String, asks_admin: bool },
     /// `wingetrs self update` (Task 213): one of its steps.
     SelfUpdate(SelfUpdateStep),
     /// `update`: another process holds the update lock and this one waits for it.
@@ -166,6 +172,15 @@ pub fn phase_title(phase: &Phase) -> String {
         Phase::RunningPackageInstaller { file } => {
             format!("Rodando o instalador do pacote ({file}; pode abrir janelas)")
         }
+        Phase::ReleaseInstaller { name, asks_admin } => {
+            if *asks_admin {
+                format!(
+                    "{ELEVATION_NOTICE} · instalador de {name} rodando (pode abrir janelas) · {RELEASE_NO_CANCEL}"
+                )
+            } else {
+                format!("Instalador de {name} rodando (pode abrir janelas) · {RELEASE_NO_CANCEL}")
+            }
+        }
         Phase::SelfUpdate(step) => match step {
             SelfUpdateStep::CheckingVersion => "Conferindo versão".into(),
             SelfUpdateStep::CheckingHash => "Conferindo SHA-256".into(),
@@ -234,7 +249,9 @@ pub fn phase_status(phase: &Phase, elapsed: Duration) -> String {
         | Phase::FetchingCatalog { .. }
         | Phase::WritingCatalog
         | Phase::ReadingInstalled
-        | Phase::Correlating => text,
+        | Phase::Correlating
+        // Its title already says it cannot be cancelled, and what to do.
+        | Phase::ReleaseInstaller { .. } => text,
     }
 }
 

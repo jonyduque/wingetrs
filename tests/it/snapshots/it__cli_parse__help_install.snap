@@ -33,7 +33,7 @@ Opções:
           Escopo de um pacote do winget: user ou machine
 
       --allow-unreviewed
-          Permite instalar de um release do GitHub (origem não revisada por um bucket)
+          Permite instalar de um release do GitHub (origem não revisada por um bucket); basta também para rodar o instalador do release, sem --allow-scripts
 
       --asset <ARQUIVO>
           Arquivo do release do GitHub a instalar (nome exato)

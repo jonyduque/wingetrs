@@ -278,20 +278,21 @@ pub fn hive_name(h: crate::installed::Hive) -> &'static str {
 }
 
 /// Writes `<version_dir>\install.json` of an app installed by its own installer: the fields
-/// of [`write_install_json`] plus `mode: "installer"` and the ARP key.
+/// of [`write_install_json`] plus `mode: "installer"` and the ARP key (`null` when the
+/// installer did not register itself).
 pub fn write_installer_json(
     version_dir: &Path,
     bucket: &str,
     version: &str,
-    rec: &InstallerRecord,
+    rec: Option<&InstallerRecord>,
 ) -> std::io::Result<()> {
     let v = serde_json::json!({
         "bucket": bucket,
         "version": version,
         "wingetrs": 1,
         "mode": "installer",
-        "arp": { "hive": hive_name(rec.hive), "key": rec.key },
-        "uninstall_string": rec.uninstall_string,
+        "arp": rec.map(|r| serde_json::json!({ "hive": hive_name(r.hive), "key": r.key })),
+        "uninstall_string": rec.and_then(|r| r.uninstall_string.clone()),
     });
     let bytes = serde_json::to_vec_pretty(&v).map_err(std::io::Error::other)?;
     let tmp = version_dir.join("install.json.tmp");
