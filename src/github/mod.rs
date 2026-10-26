@@ -1,6 +1,8 @@
 //! GitHub releases client: assets with their SHA-256 `digest`, and the latest tag through
 //! the web redirect (which does not spend the API rate limit).
 
+#[cfg(windows)]
+mod clock_win;
 pub mod install;
 pub mod pick;
 
@@ -17,7 +19,7 @@ pub enum GhError {
     Offline,
     #[error("repositório ou release não encontrado")]
     NotFound,
-    #[error("limite de requisições do GitHub atingido (renova em {reset:?})")]
+    #[error("limite de requisições do GitHub atingido{}", reset_text(*.reset))]
     RateLimited { reset: Option<u64> },
     #[error("o repositório não tem release publicada")]
     NoRelease,
@@ -37,7 +39,37 @@ pub enum GhError {
     InvalidTag(String),
 }
 
+/// ` até HH:MM` (local time) when the API said when its limit resets.
+fn reset_text(reset: Option<u64>) -> String {
+    reset
+        .map(|r| format!(" até {}", reset_clock(r)))
+        .unwrap_or_default()
+}
+
+/// `HH:MM` of the Unix time `unix` at `offset` seconds from UTC.
+pub fn clock_at(unix: u64, offset: i64) -> String {
+    let secs = i64::try_from(unix)
+        .unwrap_or(i64::MAX)
+        .saturating_add(offset);
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3600, day % 3600 / 60)
+}
+
+/// `HH:MM` of the Unix time `unix` in this machine's time zone (UTC when it cannot be read).
+pub fn reset_clock(unix: u64) -> String {
+    #[cfg(windows)]
+    let offset = clock_win::local_offset().unwrap_or(0);
+    #[cfg(not(windows))]
+    let offset = 0;
+    clock_at(unix, offset)
+}
+
 impl GhError {
+    /// The API or the site refused for its request limit.
+    pub fn is_rate_limit(&self) -> bool {
+        matches!(self, GhError::RateLimited { .. } | GhError::Status(429))
+    }
+
     fn from_http(e: HttpError) -> GhError {
         match e {
             e if e.is_offline() => GhError::Offline,

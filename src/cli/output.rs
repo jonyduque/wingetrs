@@ -356,6 +356,19 @@ fn extra_suffix(r: &ListRow) -> String {
     }
 }
 
+/// Why a release app's row was not checked (`não conferido (…)`, Task 211): its `latest` while
+/// its state is `Unknown`.
+pub fn release_note(r: &ListRow) -> Option<&str> {
+    match (&r.correlation, &r.state) {
+        (Correlation::Matched { source, .. }, UpdateState::Unknown)
+            if source.starts_with("github:") =>
+        {
+            r.latest.as_deref()
+        }
+        _ => None,
+    }
+}
+
 /// `Nome  Id  Instalada  Disponível  Fonte  Origem` for correlated rows, followed by the
 /// ambiguous and unmatched sections unless `upgradable_only`. A broken wingetrs install
 /// shows "quebrado" instead of its version.
@@ -374,7 +387,7 @@ pub fn list_text(rows: &[ListRow], upgradable_only: bool) -> String {
             } => {
                 let available = match &r.state {
                     UpdateState::Available { latest } => latest.clone(),
-                    _ => String::new(),
+                    _ => release_note(r).unwrap_or_default().to_string(),
                 };
                 if upgradable_only && available.is_empty() {
                     continue;
@@ -1017,6 +1030,75 @@ pub fn gh_missing_asset(tag: &str, name: &str, names: &[&str]) -> Advice {
         what.push_str(&paint(ID, n));
     }
     Advice::new(what, "escolha um com --asset <nome>")
+}
+
+/// `uninstall` of an app whose installer did not register itself (Task 211).
+pub fn gh_cannot_uninstall(app: &str) -> Advice {
+    Advice::new(
+        format!(
+            "o wingetrs não sabe desinstalar {app}: o instalador não se registrou em Programas instalados"
+        ),
+        format!(
+            "use o desinstalador do próprio programa e depois `wingetrs uninstall {app} --forget`"
+        ),
+    )
+}
+
+/// `--forget` on an app wingetrs put in place itself.
+pub fn gh_forget_refused(app: &str) -> Advice {
+    Advice::new(
+        format!(
+            "--forget só vale para apps instalados pelo instalador de um release ({app} é removido pelo wingetrs)"
+        ),
+        "rode de novo sem --forget",
+    )
+}
+
+/// What `--forget` (or a removal whose key is gone) does.
+pub fn gh_forget_plan(app_version: &str) -> String {
+    format!(
+        "{} {app_version}\n  Apaga só o registro do wingetrs; nada é desinstalado\n",
+        paint(HEADER, "Esquecer")
+    )
+}
+
+/// The ARP key of an installer app is gone: removed outside wingetrs.
+pub fn gh_key_gone(app: &str) -> String {
+    warning(&format!(
+        "{app} já foi removido por fora (sumiu de Programas instalados); o wingetrs só apaga o registro dele"
+    ))
+}
+
+/// The uninstaller ran but the key stayed: the record of wingetrs stays too.
+pub fn gh_key_stayed(app: &str) -> String {
+    warning(&format!(
+        "{app} continua em Programas instalados; o registro do wingetrs foi mantido"
+    ))
+}
+
+/// The record of wingetrs was deleted.
+pub fn gh_forgotten(app_version: &str) -> String {
+    success("Registro removido:", app_version)
+}
+
+/// An upgrade that ended portable leaves the program the old installer put in place.
+pub fn gh_old_program_stays(name: &str) -> String {
+    warning(&format!(
+        "a versão anterior, instalada pelo instalador, continua no Windows: {name} em Programas instalados"
+    ))
+}
+
+/// The upgrade's release has no file under the installed file's name with the new version,
+/// and nobody can choose.
+pub fn gh_pattern_changed(tag: &str, expected: &str, names: &[&str]) -> Advice {
+    let mut what = format!(
+        "o release {tag} não tem {expected} (o nome do arquivo instalado, com a versão nova); arquivos:"
+    );
+    for n in names {
+        what.push_str("\n  ");
+        what.push_str(&paint(ID, n));
+    }
+    Advice::new(what, "rode num terminal, sem --yes, para escolher")
 }
 
 /// The removal of an app of the Windows list (ARP/MSIX): `Desinstalar` as a header and the

@@ -32,6 +32,9 @@ Opções:
       --allow-scripts
           Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
 
+      --allow-unreviewed
+          Permite atualizar um app de um release do GitHub (origem não revisada); basta também para rodar o instalador do release
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 
@@ -43,3 +46,4 @@ Exemplos:
   wingetrs upgrade ripgrep
   wingetrs upgrade Git.Git --dry-run
   wingetrs upgrade --all --yes   só apps do wingetrs
+  wingetrs upgrade bat --allow-unreviewed   app de um release do GitHub

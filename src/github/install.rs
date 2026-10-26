@@ -377,6 +377,83 @@ pub fn installer_manifest_json(url: &str, asset: &Asset, version: &str) -> Strin
     .to_string()
 }
 
+/// How a release app was put in place (`install.json`, Task 211).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// A portable asset through the Scoop path: a plain wingetrs app.
+    Portable,
+    /// Its own installer, with the ARP key it registered (`None`: it did not register, or the
+    /// recorded key is not a valid one).
+    Installer(Option<InstallerRecord>),
+}
+
+/// Ceiling for the `install.json` read back.
+const MAX_INSTALL_JSON: u64 = 64 * 1024;
+
+fn hive_named(name: &str) -> Option<Hive> {
+    [Hive::User, Hive::MachineX64, Hive::MachineX86]
+        .into_iter()
+        .find(|h| state::hive_name(*h) == name)
+}
+
+/// The mode of `app` at `version`, from `<version_dir>\install.json` (no `mode` = portable).
+pub fn installed_mode(layout: &Layout, app: &str, version: &str) -> std::io::Result<Mode> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(layout.version_dir(app, version).join("install.json"))?
+        .take(MAX_INSTALL_JSON + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_INSTALL_JSON {
+        return Err(std::io::Error::other("install.json grande demais"));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    if v.get("mode").and_then(|m| m.as_str()) != Some("installer") {
+        return Ok(Mode::Portable);
+    }
+    let arp = v.get("arp").and_then(|a| {
+        let hive = hive_named(a.get("hive")?.as_str()?)?;
+        let key = a.get("key")?.as_str()?;
+        crate::winget_install::uninstall_cmd::valid_arp_key(key).then(|| InstallerRecord {
+            hive,
+            key: key.to_string(),
+            uninstall_string: v
+                .get("uninstall_string")
+                .and_then(|u| u.as_str())
+                .map(str::to_string),
+        })
+    });
+    Ok(Mode::Installer(arp))
+}
+
+/// The `arp/<hive>/<key>` identity of a recorded key (`overrides::app_key` of its row).
+pub fn arp_app_key(rec: &InstallerRecord) -> String {
+    let tag = match rec.hive {
+        Hive::User => "hkcu",
+        Hive::MachineX64 => "hklm64",
+        Hive::MachineX86 => "hklm32",
+    };
+    format!("arp/{tag}/{}", rec.key)
+}
+
+/// The release file a recorded manifest downloaded: the last segment of its `url` (without
+/// `#/<rename>`), decoded.
+pub fn asset_of_manifest(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let url = v.get("url")?.as_str()?;
+    let url = url.split('#').next()?;
+    let name = percent_decode(url.rsplit('/').next()?)?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// The file an upgrade looks for: the installed file's name with its version replaced by the
+/// new one (the same name when it holds no version).
+pub fn expected_asset(installed: &str, old_version: &str, new_version: &str) -> String {
+    if old_version.is_empty() {
+        return installed.to_string();
+    }
+    installed.replace(old_version, new_version)
+}
+
 /// One ARP key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArpKey {

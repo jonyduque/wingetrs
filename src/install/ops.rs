@@ -11,6 +11,7 @@ use crate::cache::{DataDir, UpdateLock};
 use crate::catalog::{Catalog, CatalogError};
 use crate::core::SourceKind;
 use crate::core::version::Version;
+use crate::github::{GhError, GhRepo};
 use crate::http::Http;
 use crate::install::download::{self, DownloadError, Progress};
 use crate::install::executor::{self, ExecCtx, ExecError, InUseCheck, Msiexec, NoHook};
@@ -25,6 +26,7 @@ use crate::install::script_scan::CallRoots;
 use crate::install::state::{self, AppRecord, Artifact, ArtifactKind, StateDb, StateError};
 use crate::install::target::{self, Candidate, TargetError};
 use crate::install::traits::{EffectError, Effects, EnvStore, EnvValue};
+use crate::installed::correlate::ListRow;
 use crate::update::LockWait;
 
 /// User environment variable holding the PATH.
@@ -1178,8 +1180,156 @@ fn scan_residues(
 pub struct UpgradeList {
     /// `(app, installed, latest)` whose catalog version is newer.
     pub upgradable: Vec<(String, String, String)>,
-    /// `(app, reason)` left out: broken install or no longer in the catalog.
+    /// `(app, reason)` left out: broken install, no longer in the catalog, or a release
+    /// that could not be checked.
     pub skipped: Vec<(String, String)>,
+    /// Apps from GitHub releases, not checked yet ([`check_releases`]).
+    pub releases: Vec<ReleaseApp>,
+}
+
+/// A wingetrs app from a GitHub release (bucket `github:<owner>/<repo>`): its newer version is
+/// the repository's latest tag, not a catalog row (Task 211).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseApp {
+    pub app: String,
+    pub version: String,
+    pub repo: GhRepo,
+}
+
+/// The repository of a `github:<owner>/<repo>` bucket.
+pub fn release_repo(bucket: &str) -> Option<GhRepo> {
+    GhRepo::parse(bucket.strip_prefix("github:")?).ok()
+}
+
+/// Most latest tags read at once (as the TUI reads manifests).
+const MAX_RELEASE_CHECKS: usize = 4;
+
+/// The version of the latest release of each of `repos` (in order), through the web redirect
+/// that does not spend the API limit: one request per repository, at most
+/// [`MAX_RELEASE_CHECKS`] at once.
+pub async fn latest_release_versions(
+    http: &Http,
+    web: &str,
+    repos: &[GhRepo],
+) -> Vec<Result<String, GhError>> {
+    let slots = tokio::sync::Semaphore::new(MAX_RELEASE_CHECKS);
+    let checks = repos.iter().map(|repo| {
+        let slots = &slots;
+        async move {
+            let _slot = slots
+                .acquire()
+                .await
+                .map_err(|e| GhError::Other(e.to_string()))?;
+            let tag = crate::github::latest_tag(http, web, repo).await?;
+            crate::github::install::version_of(&tag)
+        }
+    });
+    futures_util::future::join_all(checks).await
+}
+
+/// Why a release was not checked: `não conferido (limite do GitHub até HH:MM)`, or the error.
+pub fn release_unchecked(e: &GhError) -> String {
+    match e {
+        GhError::RateLimited { reset: Some(r) } => format!(
+            "não conferido (limite do GitHub até {})",
+            crate::github::reset_clock(*r)
+        ),
+        e if e.is_rate_limit() => "não conferido (limite do GitHub)".to_string(),
+        e => format!("não conferido ({e})"),
+    }
+}
+
+/// Moves `list.releases` to `upgradable` (a newer latest tag, compared as versions) or to
+/// `skipped` (not checked, and why).
+pub async fn check_releases(http: &Http, web: &str, list: &mut UpgradeList) {
+    let apps = std::mem::take(&mut list.releases);
+    let repos: Vec<GhRepo> = apps.iter().map(|a| a.repo.clone()).collect();
+    let versions = latest_release_versions(http, web, &repos).await;
+    for (a, latest) in apps.into_iter().zip(versions) {
+        match latest {
+            Ok(v) if Version::parse(&v) > Version::parse(&a.version) => {
+                list.upgradable.push((a.app, a.version, v));
+            }
+            Ok(_) => {}
+            Err(e) => list.skipped.push((a.app, release_unchecked(&e))),
+        }
+    }
+}
+
+/// `list`: a wingetrs app from a GitHub release gets its repository as its source
+/// (`github:<owner>/<repo>`, plus ` (instalador)` when its installer put it in place). With
+/// `web`, its latest tag says whether a newer version is available; one not checked keeps
+/// `Unknown` and says why in `latest`.
+pub async fn release_rows(layout: &Layout, http: &Http, web: Option<&str>, rows: &mut [ListRow]) {
+    use crate::installed::correlate::{Correlation, Rule, UpdateState};
+    if !rows.iter().any(|r| r.origin == "wingetrs") {
+        return;
+    }
+    let state = match read_state(layout) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "state.db ilegível; apps de release sem fonte");
+            return;
+        }
+    };
+    let mut checks: Vec<(usize, GhRepo)> = Vec::new();
+    for (i, r) in rows.iter_mut().enumerate() {
+        let Some(app) = r
+            .app_key
+            .strip_prefix("wingetrs/")
+            .filter(|_| r.origin == "wingetrs")
+        else {
+            continue;
+        };
+        let Ok(Some((rec, _))) = state.get(app) else {
+            continue;
+        };
+        let Some(repo) = release_repo(&rec.bucket) else {
+            continue;
+        };
+        let installer = matches!(
+            crate::github::install::installed_mode(layout, app, &rec.version),
+            Ok(crate::github::install::Mode::Installer(_))
+        );
+        r.correlation = Correlation::Matched {
+            source: if installer {
+                format!("{} (instalador)", rec.bucket)
+            } else {
+                rec.bucket.clone()
+            },
+            package_id: app.to_string(),
+            rule: Rule::ScoopManifest,
+        };
+        if r.state != UpdateState::Broken {
+            checks.push((i, repo));
+        }
+    }
+    let Some(web) = web else {
+        return;
+    };
+    let repos: Vec<GhRepo> = checks.iter().map(|(_, r)| r.clone()).collect();
+    let versions = latest_release_versions(http, web, &repos).await;
+    for ((i, _), latest) in checks.into_iter().zip(versions) {
+        let r = &mut rows[i];
+        match latest {
+            Ok(v) => {
+                let newer = r
+                    .installed_version
+                    .as_deref()
+                    .is_some_and(|cur| Version::parse(&v) > Version::parse(cur));
+                r.state = if newer {
+                    UpdateState::Available { latest: v.clone() }
+                } else {
+                    UpdateState::UpToDate
+                };
+                r.latest = Some(v);
+            }
+            Err(e) => {
+                r.state = UpdateState::Unknown;
+                r.latest = Some(release_unchecked(&e));
+            }
+        }
+    }
 }
 
 impl UpgradeList {
@@ -1198,13 +1348,15 @@ impl UpgradeList {
             UpgradeList {
                 upgradable,
                 skipped: self.skipped,
+                releases: self.releases,
             },
             names,
         )
     }
 }
 
-/// Every `state.db` app whose catalog version is newer (`upgrade --all`).
+/// Every `state.db` app whose catalog version is newer (`upgrade --all`); the apps from GitHub
+/// releases go to `releases`, for [`check_releases`].
 pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
     let _span = tracing::debug_span!("upgrade.list").entered();
     let layout = layout(ctx);
@@ -1214,6 +1366,15 @@ pub fn upgradable(ctx: &OpsCtx<'_>) -> Result<UpgradeList, OpsError> {
         if read_json(&layout.current(&rec.app).join("install.json")).is_none() {
             out.skipped
                 .push((rec.app, "instalação quebrada (rode repair)".into()));
+            continue;
+        }
+        // A release app's newer version is its repository's latest tag (Task 211).
+        if let Some(repo) = release_repo(&rec.bucket) {
+            out.releases.push(ReleaseApp {
+                app: rec.app,
+                version: rec.version,
+                repo,
+            });
             continue;
         }
         // A winget portable app's newer version is the winget catalog's (Task 189).

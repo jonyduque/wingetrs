@@ -685,6 +685,22 @@ pub async fn uninstall<F: WingetFlows>(
         )
         .into());
     }
+    uninstall_row(flows, ui, row, f, stop, say)
+        .await
+        .map(|_| ())
+}
+
+/// [`uninstall`] of the record `row`, already picked: planned, shown, confirmed and removed
+/// natively (also an app a GitHub release installer put in place, Task 211). `Ok(true)` once
+/// the removal ran; `Ok(false)` after a dry run or when the user cancelled.
+pub async fn uninstall_row<F: WingetFlows>(
+    flows: &F,
+    ui: &dyn Ui,
+    row: &ListRow,
+    f: Flags,
+    stop: Stop<'_, impl Interrupts>,
+    say: Say<'_>,
+) -> anyhow::Result<bool> {
     let t = target_of(&row.app_key).ok_or_else(|| {
         anyhow!(
             "{}: registro sem desinstalação conhecida ({})",
@@ -704,7 +720,7 @@ pub async fn uninstall<F: WingetFlows>(
             say(&output::warning(r));
         }
         say(output::DRY_RUN_DONE);
-        return Ok(());
+        return Ok(false);
     }
     if let Some(r) = refusal {
         // Only the registry record can still go (no winget runs): offered, never on `--yes`.
@@ -727,16 +743,20 @@ pub async fn uninstall<F: WingetFlows>(
         ];
         if ui.pick(items)? != Some(0) {
             say(&output::cancelled());
-            return Ok(());
+            return Ok(false);
         }
         let choice = RemovalChoice::RegistryOnly;
-        return run_removal(flows, ui, stop, &row.app_key, plan, choice, say).await;
+        return run_removal(flows, ui, stop, &row.app_key, plan, choice, say)
+            .await
+            .map(|()| true);
     }
     let Some(choice) = removal_choice(ui, &plan, f)? else {
         say(&output::cancelled());
-        return Ok(());
+        return Ok(false);
     };
-    run_removal(flows, ui, stop, &row.app_key, plan, choice, say).await
+    run_removal(flows, ui, stop, &row.app_key, plan, choice, say)
+        .await
+        .map(|()| true)
 }
 
 /// The administrator-terminal refusal of removing `plan` (Task 218): a user-scope record that

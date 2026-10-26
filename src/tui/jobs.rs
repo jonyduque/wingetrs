@@ -368,6 +368,12 @@ pub fn plan_install(
 
 /// Plans removing `app`; `purge` also deletes its persistent data.
 pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, String> {
+    // Its own uninstaller removes an app a release installer put in place (Task 211): the CLI.
+    if installer_app(c, app) {
+        return Err(format!(
+            "{app} foi instalado pelo instalador de um release; remova no terminal: wingetrs uninstall {app}"
+        ));
+    }
     let plan = ops::plan_uninstall(c, app, purge).map_err(|e| e.to_string())?;
     let mut text = format!("Remover {} {}\n", plan.app, plan.version);
     for l in plan.artifact_lines() {
@@ -399,14 +405,32 @@ pub fn plan_remove(c: &OpsCtx<'_>, app: &str, purge: bool) -> Result<Planned, St
     })
 }
 
-/// Plans upgrading every upgradable app; `keep` keeps the old versions.
+/// Whether `app` is a release app its own installer put in place (Task 211).
+fn installer_app(c: &OpsCtx<'_>, app: &str) -> bool {
+    let layout = c.data.install_layout();
+    let Ok(Some((rec, _))) = ops::read_state(&layout).and_then(|s| Ok(s.get(app)?)) else {
+        return false;
+    };
+    ops::release_repo(&rec.bucket).is_some()
+        && matches!(
+            crate::github::install::installed_mode(&layout, &rec.app, &rec.version),
+            Ok(crate::github::install::Mode::Installer(_))
+        )
+}
+
+/// Plans upgrading every upgradable app; `keep` keeps the old versions. Apps from GitHub
+/// releases are checked (their latest tag) and named, never planned here: their upgrade needs
+/// `--allow-unreviewed` in the terminal.
 pub fn plan_upgrade_all(c: &OpsCtx<'_>, w: &WingetSrc, keep: bool) -> Result<Planned, String> {
-    let (list, _pinned) = ops::upgradable(c)
-        .map_err(|e| e.to_string())?
-        .without_pinned(&crate::pins::load(c.data));
-    if list.upgradable.is_empty() {
-        return Err("nenhum app para atualizar".to_string());
+    let mut list = ops::upgradable(c).map_err(|e| e.to_string())?;
+    if !list.releases.is_empty() {
+        w.handle.block_on(ops::check_releases(
+            c.http,
+            crate::github::install::WEB_BASE,
+            &mut list,
+        ));
     }
+    let (list, _pinned) = list.without_pinned(&crate::pins::load(c.data));
     let layout = c.data.install_layout();
     let buckets: Vec<(String, String)> = StateDb::open(&layout.state_db())
         .and_then(|s| s.apps())
@@ -414,8 +438,30 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>, w: &WingetSrc, keep: bool) -> Result<Pla
         .into_iter()
         .map(|r| (r.app, r.bucket))
         .collect();
+    let release = |app: &str| {
+        buckets
+            .iter()
+            .any(|(a, b)| a == app && ops::release_repo(b).is_some())
+    };
+    let (releases, upgradable): (Vec<_>, Vec<_>) = list
+        .upgradable
+        .into_iter()
+        .partition(|(app, _, _)| release(app));
+    let mut notes = String::new();
+    for (app, _, to) in &releases {
+        notes.push_str(&format!(
+            "{app} {to} vem de um release do GitHub: atualize no terminal com wingetrs upgrade {app} --allow-unreviewed\n"
+        ));
+    }
+    if upgradable.is_empty() {
+        return Err(if notes.is_empty() {
+            "nenhum app para atualizar".to_string()
+        } else {
+            notes.trim_end().to_string()
+        });
+    }
     let mut groups = Vec::new();
-    for (app, _, _) in &list.upgradable {
+    for (app, _, _) in &upgradable {
         let bucket = buckets
             .iter()
             .find(|(a, _)| a == app)
@@ -433,7 +479,7 @@ pub fn plan_upgrade_all(c: &OpsCtx<'_>, w: &WingetSrc, keep: bool) -> Result<Pla
         }
     }
     Ok(Planned::Ready {
-        text: plans_text(&groups),
+        text: format!("{}{notes}", plans_text(&groups)),
         action: Action::Apply(groups),
     })
 }

@@ -222,7 +222,8 @@ fn uninstall_flags_parse() {
             purge: true,
             dry_run: true,
             yes: false,
-            allow_scripts: false
+            allow_scripts: false,
+            forget: false
         })
     );
 }
@@ -240,7 +241,8 @@ fn upgrade_flags_parse_and_all_excludes_a_target() {
             dry_run: false,
             yes: true,
             allow_msiexec: false,
-            allow_scripts: false
+            allow_scripts: false,
+            allow_unreviewed: false
         })
     );
     let cli = Cli::try_parse_from(["wingetrs", "upgrade", "x"]).unwrap();
@@ -253,7 +255,8 @@ fn upgrade_flags_parse_and_all_excludes_a_target() {
             dry_run: false,
             yes: false,
             allow_msiexec: false,
-            allow_scripts: false
+            allow_scripts: false,
+            allow_unreviewed: false
         })
     );
     assert!(Cli::try_parse_from(["wingetrs", "upgrade", "x", "--all"]).is_err());

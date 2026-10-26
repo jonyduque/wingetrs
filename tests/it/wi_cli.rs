@@ -687,6 +687,7 @@ async fn uninstall_falls_back_to_installed_rows() {
         dry_run: false,
         yes: true,
         allow_scripts: false,
+        forget: false,
     };
     install_cmd::execute(&ctx, &ui, cmd, &mut rx, &fake)
         .await

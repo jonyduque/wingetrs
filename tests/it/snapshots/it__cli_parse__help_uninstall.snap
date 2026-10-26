@@ -26,6 +26,9 @@ Opções:
       --allow-scripts
           Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
 
+      --forget
+          Apaga só o registro do wingetrs de um app que o instalador de um release pôs no lugar (o programa não é desinstalado)
+
   -v, --verbose...
           Verbosidade (-v, -vv): também loga no stderr
 

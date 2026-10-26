@@ -259,6 +259,10 @@ pub enum Command {
         /// Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
         #[arg(long)]
         allow_scripts: bool,
+        /// Apaga só o registro do wingetrs de um app que o instalador de um release pôs no
+        /// lugar (o programa não é desinstalado)
+        #[arg(long)]
+        forget: bool,
     },
     /// Atualiza apps do wingetrs, ou um app do Windows associado ao winget
     #[command(
@@ -269,7 +273,8 @@ pub enum Command {
   wingetrs upgrade               lista o que pode ser atualizado
   wingetrs upgrade ripgrep
   wingetrs upgrade Git.Git --dry-run
-  wingetrs upgrade --all --yes   só apps do wingetrs"
+  wingetrs upgrade --all --yes   só apps do wingetrs
+  wingetrs upgrade bat --allow-unreviewed   app de um release do GitHub"
     )]
     Upgrade {
         /// App a atualizar (id do wingetrs, id do winget ou nome na lista do Windows)
@@ -297,6 +302,10 @@ pub enum Command {
         /// Permite rodar scripts e instaladores de terceiros do manifesto (mostrados antes)
         #[arg(long)]
         allow_scripts: bool,
+        /// Permite atualizar um app de um release do GitHub (origem não revisada); basta
+        /// também para rodar o instalador do release
+        #[arg(long)]
+        allow_unreviewed: bool,
     },
     /// Gerencia os buckets do Scoop
     #[command(
@@ -970,8 +979,14 @@ async fn run_async(
             if let Some(kind) = source {
                 rows.retain(|r| row_kind(r) == Some(kind));
             }
+            // Release apps: their repository as the source; `--upgradable` reads their latest tag.
+            let web = upgradable.then_some(crate::github::install::WEB_BASE);
+            crate::install::ops::release_rows(&data.install_layout(), &http, web, &mut rows).await;
             if upgradable {
-                rows.retain(|r| matches!(r.state, UpdateState::Available { .. }));
+                rows.retain(|r| {
+                    matches!(r.state, UpdateState::Available { .. })
+                        || output::release_note(r).is_some()
+                });
             }
             line.finish();
             crate::installed::timed("output", || {
