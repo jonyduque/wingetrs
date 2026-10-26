@@ -1332,6 +1332,9 @@ async fn classify_asset(
     })
 }
 
+/// Words that name an installer asset (only to order the candidates).
+const INSTALLER_NAMES: [&str; 3] = ["instalador", "installer", "setup"];
+
 /// The assets to install: `--asset` by exact name, else the pick for this host. One installer
 /// with at most one program is taken as is (installer first); anything else ambiguous goes to
 /// the user, or fails listing the names without a terminal or with `--yes`. `None` = the user
@@ -1360,6 +1363,29 @@ async fn select_assets(
             Pick::None(why) => bail!("{why}"),
         },
     };
+    // Two candidates, one `.exe` named as an installer: the name only orders; that one is
+    // downloaded and confirmed by `classify_pe`, and the other is its fallback (looked into by
+    // `inspect` if it ever runs). A name that lied falls through to classifying both.
+    if let [x, y] = candidates.as_slice() {
+        let named = |a: &Asset| {
+            let n = a.name.to_ascii_lowercase();
+            n.ends_with(".exe") && INSTALLER_NAMES.iter().any(|w| n.contains(w))
+        };
+        let pair = match (named(x), named(y)) {
+            (true, false) => Some((x, y)),
+            (false, true) => Some((y, x)),
+            _ => None,
+        };
+        if let Some((setup, other)) = pair
+            && crate::github::pick::unsupported(&other.name).is_none()
+            && let AssetKind::Installer(i) = classify_asset(ctx, rel, setup.clone()).await?
+        {
+            return Ok(Some(Selection {
+                installer: Some(i),
+                program: Some(other.clone()),
+            }));
+        }
+    }
     let mut kinds = Vec::with_capacity(candidates.len());
     for a in candidates {
         kinds.push(classify_asset(ctx, rel, a).await?);

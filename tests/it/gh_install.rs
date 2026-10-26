@@ -1539,3 +1539,83 @@ fn gh_arp_name_rule_is_whole_word_and_unique() {
         assert_eq!(names_app(name, app), want, "{name} / {app}");
     }
 }
+
+const EPROCIA: [&str; 5] = [
+    "eprocia-0.3.0-windows-amd64-instalador.exe",
+    "eprocia-0.3.0-windows-amd64.exe",
+    "install.ps1",
+    "LICENSE",
+    "SHA256SUMS.txt",
+];
+
+#[test]
+fn gh_pick_only_installable_formats() {
+    use wingetrs::github::Asset;
+    use wingetrs::github::pick::{Pick, pick};
+    let assets: Vec<Asset> = EPROCIA
+        .iter()
+        .enumerate()
+        .map(|(i, n)| Asset {
+            name: n.to_string(),
+            size: 10,
+            sha256: [i as u8; 32],
+            url: format!("https://github.com/jonyduque/eprocia/releases/download/v0.3.0/{n}"),
+        })
+        .collect();
+    let Pick::Choose(left) = pick(&assets, wingetrs::install::manifest::Arch::X64) else {
+        panic!("expected a choice");
+    };
+    let names: Vec<&str> = left.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, EPROCIA[..2].to_vec());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gh_installer_named_pair_needs_no_asset_flag() {
+    let w = World::new().await;
+    w.release(
+        "v0.3.0",
+        vec![
+            a(EPROCIA[0], inno()),
+            a(EPROCIA[1], program()),
+            a(EPROCIA[2], b"Write-Host x".to_vec()),
+            a(EPROCIA[3], b"MIT".to_vec()),
+            a(EPROCIA[4], b"sums".to_vec()),
+        ],
+    )
+    .await;
+    let ui = TestUi::new(true, None);
+    w.run(
+        &ui,
+        &["install", "gh:o/tool", "--allow-unreviewed", "--dry-run"],
+    )
+    .await
+    .unwrap();
+    let text = ui.text();
+    assert!(ui.picked.lock().unwrap().is_empty(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Roda o instalador Inno Setup (origem não revisada): {}",
+            EPROCIA[0]
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Se falhar: instala só {}", EPROCIA[1])),
+        "{text}"
+    );
+    // Only the installer was downloaded: the name ordered, `classify_pe` confirmed.
+    let fetched: Vec<String> = w
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .filter(|p| p.contains("/releases/download/"))
+        .collect();
+    assert_eq!(
+        fetched,
+        vec![format!("/o/tool/releases/download/v0.3.0/{}", EPROCIA[0])]
+    );
+    assert!(w.launches().is_empty());
+}

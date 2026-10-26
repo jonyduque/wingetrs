@@ -68,7 +68,8 @@ const INSTALLER_PACKAGES: &[(&str, &str)] = &[
     (".msi", "instalador MSI"),
 ];
 
-/// Extensions removed before comparing two names as "the same build".
+/// The installable formats (also removed before comparing two names as "the same build"): a
+/// name without one of them (`install.ps1`, `LICENSE`, `.txt`) is never a candidate.
 const EXTENSIONS: &[&str] = &[
     ".tar.gz",
     ".tar.xz",
@@ -115,6 +116,11 @@ fn token_arch(t: &str) -> Option<NameArch> {
         t if t.starts_with("ppc") || t.starts_with("riscv") => Some(NameArch::Foreign),
         _ => None,
     }
+}
+
+fn installable(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    EXTENSIONS.iter().any(|e| lower.ends_with(e))
 }
 
 fn discarded(name: &str, toks: &[String]) -> bool {
@@ -181,7 +187,7 @@ pub fn pick(assets: &[Asset], host: Arch) -> Pick {
 
     let mut cands: Vec<Candidate> = Vec::new();
     for (asset, toks) in &all {
-        if discarded(&asset.name, toks) {
+        if discarded(&asset.name, toks) || !installable(&asset.name) {
             continue;
         }
         let archs: Vec<NameArch> = toks.iter().filter_map(|t| token_arch(t)).collect();
