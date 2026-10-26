@@ -337,6 +337,13 @@ Mutações:
 
 **Modelo:** opus (revisor opus), por causa da remoção elevada.
 
+**Escopo ampliado pelo usuário (2026-10-26):** a integração completa na TUI faz parte da 211.
+- Linhas `github:` com glifo, fonte e detalhes do registro.
+- A aba Atualizações confere `latest_tag`.
+- `u`/`U` rodam as mesmas funções do CLI pela fila de jobs, com modal no lugar do `--allow-unreviewed` e "esquecer" no lugar do `--forget`.
+- Testes de equivalência TUI × CLI.
+- Ação em linha `github:` nunca gera comando de winget.
+
 Testes (`tests/it/gh_install.rs`, continuação):
 1. `upgradable_uses_redirect_tag`.
 2. `upgrade_keeps_asset_pattern`.
